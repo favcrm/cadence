@@ -11,6 +11,14 @@
 //! attribute (no session, no agent tie) is refused before the daemon
 //! sees it — the HTTP path is never less strict than the RPC.
 //!
+//! CAD-2018: `/api/wiki/trash` and `/api/wiki/trash/items` are the one
+//! exception — they are not caller-relayed. Trash is operator-managed,
+//! so they are admitted by `operator::admit_operator_read_caller`
+//! (operator session plus peer proof; an agent or a member session is
+//! refused) and relayed over the board's own connection with NO
+//! `wiki_as` claim: the daemon's connection-bound `operator_connection`
+//! is the gate and the browser's identity is never carried as one.
+//!
 //! `/api/wiki/upload` is the one non-JSON write: a multipart body whose
 //! single file part streams into `<state>/wiki-uploads/` (the only dir
 //! `wiki_put_blob` accepts a tmp from). The part's bytes are capped at
@@ -27,6 +35,7 @@ use super::{
 };
 use crate::client;
 use crate::issue::Pm;
+use crate::wiki::trash;
 use std::path::Path;
 
 /// The board caller as the daemon's `wiki_as` relay claim.
@@ -72,6 +81,100 @@ fn board_caller(
     operator::board_caller(request, state_dir, opts, false, None)
 }
 
+// ---------- GET /api/wiki/trash, /api/wiki/trash/items ----------
+
+/// The operator's native trash browser. Unlike every other wiki read
+/// this is not a caller-relayed read: trash is operator-managed, so it
+/// is admitted by [`operator::admit_operator_read_caller`] (operator
+/// session + peer proof; an agent or a member session is refused) and
+/// relayed over the board's OWN daemon connection with no `wiki_as`
+/// claim — the daemon's `operator_connection` is the gate, and the
+/// browser's identity is never carried as one. Only the selector and
+/// the pagination are forwarded; every other query key is refused
+/// outright, so a forged `wiki_as`/`public_session` has no path into
+/// the RPC.
+fn trash_read(request: &Request, tail: &str, state_dir: &Path, opts: &ServeOpts) -> HttpResp {
+    if let Err(resp) = operator::admit_operator_read_caller(request, state_dir, opts) {
+        return resp;
+    }
+    let items = tail == "trash/items";
+    let params = match trash_params(request, items) {
+        Ok(params) => params,
+        Err(resp) => return resp,
+    };
+    let method = if items {
+        trash::ITEMS_RPC
+    } else {
+        trash::LIST_RPC
+    };
+    relay_operator(state_dir, method, params)
+}
+
+/// The trash query, read strictly from the raw URL: `limit`/`cursor`
+/// (plus `from` on the items route), each given at most once and decoded
+/// exactly. Every other key — `wiki_as`, `public_session`, an encoded
+/// spelling of one — is a refusal, never a dropped key, so no forged
+/// identity can ride the query into the relay.
+fn trash_params(request: &Request, items: bool) -> std::result::Result<Value, HttpResp> {
+    let raw_url = request.url().to_string();
+    let raw_query = raw_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let mut params = json!({});
+    for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, raw) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(key) = super::pct_decode(key) else {
+            return Err(err_response(400, "query key is not valid"));
+        };
+        let Some(value) = super::pct_decode(raw) else {
+            return Err(err_response(400, "query value is not valid"));
+        };
+        let known = matches!(key.as_str(), "limit" | "cursor") || (items && key == "from");
+        if !known {
+            return Err(err_response(400, "unknown query key"));
+        }
+        if params.get(key.as_str()).is_some() {
+            return Err(err_response(400, "each query key is given once"));
+        }
+        match key.as_str() {
+            "limit" => match value.parse::<u64>() {
+                Ok(n) => params["limit"] = json!(n),
+                Err(_) => {
+                    return Err(err_response(
+                        400,
+                        "wiki trash limit must be a non-negative integer",
+                    ))
+                }
+            },
+            "cursor" => {
+                if value.is_empty() {
+                    return Err(err_response(
+                        400,
+                        "wiki trash cursor must be a non-empty string",
+                    ));
+                }
+                params["cursor"] = json!(value);
+            }
+            _ => {
+                if value.is_empty() {
+                    return Err(err_response(400, "wiki trash items needs ?from="));
+                }
+                params["from"] = json!(value);
+            }
+        }
+    }
+    if items && params.get("from").is_none() {
+        return Err(err_response(400, "wiki trash items needs ?from="));
+    }
+    Ok(params)
+}
+
+/// Relay an operator-only read without a caller claim.
+fn relay_operator(state_dir: &Path, method: &str, params: Value) -> HttpResp {
+    match client::rpc(state_dir, method, params) {
+        Ok(v) => json_response(v),
+        Err(e) => write_err(&e),
+    }
+}
+
 // ---------- GET /api/wiki/{ls,file,search,history} ----------
 
 pub(super) fn read(
@@ -82,6 +185,11 @@ pub(super) fn read(
     pm_dir: &Path,
     opts: &ServeOpts,
 ) -> HttpResp {
+    // CAD-2018: the trash browser is operator-only, not a caller-relayed
+    // read — it is admitted and relayed on its own (see `trash_read`).
+    if tail == "trash" || tail == "trash/items" {
+        return trash_read(request, tail, state_dir, opts);
+    }
     let caller = match board_caller(request, state_dir, opts) {
         Ok(c) => c,
         Err(resp) => return resp,

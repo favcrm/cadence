@@ -47,6 +47,23 @@
       ]
     },
     {
+      "description": "Check one screen declaration against host-computed asset facts\n(CAD-2008).",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ScreenIntegrityInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "app.screen.integrity"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
+    },
+    {
       "description": "Check an issue id, project key, tags, status and priority.",
       "type": "object",
       "properties": {
@@ -491,6 +508,56 @@
         }
       },
       "additionalProperties": false
+    },
+    "ScreenAssetFact": {
+      "description": "One supplied asset as a host *reports* it: the exact byte length of the\ninstalled UTF-8 body and the `sha256:<64 lowercase hex>` digest the host\ncomputed over those same bytes.\n\nThe validator compares a declaration against these facts and never sees\nthe bytes, so the agreement it proves is with the caller's report. A\ncaller that has not hashed the exact bytes it installed has proved only\nself-consistency, not package integrity.",
+      "type": "object",
+      "properties": {
+        "sha256": {
+          "description": "The body's `sha256:<64 lowercase hex>` digest.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Exact UTF-8 byte length of the supplied body.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "size",
+        "sha256"
+      ]
+    },
+    "ScreenIntegrityInput": {
+      "description": "Input of `app.screen.integrity`.\n\nThe declaration is the exact `screens.json` text of one `screens/<tag>/`\npackage, and `assets` carries host-computed *facts* for the bytes that host\ninstalled — never bodies. `screen_count` is the app-level package count the\nsame host verified, bounded by the one [`MAX_SCREENS`] the native bundle\nscan enforces. The whole envelope is bounded by [`MAX_INPUT_BYTES`] before\nany JSON work, and the declaration by the screen contract's own 32 KiB and\n32-asset limits, so no multi-megabyte asset can be encoded through the ABI.\n\n**Authority**: the facts and the count are the caller's report. A caller\nmust compute `size`/`sha256` over the exact installed bytes and count the\n`screens/<tag>/` packages it actually installed; the op proves the\ndeclaration agrees with what it was told, and nothing here installs,\nmounts, executes or grants effect authority.",
+      "type": "object",
+      "properties": {
+        "assets": {
+          "description": "Flat asset name → the facts the host computed for that installed body.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ScreenAssetFact"
+          }
+        },
+        "manifest": {
+          "description": "The exact screen declaration (`screens.json`) text.",
+          "type": "string"
+        },
+        "screen_count": {
+          "description": "How many `screens/<tag>/` packages the app declares, 1 to\n[`MAX_SCREENS`]. Fixed-width so the same JSON is accepted or refused\nidentically on every target: a `usize` field would overflow on a 32-bit\nhost and turn one refusal into another. Checked before any declaration\nwork, so the hosted answer refuses an over-count app exactly as the\nnative bundle scan does.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "manifest",
+        "assets",
+        "screen_count"
+      ]
     },
     "SizeLimit": {
       "type": "object",

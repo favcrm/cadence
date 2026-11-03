@@ -1,4 +1,4 @@
-import { useContext, useState } from "react";
+import { useContext, useState, type ReactNode } from "react";
 import type { ResourceState } from "../../lib/cache";
 import { issueIndex } from "../../lib/scope";
 import { useTranslate } from "../../lib/locale";
@@ -15,7 +15,8 @@ import { ROLES } from "../settings/ModelDefaults";
 import RecruitChat from "./RecruitChat";
 import AgentPage from "./AgentPage";
 import HireSheet from "./HireSheet";
-import ProfileSeat, { ConnectRuntime, ProfileSheet } from "./ProfileSeat";
+import ProfileSeat, { ConnectRuntime, workText } from "./ProfileSeat";
+import AgentSidebar from "./AgentSidebar";
 import NewAgentDialog from "./NewAgentDialog";
 import Recruit from "./Recruit";
 import { HireGate, RoleCard } from "./RecruitCards";
@@ -28,7 +29,6 @@ import {
 } from "./agentRoles";
 import type { AgentTab } from "./agentTabModel";
 import {
-  AGENT_FILTERS,
   agentLocation,
   agentMatchesFilter,
   agentMatchesSearch,
@@ -40,9 +40,6 @@ import {
 } from "./agentView";
 import "./agents.css";
 import type { Agent, HiredProfile, AgentRole, AgentsPayload, IssueCard } from "../../lib/types";
-
-/** The toolbar's segmented filters, in the order they read. */
-const TOOLBAR_FILTERS: AgentFilter[] = ["current", "attention", "working", "idle", "stopped", "inbox", "all"];
 
 /** "Accountant · this computer": the catalogue title, else "Master", else the
  *  team role's label (never the raw id or the provider), then where it runs. */
@@ -69,7 +66,15 @@ export default function Agents({
   onRecruit,
   onOpenIssue,
   onRetry,
+  operator,
+  onRetryAccess,
+  hostedBoard,
 }: {
+  /** `true` alone lets the viewer read and send agent conversations, as on
+   *  Threads. `null` is an unanswered check, not a non-operator. */
+  operator: boolean | null;
+  onRetryAccess: () => void;
+  hostedBoard: boolean;
   state: ResourceState<AgentsPayload>;
   issues: ResourceState<IssueCard[]>;
   open: string | null;
@@ -85,11 +90,9 @@ export default function Agents({
 }) {
   const t = useTranslate();
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<AgentFilter>("current");
   const [creating, setCreating] = useState(false);
   const [picked, setPicked] = useState<AgentRole | null>(null);
   const [joined, setJoined] = useState<{ profile: HiredProfile; role: AgentRole } | null>(null);
-  const [openProfile, setOpenProfile] = useState<string | null>(null);
   const roles = useAgentRoles();
   const installed = useQuery(resources.apps);
   const hireBlock = useContext(HireBlock);
@@ -99,13 +102,12 @@ export default function Agents({
   const allAgents = payload?.agents ?? [];
   const profiles = payload?.profiles ?? [];
   const idleProfiles = profiles.filter((p) => profileMatchesFilter(p, "all"));
-  const counts = Object.fromEntries(
-    AGENT_FILTERS.map(({ value }) => [
-      value,
-      allAgents.filter((a) => agentMatchesFilter(a, value)).length +
-        idleProfiles.filter((p) => profileMatchesFilter(p, value)).length,
-    ]),
-  ) as Record<AgentFilter, number>;
+  // The cards are the current team; a search reaches everyone. Stopped agents
+  // and mailboxes otherwise live in the sidebar's folded groups.
+  const searching = query.trim() !== "";
+  const filter: AgentFilter = searching ? "all" : "current";
+  const sidebarAgents = allAgents.filter((a) => agentMatchesSearch(a, query, issueIndexed));
+  const sidebarProfiles = idleProfiles.filter((p) => profileMatchesSearch(p, query));
   const shownProfiles = idleProfiles.filter(
     (p) => profileMatchesFilter(p, filter) && profileMatchesSearch(p, query),
   );
@@ -114,15 +116,17 @@ export default function Agents({
     .sort(
       (a, b) =>
         Number(b.alias === MASTER) - Number(a.alias === MASTER) ||
-                agentOrder(a) - agentOrder(b) ||
+        agentOrder(a) - agentOrder(b) ||
         a.alias.localeCompare(b.alias),
     );
   const emptyCopy =
     allAgents.length + idleProfiles.length === 0
       ? t("No agents registered.")
-      : filter === "current" && counts.current === 0 && !query.trim()
-        ? t("No current agents. Select All, Stopped, or Mailboxes to see the full roster.")
-        : t("No agents match these filters.");
+      : searching
+        ? t("No agents match “{query}”.").replace("{query}", () => query)
+        : t("No current agents. Search to find stopped agents and mailboxes.");
+  // A phone has no sidebar, so what it folds is listed under the cards there.
+  const folded = searching ? [] : allAgents.filter((a) => !agentMatchesFilter(a, "current"));
   const agent = allAgents.find((a) => a.alias === open);
   const hosted = roles.data?.install.hosted ?? false;
   const suggestion = suggestedRoles(installed.data ?? [], roles.data?.roles ?? []);
@@ -132,7 +136,6 @@ export default function Agents({
   const profileTitle = (profile: HiredProfile) =>
     roles.data?.roles.find((r) => r.id === profile.catalogue)?.title ?? profile.role;
   const issueCards = issuesState.data ?? [];
-  const detailProfile = profiles.find((p) => p.id === openProfile);
   const hired = (profile: HiredProfile, role: AgentRole) => {
     setPicked(null);
     setJoined({ profile, role });
@@ -158,8 +161,29 @@ export default function Agents({
     />
   );
 
+  const openHired = profiles.find((p) => p.alias === open);
+  const shell = (content: ReactNode) => (
+    <div className="ag-shell">
+      <AgentSidebar
+        agents={sidebarAgents}
+        profiles={sidebarProfiles}
+        profileStatus={(p) => {
+          const work = profileWork(p, issueCards);
+          return work ? workText(work, t) : t("Idle · no runtime");
+        }}
+        open={open}
+        query={query}
+        onQuery={setQuery}
+        onOpen={setOpen}
+        onOverview={() => setOpen(null)}
+        onRecruit={() => onRecruit(true)}
+      />
+      <div className="ag-shell-body">{content}</div>
+    </div>
+  );
+
   if (open) {
-    return (
+    return shell(
       <AgentPage
         key={open}
         alias={open}
@@ -170,11 +194,20 @@ export default function Agents({
         onTab={onTab}
         onBack={() => setOpen(null)}
         onOpenIssue={onOpenIssue}
+        hosted={hosted}
+        groups={groups}
+        rosterLoaded={payload != null}
+        rosterFailed={payload == null && state.status === "failed"}
+        onRetryRoster={onRetry}
+        operator={operator}
+        onRetryAccess={onRetryAccess}
+        hostedBoard={hostedBoard}
+        hiredWork={openHired ? profileWork(openHired, issueCards) : null}
       />
     );
   }
   if (ask) {
-    return (
+    return shell(
       <RecruitChat
         hireBlock={hireBlock}
         onBack={() => setOpen(null)}
@@ -182,7 +215,7 @@ export default function Agents({
     );
   }
   if (recruit) {
-    return (
+    return shell(
       <>
         <Recruit
           roles={roles}
@@ -207,7 +240,7 @@ export default function Agents({
     );
   }
 
-  return (
+  return shell(
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
       <div className="rc-head">
         <div>
@@ -252,22 +285,6 @@ export default function Agents({
       {payload && (
         <>
           <div className="ag-toolbar" role="search" aria-label={t("Find agents")}>
-            <div className="ag-seg" role="group" aria-label={t("Filter agents by status")}>
-              {AGENT_FILTERS.filter((f) => TOOLBAR_FILTERS.includes(f.value))
-                .sort((x, y) => TOOLBAR_FILTERS.indexOf(x.value) - TOOLBAR_FILTERS.indexOf(y.value))
-                .map(({ value, label }) => (
-                  <button
-                    key={value}
-                    type="button"
-                    className="ag-seg-btn"
-                    aria-pressed={filter === value}
-                    onClick={() => setFilter(value)}
-                  >
-                    {t(label)}
-                    <span className="num">{counts[value]}</span>
-                  </button>
-                ))}
-            </div>
             <label className="ag-search" htmlFor="agents-search">
               <IconSearch />
               <span className="sr-only">{t("Search agents")}</span>
@@ -295,11 +312,28 @@ export default function Agents({
                 profile={profile}
                 roleTitle={profileTitle(profile)}
                 work={profileWork(profile, issueCards)}
-                onOpen={() => setOpenProfile(profile.id)}
+                onOpen={() => setOpen(profile.alias)}
               />
             ))}
-            {tile}
+            {!searching && tile}
           </div>
+          {folded.length > 0 && (
+            <details className="ag-folded">
+              <summary>
+                {t("Stopped and mailboxes")} <span className="num">{folded.length}</span>
+              </summary>
+              <div className="rc-seats">
+                {folded.map((a) => (
+                  <SeatCard
+                    key={a.alias}
+                    agent={a}
+                    roleLine={roleLine(a, roleOf(a, roles.data, profiles)?.title, hosted, t)}
+                    onOpen={() => setOpen(a.alias)}
+                  />
+                ))}
+              </div>
+            </details>
+          )}
           {agents.length + shownProfiles.length === 0 && (
             <p className="text-label text-ink-500 mt-3" role="status">
               {emptyCopy}
@@ -327,18 +361,6 @@ export default function Agents({
         </>
       )}
       {sheet}
-      {detailProfile && (
-        <ProfileSheet
-          key={detailProfile.id}
-          profile={detailProfile}
-          roleTitle={profileTitle(detailProfile)}
-          work={profileWork(detailProfile, issueCards)}
-          hosted={hosted}
-          groups={groups}
-          onClose={() => setOpenProfile(null)}
-          onOpenIssue={onOpenIssue}
-        />
-      )}
       {creating && <NewAgentDialog onClose={() => setCreating(false)} onCreated={() => onRetry()} />}
     </main>
   );

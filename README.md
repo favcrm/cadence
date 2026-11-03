@@ -130,7 +130,7 @@ history before explicitly retrying an uncertain send.
 sends it automatically, and does not resolve the item.
 
 An issue's **Overview** brings its current result, next action, output links
-and verification together. A worker report is not independent review,
+and verification together. A worker report is not a fresh-session review,
 merge or deployment evidence. Activity, Conversation, Pull request and
 Evidence remain the detailed views; feedback uses the existing conversation.
 

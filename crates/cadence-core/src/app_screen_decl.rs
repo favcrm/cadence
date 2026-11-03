@@ -1,5 +1,15 @@
-//! CAD-500 R4: a pure declaration/integrity validator for the
-//! `app-screens/v1` screen-package contract.
+//! CAD-500 R4 / CAD-2008: the one declaration/integrity validator for the
+//! `app-screens/v1|v2` screen-package contract.
+//!
+//! This module is the single implementation of the screen declaration rules.
+//! The native host calls [`validate_map`] with the asset bodies it holds; the
+//! bounded `app.screen.integrity` operation calls [`validate_facts`] with the
+//! size/sha256 facts its host computed from the exact installed bytes. Both
+//! enter the same private pipeline — one grammar, one bound set, one
+//! declared↔supplied comparison — so the two hosts cannot drift into
+//! different answers for the same declaration. The app-level screen *count*
+//! bound ([`MAX_SCREENS`]) is stated here too, so the native bundle scan and
+//! the hosted count check agree on how many packages one app may declare.
 //!
 //! [`validate_map`] checks one closed JSON declaration against a
 //! caller-supplied map of UTF-8 asset bodies: exact
@@ -8,36 +18,42 @@
 //! bytes, and finite bounds at every stage — raw manifest bytes and
 //! bracket depth before parsing, node count after a bounded
 //! `serde_json::Value` pass, then a closed typed decode that keeps
-//! duplicate JSON fields refused.
+//! duplicate JSON keys refused at every level, map-valued fields included.
 //!
 //! ## What this proves — and what it does not
 //!
 //! A returned [`IntegrityCheckedScreen`] proves only that the
-//! declaration and the supplied bodies agree: every declared asset is
-//! present, every supplied body is declared, and each body's UTF-8
-//! byte length and sha256 match its declaration. The declared
-//! provenance digests (source/SDK/toolchain) are checked for *syntax*
-//! only — they are inert metadata, never recomputed against anything.
+//! declaration and the supplied assets agree: every declared asset is
+//! present, every supplied asset is declared, and each supplied UTF-8
+//! byte length and sha256 match its declaration. With [`validate_facts`]
+//! the digests are the *caller's* reported facts: the agreement is with
+//! those facts, and it is the caller's job to hash the bytes it actually
+//! installed. The declared provenance digests (source/SDK/toolchain) are
+//! checked for *syntax* only — they are inert metadata, never recomputed
+//! against anything.
 //!
 //! Returning the checked value grants **no** approval, source-rebuild
 //! attestation, mount, execution or effect authority. Asset bodies
 //! stay caller-owned inert strings: this validator does not sanitize
 //! JS/CSS/SVG/JSON for execution and does not claim code safety.
 //! There is no actor, endpoint, filesystem, network, environment or
-//! installed-path surface here — the function touches nothing but its
+//! installed-path surface here — the functions touch nothing but their
 //! two arguments.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
-use crate::issue::model;
+use crate::issue::valid_tag;
 
 /// Largest raw manifest, bytes — checked before any parse.
-const MAX_MANIFEST_BYTES: usize = 32_768;
+pub const MAX_MANIFEST_BYTES: usize = 32_768;
 /// Deepest `{}`/`[]` nesting — an iterative quote/escape-aware scan
 /// refuses deeper manifests before serde sees them.
 const MAX_DEPTH: usize = 32;
@@ -45,24 +61,17 @@ const MAX_DEPTH: usize = 32;
 /// the bounded `Value` tree.
 const MAX_NODES: usize = 4_096;
 /// Most assets, declared and supplied alike.
-const MAX_ASSETS: usize = 32;
-/// Largest single `.js` asset body — the screen entry/leaves get the
-/// larger script budget (CAD-1254: the install gate's screen-asset cap).
-const MAX_JS_BYTES: u64 = crate::issue::app::MAX_SCREEN_ASSET_BYTES;
-/// Largest non-js asset body, UTF-8 bytes.
-const MAX_ASSET_BYTES: u64 = 131_072;
-/// Largest sum of every supplied asset body, bytes.
-const MAX_TOTAL_BYTES: u64 = 524_288;
-
-/// The per-leaf bound: `.js` gets the larger screen-script budget,
-/// every other asset the flat cap. Keyed on the leaf name's extension.
-fn asset_bound(name: &str) -> u64 {
-    if name.rsplit_once('.').map(|(_, e)| e) == Some("js") {
-        MAX_JS_BYTES
-    } else {
-        MAX_ASSET_BYTES
-    }
-}
+pub const MAX_ASSETS: usize = 32;
+/// Most screen packages one app may declare. The native bundle scan
+/// (`app_screen_pkg::tags_in`) and the hosted `app.screen.integrity` count
+/// check both read this one number, so a package set is bounded identically on
+/// both hosts.
+pub const MAX_SCREENS: usize = 8;
+/// The whole-app aggregate content budget, bytes. A screen's supplied assets
+/// share it, and the native installer keeps the same number: the limit is
+/// stated here once and re-exported as the native app budget, so the two
+/// hosts cannot disagree about the boundary.
+pub const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The read-only contract — a mounted frame may only receive the
 /// host-pushed projection (its `may` is empty).
@@ -508,7 +517,7 @@ impl ScreenNavigation {
         }
         let mut seen = HashSet::new();
         for section in &self.sections {
-            if !model::valid_tag(&section.id)
+            if !valid_tag(&section.id)
                 || !seen.insert(&section.id)
                 || section.label.is_empty()
                 || section.label.encode_utf16().count() > 40
@@ -614,7 +623,7 @@ impl IntegrityCheckedScreen {
     pub fn startup(&self) -> Option<&[String]> {
         self.startup.as_deref()
     }
-    /// The declared app tag (`model::valid_tag` grammar).
+    /// The declared app tag (`valid_tag` grammar).
     pub fn app(&self) -> &str {
         &self.app
     }
@@ -669,7 +678,9 @@ struct RawDecl {
     /// v2 only: logical alias → capability-slot declaration. Each alias
     /// is app-owned; each slot must name a `needs.capabilities` key the
     /// installed app declares (checked at invoke, never trusted here).
-    #[serde(default)]
+    /// A repeated alias refuses: a map decode would otherwise keep only
+    /// the last slot and hide the shadowed one.
+    #[serde(default, deserialize_with = "unique_map")]
     tools: BTreeMap<String, String>,
     #[serde(default)]
     operations: Vec<ScreenOperation>,
@@ -700,8 +711,84 @@ struct RawProvenance {
     toolchain_digest: String,
 }
 
-/// Validate one `app-screens/v1` declaration against caller-supplied
-/// UTF-8 asset bodies.
+/// One supplied asset as a host *reports* it: the exact byte length of the
+/// installed UTF-8 body and the `sha256:<64 lowercase hex>` digest the host
+/// computed over those same bytes.
+///
+/// The validator compares a declaration against these facts and never sees
+/// the bytes, so the agreement it proves is with the caller's report. A
+/// caller that has not hashed the exact bytes it installed has proved only
+/// self-consistency, not package integrity.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenAssetFact {
+    /// Exact UTF-8 byte length of the supplied body.
+    pub size: u64,
+    /// The body's `sha256:<64 lowercase hex>` digest.
+    pub sha256: String,
+}
+
+/// The supplied side of one declaration↔supplied comparison, borrowed.
+///
+/// Only lengths are read while the bound stage runs; a digest is produced
+/// only after the declaration's own grammar, size and digest syntax already
+/// agreed, so a declaration that is invalid for any other reason never
+/// causes a body to be hashed.
+trait Supplied {
+    /// How many assets were supplied.
+    fn count(&self) -> usize;
+    /// Every supplied name with its byte length, borrowed from the caller.
+    fn lengths(&self) -> impl Iterator<Item = (&str, u64)>;
+    /// The byte length supplied for `name`, or `None` when it is absent.
+    fn length(&self, name: &str) -> Option<u64>;
+    /// The `sha256:<64 lowercase hex>` digest of the supplied bytes for
+    /// `name`: computed on demand from a body, quoted from a fact.
+    fn sha256(&self, name: &str) -> Option<Cow<'_, str>>;
+}
+
+/// Asset bodies the caller holds: the digest is computed from the bytes.
+struct SuppliedBodies<'a>(&'a BTreeMap<String, String>);
+
+impl Supplied for SuppliedBodies<'_> {
+    fn count(&self) -> usize {
+        self.0.len()
+    }
+    fn lengths(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.0
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.len() as u64))
+    }
+    fn length(&self, name: &str) -> Option<u64> {
+        self.0.get(name).map(|body| body.len() as u64)
+    }
+    fn sha256(&self, name: &str) -> Option<Cow<'_, str>> {
+        self.0
+            .get(name)
+            .map(|body| Cow::Owned(format!("sha256:{:x}", Sha256::digest(body.as_bytes()))))
+    }
+}
+
+/// Host-reported facts: no bytes, so nothing is hashed here at all.
+struct SuppliedFacts<'a>(&'a BTreeMap<String, ScreenAssetFact>);
+
+impl Supplied for SuppliedFacts<'_> {
+    fn count(&self) -> usize {
+        self.0.len()
+    }
+    fn lengths(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.0.iter().map(|(name, fact)| (name.as_str(), fact.size))
+    }
+    fn length(&self, name: &str) -> Option<u64> {
+        self.0.get(name).map(|fact| fact.size)
+    }
+    fn sha256(&self, name: &str) -> Option<Cow<'_, str>> {
+        self.0
+            .get(name)
+            .map(|fact| Cow::Borrowed(fact.sha256.as_str()))
+    }
+}
+
+/// Validate one declaration against caller-supplied UTF-8 asset bodies.
 ///
 /// `manifest` is the raw JSON text (a separate argument — never an
 /// asset-map member). `assets` maps flat asset names to bodies; it is
@@ -718,30 +805,28 @@ pub fn validate_map(
     manifest: &str,
     assets: &BTreeMap<String, String>,
 ) -> Result<IntegrityCheckedScreen> {
-    // Supplied-side bounds first — before anything copies or hashes a
-    // byte. The map is already caller-owned; only lengths are read.
-    if assets.len() > MAX_ASSETS {
-        return Err(Error::rejected(format!(
-            "{} supplied assets — at most {MAX_ASSETS}",
-            assets.len()
-        )));
-    }
-    let mut total_bytes = 0u64;
-    for (name, body) in assets.iter() {
-        let len = body.len() as u64;
-        let bound = asset_bound(name);
-        if len > bound {
-            return Err(Error::rejected(format!(
-                "asset {name:?} body is {len} bytes — at most {bound}"
-            )));
-        }
-        total_bytes += len;
-    }
-    if total_bytes > MAX_TOTAL_BYTES {
-        return Err(Error::rejected(format!(
-            "asset bodies total {total_bytes} bytes — at most {MAX_TOTAL_BYTES}"
-        )));
-    }
+    validate_with(manifest, &SuppliedBodies(assets))
+}
+
+/// Validate one declaration against host-reported facts for the exact bytes
+/// that host installed — the same pipeline [`validate_map`] runs, with the
+/// digests quoted from the caller instead of computed from bodies.
+///
+/// Nothing is hashed here: the facts are the whole supplied side. See
+/// [`ScreenAssetFact`] for what the agreement does and does not prove.
+pub fn validate_facts(
+    manifest: &str,
+    facts: &BTreeMap<String, ScreenAssetFact>,
+) -> Result<IntegrityCheckedScreen> {
+    validate_with(manifest, &SuppliedFacts(facts))
+}
+
+/// The one pipeline both entry points run: one bound set, one grammar, one
+/// declared↔supplied comparison.
+fn validate_with<S: Supplied>(manifest: &str, supplied: &S) -> Result<IntegrityCheckedScreen> {
+    // Supplied-side bounds first — before anything copies, parses or hashes a
+    // byte. Only lengths are read.
+    check_supplied_bounds(supplied)?;
 
     // Raw byte cap and bracket depth before serde touches the text.
     if manifest.len() > MAX_MANIFEST_BYTES {
@@ -761,6 +846,7 @@ pub fn validate_map(
 
     // The closed typed decode reads the ORIGINAL raw text so duplicate
     // fields at every struct level refuse; a `Value` map would hide them.
+    // The one map-valued field (`tools`) carries its own duplicate-key guard.
     let decl: RawDecl = serde_json::from_str(manifest)
         .map_err(|e| Error::rejected(format!("manifest declaration: {e}")))?;
 
@@ -779,13 +865,8 @@ pub fn validate_map(
         return Err(Error::rejected("startup must be a non-null array"));
     }
     check_declaration(&decl)?;
-    check_assets(&decl, assets)?;
+    check_assets(&decl, supplied)?;
 
-    let tools = decl
-        .tools
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
     Ok(IntegrityCheckedScreen {
         contract: decl.contract,
         asset_count: decl.assets.len(),
@@ -797,15 +878,45 @@ pub fn validate_map(
         remote_images: decl.remote_images,
         may: decl
             .may
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
+            .into_iter()
+            .filter_map(|value| match value {
+                Value::String(value) => Some(value),
+                _ => None,
+            })
             .collect(),
         host_contract: decl.host_contract,
-        tools,
+        tools: decl.tools,
         operations: decl.operations,
         navigation: decl.navigation,
         startup: decl.startup,
     })
+}
+
+/// Supplied-side bounds: count, then each length, then the aggregate — all
+/// before a single byte is parsed or hashed.
+fn check_supplied_bounds<S: Supplied>(supplied: &S) -> Result<()> {
+    let count = supplied.count();
+    if count > MAX_ASSETS {
+        return Err(Error::rejected(format!(
+            "{count} supplied assets — at most {MAX_ASSETS}"
+        )));
+    }
+    let mut total_bytes = 0u64;
+    for (name, len) in supplied.lengths() {
+        if len > MAX_TOTAL_BYTES {
+            return Err(Error::rejected(format!(
+                "asset {name:?} body is {len} bytes — at most {MAX_TOTAL_BYTES}"
+            )));
+        }
+        // At most `MAX_ASSETS` lengths, each already bounded: no overflow.
+        total_bytes += len;
+    }
+    if total_bytes > MAX_TOTAL_BYTES {
+        return Err(Error::rejected(format!(
+            "asset bodies total {total_bytes} bytes — at most {MAX_TOTAL_BYTES}"
+        )));
+    }
+    Ok(())
 }
 
 /// Iterative, quote/escape-aware bracket scan: refuse `{}`/`[]`
@@ -915,7 +1026,7 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
             )))
         }
     };
-    if !model::valid_tag(&decl.app) {
+    if !valid_tag(&decl.app) {
         return Err(Error::rejected(format!(
             "app {:?} — 1-32 lowercase letters, digits or hyphens, not starting with a hyphen",
             decl.app
@@ -1041,7 +1152,7 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
                 "tool alias {alias:?} — lowercase words joined by dots"
             )));
         }
-        if !model::valid_tag(slot) {
+        if !valid_tag(slot) {
             return Err(Error::rejected(format!(
                 "tool {alias:?} slot {slot:?} — must name a capability slot"
             )));
@@ -1077,7 +1188,7 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
         check_asset_name(&asset.name)?;
         check_media(&asset.name, &asset.media_type)?;
         check_digest(&asset.sha256, "asset sha256")?;
-        let bound = asset_bound(&asset.name);
+        let bound = MAX_TOTAL_BYTES;
         if asset.size > bound {
             return Err(Error::rejected(format!(
                 "asset {:?} declares {} bytes — at most {bound}",
@@ -1141,7 +1252,7 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
     Ok(())
 }
 
-/// A flat leaf `<stem>.<ext>`: the stem is `model::valid_tag` (which
+/// A flat leaf `<stem>.<ext>`: the stem is `valid_tag` (which
 /// already forbids slash, backslash, percent, control, non-ASCII and
 /// dot-containing stems) and the single final extension is one of the
 /// mapped four.
@@ -1156,7 +1267,7 @@ fn check_asset_name(name: &str) -> Result<()> {
             "asset name {name:?} — the only extensions are js, css, svg, json"
         )));
     }
-    if !model::valid_tag(stem) {
+    if !valid_tag(stem) {
         return Err(Error::rejected(format!(
             "asset name {name:?} — the stem must be a 1-32 char tag (lowercase, digits, hyphens)"
         )));
@@ -1207,27 +1318,31 @@ fn check_digest(digest: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// The declared↔supplied match: every declared asset exists in the
-/// map with exactly the declared UTF-8 byte length and sha256, and
-/// every supplied name is declared — no undeclared body passes.
-fn check_assets(decl: &RawDecl, assets: &BTreeMap<String, String>) -> Result<()> {
+/// The declared↔supplied match: every declared asset is supplied with exactly
+/// the declared UTF-8 byte length and sha256, and every supplied name is
+/// declared — no undeclared asset passes. The digest is compared last, so a
+/// declaration that is invalid for any other reason never hashes a body.
+fn check_assets<S: Supplied>(decl: &RawDecl, supplied: &S) -> Result<()> {
     for asset in &decl.assets {
-        let Some(body) = assets.get(&asset.name) else {
+        let Some(len) = supplied.length(&asset.name) else {
             return Err(Error::rejected(format!(
                 "declared asset {:?} is not supplied",
                 asset.name
             )));
         };
-        if asset.size != body.len() as u64 {
+        if asset.size != len {
             return Err(Error::rejected(format!(
-                "asset {:?} declares {} bytes — the body is {}",
-                asset.name,
-                asset.size,
-                body.len()
+                "asset {:?} declares {} bytes — the body is {len}",
+                asset.name, asset.size
             )));
         }
-        let actual = format!("sha256:{:x}", Sha256::digest(body.as_bytes()));
-        if asset.sha256 != actual {
+        let Some(actual) = supplied.sha256(&asset.name) else {
+            return Err(Error::rejected(format!(
+                "declared asset {:?} is not supplied",
+                asset.name
+            )));
+        };
+        if asset.sha256.as_str() != &*actual {
             return Err(Error::rejected(format!(
                 "asset {:?} sha256 does not match its body",
                 asset.name
@@ -1235,12 +1350,182 @@ fn check_assets(decl: &RawDecl, assets: &BTreeMap<String, String>) -> Result<()>
         }
     }
     let declared: HashSet<&str> = decl.assets.iter().map(|a| a.name.as_str()).collect();
-    for name in assets.keys() {
-        if !declared.contains(name.as_str()) {
+    for (name, _) in supplied.lengths() {
+        if !declared.contains(name) {
             return Err(Error::rejected(format!(
                 "supplied asset {name:?} is not declared"
             )));
         }
     }
     Ok(())
+}
+
+/// A string→string map that refuses a repeated key. serde's map decoding keeps
+/// the last value for a repeated key, so a declaration could otherwise hide a
+/// shadowed tool slot behind one. Every other object in a declaration is a
+/// closed struct, whose derived decode already refuses a repeated field.
+fn unique_map<'de, D>(deserializer: D) -> std::result::Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct UniqueMap;
+    impl<'de> Visitor<'de> for UniqueMap {
+        type Value = BTreeMap<String, String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a map of string values without a repeated key")
+        }
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if out.contains_key(&key) {
+                    return Err(serde::de::Error::custom(format!(
+                        "tool alias {key:?} is declared twice"
+                    )));
+                }
+                out.insert(key, map.next_value::<String>()?);
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_map(UniqueMap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BODY: &str = "console.log(1);\n";
+
+    fn digest(bytes: &str) -> String {
+        format!("sha256:{:x}", Sha256::digest(bytes.as_bytes()))
+    }
+
+    /// A genuine `app-screens/v1` declaration for exactly `body` as
+    /// `client.js`, with every digest computed from the same bytes.
+    fn declaration(app: &str, body: &str) -> String {
+        serde_json::json!({
+            "contract": "app-screens/v1",
+            "app": app,
+            "entry": "client.js",
+            "assets": [{
+                "name": "client.js",
+                "media_type": "text/javascript",
+                "sha256": digest(body),
+                "size": body.len(),
+            }],
+            "provenance": {
+                "source_digest": digest("source"),
+                "sdk_digest": digest("sdk"),
+                "toolchain_digest": digest("toolchain"),
+            },
+        })
+        .to_string()
+    }
+
+    fn facts(body: &str) -> BTreeMap<String, ScreenAssetFact> {
+        BTreeMap::from([(
+            "client.js".to_string(),
+            ScreenAssetFact {
+                size: body.len() as u64,
+                sha256: digest(body),
+            },
+        )])
+    }
+
+    /// One implementation, two callers: the bodies a native host holds and the
+    /// facts a hosted host reports reach the same verdict.
+    #[test]
+    fn facts_and_bodies_reach_the_same_verdict() {
+        let manifest = declaration("demo", BODY);
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let from_bodies = validate_map(&manifest, &bodies).expect("bodies agree");
+        let from_facts = validate_facts(&manifest, &facts(BODY)).expect("facts agree");
+        assert_eq!(from_facts.app(), from_bodies.app());
+        assert_eq!(from_facts.app(), "demo");
+        assert_eq!(from_facts.asset_count(), 1);
+        assert_eq!(from_facts.entry(), from_bodies.entry());
+    }
+
+    /// Every way the supplied facts can disagree with the declaration refuses:
+    /// a same-length body swap (digest only), a wrong size, a missing fact and
+    /// an undeclared fact.
+    #[test]
+    fn wrong_facts_are_refused() {
+        let manifest = declaration("demo", BODY);
+        let swapped = BODY.replace('1', "2");
+        assert_eq!(swapped.len(), BODY.len());
+
+        let mut tampered = facts(BODY);
+        tampered.get_mut("client.js").unwrap().sha256 = digest(&swapped);
+        assert!(validate_facts(&manifest, &tampered).is_err());
+
+        let mut sized = facts(BODY);
+        sized.get_mut("client.js").unwrap().size += 1;
+        assert!(validate_facts(&manifest, &sized).is_err());
+
+        assert!(validate_facts(&manifest, &BTreeMap::new()).is_err());
+
+        let mut extra = facts(BODY);
+        extra.insert(
+            "styles.css".to_string(),
+            ScreenAssetFact {
+                size: 0,
+                sha256: digest(""),
+            },
+        );
+        assert!(validate_facts(&manifest, &extra).is_err());
+    }
+
+    /// Duplicate object keys refuse wherever they appear: a repeated top-level
+    /// field (serde's derived decode) and a repeated key inside the `tools`
+    /// map, which a plain map decode would otherwise collapse to the last
+    /// value. Each refusal is proved by behaviour, not by refusal wording: the
+    /// same declaration carrying the key once is admitted.
+    #[test]
+    fn a_repeated_key_anywhere_is_refused() {
+        let manifest = declaration("demo", BODY);
+        let repeated_field = manifest.replacen('{', "{\"app\":\"other\",", 1);
+        assert!(validate_facts(&repeated_field, &facts(BODY)).is_err());
+
+        let v2_with_tools = |tools: &str| {
+            manifest
+                .replacen("\"app-screens/v1\"", "\"app-screens/v2\"", 1)
+                .replacen(
+                    '{',
+                    &format!("{{\"host_contract\":\"screen-media.v1\",\"tools\":{tools},"),
+                    1,
+                )
+        };
+        let unique_alias = v2_with_tools("{\"media.read\":\"catalog\"}");
+        assert!(
+            validate_facts(&unique_alias, &facts(BODY)).is_ok(),
+            "one alias is a valid declaration: {unique_alias}"
+        );
+
+        let repeated_alias =
+            v2_with_tools("{\"media.read\":\"catalog\",\"media.read\":\"catalog\"}");
+        assert!(
+            validate_facts(&repeated_alias, &facts(BODY)).is_err(),
+            "a shadowed tool alias must refuse: {repeated_alias}"
+        );
+    }
+
+    /// The declaration grammar and bounds still decide before any digest is
+    /// compared: a declaration that breaks the closed grammar refuses from
+    /// bodies and from facts alike, while the valid one it was derived from is
+    /// admitted by both.
+    #[test]
+    fn declaration_rules_are_unchanged() {
+        let manifest = declaration("demo", BODY);
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        assert!(validate_map(&manifest, &bodies).is_ok());
+        assert!(validate_facts(&manifest, &facts(BODY)).is_ok());
+
+        let broken = manifest.replacen("\"app\":\"demo\"", "\"app\":\"Demo\"", 1);
+        assert!(validate_map(&broken, &bodies).is_err());
+        assert!(validate_facts(&broken, &facts(BODY)).is_err());
+    }
 }

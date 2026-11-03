@@ -209,7 +209,9 @@ an ignored local document cannot satisfy a link. It checks paths, not external
 sites or heading fragments.
 
 Post the six-field reflection (expected, evidence, cause, correction, lesson,
-next) to the ticket. Hand independent review the exact committed head and PR.
+next) to the ticket. Hand a fresh-session review (a non-author session with no inherited context,
+including a subagent; AGENTS.md "Review") the exact committed head and PR,
+with a brief that points at the change and not at your conclusions.
 Only a passing review pinned to that head permits merge-queue enrollment:
 `gh pr merge <PR> -R favcrm/cadence --auto --squash --match-head-commit <REVIEWED-SHA>`.
 Disable auto-merge before changing a queued head. The full delivery and

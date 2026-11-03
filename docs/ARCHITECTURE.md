@@ -78,7 +78,7 @@ provider/pane observations are different axes. An inbox endpoint stores
 messages but has no worker actor. External collaboration agents are not
 implicitly members of the native Cadence registry.
 
-Implementation results go to independent review. A verdict names the reviewed
+Implementation results go to fresh-session review. A verdict names the reviewed
 commit; changing the head invalidates its applicability. Combined-tree checks
 address changes that landed in main after review. Recording merge evidence is
 different from executing a GitHub merge. Source merge is different from a live
