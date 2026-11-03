@@ -2560,7 +2560,7 @@ mod cad2009_closed_output_acceptance {
         project_fixture(home.path());
         let repo = home.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
-        git(home.path(), &repo, &["init", "-q", "-b", "main"]);
+        git(home.path(), &repo, &["init", "-q", "-b", "master"]);
         git(
             home.path(),
             &repo,
@@ -3040,5 +3040,800 @@ mod cad2009_follow_closed_stdout_acceptance {
             .tempdir_in("/tmp")
             .unwrap();
         run_case(home.path(), true, Some(0));
+    }
+}
+
+// CAD-2009 acceptance: independently authored; implementers must not weaken it.
+#[cfg(unix)]
+mod cad2009_inbox_output_acceptance {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
+    use std::process::{Child, Command, Output, Stdio};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{json, Value};
+
+    fn poll_until(descriptors: &mut [libc::pollfd], deadline: Instant) -> i32 {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return 0;
+            }
+            let timeout = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+            // SAFETY: the slice contains initialized pollfd values for this call.
+            let ready = unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as libc::nfds_t,
+                    timeout,
+                )
+            };
+            if ready >= 0 {
+                return ready;
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+        }
+    }
+
+    fn command(home: &Path, closed_stdout: bool) -> Command {
+        let state = home.join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(home.join("pm")).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_STATE_HOME", home.join("xdg-state"))
+            .env("CADENCE_STATE_DIR", &state)
+            .env("CADENCE_SOCKET", state.join("cadence.sock"))
+            .env("CADENCE_PM_DIR", home.join("pm"))
+            .env("CADENCE_JSON", "pretty")
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(home)
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped());
+        if closed_stdout {
+            let (reader, writer) = UnixStream::pair().unwrap();
+            drop(reader);
+            let writer: OwnedFd = writer.into();
+            command.stdout(Stdio::from(writer));
+        } else {
+            command.stdout(Stdio::piped());
+        }
+        command
+    }
+
+    fn sentinel() -> Value {
+        json!({"ok": false, "error": {
+            "kind": "internal",
+            "message": "synthetic unexpected next-unit sentinel"
+        }})
+    }
+
+    struct OwnedCli(Option<Child>);
+
+    impl Drop for OwnedCli {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                // A fixture panic must not leave its own CLI running.
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn exercise(
+        home: &Path,
+        mut command: Command,
+        mut response: impl FnMut(usize, &Value) -> Value,
+    ) -> (Output, Vec<Value>) {
+        let listener = UnixListener::bind(home.join("state/cadence.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (completion, mut completed) = UnixStream::pair().unwrap();
+        // reaper::output would replace the deliberately closed stdout.
+        let mut child = OwnedCli(Some(cadence_agent::reaper::spawn(&mut command).unwrap()));
+        let pid = child.0.as_ref().unwrap().id();
+        let notifier = std::thread::spawn(move || -> std::io::Result<()> {
+            // The same blocking waitid(WNOWAIT) seam is used by slots_rpc.
+            // Unlike Child::wait, it observes exit without reaping: OwnedCli
+            // retains the child and its PID until after this thread joins.
+            // There is no periodic wakeup and no signal handler/global state.
+            // SAFETY: zero initializes the output buffer passed to waitid.
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            loop {
+                // SAFETY: pid identifies our unreaped child and info is writable.
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if result == 0 {
+                    return completed.write_all(b"done");
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut requests = Vec::new();
+        let timed_out = loop {
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: completion.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            if poll_until(&mut descriptors, deadline) == 0 {
+                // The notifier never reaps. Even if exit races the deadline,
+                // this Child still owns its PID; cancellation cannot hit a
+                // different process through PID reuse.
+                let _ = child.0.as_mut().unwrap().kill();
+                break true;
+            }
+            // Drain an already-queued request even when completion is also ready.
+            if descriptors[0].revents & libc::POLLIN != 0 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let reply = response(requests.len(), &request);
+                requests.push(request);
+                writeln!(stream, "{reply}").unwrap();
+            } else if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                break false;
+            } else {
+                panic!("unexpected synthetic transport poll events");
+            }
+        };
+        // Join the non-reaping observer before the sole owner finally reaps.
+        notifier.join().unwrap().unwrap();
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        assert!(
+            !timed_out,
+            "CLI did not settle within the bounded fixture: {requests:?}; {output:?}"
+        );
+        (output, requests)
+    }
+
+    fn messages() -> Value {
+        json!([
+            {"seq": 11, "id": "synthetic-first", "content": "first\nrecord"},
+            {"seq": 12, "id": "synthetic-second", "content": "second record"}
+        ])
+    }
+
+    fn assert_success(output: &Output) {
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    fn inbox_page_case(peek: bool, follow: bool, closed_stdout: bool) {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-inbox-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let mut command = command(home.path(), closed_stdout);
+        command.args([
+            "inbox",
+            "SYNTHETIC",
+            "--reader",
+            "synthetic-reader",
+            "--after",
+            "10",
+        ]);
+        if peek {
+            command.arg("--peek");
+        }
+        if follow {
+            command.arg("--follow");
+        }
+        let (output, requests) = exercise(home.path(), command, |index, request| {
+            if index != 0 {
+                return sentinel();
+            }
+            assert_eq!(request["method"], "agent_inbox");
+            let mut params = json!({
+                "alias": "SYNTHETIC",
+                "reader": "synthetic-reader",
+                "after": 10,
+                "wait": if follow { 25 } else { 0 }
+            });
+            if peek {
+                params["peek"] = json!(true);
+            }
+            assert_eq!(request["params"], params);
+            // A draining daemon has already settled this entire page. The CLI
+            // must neither fetch another page nor invent a compensating ack.
+            json!({"ok": true, "result": {"messages": messages(), "cursor": 12}})
+        });
+        assert_success(&output);
+        assert_eq!(requests.len(), 1, "unexpected next unit: {requests:?}");
+        if !closed_stdout {
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout.ends_with('\n'),
+                "missing record terminator: {stdout:?}"
+            );
+            let lines: Vec<_> = stdout.lines().collect();
+            assert_eq!(lines.len(), 2, "expected one compact line per message");
+            for (line, expected) in lines.iter().zip(messages().as_array().unwrap()) {
+                assert_eq!(serde_json::from_str::<Value>(line).unwrap(), *expected);
+                assert_eq!(*line, serde_json::to_string(expected).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_inbox_follow_stops_after_the_settled_drain_page() {
+        inbox_page_case(false, true, true);
+    }
+
+    #[test]
+    fn cad2009_inbox_follow_peek_stops_before_another_fetch() {
+        inbox_page_case(true, true, true);
+    }
+
+    #[test]
+    fn cad2009_inbox_finite_drain_and_peek_keep_compact_message_records() {
+        inbox_page_case(false, false, false);
+        inbox_page_case(true, false, false);
+    }
+
+    fn inbox_exec_case(page_size: usize, refuse_ack: bool) {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-inbox-exec-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let consumed = home.path().join("consumed.jsonl");
+        let script = home.path().join("consume.sh");
+        std::fs::write(
+            &script,
+            "set -eu\n/bin/cat >> \"$1\"\nprintf '\\n' >> \"$1\"\n",
+        )
+        .unwrap();
+        let mut command = command(home.path(), true);
+        command
+            .args([
+                "inbox",
+                "SYNTHETIC",
+                "--reader",
+                "synthetic-reader",
+                "--exec-timeout-ms",
+                "2000",
+                "--exec",
+                "/bin/sh",
+            ])
+            .arg(&script)
+            .arg(&consumed);
+        let first = messages()[0].clone();
+        let page: Vec<_> = messages()
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(page_size)
+            .cloned()
+            .collect();
+        let (output, requests) = exercise(home.path(), command, |index, request| match index {
+            0 => {
+                assert_eq!(request["method"], "agent_inbox");
+                assert_eq!(
+                    request["params"],
+                    json!({"alias": "SYNTHETIC", "reader": "synthetic-reader",
+                           "peek": true, "wait": 25})
+                );
+                json!({"ok": true, "result": {"messages": page, "cursor": 12}})
+            }
+            1 => {
+                // The real child must have finished its work before the ack.
+                let bytes = std::fs::read_to_string(&consumed).unwrap();
+                assert_eq!(
+                    bytes,
+                    format!("{}\n", serde_json::to_string(&first).unwrap())
+                );
+                assert_eq!(request["method"], "agent_inbox_ack");
+                assert_eq!(
+                    request["params"],
+                    json!({"alias": "SYNTHETIC", "reader": "synthetic-reader", "through": 11})
+                );
+                if refuse_ack {
+                    json!({"ok": false, "error": {
+                        "kind": "internal", "message": "synthetic required ack refusal"
+                    }})
+                } else {
+                    json!({"ok": true, "result": {"through": 11}})
+                }
+            }
+            _ => sentinel(),
+        });
+        assert_eq!(requests.len(), 2, "unexpected next unit: {requests:?}");
+        assert_eq!(
+            std::fs::read_to_string(&consumed).unwrap(),
+            format!("{}\n", serde_json::to_string(&first).unwrap()),
+            "closed stdout must not execute the next pending message"
+        );
+        if refuse_ack {
+            assert_eq!(output.status.code(), Some(70), "{output:?}");
+            let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(error["kind"], "internal");
+            assert!(error["error"]
+                .as_str()
+                .unwrap()
+                .contains("synthetic required ack refusal"));
+        } else {
+            assert_success(&output);
+        }
+    }
+
+    #[test]
+    fn cad2009_inbox_exec_finishes_child_and_ack_before_stopping_next_fetch() {
+        inbox_exec_case(1, false);
+    }
+
+    #[test]
+    fn cad2009_inbox_exec_does_not_execute_the_next_message_in_the_same_page() {
+        inbox_exec_case(2, false);
+    }
+
+    #[test]
+    fn cad2009_inbox_exec_preserves_a_required_ack_failure_with_closed_stdout() {
+        inbox_exec_case(2, true);
+    }
+
+    #[test]
+    fn cad2009_delivery_watch_stops_after_an_isolated_empty_sync_pass() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-delivery-watch-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let mut command = command(home.path(), true);
+        command.args(["delivery", "sync", "--watch", "0"]);
+        let (output, requests) = exercise(home.path(), command, |index, request| {
+            if index != 0 {
+                // A bad next pass gets a refusal rather than hanging in an RPC.
+                // The overall deadline also bounds a watcher that retries errors.
+                return sentinel();
+            }
+            assert_eq!(request["method"], "delivery_list");
+            assert_eq!(request["params"], json!({}));
+            // sync() invokes gh only for eligible PR records. An empty list is
+            // a genuine local-only pass, not a fake GitHub executable or echo.
+            json!({"ok": true, "result": {"records": []}})
+        });
+        assert_success(&output);
+        assert_eq!(requests.len(), 1, "unexpected next sync pass: {requests:?}");
+    }
+}
+
+#[cfg(unix)]
+mod cad2009_finite_output_acceptance {
+    use std::io::{self, Write};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output, Stdio};
+
+    use cadence_agent::agent_uid::{
+        provision::{self, Report, Spec},
+        AclEntry, Group, Host, Meta, NewUser, User, View,
+    };
+
+    fn closed_stream() -> Stdio {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        Stdio::from(writer)
+    }
+
+    fn cli(root: &Path, state: &Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .env("HOME", root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("xdg-state"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("CADENCE_STATE_DIR", state)
+            .env("CADENCE_PM_DIR", root.join("pm"))
+            .env("PATH", root.join("bin"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Synthetic Acceptance")
+            .env("GIT_AUTHOR_EMAIL", "synthetic@example.test")
+            .env("GIT_COMMITTER_NAME", "Synthetic Acceptance")
+            .env("GIT_COMMITTER_EMAIL", "synthetic@example.test")
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .env("GIT_CONFIG_KEY_1", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_1", "/dev/null")
+            .arg("--state-dir")
+            .arg(state)
+            .current_dir(root)
+            .stdin(Stdio::null());
+        command
+    }
+
+    fn output(command: &mut Command, close_stdout: bool, close_stderr: bool) -> Output {
+        command.stdout(if close_stdout {
+            closed_stream()
+        } else {
+            Stdio::piped()
+        });
+        command.stderr(if close_stderr {
+            closed_stream()
+        } else {
+            Stdio::piped()
+        });
+        cadence_agent::reaper::spawn(command)
+            .unwrap()
+            .wait_with_output()
+            .unwrap()
+    }
+
+    #[test]
+    fn setup_keeps_exact_failure_and_initializes_tracker_after_closed_output() {
+        for json in [false, true] {
+            for close_stdout in [false, true] {
+                let root = tempfile::Builder::new()
+                    .prefix("cad2009-finite-")
+                    .tempdir_in("/tmp")
+                    .unwrap();
+                let bin = root.path().join("bin");
+                std::fs::create_dir(&bin).unwrap();
+                std::os::unix::fs::symlink("/usr/bin/git", bin.join("git")).unwrap();
+                let state = root.path().join("s".repeat(108));
+                assert!(cadence_agent::client::socket_path(&state).as_os_str().len() > 107);
+                assert!(!root.path().join("pm").exists());
+                let mut command = cli(root.path(), &state);
+                command
+                    .env("CADENCE_PROFILE", "sandbox:cad2009-acceptance")
+                    .arg("setup");
+                if json {
+                    command.arg("--json");
+                }
+                let result = output(&mut command, close_stdout, false);
+                assert_eq!(
+                    result.status.code(),
+                    Some(1),
+                    "json={json}, closed={close_stdout}: {result:?}"
+                );
+                assert!(
+                    result.stderr.is_empty(),
+                    "json={json}, closed={close_stdout}: {result:?}"
+                );
+                let tracker = root.path().join("pm");
+                assert!(tracker.join("pm.yaml").is_file());
+                assert!(tracker.join("README.md").is_file());
+                assert!(tracker.join(".gitignore").is_file());
+                let mut git = Command::new("/usr/bin/git");
+                git.env_clear()
+                    .env("HOME", root.path())
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .arg("-C")
+                    .arg(&tracker)
+                    .args(["show", "HEAD:pm.yaml"])
+                    .stdin(Stdio::null());
+                let committed = cadence_agent::reaper::output(&mut git).unwrap();
+                assert!(committed.status.success(), "{committed:?}");
+                assert_eq!(
+                    committed.stdout,
+                    std::fs::read(tracker.join("pm.yaml")).unwrap()
+                );
+                assert!(
+                    !state.exists(),
+                    "the failed state prerequisite must prevent daemon/UI startup"
+                );
+                assert!(!root.path().join(".claude").exists());
+                if !close_stdout && json {
+                    let rows: Vec<serde_json::Value> = result
+                        .stdout
+                        .split(|byte| *byte == b'\n')
+                        .filter(|line| !line.is_empty())
+                        .map(|line| serde_json::from_slice(line).unwrap())
+                        .collect();
+                    let row = |name: &str| {
+                        rows.iter()
+                            .find(|row| row["check"] == name)
+                            .unwrap_or_else(|| panic!("missing {name}: {rows:?}"))
+                    };
+                    assert_eq!(row("state_dir")["status"], "failed");
+                    assert_eq!(row("tracker")["status"], "created");
+                    assert_eq!(row("daemon")["status"], "missing");
+                    assert_eq!(row("ui")["status"], "missing");
+                    assert_eq!(row("scope")["changed_org"], false);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unshared_stop_is_quietly_successful_without_any_tailnet_capability() {
+        for close_stdout in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let state = root.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            std::fs::create_dir(root.path().join("bin")).unwrap();
+            let mut command = cli(root.path(), &state);
+            command.args(["ui", "tailscale", "stop"]);
+            let result = output(&mut command, close_stdout, false);
+            assert_eq!(result.status.code(), Some(0), "{result:?}");
+            assert!(result.stderr.is_empty(), "{result:?}");
+            assert!(!state.join("ui.json").exists());
+            assert!(!cadence_agent::client::socket_path(&state).exists());
+            if !close_stdout {
+                let body: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+                assert_eq!(body["state"], "not_sharing");
+            }
+        }
+    }
+
+    #[test]
+    fn restart_preserves_restore_refusal_without_connecting_or_replacing_state() {
+        for closed in [false, true] {
+            let root = tempfile::Builder::new()
+                .prefix("cad2009-restart-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let state = root.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            std::fs::create_dir(root.path().join("bin")).unwrap();
+            let aside = state.join("cadence.sqlite3.replaced-synthetic");
+            std::fs::write(&aside, b"synthetic previous store").unwrap();
+            let listener = UnixListener::bind(cadence_agent::client::socket_path(&state)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut command = cli(root.path(), &state);
+            command.args(["daemon", "restart"]);
+            let result = output(&mut command, closed, closed);
+            assert_eq!(result.status.code(), Some(3), "{result:?}");
+            assert_eq!(std::fs::read(&aside).unwrap(), b"synthetic previous store");
+            assert!(!state.join("cadence.sqlite3").exists());
+            match listener.accept() {
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+                Ok(_) => panic!("restart contacted the daemon despite restore leftovers"),
+            }
+            if !closed {
+                let body: serde_json::Value = serde_json::from_slice(&result.stderr).unwrap();
+                assert_eq!(body["kind"], "rejected");
+                assert!(body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("daemon restart refused before shutdown"));
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RefusingHost {
+        attempts: Vec<String>,
+    }
+
+    impl View for RefusingHost {
+        fn user(&self, _: &str) -> io::Result<Option<User>> {
+            panic!("a refused first account action must stop further assessment")
+        }
+
+        fn group(&self, _: &str) -> io::Result<Option<Group>> {
+            Ok(None)
+        }
+
+        fn user_name(&self, _: u32) -> io::Result<Option<String>> {
+            panic!("unexpected reverse user lookup")
+        }
+
+        fn group_name(&self, _: u32) -> io::Result<Option<String>> {
+            panic!("unexpected reverse group lookup")
+        }
+
+        fn stat(&self, _: &str) -> io::Result<Option<Meta>> {
+            panic!("refused accounts must prevent filesystem assessment")
+        }
+
+        fn acls(&self, _: &str) -> io::Result<Vec<AclEntry>> {
+            panic!("refused accounts must prevent preflight")
+        }
+
+        fn users(&self) -> io::Result<Vec<User>> {
+            panic!("refused accounts must prevent preflight")
+        }
+
+        fn member_gids(&self, _: &User) -> io::Result<Vec<u32>> {
+            panic!("unexpected membership lookup")
+        }
+
+        fn read_file(&self, _: &str) -> io::Result<Vec<u8>> {
+            panic!("unexpected host file read")
+        }
+
+        fn read_link(&self, _: &str) -> io::Result<PathBuf> {
+            panic!("unexpected host symlink read")
+        }
+
+        fn git_config(&self, _: &str) -> io::Result<Vec<(String, String)>> {
+            panic!("unexpected host git config read")
+        }
+
+        fn file_sha256(&self, _: &str) -> io::Result<[u8; 32]> {
+            panic!("unexpected installed helper read")
+        }
+
+        fn helper_source(&self, _: &Path) -> io::Result<[u8; 32]> {
+            panic!("unexpected helper source read")
+        }
+
+        fn walk(&self, _: &str, _: usize) -> io::Result<(Vec<String>, bool)> {
+            panic!("unexpected host walk")
+        }
+
+        fn env(&self, _: &str) -> Option<String> {
+            panic!("unexpected host environment read")
+        }
+    }
+
+    impl Host for RefusingHost {
+        fn as_view(&self) -> &dyn View {
+            self
+        }
+
+        fn create_group(&mut self, name: &str, _: bool) -> io::Result<()> {
+            self.attempts.push(name.to_string());
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "synthetic account capability refusal",
+            ))
+        }
+
+        fn create_user(&mut self, _: &NewUser) -> io::Result<()> {
+            panic!("must not create a user after a group refusal")
+        }
+
+        fn repair_user(&mut self, _: &NewUser) -> io::Result<()> {
+            panic!("must not repair a user after a group refusal")
+        }
+
+        fn add_member(&mut self, _: &str, _: &str) -> io::Result<()> {
+            panic!("must not add membership after a group refusal")
+        }
+
+        fn mkdir(&mut self, _: &str) -> io::Result<()> {
+            panic!("must not provision filesystem after a group refusal")
+        }
+
+        fn set_meta(&mut self, _: &str, _: &str, _: &str, _: u32) -> io::Result<()> {
+            panic!("must not change metadata after a group refusal")
+        }
+
+        fn install(&mut self, _: &Path, _: &str, _: &str, _: &str, _: u32) -> io::Result<()> {
+            panic!("must not install a helper after a group refusal")
+        }
+
+        fn set_default_group_acl(&mut self, _: &str, _: &str, _: u8) -> io::Result<()> {
+            panic!("must not set ACLs after a group refusal")
+        }
+    }
+
+    struct FailingWriter {
+        kind: io::ErrorKind,
+        lines_before_failure: usize,
+        failures: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.lines_before_failure == 0 {
+                self.failures += 1;
+                return Err(io::Error::new(self.kind, "synthetic output failure"));
+            }
+            self.lines_before_failure = self
+                .lines_before_failure
+                .saturating_sub(bytes.iter().filter(|byte| **byte == b'\n').count());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn provision_spec() -> Spec {
+        Spec {
+            operator: "synthetic-operator".to_string(),
+            helper: Some(PathBuf::from("/synthetic/helper")),
+            dry_run: false,
+        }
+    }
+
+    fn report_steps(report: &Report) -> Vec<(String, String, bool)> {
+        report
+            .steps
+            .iter()
+            .map(|step| {
+                (
+                    step.action.render(),
+                    format!("{:?}", step.assess),
+                    step.applied,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn production_provision_adapter_preserves_real_refusal_after_closed_output() {
+        let mut baseline_host = RefusingHost::default();
+        let baseline =
+            provision::run(&mut baseline_host, &provision_spec(), &mut Vec::new()).unwrap();
+        assert!(baseline.failed);
+        assert!(baseline.refused());
+        assert_eq!(baseline_host.attempts.len(), 1);
+        assert!(!baseline.steps[0].applied);
+        for lines_before_failure in [0, 1] {
+            let mut host = RefusingHost::default();
+            let mut writer = FailingWriter {
+                kind: io::ErrorKind::BrokenPipe,
+                lines_before_failure,
+                failures: 0,
+            };
+            let report = provision::run(
+                &mut host,
+                &provision_spec(),
+                &mut cadence_agent::output::tolerate_closed(&mut writer),
+            )
+            .unwrap();
+            assert!(writer.failures > 0);
+            assert_eq!(host.attempts, baseline_host.attempts);
+            assert_eq!(report.failed, baseline.failed);
+            assert_eq!(report.refused(), baseline.refused());
+            assert_eq!(report.preflight, baseline.preflight);
+            assert_eq!(report_steps(&report), report_steps(&baseline));
+        }
+    }
+
+    #[test]
+    fn provisioning_keeps_unwrapped_broken_pipe_and_other_io_errors_fallible() {
+        let mut host = RefusingHost::default();
+        let mut writer = FailingWriter {
+            kind: io::ErrorKind::BrokenPipe,
+            lines_before_failure: 0,
+            failures: 0,
+        };
+        assert!(provision::run(&mut host, &provision_spec(), &mut writer).is_err());
+        assert!(host.attempts.is_empty());
+        let mut writer = FailingWriter {
+            kind: io::ErrorKind::PermissionDenied,
+            lines_before_failure: 0,
+            failures: 0,
+        };
+        assert!(provision::run(
+            &mut host,
+            &provision_spec(),
+            &mut cadence_agent::output::tolerate_closed(&mut writer),
+        )
+        .is_err());
+        assert!(host.attempts.is_empty());
+        assert!(writer.failures > 0);
     }
 }

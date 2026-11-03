@@ -103,6 +103,9 @@ pub(super) fn run(
     // `--peek` changes nothing: the same lines, still queued.
     let mut after = after;
     loop {
+        if cadence_agent::output::stdout_closed() {
+            return Ok(0);
+        }
         let mut req = json!({"alias": alias, "reader": reader,
                              "wait": if follow { 25 } else { wait }});
         if peek {
@@ -117,9 +120,9 @@ pub(super) fn run(
             println!("{}", serde_json::to_string(m).unwrap_or_default());
         }
         after = Some(page["cursor"].as_i64().unwrap_or(after.unwrap_or(0)));
-        if !follow {
-            // An empty drain/peek prints nothing — the output
-            // is the complete record of what was seen.
+        if !follow || cadence_agent::output::stdout_closed() {
+            // Finish the returned page, but never fetch another after the
+            // consumer has closed.
             break;
         }
     }
@@ -152,6 +155,9 @@ pub(crate) fn run_inbox_exec(
     let mut attempts: HashMap<i64, u32> = HashMap::new();
     let mut retry_at: Option<Instant> = None;
     loop {
+        if cadence_agent::output::stdout_closed() {
+            return Ok(0);
+        }
         if let Some(m) = pending.front().cloned() {
             if let Some(t) = retry_at {
                 let now = Instant::now();

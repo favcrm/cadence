@@ -16,6 +16,15 @@
     allow(dead_code, unused_imports)
 )]
 
+// Production console output must not interrupt a finite operation on EPIPE.
+// Tests retain libtest's normal output capture; CLI integration tests run the
+// production writers.
+#[cfg(not(test))]
+use crate::output as console_output;
+#[cfg(not(test))]
+#[macro_use]
+mod console_macros;
+
 pub mod adapter;
 pub mod agent_roles;
 pub mod agent_settings;

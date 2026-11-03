@@ -7,6 +7,14 @@
 // (only `daemon run` does), so the spawn registry need not see it.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+// Share the library's finite-output behavior with the binary's CLI modules.
+// Unit tests keep libtest capture; integration tests exercise these writers.
+#[cfg(not(test))]
+use cadence_agent::output as console_output;
+#[cfg(not(test))]
+#[macro_use]
+mod console_macros;
+
 use serde_json::json;
 
 mod cli;

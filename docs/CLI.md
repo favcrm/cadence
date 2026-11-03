@@ -680,10 +680,13 @@ probes use bounded deadlines.
 hosted answers and offline result receipts. Raw text and byte streams retain
 their own formats.
 
-Audit, review and runner reports retain their command's result when a consumer
-closes stdout or stderr. Event and job-event followers stop reading when an
-output write finds a closed consumer. An unconverted output panic cannot
-prove an interrupted command succeeded, so its fallback is nonzero.
+CLI-owned finite console output does not interrupt a command when its consumer
+closes stdout or stderr; the command's own result still determines the exit
+status. Other I/O errors remain failures. A follower stops before its next
+read, execution or sync after a stdout write detects a closed consumer, while
+finishing the current page, acknowledgement or sync result. Closing stderr
+alone does not cancel work. A follower cannot detect closure until it writes;
+inbox child-process output is not an observation by the parent.
 
 With `--watch`, machine mode writes one compact JSON value per line and
 no terminal-control bytes, including when `CADENCE_JSON=pretty`. A

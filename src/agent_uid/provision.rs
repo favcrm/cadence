@@ -835,6 +835,7 @@ pub fn cli(dry_run: bool, helper: PathBuf, operator: &str) -> Result<i32> {
         helper: Some(helper),
         dry_run,
     };
-    let report = run(&mut host, &spec, &mut std::io::stdout())?;
+    let mut out = crate::output::tolerate_closed(std::io::stdout());
+    let report = run(&mut host, &spec, &mut out)?;
     Ok(if report.refused() { 2 } else { 0 })
 }
