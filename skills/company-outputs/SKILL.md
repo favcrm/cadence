@@ -14,6 +14,7 @@ Check which tools or commands this session actually has before relying on one. `
 | Capability | What it does |
 |---|---|
 | Company facts | Read the company's details, price list and past decisions |
+| Find past work | Find and reopen what was produced earlier |
 | Find template | See the company's templates and their versions |
 | Read template | Open one exact version: its guidelines and reference files |
 | Calculate | Work out amounts in code, not in your head |

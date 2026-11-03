@@ -56220,10 +56220,10 @@ var BOARD_MESSAGE_KIND = "tenant.board.message";
 var OPERATIONAL_SKILL_VERSION = "tenant-operations-1";
 
 // src/company-outputs.generated.ts
-var COMPANY_OUTPUTS_FINGERPRINT = "tenant-company-outputs-e9404e33c74a7101";
+var COMPANY_OUTPUTS_FINGERPRINT = "tenant-company-outputs-dfc9751b45080cc2";
 var COMPANY_OUTPUTS_SKILL = {
   name: "company-outputs",
-  version: "e9404e33c74a7101",
+  version: "dfc9751b45080cc2",
   description: "Prepare and reuse a company's quotes, quotations, invoices, proposals, tenders, reports, letters, slides and page mockups, and save a good result as a reusable template. Use when someone asks for one of these, asks to use or change their template, or asks to save something as a template. Produces drafts only; nothing is sent, issued or approved.",
   body: `# Company outputs
 
@@ -56236,6 +56236,7 @@ Check which tools or commands this session actually has before relying on one. \
 | Capability | What it does |
 |---|---|
 | Company facts | Read the company's details, price list and past decisions |
+| Find past work | Find and reopen what was produced earlier |
 | Find template | See the company's templates and their versions |
 | Read template | Open one exact version: its guidelines and reference files |
 | Calculate | Work out amounts in code, not in your head |
@@ -56287,6 +56288,7 @@ Use this lookup only to find the command or tool. A listed command is not proof 
 | Capability | Hosted workspace |
 |---|---|
 | Company facts | \`wiki_search\`, \`wiki_list\`, \`wiki_read\` |
+| Find past work | Not available yet |
 | Find template | Not available yet |
 | Read template | Not available yet |
 | Calculate | Not available yet |

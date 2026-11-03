@@ -2,6 +2,10 @@
 //! Only the master's live turn may put; the daemon resolves that turn from
 //! the proven caller and takes the conversation and scope from it, so the
 //! CLI sends the kind, title, bytes and (for a new version) the id alone.
+//!
+//! AOS-346: on a hosted org (`--org`) a worker uses the same verb; see
+//! `cli/remote.rs`. `--issue`, `--label` and `--customer`, `find` and `show`
+//! are hosted-only for now.
 
 use super::*;
 
@@ -26,6 +30,37 @@ pub(crate) enum ArtifactAction {
         /// first: the thread keeps only 160 characters of the command.
         #[arg(long)]
         id: Option<String>,
+        /// Hosted: link it to this issue, so whoever can read the issue can find it.
+        #[arg(long)]
+        issue: Option<String>,
+        /// Hosted: what it is, such as quotation, invoice or report.
+        #[arg(long)]
+        label: Option<String>,
+        /// Hosted: the customer it is for.
+        #[arg(long)]
+        customer: Option<String>,
+    },
+    /// Hosted: find artifacts you can see, by words, label, customer or kind.
+    Find {
+        /// Words in the title or customer.
+        q: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        customer: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Hosted: list an artifact's versions, or write one to a new file with `--out`.
+    Show {
+        id: String,
+        #[arg(long)]
+        version: Option<u32>,
+        /// A new file for the bytes. Never overwrites; the digest is checked first.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -36,7 +71,15 @@ pub(super) fn run(state_dir: PathBuf, action: ArtifactAction) -> Result<i32> {
             title,
             file,
             id,
+            issue,
+            label,
+            customer,
         } => {
+            if issue.is_some() || label.is_some() || customer.is_some() {
+                return Err(Error::usage(
+                    "--issue, --label and --customer are hosted-only for now; pass --org <name>. Nothing was sent",
+                ));
+            }
             use base64::Engine;
             let limit = cadence_agent::store::ARTIFACT_MAX_BYTES as u64;
             // The master's file confinement applies exactly as for the other
@@ -85,5 +128,9 @@ pub(super) fn run(state_dir: PathBuf, action: ArtifactAction) -> Result<i32> {
             print_json(&client::rpc(&state_dir, "artifact_put", params)?);
             Ok(0)
         }
+        ArtifactAction::Find { .. } | ArtifactAction::Show { .. } => Err(Error::usage(
+            "artifact find and show are hosted-only for now; pass --org <name>. On this \
+             board, the canvas shows what `artifact put` stored",
+        )),
     }
 }

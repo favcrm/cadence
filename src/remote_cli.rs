@@ -127,6 +127,11 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_show",
     "issue_history",
     "issue_artifact",
+    // AOS-346: artifacts a worker or the assistant produced. The upload is its
+    // own multipart path, `upload_artifact`.
+    "artifact_find",
+    "artifact_show",
+    "artifact_read",
     "message_read",
     "message_inbox",
     "team_list",
@@ -1689,6 +1694,191 @@ fn upload_once(
         return Err(reject("remote response too large"));
     }
     Ok((status, retry_after, serde_json::from_slice(&bytes).ok()))
+}
+
+/// What one `artifact put` asks for. The server's answer says what happened.
+pub struct ArtifactUpload<'a> {
+    pub kind: &'a str,
+    pub title: &'a str,
+    pub id: Option<&'a str>,
+    pub issue: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub customer: Option<&'a str>,
+    pub file_name: &'a str,
+    pub bytes: &'a [u8],
+}
+
+/// AOS-346: one `POST /__platform/artifacts/upload`, the wiki upload's shape on
+/// the CLI surface: the bearer, a fresh `cli.write` envelope, then one multipart
+/// body. `request_id` is fixed for the command, so a wake retry cannot add a
+/// second version.
+fn artifact_upload_once(
+    target: &RemoteTarget,
+    cred: &Credential,
+    upload: &ArtifactUpload,
+    request_id: &str,
+    deadline: Instant,
+) -> Result<(u16, Option<u64>, Option<Value>)> {
+    let envelope = authorize(
+        target,
+        cred,
+        Surface::Cli,
+        &["cli.write"],
+        request_timeout(deadline, AUTH_TIMEOUT)?,
+    )?;
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| reject("unable to create upload boundary"))?;
+    let boundary = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let mut fields = vec![
+        ("version", CLI_VERSION),
+        ("kind", upload.kind),
+        ("request_id", request_id),
+    ];
+    if !upload.title.is_empty() {
+        fields.push(("title", upload.title));
+    }
+    for (name, value) in [
+        ("id", upload.id),
+        ("issue", upload.issue),
+        ("label", upload.label),
+        ("customer", upload.customer),
+    ] {
+        if let Some(value) = value {
+            fields.push((name, value));
+        }
+    }
+    let body =
+        crate::wiki::upload::build_multipart(&boundary, &fields, upload.file_name, upload.bytes);
+    let builder = ureq::Agent::config_builder()
+        .timeout_global(Some(request_timeout(deadline, CALL_TIMEOUT)?))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None);
+    let response = crate::issuer_transport::agent(builder)
+        .post(format!("{}/__platform/artifacts/upload", target.endpoint))
+        .header("Authorization", format!("Bearer {}", cred.access_token))
+        .header("X-Cadence-Cli-Envelope", envelope.as_str())
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .send(&body[..])
+        .map_err(|_| {
+            Error::unknown(
+                "the upload may or may not have been recorded — check `artifact find` \
+                 before repeating it",
+            )
+        })?;
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_BODY {
+        return Err(reject("remote response too large"));
+    }
+    Ok((status, retry_after, serde_json::from_slice(&bytes).ok()))
+}
+
+/// AOS-346 `artifact put`: hand one local file to a hosted workspace. A tenant
+/// that predates the route is named as such, never reported as an outage.
+pub fn upload_artifact(
+    target: &RemoteTarget,
+    upload: &ArtifactUpload,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(wake_timeout))
+        .ok_or_else(|| reject("invalid wake timeout"))?;
+    let waking = || {
+        Error::busy_coded(
+            "waking",
+            format!(
+                "org '{}' is still waking after {}s — retry, or pass a larger --wake-timeout",
+                target.org, wake_timeout
+            ),
+        )
+    };
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| reject("unable to create a request id"))?;
+    let request_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    loop {
+        request_timeout(deadline, AUTH_TIMEOUT).map_err(|_| waking())?;
+        let cred = renewed_credential(&dir, target, deadline)?;
+        if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "cli.write") {
+            return Err(reject(
+                "artifact put needs the cli.write capability, which this remote login \
+                 lacks — nothing was sent",
+            ));
+        }
+        let (status, retry_after, body) =
+            artifact_upload_once(target, &cred, upload, &request_id, deadline)?;
+        if status == 501 || (status == 404 && body.is_none()) {
+            return Err(reject(artifact_tenant_too_old(
+                "artifact put",
+                status,
+                "sent",
+            )));
+        }
+        if !(200..300).contains(&status) && status != 503 {
+            return Err(artifact_refusal(status, body.as_ref()));
+        }
+        match classify(status, retry_after, body) {
+            Verdict::Done(result) => return result,
+            Verdict::Conflict(_) => return Err(reject("remote upload conflicted")),
+            Verdict::Waking(wait) => {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(waking)?;
+                if wait >= remaining {
+                    return Err(waking());
+                }
+                note(&format!("waking {}… ({}s)", target.org, wait.as_secs()));
+                std::thread::sleep(wait);
+            }
+        }
+    }
+}
+
+/// The store's refusals carry a safe code and message of its own; anything else
+/// goes through the shared decoder, which never echoes a raw body.
+fn artifact_refusal(status: u16, body: Option<&Value>) -> Error {
+    const STORE_CODES: &[&str] = &[
+        "invalid_request",
+        "not_found",
+        "conflict",
+        "payload_too_large",
+    ];
+    let error = body.and_then(|b| b.get("error"));
+    let code = error.and_then(|e| e["code"].as_str());
+    let message = error.and_then(|e| e["message"].as_str());
+    match (code, message) {
+        (Some(code), Some(message)) if STORE_CODES.contains(&code) => reject(format!(
+            "artifact put refused ({code}): {message}. Nothing was stored"
+        )),
+        _ => refusal_error(status, body),
+    }
+}
+
+/// Deploy order is the tenant first, then this client. The fallback is a named
+/// refusal, so a mismatch never reads as an outage or an empty result.
+pub fn artifact_tenant_too_old(verb: &str, status: u16, nothing: &str) -> String {
+    format!(
+        "this workspace's server does not serve `{verb}` yet (HTTP {status}): update the \
+         tenant server first, then this Cadence client. Nothing was {nothing}"
+    )
 }
 
 /// CAD-913 `wiki upload`: send one local file (already read and size-checked
@@ -3331,6 +3521,9 @@ fn call_verb_until_retry(
         // evidence". Report it before the generic decoder can call it
         // retryable. A checked write conflict keeps its own verdict: the call
         // ran and proved nothing was written.
+        if status == 501 && matches!(verb, "artifact_find" | "artifact_show" | "artifact_read") {
+            return Err(reject(artifact_tenant_too_old(verb, status, "read")));
+        }
         if PROJECT_SCOPED_GATE_VERBS.contains(&verb) {
             let checked_conflict = body.as_ref().is_some_and(|b| {
                 b.get("conflict").is_some()
