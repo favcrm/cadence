@@ -33,6 +33,7 @@ export default function UploadPane({
   dir,
   navHref,
   readOnly,
+  readOnlyReason,
   onToast,
   onUploaded,
   multipart = false,
@@ -40,6 +41,8 @@ export default function UploadPane({
   dir: string;
   navHref: (route: Route) => string;
   readOnly: boolean;
+  /** Why writes are blocked, when the board knows it. */
+  readOnlyReason?: string | null;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onUploaded: () => void;
   /** Hosted boards upload with one multipart POST; local boards use transfer jobs. */
@@ -226,7 +229,7 @@ export default function UploadPane({
       </>} />
 
       {readOnly && (
-        <Note warn>{t("writes are disabled on this board — sign in as the operator to upload.")}</Note>
+        <Note warn>{readOnlyReason ?? t("Writes are disabled on this board.")}</Note>
       )}
 
       <div

@@ -76,6 +76,12 @@ export interface WikiPage {
 export interface WikiSearchResponse {
   hits?: SearchHit[];
   results?: SearchHit[];
+  /**
+   * The hosted Worker's fallback disclosure: no page matched every term, so
+   * the hits match some of them. Absent on the native daemon, which does not
+   * fall back, and never invented here.
+   */
+  partial?: boolean;
 }
 
 export interface WikiHistoryResponse {
@@ -128,6 +134,26 @@ export function wikiErrorFrom(status: number, body: unknown): WikiError {
     author: str(b.author) ?? str(b.edited_by) ?? null,
     at: str(b.at) ?? str(b.mtime) ?? null,
   });
+}
+
+/**
+ * The one listing answer that means "this folder does not exist yet", for the
+ * project Context's first-time empty state. Both hosts are recognised by the
+ * shape they actually send, and nothing else is:
+ *
+ * - hosted Worker: `404` with `code: "not_found"` (`wiki ls` only answers it
+ *   for a folder that has neither a row nor a descendant);
+ * - native daemon: `400` whose message is exactly its missing-directory
+ *   refusal for this path — the daemon's other refusals (a file, an
+ *   unreadable path, a lock) keep their own text and are not this case.
+ *
+ * A 403, a 5xx, a network failure or a message that merely mentions a
+ * directory stays an error.
+ */
+export function isMissingWikiFolder(error: unknown, path: string): boolean {
+  if (!(error instanceof WikiError)) return false;
+  if (error.status === 404 && error.code === "not_found") return true;
+  return error.status === 400 && error.message === `wiki ls '${path}': no such directory`;
 }
 
 async function json<T>(resp: Response): Promise<T> {

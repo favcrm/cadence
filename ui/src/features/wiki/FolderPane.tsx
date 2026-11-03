@@ -83,13 +83,21 @@ export default function FolderPane({
     if (!dialog || busy || readOnly) return;
     const value = dialog.value.trim();
     if (!value) return;
+    const from = dialog.entry.path;
+    const to = dialog.kind === "rename" ? joinPath(parentPath(from), value) : value;
+    // Nothing to do: closing is honest, and the server would refuse a
+    // self-move as "a directory into itself".
+    if (to === from) {
+      setDialog(null);
+      return;
+    }
     setBusy(true);
     try {
-      if (dialog.kind === "rename" && value.includes("/")) throw new Error("Use a file name without folders. Use Move to change its location.");
-      const to = dialog.kind === "rename" ? joinPath(parentPath(dialog.entry.path), value) : value;
+      if (dialog.kind === "rename" && value.includes("/")) throw new Error("Use a name without folders. Use Move to change the location.");
       if (scope && !withinScope(to, scope.root)) throw new Error("Choose a destination inside this project’s context");
-      await wiki.mv(dialog.entry.path, to);
-      onToast("ok", `${dialog.kind === "rename" ? "renamed" : "moved"} ${baseName(dialog.entry.path)}`);
+      if (dialog.entry.kind === "dir" && to.startsWith(`${from}/`)) throw new Error("A folder cannot move inside itself");
+      await wiki.mv(from, to);
+      onToast("ok", `${dialog.kind === "rename" ? "renamed" : "moved"} ${baseName(from)}`);
       setDialog(null);
       onRefresh();
     } catch (error) {
@@ -102,8 +110,12 @@ export default function FolderPane({
   const remove = async (entry: WikiEntry) => {
     setBusy(true);
     try {
-      await wiki.rm(entry.path);
-      onToast("ok", `${entry.name} moved to trash`);
+      // Neither host lists trash here. Name the returned landing as an
+      // operator recovery path, not as a place this screen can browse.
+      const result = await wiki.rm(entry.path);
+      onToast("ok", result.trash
+        ? `${entry.name} moved to ${result.trash} — restoring it is an operator recovery step`
+        : `${entry.name} was removed`);
       setConfirm(null);
       setMenu(null);
       onRefresh();
@@ -150,7 +162,7 @@ export default function FolderPane({
         <IconFolder size={34} />
         <div className="wk-etitle">{t("This folder is empty")}</div>
         <div className="wk-ebody">
-          {readOnly ? t("nothing here yet — and writes are disabled for this board.") : t("start with New page, or drop files to upload.")}
+          {readOnly ? t("nothing here yet — you can read this folder, but not add to it.") : t("start with New page, or drop files to upload.")}
         </div>
       </div>
     );
@@ -175,16 +187,12 @@ export default function FolderPane({
         <>
           <div className="wk-menu-backdrop" onClick={() => setMenu(null)} />
           <div id={`${menuId}-${encodeURIComponent(entry.path)}`} className="wk-fmenu" role="group" aria-label={`${entry.name} actions`}>
-            {entry.kind === "page" && (
-              <>
-                <button type="button" onClick={() => { setMenu(null); setDialog({ kind: "rename", entry, value: entry.name }); }} disabled={readOnly}>
-                  {t("Rename")}
-                </button>
-                <button type="button" onClick={() => { setMenu(null); setDialog({ kind: "move", entry, value: entry.path }); }} disabled={readOnly}>
-                  {t("Move")}
-                </button>
-              </>
-            )}
+            <button type="button" onClick={() => { setMenu(null); setDialog({ kind: "rename", entry, value: entry.name }); }} disabled={readOnly}>
+              {t("Rename")}
+            </button>
+            <button type="button" onClick={() => { setMenu(null); setDialog({ kind: "move", entry, value: entry.path }); }} disabled={readOnly}>
+              {t("Move")}
+            </button>
             {(entry.kind === "page" || entry.kind === "file") && <button type="button" onClick={() => void downloadEntry(entry)}>{t("Download")}</button>}
             <button
               type="button"
@@ -240,8 +248,12 @@ export default function FolderPane({
           }}
         >
           <h2 className="wk-dialog-title">{dialog.kind === "rename" ? t("Rename") : t("Move")} {dialog.entry.name}</h2>
-          <label className="slabel" htmlFor={fieldId}>{dialog.kind === "rename" ? t("File name") : t("Destination path")}</label>
-          {dialog.kind === "move" && <p id={`${fieldId}-hint`} className="wk-dialog-hint">{t("Include the file name")}{scope ? ` ${t("and keep it inside this project’s context")}` : ` ${t("relative to Wiki")}`}.</p>}
+          <label className="slabel" htmlFor={fieldId}>
+            {dialog.kind === "rename"
+              ? dialog.entry.kind === "dir" ? t("Folder name") : t("File name")
+              : t("Destination path")}
+          </label>
+          {dialog.kind === "move" && <p id={`${fieldId}-hint`} className="wk-dialog-hint">{t("Include the name")}{scope ? ` ${t("and keep it inside this project’s context")}` : ` ${t("relative to Wiki")}`}.</p>}
           <input
             id={fieldId}
             name={dialog.kind === "rename" ? "name" : "destination"}
@@ -268,7 +280,7 @@ export default function FolderPane({
         <div className="wk-dialog card">
           <h2 className="wk-dialog-title">{t("Delete")} {baseName(confirm)}?</h2>
           <div className="text-secondary text-ink-300">
-            {t("This item moves to Trash. It can be restored later.")}
+            {t("This item moves to .trash/. Restoring it is an operator recovery step — this board has no trash browser.")}
           </div>
           <div className="wk-tools">
             <Button

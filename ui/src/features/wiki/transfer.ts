@@ -278,16 +278,25 @@ export async function uploadMultipart(
   }
   onProgress(100);
   const rev = text(row?.rev) ?? undefined;
-  // A text page is searchable at once and carries no status; a blob reports one.
-  const status = text(row?.status) ?? "indexed";
+  const kind = text(row?.kind);
+  const status = text(row?.status);
   const mapped = statusText(status);
   const reason = text(row?.status_reason);
+  // A text upload is written as a page inside the board's index, so it is
+  // searchable at once. An attachment carries the Worker's own extraction
+  // status; when the board does not report one, say so instead of guessing at
+  // a background job.
+  const page = kind === "text";
+  const indexed = page || status === "indexed";
   return {
     outcome: text(row?.outcome) ?? "applied",
-    extraction: status,
-    index: status === "indexed" ? "covered" : status,
+    extraction: status ?? (page ? "indexed" : "unknown"),
+    index: indexed ? "covered" : status ?? "unknown",
     ...(rev ? { rev } : {}),
-    ...(mapped ? { detail: mapped.text, warn: mapped.warn } : {}),
+    detail: mapped?.text ?? (page
+      ? "saved — this page is searchable"
+      : "saved — this board did not report its extraction state"),
+    warn: mapped?.warn ?? false,
     ...(reason ? { error: reason } : {}),
   };
 }

@@ -45,6 +45,25 @@ contradictions and open questions. Periodically check broken source links,
 orphan pages, and claims whose source has changed. Do not automatically turn
 an uploaded document into accepted operational guidance.
 
+### Board navigation and recovery
+
+The Wiki root lists the fixed namespaces; it is not itself a place to create
+pages. Open a writable folder such as `global/`, a project folder, or your
+personal folder. Native boards identify that folder by handle; hosted boards
+use the verified member subject. A read-only message on one folder does not
+mean every folder is read-only.
+
+An empty project Context offers to create its wiki folder. Search filters use
+the available file type, and a hosted result that matched only some search
+terms says so. An upload's extraction status is a receipt, not a live progress
+feed; an unconfirmed result does not establish that extraction has finished.
+
+Removing an item returns its exact `.trash/...` landing. There is no board
+trash browser; retain that landing and ask an operator to restore it with
+`cadence wiki mv <landing> <destination>` when the target host supports the
+restore. The destination must be available. An older revision whose original
+text was not retained cannot be reconstructed from its history entry.
+
 ## Upload and update
 
 The board Wiki Upload pane sends a complete destination path for every file.
@@ -52,6 +71,9 @@ Markdown and TXT uploads create or update a text page. Other uploads use the
 blob store; PDF text extraction runs after the blob commits and the response
 includes an `extraction` status. The board warns when a PDF was saved but its
 text could not be indexed.
+
+On hosted boards, editable Markdown and TXT uploads are limited to 256 KiB;
+larger text uploads are refused before storage rather than becoming attachments.
 
 An operator can use the CLI:
 

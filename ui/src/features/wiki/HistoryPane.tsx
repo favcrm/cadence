@@ -22,7 +22,12 @@ export default function HistoryPane({
 }: {
   path: string;
   navHref: (route: Route) => string;
-  /** A hosted Worker board keeps no historical page text yet (AOS-452), so only the current revision opens there; undefined = not known yet, treated as hosted. */
+  /**
+   * A hosted Worker board: it opens a revision only when that row's text was
+   * retained and is still readable (`can_open`), so a row without the board's
+   * own answer defaults to closed there. The native daemon reads any commit in
+   * the log. Undefined = the board's meta is not known yet, treated as hosted.
+   */
   hosted?: boolean;
 }) {
   const t = useTranslate();
@@ -33,7 +38,10 @@ export default function HistoryPane({
   const [error, setError] = useState<string | null>(null);
   const [canCompare, setCanCompare] = useState(false);
   const [replyCanOpen, setReplyCanOpen] = useState<boolean | undefined>(undefined);
-  const canOpen = replyCanOpen ?? hosted === false;
+  // The board's own answer, else the host's rule; `undefined` while neither is
+  // known, so a row never claims "not retained" on a guess.
+  const hostCanOpen = replyCanOpen ?? (hosted === undefined ? undefined : hosted === false);
+  const browseHref = navHref({ screen: "wiki", mode: "browse", path, query: null });
 
   useEffect(() => {
     let cancelled = false;
@@ -110,13 +118,27 @@ export default function HistoryPane({
                 </span>
                 {row.summary && <span className="wk-vsum">{row.summary}</span>}
               </button>
-              <Link href={navHref({ screen: "wiki", mode: "browse", path, query: null, at: row.rev })}>{t("Open this revision")}</Link>
+              {/* The current row opens the live page without depending on
+                  historical-read support or locking the view to a revision. */}
+              {row.current ? (
+                <Link href={browseHref}>{t("Open this page")}</Link>
+              ) : (row.can_open ?? hostCanOpen) === true ? (
+                <Link href={navHref({ screen: "wiki", mode: "browse", path, query: null, at: row.rev })}>{t("Open this revision")}</Link>
+              ) : (row.can_open ?? hostCanOpen) === false ? (
+                <span className="kicker">{t("text not retained")}</span>
+              ) : null}
               </div>
             ) : <div key={row.rev} className="wk-vrow">
               <span className="wk-vwho">{versionWho(row)}</span>
               <span className="wk-vwhen">{row.when}</span>
               {row.summary && <span className="wk-vsum">{row.summary}</span>}
-              {(canOpen || row.rev === currentRev) && <Link href={navHref({ screen: "wiki", mode: "browse", path, query: null, at: row.rev })}>{t("Open this revision")}</Link>}
+              {row.current ? (
+                <Link href={browseHref}>{t("Open this page")}</Link>
+              ) : (row.can_open ?? hostCanOpen) === true ? (
+                <Link href={navHref({ screen: "wiki", mode: "browse", path, query: null, at: row.rev })}>{t("Open this revision")}</Link>
+              ) : (row.can_open ?? hostCanOpen) === false ? (
+                <span className="kicker">{t("text not retained")}</span>
+              ) : null}
             </div>)}
           </div>
           {canCompare && <div className="min-w-0">
