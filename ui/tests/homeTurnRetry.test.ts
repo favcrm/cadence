@@ -29,6 +29,22 @@ const Home = require<typeof HomeModule>("../src/features/home/Home").default;
 const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
 const { resources } = require<typeof Stores>("../src/lib/resources");
 const { setImmediate: nextTurn } = require<{ setImmediate: () => Promise<void> }>("node:timers/promises");
+// CAD-2012: history must never carry the rise-in class, not even on the first
+// loaded render, whose class a later render removes before any DOM read.
+const classesEverSet: string[] = [];
+{
+  const proto = win.Element.prototype as unknown as { setAttribute(name: string, value: string): void };
+  const setAttribute = proto.setAttribute;
+  proto.setAttribute = function (name: string, value: string) {
+    if (name === "class") classesEverSet.push(String(value));
+    return setAttribute.call(this, name, value);
+  };
+  const className = Object.getOwnPropertyDescriptor(win.Element.prototype, "className");
+  if (className?.set) {
+    const set = className.set;
+    Object.defineProperty(win.Element.prototype, "className", { ...className, set(value: string) { classesEverSet.push(String(value)); set.call(this, value); } });
+  }
+}
 const posts: Record<string, unknown>[] = [];
 // The stream's own master frame: the fixture emits it on open, so a turn the
 // test wants the stream to report must be in this object, not only the store.
@@ -75,6 +91,7 @@ async function main() {
     await settle();
   };
   await render(false);
+  assert(!classesEverSet.some((value) => value.includes("msg-in")), "stored history does not rise in on the first loaded render");
   entries.push({ seq: 2, role: "agent", kind: "turn_result", message: "turn-b", text: "Turn B failed", created: new Date().toISOString(), payload: { status: "failed", error: "Turn B failed" } });
   await React.act(async () => {
     resources.masterThread.write((state) => ({ ...state!, entries: [...entries], pending: [{ message: "transport-a", text: "Do not retry A", state: "failed", at: 1, refs: [{ kind: "issue", id: "CAD-A" }], attachments: [{ id: "file-a" }], conversation: "other-home" }] }));
@@ -392,6 +409,20 @@ async function main() {
   await settle();
   assert(host.querySelectorAll('[data-kind="typing"]').length === 0, "the typing bubble clears once the send settles out of submitting");
 
+
+  // CAD-2012: reloading during a running turn is a first connection, not an
+  // outage: no banner at any point, and Stop only once the stream is live.
+  await React.act(async () => { root.render(null); });
+  await settle();
+  const runningState = { alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: { state: "working", message: "turn-b", conversation: "home-thread" }, queue: [] };
+  streamMaster.turn = runningState.turn;
+  await React.act(async () => { resources.masterState.write(() => runningState as never); });
+  classesEverSet.length = 0;
+  await render(false);
+  assert(host.querySelector('[data-kind="typing"], [data-kind="turn"]') !== null, "the reloaded thread is painted");
+  assert(!classesEverSet.some((value) => value.includes("streambanner")), "reloading mid-turn shows no reconnecting banner");
+  assert(!host.textContent?.includes("reconnecting…"), "reloading mid-turn shows no reconnecting text in the header");
+  assert(!classesEverSet.some((value) => value.includes("msg-in")), "reloaded history does not rise in");
 
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();

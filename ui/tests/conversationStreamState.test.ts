@@ -12,7 +12,6 @@ import type * as Queries from "../src/lib/useResource";
 import type * as Resources from "../src/lib/resources";
 import type { MasterState } from "../src/lib/types";
 import type { ThreadEntry } from "../src/features/home/thread";
-import type { SseErrorState } from "../src/lib/sse";
 declare function require<T>(name: string): T;
 const { Window } = require<typeof HappyDOM>("happy-dom");
 const win = new Window({ url: "http://localhost/" });
@@ -24,6 +23,7 @@ const React = require<typeof ReactModule>("react");
 const { createRoot } = require<typeof ReactDOM>("react-dom/client");
 const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
 const { conversationThread } = require<typeof Client>("../src/features/app-shell/conversationClient");
+type StreamLink = import("../src/features/app-shell/chat/conversationThread").StreamLink;
 const { useThreadStream } = require<typeof Engine>("../src/features/app-shell/chat/conversationThread");
 const { TurnBar } = require<typeof Bar>("../src/features/app-shell/chat/TurnBar");
 const ComposerDefault = require<typeof Composer>("../src/features/app-shell/chat/Composer").default;
@@ -36,7 +36,7 @@ globalThis.fetch = async (input, init) => {
   if (!url.includes("/api/threads/master/stream")) throw new Error(`Unexpected request: ${url}`);
   const body = new ReadableStream<Uint8Array>({ start(controller) {
     streams.push({ url, controller });
-    init?.signal?.addEventListener("abort", () => controller.close(), { once: true });
+    init?.signal?.addEventListener("abort", () => { try { controller.close(); } catch { /* the test already closed it */ } }, { once: true });
   } });
   return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
 };
@@ -51,7 +51,7 @@ resources.masterState.write(() => snapshot("m-old"));
 function Harness() {
   const data = useResource(thread);
   const master = useResource(resources.masterState);
-  const [link, setLink] = React.useState<"live" | SseErrorState>("reconnecting");
+  const [link, setLink] = React.useState<StreamLink>("reconnecting");
   useThreadStream(thread, "/api/threads/master/stream?conversation=conv-stream", true, setLink);
   const state = turnBarState({ master: master.data, entries: data.data?.entries ?? [], pendingMessages: [], awaitingApproval: false, reconnecting: link !== "live" }, "conv-stream");
   // CAD-1880: the running turn paints no dock row; Stop is the composer's
@@ -113,6 +113,7 @@ async function main() {
   });
   await mount();
   assert(streams.length === 1 && streams[0].url.includes("after=10"), "the actual stream resumes from its stored entry cursor");
+  assert(host.querySelector("main")?.getAttribute("data-link") === "connecting", "a first attempt is connecting, not reconnecting");
   assert(host.querySelector("main")?.getAttribute("data-link") !== "live" && !host.querySelector('[aria-label="Stop this turn"]'), "opening the socket cannot enable cached-turn actions before the current-state snapshot");
   await React.act(async () => {
     emit(`event: master\ndata: ${JSON.stringify(snapshot("m-new"))}\n\nid: 11\nevent: entry\ndata: ${JSON.stringify(entry(11))}\n\n`);
@@ -131,6 +132,17 @@ async function main() {
   await settle();
   assert(JSON.stringify(thread.get().data?.entries.map((row) => row.seq)) === "[10,11,12]", "resume has no gap or duplicate despite overlapping replay");
   assert(observed.some((row) => row.seq === 12) && observed.filter((row) => row.seq === 12).every((row) => row.master === "m-next"), "reconnected replay follows the new current-state snapshot");
+  // CAD-2012: a live stream dropping, or a first attempt failing, is an outage.
+  await React.act(async () => { streams.at(-1)!.controller.close(); });
+  await settle();
+  const dropped = host.querySelector("main")?.getAttribute("data-link");
+  assert(dropped !== "live" && dropped !== "connecting", `a dropped live stream reports an outage (got ${dropped})`);
+  await React.act(async () => { root.render(null); });
+  await mount();
+  await React.act(async () => { streams.at(-1)!.controller.close(); });
+  await settle();
+  const failed = host.querySelector("main")?.getAttribute("data-link");
+  assert(failed !== "live" && failed !== "connecting", `a failed first attempt reports an outage (got ${failed})`);
   off();
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();
