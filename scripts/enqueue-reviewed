@@ -599,6 +599,33 @@ def read_verdicts(notes_dir, issue, pr, head, project=None):
     return verdicts, skipped, origin
 
 
+def read_identities():
+    """`login -> subject_id` from the workspace's principal attestation map.
+
+    CAD-2049: the author exclusion has to resolve the PR author's login to a
+    principal before it can exclude that principal. `cadence audit identities`
+    is the owner's record of that join, and the read is admitted to the live
+    human owner only: a refusal is a refusal, never an empty map."""
+    rc, out, err = run(["cadence", "audit", "identities"])
+    try:
+        doc = json.loads(out)
+        rows = doc["identities"]
+        if rc != 0 or not isinstance(rows, list):
+            raise ValueError("unexpected shape")
+        mapping = {}
+        for row in rows:
+            login = (row.get("github_login") or "").strip().lower()
+            subject = (row.get("subject_id") or "").strip()
+            if login and subject:
+                mapping[login] = subject
+        return mapping
+    except (ValueError, KeyError, TypeError, AttributeError):
+        detail = (err or out).strip()[:200]
+        raise RuntimeError(
+            f"cannot read the workspace identity map via `cadence audit identities` (rc {rc}): "
+            f"{detail}" + stale_cli_hint(detail))
+
+
 def reviewer_key(v, hosted):
     """The identity a verdict counts as. A hosted row counts the attested
     principal (`reviewer_id`), never the login string: two logins for one
@@ -741,6 +768,17 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
                 reasons.append(
                     f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
                     f"the owner attested that login as the PR author")
+            elif not hosted.get("author_principal"):
+                # CAD-2049: without the author's principal, no row can be proven
+                # not to be the author's — a second login is not a second person.
+                reasons.append(
+                    f"verdict {n['name']} cannot be proven independent: the PR author "
+                    f"{hosted.get('author_login') or '(unknown login)'} has no attested principal "
+                    "(`cadence audit identities set --identity <subject>=<login>`)")
+            elif (n.get("reviewer_id") or "").strip() == hosted["author_principal"]:
+                reasons.append(
+                    f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
+                    f"its principal is the PR author's ({hosted['author_principal']})")
             else:
                 counted.append(n)
         elif who in authors:
@@ -1316,10 +1354,27 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         # else keeps the local rule. A failed read leaves no verdicts to count.
         # CAD-2001: a hosted document also had to name the ticket's project —
         # `read_verdicts` refuses one that does not.
-        hosted = {"repo": repo, "project": hosted_project} if origin == "hosted" else None
-        if hosted is not None:
+        hosted = None
+        if origin == "hosted":
+            author_login = ((view.get("author") or {}).get("login") or "").strip()
+            # CAD-2049: read the map only when there is a row to count. The read
+            # is the owner's, and the CAD-1946 exception needs no verdicts, so a
+            # caller with nothing to count is never refused over it.
+            identities = {}
+            if verdicts:
+                try:
+                    identities = read_identities()
+                except RuntimeError as e:
+                    reasons.append(str(e))
+            hosted = {"repo": repo, "project": hosted_project,
+                      "author_login": author_login,
+                      "author_principal": identities.get(author_login.lower(), "")}
             report.append(f"verdict origin: hosted ({repo}, project {hosted_project}); "
                           "counting attested principals")
+            if verdicts:
+                report.append("PR author principal: "
+                              + (hosted["author_principal"]
+                                 or f"unattested ({author_login or 'no login'})"))
         active = authority is not None and authority["requirements"]["activation"] == "active"
         klass = authority["requirements"]["class"] if authority else None
         counted = []
@@ -1549,7 +1604,50 @@ def enqueue(args, repo):
     return 1
 
 
+def self_test():
+    """CAD-2049: the independence rule over fixed documents. No network, no files.
+
+    The gate cannot approve its own change, so this is the reproducible check
+    the ticket asks for: it runs the counting function the gate runs, over the
+    three shapes that decide the rule."""
+    def row(name, reviewer_id, login, kind="combined", outcome="pass"):
+        return {"name": name, "stamp": "20261103-000000", "reviewer": login,
+                "reviewer_id": reviewer_id, "github_login": login, "repo": "o/r",
+                "kind": kind, "outcome": outcome, "title_outcome": outcome,
+                "section_outcome": outcome, "risk": "auto"}
+
+    def hosted(author_login, author_principal):
+        return {"repo": "o/r", "project": "p", "author_login": author_login,
+                "author_principal": author_principal}
+
+    cases = [
+        ("same principal under another login refuses",
+         hosted("author", "usr_author"), row("a.md", "usr_author", "author2"),
+         "not independent"),
+        ("an unattested author proves nothing",
+         hosted("author", ""), row("b.md", "usr_other", "reviewer"),
+         "no attested principal"),
+        ("a distinct attested principal counts",
+         hosted("author", "usr_author"), row("c.md", "usr_other", "reviewer"),
+         None),
+    ]
+    failures = 0
+    for label, h, verdict, expected in cases:
+        reasons, counted = check_reviews([verdict], True, False, {"author"}, "CAD-1", h)
+        if expected is None:
+            ok = not reasons and len(counted) == 1
+            detail = "; ".join(reasons) or f"counted {len(counted)}"
+        else:
+            ok = bool(reasons) and not counted and any(expected in r for r in reasons)
+            detail = "; ".join(reasons) or "no refusal"
+        print(f"{'ok  ' if ok else 'FAIL'} {label}: {detail}")
+        failures += 0 if ok else 1
+    return 0 if not failures else 1
+
+
 def main(argv):
+    if "--self-test" in argv:
+        return self_test()
     ap = argparse.ArgumentParser(prog=ME, description="Enqueue a PR only when review, checks and approval hold.")
     ap.add_argument("pr", type=int)
     ap.add_argument("--head", required=True, help="the full 40-hex head SHA the review covered")
