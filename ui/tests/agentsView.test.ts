@@ -775,6 +775,7 @@ async function main() {
   await React.act(async () => releaseDetail?.());
   await flush();
   holdDetail = false;
+  await mountServed("dev", "history", liveRoster); // A new page, so its panel starts closed.
   await mountServed("dev", "overview", { ...liveRoster, data: null, status: "loading" });
   const pendingPanel = await openPanel();
   assert(pendingPanel.includes("Doing now"), "the panel shows Work while the roster is pending");
