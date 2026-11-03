@@ -23,6 +23,34 @@ fn show_register_code(url: &str, code: &str, no_open: bool) -> Result<()> {
     Ok(())
 }
 
+fn show_workspace_handover(slug: &str, stored: &Value) {
+    let selected = stored.get("selected").and_then(Value::as_bool);
+    match selected {
+        Some(true) => println!("Saved default: {slug}"),
+        Some(false) => println!("Saved default: unchanged"),
+        None => println!("Saved default: unavailable"),
+    }
+
+    if std::env::var_os("CADENCE_ALIAS").is_some()
+        || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
+    {
+        println!("Use the workspace bound to your agent assignment.");
+        return;
+    }
+
+    if org::inherited_local_pin() {
+        println!(
+            "This shell is bound to local Cadence. In a shell without that binding, run:\n  \
+             cadence --org {slug} status"
+        );
+    } else {
+        println!("Next: cadence --org {slug} status");
+    }
+    if selected == Some(false) {
+        println!("To make it the saved default: cadence org switch {slug}");
+    }
+}
+
 fn report_register_error(error: &Error, json: bool) {
     if !json {
         return;
@@ -263,7 +291,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 |url, code| show_register_code(url, code, *no_open),
             )
             .inspect_err(|error| report_register_error(error, *json))?;
-            org::record_remote(
+            let stored = org::record_remote(
                 &grant.slug,
                 &grant.endpoint,
                 &grant.organization_id,
@@ -289,6 +317,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     "Registered and signed in to {} ({})",
                     grant.slug, grant.endpoint
                 );
+                show_workspace_handover(&grant.slug, &stored);
             }
             return Ok(0);
         }
@@ -382,7 +411,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             // Registry replacement and credential save are one recovery
             // unit: a failed credential write restores the old binding, so a
             // replay never leaves a new binding pointing at an old token.
-            org::record_remote(
+            let stored = org::record_remote(
                 &grant.slug,
                 &grant.endpoint,
                 &grant.organization_id,
@@ -390,6 +419,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 || grant.save_credential(&dir),
             )?;
             println!("Signed in to {} ({})", grant.slug, grant.endpoint);
+            show_workspace_handover(&grant.slug, &stored);
             return Ok(0);
         }
         Commands::Auth { action } => {

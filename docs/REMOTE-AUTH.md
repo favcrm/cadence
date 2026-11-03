@@ -129,6 +129,13 @@ remove an org binding; a verified re-login replaces it. Use
 `--use`, the current default is unchanged. `--no-open` prints the approval
 URL and code without opening a browser.
 
+After a successful browser login or human-readable registration, the CLI
+reports whether that workspace is the saved default and gives an explicit
+`cadence --org <slug> status` next step. Changing the saved default remains
+a separate choice. If the shell is bound to a local Cadence installation,
+use a shell without that binding for the hosted command. A managed agent
+uses its assignment's workspace binding rather than the saved default.
+
 An owner or current member can approve ordinary collaboration. Both the portal
 and explicit org login request `cli.read`, `cli.write`, `wiki.read` and
 `wiki.write`; saved renewal retains the consented set. `--web` requests its

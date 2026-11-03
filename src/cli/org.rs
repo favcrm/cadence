@@ -719,6 +719,19 @@ pub(super) fn saved_login_token(auth_dir: Option<&Path>) -> Result<Option<String
         .map(|material| material.access_token))
 }
 
+/// Whether this shell is bound to a local Cadence installation. The login
+/// handover uses the same pin check as routing for its next command.
+pub(super) fn inherited_local_pin() -> bool {
+    [
+        "CADENCE_STATE_DIR",
+        "CADENCE_PM_DIR",
+        "CADENCE_HOME",
+        "CADENCE_PROFILE",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
+}
+
 /// Settle this invocation's destination once — the shared body of [`resolve`]
 /// and [`route`], so the two can never disagree. `org` is `--org`. A
 /// managed caller keeps its inherited local daemon and never consults
@@ -744,16 +757,7 @@ fn settle(
     }
     // An explicit flag or inherited binding is a pin; it conflicts with
     // `--org` rather than mixing roots.
-    let pinned = state.is_some()
-        || tracker.is_some()
-        || [
-            "CADENCE_STATE_DIR",
-            "CADENCE_PM_DIR",
-            "CADENCE_HOME",
-            "CADENCE_PROFILE",
-        ]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some());
+    let pinned = state.is_some() || tracker.is_some() || inherited_local_pin();
     if pinned {
         if org.is_some() {
             return Err(pin_conflict());
