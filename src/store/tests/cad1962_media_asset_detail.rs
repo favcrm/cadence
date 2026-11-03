@@ -266,17 +266,23 @@ fn a_pinned_library_image_resolves_by_its_own_bytes_for_either_provenance() {
         "imported custody has no producer proof"
     );
 
-    // A stale revision or a different digest refuses, whatever the provenance.
-    assert!(s.app_media_pinned_display(asset_id, 2, &digest).is_err());
+    // A stale revision or a different digest answers none, whatever the
+    // provenance; each caller words its own refusal.
+    assert!(s
+        .app_media_pinned_display(asset_id, 2, &digest)
+        .unwrap()
+        .is_none());
     assert!(s
         .app_media_pinned_display(
             asset_id,
             1,
             &crate::store::app_runs::artifact_digest(b"other")
         )
-        .is_err());
-    // Anything that is not a verified workspace asset refuses too.
+        .unwrap()
+        .is_none());
+    // Anything that is not a verified workspace asset answers none too.
     assert!(s
         .app_media_pinned_display(&format!("med-{}", "9".repeat(32)), 1, &digest)
-        .is_err());
+        .unwrap()
+        .is_none());
 }
