@@ -587,6 +587,51 @@ pub enum IssueAction {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Leave a message for a role on a ticket (hosted orgs). It is stored for
+    /// whoever holds that role to read: nothing wakes a session or proves a read.
+    Say {
+        id: String,
+        /// The role it is for, such as `developer`.
+        #[arg(long)]
+        to: String,
+        /// The role you are writing as. A label only: the verified sender is
+        /// your login.
+        #[arg(long)]
+        from: Option<String>,
+        /// A stable id you choose: 1-64 lowercase letters, digits or hyphens,
+        /// never `sys-*`. Reuse it to retry this exact message.
+        #[arg(long)]
+        message: String,
+        /// The message.
+        #[arg(short = 'm', long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the message from a file (`-` is stdin).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Read a ticket's messages, one page at a time (hosted orgs).
+    Messages {
+        id: String,
+        /// Only this role's messages and unread count. Use it for your own
+        /// role: without it the unread map stops at 100 roles.
+        #[arg(long)]
+        to: Option<String>,
+        /// Start after this `seq`. Repeat with the last `seq` while `more` is true.
+        #[arg(long)]
+        after: Option<u64>,
+    },
+    /// Move a role's read point forward (hosted orgs). It never moves back, and
+    /// stops at the role's last message.
+    MessagesRead {
+        id: String,
+        /// The role whose read point moves. It is shared by everyone in that role.
+        #[arg(long)]
+        role: String,
+        /// The last `seq` you actually received: a larger value marks messages
+        /// you have not seen.
+        #[arg(long)]
+        through: u64,
+    },
     /// Several updates to one issue as ONE tracker commit: set, tag,
     /// link, ref, attach, acceptance and a comment. Every part is
     /// validated first — one bad part refuses the whole edit and writes
@@ -950,7 +995,10 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         | IssueAction::Edit { .. }
         | IssueAction::Attach { .. }
         | IssueAction::Artifact { .. }
-        | IssueAction::Review { .. } => links::run(action, state_dir),
+        | IssueAction::Review { .. }
+        | IssueAction::Say { .. }
+        | IssueAction::Messages { .. }
+        | IssueAction::MessagesRead { .. } => links::run(action, state_dir),
         IssueAction::Lint { .. }
         | IssueAction::Reconcile { .. }
         | IssueAction::Sync { .. }

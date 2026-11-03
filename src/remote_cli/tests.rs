@@ -629,8 +629,10 @@ fn fake_worker(
                     302 => "302 Found",
                     401 => "401 Unauthorized",
                     403 => "403 Forbidden",
+                    404 => "404 Not Found",
                     409 => "409 Conflict",
                     500 => "500 Internal Server Error",
+                    501 => "501 Not Implemented",
                     503 => "503 Service Unavailable",
                     _ => "400 Bad Request",
                 };
@@ -1288,6 +1290,64 @@ fn cli_message_refusals_map_bounded_codes_never_server_text() {
     let shown = out.unwrap_err().to_string();
     assert!(shown.contains("unknown"), "{shown}");
     assert!(!shown.contains("internal-server-text"), "{shown}");
+}
+
+#[test]
+fn ticket_message_verbs_name_each_refusal_and_never_retry_it() {
+    let refusal =
+        |code: &str| json!({"ok": false, "error": {"code": code, "message": "server-text"}});
+    for (verb, status, code) in [
+        ("issue_message_send", 409u16, "message_id_conflict"),
+        ("issue_message_send", 404, "not_found"),
+        ("issue_messages", 404, "not_found"),
+        ("issue_messages_read", 404, "not_found"),
+        ("issue_message_send", 403, "insufficient_scope"),
+        ("issue_messages_read", 403, "insufficient_scope"),
+        ("issue_message_send", 400, "invalid_request"),
+        ("issue_messages", 400, "invalid_request"),
+        ("issue_messages_read", 400, "invalid_request"),
+        // A tenant that predates the verbs must not read as an outage.
+        ("issue_message_send", 501, "not_implemented"),
+        ("issue_messages", 501, "not_implemented"),
+        ("issue_messages_read", 501, "not_implemented"),
+    ] {
+        let (out, requests) = run(vec![(status, "", refusal(code))], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.code(), Some(code), "{verb} {status}: {err}");
+        assert_ne!(err.kind(), "unknown", "{verb} {status}");
+        assert!(!err.to_string().contains("server-text"), "{verb}: {err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb} retried");
+    }
+}
+
+#[test]
+fn a_lost_ticket_message_answer_is_unknown_and_says_how_to_retry() {
+    for (verb, note) in [
+        ("issue_message_send", "same --message"),
+        ("issue_messages_read", "only moves forward"),
+    ] {
+        let (out, requests) = run(vec![(500, "", json!({}))], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{verb}: {err}");
+        assert!(err.to_string().contains(note), "{verb}: {err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb} retried");
+    }
+}
+
+#[test]
+fn a_ticket_message_receipt_passes_through_as_stored() {
+    let receipt = json!({
+        "message": "tm-1", "id": "CAD-1", "to": "developer", "from": null,
+        "sender_subject": "usr_1", "sender": "member", "text": "hi", "seq": 3,
+        "created_at": 1, "duplicate": false, "state": "stored",
+    });
+    let (out, _) = run(
+        vec![(200, "", receipt.clone())],
+        "issue_message_send",
+        Map::new(),
+        10,
+    );
+    assert_eq!(out.unwrap(), receipt);
 }
 
 #[test]

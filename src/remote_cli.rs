@@ -126,6 +126,7 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_ls",
     "issue_show",
     "issue_history",
+    "issue_messages",
     "issue_artifact",
     // AOS-346: artifacts a worker or the assistant produced. The upload is its
     // own multipart path, `upload_artifact`.
@@ -145,6 +146,8 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_comment",
     "issue_attach",
     "issue_review",
+    "issue_message_send",
+    "issue_messages_read",
     "issue_set",
     "team_invite",
     "team_revoke_invite",
@@ -265,6 +268,8 @@ fn mutating_cli_verb(verb: &str) -> bool {
         "message_send"
             | "issue_attach"
             | "issue_review"
+            | "issue_message_send"
+            | "issue_messages_read"
             | "audit_verdict"
             | "audit_reviewers_set"
             | "audit_verdict_project"
@@ -284,6 +289,12 @@ fn mutating_cli_verb(verb: &str) -> bool {
 fn lost_mutation_note(verb: &str) -> &'static str {
     if verb == "message_send" {
         "the send may or may not have been recorded"
+    } else if verb == "issue_message_send" {
+        "the message may or may not have been stored — repeat `issue say` with the same \
+         --message and text: an identical retry reports `duplicate` and stores nothing new"
+    } else if verb == "issue_messages_read" {
+        "the read point may or may not have moved — repeating the same call is safe, because \
+         it only moves forward"
     } else if verb == "issue_attach" {
         "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it"
     } else if verb == "audit_reviewers_set" {
@@ -2412,6 +2423,32 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
                  passive inbox inspection requires a human workspace owner",
             ))
         }
+        ("issue_message_send", Some("message_id_conflict")) => Some((
+            "message_id_conflict",
+            "that --message id was already used with different content, on another ticket, \
+             or by another member — pick a new id; nothing was stored",
+        )),
+        ("issue_message_send" | "issue_messages" | "issue_messages_read", Some("not_found")) => {
+            Some((
+                "not_found",
+                "this workspace has no ticket with that id; nothing was read or changed",
+            ))
+        }
+        ("issue_message_send" | "issue_messages_read", Some("insufficient_scope")) => Some((
+            "insufficient_scope",
+            "this remote login lacks the cli.write grant this needs — re-login with write \
+             scope, then retry",
+        )),
+        // An older relay refuses a verb it does not know the same way, so this
+        // cannot say which of the two happened.
+        (
+            "issue_message_send" | "issue_messages" | "issue_messages_read",
+            Some("invalid_request"),
+        ) => Some((
+            "invalid_request",
+            "the call was refused at the request boundary: a value was invalid, or this \
+             workspace's hosted service predates ticket messages. Nothing was read or changed",
+        )),
         ("message_read", Some("not_found")) => Some((
             "not_found",
             "no CLI message with that id is visible to this human identity; \
@@ -3537,8 +3574,10 @@ fn call_verb_until_retry(
                 refusal_code.as_deref(),
                 Some("mutation_outcome_uncertain" | "invite_email_uncertain")
             );
-        let artifact_outcome_unknown = matches!(verb, "issue_attach" | "issue_review")
-            && status >= 500
+        let artifact_outcome_unknown = matches!(
+            verb,
+            "issue_attach" | "issue_review" | "issue_message_send" | "issue_messages_read"
+        ) && status >= 500
             && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
             && !board_gate_refused(body.as_ref());
         // CAD-1999: a project create is answered by the tenant Worker from
@@ -3569,6 +3608,22 @@ fn call_verb_until_retry(
         // evidence". Report it before the generic decoder can call it
         // retryable. A checked write conflict keeps its own verdict: the call
         // ran and proved nothing was written.
+        if status == 501
+            && matches!(
+                verb,
+                "issue_message_send" | "issue_messages" | "issue_messages_read"
+            )
+        {
+            let nothing = if verb == "issue_messages" {
+                "read"
+            } else {
+                "changed"
+            };
+            return Err(Error::invalid(
+                "not_implemented",
+                artifact_tenant_too_old(&verb.replace('_', " "), status, nothing),
+            ));
+        }
         if status == 501 && matches!(verb, "artifact_find" | "artifact_show" | "artifact_read") {
             let verb = verb.replacen('_', " ", 1);
             return Err(reject(artifact_tenant_too_old(&verb, status, "read")));

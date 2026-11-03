@@ -473,6 +473,57 @@ fn verb_for(
         }
         Commands::Issue {
             action:
+                cadence_agent::issue::cli::IssueAction::Say {
+                    id,
+                    to,
+                    from,
+                    message,
+                    text,
+                    file,
+                },
+        } => {
+            let body = read_body_capped(text.clone(), file.clone(), TICKET_MESSAGE_BYTES as u64)?;
+            if body.trim().is_empty() {
+                return Err(Error::rejected(
+                    "a ticket message needs text — nothing was sent",
+                ));
+            }
+            if body.len() > TICKET_MESSAGE_BYTES {
+                return Err(Error::rejected(
+                    "ticket message exceeds the 16,000 byte cap — trim it; nothing was sent",
+                ));
+            }
+            args.insert("id".into(), json!(id));
+            args.insert("to".into(), json!(ticket_role(to, "--to")?));
+            if let Some(from) = from {
+                args.insert("from".into(), json!(ticket_role(from, "--from")?));
+            }
+            args.insert("message".into(), json!(ticket_message_id(message)?));
+            args.insert("text".into(), json!(body));
+            "issue_message_send"
+        }
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Messages { id, to, after },
+        } => {
+            args.insert("id".into(), json!(id));
+            if let Some(to) = to {
+                args.insert("to".into(), json!(ticket_role(to, "--to")?));
+            }
+            if let Some(after) = after {
+                args.insert("after".into(), json!(ticket_seq(*after, "--after")?));
+            }
+            "issue_messages"
+        }
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::MessagesRead { id, role, through },
+        } => {
+            args.insert("id".into(), json!(id));
+            args.insert("role".into(), json!(ticket_role(role, "--role")?));
+            args.insert("through".into(), json!(ticket_seq(*through, "--through")?));
+            "issue_messages_read"
+        }
+        Commands::Issue {
+            action:
                 cadence_agent::issue::cli::IssueAction::Comment {
                     id,
                     text,
@@ -1009,6 +1060,55 @@ fn platform_replay_key(tool: &str, query: Option<&Value>, body: Option<&Value>) 
     serde_json::to_writer(&mut writer, &Material { body, query, tool })
         .expect("JSON values serialize to the hash writer");
     format!("pcli_{:x}", writer.0.finalize())
+}
+
+/// The tenant's own cap on a ticket message, so an oversized one stays off the wire.
+const TICKET_MESSAGE_BYTES: usize = 16_000;
+
+/// A role on a ticket: a free label, in the tenant's grammar.
+fn ticket_role<'a>(value: &'a str, flag: &str) -> Result<&'a str> {
+    let mut chars = value.chars();
+    let shaped = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && value.len() <= 32;
+    if shaped {
+        Ok(value)
+    } else {
+        Err(Error::rejected(format!(
+            "{flag} must be a role of 1-32 lowercase letters, digits or hyphens, starting \
+             with a letter — nothing was sent"
+        )))
+    }
+}
+
+/// A ticket message's stable id, in the tenant's grammar.
+fn ticket_message_id(value: &str) -> Result<&str> {
+    let mut chars = value.chars();
+    let shaped = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && value.len() <= 64
+        && !value.starts_with(cadence_agent::proto::DAEMON_MESSAGE_PREFIX);
+    if shaped {
+        Ok(value)
+    } else {
+        Err(Error::rejected(
+            "--message must be 1-64 lowercase letters, digits or hyphens, not starting with \
+             '-', never `sys-*` — nothing was sent",
+        ))
+    }
+}
+
+/// A `seq` the tenant can compare exactly: it is a JavaScript safe integer there.
+fn ticket_seq(value: u64, flag: &str) -> Result<u64> {
+    if value < (1 << 53) {
+        Ok(value)
+    } else {
+        Err(Error::rejected(format!(
+            "{flag} is too large to be a message seq — nothing was sent"
+        )))
+    }
 }
 
 /// CAD-1568: `send`/`message send` → `message_send` arguments. Exactly
@@ -3273,6 +3373,118 @@ mod read_contract_tests {
         })
         .unwrap();
         assert_eq!(args, json!({"id": "CAD-1", "limit": 10}));
+    }
+
+    #[test]
+    fn ticket_message_verbs_send_exactly_what_the_tenant_reads() {
+        let say = |from: Option<&str>| {
+            outcome(&Commands::Issue {
+                action: IssueAction::Say {
+                    id: "CAD-1".into(),
+                    to: "developer".into(),
+                    from: from.map(Into::into),
+                    message: "tm-1".into(),
+                    text: Some("REVISE: head moved".into()),
+                    file: None,
+                },
+            })
+            .unwrap()
+        };
+        let (verb, args) = say(Some("reviewer"));
+        assert_eq!(verb, "issue_message_send");
+        assert_eq!(
+            args,
+            json!({
+                "id": "CAD-1",
+                "to": "developer",
+                "from": "reviewer",
+                "message": "tm-1",
+                "text": "REVISE: head moved",
+            })
+        );
+        // Unset options are absent, not null: the tenant's argument check is exact.
+        assert!(say(None).1.get("from").is_none());
+
+        let messages = |to: Option<&str>, after: Option<u64>| {
+            outcome(&Commands::Issue {
+                action: IssueAction::Messages {
+                    id: "CAD-1".into(),
+                    to: to.map(Into::into),
+                    after,
+                },
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            messages(None, None),
+            ("issue_messages", json!({"id": "CAD-1"}))
+        );
+        assert_eq!(
+            messages(Some("developer"), Some(7)).1,
+            json!({"id": "CAD-1", "to": "developer", "after": 7})
+        );
+
+        let (verb, args) = outcome(&Commands::Issue {
+            action: IssueAction::MessagesRead {
+                id: "CAD-1".into(),
+                role: "developer".into(),
+                through: 7,
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "issue_messages_read");
+        assert_eq!(
+            args,
+            json!({"id": "CAD-1", "role": "developer", "through": 7})
+        );
+    }
+
+    #[test]
+    fn ticket_message_verbs_refuse_a_bad_value_before_the_wire() {
+        let say = |to: &str, from: Option<&str>, message: &str, text: &str| {
+            outcome(&Commands::Issue {
+                action: IssueAction::Say {
+                    id: "CAD-1".into(),
+                    to: to.into(),
+                    from: from.map(Into::into),
+                    message: message.into(),
+                    text: Some(text.into()),
+                    file: None,
+                },
+            })
+        };
+        assert!(say(&"r".repeat(32), None, &"m".repeat(64), &"x".repeat(16_000)).is_ok());
+        for bad in [
+            say("Not A Role", None, "tm-1", "hi"),
+            say("-dev", None, "tm-1", "hi"),
+            say("", None, "tm-1", "hi"),
+            say(&"r".repeat(33), None, "tm-1", "hi"),
+            say("developer", Some("Not A Role"), "tm-1", "hi"),
+            say("developer", None, "sys-reserved", "hi"),
+            say("developer", None, "-leading", "hi"),
+            say("developer", None, &"m".repeat(65), "hi"),
+            say("developer", None, "tm-1", "   "),
+            say("developer", None, "tm-1", &"x".repeat(16_001)),
+        ] {
+            assert!(bad.unwrap_err().contains("nothing was sent"));
+        }
+        let too_big = 1u64 << 53;
+        assert!(outcome(&Commands::Issue {
+            action: IssueAction::Messages {
+                id: "CAD-1".into(),
+                to: None,
+                after: Some(too_big),
+            },
+        })
+        .is_err());
+        assert!(outcome(&Commands::Issue {
+            action: IssueAction::MessagesRead {
+                id: "CAD-1".into(),
+                role: "developer".into(),
+                through: too_big,
+            },
+        })
+        .is_err());
     }
 
     #[test]

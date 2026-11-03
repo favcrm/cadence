@@ -421,6 +421,27 @@ selected workspace's supported ticket update, for example:
 cadence --org acme issue set <issue-id> status=done --if-rev <issue-rev>
 ```
 
+### Leaving a message for a role on a ticket
+
+A session can leave a message for whoever holds a role on a ticket. The role is
+a label, so the next holder still gets it after the first session has gone.
+
+```sh
+cadence --org acme issue say <issue-id> --to developer --from reviewer \
+  --message <stable-id> -m "REVISE: see the verdict on the new head"
+cadence --org acme issue messages <issue-id> --to developer
+cadence --org acme issue messages-read <issue-id> --role developer --through <last-seq>
+```
+
+- `state: "stored"` is all a send proves. Nothing wakes a session or proves a read.
+- Reuse the same `--message` and text to retry a send whose answer was lost.
+- Read with `--to`, and repeat with `--after <last-seq>` while `more` is true.
+  Without `--to`, the unread map stops at 100 roles and `unread_more` says so.
+- Pass `--through` the last `seq` you received. The read point is shared by
+  everyone in the role, so one reader marking read hides messages from the others.
+- `from` is a label. `sender_subject` is verified, and it is the member, not the
+  session. A message approves nothing and changes nothing on the ticket.
+
 ### Reviewing software changes
 
 The owning repository's delivery policy determines the required reviews,
