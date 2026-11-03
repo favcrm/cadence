@@ -2,7 +2,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "bun:test";
 import { BOARD_MESSAGE_KIND } from "../src/contract.ts";
-import { threadEntries } from "../src/transcript.ts";
+import { projectedThreadEntries, threadEntries } from "../src/transcript.ts";
 
 const input = (
   id: string,
@@ -470,5 +470,49 @@ describe("board transcript identity", () => {
       false,
     );
     expect(Object.hasOwn(untimed[0], "created")).toBe(false);
+  });
+});
+
+describe("projectedThreadEntries", () => {
+  const records = [input("1", "hello")];
+
+  it("returns the runtime's entries unchanged without a projection", () => {
+    expect(projectedThreadEntries(records, false)).toEqual(
+      threadEntries(records, false),
+    );
+  });
+
+  it("applies the host's projection without changing the stored records", () => {
+    const before = JSON.stringify(records);
+    // Anchored to an entry and renumbered from there, as the contract asks: what
+    // follows the anchor moves by one, consistently, on every read.
+    const seen = projectedThreadEntries(records, false, (entries) =>
+      entries.flatMap((entry, index) =>
+        index === 0
+          ? [entry, { seq: 2, role: "agent", kind: "artifact", text: "" }]
+          : [{ ...entry, seq: entry.seq + 1 }],
+      ),
+    );
+    expect(seen.map((entry) => entry.kind)).toContain("artifact");
+    expect(seen.map((entry) => entry.seq)).toEqual(seen.map((_, index) => index + 1));
+    expect(seen).toHaveLength(threadEntries(records, false).length + 1);
+    expect(JSON.stringify(records)).toBe(before);
+  });
+
+  it("hands the host's projection the operator entry's app binding, and keeps it", () => {
+    const app = { install_id: "install_ledger", context_id: "campaign" };
+    const scoped = [
+      input("1", "ledger question", {
+        messageId: "op-1",
+        app: { installId: "install_ledger", contextId: "campaign" },
+      }),
+    ];
+    let given: unknown;
+    const seen = projectedThreadEntries(scoped, false, (entries) => {
+      given = entries[0]?.payload?.app;
+      return entries;
+    });
+    expect(given).toEqual(app);
+    expect(seen[0]?.payload?.app).toEqual(app);
   });
 });

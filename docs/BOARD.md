@@ -182,9 +182,15 @@ created: 2026-09-17T16:01:23Z
 |---|---|
 | `status` | A container's status rolls up from its children; else a bound job's task states (`dispatched`/`running`/`revising` → `doing`, `review` and `verified` → `review`, `done` → `done`, `blocked` only flags `blocked_reason`); else a terminal file status (`done`/`dropped` — merge evidence or an explicit set, which no note can reopen); else the latest note carrying `Issue: <id>` (`-kickoff` → `doing`, `-qa` → `review`, `-verdict` → `review` — a verdict is a review outcome, pass or not; notes never derive `done` — on that side the file field carries it, set by reconcile/`mark_done_on_merge` on merge evidence or by hand); else the file. `verified` stays `review` until `job accept`. `status_source` says which: `rollup` \| `job` \| `notes` \| `file`. Draft tasks are unstarted templates and never drive the board. |
 | `blocks` / `duplicates` | Inverses of `blocked_by` / `duplicate_of`, computed at read time. |
-| `ready` | Leaf issue, status `ready`, nothing unfinished in `blocked_by`. |
-| `blocked` | Any `blocked_by` target not `done`. |
+| `ready` | Leaf issue with status `backlog` or `ready` that is not blocked. |
+| `blocked` | A `blocked_by` target is absent or is neither `done` nor `dropped`, or a task in the selected job is blocked. |
 | counts, activity, sessions | Comments/artifacts/refs lengths; merged notes+comments+git log; agents bound through `agent.tasks` × `jobs.issue_id` — exact, never a text scan. |
+
+When several jobs bind to an issue, the newest nonterminal job wins by numeric
+creation time; equal times use the job ID in descending order. If every job is
+terminal, the newest terminal job wins. If any job in the group has a
+nonnumeric creation time, the selector retains its previous string-and-ID
+ordering; this fallback does not establish that the job state is safe or current.
 
 Statuses: `backlog ready doing review done dropped`. Issues are never
 deleted — `dropped` is the end state. `dropped` issues don't render on

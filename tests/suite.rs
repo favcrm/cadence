@@ -276,3 +276,216 @@ fn a_shared_checkout_is_registered_by_both_projects_and_never_first_matched() {
         "beta"
     );
 }
+
+// CAD-2014 acceptance, authored independently of the fix; implementers must
+// not edit it. Native `job_list` emits `created` as a JSON number (the store
+// column is REAL), so issue-bound job selection must order timestamps
+// numerically. These checks drive the shared decision seam the CLI and the
+// board read use: `board::outcomes_from_jobs` for the chosen job's outcome
+// and `board::views_with_jobs` for the resulting issue readiness.
+mod cad2014_job_readiness {
+    use cadence_agent::issue::board::{self, Issue, JobOutcome, View};
+    use cadence_agent::issue::model::Front;
+    use serde_json::{json, Map, Value};
+    use std::path::{Path, PathBuf};
+
+    const NOTES: &str = "/nonexistent-cad2014-notes";
+
+    fn job(id: &str, issue: &str, state: &str, created: f64, tasks: &[&str]) -> Value {
+        json!({
+            "id": id,
+            "issue": issue,
+            "state": state,
+            "created": created,
+            "tasks": tasks
+                .iter()
+                .map(|state| (state.to_string(), json!(1)))
+                .collect::<Map<String, Value>>(),
+        })
+    }
+
+    fn issue(id: &str, status: &str) -> Issue {
+        let mut front = Front::new(id, "synthetic", "2026-11-03T00:00:00Z");
+        front.status = status.to_string();
+        Issue {
+            project: "cadence".to_string(),
+            dir: PathBuf::from("/nonexistent-cad2014-issue"),
+            front,
+            body: String::new(),
+            comments: vec![],
+            artifacts: vec![],
+        }
+    }
+
+    fn view_of<'a>(views: &'a [View], id: &str) -> &'a View {
+        views
+            .iter()
+            .find(|view| view.issue.front.id == id)
+            .expect("issue view")
+    }
+
+    /// The reported bug: `created` values are numeric, so a string comparator
+    /// ties them and the inverted ids pick the older job `z`. Its only task is
+    /// the auto-created draft stub, which yields no outcome, so the issue
+    /// falls through to its file `ready` status even though the newer job `a`
+    /// has a blocked task.
+    #[test]
+    fn a_newer_blocked_job_is_not_hidden_by_an_older_unstarted_one() {
+        let jobs = vec![
+            job("z", "CAD-2014", "open", 1.0, &["draft"]),
+            job("a", "CAD-2014", "open", 2.0, &["blocked"]),
+        ];
+        let outcomes = board::outcomes_from_jobs(&jobs);
+        assert_eq!(outcomes.get("CAD-2014"), Some(&JobOutcome::Blocked));
+
+        let views = board::views_with_jobs(
+            Path::new(NOTES),
+            vec![issue("CAD-2014", "ready")],
+            &outcomes,
+        );
+        let view = view_of(&views, "CAD-2014");
+        assert_eq!(view.blocked_reason, Some("job blocked"));
+        assert!(
+            view.blocked,
+            "the newer job's blocked task must block the issue"
+        );
+        assert!(
+            !view.ready,
+            "a newer blocked job must not leave the issue ready"
+        );
+    }
+
+    /// Numeric `created` is the ordering; an id that sorts the other way must
+    /// not win. Both id directions are exercised so a fix cannot pass by
+    /// continuing to sort ids.
+    #[test]
+    fn numeric_created_order_beats_an_inverted_job_id() {
+        let newer_smaller_id = vec![
+            job("z", "CAD-2014", "open", 1.0, &["running"]),
+            job("a", "CAD-2014", "open", 2.0, &["blocked"]),
+        ];
+        assert_eq!(
+            board::outcomes_from_jobs(&newer_smaller_id).get("CAD-2014"),
+            Some(&JobOutcome::Blocked)
+        );
+
+        let newer_larger_id = vec![
+            job("a", "CAD-2014", "open", 1.0, &["running"]),
+            job("z", "CAD-2014", "open", 2.0, &["blocked"]),
+        ];
+        assert_eq!(
+            board::outcomes_from_jobs(&newer_larger_id).get("CAD-2014"),
+            Some(&JobOutcome::Blocked)
+        );
+    }
+
+    /// Equal `created` keeps the established deterministic tie-break:
+    /// descending id, so `z` (running) wins over `a` (blocked), and the result
+    /// does not depend on the daemon's list order.
+    #[test]
+    fn equal_timestamps_use_a_stable_id_tie() {
+        let jobs = vec![
+            job("a", "CAD-2014", "open", 7.0, &["blocked"]),
+            job("z", "CAD-2014", "open", 7.0, &["running"]),
+        ];
+        let forward = board::outcomes_from_jobs(&jobs);
+        assert_eq!(forward.get("CAD-2014"), Some(&JobOutcome::Status("doing")));
+
+        let mut reversed = jobs.clone();
+        reversed.reverse();
+        let backward = board::outcomes_from_jobs(&reversed);
+        assert_eq!(backward.get("CAD-2014"), Some(&JobOutcome::Status("doing")));
+    }
+
+    /// The newest non-terminal job wins over a newer terminal one.
+    #[test]
+    fn a_newer_terminal_job_does_not_hide_an_older_active_job() {
+        let jobs = vec![
+            job("active", "CAD-2014", "open", 1.0, &["running"]),
+            job("terminal", "CAD-2014", "done", 2.0, &["done"]),
+        ];
+        assert_eq!(
+            board::outcomes_from_jobs(&jobs).get("CAD-2014"),
+            Some(&JobOutcome::Status("doing"))
+        );
+    }
+
+    /// With no live job, the numeric newest terminal job decides. A string
+    /// comparator ties on created and picks the older failed job `z`, which
+    /// yields no outcome at all.
+    #[test]
+    fn all_terminal_jobs_fall_back_to_the_newest_terminal_job() {
+        let newest_done = vec![
+            job("z", "CAD-2014", "failed", 1.0, &["failed"]),
+            job("a", "CAD-2014", "done", 2.0, &["done"]),
+        ];
+        assert_eq!(
+            board::outcomes_from_jobs(&newest_done).get("CAD-2014"),
+            Some(&JobOutcome::Status("done"))
+        );
+
+        // A cancelled newest job reports no board outcome.
+        let newest_cancelled = vec![
+            job("z", "CAD-2014", "done", 1.0, &["done"]),
+            job("a", "CAD-2014", "cancelled", 2.0, &["cancelled"]),
+        ];
+        assert_eq!(
+            board::outcomes_from_jobs(&newest_cancelled).get("CAD-2014"),
+            None
+        );
+    }
+
+    /// Empty input and a single bound job are handled without inventing an
+    /// issue entry; an unbound job is ignored.
+    #[test]
+    fn no_jobs_and_a_single_job_are_handled() {
+        assert!(board::outcomes_from_jobs(&[]).is_empty());
+
+        let single = vec![job("only", "CAD-2014", "open", 3.0, &["blocked"])];
+        assert_eq!(
+            board::outcomes_from_jobs(&single).get("CAD-2014"),
+            Some(&JobOutcome::Blocked)
+        );
+
+        let unbound = vec![job("loose", "", "open", 4.0, &["blocked"])];
+        assert!(board::outcomes_from_jobs(&unbound).is_empty());
+    }
+
+    /// Unsupported `created` values are not demoted to "oldest" while a
+    /// numeric sibling wins: the original comparator kept its complete
+    /// string/id ordering for the whole issue group whenever any `created` is
+    /// nonnumeric. The missing/null/garbage timestamp therefore keeps `z`
+    /// (blocked) ahead of `a` (created 2, draft-only). Demoting `z` would
+    /// select `a`, yield no job outcome, and make the issue falsely ready.
+    #[test]
+    fn mixed_malformed_timestamps_keep_the_original_blocked_choice() {
+        let mut missing = job("z", "CAD-2014", "open", 1.0, &["blocked"]);
+        missing.as_object_mut().unwrap().remove("created").unwrap();
+        let mut null = missing.clone();
+        null["created"] = Value::Null;
+        let mut garbage = missing.clone();
+        garbage["created"] = json!("garbage");
+
+        for blocked_z in [missing, null, garbage] {
+            let jobs = vec![blocked_z, job("a", "CAD-2014", "open", 2.0, &["draft"])];
+            let outcomes = board::outcomes_from_jobs(&jobs);
+            assert_eq!(
+                outcomes.get("CAD-2014"),
+                Some(&JobOutcome::Blocked),
+                "a nonnumeric created must not demote the blocked job"
+            );
+
+            let views = board::views_with_jobs(
+                Path::new(NOTES),
+                vec![issue("CAD-2014", "ready")],
+                &outcomes,
+            );
+            let view = view_of(&views, "CAD-2014");
+            assert!(view.blocked);
+            assert!(
+                !view.ready,
+                "mixed malformed timestamps must not fake readiness"
+            );
+        }
+    }
+}

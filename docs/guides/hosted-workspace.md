@@ -72,6 +72,8 @@ model registry or nested-execution API.
 two optional domain-data callbacks on `HostedSessionOptions`: `identity()`
 returns the current personal profile or workspace identity, and
 `threadContext()` returns the thread's public projection. Both carry data only.
+A host may also supply `projectThread` to add entries, such as artifact cards, to
+what every thread read reports; its contract is on `HostedSessionOptions`.
 Prompt text, model messages, engine hooks and SDK types are not accepted
 through them, and a generic host that supplies neither keeps its current
 behavior.

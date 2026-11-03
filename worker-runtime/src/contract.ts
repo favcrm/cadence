@@ -65,6 +65,13 @@ export interface ThreadEntry {
      * binding back unchanged.
      */
     app?: { install_id: string; context_id?: string };
+    /** A host's artifact card, with the board's `kind: "artifact"`; never the content. */
+    id?: string;
+    version?: number;
+    kind?: string;
+    title?: string;
+    bytes?: number;
+    digest?: string;
   };
 }
 
@@ -207,7 +214,27 @@ export interface ThreadContext {
  * `requestModel` is the only model path: the runtime never calls a provider,
  * holds provider credentials or chooses a fallback route.
  */
+/** A host's addition to the board's thread entries; see `projectThread`. */
+export type ThreadProjection = (
+  entries: readonly ThreadEntry[],
+) => readonly ThreadEntry[];
+
 export interface HostedSessionOptions {
+  /**
+   * Add host entries to what the board reads, on every thread path. It sees a
+   * copy of the projection, and changes neither stored records nor what the
+   * model receives. Absent, the runtime's entries are returned unchanged.
+   *
+   * Clients resume from `seq`, so a projection must be synchronous and
+   * repeatable, and return ascending positive safe integers that stay stable as
+   * the thread grows. Anchor an entry to the record it belongs to (a tool
+   * result's `tool_use_id`, not a position), so it is present from the moment
+   * that record is, and never add one at or before a `seq` a client may hold.
+   * Owner and member views number differently, so derive `seq` from the entries
+   * given. A batch runs only on a session commit, so state changed outside one
+   * appears at the next commit or reconnect. A throw refuses the read.
+   */
+  readonly projectThread?: ThreadProjection;
   /** The platform default alias this deployment sends. */
   readonly modelAlias: string;
   /**

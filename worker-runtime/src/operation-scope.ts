@@ -149,8 +149,9 @@ export function appPayload(app: AppScope): {
 }
 
 /**
- * The app scope one stored entry carries, or `null` for a Home entry and for
- * any entry that is not an operator submission. A malformed stored scope
+ * The app scope one stored entry carries, or `null` for a Home entry (a
+ * readable board entry without an app) and for any entry that is not an
+ * operator submission. A malformed stored scope
  * throws: a caller that acts on the scope must refuse rather than act outside
  * the envelope the operation was admitted with, and a reader that projects it
  * must fail rather than present the operation as Home.
@@ -160,8 +161,10 @@ export function parseEntryAppScope(
   data: unknown,
 ): AppScope | null {
   if (kind !== BOARD_MESSAGE_KIND) return null;
+  // The board's own entry always stores an object. Anything else is a record
+  // this reader cannot prove Home, so it refuses rather than reading Home.
   if (typeof data !== "object" || data === null || Array.isArray(data))
-    return null;
+    throw new Error("The stored operation entry is malformed.");
   if (!("app" in data) || data.app === undefined) return null;
   return parseAppScope(data.app);
 }

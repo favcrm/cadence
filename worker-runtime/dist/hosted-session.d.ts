@@ -120,8 +120,9 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
     private inputEntry;
     /**
      * The app scope of the operation whose input root is this engine submission,
-     * read from the placed entry the engine stored. `null` is Home: the operation
-     * was admitted without a scope, or the input is not an operation at all.
+     * read from the placed entry the engine stored. `null` is proven Home: a
+     * readable input entry that carries no scope. An entry that cannot be read
+     * throws, so the caller refuses rather than running an app turn as Home.
      */
     private operationAppScope;
     /** What the runtime has not settled yet, so the board can show queued/running/parked. */

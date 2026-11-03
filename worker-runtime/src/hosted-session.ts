@@ -67,7 +67,7 @@ import {
 import { sessionEventResponse } from "./session-stream.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
-import { threadEntries } from "./transcript.ts";
+import { projectedThreadEntries } from "./transcript.ts";
 
 /**
  * The last model the platform gateway reported serving for this conversation.
@@ -107,7 +107,10 @@ export class HostedSession<
   private readonly toolAppScope: AppScopeResolver = async (api, context) => {
     const live = await api.snapshot(LiveDoc, api.conversationId, context);
     const run = live?.run;
-    if (run === undefined || run.inputs.length === 0) return null;
+    // A tool executes inside a run that has inputs. Reading anything else as
+    // Home would run an app turn unscoped, so the call refuses instead.
+    if (run === undefined || run.inputs.length === 0)
+      throw new Error("The active run's operation envelope is unavailable.");
     return runAppScope(run.inputs, (root) => this.operationAppScope(root));
   };
 
@@ -259,6 +262,28 @@ export class HostedSession<
       // Capture the watch before reading its snapshot so commits between the
       // initial read and subscription are buffered, not silently missed.
       const stream = await this.harness.session().events();
+      // Project before SSE 200, so a failing projection refuses like the master
+      // projection above rather than opening a body that errors and reconnects.
+      let snapshotEntries: ThreadEntry[];
+      try {
+        snapshotEntries = projectedThreadEntries(
+          stream.snapshot.entries,
+          thinking,
+          this.options.projectThread,
+        );
+      } catch {
+        await stream.stop();
+        return Response.json(
+          {
+            ok: false,
+            error: {
+              code: "capability_unavailable",
+              message: "The thread projection is unavailable.",
+            },
+          },
+          { status: 503 },
+        );
+      }
       function emit(entry: ThreadEntry, send: (frame: string) => void): void {
         if (entry.seq <= last) return;
         send(
@@ -275,8 +300,7 @@ export class HostedSession<
           // It reports this object's real turn state. A host projection
           // composes under those runtime fields and cannot replace them.
           send(masterFrame);
-          for (const entry of threadEntries(stream.snapshot.entries, thinking))
-            emit(entry, send);
+          for (const entry of snapshotEntries) emit(entry, send);
         },
         events: async (_events, send) => {
           for (const entry of await this.transcript(thinking))
@@ -328,9 +352,10 @@ export class HostedSession<
 
   /** Map the engine's committed records, including durable input metadata, for the board. */
   async transcript(includeThinking: boolean): Promise<ThreadEntry[]> {
-    return threadEntries(
+    return projectedThreadEntries(
       await this.harness.session().messages(),
       includeThinking,
+      this.options.projectThread,
     );
   }
 
@@ -515,15 +540,15 @@ export class HostedSession<
 
   /**
    * The app scope of the operation whose input root is this engine submission,
-   * read from the placed entry the engine stored. `null` is Home: the operation
-   * was admitted without a scope, or the input is not an operation at all.
+   * read from the placed entry the engine stored. `null` is proven Home: a
+   * readable input entry that carries no scope. An entry that cannot be read
+   * throws, so the caller refuses rather than running an app turn as Home.
    */
   private operationAppScope(root: string): AppScope | null {
     const entry = readSubmissionEntry(
       this.ctx.storage.sql as unknown as TaskSql,
       root,
     );
-    if (entry === null) return null;
     return parseEntryAppScope(entry.kind, entry.data);
   }
 

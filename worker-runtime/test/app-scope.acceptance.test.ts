@@ -77,20 +77,22 @@ import {
  * engine's queue/replay behaviour, both on `MemoryStorage` and on the session's
  * own SQLite where the guard reads the engine's `pi_` tables.
  *
- * What this file does NOT prove: the Durable Object construction and lifecycle
- * around `HostedSession`. This repository has no Workers runtime rig — no
- * `wrangler`/`miniflare`/`@cloudflare/vitest-pool-workers` configuration, and
- * `bun test` cannot resolve `cloudflare:workers` — so the platform base is
- * stubbed here and the session is driven through its prototype methods. That
- * gap is reported as a blocker, not papered over.
+ * Not covered here: the Workers runtime itself (Durable Object lifecycle,
+ * eviction and alarms). This repository has no Workers rig, and `bun test`
+ * cannot resolve `cloudflare:workers`, so the platform base is stubbed below.
+ * The session's own constructor does run over that stub in the last describe
+ * block, so the wiring it installs is exercised rather than copied.
  */
 
 // `hosted-session.ts` imports its Durable Object base from the platform
 // module. `bun test` cannot resolve it, so the base is stubbed for this file
-// only; no session is constructed, and the stub is never reached at runtime.
+// only. It carries no behaviour the session relies on.
 mock.module("cloudflare:workers", () => ({
   DurableObject: class {
-    constructor(_ctx: unknown, _env: unknown) {}
+    constructor(
+      readonly ctx: unknown,
+      readonly env: unknown,
+    ) {}
   },
 }));
 
@@ -241,6 +243,7 @@ function scriptedModels(
   models.setProvider(provider);
   return {
     models,
+    provider,
     observations,
     requests,
     /** Resolves when the current gate's request has been observed. */
@@ -1178,7 +1181,7 @@ function scopeReaders(database: Database) {
   const store = sqlStore(database);
   const load = (root: string): AppScope | null => {
     const entry = readSubmissionEntry(store, root);
-    return entry === null ? null : parseEntryAppScope(entry.kind, entry.data);
+    return parseEntryAppScope(entry.kind, entry.data);
   };
   const forTool: AppScopeResolver = async (api, context) => {
     const live = await api.snapshot(LiveDoc, api.conversationId, context);
@@ -1867,5 +1870,302 @@ describe("hosted operation envelope", () => {
       await harness.close(BACKGROUND_CONTEXT);
       database.close();
     }
+  });
+});
+
+/**
+ * The session's own constructor over the stubbed platform base and a real
+ * SQLite: its models, registry and installed extensions are what a turn runs
+ * through, with only the model provider replaced by the scripted one.
+ */
+async function constructedSession(
+  database: Database,
+  options: {
+    tools: RuntimeTool[];
+    authorizeTool?: (name: string) => Promise<void>;
+  },
+) {
+  const { HostedSession } = await import("../src/hosted-session.ts");
+  const session = new HostedSession(
+    {
+      id: { name: "conversation" },
+      storage: { sql: sqlStore(database) },
+    } as never,
+    {},
+    {
+      modelAlias: "scripted",
+      requestModel: async () => new Response(null, { status: 500 }),
+      tools: [{ name: "wiring-tools", tools: options.tools }],
+      authorizeTool: options.authorizeTool ?? (async () => {}),
+      toolRefusal: () => undefined,
+    },
+  );
+  return session as unknown as {
+    models: ReturnType<typeof createModels>;
+    registry: ReturnType<typeof createRegistry>;
+    toolAppScope: AppScopeResolver;
+    operationAppScope(root: string): AppScope | null;
+  };
+}
+
+describe("session wiring", () => {
+  it("runs a queued app turn, then a Home turn, with each turn's own scope through the constructed session", async () => {
+    const { database } = sessionDatabase();
+    const seen: Array<AppScope | undefined> = [];
+    const probe: RuntimeTool = {
+      name: "scope_probe",
+      description: "Report the app scope of the turn.",
+      parameters: { type: "object", properties: {} },
+      async execute(_input, invocation) {
+        seen.push(invocation.app);
+        return { output: [{ type: "text", text: "noted" }] };
+      },
+    };
+    let calls = 0;
+    const scripted = scriptedModels(
+      ({ hasToolResult }) =>
+        hasToolResult
+          ? assistantReply("done")
+          : toolCallReply(`wired-${(calls += 1)}`, "scope_probe"),
+    );
+    const session = await constructedSession(database, { tools: [probe] });
+    session.models.setProvider(scripted.provider);
+    const storage = await SqliteStorage.open(sqliteFacade(database), {
+      prefix: "pi_",
+    });
+    const harness = await Harness.open(
+      storage,
+      { models: session.models, registry: session.registry },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const conversation = await harness.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      const first = await conversation.submit(
+        {
+          type: "input",
+          requestId: "op-ledger",
+          content: "ledger question",
+          entry: operationEntry("op-ledger", LEDGER_CAMPAIGN),
+        },
+        BACKGROUND_CONTEXT,
+      );
+      await scripted.started;
+      // Queued while the app turn is running.
+      const second = await conversation.submit(
+        {
+          type: "input",
+          requestId: "op-home",
+          content: "home question",
+          entry: operationEntry("op-home"),
+        },
+        BACKGROUND_CONTEXT,
+      );
+      scripted.release();
+      expect((await first.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      expect((await second.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+
+      const ledgerRequest = scripted.observations.find(
+        (observation) => observation.user === "ledger question",
+      );
+      expect(ledgerRequest?.system).toContain(
+        "install_id install_ledger, context_id campaign",
+      );
+      const homeRequest = scripted.observations.find(
+        (observation) => observation.user === "home question",
+      );
+      expect(homeRequest, "the queued Home turn reached the provider").toBeDefined();
+      expect(homeRequest?.system).not.toContain("install_id install_ledger");
+      expect(seen).toEqual([LEDGER_CAMPAIGN, undefined]);
+    } finally {
+      scripted.release();
+      await harness.close(BACKGROUND_CONTEXT);
+      database.close();
+    }
+  }, 30_000);
+
+  it("refuses a tool call through the constructed session before its handler runs", async () => {
+    const { database } = sessionDatabase();
+    let effects = 0;
+    const probe: RuntimeTool = {
+      name: "scope_probe",
+      description: "Record a call.",
+      parameters: { type: "object", properties: {} },
+      async execute() {
+        effects += 1;
+        return { output: [{ type: "text", text: "noted" }] };
+      },
+    };
+    const session = await constructedSession(database, {
+      tools: [probe],
+      authorizeTool: async () => {
+        throw new Error("session_revoked");
+      },
+    });
+    const scripted = scriptedModels(
+      ({ hasToolResult }) =>
+        hasToolResult
+          ? assistantReply("done")
+          : toolCallReply("revoked-call", "scope_probe"),
+      { gate: false },
+    );
+    session.models.setProvider(scripted.provider);
+    const storage = await SqliteStorage.open(sqliteFacade(database), {
+      prefix: "pi_",
+    });
+    const harness = await Harness.open(
+      storage,
+      { models: session.models, registry: session.registry },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const conversation = await harness.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      const turn = await conversation.submit(
+        {
+          type: "input",
+          requestId: "op-ledger",
+          content: "ledger question",
+          entry: operationEntry("op-ledger", LEDGER),
+        },
+        BACKGROUND_CONTEXT,
+      );
+      await turn.wait(BACKGROUND_CONTEXT);
+      expect(scripted.observations.length).toBeGreaterThan(0);
+      expect(effects).toBe(0);
+    } finally {
+      await harness.close(BACKGROUND_CONTEXT);
+      database.close();
+    }
+  }, 30_000);
+
+  it("rechecks authority on every execution of an app tool, ahead of the handler", async () => {
+    let permitted = true;
+    let effects = 0;
+    const probe: RuntimeTool = {
+      name: "scope_probe",
+      description: "Record a call.",
+      parameters: { type: "object", properties: {} },
+      async execute() {
+        effects += 1;
+        return { output: [{ type: "text", text: "noted" }] };
+      },
+    };
+    let resolved = 0;
+    const extension = runtimeExtension(
+      { name: "wiring-tools", tools: [probe] },
+      {
+        toolRefusal: () => undefined,
+        authorizeTool: async () => {
+          if (!permitted) throw new Error("session_revoked");
+        },
+      },
+      async () => {
+        resolved += 1;
+        return null;
+      },
+    );
+    const execute = extension.tools![0]!.execute;
+    const api = { conversationId: 1, taskId: 2, now: () => 0 } as never;
+    await execute({}, api, {} as never);
+    expect(effects).toBe(1);
+    permitted = false;
+    await expect(execute({}, api, {} as never)).rejects.toThrow(
+      "session_revoked",
+    );
+    expect(effects).toBe(1);
+    // A refused call resolves no scope either.
+    expect(resolved).toBe(1);
+  });
+
+  it("places the admitted app scope on the entry through submit and ask", async () => {
+    const { database } = sessionDatabase();
+    const entries: Array<{ kind: string; data: JsonObject } | undefined> = [];
+    const session = await sessionOver(
+      {
+        submit: async (_text, options) => {
+          entries.push(options.entry);
+          return { accepted: true, operationId: options.operationId };
+        },
+        prompt: async (_text, options) => {
+          entries.push(options.entry);
+          return { status: "done", text: "ok", operationId: options.operationId };
+        },
+      },
+      new OperationScopes(sqlStore(database)),
+      sqlStore(database),
+    );
+    await session.submit("first", "op-submit", LEDGER_CAMPAIGN);
+    await session.ask("second", "op-ask", LEDGER);
+    await session.submit("third", "op-home");
+    expect(entries).toEqual([
+      operationEntry("op-submit", LEDGER_CAMPAIGN),
+      operationEntry("op-ask", LEDGER),
+      operationEntry("op-home"),
+    ]);
+    database.close();
+  });
+
+  it("refuses a tool call that has no active run instead of reading it as Home", async () => {
+    const { database } = sessionDatabase();
+    const session = await constructedSession(database, { tools: [] });
+    const api = {
+      conversationId: 1,
+      taskId: 2,
+      snapshot: async () => undefined,
+    } as never;
+    await expect(session.toolAppScope(api, {} as never)).rejects.toThrow();
+    database.close();
+  });
+
+  it("refuses a provider request that carries no attestation from the constructed session", async () => {
+    const { database } = sessionDatabase();
+    const session = await constructedSession(database, { tools: [] });
+    const scripted = scriptedModels("must not run", { gate: false });
+    session.models.setProvider(scripted.provider);
+    expect(() =>
+      session.models.streamSimple(MODEL, {
+        messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
+      }),
+    ).toThrow(/attestation/);
+    expect(scripted.observations).toHaveLength(0);
+    database.close();
+  });
+
+  it("refuses to read an unavailable placed entry as Home", () => {
+    const { database } = sessionDatabase();
+    const store = sqlStore(database);
+    database.exec(
+      "CREATE TABLE pi_submissions (id INTEGER PRIMARY KEY, record TEXT); CREATE TABLE pi_entries (id INTEGER PRIMARY KEY, record TEXT)",
+    );
+    const submission = (id: number, record: unknown) =>
+      database
+        .prepare("INSERT INTO pi_submissions (id, record) VALUES (?, ?)")
+        .run(id, JSON.stringify(record));
+    submission(1, { type: "input", entry: 1 });
+    submission(2, { type: "input" });
+    submission(3, { type: "input", entry: 99 });
+    database
+      .prepare("INSERT INTO pi_entries (id, record) VALUES (1, ?)")
+      .run(JSON.stringify({ kind: BOARD_MESSAGE_KIND, data: { messageId: "op" } }));
+
+    // A readable board entry without an app is proven Home.
+    expect(
+      parseEntryAppScope(
+        readSubmissionEntry(store, "1").kind,
+        readSubmissionEntry(store, "1").data,
+      ),
+    ).toBeNull();
+    // Everything else is unavailable, never Home.
+    expect(() => readSubmissionEntry(store, "404")).toThrow();
+    expect(() => readSubmissionEntry(store, "2")).toThrow();
+    expect(() => readSubmissionEntry(store, "3")).toThrow();
+    database.exec("DROP TABLE pi_entries");
+    expect(() => readSubmissionEntry(store, "1")).toThrow();
+    expect(() => parseEntryAppScope(BOARD_MESSAGE_KIND, "not-an-object")).toThrow();
+    expect(() => parseEntryAppScope(BOARD_MESSAGE_KIND, undefined)).toThrow();
+    database.close();
   });
 });

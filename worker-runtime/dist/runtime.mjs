@@ -55960,20 +55960,20 @@ function readGenerationIdentity(sql) {
   return { conversation, task, cutoff: cutoffValue };
 }
 function readSubmissionEntry(sql, submissionId) {
+  const unavailable = () => new Error(`Submission "${submissionId}" has no readable placed entry.`);
   const id = Number(submissionId);
   if (!Number.isSafeInteger(id) || id <= 0)
-    return null;
+    throw unavailable();
   const submission = record4(sql, "pi_submissions", id);
-  if (submission === null || !("type" in submission))
-    return null;
-  if (submission.type !== "input")
-    return null;
-  if (!("entry" in submission))
-    return null;
+  if (submission === null || submission.type !== "input")
+    throw unavailable();
   const entryId = submission.entry;
   if (typeof entryId !== "number" || !Number.isSafeInteger(entryId) || entryId <= 0)
-    return null;
-  return entryData(sql, entryId);
+    throw unavailable();
+  const entry = entryData(sql, entryId);
+  if (entry === null)
+    throw unavailable();
+  return entry;
 }
 function submissionHeld(sql, operationId) {
   if (!hasSubmissions(sql))
@@ -56053,12 +56053,7 @@ function parseRecord(stored) {
   }
 }
 function record4(sql, table, id) {
-  let row;
-  try {
-    row = sql.exec(`SELECT record FROM ${table} WHERE id=?`, id).toArray()[0];
-  } catch {
-    return null;
-  }
+  const row = sql.exec(`SELECT record FROM ${table} WHERE id=?`, id).toArray()[0];
   if (row === undefined)
     return null;
   return parseRecord(row.record);
@@ -56386,7 +56381,7 @@ function parseEntryAppScope(kind, data) {
   if (kind !== BOARD_MESSAGE_KIND)
     return null;
   if (typeof data !== "object" || data === null || Array.isArray(data))
-    return null;
+    throw new Error("The stored operation entry is malformed.");
   if (!("app" in data) || data.app === undefined)
     return null;
   return parseAppScope(data.app);
@@ -57030,6 +57025,10 @@ function toolCallText(name, args) {
 function createdAt(timestamp) {
   return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0 ? { created: new Date(timestamp).toISOString() } : {};
 }
+function projectedThreadEntries(records, includeThinking, project) {
+  const entries = threadEntries(records, includeThinking);
+  return project ? [...project(entries)] : entries;
+}
 function threadEntries(records, includeThinking) {
   const entries = [];
   const all = records.flatMap((record) => record.model ?? []);
@@ -57132,7 +57131,7 @@ class HostedSession extends DurableObject {
     const live = await api.snapshot(LiveDoc, api.conversationId, context);
     const run = live?.run;
     if (run === undefined || run.inputs.length === 0)
-      return null;
+      throw new Error("The active run's operation envelope is unavailable.");
     return runAppScope(run.inputs, (root) => this.operationAppScope(root));
   };
   harness;
@@ -57211,13 +57210,26 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
         }, { status: 503 });
       }
       const stream = await this.harness.session().events();
+      let snapshotEntries;
+      try {
+        snapshotEntries = projectedThreadEntries(stream.snapshot.entries, thinking, this.options.projectThread);
+      } catch {
+        await stream.stop();
+        return Response.json({
+          ok: false,
+          error: {
+            code: "capability_unavailable",
+            message: "The thread projection is unavailable."
+          }
+        }, { status: 503 });
+      }
       return sessionEventResponse(stream, {
         snapshot: (send) => {
           send(`: connected
 
 `);
           send(masterFrame);
-          for (const entry of threadEntries(stream.snapshot.entries, thinking))
+          for (const entry of snapshotEntries)
             emit(entry, send);
         },
         events: async (_events, send) => {
@@ -57257,7 +57269,7 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
     };
   }
   async transcript(includeThinking) {
-    return threadEntries(await this.harness.session().messages(), includeThinking);
+    return projectedThreadEntries(await this.harness.session().messages(), includeThinking, this.options.projectThread);
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;
@@ -57333,8 +57345,6 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
   }
   operationAppScope(root) {
     const entry = readSubmissionEntry(this.ctx.storage.sql, root);
-    if (entry === null)
-      return null;
     return parseEntryAppScope(entry.kind, entry.data);
   }
   async pendingOperations() {

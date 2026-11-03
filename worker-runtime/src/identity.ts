@@ -124,28 +124,32 @@ export interface StoredEntryData {
  *
  * Each of a run's inputs is a submission id. Its record names the placed
  * entry, and that entry is immutable, so the runtime reads the envelope it
- * actually admitted instead of re-deriving a scope from a caller. A missing
- * row, an unplaced or non-input submission, or an unparsable record yields
- * `null`; this never guesses.
+ * actually admitted instead of re-deriving a scope from a caller. This never
+ * guesses and never answers "nothing": a missing row, a failed read, a
+ * non-input submission, one with no placed entry or an unusable record all
+ * throw, so a caller can tell "proven Home" (a readable entry without an app)
+ * from "unavailable" and refuse the latter.
  */
 export function readSubmissionEntry(
   sql: TaskSql,
   submissionId: string,
-): StoredEntryData | null {
+): StoredEntryData {
+  const unavailable = () =>
+    new Error(`Submission "${submissionId}" has no readable placed entry.`);
   const id = Number(submissionId);
-  if (!Number.isSafeInteger(id) || id <= 0) return null;
+  if (!Number.isSafeInteger(id) || id <= 0) throw unavailable();
   const submission = record(sql, "pi_submissions", id);
-  if (submission === null || !("type" in submission)) return null;
-  if (submission.type !== "input") return null;
-  if (!("entry" in submission)) return null;
+  if (submission === null || submission.type !== "input") throw unavailable();
   const entryId = submission.entry;
   if (
     typeof entryId !== "number" ||
     !Number.isSafeInteger(entryId) ||
     entryId <= 0
   )
-    return null;
-  return entryData(sql, entryId);
+    throw unavailable();
+  const entry = entryData(sql, entryId);
+  if (entry === null) throw unavailable();
+  return entry;
 }
 
 /**
@@ -330,8 +334,8 @@ function parseRecord(stored: unknown): Record<string, unknown> | null {
 }
 
 /**
- * One row's parsed `record`, or `null` when the row is absent, unreadable or
- * not a JSON object. The row's id is already known by the caller, so only the
+ * One row's parsed `record`, or `null` when the row is absent or not a JSON
+ * object. A failed SQL read throws. The row's id is already known by the caller, so only the
  * body is read.
  */
 function record(
@@ -339,12 +343,10 @@ function record(
   table: "pi_submissions" | "pi_entries",
   id: number,
 ): Record<string, unknown> | null {
-  let row: Record<string, unknown> | undefined;
-  try {
-    row = sql.exec(`SELECT record FROM ${table} WHERE id=?`, id).toArray()[0];
-  } catch {
-    return null;
-  }
+  // A failed read propagates: callers must not read it as an absent row.
+  const row = sql
+    .exec(`SELECT record FROM ${table} WHERE id=?`, id)
+    .toArray()[0];
   if (row === undefined) return null;
   return parseRecord(row.record);
 }
