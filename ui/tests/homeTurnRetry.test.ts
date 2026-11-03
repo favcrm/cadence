@@ -29,6 +29,8 @@ const Home = require<typeof HomeModule>("../src/features/home/Home").default;
 const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
 const { resources } = require<typeof Stores>("../src/lib/resources");
 const { setImmediate: nextTurn } = require<{ setImmediate: () => Promise<void> }>("node:timers/promises");
+// What a hosted board's state read answers while a case holds its working flag.
+let hostedStateRead: unknown = null;
 const posts: Record<string, unknown>[] = [];
 // The stream's own master frame: the fixture emits it on open, so a turn the
 // test wants the stream to report must be in this object, not only the store.
@@ -53,6 +55,7 @@ globalThis.fetch = async (input, init) => {
     commands.push(JSON.parse(String(init?.body)) as { command?: string; message?: string });
     return json({ ok: true, state: "stopped" });
   }
+  if (url.pathname === "/api/master/state" && hostedStateRead !== null) return json(hostedStateRead);
   if (url.pathname === "/api/threads/master") return json({ thread: { id: "home-thread", alias: "master" }, entries, more_before: false });
   if (url.pathname === "/api/master/state") return json({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] });
   if (url.pathname === "/api/agents") return json({ daemon: "reachable", agents: [{ alias: "master", state: "idle" }], totals: null });
@@ -417,6 +420,7 @@ async function main() {
   assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "the hosted run has one typing row");
   assert(host.querySelector('[data-kind="answer"]') === null && !host.textContent?.includes("Earlier transcript"), "an interim note stays in the trace while the hosted turn runs");
   // The answer usually arrives a read before the working flag clears.
+  hostedStateRead = hostedState(hostedTurn);
   await React.act(async () => {
     resources.masterThread.write((state) => ({
       ...state!,
@@ -425,6 +429,7 @@ async function main() {
   });
   await settle();
   assert(host.querySelectorAll(".turn-head").length === 1, `no second head while the flag catches up (got ${host.querySelectorAll(".turn-head").length})`);
+  hostedStateRead = null;
   await React.act(async () => { resources.masterState.write(() => hostedState(null)); });
   await settle();
   assert(host.querySelectorAll(".turn-head").length === 1 && host.querySelectorAll('[data-kind="answer"]').length === 1, "the answer lands under the one head");

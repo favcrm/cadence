@@ -817,6 +817,14 @@ equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no 
   await settle();
   equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "the open run types for an unnamed turn");
   equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows an unnamed turn's run");
+  // The answer lands a read before the working flag clears: still one head.
+  threads["c-hosted"].push(ent(4, "agent", "turn_result", "hosted answer", null));
+  await React.act(async () => {
+    await conversationThread("c-hosted").refresh();
+    await resources.masterConversation("c-hosted").refresh();
+  });
+  await settle();
+  equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head under an unnamed turn's answer");
   turn = before;
   await React.act(async () => { await resources.masterConversation("c-hosted").refresh(); });
   await settle();
