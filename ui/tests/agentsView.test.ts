@@ -677,6 +677,14 @@ async function main() {
   await flush();
   assert(!servedHost.querySelector(".ag-chat-panel")?.textContent?.includes("no role text"), "an unread read claims no role text");
   assert(!servedHost.querySelector(".ag-chat-main")?.textContent?.includes("Some details"), "a missing agent has one answer, the gate");
+  // An ordinary failed read for an unlisted agent can still recover, so it keeps its Retry.
+  detailNotServed = false;
+  failDetail = true;
+  await mountServed("nobody", "overview", liveRoster);
+  const failedUnlisted = servedHost.querySelector(".ag-chat-main")?.textContent ?? "";
+  assert(failedUnlisted.includes("Some details aren’t available") && failedUnlisted.includes("Retry"), "a failed read for an unlisted agent keeps its line and Retry");
+  failDetail = false;
+  detailNotServed = true;
   await mountServed("dev", "history", liveRoster);
   assert(servedHost.textContent?.includes(NOT_RECORDED), "a known agent's history says it isn't recorded");
   assert(!servedHost.querySelector(".rc-cats"), "no filters over a history the board doesn't keep");
