@@ -47,6 +47,13 @@ unless ALL of these hold for the pinned head:
     `cadence audit approval` reports an approval in
     force for exactly this head. This script never records an approval.
 
+Review standard (operator decision 2026-11-03, CAD-1946): a valid review is a
+fresh-context session that is not the author, a subagent included (AGENTS.md
+"Review"). This gate does not enforce that: hosted verdicts count by attested
+principal and the author's is refused, local notes count by their self-declared
+`From:` alias (not attested), so it cannot tell a fresh session from the author
+under one login. Until it can, the temporary exception below is the merge path.
+
 CAD-1946 temporary exception: `--exception --advisory standards=<url> --advisory
 spec-security=<url>` (and `browser-qa=<url>` for a `ui/` change) waives only the
 missing authenticated reviewer attestation, and on a hosted routine PR the readiness
@@ -54,7 +61,9 @@ proof hosted can't produce yet, which the evidence names. Every other rule still
 holds, a filed non-pass verdict still refuses, the operator must have approved this exact head
 (no scope fallback), and the signature and evidence say it is an exception. The
 advisory links are findings from separately assigned sessions, not verdicts: the
-gate cannot prove their independence, and the operator accepts that. Ends at
+gate cannot prove they are fresh sessions, and the operator accepts that. The
+exception only checks that the links are separate https URLs: it proves neither
+head binding nor that Browser QA ran. Ends at
 `EXCEPTION_ENDS` in scripts/delivery-gate.
 
 CAD-2001 release order: the tenant server must serve the project-scoped gate
@@ -89,6 +98,18 @@ DEFAULT_NOTES_DIR = "/var/www/agent-notes"
 GATE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "delivery-gate")
 DEFAULT_GATE_KEY = "~/.config/cadence/delivery-gate/signing_key"  # CAD-1925
 ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
+# The review standard is a fresh-session review (AGENTS.md "Review", CAD-1946), which
+# this gate cannot yet enforce. Refusals for a missing or shared reviewer point at
+# the temporary exception and the standard.
+# A filed row by the author is refused even under --exception, and an advisory link does not clear it.
+AUTHOR_ROW_HINT = (" (a filed row under the author's identity still refuses under --exception, and an "
+                   "advisory link does not clear it. The author's own review can never be an advisory; "
+                   "only a fresh non-author session's review can)")
+REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a non-author session, "
+                        "and this gate cannot yet tell one from the author under one login: use "
+                        "--exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate. "
+                        "A verdict filed under the author's identity still refuses under the exception, "
+                        "so a same-login session posts its findings as a PR comment and files no verdict)")
 
 # Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
 # AGENTS.md list. A verdict note's `Risk: human` also makes a diff human.
@@ -767,7 +788,7 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
             elif (n.get("github_login") or "").strip().lower() in authors:
                 reasons.append(
                     f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
-                    f"the owner attested that login as the PR author")
+                    f"the owner attested that login as the PR author{AUTHOR_ROW_HINT}")
             elif not hosted.get("author_principal"):
                 # CAD-2049: without the author's principal, no row can be proven
                 # not to be the author's — a second login is not a second person.
@@ -778,11 +799,11 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
             elif (n.get("reviewer_id") or "").strip() == hosted["author_principal"]:
                 reasons.append(
                     f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
-                    f"its principal is the PR author's ({hosted['author_principal']})")
+                    f"its principal is the PR author's ({hosted['author_principal']}){AUTHOR_ROW_HINT}")
             else:
                 counted.append(n)
         elif who in authors:
-            reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']})")
+            reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']}){AUTHOR_ROW_HINT}")
         else:
             counted.append(n)
     if hosted is not None:
@@ -813,14 +834,14 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
         return reasons, counted
     if qualifies_one:
         if not (combined or two):
-            reasons.append(f"no pass verdict for {issue} pinned to this head (one review is required)")
+            reasons.append(f"no pass verdict for {issue} pinned to this head (one review is required){REVIEW_STANDARD_HINT}")
     else:
         if not std:
-            reasons.append(f"no pass Standards verdict for {issue} pinned to this head")
+            reasons.append(f"no pass Standards verdict for {issue} pinned to this head{REVIEW_STANDARD_HINT}")
         if not spec:
-            reasons.append(f"no pass Spec/security verdict for {issue} pinned to this head")
+            reasons.append(f"no pass Spec/security verdict for {issue} pinned to this head{REVIEW_STANDARD_HINT}")
         if std and spec and not two:
-            reasons.append("the Standards and Spec/security verdicts come from the same reviewer; two distinct reviewers are required")
+            reasons.append(f"the Standards and Spec/security verdicts come from the same reviewer; two distinct reviewers are required{REVIEW_STANDARD_HINT}")
     if need_qa and not by("browser-qa"):
         reasons.append(f"a ui/ change needs a pass Browser QA verdict for {issue} pinned to this head, from someone other than the author")
     return reasons, counted

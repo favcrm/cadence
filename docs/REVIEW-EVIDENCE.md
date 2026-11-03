@@ -39,7 +39,10 @@ future publisher must read GitHub and recheck those heads itself.
 ## Remaining boundary before GitHub protection
 
 The current shared GitHub credential and manual `qa-verdict` status cannot
-authenticate an independent reviewer. Repository writers can publish
+authenticate a reviewer. (The review standard itself is a fresh-session review,
+AGENTS.md "Review": a non-author session with no inherited context. Nothing
+here enforces it; merges use the temporary exception until `EXCEPTION_ENDS`
+in `scripts/delivery-gate`.) Repository writers can publish
 ordinary statuses, so the eventual required check must be bound to a
 dedicated GitHub App identity, with its publishing credential confined to
 a trusted bridge process outside worker/reviewer environments. The daemon

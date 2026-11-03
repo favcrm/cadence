@@ -713,6 +713,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_media_read", Rule::Handler("operator_connection + consumed live mount + declared media.read (CAD-1365)")),
     ("app_media_chat_attach", Rule::Handler("operator_connection + consumed live mount + declared media.chat.attach (CAD-1482)")),
     ("app_media_publish", Rule::Handler("operator_connection + consumed live mount + declared media.publish (CAD-1365)")),
+    ("app_media_import", Rule::Handler("operator_connection + consumed live mount + declared media.import (CAD-1962)")),
     // The frame-GET peer: authority is the burned one-use nonce, not a
     // connection class — the handler binds it to the consuming session.
     ("app_screen_consume", Rule::Handler("operator_connection + burned one-use frame capability + stored-session liveness (CAD-1006)")),
@@ -1587,6 +1588,17 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "wiki_index_refresh",
         Rule::Handler("operator_connection (CAD-719)"),
+    ),
+    // CAD-2018: the native trash browser. Operator-only and
+    // connection-bound like the index reads; no `wiki_as` and no
+    // identity field is accepted, so a relayed claim cannot enter.
+    (
+        "wiki_trash_list",
+        Rule::Handler("operator_connection; no wiki_as/identity field (CAD-2018)"),
+    ),
+    (
+        "wiki_trash_items",
+        Rule::Handler("operator_connection; no wiki_as/identity field (CAD-2018)"),
     ),
     // CAD-129: submitting a test run is a mutation attributed to the
     // caller. Reading a job, its log, or the queue is not.

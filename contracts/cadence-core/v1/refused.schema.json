@@ -31,7 +31,7 @@
           "const": "invalid_command"
         },
         {
-          "description": "The manifest is not a well-formed `app.md` with a valid `needs.requires`.",
+          "description": "The manifest is not a well-formed `app.md` with a valid `needs.requires`,\nor a screen package set is not well formed: its app-level screen count,\nits declaration grammar and bounds, or its declared↔supplied size/sha256\nfacts disagree.",
           "type": "string",
           "const": "invalid_manifest"
         }

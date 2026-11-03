@@ -1,14 +1,15 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import Link from "../../ui/Link";
-import { IconFolder, IconGrid, IconList, IconMore } from "../../ui/icons";
-import { wiki, wikiBlob, type WikiEntry } from "./api";
+import { IconFolder, IconGrid, IconList, IconMore, IconTrash } from "../../ui/icons";
+import { wiki, WikiError, wikiBlob, type WikiEntry } from "./api";
 import { baseName, joinPath, parentPath } from "./paths";
 import { withinScope } from "./scope";
 import { kindLabel, previewKind } from "./preview";
 import { entryOrder } from "./tree";
+import { confirmedDeleteLanding } from "./trash";
 import Button from "../../ui/Button";
-import { KindIcon, Loading, WikiImage, useWikiScope } from "./shared";
+import { KindIcon, Loading, Note, WikiImage, useWikiScope } from "./shared";
 import { useTranslate } from "../../lib/locale";
 import { onPrivateReadsPaused, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { sessionKey } from "../../lib/sessionKey";
@@ -18,10 +19,15 @@ import { sessionKey } from "../../lib/sessionKey";
  * menu (rename, move, download, delete-to-trash) and the empty state.
  */
 
+export type DeleteReceipt = { name: string; trash: string };
+
 export default function FolderPane({
   entries,
+  receipt,
+  onReceipt,
   navHref,
   readOnly,
+  trashHref,
   onRefresh,
   onToast,
   onFail,
@@ -29,6 +35,11 @@ export default function FolderPane({
   entries: WikiEntry[];
   navHref: (route: Route) => string;
   readOnly: boolean;
+  /** The operator's Trash screen; absent for a non-operator, who gets no
+   *  discovery. The landing receipt itself is shown either way. */
+  trashHref?: string | null;
+  receipt: DeleteReceipt | null;
+  onReceipt: (receipt: DeleteReceipt) => void;
   onRefresh: () => void;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onFail: (error: unknown, verb: string) => void;
@@ -71,6 +82,7 @@ export default function FolderPane({
     return () => window.removeEventListener("keydown", dismiss);
   }, [menu]);
 
+
   const rows = [...entries].sort(entryOrder);
   const openHref = (entry: WikiEntry) =>
     navHref({ screen: "wiki", mode: "browse", path: entry.path, query: null });
@@ -83,13 +95,21 @@ export default function FolderPane({
     if (!dialog || busy || readOnly) return;
     const value = dialog.value.trim();
     if (!value) return;
+    const from = dialog.entry.path;
+    const to = dialog.kind === "rename" ? joinPath(parentPath(from), value) : value;
+    // Nothing to do: closing is honest, and the server would refuse a
+    // self-move as "a directory into itself".
+    if (to === from) {
+      setDialog(null);
+      return;
+    }
     setBusy(true);
     try {
-      if (dialog.kind === "rename" && value.includes("/")) throw new Error("Use a file name without folders. Use Move to change its location.");
-      const to = dialog.kind === "rename" ? joinPath(parentPath(dialog.entry.path), value) : value;
+      if (dialog.kind === "rename" && value.includes("/")) throw new Error("Use a name without folders. Use Move to change the location.");
       if (scope && !withinScope(to, scope.root)) throw new Error("Choose a destination inside this project’s context");
-      await wiki.mv(dialog.entry.path, to);
-      onToast("ok", `${dialog.kind === "rename" ? "renamed" : "moved"} ${baseName(dialog.entry.path)}`);
+      if (dialog.entry.kind === "dir" && to.startsWith(`${from}/`)) throw new Error("A folder cannot move inside itself");
+      await wiki.mv(from, to);
+      onToast("ok", `${dialog.kind === "rename" ? "renamed" : "moved"} ${baseName(from)}`);
       setDialog(null);
       onRefresh();
     } catch (error) {
@@ -102,13 +122,27 @@ export default function FolderPane({
   const remove = async (entry: WikiEntry) => {
     setBusy(true);
     try {
-      await wiki.rm(entry.path);
-      onToast("ok", `${entry.name} moved to trash`);
+      // Both hosts answer the landing this delete created. Name it as the
+      // receipt, and (for the operator) offer the Trash screen as the way
+      // to find it again; the landing itself is never browsed from here.
+      const result = await wiki.rm(entry.path);
+      const landing = confirmedDeleteLanding(result, entry.path);
+      if (landing) {
+        onReceipt({ name: entry.name, trash: landing });
+        onToast("ok", `${entry.name} moved to ${landing}`);
+      } else {
+        onToast("warn", `Delete of ${entry.name} was not confirmed. Refresh and check the folder and Trash.`);
+      }
       setConfirm(null);
       setMenu(null);
       onRefresh();
     } catch (error) {
-      onFail(error, "delete");
+      if (error instanceof WikiError && [403, 404, 409].includes(error.status)) {
+        onFail(error, "delete");
+      } else {
+        onToast("warn", `Delete of ${entry.name} was not confirmed. Refresh and check the folder and Trash.`);
+        onRefresh();
+      }
     } finally {
       setBusy(false);
     }
@@ -144,15 +178,30 @@ export default function FolderPane({
     }
   };
 
+  // The receipt outlives the row it names, including when the delete
+  // emptied the folder: the landing is the operator's way back.
+  const receiptNote = receipt && (
+    <Note>
+      <IconTrash size={13} />
+      <span>
+        {receipt.name} {t("moved to")} <span className="num">{receipt.trash}</span>.
+        {trashHref && <> <Link className="lnk" href={trashHref}>{t("Open Trash")}</Link></>}
+      </span>
+    </Note>
+  );
+
   if (rows.length === 0) {
     return (
-      <div className="wk-empty card">
-        <IconFolder size={34} />
-        <div className="wk-etitle">{t("This folder is empty")}</div>
-        <div className="wk-ebody">
-          {readOnly ? t("nothing here yet — and writes are disabled for this board.") : t("start with New page, or drop files to upload.")}
+      <>
+        {receiptNote}
+        <div className="wk-empty card">
+          <IconFolder size={34} />
+          <div className="wk-etitle">{t("This folder is empty")}</div>
+          <div className="wk-ebody">
+            {readOnly ? t("nothing here yet — you can read this folder, but not add to it.") : t("start with New page, or drop files to upload.")}
+          </div>
         </div>
-      </div>
+      </>
     );
   }
 
@@ -175,16 +224,12 @@ export default function FolderPane({
         <>
           <div className="wk-menu-backdrop" onClick={() => setMenu(null)} />
           <div id={`${menuId}-${encodeURIComponent(entry.path)}`} className="wk-fmenu" role="group" aria-label={`${entry.name} actions`}>
-            {entry.kind === "page" && (
-              <>
-                <button type="button" onClick={() => { setMenu(null); setDialog({ kind: "rename", entry, value: entry.name }); }} disabled={readOnly}>
-                  {t("Rename")}
-                </button>
-                <button type="button" onClick={() => { setMenu(null); setDialog({ kind: "move", entry, value: entry.path }); }} disabled={readOnly}>
-                  {t("Move")}
-                </button>
-              </>
-            )}
+            <button type="button" onClick={() => { setMenu(null); setDialog({ kind: "rename", entry, value: entry.name }); }} disabled={readOnly}>
+              {t("Rename")}
+            </button>
+            <button type="button" onClick={() => { setMenu(null); setDialog({ kind: "move", entry, value: entry.path }); }} disabled={readOnly}>
+              {t("Move")}
+            </button>
             {(entry.kind === "page" || entry.kind === "file") && <button type="button" onClick={() => void downloadEntry(entry)}>{t("Download")}</button>}
             <button
               type="button"
@@ -202,6 +247,7 @@ export default function FolderPane({
 
   return (
     <>
+      {receiptNote}
       <div className="wk-viewrow">
         <span className="text-label text-ink-500">{rows.length} {rows.length === 1 ? "item" : "items"}</span>
         <span className="wk-vt" role="group" aria-label={t("Folder view")}>
@@ -240,8 +286,12 @@ export default function FolderPane({
           }}
         >
           <h2 className="wk-dialog-title">{dialog.kind === "rename" ? t("Rename") : t("Move")} {dialog.entry.name}</h2>
-          <label className="slabel" htmlFor={fieldId}>{dialog.kind === "rename" ? t("File name") : t("Destination path")}</label>
-          {dialog.kind === "move" && <p id={`${fieldId}-hint`} className="wk-dialog-hint">{t("Include the file name")}{scope ? ` ${t("and keep it inside this project’s context")}` : ` ${t("relative to Wiki")}`}.</p>}
+          <label className="slabel" htmlFor={fieldId}>
+            {dialog.kind === "rename"
+              ? dialog.entry.kind === "dir" ? t("Folder name") : t("File name")
+              : t("Destination path")}
+          </label>
+          {dialog.kind === "move" && <p id={`${fieldId}-hint`} className="wk-dialog-hint">{t("Include the name")}{scope ? ` ${t("and keep it inside this project’s context")}` : ` ${t("relative to Wiki")}`}.</p>}
           <input
             id={fieldId}
             name={dialog.kind === "rename" ? "name" : "destination"}
@@ -268,7 +318,7 @@ export default function FolderPane({
         <div className="wk-dialog card">
           <h2 className="wk-dialog-title">{t("Delete")} {baseName(confirm)}?</h2>
           <div className="text-secondary text-ink-300">
-            {t("This item moves to Trash. It can be restored later.")}
+            {t("This item moves to .trash/ with its stored bytes. Restoring it is the operator’s step.")}
           </div>
           <div className="wk-tools">
             <Button

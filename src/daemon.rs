@@ -141,6 +141,8 @@ mod caller_rule;
 mod chat_files_rpc;
 mod checkup;
 mod cli_rpc;
+#[cfg(all(test, feature = "test-seam"))]
+mod wiki_trash_guard_acceptance;
 #[cfg(all(test, feature = "cli-runtime-test"))]
 pub(crate) use cli_rpc::prime_jwks_for_test as prime_cli_jwks_for_test;
 #[cfg(all(test, feature = "test-seam"))]
@@ -180,6 +182,8 @@ pub(crate) mod custody_acceptance_fixture;
 #[cfg(all(test, unix, feature = "test-seam"))]
 mod custody_security_r2;
 mod delivery_requirements_rpc;
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+pub use delivery_requirements_rpc::queue_authority_acceptance;
 pub(crate) use delivery_requirements_rpc::{classify_from, GhRead, RequirementInputs};
 mod delivery_rpc;
 mod dispatch_rpc;
@@ -3964,6 +3968,7 @@ impl Shared {
             "app_media_read" => self.rpc_app_media_read(params, peer_pid),
             "app_media_chat_attach" => self.rpc_app_media_chat_attach(params, peer_pid),
             "app_media_publish" => self.rpc_app_media_publish(params, peer_pid),
+            "app_media_import" => self.rpc_app_media_import(params, peer_pid),
             "app_tool_revoke" => self.rpc_app_tool_revoke(params, peer_pid),
             "app_tool_result" | "app_tool_results" => self.rpc_app_tool_result(params, peer_pid),
             "app_run_capability_call" => self.rpc_app_capability(method, params, peer_pid),
@@ -4404,6 +4409,11 @@ impl Shared {
             // on `operator_connection`, never `wiki_caller`/`wiki_as`.
             "wiki_index_status" => self.rpc_wiki_index_status(params, peer_pid),
             "wiki_index_refresh" => self.rpc_wiki_index_refresh(params, peer_pid),
+            // CAD-2018: the native trash browser — operator-only,
+            // connection-bound like the index reads above; the field
+            // allowlist refuses any identity claim.
+            "wiki_trash_list" => self.rpc_wiki_trash_list(params, peer_pid),
+            "wiki_trash_items" => self.rpc_wiki_trash_items(params, peer_pid),
             // CAD-129: the deterministic test queue. Submit is attributed
             // to the caller; status, log and the queue summary are reads.
             "test_submit" => self.rpc_test_submit(params),

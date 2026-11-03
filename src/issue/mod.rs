@@ -14,7 +14,11 @@ pub mod app_catalog;
 pub mod app_chat;
 pub mod app_guard;
 pub mod app_listing;
-pub mod app_screen_decl;
+// CAD-2008: the screen declaration/integrity rules live in `cadence-core`, so
+// the native install/mount guard (`validate_map`) and the hosted
+// `app.screen.integrity` operation run one implementation. This re-export keeps
+// every existing `crate::issue::app_screen_decl` path working unchanged.
+pub use cadence_core::app_screen_decl;
 pub mod app_screen_pkg;
 pub mod app_source;
 pub mod app_view;
@@ -1166,6 +1170,9 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
   remains a later CAD-159 change.\n\
 - Every write is one git commit, serialised by a kernel lock on\n\
   `.git/cadence-write.flock` (`.write.lock` fences older binaries).\n";
+
+#[cfg(test)]
+mod app_screen_bound_acceptance;
 
 #[cfg(test)]
 mod lock_tests;

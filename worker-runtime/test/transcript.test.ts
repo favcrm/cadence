@@ -498,4 +498,21 @@ describe("projectedThreadEntries", () => {
     expect(seen).toHaveLength(threadEntries(records, false).length + 1);
     expect(JSON.stringify(records)).toBe(before);
   });
+
+  it("hands the host's projection the operator entry's app binding, and keeps it", () => {
+    const app = { install_id: "install_ledger", context_id: "campaign" };
+    const scoped = [
+      input("1", "ledger question", {
+        messageId: "op-1",
+        app: { installId: "install_ledger", contextId: "campaign" },
+      }),
+    ];
+    let given: unknown;
+    const seen = projectedThreadEntries(scoped, false, (entries) => {
+      given = entries[0]?.payload?.app;
+      return entries;
+    });
+    expect(given).toEqual(app);
+    expect(seen[0]?.payload?.app).toEqual(app);
+  });
 });

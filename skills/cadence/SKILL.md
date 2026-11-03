@@ -102,7 +102,7 @@ exactly that commit. Managed endpoints (codex/claude) never run
 a last line `SHA: <40-hex>` — the daemon reads the last such line as the
 reported revision.
 
-A ticket the master dispatched goes to independent review when you file
+A ticket the master dispatched goes to fresh-session review when you file
 its `done` report with the head and the PR (`sha: <40-hex>` and
 `pr: https://github.com/<owner>/<repo>/pull/<n>` in the frontmatter).
 A REVISE comes back to you as a message: fix it on the same branch, push,
@@ -481,7 +481,7 @@ install. Ask which they need:
 
 Never ask for a password, one-time code, cookie, device code or token in chat,
 and never copy another person's credential or browser cookie. A workspace
-invitation, credential consent and local-agent registration are three separate
+invitation, credential consent and `agent connect` registration are three separate
 actions; completing one does not perform the others. Do not offer `cadence
 setup` to a hosted user who only needs the board.
 
@@ -679,11 +679,22 @@ During implementation and handoff:
   as an admitted gate. Reuse eligible evidence and avoid duplicate full suites.
 - Self-check before handoff, including a simplification pass over your own
   diff (dead code, duplication, abstractions the change does not need; your
-  changed lines only, no behaviour change). Obtain the independent review
-  required by the project's policy; bind its verdict to the actual revision
-  and list checks run, skipped and limitations. An OMP session can perform a
-  genuine review, but a profile or separate session alone does not prove a
-  distinct authenticated principal or a gate-counted verdict.
+  changed lines only, no behaviour change). Obtain the review
+  the project's policy requires; bind its verdict to the actual revision and
+  list checks run, skipped and limitations. The standard is a fresh-session
+  review: a session that is not the author and inherits no conversation or
+  context from the work (a subagent qualifies; a fork or a resumed authoring
+  session does not). Brief it with the PR, the exact head and the ticket, not
+  your conclusions, and call it a fresh-session review, never independent
+  parties. In the Cadence repository the merge gate does not enforce this yet: hosted
+  verdicts count by attested principal (the author's is refused) and local notes by
+  their self-declared `From:` alias, so a same-login session must not file
+  one: hosted refuses it, and a local note's alias proves nothing. Post its
+  findings as a PR comment. In the Cadence
+  repository itself, merges use the temporary `--exception --advisory ...`
+  path (exact-head operator approval and two advisory links, plus browser-qa for a `ui/` change) until
+  `EXCEPTION_ENDS` (2026-11-10); it checks only that the links are separate https URLs.
+  A second attested human is not required.
 - Make review converge. First inspect the complete change against acceptance;
   verify each blocking finding with a concrete failure scenario and source
   evidence before sending it to the author. Report the class of bug and all
@@ -824,7 +835,7 @@ the failing iterations' output is the `stress-failures-*` artifact.
 5. Promote a lesson into a skill change only when it improves a recurring,
    broadly applicable decision. Keep project-specific design choices in scoped
    memory/ADRs. Change the smallest instruction, give it a realistic behavioral
-   check and independent review, and retain source/revision and supersession
+   check and fresh-session review, and retain source/revision and supersession
    evidence. A lesson cannot enlarge user scope or grant execution permissions.
 
 Curators consolidate at delivery/incident boundaries and batch accumulated

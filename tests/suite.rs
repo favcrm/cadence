@@ -489,3 +489,91 @@ mod cad2014_job_readiness {
         }
     }
 }
+
+// CAD-2055 acceptance, authored independently of the implementation;
+// implementers must not edit or weaken this real queue-guard check.
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+#[test]
+fn cad2055_native_queue_keeps_real_gates_after_test_job_retirement() {
+    use base64::Engine;
+    use cadence_agent::daemon::queue_authority_acceptance;
+    use cadence_agent::error::{Error, Result};
+    use serde_json::json;
+
+    let repo = "fixture/queue";
+    let base = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let rules = json!([{
+        "type": "merge_queue",
+        "ruleset_id": 7
+    }]);
+    let ruleset = json!({
+        "id": 7,
+        "enforcement": "active",
+        "target": "branch",
+        "current_user_can_bypass": "never",
+        "bypass_actors": [],
+        "rules": [{"type": "merge_queue"}]
+    });
+    let mut protection = json!({
+        "enforce_admins": {"enabled": true},
+        "required_status_checks": {
+            "contexts": ["fmt", "clippy", "build", "ui"],
+            "checks": [
+                {"context": "fmt", "app_id": 15368},
+                {"context": "clippy", "app_id": 15368},
+                {"context": "build", "app_id": 15368},
+                {"context": "ui", "app_id": 15368}
+            ]
+        }
+    });
+    // This is the current CI contract: four real jobs, no retired test job.
+    let workflow = r#"on: [pull_request, merge_group]
+jobs:
+  fmt: {runs-on: ubuntu-22.04, steps: [{run: "true"}]}
+  clippy: {runs-on: ubuntu-22.04, steps: [{run: "true"}]}
+  build: {runs-on: ubuntu-22.04, steps: [{run: "true"}]}
+  ui: {runs-on: ubuntu-22.04, steps: [{run: "true"}]}
+"#;
+    let contents = json!({
+        "encoding": "base64",
+        "content": base64::engine::general_purpose::STANDARD.encode(workflow)
+    });
+    let workflow_endpoint = format!("repos/{repo}/contents/.github/workflows/ci.yml?ref={base}");
+    let read = |args: &[&str]| -> Result<String> {
+        assert_eq!(args.len(), 2, "unexpected GitHub read: {args:?}");
+        assert_eq!(args[0], "api", "unexpected GitHub command: {args:?}");
+        match args[1] {
+            "repos/fixture/queue/rulesets/7" => Ok(ruleset.to_string()),
+            endpoint if endpoint == workflow_endpoint => Ok(contents.to_string()),
+            _ => panic!("unexpected GitHub read: {args:?}"),
+        }
+    };
+
+    queue_authority_acceptance(repo, base, &rules, Some(&protection), read)
+        .expect("a protected four-gate workflow must not require the retired test job");
+
+    // Operator settings can drop a still-existing gate. Keep their legacy
+    // contexts internally consistent so only the real integration floor
+    // can catch the missing ui protection, rather than an earlier check.
+    protection["required_status_checks"]["checks"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|check| check["context"] != "ui");
+    protection["required_status_checks"]["contexts"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|context| context != "ui");
+
+    let error = queue_authority_acceptance(repo, base, &rules, Some(&protection), read)
+        .expect_err("retiring test must not permit an unprotected real ui gate");
+    match error {
+        Error::Rejected(message) => assert_eq!(
+            message,
+            concat!(
+                "delivery requirements: operator must protect the existing ui ",
+                "integration gate before automatic landing"
+            )
+        ),
+        other => panic!("expected a queue-guard rejection, got {other:?}"),
+    }
+}

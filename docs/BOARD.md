@@ -119,7 +119,7 @@ and does not activate Private projects or qualify assistant/filesystem isolation
 through the existing `cli.read` actor-envelope protocol. The native server derives
 the owner from the verified user actor and accepts no arguments. A local-org CLI
 invocation explains that a hosted org is required. Existing project, issue, setup,
-membership and local-agent commands remain their current interfaces; this feature
+membership and `agent connect` commands remain their current interfaces; this feature
 adds no setup/access screens, work-proof format or agent-execution dashboard.
 
 

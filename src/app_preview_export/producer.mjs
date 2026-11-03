@@ -140,6 +140,7 @@ var CALL_VERBS = [
 	"publish.draft.cancel",
 	"media.read",
 	"media.publish",
+	"media.import",
 	"media.chat.attach"
 ];
 var SLOT_VERBS = [
@@ -159,6 +160,7 @@ var ORIGINAL_DOWNLOAD_VERB = "media.original.download";
 var MEDIA_VERBS = [
 	"media.read",
 	"media.publish",
+	"media.import",
 	"media.chat.attach"
 ];
 /** The verbs a screen.v2 PUSH advertises in `actions` — media verbs are
