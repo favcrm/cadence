@@ -309,6 +309,12 @@ async function main() {
   assert(profileWork(claimed("result"), owned)?.id === "DEMO-2", "an ended claim does not outrank open owned work");
   const ended = profileWork(claimed("failed"), []);
   assert(ended?.id === "DEMO-9" && ended.state === "last" && ended.title === undefined, "an ended claim outside the list is the last work, by id alone");
+  for (const bad of [{ state: "running" }, { issue_id: 7, state: "running" }, { issue_id: "", state: "running" }, "x", 7, [], {}, { issue_id: "DEMO-9", state: "paused" }, { issue_id: "DEMO-9", state: "constructor" }]) {
+    const malformed = { ...profile, latest_claim: bad } as unknown as typeof profile;
+    assert(profileWork(malformed, []) === null, `a malformed or unknown claim names no work: ${JSON.stringify(bad)}`);
+    assert(profileWork(malformed, owned)?.state === "open", `owned work still shows beside a bad claim: ${JSON.stringify(bad)}`);
+    assert(profileMatchesFilter(malformed, "idle"), `a bad claim doesn't move the filter: ${JSON.stringify(bad)}`);
+  }
   const inFilter = (state: string, filter: Parameters<typeof profileMatchesFilter>[1]) => profileMatchesFilter(claimed(state), filter);
   assert(inFilter("running", "working") && !inFilter("running", "idle"), "a running claim files under Working, not Idle");
   assert(inFilter("blocked", "attention") && !inFilter("blocked", "idle"), "a blocked claim files under Needs attention");

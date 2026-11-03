@@ -226,7 +226,7 @@ export function profileMatchesFilter(p: HiredProfile, filter: AgentFilter): bool
 
 export function profileMatchesSearch(p: HiredProfile, query: string): boolean {
   const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
-  const text = [p.alias, p.role, p.team_role, p.catalogue, p.latest_claim?.issue_id].filter(Boolean).join(" ").toLowerCase();
+  const text = [p.alias, p.role, p.team_role, p.catalogue, usableClaim(p)?.issue_id].filter(Boolean).join(" ").toLowerCase();
   return terms.every((term) => text.includes(term));
 }
 
@@ -246,8 +246,19 @@ const LIVE_CLAIMS = new Map<string, ProfileWork["state"]>([
   ["waiting", "waiting"],
 ]);
 
+const ENDED_CLAIMS = new Set(["failed", "result", "cancelled"]);
+
+/** The claim to show, or none. The payload isn't validated, and a card must never
+ *  say work started on nothing, or read a state it doesn't know as finished. */
+function usableClaim(p: HiredProfile): { issue_id: string; state: string } | null {
+  const claim = p.latest_claim;
+  if (!claim || typeof claim.issue_id !== "string" || !claim.issue_id || typeof claim.state !== "string") return null;
+  return LIVE_CLAIMS.has(claim.state) || ENDED_CLAIMS.has(claim.state) ? claim : null;
+}
+
 function liveClaimState(p: HiredProfile): ProfileWork["state"] | undefined {
-  return p.latest_claim ? LIVE_CLAIMS.get(p.latest_claim.state) : undefined;
+  const claim = usableClaim(p);
+  return claim ? LIVE_CLAIMS.get(claim.state) : undefined;
 }
 
 /** In order: a live claim, the newest open issue the profile owns, then the last
@@ -258,7 +269,7 @@ export function profileWork(p: HiredProfile, issues: IssueCard[]): ProfileWork |
     const title = issues.find((issue) => issue.id === id)?.title;
     return title === undefined ? { id, state } : { id, title, state };
   };
-  const claim = p.latest_claim;
+  const claim = usableClaim(p);
   const live = liveClaimState(p);
   if (claim && live) return titled(claim.issue_id, live);
   const owned = issues
