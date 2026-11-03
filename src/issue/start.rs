@@ -179,7 +179,9 @@ pub(crate) fn configured_integration<'a>(
 
 /// Base resolution for a new lane.
 ///
-/// An explicit `--base` is used as given. Otherwise the base is the
+/// An explicit `--base` is used as given, except that a branch name `origin`
+/// carries resolves to the remote's current tip (see
+/// [`verify_explicit_base`]). Otherwise the base is the
 /// project's integration ref, fetched from the remote: `configured`
 /// (`repos[].base`), else `origin/HEAD` when that symbolic ref exists,
 /// else the remote's symbolic HEAD (`git ls-remote --symref origin
@@ -198,7 +200,7 @@ pub(crate) fn resolve_base(
 ) -> Result<ResolvedBase> {
     if let Some(base) = flag {
         return Ok(ResolvedBase {
-            sha: verify_base(root, base)?,
+            sha: verify_explicit_base(root, base)?,
             name: base.to_string(),
             warning: None,
         });
@@ -234,6 +236,48 @@ fn pin_integration(root: &Path, base: String) -> Result<ResolvedBase> {
         sha,
         warning,
     })
+}
+
+/// An explicit `--base` naming a branch that exists on `origin` resolves to
+/// the remote's tip now, not to a local ref that may lag it. An unreachable
+/// origin or a refused fetch refuses the start. A full commit SHA, a ref
+/// origin does not carry as a branch (a local branch, a tag), and a
+/// repository with no `origin` keep resolving locally.
+fn verify_explicit_base(root: &Path, base: &str) -> Result<String> {
+    let is_sha = matches!(base.len(), 40 | 64) && base.chars().all(|c| c.is_ascii_hexdigit());
+    if is_sha || !origin_configured(root) {
+        return verify_base(root, base);
+    }
+    let branch = base
+        .strip_prefix("refs/remotes/origin/")
+        .or_else(|| base.strip_prefix("refs/heads/"))
+        .or_else(|| base.strip_prefix("origin/"))
+        .unwrap_or(base);
+    if !valid_branch(branch) {
+        return verify_base(root, base);
+    }
+    let listed = git(
+        root,
+        &[
+            "ls-remote",
+            "--heads",
+            "origin",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .map_err(|e| {
+        Error::rejected(format!(
+            "Could not reach origin to resolve base '{base}' in {} ({e}) — retry when origin is \
+             reachable; no stale local ref was used",
+            root.display()
+        ))
+    })?;
+    if listed.trim().is_empty() {
+        return verify_base(root, base);
+    }
+    let remote_ref = format!("origin/{branch}");
+    fetch_integration(root, &remote_ref)?;
+    verify_base(root, &remote_ref)
 }
 
 fn verify_base(root: &Path, base: &str) -> Result<String> {
@@ -1661,6 +1705,60 @@ mod resolve_base_tests {
         let resolved = resolve_base(&fix.checkout, Some("side"), None).expect("override");
         assert_eq!(resolved.sha, fix.side_sha);
         assert!(resolved.warning.is_none());
+    }
+
+    #[test]
+    fn explicit_branch_base_is_the_remote_tip_not_a_stale_local_ref() {
+        let fix = fixture();
+        // Advance origin/main from a second clone; the checkout's local
+        // `main` and its remote-tracking ref both stay behind.
+        let other = fix._tmp.path().join("other");
+        let origin = fix._tmp.path().join("origin.git");
+        run_git(
+            fix._tmp.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        run_git(&other, &["config", "user.email", "t@example.com"]);
+        run_git(&other, &["config", "user.name", "t"]);
+        std::fs::write(other.join("n"), "newer\n").unwrap();
+        run_git(&other, &["add", "n"]);
+        run_git(&other, &["commit", "--quiet", "-m", "newer"]);
+        run_git(
+            &other,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+        let remote_tip = rev(&other, "HEAD");
+        assert_ne!(remote_tip, fix.main_sha);
+        assert_eq!(rev(&fix.checkout, "main"), fix.main_sha);
+
+        let resolved = resolve_base(&fix.checkout, Some("main"), None).expect("fresh");
+        assert_eq!(resolved.name, "main");
+        assert_eq!(resolved.sha, remote_tip);
+
+        // A full SHA is used as given.
+        let pinned = resolve_base(&fix.checkout, Some(&fix.main_sha), None).expect("sha");
+        assert_eq!(pinned.sha, fix.main_sha);
+    }
+
+    #[test]
+    fn explicit_branch_base_refuses_when_origin_is_unreachable() {
+        let fix = fixture();
+        run_git(
+            &fix.checkout,
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        );
+        let error = resolve_base(&fix.checkout, Some("main"), None).expect_err("must refuse");
+        assert!(
+            error.to_string().contains("Could not reach origin"),
+            "{error}"
+        );
+        // A full SHA does not need the remote.
+        resolve_base(&fix.checkout, Some(&fix.main_sha), None).expect("sha");
     }
 
     #[test]
