@@ -23,7 +23,7 @@ fn show_register_code(url: &str, code: &str, no_open: bool) -> Result<()> {
     Ok(())
 }
 
-fn show_workspace_handover(slug: &str, stored: &Value) {
+fn show_workspace_handover(slug: &str, stored: &Value, explicit_auth_dir: bool) {
     let selected = stored.get("selected").and_then(Value::as_bool);
     match selected {
         Some(true) => println!("Saved default: {slug}"),
@@ -35,6 +35,19 @@ fn show_workspace_handover(slug: &str, stored: &Value) {
         || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
     {
         println!("Use the workspace bound to your agent assignment.");
+        return;
+    }
+    if explicit_auth_dir {
+        println!(
+            "This login used --auth-dir. Hosted commands use the default credential directory; \
+             if they differ, sign in without --auth-dir before using those commands."
+        );
+        if org::inherited_local_pin() {
+            println!(
+                "This shell is also bound to local Cadence; use a shell without that binding \
+                 for hosted commands."
+            );
+        }
         return;
     }
 
@@ -317,7 +330,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     "Registered and signed in to {} ({})",
                     grant.slug, grant.endpoint
                 );
-                show_workspace_handover(&grant.slug, &stored);
+                show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
             }
             return Ok(0);
         }
@@ -419,7 +432,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 || grant.save_credential(&dir),
             )?;
             println!("Signed in to {} ({})", grant.slug, grant.endpoint);
-            show_workspace_handover(&grant.slug, &stored);
+            show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
             return Ok(0);
         }
         Commands::Auth { action } => {
