@@ -71,7 +71,7 @@ export default function PagePane({ page, navHref, readOnly, hosted, section, cit
       {citedPage !== undefined && <p className="wk-meta">{t("Cited page")}: {citedPage}</p>}
       {downloadError && <Note warn>{downloadError}</Note>}
       {(page.edited_by || page.mtime) && <p className="wk-meta mb-4">
-        {page.edited_by && <>{t("Edited by")} <b>{whoLabel(page.edited_by, viewerSub, t)}</b></>}
+        {page.edited_by && <>{t("Edited by")} <b>{whoLabel(page.edited_by, viewerSub, t, hosted)}</b></>}
         {page.edited_by && page.mtime && " · "}{relTime(page.mtime)}
       </p>}
       <article className="md wk-md issue-reader">

@@ -55,8 +55,11 @@ mean every folder is read-only.
 
 An empty project Context offers to create its wiki folder. Search filters use
 the available file type, and a hosted result that matched only some search
-terms says so. An upload's extraction status is a receipt, not a live progress
-feed; an unconfirmed result does not establish that extraction has finished.
+terms says so. Hosted attachment filenames remain searchable even when their
+text cannot be extracted. An upload's extraction status is a receipt, not a
+live progress feed; an unconfirmed result does not establish that extraction
+has finished. Hosted history identifies your edits as yours and uses a neutral
+contributor label for other, unresolved subjects.
 
 Removing an item returns its exact `.trash/...` landing. An operator can open
 Trash in the board, inspect the recorded entries, and restore to the original

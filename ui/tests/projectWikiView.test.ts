@@ -34,6 +34,7 @@ let holdSave = false;
 let finishSave: (() => void) | null = null;
 let unavailable = false;
 let missing = false;
+let hostedHistory = false;
 const pagePath = "projects/cadence/README.md";
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 globalThis.fetch = async (input, init) => {
@@ -66,7 +67,14 @@ globalThis.fetch = async (input, init) => {
     { path: pagePath, line: 12, text: "Third brief match" },
     { path: pagePath, line: 15, text: "Fourth brief match" },
   ] });
-  if (url.pathname.endsWith("/history")) return json({ path, commits: [{ sha: "commit1", at: 1, actor: "master", subject: "Saved project brief" }] });
+  if (url.pathname.endsWith("/history")) return json(hostedHistory ? {
+    path,
+    rev: "own-rev",
+    commits: [
+      { sha: "own-rev", at: 2, actor: "usr_viewer_fixture", subject: "Own edit" },
+      { sha: "other-rev", at: 1, actor: "teammatefixture123", subject: "Team edit" },
+    ],
+  } : { path, commits: [{ sha: "commit1", at: 1, actor: "master", subject: "Saved project brief" }] });
   throw new Error(`Unexpected request: ${url}`);
 };
 function assert(value: unknown, what: string): asserts value { if (!value) throw new Error(what); }
@@ -175,6 +183,23 @@ async function run() {
   await go("/projects/cadence/context?file=README.md&mode=history");
   assert(host.textContent?.includes("Saved project brief"), "real commit log renders");
   assert(!host.textContent?.includes("Restore this version"), "unsupported restore is not offered");
+  await React.act(() => renderWithNavigation(React.createElement(Context, { ...props, hosted: false })));
+  assert(host.textContent?.includes("master"), "native history retains the daemon's author label");
+  hostedHistory = true;
+  await go("/projects/cadence/context?file=README.md");
+  await React.act(async () => {
+    renderWithNavigation(React.createElement(Context, { ...props, hosted: true, viewerSub: "usr_viewer_fixture" }));
+    await flush();
+  });
+  await go("/projects/cadence/context?file=README.md&mode=history");
+  const hostedHistoryText = host.textContent ?? "";
+  assert(
+    hostedHistoryText.includes("you · current") && hostedHistoryText.includes("a contributor") &&
+    !hostedHistoryText.includes("usr_viewer_fixture") && !hostedHistoryText.includes("teammatefixture123"),
+    "hosted history identifies the viewer and a teammate without exposing subject ids",
+  );
+  hostedHistory = false;
+  await render();
   await go("/projects/cadence/context?file=logo.png");
   await render({ project: "assets" });
   sessionStorage.setItem("cadence.sessionKey", "synthetic-unit-tab-key");

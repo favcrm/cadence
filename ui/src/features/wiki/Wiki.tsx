@@ -327,6 +327,7 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
               path={route.path}
               navHref={navHref}
               hosted={hosted}
+              viewerSub={viewerSub}
             />
           ) : route.mode === "edit" && route.path ? (
             <EditorPane
@@ -596,13 +597,14 @@ function BrowsePane({
 
   const page = open.page;
   if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} hosted={hosted} viewerSub={viewerSub} section={section} citedPage={citedPage} />;
-  return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} viewerSub={viewerSub} />;
+  return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} hosted={hosted} viewerSub={viewerSub} />;
 }
 
-function BlobPane({ page, blob, navHref, viewerSub }: {
+function BlobPane({ page, blob, navHref, hosted, viewerSub }: {
   page: WikiPage;
   blob: PreviewKind;
   navHref: (route: Route) => string;
+  hosted?: boolean;
   viewerSub?: string | null;
 }) {
   const t = useTranslate();
@@ -648,7 +650,7 @@ function BlobPane({ page, blob, navHref, viewerSub }: {
         <span className="num">{name}</span>
         {page.size != null && <span>{fmtBytes(page.size)}</span>}
         {page.mime && <span>{page.mime}</span>}
-        {page.edited_by && <span>{t("uploaded by")} {whoLabel(page.edited_by, viewerSub, t)}</span>}
+        {page.edited_by && <span>{t("uploaded by")} {whoLabel(page.edited_by, viewerSub, t, hosted)}</span>}
         {status && <span>{t(status.text)}{page.status_reason ? ` — ${page.status_reason}` : ""}</span>}
         {page.mtime && <span>{relTime(page.mtime)}</span>}
       </div>

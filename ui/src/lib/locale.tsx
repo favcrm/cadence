@@ -1622,12 +1622,13 @@ Object.assign(zhTW, {
 
 Object.assign(zhTW, {
   "a team member": "團隊成員",
+  "a contributor": "貢獻者",
   "Open PDF": "開啟 PDF",
   "text extraction was queued — search availability is not confirmed": "文字擷取已排入處理 — 尚未確認是否可搜尋",
   "indexed — searchable": "已建立索引 — 可搜尋",
   "saved, but no text was found in it": "已儲存，但在其中找不到文字",
   "saved, but text extraction failed": "已儲存，但文字擷取失敗",
-  "saved, but this file type is not searchable": "已儲存，但此檔案類型無法搜尋",
+  "saved, but text in this file type cannot be searched": "已儲存，但無法搜尋此檔案類型的文字內容",
   "saved — this page is searchable": "已儲存 — 此頁面可搜尋",
   "saved — this board did not report its extraction state": "已儲存 — 此看板未回報文字擷取狀態",
   "This revision is unavailable": "此版本無法取得",
