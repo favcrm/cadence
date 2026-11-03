@@ -64,7 +64,8 @@ versions are evidence, not certification of native steering.
 
 1. Instance and state, on a non-production board port:
    `cadence dev up --name <n> --build <cadence>` then
-   `eval "$(cadence dev env <n>)"`. Pin the destination explicitly on every
+   `eval "$(cadence dev env <n>)"` (`dev reload`, `down` and `reset` refuse in
+   that shell; use a clean one for them). Pin the destination explicitly on every
    later command (`--state-dir <root>/state`) and confirm
    `cadence dev status <n>` reports that same `root` before reading or
    mutating; `settings agents show` reports the settings revision separately
@@ -152,7 +153,9 @@ versions are evidence, not certification of native steering.
    messages are listed without a filter, while routed `worker_result` and
    notice copies are system traffic and appear only with
    `include_system=true`.
-7. Restart, dedup and unknown: `cadence dev reload` resumes registered agents
+7. Restart, dedup and unknown: `cadence dev reload --name <n>`, run from a
+   clean shell (one that `dev env` did not export; it refuses otherwise),
+   resumes registered agents
    on their stored session ids and keeps message ids. Retrying the same
    `--message` id with the same body answers `{"duplicate":true,…}` and starts
    no second turn; different content for a used id is refused. A provider

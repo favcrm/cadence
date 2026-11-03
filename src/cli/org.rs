@@ -83,22 +83,17 @@ struct RegistryFile {
 
 impl RegistryFile {
     fn path() -> Result<PathBuf> {
-        let base = match std::env::var_os("XDG_CONFIG_HOME") {
-            Some(path) => PathBuf::from(path),
-            None => PathBuf::from(
-                std::env::var_os("HOME").ok_or_else(|| Error::rejected("HOME is not set"))?,
-            )
-            .join(".config"),
-        };
-        absolute(&base)?;
-        Ok(base.join("cadence").join("orgs.json"))
+        // The same hosted config root as the credentials: `<home>/config`
+        // for a first run, `$XDG_CONFIG_HOME/cadence` (else
+        // `~/.config/cadence`) for an existing installation.
+        Ok(cadence_agent::home::config_dir()?.join("orgs.json"))
     }
     /// Exclusive flock: every read-modify-write is one locked snapshot, so a
     /// `login` racing a `switch` cannot interleave a stale default.
     fn open() -> Result<Self> {
         let path = Self::path()?;
         let dir = path.parent().expect("registry parent");
-        std::fs::create_dir_all(dir)?;
+        cadence_agent::home::create_home_dir(dir)?;
         let lock = OpenOptions::new()
             .write(true)
             .create(true)
@@ -915,6 +910,7 @@ fn local_resolved(org: &str, state_dir: PathBuf, tracker_dir: PathBuf) -> Result
 enum LocalMaintenance {
     Update,
     Dev,
+    Setup,
 }
 
 impl LocalMaintenance {
@@ -931,6 +927,11 @@ impl LocalMaintenance {
                  is remote. A saved remote org does not select it. Omit the remote \
                  `--org`/`CADENCE_ORG`, or choose local (for example `CADENCE_ORG=local`)."
             )),
+            Self::Setup => Error::rejected(format!(
+                "`cadence setup` installs on this machine only — org '{name}' is \
+                 remote. Its hosted routes are its own `--hosted`/`--register` flags; \
+                 omit the remote `--org`/`CADENCE_ORG`, or choose local."
+            )),
         }
     }
 
@@ -939,7 +940,7 @@ impl LocalMaintenance {
     /// `CADENCE_ORG` beside it is a deliberate selection and must refuse
     /// instead of being dropped on the floor.
     fn refuse_remote_env_beside_pins(self) -> bool {
-        matches!(self, Self::Dev)
+        matches!(self, Self::Dev | Self::Setup)
     }
 }
 
@@ -1007,6 +1008,18 @@ pub(super) fn resolve_update(
 /// root is present, so that env is not silently discarded. `--org` on a
 /// pin still conflicts exactly as [`resolve`]; `--org` on a managed caller
 /// is still the managed-caller refusal, before any assignment lookup.
+/// `cadence setup` installs on this machine. It shares the local-maintenance
+/// selector, so a saved *local* connection keeps its state and tracker, a
+/// saved remote default never routes it over the allowlist, and a remote
+/// `--org`/`CADENCE_ORG` is refused rather than silently ignored.
+pub(super) fn resolve_setup(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    resolve_local_maintenance(LocalMaintenance::Setup, org, state, tracker)
+}
+
 pub(super) fn resolve_dev(
     org: Option<&str>,
     state: Option<PathBuf>,
@@ -1156,6 +1169,13 @@ mod tests {
             std::env::set_var("HOME", home.path());
             std::env::set_var("XDG_CONFIG_HOME", home.path().join("config"));
             std::env::set_var("XDG_STATE_HOME", home.path().join("xdg-state"));
+            // CAD-1922: a `HOME`/XDG-only environment with nothing in it
+            // is a first run, which resolves `~/.cadence`. This fixture
+            // models an EXISTING installation (ambient local state under
+            // `XDG_STATE_HOME`), so it presents that installation's own
+            // roots before anything resolves.
+            std::fs::create_dir_all(home.path().join("xdg-state").join("cadence")).unwrap();
+            std::fs::create_dir_all(home.path().join("config").join("cadence")).unwrap();
             Self { home, saved }
         }
         fn expected_state(&self) -> PathBuf {

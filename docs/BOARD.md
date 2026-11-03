@@ -5,8 +5,11 @@ one writer implementation (`src/issue/write.rs`) shared by the
 `cadence issue` CLI and the board's HTTP write API, and `cadence ui`
 serving a board + JSON API on loopback.
 
-- **Tracker dir:** `~/pm` (or `CADENCE_PM_DIR`). A private git repo —
-  never pushed anywhere public.
+- **Tracker dir:** `~/pm` (or `CADENCE_PM_DIR`) for an existing
+  installation; `<home>/tracker` (`~/.cadence/tracker`) for a first run
+  that has no earlier tracker, state dir or hosted config — see
+  [CLI.md](CLI.md#cadence-home-overrides-and-isolation-cad-1922). A
+  private git repo — never pushed anywhere public.
 - **Notes dir:** `/var/www/agent-notes` (`notes_dir` in `pm.yaml`) —
   kickoff/QA/verdict chains, read-only.
 - **Runtime:** the cadence daemon socket, read-only. The board and CLI
