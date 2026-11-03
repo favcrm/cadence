@@ -117,21 +117,27 @@ the code you just wrote.
   author's conclusions. A second model vendor is optional. A separate human or
   account is not required. Records say "fresh-session review" and never claim
   independent parties. Standards and Spec/security stay two separate passes
-  where two are required. Owner approval of the exact head still applies on
-  `human`-class paths, and always for send, publish, spend and deploy.
+  where two are required, each by its own fresh session. Owner approval of the
+  exact head still applies on `human`-class paths; this decision changes no
+  approval rule for send, publish, spend or deploy.
 - **What the gate enforces today.** Not this standard. `scripts/enqueue-reviewed`
-  counts verdicts by attested principal and, since CAD-2049, refuses a
-  principal that is the author's, so it cannot tell a fresh session from the
-  author when both act under one login. Until it can, merge through the
+  counts hosted verdicts by attested principal and, since CAD-2049, refuses the
+  author's principal; local notes count by their self-declared `From:` alias,
+  which is not attested. It cannot tell a fresh session from the author when
+  both act under one login. Until it can, merge through the
   temporary exception (`--exception --advisory standards=<url> --advisory
   spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
-  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10). Do not
-  propose registering a second attested human to satisfy the gate. A
-  workflow-issued reviewer identity is a proposal, not shipped.
+  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10). The exception
+  only checks that the advisory links are separate https URLs; it proves
+  neither head binding nor that Browser QA ran. A verdict filed under the
+  author's identity still refuses under the exception, so a same-login
+  session posts its findings as a PR comment and files no verdict. A second
+  attested human is not required. A workflow-issued reviewer identity is a proposal, not shipped.
 - One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
-  two reviews, Standards and Spec/security, as separate passes. No reviewer
+  two reviews, Standards and Spec/security, as separate passes by two fresh
+  sessions. No reviewer
   may be the author.
 - A reviewer who sees auth, identity, credential, signature, secret or
   confinement logic in a one-review PR returns REVISE, names the trigger in
@@ -147,7 +153,8 @@ the code you just wrote.
   was checked.
 - A `human` trigger needs the operator as the second check. One fresh-session
   review plus the operator is enough only outside triggers 1 and 3; inside
-  them two separate passes (Standards and Spec/security) are required and the
+  them two separate passes by two fresh sessions (Standards and Spec/security)
+  are required and the
   operator's approval does not stand in for the second pass. The operator's
   approval of the exact head never lowers Browser QA, the `qa-verdict`
   status or the risk class itself. Browser QA at desktop and narrow widths

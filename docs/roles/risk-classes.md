@@ -74,21 +74,25 @@ resumed authoring session does not count, and its brief points at the change
 without the author's conclusions. A second model vendor is optional, and a
 separate human or account is not required. Records say "fresh-session review"
 and never claim independent parties. For a two-review PR (AGENTS.md "Review",
-CAD-1099) Standards and Spec/security remain two separate passes; one pass
-never covers both. The operator's approval of the exact head
+CAD-1099) Standards and Spec/security remain two separate passes by two fresh
+sessions; one pass never covers both. The operator's approval of the exact head
 (`cadence audit approve --pr <n> --head <full sha> --action merge`,
 operator-connection-only, an `approval_recorded` event on the `audit:approvals`
 stream bound to the head; a ticket comment or note is never approval evidence)
-still applies on `human`-class paths and always for send, publish, spend and
-deploy. It never stands in for a review pass and never lowers Browser QA, the
+still applies on `human`-class paths; this decision changes no approval rule
+for send, publish, spend or deploy. It never stands in for a review pass and never lowers Browser QA, the
 `qa-verdict` status binding or the risk class. A change to this rule is class
 `human` (trigger 7) and can never approve itself.
 
-**Not yet enforced.** `scripts/enqueue-reviewed` counts verdicts by attested
-principal and, since CAD-2049, refuses the author's principal, so it cannot tell
-a fresh session from the author under one login. Until it can, merges use the
-temporary exception (`--exception --advisory ...`, ends at `EXCEPTION_ENDS` in
-`scripts/delivery-gate`, 2026-11-10). The `solo_operator` delivery-profile
+**Not yet enforced.** `scripts/enqueue-reviewed` counts hosted verdicts by
+attested principal and, since CAD-2049, refuses the author's principal; local
+notes count by their self-declared `From:` alias, which is not attested. It
+cannot tell a fresh session from the author under one login. Until it can,
+merges use the temporary exception (`--exception --advisory ...`, ends at
+`EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-11-10). The exception only
+checks that the advisory links are separate https URLs; it proves neither head
+binding nor that Browser QA ran, and a verdict filed under the author's identity
+still refuses under it. The `solo_operator` delivery-profile
 field still exists in code; it is not this standard. A workflow-issued reviewer
 identity is a proposal, not shipped.
 

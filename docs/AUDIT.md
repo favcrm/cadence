@@ -69,9 +69,10 @@ needs no daemon, state dir or `HOME`.
 
 The review standard is a fresh-session review (AGENTS.md "Review", operator
 decision 2026-11-03): a non-author session with no inherited context, including
-a subagent. These verbs do not enforce it. The gate counts distinct attested
-principals and refuses the author's, so it cannot tell a fresh session from
-the author under one login; until it can, merges use the temporary
+a subagent. These verbs do not enforce it. The gate counts hosted verdicts by
+attested principal and refuses the author's principal, while local notes count
+by their self-declared `From:` alias, which is not attested; it cannot tell a
+fresh session from the author under one login; until it can, merges use the temporary
 `--exception --advisory ...` path (ends at `EXCEPTION_ENDS` in
 `scripts/delivery-gate`, 2026-11-10).
 

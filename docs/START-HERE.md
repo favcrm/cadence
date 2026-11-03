@@ -5,7 +5,7 @@ status feed. Check the current source revision and running build before acting.
 A merged feature is not necessarily installed, enabled or proven unattended.
 
 Cadence is a local Rust controller for a development team: it coordinates
-provider agents, durable messages, tasks, project issues, independent review and
+provider agents, durable messages, tasks, project issues, fresh-session review and
 operational evidence. The intended outcome is a human goal carried through
 verified delivery with routine coordination handled by the system.
 

@@ -686,10 +686,13 @@ During implementation and handoff:
   context from the work (a subagent qualifies; a fork or a resumed authoring
   session does not). Brief it with the PR, the exact head and the ticket, not
   your conclusions, and call it a fresh-session review, never independent
-  parties. The merge gate does not enforce this yet: it counts attested
-  principals, so a separate session alone is not a gate-counted verdict, and
-  merges use the temporary `--exception --advisory ...` path until
-  `EXCEPTION_ENDS` (2026-11-10). Do not propose a second attested human.
+  parties. The merge gate does not enforce this yet: hosted verdicts
+  count by attested principal (the author's is refused) and local notes by
+  their self-declared `From:` alias, so a same-login session cannot file a
+  gate-counted verdict. Post its findings as a PR comment; merges use the
+  temporary `--exception --advisory ...` path until `EXCEPTION_ENDS`
+  (2026-11-10), and it checks only that the links are https URLs. A second
+  attested human is not required.
 - Make review converge. First inspect the complete change against acceptance;
   verify each blocking finding with a concrete failure scenario and source
   evidence before sending it to the author. Report the class of bug and all
@@ -830,7 +833,7 @@ the failing iterations' output is the `stress-failures-*` artifact.
 5. Promote a lesson into a skill change only when it improves a recurring,
    broadly applicable decision. Keep project-specific design choices in scoped
    memory/ADRs. Change the smallest instruction, give it a realistic behavioral
-   check and independent review, and retain source/revision and supersession
+   check and fresh-session review, and retain source/revision and supersession
    evidence. A lesson cannot enlarge user scope or grant execution permissions.
 
 Curators consolidate at delivery/incident boundaries and batch accumulated
