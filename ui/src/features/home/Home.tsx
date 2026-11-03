@@ -186,7 +186,7 @@ export function activityAnchor(items: ThreadItem[], message: string | undefined 
   for (const item of items) {
     // An artifact card sits after the run that put it (or between two runs'
     // cards): the header never rides on one while the run itself is there.
-    if (item.type === "artifact") {
+    if (item.type === "artifact" || item.type === "image") {
       if (item.entry.message === message) cardKey = item.key;
       continue;
     }
