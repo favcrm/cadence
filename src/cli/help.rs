@@ -75,6 +75,7 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
         &[
             ("memory", "Reviewed, scoped project facts"),
             ("wiki", "Shared, scoped knowledge pages"),
+            ("skill", "Read or install bundled public guidance"),
         ],
     ),
 ];
@@ -130,7 +131,7 @@ const ADVANCED: &[&str] = &[
     "report",
     "resume",
     "schema",
-    "skill",
+
     "stop",
     "template",
     "test",
