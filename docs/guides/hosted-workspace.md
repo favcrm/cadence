@@ -211,6 +211,40 @@ Sources: [`cli/commands.rs` (`TeamAction`)](../../src/cli/commands.rs),
 [`cli/local_agent.rs`](../../src/cli/local_agent.rs),
 [hosted login](../REMOTE-AUTH.md#hosted-login-and-remote-org-transport-cad-1019-cad-1329).
 
+## Workspace platform tools
+
+The hosted workspace owns its tool catalog and account selection. List it with
+`cli.read`, or call an eligible tool with `cli.write`:
+
+```sh
+cadence --org acme platform tools
+cadence --org acme platform call generate_image --input '{"prompt":"A blue circle"}'
+```
+
+An eligible call can charge the workspace balance. The tool's own effect and
+authorization checks still apply. An absent tool returns not found; an
+unavailable catalog is reported as unavailable rather than as an empty list.
+Hosted calls refuse `--platform`, `--account` and `--project` instead of
+silently changing the selected workspace.
+
+The CLI derives a replay key from the tool and input. If the first call was
+recorded, repeating the command recovers that outcome instead of charging
+twice; a call never recorded may start on retry.
+To deliberately run the same input again, pass a fresh `--request <handle>`;
+keep that handle and the same input when reconciling an uncertain outcome.
+Use `--query <json>` for query fields and `--input <json>` for a body; pass both
+when the tool needs both. The replay key includes both fields.
+
+An image submission may return a queued job. Poll its returned `data.job.id`
+with the same workspace and `cli.write` grant:
+
+```sh
+cadence --org acme platform call get_media_job --query '{"jobId":"med_job_from_submit"}'
+```
+
+Polling can complete and settle the existing job. A succeeded job includes
+retained artifact references; this CLI does not download the image bytes.
+
 ## A teammate's own-agent collaboration flow
 
 Use a plain signed-in human shell, or an eligible managed agent's existing

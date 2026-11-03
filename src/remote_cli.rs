@@ -90,8 +90,8 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 /// consumed. Anything else stays unresolved.
 ///
 /// The cli.write half (`issue_new`/`issue_comment`/`issue_set`/
-/// `issue_attach`/`issue_review`/`project_policy`/`message_send`/`team_*`)
-/// rides the same envelope — the
+/// `issue_attach`/`issue_review`/`project_policy`/`project_new`/
+/// `message_send`/`team_*`) rides the same envelope — the
 /// caller's authority never travels as a request field, only inside the
 /// verified, single-use envelope. A failed or ambiguous call is never retried
 /// by the client: the wake retry is the only loop, and it fires only on a
@@ -131,6 +131,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     "message_inbox",
     "team_list",
     "team_invites",
+    // CAD-1999: the hosted org's own project registry — the projects a
+    // workspace has registered, plus the ones that exist only as their
+    // tickets' key. A read; the write beside it is `project_new`.
+    "project_ls",
     // cli.write
     "issue_new",
     "issue_comment",
@@ -142,10 +146,19 @@ pub const REMOTE_VERBS: &[&str] = &[
     "team_set_role",
     "team_remove",
     "project_policy",
+    // CAD-1999: register an empty project — its key, its human name and its
+    // issue-id prefix — before any card exists. The tenant Worker answers it
+    // from its own storage, and requires a live human owner: a project key
+    // and prefix are workspace structure every later card inherits.
+    "project_new",
     "message_send",
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
     "master_status",
+    // CAD-1678 / AOS-328: the hosted workspace's own tool catalog. `tools`
+    // needs `cli.read`, `call` needs `cli.write`; the Worker decides per
+    // operation, so this client asks for the historical pair.
+    "platform_call",
     // CAD-1946: the merge gate. Reads (cli.read) and the operator's merge
     // approval (`audit.approve`, which only `cadence login --audit-approve`
     // requests; the hosted org admits it for the human owner only).
@@ -196,10 +209,15 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_identities"
         | "agent_profile_list"
         | "agent_profile_context"
-        | "agent_roles" => &["cli.read"],
+        | "agent_roles"
+        | "project_ls" => &["cli.read"],
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
         "audit_verdict" | "audit_verdict_project" => &["cli.write"],
+        // CAD-1999: creating a project is a workspace-structure write; the
+        // board also requires a live human owner. Reading the registry is a
+        // plain cli.read above.
+        "project_new" => &["cli.write"],
         // CAD-2001: attesting project eligibility or a principal's GitHub
         // identity decides whose verdicts count, so both writes need the same
         // `audit.approve` login as the merge approval — and the tenant admits
@@ -232,7 +250,10 @@ fn team_mutation_verb(verb: &str) -> bool {
 /// — never a plain refusal, and never a bare retry.
 ///
 /// `message_send` is the historical member of this set; the team mutations
-/// join it for the reason above.
+/// join it for the reason above. `project_new` is idempotent for the same
+/// key, name and prefix, but a lost answer still leaves the caller unsure
+/// whether the project exists, so the note sends it to `issue project ls`
+/// first.
 fn mutating_cli_verb(verb: &str) -> bool {
     matches!(
         verb,
@@ -245,6 +266,8 @@ fn mutating_cli_verb(verb: &str) -> bool {
             | "audit_approve_project"
             | "audit_reviewers_project_set"
             | "audit_identities_set"
+            | "project_new"
+            | "platform_call"
     ) || team_mutation_verb(verb)
 }
 
@@ -268,8 +291,14 @@ fn lost_mutation_note(verb: &str) -> &'static str {
         "the approval may or may not have been recorded — read `audit approval` for the same issue, repo and head before repeating it"
     } else if verb == "audit_verdict" || verb == "audit_verdict_project" {
         "the verdict may or may not have been recorded — read `audit verdicts` for the same head before repeating it"
+    } else if verb == "platform_call" {
+        "the tool call may or may not have run and been charged — replay the same \
+         command; the relayed key returns the door's recorded outcome instead of \
+         running it a second time"
     } else if verb == "issue_review" {
         "the verdict may or may not have been recorded — read the same issue before repeating it; a reviewer holds one verdict per revision"
+    } else if verb == "project_new" {
+        "the project may or may not have been registered — read `issue project ls` with the same explicit --org before repeating it; the same key, name and prefix is the same project"
     } else {
         "the team change may or may not have been applied — inspect `team list` or \
          `team invites` with the same explicit --org before repeating it"
@@ -1575,7 +1604,12 @@ fn call_once(
     // have landed, so the caller must reconcile by idempotency key, never
     // assume nothing landed. `message_send` reconciles on `arguments.message`;
     // the team mutations reconcile with a read (`team list` / `team invites`).
-    let mutating = matches!(surface, Surface::Cli) && mutating_cli_verb(verb);
+    // A platform call is mutating only when it runs a tool: listing the
+    // catalog changes nothing, so a lost answer there is not a possible charge.
+    let mutating = matches!(surface, Surface::Cli)
+        && mutating_cli_verb(verb)
+        && (verb != "platform_call"
+            || arguments.get("operation").and_then(Value::as_str) == Some("call"));
     post(
         &target.endpoint,
         &format!("{relay}/call"),
@@ -2102,10 +2136,11 @@ fn ambiguous_mutation_error(status: u16, correlation: Option<String>) -> Error {
     Error::unknown(text)
 }
 
-/// CAD-1568: actionable text for the `cli_message_*` family's typed
-/// refusals, keyed on the container's bounded `error.code` — the raw
-/// `error.message` the route returns is never shown (a `cli_fail` body
-/// can carry arbitrary server text). Unknown or absent codes keep the
+/// CAD-1568: actionable text for a verb's typed refusals, keyed on the
+/// container's bounded `error.code` — the raw `error.message` the route
+/// returns is never shown (a `cli_fail` body can carry arbitrary server
+/// text). Today it covers the `cli_message_*` family and CAD-1999's
+/// `project_new` registry refusals. Unknown or absent codes keep the
 /// generic decoded refusal unchanged.
 fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Error) -> Error {
     let action: Option<(&'static str, &'static str)> = match (verb, code) {
@@ -2153,6 +2188,34 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "not_found",
             "no CLI message with that id is visible to this human identity; \
              reconcile the original workspace and login before retrying the same id",
+        )),
+        // CAD-1999: the hosted project registry's own typed refusals. A key
+        // that already exists as a ticket-only project conflicts exactly like
+        // a registered one; only the identical key+name+prefix is a reuse.
+        ("project_new", Some("project_exists")) => Some((
+            "project_exists",
+            "that project key is already registered, or already exists as its \
+             tickets' project with a different name or prefix — `issue project \
+             ls` shows the stored record; pick another key, or repeat the same \
+             key, name and prefix to reuse it. Nothing was written",
+        )),
+        ("project_new", Some("prefix_conflict")) => Some((
+            "prefix_conflict",
+            "that issue-id prefix already belongs to another project (registered, \
+             or spelled by existing ticket ids) — pass a different --prefix; \
+             nothing was written",
+        )),
+        ("project_new", Some("not_permitted")) => Some((
+            "not_permitted",
+            "remote `project new` requires a verified human workspace owner; an \
+             agent, service or ordinary-member credential cannot register \
+             workspace structure",
+        )),
+        ("project_new", Some("invalid_request")) => Some((
+            "invalid_request",
+            "the project was refused at the request boundary — the key must be \
+             1-32 lowercase letters, digits or hyphens, --name 1-200 bytes, and \
+             --prefix 1-16 letters/digits starting with a letter; nothing was written",
         )),
         _ => None,
     };
@@ -2943,6 +3006,53 @@ fn send_receipt_correlates(
             .is_some_and(|s| !s.is_empty())
 }
 
+/// A hosted issue-id prefix as the registry stores it: 1-16 ASCII
+/// letters/digits starting with a letter (the board normalizes case, so the
+/// shape is what matters; the caller's own spelling is compared
+/// case-insensitively).
+fn valid_hosted_prefix(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 16
+        && value.starts_with(|c: char| c.is_ascii_alphabetic())
+        && value.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// CAD-1999: a `project_new` 2xx is usable only when it carries the
+/// requested project back — a `project` object whose `key` and `name` are
+/// exactly the ones sent, and whose `prefix` is a valid stored issue-id
+/// prefix that matches the requested `--prefix` case-insensitively (when
+/// one was sent). Anything less (a `null` or `{ok:true}` body, a foreign
+/// project, a missing/invalid prefix or another project's prefix) cannot
+/// establish that THIS create landed under the intended namespace, so the
+/// outcome is unknown and is reconciled with `issue project ls`, never
+/// called a failure and never replayed blindly.
+fn project_receipt_correlates(receipt: &Value, arguments: &Map<String, Value>) -> bool {
+    let project = receipt.get("project").and_then(Value::as_object);
+    let bound = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|expected| {
+                !expected.is_empty()
+                    && project
+                        .and_then(|fields| fields.get(key))
+                        .and_then(Value::as_str)
+                        == Some(expected)
+            })
+    };
+    let prefix_ok = project
+        .and_then(|fields| fields.get("prefix"))
+        .and_then(Value::as_str)
+        .is_some_and(|actual| {
+            valid_hosted_prefix(actual)
+                && arguments
+                    .get("prefix")
+                    .and_then(Value::as_str)
+                    .is_none_or(|requested| actual.eq_ignore_ascii_case(requested))
+        });
+    project.is_some() && bound("key") && bound("name") && prefix_ok
+}
+
 #[allow(clippy::too_many_arguments)]
 fn call_verb_until_retry(
     target: &RemoteTarget,
@@ -3046,6 +3156,33 @@ fn call_verb_until_retry(
         }
         let (status, retry_after, body) =
             call_once(target, &cred, surface, verb, &arguments, deadline)?;
+        let platform_operation = (verb == "platform_call")
+            .then(|| arguments.get("operation").and_then(Value::as_str))
+            .flatten();
+        if (200..300).contains(&status) {
+            match platform_operation {
+                Some("call")
+                    if !body.as_ref().is_some_and(|answer| {
+                        answer.get("ok").and_then(Value::as_bool) == Some(true)
+                            && answer.get("data").is_some_and(Value::is_object)
+                    }) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote tool returned no usable receipt — {}",
+                        lost_mutation_note(verb)
+                    )));
+                }
+                Some("tools")
+                    if !body
+                        .as_ref()
+                        .and_then(|answer| answer.get("tools"))
+                        .is_some_and(Value::is_array) =>
+                {
+                    return Err(reject("the remote tool catalog is unavailable"));
+                }
+                _ => {}
+            }
+        }
         // A successful status without the complete, correlated enqueue
         // receipt cannot establish whether — or as whose message, in which
         // workspace and conversation — the mutation landed. Unknown, never
@@ -3116,6 +3253,27 @@ fn call_verb_until_retry(
                 ));
             }
         }
+        // CAD-1999: a project create's 2xx is usable only when it echoes the
+        // requested project — a `project` object whose `key` and `name` are
+        // exactly what was sent and whose `prefix` is a valid stored prefix
+        // matching `--prefix` when one was sent. A `null`, `{ok:true}`,
+        // unrelated or foreign receipt, or a missing/invalid/different
+        // prefix cannot establish that THIS create landed under the intended
+        // namespace, so the outcome is unknown and is reconciled with
+        // `issue project ls`, never reported as a failure and never replayed
+        // blindly. A 2xx with no parseable body (empty, 204, non-JSON) is
+        // the same check on a `None` body, so it is unknown here too.
+        if verb == "project_new"
+            && (200..300).contains(&status)
+            && !body
+                .as_ref()
+                .is_some_and(|receipt| project_receipt_correlates(receipt, &arguments))
+        {
+            return Err(Error::unknown(format!(
+                "remote project create returned no correlated receipt; {}",
+                lost_mutation_note(verb)
+            )));
+        }
         let refusal_code = refusal_fields(body.as_ref()).0.map(str::to_owned);
         // CAD-1568: a 5xx carrying a worker `state` is a pre-forward
         // verdict (waking handled below, wake_failed/unavailable = nothing
@@ -3145,6 +3303,28 @@ fn call_verb_until_retry(
             && status >= 500
             && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
             && !board_gate_refused(body.as_ref());
+        // CAD-1999: a project create is answered by the tenant Worker from
+        // its own storage. A 5xx naming no pre-forward `state` may follow a
+        // committed project, so it is unknown — reconciled with
+        // `issue project ls`, never reported as a refusal that invites a
+        // blind retry. A 5xx that names a pre-forward state, or a board gate
+        // refusal (`hop: board`), is decided before the verb ran and stays
+        // definite. (An unusable 2xx is answered by the receipt check
+        // above, before this verdict.)
+        let project_create_unknown = verb == "project_new"
+            && status >= 500
+            && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
+            && !board_gate_refused(body.as_ref());
+        // An in-progress replay or explicit uncertain outcome can still be
+        // charged; a lost reply may also follow a funded dispatch.
+        let platform_outcome_unknown = platform_operation == Some("call")
+            && !board_gate_refused(body.as_ref())
+            && ((status == 409
+                && matches!(
+                    refusal_code.as_deref(),
+                    Some("uncertain" | "idempotency_in_progress")
+                ))
+                || (status >= 500 && body.as_ref().and_then(|b| b["state"].as_str()).is_none()));
         let unknown_correlation = refusal_correlation(body.as_ref());
         // CAD-2001: a project-scoped gate verb the tenant cannot serve is a
         // release-order problem, not an availability blip and not "no
@@ -3165,6 +3345,18 @@ fn call_verb_until_retry(
         match classify(status, retry_after, body) {
             Verdict::Done(Err(_e)) if team_mutation_unknown => {
                 return Err(ambiguous_mutation_error(status, unknown_correlation));
+            }
+            Verdict::Done(Err(_e)) if project_create_unknown => {
+                return Err(Error::unknown(format!(
+                    "the project create was not confirmed (outcome_unknown, HTTP {status}); {}",
+                    lost_mutation_note(verb)
+                )));
+            }
+            Verdict::Done(Err(_e)) if platform_outcome_unknown => {
+                return Err(Error::unknown(format!(
+                    "remote platform call returned HTTP {status} — {}",
+                    lost_mutation_note(verb)
+                )));
             }
             Verdict::Done(Err(e)) if artifact_outcome_unknown => {
                 return Err(Error::unknown(format!(

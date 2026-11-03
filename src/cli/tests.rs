@@ -598,7 +598,10 @@ fn audit_reviewers_read_and_set_parse() {
     else {
         panic!("audit reviewers must parse to AuditAction::Reviewers");
     };
-    assert_eq!((project.as_str(), action.is_none()), ("cadence", true));
+    assert_eq!(
+        (project.as_deref(), action.is_none()),
+        (Some("cadence"), true)
+    );
     // No project, and the retired repo selector, both refuse.
     assert!(Cli::try_parse_from(["cadence", "audit", "reviewers"]).is_err());
     assert!(
@@ -633,7 +636,7 @@ fn audit_reviewers_read_and_set_parse() {
     else {
         panic!("audit reviewers set must parse to ReviewersAction::Set");
     };
-    assert_eq!(project.as_str(), "cadence");
+    assert_eq!(project, None);
     assert_eq!(set_project, "cadence");
     assert_eq!(reviewer, vec!["user_a", "user_b"]);
     // Omitting every `--reviewer` clears the map: a real replacement.

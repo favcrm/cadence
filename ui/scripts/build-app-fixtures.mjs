@@ -27,7 +27,8 @@ function eventBase() {
     if (name === "pull_request" || name === "pull_request_target") return event.pull_request?.base?.sha ?? null;
     if (name === "merge_group") return event.merge_group?.base_sha ?? null;
     if (name === "push" && event.before !== "0".repeat(40)) return event.before ?? null;
-    if (name === "workflow_dispatch" || name === "push") {
+    // A nightly run has no base in its payload either: it checks HEAD against its parent.
+    if (name === "workflow_dispatch" || name === "schedule" || name === "push") {
       const commit = git(["cat-file", "-p", "HEAD"]);
       const parentHeader = commit.split("\n").find(line => line.startsWith("parent "));
       if (!parentHeader) throw new Error(`${name} HEAD commit has no parent (root commit)`);
