@@ -75,6 +75,7 @@ let holdReconnect = false;
 let disconnectTranscript: (() => void) | null = null;
 let heldOperations: Array<(response: Response) => void> | null = null;
 const commandPosts: unknown[] = [];
+const commandSearches: string[] = [];
 // Set inside a check to hold one send in flight (pending state "sending").
 let deferSend: ((resolve: (r: Response) => void) => void) | null = null;
 const messagePosts: any[] = [];
@@ -146,6 +147,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     : json(masterSnapshot(url.searchParams.get("conversation") ?? "home-thread"));
   if (url.pathname === "/api/master/command") {
     commandPosts.push(JSON.parse(String(init!.body)));
+    commandSearches.push(url.search);
     if (hostedIdentity) { turn = null; queue = []; }
     return json({ command: "x", ok: true, result: {} });
   }
@@ -664,6 +666,7 @@ assert(bar() === null && stopButton(), "a hosted app shows its own working turn 
 await React.act(async () => { stopButton()!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
 equal(commandPosts.at(-1), { command: "stop", message: "m-gen" }, "hosted Stop controls the selected app message");
+assert((commandSearches.at(-1) ?? "").startsWith("?conversation=") && !commandSearches.at(-1)?.includes("home-thread"), `hosted Stop names its conversation, not Home (got ${commandSearches.at(-1)})`);
 assert(!stopButton(), "Stop refreshes the selected hosted conversation after the operation ends");
 turn = { state: "working", message: "m-other", conversation: "c-camp" };
 queue = [{ message: "m-gen", conversation: "c-gen" }];

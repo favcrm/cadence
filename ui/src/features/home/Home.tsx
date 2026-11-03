@@ -41,6 +41,7 @@ import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "
 import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
 import Conversation from "../app-shell/chat/Conversation";
+import { useDockHeight } from "./useDockHeight";
 import { TurnBar } from "../app-shell/chat/TurnBar";
 import { usePendingPermission } from "../app-shell/chat/usePendingApproval";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
@@ -68,6 +69,7 @@ import { agentOn } from "../../lib/agentOn";
 import SinceCard from "./SinceCard";
 import {
   discardPending,
+  failWithdrawn,
   inFlightTurnKey,
   unnamedTurnAnswered,
   lastSeq,
@@ -1218,25 +1220,13 @@ function MasterHome({
   // The dock's measured height is the thread's bottom padding and the
   // pill's floor (`--dock-h`, styles.css); while pinned, a growing dock
   // (a longer draft, a wrapped hint) keeps the tail in view.
-  useEffect(() => {
-    const dock = dockRef.current;
-    if (!dock || typeof ResizeObserver === "undefined") return;
-    const apply = () => {
-      // Judge "on the tail" before the new padding lands: a strip that
-      // appears (Queued) must not push the last bubble under the dock.
-      const el = scrollRef.current;
-      const onTail = el ? atTail(el.scrollTop, el.scrollHeight, el.clientHeight) : false;
-      document.documentElement.style.setProperty("--dock-h", `${dock.offsetHeight}px`);
+  const keepDockTail = useCallback(
+    (onTail: boolean) => {
       if (follow.current.pinned || onTail) scrollPanel("jump");
-    };
-    const ro = new ResizeObserver(apply);
-    ro.observe(dock);
-    apply();
-    return () => {
-      ro.disconnect();
-      document.documentElement.style.removeProperty("--dock-h");
-    };
-  }, [scrollPanel]);
+    },
+    [scrollPanel],
+  );
+  useDockHeight(dockRef, scrollRef, keepDockTail);
 
   const lastKey = items.length ? items[items.length - 1].key : "";
   useEffect(() => {
@@ -1299,6 +1289,14 @@ function MasterHome({
   };
 
 
+  const handBackWithdrawn = useCallback((r: MasterCommandResult) => {
+    if (!r.withdrawn?.length) return;
+    const withdrawn = r.withdrawn;
+    resources.masterThread.write((state) =>
+      failWithdrawn(state ?? EMPTY_THREAD, withdrawn, t("Withdrawn when the turn was stopped. Retry to send it again."), newMessageId),
+    );
+  }, [t]);
+
   /** One `/` verb → the board's command route; its answer is a card. */
   const runCommand = useCallback(
     (name: string, arg: string) => {
@@ -1326,6 +1324,7 @@ function MasterHome({
       api
         .masterCommand(name, arg || undefined)
         .then((r) => {
+          handBackWithdrawn(r);
           const { text, value } = fmtCommandResult(r);
           setCmds((c) =>
             c.map((x) => (x.id === id ? { ...x, running: false, ok: r.ok, text, value } : x)),
@@ -1343,7 +1342,7 @@ function MasterHome({
           ),
         );
     },
-    [offered, t],
+    [offered, t, handBackWithdrawn],
   );
 
   const runTurnCommand = useCallback((command: "stop" | "cancel", message: string) => {
@@ -1353,10 +1352,11 @@ function MasterHome({
       .masterCommand(command, undefined, undefined, message)
       .then((r) => {
         void resources.masterState.refresh();
+        handBackWithdrawn(r);
         if (!r.ok) setCmds((c) => [...c, { id, name: command, ok: false, text: "The master did not accept the command." }]);
       })
       .catch((e: ApiError) => setCmds((c) => [...c, { id, name: command, ok: false, text: e.message }]));
-  }, [writeBlock]);
+  }, [writeBlock, handBackWithdrawn]);
 
   const onEarlier = useCallback(() => {
     const step = earlierStep(resources.masterThread, threadReader(MASTER), limit);

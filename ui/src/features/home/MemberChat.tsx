@@ -7,6 +7,7 @@ import type { ThreadRef } from "../../lib/types";
 import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
 import { tailTop } from "./dock";
+import { useDockHeight } from "./useDockHeight";
 import { memberHistory, memberThreadStore, memberWrite, sendToAssistant } from "./memberThread";
 import { initialFollow, motionBehavior, onSend, type Follow } from "./scrollFollow";
 import {
@@ -223,6 +224,15 @@ export default function MemberChat({
     if (!el) return;
     el.scrollTo({ top: tailTop(el.scrollHeight, el.clientHeight), behavior: motionBehavior(false, kind) });
   }, []);
+  // The dock grows with its note, and the thread's bottom padding follows it.
+  const dockRef = useRef<HTMLDivElement | null>(null);
+  const keepDockTail = useCallback(
+    (onTail: boolean) => {
+      if (follow.current.pinned || onTail) scrollPanel("jump");
+    },
+    [scrollPanel],
+  );
+  useDockHeight(dockRef, scrollRef, keepDockTail);
   const engage = useCallback(() => {
     const next = onSend(follow.current);
     follow.current = next.state;
@@ -386,7 +396,7 @@ export default function MemberChat({
             />
           </div>
 
-          <div className="chatdock" data-chat-dock>
+          <div className="chatdock" ref={dockRef} data-chat-dock>
             {/* Inside the dock: it is absolutely placed, so a note before it
                 would sit behind the composer. */}
             {sendNote !== null && (

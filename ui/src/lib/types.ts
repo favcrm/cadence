@@ -693,6 +693,8 @@ export interface MasterCommandResult {
   command: string;
   ok: boolean;
   result?: unknown;
+  /** Queued messages the command withdrew: this surface offers them back. */
+  withdrawn?: string[];
 }
 
 /**

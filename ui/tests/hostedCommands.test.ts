@@ -38,6 +38,7 @@ const master = {
   commands: [] as string[], turn: null, queue: [], queued: 0,
 };
 const requests: string[] = [];
+let stopAnswer: unknown = null;
 const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { "Content-Type": "application/json" } });
 globalThis.fetch = async (input, init) => {
   const url = new URL(String(input), "http://localhost");
@@ -47,6 +48,7 @@ globalThis.fetch = async (input, init) => {
   if (url.pathname === "/api/master/state") return json(master);
   if (url.pathname === "/api/agents") return json({ daemon: "reachable", agents: [{ alias: "master", state: "running" }], totals: null });
   if (url.pathname === "/api/meta") return json({ operator: true, read_only: false });
+  if (url.pathname === "/api/master/command" && stopAnswer !== null) return json(stopAnswer);
   return new Response(JSON.stringify({ ok: false }), { status: 501, headers: { "Content-Type": "application/json" } });
 };
 function assert(value: unknown, why: string): asserts value { if (!value) throw new Error(why); }
@@ -120,6 +122,34 @@ async function main() {
   await type("/new");
   await enter();
   assert(requests.includes("POST /api/master/command"), "an advertised command is sent");
+
+  // Stopping withdraws what was queued, and the board hands it back.
+  await React.act(async () => { root.render(null); });
+  await settle();
+  master.commands = ["stop"];
+  (master as { turn: unknown }).turn = { state: "working", message: "turn-1", conversation: "home-thread" };
+  stopAnswer = { ok: true, result: "Stopped.", withdrawn: ["queued-1"] };
+  await mount(true);
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [{ seq: 1, role: "operator", kind: "message", message: "turn-1", text: "Go" }],
+      pending: [{ message: "queued-1", text: "And then this", state: "sent", at: 1 }],
+    }));
+    resources.masterState.write(() => master as never);
+  });
+  await settle();
+  const stop = host.querySelector<HTMLButtonElement>('[aria-label="Stop this turn"]');
+  assert(stop, "a named hosted turn offers Stop");
+  await React.act(async () => { stop.click(); });
+  await settle();
+  const handedBack = resources.masterThread.get().data?.pending.find((row) => row.text === "And then this");
+  assert(handedBack?.state === "failed", "a withdrawn message is no longer sending");
+  assert(handedBack?.message !== "queued-1", "a Retry must not reuse the withdrawn id, which the engine would treat as already handled");
+  assert(Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "Retry"), "a withdrawn message offers Retry");
+  await React.act(async () => { resources.masterThread.write((state) => ({ ...state!, pending: [] })); });
+  stopAnswer = null;
+  (master as { turn: unknown }).turn = null;
 
   // A native board keeps everything, whatever its provider's partial list says.
   await React.act(async () => { root.render(null); });
