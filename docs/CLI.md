@@ -586,8 +586,10 @@ cadence settings agents profile sync review --expected-revision "$REV"
 
 Capture the new revision after each configuration change. Saving does not
 sync exports. Sync reports per-file status and a `snapshot`; it preserves
-unmanaged files. Preview starts no process and proves neither authentication
-nor future launch success. Launch saved profiles through the existing
+unmanaged files. A sync that may have changed an export reports an unknown
+outcome: inspect `cadence settings agents show` in the same workspace before
+repeating it. Preview starts no process and proves neither authentication nor
+future launch success. Launch saved profiles through the existing
 `cadence join ... --profile review` path.
 
 ### Managing-agent authorization
