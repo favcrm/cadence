@@ -318,6 +318,40 @@ fn assignment_unknown(org: &str, path: &str, body: Option<&Value>) -> Error {
     Error::unknown(message)
 }
 
+fn assignment_custody_failed(
+    org: &str,
+    action: &str,
+    assignment: &Assignment,
+    body: &Value,
+    error: Error,
+) -> Error {
+    let mut message = format!(
+        "hosted {action} for assignment {} in workspace {org} was confirmed at generation={}; \
+         local custody could not be recorded: {error}",
+        assignment.assignment_id, assignment.generation
+    );
+    if let Some(claim) = assignment.claim_id.as_deref() {
+        write!(&mut message, "; claim_id={claim}").expect("writing to a String cannot fail");
+    }
+    if let Some(operation) = body
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| hosted_id(value))
+    {
+        write!(&mut message, "; operation_id={operation}")
+            .expect("writing to a String cannot fail");
+    }
+    if let Some(generation) = body.get("expected_generation").and_then(Value::as_u64) {
+        write!(&mut message, "; expected_generation={generation}")
+            .expect("writing to a String cannot fail");
+    }
+    message.push_str(
+        "; inspect `cadence agent status` in the same selected workspace and reconcile \
+         the original assignment before deciding whether to retry; do not replay blindly",
+    );
+    Error::internal(message)
+}
+
 fn slug(name: Option<&str>) -> Result<String> {
     let slug = name.unwrap_or("work").to_ascii_lowercase();
     if slug.is_empty()
@@ -411,6 +445,19 @@ impl Assignment {
                 "unsupported_work_kind",
                 format!(
                     "{} is {kind} work, which this client cannot run; nothing local was started",
+                    self.issue_id
+                ),
+            )
+        })
+    }
+
+    fn confirmed_kind_refusal(&self, action: &str) -> Option<Error> {
+        self.unsupported_kind.as_ref().map(|kind| {
+            Error::invalid(
+                "unsupported_work_kind",
+                format!(
+                    "the hosted {action} for {} was confirmed; this client cannot run {kind} \
+                     work, so no further local work was started",
                     self.issue_id
                 ),
             )
@@ -1166,11 +1213,6 @@ impl<H: CoordHttp> Coordinator<H> {
         {
             return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
         }
-        // The board's answer is the row this client would run, so its work kind
-        // is authoritative here — not only the observation that was claimed.
-        if let Some(refusal) = claimed.work_kind_refusal() {
-            return Err(refusal);
-        }
         self.with_ledger(|ledger| {
             let mut found = false;
             for attempt in ledger.attempts.values_mut() {
@@ -1213,7 +1255,14 @@ impl<H: CoordHttp> Coordinator<H> {
                     .insert(format!("discovered:{}", claimed.assignment_id), attempt);
             }
             Ok(())
+        })
+        .map_err(|error| {
+            assignment_custody_failed(&self.org_id, "claim", &claimed, &body, error)
         })?;
+        // The confirmed row is authoritative, but must never start unsupported work.
+        if let Some(refusal) = claimed.confirmed_kind_refusal("claim") {
+            return Err(refusal);
+        }
         Ok(claimed)
     }
 
@@ -1489,12 +1538,12 @@ impl<H: CoordHttp> Coordinator<H> {
         })
     }
 
-    fn block_claim(&mut self, claimed: &Assignment, text: &str) -> bool {
+    fn block_claim(&mut self, claimed: &Assignment, text: &str) -> Result<bool> {
         if self.ensure_active().is_err() {
-            return false;
+            return Ok(false);
         }
         let Some(claim_id) = claimed.claim_id.as_deref() else {
-            return false;
+            return Ok(false);
         };
         let Ok(text) = wire::bounded_report_text(
             &wire::ReportIdentity {
@@ -1507,7 +1556,7 @@ impl<H: CoordHttp> Coordinator<H> {
             &claimed.assignment_id,
             text,
         ) else {
-            return false;
+            return Ok(false);
         };
         self.report_claimed(
             &claimed.assignment_id,
@@ -1517,7 +1566,7 @@ impl<H: CoordHttp> Coordinator<H> {
             Some(&text),
             None,
         )
-        .is_ok()
+        .map(|_| true)
     }
 
     fn activation_failure(&mut self, claimed: &Assignment, error: Error) -> Error {
@@ -1527,7 +1576,22 @@ impl<H: CoordHttp> Coordinator<H> {
         if error.code() == Some("binding_cancelled") {
             return error;
         }
-        let blocked = self.block_claim(claimed, &error.to_string());
+        let blocked = match self.block_claim(claimed, &error.to_string()) {
+            Ok(blocked) => blocked,
+            Err(report) if report.kind() == "unknown" => {
+                return Error::unknown(format!("local activation failed: {error}; {report}"));
+            }
+            Err(report) if report.kind() == "internal" => {
+                return Error::internal(format!("local activation failed: {error}; {report}"));
+            }
+            Err(report) if report.code() == Some("unsupported_work_kind") => {
+                return Error::invalid(
+                    "unsupported_work_kind",
+                    format!("local activation failed: {error}; {report}"),
+                );
+            }
+            Err(_) => false,
+        };
         if let Err(cancelled) = self.ensure_active() {
             return cancelled;
         }
@@ -1830,11 +1894,6 @@ impl<H: CoordHttp> Coordinator<H> {
                 {
                     return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
                 }
-                // A resume report replaces the row this client will run, so a
-                // kind it cannot serve must stop it before any worktree.
-                if let Some(refusal) = reported.work_kind_refusal() {
-                    return Err(refusal);
-                }
                 self.with_ledger(|ledger| {
                     for attempt in ledger.attempts.values_mut() {
                         if attempt.assignment_id.as_deref() != Some(reported.assignment_id.as_str())
@@ -1863,7 +1922,19 @@ impl<H: CoordHttp> Coordinator<H> {
                         }
                     }
                     Ok(())
+                })
+                .map_err(|error| {
+                    assignment_custody_failed(
+                        &self.org_id,
+                        &format!("report ({state})"),
+                        &reported,
+                        &body,
+                        error,
+                    )
                 })?;
+                if let Some(refusal) = reported.confirmed_kind_refusal("report") {
+                    return Err(refusal);
+                }
                 Ok(reported)
             }
             Err(error) if error.code() == Some("fenced") => {
@@ -2418,10 +2489,6 @@ impl<H: CoordHttp> Coordinator<H> {
         {
             return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
         }
-        // Reassignment hands this client the row it will start.
-        if let Some(refusal) = updated.work_kind_refusal() {
-            return Err(refusal);
-        }
         self.with_ledger(|ledger| {
             for attempt in ledger.attempts.values_mut() {
                 if attempt.assignment_id.as_deref() != Some(assignment) {
@@ -2436,7 +2503,13 @@ impl<H: CoordHttp> Coordinator<H> {
                 attempt.fenced = true;
             }
             Ok(())
+        })
+        .map_err(|error| {
+            assignment_custody_failed(&self.org_id, "reassignment", &updated, &body, error)
         })?;
+        if let Some(refusal) = updated.confirmed_kind_refusal("reassignment") {
+            return Err(refusal);
+        }
         Ok(updated)
     }
 
@@ -2822,7 +2895,9 @@ mod assignment_contract_tests {
 
     #[test]
     fn a_non_dev_reassign_response_is_refused() {
-        let (mut coord, calls, _state) = coord_with(running(json!("review")));
+        let mut response = queued(json!("review"));
+        response["generation"] = json!(2);
+        let (mut coord, calls, _state) = coord_with(response);
         let input = parse_assignment(&queued(json!("dev"))).ok().unwrap();
         coord.remember_discovered(&input).unwrap();
         let error = coord
@@ -2835,6 +2910,122 @@ mod assignment_contract_tests {
             .unwrap();
         assert_eq!(error.code(), Some("unsupported_work_kind"));
         assert_eq!(calls.get(), 1, "the reassign was sent before the refusal");
+    }
+
+    // CAD-2009/CAD-2060: independent confirmed-effect custody acceptance.
+    // A work-kind fence may stop local execution, never discard a correlated
+    // remote receipt. These use the real durable Coordinator ledger.
+    #[test]
+    fn a_non_dev_terminal_report_retains_confirmed_custody() {
+        let original = parse_assignment(&running(json!("dev"))).ok().unwrap();
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut response = running(json!("research"));
+        response["state"] = json!("result");
+        response["text"] = json!("Confirmed terminal report");
+        response["reported_head_sha"] = json!(head);
+        let (mut coord, calls, state) = coord_with(response);
+        coord.remember_discovered(&original).unwrap();
+        let message = coord.reserve_kickoff(&original).unwrap();
+        coord
+            .mark_kickoff_delivered(&original.assignment_id, &message)
+            .unwrap();
+        let before = Ledger::load(state.path(), "ws_1").unwrap();
+        assert!(!before.origins[&message].settled);
+        assert!(!coord.claim_already_ended(&original).unwrap());
+
+        let error = coord
+            .report_claimed(
+                &original.assignment_id,
+                original.claim_id.as_deref().unwrap(),
+                original.generation,
+                "result",
+                Some("Confirmed terminal report"),
+                Some(head),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"));
+        assert_eq!(calls.get(), 1, "report must not be replayed");
+
+        // Reopen persisted custody instead of inspecting a transient result.
+        let saved = Ledger::load(state.path(), "ws_1").unwrap();
+        let attempt = saved
+            .attempts
+            .values()
+            .find(|attempt| {
+                attempt.assignment_id.as_deref() == Some(original.assignment_id.as_str())
+            })
+            .unwrap();
+        assert_eq!(attempt.state, "result");
+        assert_eq!(attempt.generation, Some(original.generation));
+        assert_eq!(attempt.claim_id, original.claim_id);
+        assert!(attempt.kickoff_message.is_none());
+        assert!(attempt.kickoff_reserved.is_none());
+        assert!(attempt.lane.is_none());
+        assert!(attempt.worktree.is_none());
+        assert!(saved.origins[&message].settled);
+        assert_eq!(saved.origins.len(), before.origins.len());
+        assert!(coord.claim_already_ended(&original).unwrap());
+        assert!(coord.reserve_kickoff(&original).is_err());
+        assert_eq!(calls.get(), 1, "custody observation must not send HTTP");
+    }
+
+    #[test]
+    fn a_non_dev_reassign_retains_confirmed_generation_and_fence() {
+        let original = parse_assignment(&running(json!("dev"))).ok().unwrap();
+        let mut response = queued(json!("review"));
+        response["generation"] = json!(original.generation + 1);
+        let (mut coord, calls, state) = coord_with(response);
+        coord.remember_discovered(&original).unwrap();
+        let message = coord.reserve_kickoff(&original).unwrap();
+        coord
+            .mark_kickoff_delivered(&original.assignment_id, &message)
+            .unwrap();
+        assert!(coord.origin_for_assignment(&original.assignment_id).is_ok());
+        let before = Ledger::load(state.path(), "ws_1").unwrap();
+
+        let error = coord
+            .reassign_owned(&original.assignment_id, Some("usr_1"), false)
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"));
+        assert_eq!(calls.get(), 1, "reassignment must not be replayed");
+
+        let saved = Ledger::load(state.path(), "ws_1").unwrap();
+        let attempt = saved
+            .attempts
+            .values()
+            .find(|attempt| {
+                attempt.assignment_id.as_deref() == Some(original.assignment_id.as_str())
+            })
+            .unwrap();
+        assert_eq!(attempt.generation, Some(original.generation + 1));
+        assert_eq!(attempt.state, "queued");
+        assert_eq!(attempt.target.as_deref(), Some("usr_1"));
+        assert!(
+            attempt.fenced,
+            "the old local claim must retire immediately"
+        );
+        assert!(attempt.claim_id.is_none());
+        assert!(attempt.kickoff_message.is_none());
+        assert!(attempt.kickoff_reserved.is_none());
+        assert!(attempt.origin_claim_id.is_none());
+        assert!(attempt.origin_generation.is_none());
+        assert!(attempt.lane.is_none());
+        assert!(attempt.worktree.is_none());
+        assert!(attempt.reassign_operation_id.is_none());
+        assert!(attempt.reassign_fingerprint.is_none());
+        assert!(attempt.reassign_expected_generation.is_none());
+        assert_eq!(saved.origins.len(), before.origins.len());
+        assert!(
+            saved.origins.contains_key(&message),
+            "retain historical origin"
+        );
+        assert!(coord
+            .origin_for_assignment(&original.assignment_id)
+            .is_err());
+        assert!(coord.reserve_kickoff(&original).is_err());
+        assert_eq!(calls.get(), 1, "custody observation must not send HTTP");
     }
 }
 
@@ -3166,6 +3357,9 @@ mod cad2009_assignment_acceptance {
             Mutation::Cancel => coord.reassign(ID, None, true),
         }
     }
+
+    include!("local_assignment/cad2009_activation_acceptance.rs");
+    include!("local_assignment/cad2009_confirmed_custody_acceptance.rs");
 
     fn exercise(mutation: Mutation) {
         for answer in [

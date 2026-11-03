@@ -298,9 +298,15 @@ The gateway's real refusal shapes (AOS-243):
   separate upload endpoint or wiki uploads.
 - Hosted local-assignment writes use a separate protocol: authorization can be
   rechecked after a report, claim or reassignment commits. A post-dispatch
-  `401` or `403` therefore does not prove rejection. Inspect `cadence agent
-  status` in the same selected workspace and retain the assignment, claim,
-  generation and operation identifiers before deciding whether to retry.
+  `401` or `403` therefore does not prove rejection. A failed local activation
+  can itself send a blocked report; if its answer is lost, the result remains
+  unknown alongside the local failure. If a correlated receipt confirms the
+  remote action but local custody cannot be recorded, the error says the action
+  was confirmed and identifies the local failure. Inspect `cadence agent status`
+  in the same selected workspace and retain the assignment, claim, generation
+  and operation identifiers before deciding whether to retry. Unsupported work
+  kinds are never started locally; a confirmed receipt is recorded before that
+  local refusal.
 - Hosted app release mutations retain the caller's operation UUID. On an
   unproved response, inspect `app catalog operation` or `reconcile` for that
   UUID in the same workspace; do not create a new operation blindly.
