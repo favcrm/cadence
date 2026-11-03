@@ -73,6 +73,7 @@ export default function AgentPage({
   rosterFailed,
   onRetryRoster,
   operator,
+  onRetryAccess,
   hostedBoard,
   hiredWork,
 }: {
@@ -91,13 +92,14 @@ export default function AgentPage({
   rosterLoaded: boolean;
   rosterFailed: boolean;
   onRetryRoster: () => void;
-  operator: boolean;
+  operator: boolean | null;
+  onRetryAccess: () => void;
   hostedBoard: boolean;
   /** What a runtime-less profile's card names, if anything. */
   hiredWork: ProfileWork | null;
 }) {
   const boardBlock = useContext(WriteGate);
-  const writeBlock = useWriteBlock(!operator) ?? boardBlock;
+  const writeBlock = useWriteBlock(operator !== true) ?? boardBlock;
   const t = useTranslate();
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -109,7 +111,8 @@ export default function AgentPage({
   const leave = chat ? onBack : () => onTab("overview");
   useEffect(() => {
     // A runtime-less profile is not a registered agent: there is nothing to read.
-    if (hired || !rosterLoaded) return;
+    // Once the roster has answered, or failed, so a failed read still says so.
+    if (hired || (!rosterLoaded && !rosterFailed)) return;
     // A reload after a save keeps what is on screen; only a new alias resets.
     if (retry === 0) setDetail(null);
     setErr(null);
@@ -121,7 +124,7 @@ export default function AgentPage({
     return () => {
       live = false;
     };
-  }, [alias, retry, hired, rosterLoaded]);
+  }, [alias, retry, hired, rosterLoaded, rosterFailed]);
 
   // Esc leaves the page, unless it is closing something inside it.
   useEffect(() => {
@@ -320,6 +323,12 @@ export default function AgentPage({
           body: "",
           extra: rosterFailed ? <Button onClick={onRetryRoster}>{t("Retry")}</Button> : undefined,
         }
+      : operator === null
+        ? {
+            title: t("We couldn’t confirm your access"),
+            body: t("This doesn’t mean you’ve been signed out. The connection may be interrupted."),
+            extra: <Button onClick={onRetryAccess}>{t("Retry")}</Button>,
+          }
       : !operator
         ? boardIsHosted
           ? {

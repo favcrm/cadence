@@ -284,13 +284,14 @@ function AgentConversation({
           {gate ? (
             <div className="card p-3.5 ag-chat-gate" role="status">
               <strong>{gate.title}</strong>
-              <p>{gate.body}</p>
+              {gate.body && <p>{gate.body}</p>}
               {gate.extra}
             </div>
           ) : (
             <>
             <div className="text-micro text-ink-500 px-1 pb-1" role="status">
-              {sendNote ?? expectation}
+              {expectation}
+              {sendNote && <div>{sendNote}</div>}
             </div>
             <SharedComposer
               density="full"

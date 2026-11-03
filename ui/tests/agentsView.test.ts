@@ -136,7 +136,7 @@ let holdDetail = false;
 const reads: string[] = [];
 const threadReads: string[] = [];
 let threadExtra: Record<string, unknown> = {};
-let viewerIsOperator = true;
+let viewerIsOperator: boolean | null = true;
 let viewerHosted = false;
 globalThis.fetch = async (input, init) => {
   if (init?.method && init.method !== "GET")
@@ -215,6 +215,7 @@ async function render() {
       React.createElement(LocaleProvider, null, React.createElement(Agents, {
         key: `${viewerIsOperator}`,
         operator: viewerIsOperator,
+        onRetryAccess: () => {},
         hostedBoard: viewerHosted,
         state,
         issues: issueState,
@@ -540,7 +541,52 @@ async function main() {
   await render();
   assert(host.textContent?.includes("Cloud content unavailable") && !host.textContent?.includes("No messages with dev"), "a withheld thread does not read as empty");
   threadExtra = {};
+  viewerIsOperator = null;
+  threadReads.length = 0;
+  await render();
+  assert(dock().includes("couldn’t confirm your access") && !dock().includes("for the operator"), "an unanswered access check is not a non-operator");
+  assert(!host.querySelector("[data-composer]") && threadReads.length === 0, "an unanswered access check grants nothing");
+  viewerIsOperator = true;
+  // A roster that failed on a fresh mount claims nothing about the agent.
+  failDetail = true;
   await React.act(() => root.unmount());
+  const freshHost = document.createElement("div");
+  document.body.append(freshHost);
+  const freshRoot = createRoot(freshHost);
+  const failedRoster = { data: null, status: "failed", error: "Unavailable", asOf: null, inFlight: false } as unknown as typeof state;
+  const mountFresh = async (alias: string, section: typeof tab) => {
+    await React.act(() =>
+      freshRoot.render(
+        React.createElement(LocaleProvider, null, React.createElement(Agents, {
+          key: `${alias}:${section}`,
+          operator: true,
+          onRetryAccess: () => {},
+          hostedBoard: false,
+          state: failedRoster,
+          issues: issueState,
+          open: alias,
+          tab: section,
+          recruit: false,
+          ask: false,
+          onAsk: () => {},
+          onOpenAgent: () => {},
+          onTab: () => {},
+          onRecruit: () => {},
+          onOpenIssue: () => {},
+          onRetry: () => {},
+        })),
+      ),
+    );
+    await flush();
+    await flush();
+  };
+  await mountFresh("owner", "work");
+  assert(!freshHost.textContent?.includes("Loading agent details"), "a failed roster does not leave details loading forever");
+  assert(freshHost.textContent?.includes("Some details aren’t available"), "a failed roster still reports the detail failure, with its Retry");
+  assert(!freshHost.textContent?.includes("Nothing right now") && !freshHost.textContent?.includes("Nothing queued"), "a failed roster claims nothing about an agent's work");
+  await mountFresh("foreign", "overview");
+  assert(freshHost.textContent?.includes("Could not load agents") && !freshHost.textContent?.includes("Loading agent details"), "the page gives one answer, with no loading line beside the failure");
+  await React.act(() => freshRoot.unmount());
   console.log("agents view checks passed");
 }
 main().catch(async (error) => {

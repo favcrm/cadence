@@ -67,10 +67,13 @@ export default function Agents({
   onOpenIssue,
   onRetry,
   operator,
+  onRetryAccess,
   hostedBoard,
 }: {
-  /** The viewer may read and send agent conversations (as Threads requires). */
-  operator: boolean;
+  /** `true` alone lets the viewer read and send agent conversations, as on
+   *  Threads. `null` is an unanswered check, not a non-operator. */
+  operator: boolean | null;
+  onRetryAccess: () => void;
   hostedBoard: boolean;
   state: ResourceState<AgentsPayload>;
   issues: ResourceState<IssueCard[]>;
@@ -197,6 +200,7 @@ export default function Agents({
         rosterFailed={payload == null && state.status === "failed"}
         onRetryRoster={onRetry}
         operator={operator}
+        onRetryAccess={onRetryAccess}
         hostedBoard={hostedBoard}
         hiredWork={openHired ? profileWork(openHired, issueCards) : null}
       />
