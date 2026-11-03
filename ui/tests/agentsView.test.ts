@@ -685,6 +685,9 @@ async function main() {
   const failedUnlisted = servedHost.querySelector(".ag-chat-main")?.textContent ?? "";
   assert(failedUnlisted.includes("Some details aren’t available") && failedUnlisted.includes("Retry"), "a failed read for an unlisted agent keeps its line and Retry");
   failDetail = false;
+  // A failed roster must not hide what a served read says about the agent.
+  await mountServed("blocked", "overview", failedRoster);
+  assert(servedHost.querySelector(".ag-chat-main")?.textContent?.includes("Recovery required"), "a failed roster keeps a fenced agent's recovery banner");
   detailNotServed = true;
   await mountServed("dev", "history", liveRoster);
   assert(servedHost.textContent?.includes(NOT_RECORDED), "a known agent's history says it isn't recorded");

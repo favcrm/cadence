@@ -392,10 +392,11 @@ export default function AgentPage({
         block={writeBlock}
         onBack={onBack}
         onOpenIssue={onOpenIssue}
-        // The gate is already the one answer for an unread roster or a board that
-        // keeps no details. A failed read for an unlisted agent keeps its Retry:
-        // a successful read is what would bring the page back.
-        notices={hired || !rosterLoaded || (!profile && notServed) ? null : notices}
+        // With nothing known about the agent, the gate is already the one answer
+        // for an unread roster or a board that keeps no details. A known agent
+        // keeps its recovery banners, and a failed read for an unlisted agent
+        // keeps its Retry: a successful read is what would bring the page back.
+        notices={hired || (!profile && (!rosterLoaded || notServed)) ? null : notices}
         heading={
           <>
             <AgentAvatar
