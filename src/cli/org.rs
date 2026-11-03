@@ -358,20 +358,28 @@ fn view(c: &Connection, selected: bool) -> Value {
     out
 }
 
+/// Avoid accidental default changes in an inherited managed session.
+/// Environment markers are not authentication or a security boundary.
+pub(super) fn refuse_managed_default_change() -> Result<()> {
+    if std::env::var_os("CADENCE_ALIAS").is_some()
+        || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
+    {
+        return Err(Error::rejected(
+            "a managed session must not change the saved workspace default; \
+             use --org <workspace> for this command or ask the operator to change the default",
+        ));
+    }
+    Ok(())
+}
+
 /// `cadence org …` — no operator proof: a preference, never authority.
 pub(super) fn run(action: OrgAction) -> Result<i32> {
-    // A managed caller may read but never change the saved default — a UX
-    // guard, not a security claim.
-    let alias_bound = std::env::var_os("CADENCE_ALIAS").is_some();
+    if matches!(&action, OrgAction::Switch { .. }) {
+        refuse_managed_default_change()?;
+    }
     // `switch local` materializes the first-class connection before the
     // shared read, so `ensure_local`'s write lock never nests under this one.
     if matches!(&action, OrgAction::Switch { name } if name == LOCAL_ORG) {
-        if alias_bound {
-            return Err(Error::rejected(
-                "a managed caller cannot change the saved org default — \
-                 run `cadence org switch` from the operator's shell",
-            ));
-        }
         ensure_local(
             &cadence_agent::client::state_dir()?,
             &cadence_agent::issue::default_dir()?,
@@ -397,12 +405,6 @@ pub(super) fn run(action: OrgAction) -> Result<i32> {
             view(&c, registry.selected.as_ref() == Some(&c.selection))
         }
         OrgAction::Switch { name } => {
-            if alias_bound {
-                return Err(Error::rejected(
-                    "a managed caller cannot change the saved org default — \
-                     run `cadence org switch` from the operator's shell",
-                ));
-            }
             let c = select(&registry, Some(&name))?.expect("explicit org");
             registry.selected = Some(c.selection.clone());
             file.write(&registry)?;
