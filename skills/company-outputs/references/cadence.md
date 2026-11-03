@@ -10,7 +10,8 @@ Use this lookup only to find the command or tool. A listed command is not proof 
 | Read template | `cadence template show NAME --version V [--out NEW_DIR]` | Not available yet |
 | Calculate | The draft model behind `cadence document create`, or an inspected Decimal calculation where the session can run code | Not available yet |
 | Render | `cadence document create`, `show`, `export`, for an approved DOCX financial template | Not available yet |
-| Show | `cadence artifact put`, for the master's own turn; a worker on a hosted workspace uses `cadence --org <name> artifact put` | Not available yet |
+| Show | `cadence artifact put`, for the master's own turn | Not available yet |
+| Save file | `cadence --org <name> artifact put --issue <id>`, for a worker on a hosted workspace; without `--issue` it stays private to you | Not available yet |
 | Save draft | `cadence template create`, `revise` | Not available yet |
 | Approve | The operator's `cadence template approve` | Not available yet |
 

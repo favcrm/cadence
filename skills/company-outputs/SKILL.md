@@ -20,6 +20,7 @@ Check which tools or commands this session actually has before relying on one. `
 | Calculate | Work out amounts in code, not in your head |
 | Render | Produce a filled output from a template and structured data, with amounts calculated in code |
 | Show | Put a result on the canvas beside the conversation |
+| Save file | Store a result in the workspace for people to find later. This does not show it on a canvas |
 | Save draft | Record a new template version as an unapproved draft |
 | Approve | The owner's act alone. You never do this |
 

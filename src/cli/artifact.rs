@@ -11,8 +11,10 @@ use super::*;
 
 #[derive(Subcommand)]
 pub(crate) enum ArtifactAction {
-    /// Put a file on the canvas beside the chat. The same `--id` again
-    /// stores the next version; without it a new artifact is created.
+    /// Native: put a file on the canvas beside the chat. Hosted (`--org`): store
+    /// it in the workspace, private to you unless `--issue` links it; it does not
+    /// show on a canvas. The same `--id` again stores the next version; without
+    /// it a new artifact is created.
     Put {
         /// md, pdf, html, image or csv.
         #[arg(long)]

@@ -1763,12 +1763,7 @@ fn artifact_upload_once(
             format!("multipart/form-data; boundary={boundary}"),
         )
         .send(&body[..])
-        .map_err(|_| {
-            Error::unknown(
-                "the upload may or may not have been recorded — check `artifact find` \
-                 before repeating it",
-            )
-        })?;
+        .map_err(|_| artifact_outcome_unknown())?;
     let status = response.status().as_u16();
     let retry_after = response
         .headers()
@@ -1780,9 +1775,10 @@ fn artifact_upload_once(
         .into_body()
         .as_reader()
         .take(MAX_BODY + 1)
-        .read_to_end(&mut bytes)?;
+        .read_to_end(&mut bytes)
+        .map_err(|_| artifact_outcome_unknown())?;
     if bytes.len() as u64 > MAX_BODY {
-        return Err(reject("remote response too large"));
+        return Err(artifact_outcome_unknown());
     }
     Ok((status, retry_after, serde_json::from_slice(&bytes).ok()))
 }
@@ -1828,14 +1824,22 @@ pub fn upload_artifact(
             return Err(reject(artifact_tenant_too_old(
                 "artifact put",
                 status,
-                "sent",
+                "stored",
             )));
+        }
+        // Past this point the store may already have committed. Only a stated
+        // wake, or the store's own refusal, is a definite answer: a new command
+        // draws a new request id, so a wrong "failed" would add a version.
+        let waking_state = body.as_ref().and_then(|b| b["state"].as_str()) == Some("waking");
+        if status >= 500 && !waking_state {
+            return Err(artifact_outcome_unknown());
         }
         if !(200..300).contains(&status) && status != 503 {
             return Err(artifact_refusal(status, body.as_ref()));
         }
         match classify(status, retry_after, body) {
-            Verdict::Done(result) => return result,
+            Verdict::Done(Ok(answer)) => return artifact_receipt(answer, upload.bytes),
+            Verdict::Done(Err(_)) => return Err(artifact_outcome_unknown()),
             Verdict::Conflict(_) => return Err(reject("remote upload conflicted")),
             Verdict::Waking(wait) => {
                 let remaining = deadline
@@ -1852,6 +1856,29 @@ pub fn upload_artifact(
     }
 }
 
+fn artifact_outcome_unknown() -> Error {
+    Error::unknown(
+        "the upload may or may not have been recorded — check `artifact find` before \
+         repeating it, because a repeat can add a version",
+    )
+}
+
+/// A success must name what was stored, and its digest must be these bytes.
+fn artifact_receipt(answer: Value, bytes: &[u8]) -> Result<Value> {
+    let local: String = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let file = &answer["file"];
+    if file["id"].as_str().is_none()
+        || file["version"].as_u64().is_none()
+        || file["digest"].as_str() != Some(local.as_str())
+    {
+        return Err(artifact_outcome_unknown());
+    }
+    Ok(answer)
+}
+
 /// The store's refusals carry a safe code and message of its own; anything else
 /// goes through the shared decoder, which never echoes a raw body.
 fn artifact_refusal(status: u16, body: Option<&Value>) -> Error {
@@ -1865,9 +1892,13 @@ fn artifact_refusal(status: u16, body: Option<&Value>) -> Error {
     let code = error.and_then(|e| e["code"].as_str());
     let message = error.and_then(|e| e["message"].as_str());
     match (code, message) {
-        (Some(code), Some(message)) if STORE_CODES.contains(&code) => reject(format!(
-            "artifact put refused ({code}): {message}. Nothing was stored"
-        )),
+        (Some(code), Some(message)) if STORE_CODES.contains(&code) => {
+            let message: String = message.chars().take(300).collect();
+            let message = message.trim_end_matches('.');
+            reject(format!(
+                "artifact put refused ({code}): {message}. Nothing was stored"
+            ))
+        }
         _ => refusal_error(status, body),
     }
 }
@@ -3522,7 +3553,8 @@ fn call_verb_until_retry(
         // retryable. A checked write conflict keeps its own verdict: the call
         // ran and proved nothing was written.
         if status == 501 && matches!(verb, "artifact_find" | "artifact_show" | "artifact_read") {
-            return Err(reject(artifact_tenant_too_old(verb, status, "read")));
+            let verb = verb.replacen('_', " ", 1);
+            return Err(reject(artifact_tenant_too_old(&verb, status, "read")));
         }
         if PROJECT_SCOPED_GATE_VERBS.contains(&verb) {
             let checked_conflict = body.as_ref().is_some_and(|b| {

@@ -1246,7 +1246,9 @@ fn artifact(
 ) -> Result<i32> {
     use super::artifact::ArtifactAction;
     use cadence_agent::remote_cli::{call_verb, upload_artifact, ArtifactUpload, RemoteAnswer};
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wake_timeout);
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(wake_timeout))
+        .ok_or_else(|| Error::usage("invalid wake timeout"))?;
     let read = |verb: &str, args: serde_json::Map<String, Value>| -> Result<Value> {
         match call_verb(target, verb, args, deadline, wake_timeout, |line| {
             eprintln!("{line}")
@@ -1265,6 +1267,11 @@ fn artifact(
             label,
             customer,
         } => {
+            if cadence_agent::master::caller_is_master() {
+                return Err(Error::rejected(
+                    "the master puts artifacts on its own board; nothing was sent",
+                ));
+            }
             let bytes = cadence_agent::wiki::upload::read_local_file(file, ARTIFACT_MAX_BYTES)?;
             let name = file
                 .file_name()
@@ -1317,7 +1324,9 @@ fn artifact(
         ArtifactAction::Show { id, version, out } => {
             let Some(path) = out else {
                 if version.is_some() {
-                    return Err(Error::usage("--version needs --out <new file>"));
+                    return Err(Error::usage(
+                        "--version selects the bytes to write; pass --out <new file>",
+                    ));
                 }
                 let mut args = serde_json::Map::new();
                 args.insert("id".into(), json!(id));
@@ -1329,11 +1338,13 @@ fn artifact(
                 return Ok(0);
             };
             let mut bytes = Vec::new();
+            // Pinned from the first answer, so a new version cannot land mid-read.
+            let mut pinned = version.map(u64::from);
             let file = loop {
                 let mut args = serde_json::Map::new();
                 args.insert("id".into(), json!(id));
                 args.insert("offset".into(), json!(bytes.len()));
-                if let Some(version) = version {
+                if let Some(version) = pinned {
                     args.insert("version".into(), json!(version));
                 }
                 let body = read("artifact_read", args)?;
@@ -1351,6 +1362,7 @@ fn artifact(
                 if chunk.is_empty() && (bytes.len() as u64) < total {
                     return Err(Error::rejected("remote artifact read stopped early"));
                 }
+                pinned = pinned.or(body["file"]["version"].as_u64());
                 bytes.extend_from_slice(&chunk);
                 if bytes.len() as u64 >= total {
                     break body["file"].clone();
@@ -1367,12 +1379,22 @@ fn artifact(
                 ));
             }
             use std::io::Write;
-            let mut target_file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600); // An artifact may be private to its creator.
+            let mut target_file = options
                 .open(path)
                 .map_err(|e| Error::rejected(format!("cannot create {}: {e}", path.display())))?;
-            target_file.write_all(&bytes)?;
+            if let Err(error) = target_file.write_all(&bytes) {
+                let _ = std::fs::remove_file(path);
+                return Err(Error::rejected(format!(
+                    "cannot write {}: {error}",
+                    path.display()
+                )));
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({

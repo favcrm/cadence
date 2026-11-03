@@ -3169,6 +3169,17 @@ fn artifact_verbs_are_reads_and_a_store_refusal_is_named() {
         Some(&serde_json::json!({"error": {"code": "secret", "message": "leak-me"}})),
     );
     assert!(!other.to_string().contains("leak-me"));
+    // A success that does not name these bytes is not a proven success.
+    use super::artifact_receipt;
+    let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let good = serde_json::json!({"file": {"id": "art-1", "version": 1, "digest": digest}});
+    assert!(artifact_receipt(good, b"abc").is_ok());
+    for bad in [
+        serde_json::json!({}),
+        serde_json::json!({"file": {"id": "art-1", "version": 1, "digest": "00"}}),
+    ] {
+        assert_eq!(artifact_receipt(bad, b"abc").unwrap_err().kind(), "unknown");
+    }
     let old = artifact_tenant_too_old("artifact_find", 501, "read");
     assert!(old.contains("update the tenant server first"));
     assert!(!old.contains("unavailable"));
