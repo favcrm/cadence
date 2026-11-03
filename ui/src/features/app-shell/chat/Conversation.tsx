@@ -42,7 +42,6 @@ import {
   activeSendId,
   discardPending,
   sendBefore,
-  EMPTY_THREAD,
   failWithdrawn,
   inFlightTurnKey,
   unnamedTurnAnswered,
@@ -1282,9 +1281,15 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       .then((r) => {
         if (!r.withdrawn?.length) return;
         const withdrawn = r.withdrawn;
-        store.write((state) =>
-          failWithdrawn(state ?? EMPTY_THREAD, withdrawn, t("Withdrawn when the turn was stopped. Retry to send it again."), newMessageId),
-        );
+        const state = store.get().data;
+        if (state) {
+          store.write((current) =>
+            failWithdrawn(current ?? state, withdrawn, t("Withdrawn when the turn was stopped. Retry to send it again."), newMessageId),
+          );
+        }
+        if (!state || withdrawn.some((id) => !state.pending.some((row) => row.message === id))) {
+          setComposerNotice("A queued message was withdrawn too. Send it again if you still need it.");
+        }
       })
       .catch((e: unknown) => {
         const current =

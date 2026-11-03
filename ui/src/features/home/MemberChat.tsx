@@ -228,7 +228,9 @@ export default function MemberChat({
   const dockRef = useRef<HTMLDivElement | null>(null);
   const keepDockTail = useCallback(
     (onTail: boolean) => {
-      if (follow.current.pinned || onTail) scrollPanel("jump");
+      // Nothing unpins `follow` here, so only the reader's position counts:
+      // someone reading history stays where they are while they type.
+      if (onTail) scrollPanel("jump");
     },
     [scrollPanel],
   );

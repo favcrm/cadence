@@ -147,7 +147,14 @@ async function main() {
   assert(handedBack?.state === "failed", "a withdrawn message is no longer sending");
   assert(handedBack?.message !== "queued-1", "a Retry must not reuse the withdrawn id, which the engine would treat as already handled");
   assert(Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "Retry"), "a withdrawn message offers Retry");
+  assert(!host.querySelector('[data-cmd="stop"]'), "a row handed back needs no separate notice");
+  // A message queued from another tab has no row here, so the notice carries it.
   await React.act(async () => { resources.masterThread.write((state) => ({ ...state!, pending: [] })); });
+  await settle();
+  stopAnswer = { ok: true, result: "Stopped.", withdrawn: ["from-another-tab"] };
+  await React.act(async () => { host.querySelector<HTMLButtonElement>('[aria-label="Stop this turn"]')!.click(); });
+  await settle();
+  assert(host.querySelector('[data-cmd="stop"]')?.textContent?.includes("A queued message was withdrawn too"), "a withdrawal with no row here still says so");
   stopAnswer = null;
   (master as { turn: unknown }).turn = null;
 

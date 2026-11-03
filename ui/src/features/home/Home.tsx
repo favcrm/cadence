@@ -69,7 +69,6 @@ import { agentOn } from "../../lib/agentOn";
 import SinceCard from "./SinceCard";
 import {
   discardPending,
-  EMPTY_THREAD,
   failWithdrawn,
   inFlightTurnKey,
   unnamedTurnAnswered,
@@ -1290,12 +1289,19 @@ function MasterHome({
   };
 
 
-  const handBackWithdrawn = useCallback((r: MasterCommandResult) => {
+  const handBackWithdrawn = useCallback((id: number, r: MasterCommandResult) => {
     if (!r.withdrawn?.length) return;
     const withdrawn = r.withdrawn;
-    resources.masterThread.write((state) =>
-      failWithdrawn(state ?? EMPTY_THREAD, withdrawn, t("Withdrawn when the turn was stopped. Retry to send it again."), newMessageId),
-    );
+    const state = resources.masterThread.get().data;
+    if (state) {
+      resources.masterThread.write((current) =>
+        failWithdrawn(current ?? state, withdrawn, t("Withdrawn when the turn was stopped. Retry to send it again."), newMessageId),
+      );
+    }
+    // A message sent from another tab has no row here to hand back.
+    if (!state || withdrawn.some((message) => !state.pending.some((row) => row.message === message))) {
+      setCmds((c) => [...c, { id, name: "stop", ok: true, text: t("A queued message was withdrawn too. Send it again if you still need it.") }]);
+    }
   }, [t]);
 
   /** One `/` verb → the board's command route; its answer is a card. */
@@ -1325,7 +1331,7 @@ function MasterHome({
       api
         .masterCommand(name, arg || undefined)
         .then((r) => {
-          handBackWithdrawn(r);
+          handBackWithdrawn(id, r);
           const { text, value } = fmtCommandResult(r);
           setCmds((c) =>
             c.map((x) => (x.id === id ? { ...x, running: false, ok: r.ok, text, value } : x)),
@@ -1353,7 +1359,7 @@ function MasterHome({
       .masterCommand(command, undefined, undefined, message)
       .then((r) => {
         void resources.masterState.refresh();
-        handBackWithdrawn(r);
+        handBackWithdrawn(id, r);
         if (!r.ok) setCmds((c) => [...c, { id, name: command, ok: false, text: "The master did not accept the command." }]);
       })
       .catch((e: ApiError) => setCmds((c) => [...c, { id, name: command, ok: false, text: e.message }]));
