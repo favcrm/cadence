@@ -1,0 +1,29 @@
+# CAD-2081: the service principals whose workflow-issued review verdicts
+# `scripts/enqueue-reviewed` counts without a GitHub login, the ONE verdict kind
+# each may fill, and the workflow file that principal's runs execute. Read at the
+# LIVE tip of `main` (not the PR's base, which can lag by hundreds of commits), so
+# a revocation or a workflow fix on main reaches an open PR. The tip never holds an
+# unmerged PR, so a PR cannot add its own reviewer.
+#
+# The rows are filed by the tenant after it verifies a GitHub Actions OIDC token
+# from the matching workflow on `main`. The principal names below must equal the
+# `subject` of the writer's reviewed map (agenticos-v2
+# apps/api/src/tenant-board/review-workflows.ts). `identity_source` alone never
+# counts a row: the principal must be listed here with the row's kind, and the
+# `workflow` file at the row's `workflow_sha` must be a regular file byte-identical
+# to the same file at main's tip, so a re-run of a since-fixed workflow counts for
+# nothing.
+#
+# Only `standards` and `spec-security` are accepted; any other kind, or a
+# malformed entry, makes the whole file unreadable and every workflow row
+# refuses. There is no Browser QA workflow, so a `ui/` PR still needs a Browser
+# QA verdict from a session. Changing this file is class `human`
+# (risk-classes.md trigger 7).
+
+[principals.svc_review_standards]
+kind = "standards"
+workflow = ".github/workflows/review-standards.yml"
+
+[principals.svc_review_spec]
+kind = "spec-security"
+workflow = ".github/workflows/review-spec.yml"

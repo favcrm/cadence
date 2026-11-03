@@ -434,7 +434,8 @@ that standard yet: it counts hosted verdicts by attested principal and refuses
 the author's principal (local notes count by their self-declared `From:`
 alias, which is not attested), so a profile or separate session alone does not make a
 gate-counted verdict, and in-chat findings are not one either. Until the gate
-can tell a fresh session from the author, merges use the temporary
+can tell a fresh session from the author (the workflow-issued reviews of
+CAD-2081, not shipped yet; AGENTS.md "Review"), merges use the temporary
 `--exception --advisory ...` path (exact-head operator approval and two
 advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change; ends at `EXCEPTION_ENDS` in

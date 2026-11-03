@@ -52,7 +52,9 @@ fresh-context session that is not the author, a subagent included (AGENTS.md
 "Review"). This gate does not enforce that: hosted verdicts count by attested
 principal and the author's is refused, local notes count by their self-declared
 `From:` alias (not attested), so it cannot tell a fresh session from the author
-under one login. Until it can, the temporary exception below is the merge path.
+under one login. CAD-2081 adds workflow-issued rows (see AGENTS.md "Review"), but
+their workflows are not shipped yet, so until they are the temporary exception
+below is the merge path.
 
 CAD-1946 temporary exception: `--exception --advisory standards=<url> --advisory
 spec-security=<url>` (and `browser-qa=<url>` for a `ui/` change) waives only the
@@ -99,7 +101,7 @@ GATE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "delivery
 DEFAULT_GATE_KEY = "~/.config/cadence/delivery-gate/signing_key"  # CAD-1925
 ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 # CAD-2081: the workflow principals whose rows count without a login, and the one
-# kind each may fill. Read at the PR's base, like the lists above.
+# kind each may fill. Read at main's LIVE tip, not the PR's base (which can lag).
 WORKFLOW_PRINCIPALS_FILE = "docs/roles/review-workflow-principals.toml"
 WORKFLOW_KINDS = ("standards", "spec-security")
 # The review standard is a fresh-session review (AGENTS.md "Review", CAD-1946), which
@@ -111,7 +113,8 @@ AUTHOR_ROW_HINT = (" (a filed row under the author's identity still refuses unde
                    "only a fresh non-author session's review can)")
 REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a non-author session, "
                         "and this gate cannot yet tell one from the author under one login: use "
-                        "--exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate. "
+                        "--exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate "
+                        "(workflow-issued reviews, CAD-2081, are not shipped yet). "
                         "A verdict filed under the author's identity still refuses under the exception, "
                         "so a same-login session posts its findings as a PR comment and files no verdict)")
 
@@ -126,6 +129,10 @@ HUMAN_PREFIXES = (".github/", "scripts/", "docs/roles/", ".config/", ".cargo/",
 # PR's base, is human too (CAD-1104). Unreadable means human (fail closed).
 RISK_PATHS_FILE = "docs/roles/risk-paths.toml"
 RISK_HUMAN_TABLES = ("schema", "trigger4", "trigger6", "trigger7")
+# CAD-2081: trust-boundary and secret paths keep TWO reviews, not an operator. A
+# workflow review can write `risk: auto` (a prompt-injected model can), so on these
+# paths a workflow row never replaces the operator's approval.
+RISK_WORKFLOW_OPERATOR_TABLES = ("trigger1", "trigger3")
 HUMAN_LINES = 1500  # risk-classes trigger 5
 HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml",
                    "package-lock.json", ".npmrc", "yarn.lock", "bun.lockb",
@@ -299,16 +306,26 @@ def pr_changes(pr, head, base, base_oid):
     return parse_raw_diff(out), lines
 
 
-def risk_globs(toml_text):
+def risk_globs(toml_text, tables=RISK_HUMAN_TABLES):
     """The human-class globs of risk-paths.toml, or None if unreadable."""
     if toml_text is None:
         return None
     try:
         doc = tomllib.loads(toml_text)
-        globs = [g for t in RISK_HUMAN_TABLES for g in doc[t]["paths"]]
+        globs = [g for t in tables for g in doc[t]["paths"]]
     except (tomllib.TOMLDecodeError, KeyError, TypeError):
         return None
     return globs if all(isinstance(g, str) for g in globs) else None
+
+
+def workflow_operator_reasons(paths, risk_text):
+    """Why a workflow review needs the operator's approval on these paths (CAD-2081)."""
+    globs = risk_globs(risk_text, RISK_WORKFLOW_OPERATOR_TABLES)
+    if globs is None:
+        return ["cannot read the trigger 1/3 lists to place a workflow review (fail closed)"]
+    hit = [p for p in paths if any(glob_match(g, p) for g in globs)]
+    return ([f"a workflow review cannot stand in for the operator on trigger 1/3 path {hit[0]}"]
+            if hit else [])
 
 
 def is_human_path(path, risk=()):
@@ -672,28 +689,46 @@ def workflow_principals(toml_text):
     return {k: {"kind": v["kind"], "workflow": v["workflow"]} for k, v in table.items()}
 
 
-def workflow_file_reason(base_oid, sha, path):
-    """"" when `path` at `sha` is byte-identical to `path` at the PR's base commit.
+def workflow_file_reason(main_oid, sha, path):
+    """"" when `path` at `sha` is a regular file (mode 100644) byte-identical to
+    `path` at `main_oid`, main's live tip.
 
     A GitHub re-run keeps the original commit's workflow for up to 30 days, so a
-    since-fixed workflow can still file a pass. A blob id equals byte equality.
-    An unreachable commit or a missing file refuses; it is never skipped."""
+    since-fixed workflow can still file a pass. A blob id equals byte equality, and
+    the mode is read too so a symlinked workflow cannot pass the blob compare. An
+    unreachable commit or a missing file refuses; it is never skipped."""
+    def have(rev):
+        return run(["git", "cat-file", "-e", f"{rev}^{{commit}}"])[0] == 0
+
     def blob(rev):
-        rc, out, _ = run(["git", "rev-parse", "--verify", "--quiet", f"{rev}:{path}"])
-        return out.strip() if rc == 0 else ""
-    if not FULL_SHA.match(sha or ""):
+        rc, out, _ = run(["git", "ls-tree", rev, "--", path])
+        parts = out.rstrip("\n").split("\t", 1)[0].split(" ") if rc == 0 and out.strip() else []
+        if len(parts) != 3 or parts[0] != "100644" or parts[1] != "blob":
+            return ""
+        return parts[2]
+
+    if not FULL_SHA.fullmatch(sha or ""):
         return f"its workflow_sha {sha!r} is not a full commit SHA"
-    if run(["git", "cat-file", "-e", f"{sha}^{{commit}}"])[0] != 0:
-        run(["git", "fetch", "--quiet", "--no-tags", "origin", sha])
-    if run(["git", "cat-file", "-e", f"{sha}^{{commit}}"])[0] != 0:
-        return f"workflow commit {sha} is not in this checkout, so {path} there cannot be compared"
-    then, now = blob(sha), blob(base_oid)
+    for rev in (sha, main_oid):
+        if not have(rev):
+            run(["git", "fetch", "--quiet", "--no-tags", "origin", rev])
+        if not have(rev):
+            return f"commit {rev} is not in this checkout, so {path} there cannot be compared"
+    then, now = blob(sha), blob(main_oid)
     if not then or not now:
-        return f"{path} cannot be read at workflow commit {sha[:12]} or at the PR's base"
+        return (f"{path} is not a regular file (100644) at workflow commit {sha[:12]} "
+                f"and at main's tip {main_oid[:12]}")
     if then != now:
-        return (f"{path} at workflow commit {sha[:12]} differs from the PR's base: "
+        return (f"{path} at workflow commit {sha[:12]} differs from main's live tip: "
                 "a run of a superseded workflow does not count")
     return ""
+
+
+def live_main_tip(repo):
+    """main's live tip commit, or "" when it cannot be read."""
+    rc, out, _ = run(["gh", "api", f"repos/{repo}/git/ref/heads/main", "--jq", ".object.sha"])
+    tip = out.strip()
+    return tip if rc == 0 and FULL_SHA.fullmatch(tip) else ""
 
 
 def is_workflow_row(n):
@@ -704,32 +739,30 @@ def workflow_reason(n, hosted):
     """Why a workflow-issued row cannot count, or "" when it can (CAD-2081).
 
     `identity_source` is only a claim. The row counts when its PRINCIPAL is in
-    the allowlist read from the PR's base and the kind is the one that
+    the allowlist read from main's live tip and the kind is the one that
     principal may fill. It has no login, so no login-based check applies."""
     principal = (n.get("reviewer_id") or "").strip()
+    if not FULL_SHA.fullmatch(n.get("base_sha") or ""):
+        return f"workflow verdict {n['name']} cannot count: it records no base_sha"
+    # The tenant files only for a base of main. A PR retargeted since the filing no
+    # longer has the base the review ran against: judge the CURRENT base, not the row.
+    if hosted.get("pr_base") != "main":
+        return (f"workflow verdict {n['name']} cannot count: the PR's base is now "
+                f"{hosted.get('pr_base')!r}, not main")
     allowed = hosted.get("workflow_principals")
     if allowed is None:
         return (f"workflow verdict {n['name']} cannot count: cannot read "
-                f"{WORKFLOW_PRINCIPALS_FILE} at the base (fail closed)")
+                f"{WORKFLOW_PRINCIPALS_FILE} at main's live tip (fail closed)")
     if (n.get("repo") or "").strip().lower() != hosted["repo"].lower():
         return (f"workflow verdict {n['name']} cannot count: it names repo "
                 f"{n.get('repo')!r}, not the PR's repo {hosted['repo']}")
     if principal not in allowed:
         return (f"workflow verdict {n['name']} cannot count: principal {principal or '(none)'} is "
-                f"not in {WORKFLOW_PRINCIPALS_FILE} at the base")
+                f"not in {WORKFLOW_PRINCIPALS_FILE} at main's live tip")
     entry = allowed[principal]
     if n["kind"] != entry["kind"]:
         return (f"workflow verdict {n['name']} cannot count: principal {principal} may file only "
                 f"{entry['kind']}, not {n['kind']}")
-    # The tenant files only for a base of main and records the base commit it saw
-    # as `base_sha`. A row without one proves nothing, and a PR retargeted since
-    # the filing no longer has the base the review ran against: judge the CURRENT
-    # base, never the row.
-    if not FULL_SHA.fullmatch(n.get("base_sha") or ""):
-        return f"workflow verdict {n['name']} cannot count: it records no base_sha"
-    if hosted.get("pr_base") != "main":
-        return (f"workflow verdict {n['name']} cannot count: the PR's base is now "
-                f"{hosted.get('pr_base')!r}, not main")
     why = hosted["workflow_file"](n.get("workflow_sha"), entry["workflow"])
     if why:
         return f"workflow verdict {n['name']} cannot count: {why}"
@@ -1395,11 +1428,6 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     report.append("reviews required: " + ("one (diff is on the one-review list)" if one else "two (Standards and Spec/security)"))
     need_qa = any(p.startswith("ui/") for p in paths)
 
-    # CAD-2081: the workflow principals, read at the PR's base like the list above.
-    rc, wf_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
-                          f"repos/{repo}/contents/{WORKFLOW_PRINCIPALS_FILE}?ref={base_oid}"])
-    wf_principals = workflow_principals(wf_text if rc == 0 and base_oid else None)
-
     # Ticket and verdicts.
     m = re.match(r"\s*([A-Z][A-Z0-9]*-\d+)\b", view.get("title") or "")
     issue = m.group(1) if m else None
@@ -1500,11 +1528,23 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                     identities = read_identities()
                 except RuntimeError as e:
                     reasons.append(str(e))
+            # CAD-2081: the workflow allowlist and workflow files are read at main's
+            # LIVE tip, not the PR's base, which can sit hundreds of commits behind: a
+            # revocation or fix on main must reach an open PR. The tip never contains
+            # an unmerged PR, so a PR still cannot add its own reviewer. Only a PR
+            # based on main can count workflow rows, so any other base reads nothing.
+            wf_principals, main_tip = None, ""
+            if any(is_workflow_row(v) for v in verdicts) and base == "main":
+                main_tip = live_main_tip(repo)
+                if main_tip:
+                    rc, wf_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                                          f"repos/{repo}/contents/{WORKFLOW_PRINCIPALS_FILE}?ref={main_tip}"])
+                    wf_principals = workflow_principals(wf_text if rc == 0 else None)
             hosted = {"repo": repo, "project": hosted_project,
                       "author_login": author_login,
                       "author_principal": identities.get(author_login.lower(), ""),
                       "workflow_principals": wf_principals, "pr_base": base,
-                      "workflow_file": lambda sha, path: workflow_file_reason(base_oid, sha, path)}
+                      "workflow_file": lambda sha, path: workflow_file_reason(main_tip, sha, path)}
             report.append(f"verdict origin: hosted ({repo}, project {hosted_project}); "
                           "counting attested principals")
             if any(not is_workflow_row(v) for v in verdicts):
@@ -1561,6 +1601,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     why += [p for p in paths if is_human_path(p, risk or ())][:5]
     if lines > HUMAN_LINES:
         why.append(f"{lines} changed lines")
+    if any(is_workflow_row(v) for v in verdicts):
+        why += workflow_operator_reasons(paths, risk_text)
     not_auto = [v for v in verdicts if v["risk"] != "auto"]
     if not_auto:
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
@@ -1740,6 +1782,88 @@ def enqueue(args, repo):
     return 1
 
 
+def real_function_cases(hosted_wf, wrow, wf):
+    """CAD-2081: the real allowlist parser, trigger lists and workflow-file comparison,
+    over a throwaway git repo, so no stub stands in for them. Returns the failure count."""
+    import tempfile
+    failures = 0
+
+    def check(label, ok, detail=""):
+        nonlocal failures
+        print(f"{'ok  ' if ok else 'FAIL'} {label}: {detail}"[:200])
+        failures += 0 if ok else 1
+
+    allow_text = ('[principals.svc_std]\nkind = "standards"\nworkflow = ".github/workflows/review-standards.yml"\n'
+                  '[principals.svc_spec]\nkind = "spec-security"\nworkflow = ".github/workflows/review-spec.yml"\n')
+    check("the real allowlist parser reads the two principals",
+          workflow_principals(allow_text) == wf, str(workflow_principals(allow_text)))
+    for label, text in (("a combined kind", allow_text.replace('"standards"', '"combined"')),
+                        ("a non-workflow path", allow_text.replace(".github/workflows/review-spec.yml", "src/x.rs")),
+                        ("a missing file", None), ("malformed toml", "[principals")):
+        check(f"the real allowlist parser fails closed on {label}", workflow_principals(text) is None)
+    risk_text = '[trigger1]\npaths = ["src/remote_cli.rs"]\n[trigger3]\npaths = ["src/secret/**"]\n'
+    check("a trigger 1 path needs the operator for a workflow review",
+          bool(workflow_operator_reasons(["a.md", "src/remote_cli.rs"], risk_text)))
+    check("a trigger 3 path needs the operator for a workflow review",
+          bool(workflow_operator_reasons(["src/secret/x.rs"], risk_text)))
+    check("an ordinary path does not", not workflow_operator_reasons(["docs/a.md"], risk_text))
+    check("an unreadable trigger list refuses", bool(workflow_operator_reasons(["a.md"], None)))
+
+    path = ".github/workflows/review-standards.yml"
+    with tempfile.TemporaryDirectory(prefix="eq") as tmp:
+        git = ["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@t"]
+        def sh(*a):
+            return subprocess.run([*git, *a], capture_output=True, text=True).stdout.strip()
+        def commit(msg):
+            sh("add", "-A")
+            sh("commit", "-q", "-m", msg)
+            return sh("rev-parse", "HEAD")
+        sh("init", "-q")
+        os.makedirs(f"{tmp}/.github/workflows")
+        with open(f"{tmp}/{path}", "w") as f:
+            f.write("v1\n")
+        with open(f"{tmp}/.github/workflows/review-spec.yml", "w") as f:
+            f.write("spec\n")
+        with open(f"{tmp}/allow.toml", "w") as f:
+            f.write(allow_text)
+        old = commit("v1")
+        with open(f"{tmp}/{path}", "w") as f:
+            f.write("v2\n")
+        with open(f"{tmp}/allow.toml", "w") as f:
+            f.write(allow_text.replace("[principals.svc_std]", "[principals.svc_gone]"))
+        tip = commit("fix the workflow and revoke svc_std")
+        os.remove(f"{tmp}/{path}")
+        os.symlink("review-spec.yml", f"{tmp}/{path}")
+        link = commit("symlinked workflow")
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            check("a fresh run from main's tip matches", workflow_file_reason(tip, tip, path) == "")
+            check("a run of a since-fixed workflow differs from the tip",
+                  "differs from main's live tip" in workflow_file_reason(tip, old, path))
+            check("a symlinked workflow is not a regular file",
+                  "regular file" in workflow_file_reason(link, link, path))
+            check("an unreachable workflow commit refuses",
+                  "cannot be compared" in workflow_file_reason(tip, "c" * 40, path))
+            check("a trailing newline on the sha is not a sha",
+                  "not a full commit SHA" in workflow_file_reason(tip, tip + "\n", path))
+            tip_allow = workflow_principals(sh("show", f"{tip}:allow.toml"))
+            h = hosted_wf(allow=tip_allow, same=lambda sha, p: workflow_file_reason(tip, sha, p))
+            # A PR behind main: svc_std was revoked and the workflow fixed on main. Its
+            # old run refuses; a fresh run from the tip by a listed principal counts.
+            rows = [dict(wrow("s.md", "svc_std", "standards"), workflow_sha=old),
+                    dict(wrow("p.md", "svc_spec", "spec-security"), workflow_sha=tip)]
+            reasons, counted = check_reviews(rows, False, False, {"author"}, "CAD-1", h)
+            check("a revocation on main refuses the revoked principal's row",
+                  any("principal svc_std is not in docs/roles/review-workflow-principals.toml at main's live tip" in r
+                      for r in reasons))
+            check("a fresh run from main's tip by a listed principal counts",
+                  [n["name"] for n in counted] == ["p.md"], str([n["name"] for n in counted]))
+        finally:
+            os.chdir(cwd)
+    return failures
+
+
 def self_test():
     """CAD-2049: the independence rule over fixed documents. No network, no files.
 
@@ -1821,6 +1945,10 @@ def self_test():
          [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_spec", "spec-security")],
          False, "cannot be compared", 0, False,
          lambda sha, path: f"workflow commit {sha} is not in this checkout, so {path} there cannot be compared"),
+        ("a workflow row naming another repo than the PR refuses",
+         [dict(wrow("s.md", "svc_std", "standards"), repo="x/y"),
+          wrow("p.md", "svc_spec", "spec-security")],
+         False, "not the PR's repo", 1),
         ("a retargeted PR refuses two good workflow rows",
          [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_spec", "spec-security")],
          False, "is now 'staging', not main", 0, False, None, "staging"),
@@ -1855,6 +1983,7 @@ def self_test():
             detail = "; ".join(reasons) or "no refusal"
         print(f"{'ok  ' if ok else 'FAIL'} {label}: {detail}")
         failures += 0 if ok else 1
+    failures += real_function_cases(hosted_wf, wrow, wf)
     for label, rows, one, expected, n_counted, *extra in wf_cases:
         qa = extra[0] if extra else False
         h = hosted_wf(allow=None if "unreadable" in label else wf,

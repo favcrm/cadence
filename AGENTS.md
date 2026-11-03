@@ -120,11 +120,13 @@ the code you just wrote.
   where two are required, each by its own fresh session. Owner approval of the
   exact head still applies on `human`-class paths; this decision changes no
   approval rule for send, publish, spend or deploy.
-- **What the gate enforces today.** Not this standard. `scripts/enqueue-reviewed`
-  counts hosted verdicts by attested principal and, since CAD-2049, refuses the
-  author's principal; local notes count by their self-declared `From:` alias,
-  which is not attested. It cannot tell a fresh session from the author when
-  both act under one login. Until it can, merge through the
+- **What the gate enforces today.** Not this standard directly.
+  `scripts/enqueue-reviewed` counts hosted verdicts by attested principal and,
+  since CAD-2049, refuses the author's principal; local notes count by their
+  self-declared `From:` alias, which is not attested. It cannot tell a fresh
+  session from the author when both act under one login. Two routes exist.
+  Workflow-issued reviews (below) are the intended one but their workflows are
+  not shipped yet (CAD-2081 stage 3). Until they are, merge through the
   temporary exception (`--exception --advisory standards=<url> --advisory
   spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
   at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10). Of the advisory
@@ -133,23 +135,36 @@ the code you just wrote.
   author's identity still refuses under the exception, so a same-login
   session posts its findings as a PR comment and files no verdict. A second
   attested human is not required.
-- **Workflow-issued reviews (CAD-2081).** The gate also counts a hosted row whose
-  `identity_source` is `workflow-oidc`, but only when its principal is in
-  `docs/roles/review-workflow-principals.toml` read from the PR's base and the
-  row's kind is the one kind that principal may fill, and the principal's workflow
-  file at the row's `workflow_sha` is byte-identical to the one on the PR's base
-  (a re-run keeps the original commit's workflow for up to 30 days, so a
-  since-fixed workflow cannot still file a pass; an unreachable commit refuses).
-  An unlisted principal, a wrong kind, a PR whose current base is not main, a row without a `base_sha` or a non-pass row
-  refuses and counts for nothing. Such a row has no
-  login, so the author-login checks do not apply to it. Standards plus
+- **Workflow-issued reviews (CAD-2081; the workflows are not shipped yet).** The
+  gate counts a hosted row whose `identity_source` is `workflow-oidc` only when
+  all of these hold, each read at gate time: its principal is in
+  `docs/roles/review-workflow-principals.toml` at the live tip of `main` (not the
+  PR's base, which can lag; the tip never holds an unmerged PR, so a PR cannot add
+  its own reviewer) and the row's kind is the one kind that principal may fill;
+  the PR's current base is `main`; the row records a `base_sha`; and the
+  principal's workflow file at the row's `workflow_sha` is a regular file
+  byte-identical to the same file at main's tip. A re-run keeps the original
+  commit's workflow for up to 30 days, so the comparison keeps a since-fixed
+  workflow from still filing a pass. It covers the workflow file itself, not the
+  actions it calls. An unlisted principal, a wrong kind, an unreadable tip or
+  allowlist, a retargeted PR or a non-pass row refuses and counts for nothing.
+  Such a row has no login, so the author-login checks do not apply. Standards plus
   Spec/security from the two workflow principals satisfy the two-review
-  requirement. This proves a fresh GitHub-hosted job ran workflow code that was
-  on `main`, filed for the head that was live; it does not prove good judgement
-  or resistance to a prompt injected through the diff, and a session holding
-  admin can still rewrite the workflow or sign directly until agents lose admin.
-  There is no Browser QA workflow: a `ui/` PR still needs a Browser QA verdict
-  from a session, and refuses without it. The exception path is unchanged.
+  requirement; the `consequential` class wants a combined review, so it refuses
+  workflow rows.
+  What this proves: a fresh GitHub-hosted job ran workflow code from `main`,
+  filed for a head live at filing. It does not prove good judgement. A workflow
+  row may carry `risk: auto`, and a prompt-injected model can write it: a PR that
+  fools both models skips the operator unless a human path or size trigger
+  applies. The gate therefore requires the operator's approval for a workflow
+  review on trigger 1 and 3 paths (trust boundary, identity, secrets), and the
+  rule-7 paths (the rules and the gates, including `src/delivery/**`) are human
+  class. The tenant stops re-filing, not re-rolling: a run can be cancelled and
+  re-dispatched, or an empty commit pushed, for a new head and a new verdict.
+  A session holding admin can still rewrite the workflow or sign directly until
+  agents lose admin. There is no Browser QA workflow: a `ui/` PR still needs a
+  Browser QA verdict from a session, and refuses without it. The exception path
+  is unchanged.
 - One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
