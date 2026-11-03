@@ -180,6 +180,34 @@ class Advisory(unittest.TestCase):
         self.assertIn("Advisory review: standards = https://x.test/1", body)
 
 
+class Routine(unittest.TestCase):
+    PROOF = {"ci_run_url": "https://ci/1"}
+
+    def test_only_a_hosted_org_may_lack_readiness_and_it_is_named(self):
+        self.assertEqual(enqueue.exception_routine("routine", True, "hosted", None, "https://ci/1"), ([], True))
+        reasons, waived = enqueue.exception_routine("routine", True, "local", None, "https://ci/1")
+        self.assertTrue(reasons)
+        self.assertFalse(waived)
+
+    def test_a_proof_for_another_run_still_refuses(self):
+        reasons, _ = enqueue.exception_routine("routine", True, "hosted", self.PROOF, "https://ci/2")
+        self.assertTrue(reasons)
+        self.assertEqual(enqueue.exception_routine("routine", True, "local", self.PROOF, "https://ci/1"), ([], False))
+
+    def test_other_classes_are_not_touched(self):
+        self.assertEqual(enqueue.exception_routine("strict", True, "hosted", None, None), ([], False))
+
+    def test_the_waiver_is_on_the_record(self):
+        body = enqueue.evidence_body({
+            "repo": REPO, "pr": PR, "head": HEAD, "base": OTHER, "base_ref": "main", "ci_run": "https://ci",
+            "checks": [], "notes": [],
+            "exception": {"ends": gate.EXCEPTION_ENDS, "advisory": {}, "waives_readiness": True}})
+        self.assertIn("routine readiness (hosted has none)", body)
+
+    def test_an_unknown_advisory_kind_refuses(self):
+        self.assertTrue(enqueue.advisory_reasons({**Advisory.OK, "junk": "https://x.test/9"}, False))
+
+
 class CommandLine(unittest.TestCase):
     def test_advisory_alone_is_refused(self):
         with redirect_stderr(StringIO()):

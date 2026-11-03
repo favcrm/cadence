@@ -49,8 +49,9 @@ unless ALL of these hold for the pinned head:
 
 CAD-1946 temporary exception: `--exception --advisory standards=<url> --advisory
 spec-security=<url>` (and `browser-qa=<url>` for a `ui/` change) waives only the
-missing authenticated reviewer attestation. Every other rule still holds, a filed
-non-pass verdict still refuses, the operator must have approved this exact head
+missing authenticated reviewer attestation, and on a hosted routine PR the readiness
+proof hosted can't produce yet, which the evidence names. Every other rule still
+holds, a filed non-pass verdict still refuses, the operator must have approved this exact head
 (no scope fallback), and the signature and evidence say it is an exception. The
 advisory links are findings from separately assigned sessions, not verdicts: the
 gate cannot prove their independence, and the operator accepts that. Ends at
@@ -787,10 +788,30 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
     return reasons, counted
 
 
+def exception_routine(klass, active, origin, readiness, ci_url):
+    """(refusals, waives readiness) for an exception on a routine PR (CAD-1946).
+
+    Hosted has no readiness record yet, and the exception names that waiver. A
+    present proof must still match the run, and a local org must still have one."""
+    if klass != "routine" or not active:
+        return [], False
+    if readiness is None:
+        if origin == "hosted":
+            return [], True
+        return ["active routine delivery has no fresh native readiness proof for this exact binding"], False
+    if ci_url is not None and ci_url != readiness["ci_run_url"]:
+        return ["native routine readiness CI run is not the actual successful ci.yml run at this head"], False
+    return [], False
+
+
+ADVISORY_KINDS = ("standards", "spec-security", "browser-qa")
+
+
 def advisory_reasons(advisory, need_qa):
     """Refusals for the exception's advisory links (CAD-1946)."""
     kinds = ["standards", "spec-security"] + (["browser-qa"] if need_qa else [])
     reasons = [f"the exception needs --advisory {k}=<https url>" for k in kinds if k not in advisory]
+    reasons += [f"unknown advisory kind {k!r}" for k in sorted(advisory) if k not in ADVISORY_KINDS]
     reasons += [f"advisory {k} is not an https url: {v!r}" for k, v in sorted(advisory.items())
                 if not re.fullmatch(r"https://\S+", v)]
     picked = [advisory[k] for k in kinds if k in advisory]
@@ -1303,13 +1324,14 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         klass = authority["requirements"]["class"] if authority else None
         counted = []
         if args.exception:
-            # Hosted readiness doesn't exist yet, so a routine PR takes this path
-            # too. That asks for more evidence than routine would, never less.
             rc, ends, err = run([sys.executable, GATE_SCRIPT, "exception-open"])
             if rc != 0:
                 reasons.append((err or ends).strip()[:200] or "the review exception is closed")
             ends = ends.strip()
             reasons += advisory_reasons(args.advisory, need_qa)
+            routine_reasons, waives_readiness = exception_routine(
+                klass, active, origin, authority["readiness"] if authority else None, ci_url)
+            reasons += routine_reasons
             rs, counted = check_reviews(verdicts, False, need_qa, authors, issue, hosted,
                                         exception=True)
             reasons += rs
@@ -1389,7 +1411,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                         requirements=authority["requirements"] if authority else None,
                         readiness=authority["readiness"] if authority else None)
         if args.exception:
-            evidence["exception"] = {"ends": ends, "advisory": dict(args.advisory)}
+            evidence["exception"] = {"ends": ends, "advisory": dict(args.advisory),
+                                     "waives_readiness": waives_readiness}
         evidence["ci_run"] = ci_url
         evidence["ci_proofs"] = proofs
     return reasons, report
@@ -1433,7 +1456,10 @@ def evidence_body(evidence):
         lines.append("Operator approval id: " + evidence["approval"])
     exception = evidence.get("exception")
     if exception:
-        lines.append("EXCEPTION, not a normal gate pass. Waived: authenticated reviewer attestation.")
+        waived = "authenticated reviewer attestation"
+        if exception.get("waives_readiness"):
+            waived += ", routine readiness (hosted has none)"
+        lines.append(f"EXCEPTION, not a normal gate pass. Waived: {waived}.")
         lines.append(f"Review exception until: {exception['ends']}")
         lines.extend(f"Advisory review: {k} = {v}" for k, v in sorted(exception["advisory"].items()))
     return "\n".join(lines)
