@@ -27,8 +27,6 @@ use crate::issue::{app_screen_decl, model};
 pub const SCREENS_DIR: &str = "screens";
 /// The declaration filename (the app-screens/v1 manifest) within a tag dir.
 pub const SCREEN_MANIFEST: &str = "screens.json";
-/// Most screen tags one bundle may declare — the count a scan accepts.
-const MAX_SCREENS: usize = 8;
 
 /// One screen package, integrity-checked against the live bundle bytes.
 /// Carries the validated assets and the declared app tag; never paths,
@@ -83,7 +81,8 @@ pub fn leaf_ok(leaf: &str) -> bool {
 
 /// The screen tags a live bundle carries — the `screens/<tag>/` dirs
 /// that contain a `screens.json`, derived from the file list only.
-/// Bounded at [`MAX_SCREENS`]; a malformed or oversized set refuses.
+/// Bounded at [`app_screen_decl::MAX_SCREENS`]; a malformed or oversized set
+/// refuses.
 pub fn tags_in(files: &BTreeMap<String, String>) -> Result<Vec<String>> {
     let prefix = format!("{SCREENS_DIR}/");
     let mut tags = Vec::new();
@@ -102,9 +101,9 @@ pub fn tags_in(files: &BTreeMap<String, String>) -> Result<Vec<String>> {
                 "screen tag {tag:?} is not a valid tag"
             )));
         }
-        if !tags.contains(&tag.to_string()) {
+        if !tags.iter().any(|seen| seen == tag) {
             tags.push(tag.to_string());
-            if tags.len() > MAX_SCREENS {
+            if tags.len() > app_screen_decl::MAX_SCREENS {
                 return Err(Error::rejected("too many screen packages in one bundle"));
             }
         }

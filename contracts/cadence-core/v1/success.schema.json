@@ -44,6 +44,23 @@
       ]
     },
     {
+      "description": "The declared app tag of a screen declaration whose assets matched the\nsupplied facts (CAD-2008).",
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "app.screen.integrity"
+        },
+        "value": {
+          "$ref": "#/$defs/ScreenIntegrityValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "op": {
@@ -702,6 +719,20 @@
         }
       },
       "additionalProperties": false
+    },
+    "ScreenIntegrityValue": {
+      "description": "Success value of `app.screen.integrity`: the declared app tag of the one\ndeclaration that passed.\n\n`ok: true` on the envelope only says the check ran; this value says the\ndeclaration and the supplied facts agreed under the native screen contract.\nIt is integrity evidence, not install, mount, execution or effect authority,\nand it covers the facts the caller supplied — the caller must have hashed\nthe exact bytes it installed.",
+      "type": "object",
+      "properties": {
+        "app": {
+          "description": "The declared app tag (`valid_tag` grammar).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "app"
+      ]
     },
     "SizeLimit": {
       "type": "object",

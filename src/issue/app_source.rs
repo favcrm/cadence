@@ -60,13 +60,12 @@
 //! directory or member refuses, a FIFO refuses without ever blocking,
 //! and a swap between listing and open loses to the post-open `fstat`.
 //! No `symlink_metadata`-then-`PathBuf` rejoin and no `canonicalize`.
-//! The shape and bounds are the v0 bundle shape `app.rs` enforces:
-//! `app.md` plus flat `workflows/`/`rubrics/`/`templates/` only —
-//! nothing else, no dotfiles, no nested dirs — at most 128 files,
-//! each ≤ 256 KiB (`plan::MAX_PLAN_BYTES`; a screen JS/CSS ≤ 384 KiB,
-//! `app::MAX_SCREEN_ASSET_BYTES`), ≤ 2 MiB aggregate
-//! (`app::MAX_APP_BYTES`), read through `take(MAX_FILE_BYTES + 1)` so
-//! no unbounded allocation happens before the bound is proved.
+//! Snapshot paths and byte bounds follow the bundle grammar in `app.rs`.
+//! At most 128 files share the 2 MiB aggregate app budget; screen assets
+//! may use that budget, while screen declarations, skill packages and other
+//! members keep their published bounds. Each file is read through
+//! `take(file_cap + 1)`, so no unbounded allocation happens before its
+//! applicable bound is proved.
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};

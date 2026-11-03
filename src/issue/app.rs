@@ -93,24 +93,31 @@ const TOP_DIRS: &[&str] = &[
     "skills",
 ];
 
-/// Largest single file in a bundle — workflows render to plans, so the
-/// plan cap applies; the same bound keeps every other file small.
+/// The ordinary per-file bound; screen and skill package members use their
+/// own published bounds instead.
 const MAX_FILE_BYTES: u64 = plan::MAX_PLAN_BYTES as u64;
 
-/// CAD-1254: a declared screen's JS/CSS asset (`screens/<tag>/<stem>.js|css`)
-/// gets its own 384 KiB per-file cap; nothing else is raised.
-pub(crate) const MAX_SCREEN_ASSET_BYTES: u64 = 400 * 1024;
+/// A screen asset may use the whole app budget; the aggregate bound still
+/// applies to the complete package.
+pub(crate) const MAX_SCREEN_ASSET_BYTES: u64 = MAX_APP_BYTES;
 
-/// The per-file cap for bundle member `rel`: [`MAX_SCREEN_ASSET_BYTES`] for a
-/// screen JS/CSS leaf, the skill caps inside a `skills/<tag>/` package, else
-/// [`MAX_FILE_BYTES`].
+/// The per-member safety bound. Screen assets share the app budget; screen
+/// declarations, workflows and other files retain their own smaller bounds.
 pub(crate) fn file_cap(rel: &str) -> u64 {
-    let screen_leaf = rel
+    if let Some((tag, leaf)) = rel
         .strip_prefix("screens/")
-        .is_some_and(|r| r.split('/').count() == 2 && (r.ends_with(".js") || r.ends_with(".css")));
-    if screen_leaf {
-        MAX_SCREEN_ASSET_BYTES
-    } else if rel
+        .and_then(|rest| rest.split_once('/'))
+    {
+        if model::valid_tag(tag) {
+            if leaf == crate::issue::app_screen_pkg::SCREEN_MANIFEST {
+                return crate::issue::app_screen_decl::MAX_MANIFEST_BYTES as u64;
+            }
+            if crate::issue::app_screen_pkg::leaf_ok(leaf) {
+                return MAX_SCREEN_ASSET_BYTES;
+            }
+        }
+    }
+    if rel
         .strip_prefix("skills/")
         .is_some_and(|r| r.split('/').count() == 2 && r.ends_with(&format!("/{SKILL_MANIFEST}")))
     {
@@ -201,9 +208,9 @@ pub(crate) const DIR_RULES: &[(&str, DirRule)] = &[
     ("storage", DirRule::TaggedLeaf { suffix: ".json" }),
 ];
 
-/// Version of the published grammar document. Bump only for a shape change.
+/// Version of the published grammar document. Bump for a shape or scope change.
 #[cfg(test)]
-pub(crate) const GRAMMAR_VERSION: u32 = 3;
+pub(crate) const GRAMMAR_VERSION: u32 = 4;
 
 /// The lexical pieces the published document must state normatively. They are
 /// constants so the predicate and the document cannot disagree.
@@ -738,9 +745,8 @@ pub(crate) fn bundle_path_ok(path: &str) -> bool {
 }
 
 /// The published grammar document, generated from [`ROOT_MEMBERS`],
-/// [`DIR_RULES`] and the caps. `contracts/bundle-grammar/v3/grammar.json` must
-/// equal this byte for byte; the test below refuses drift. The v1 and v2
-/// documents stay as the historical artifacts a v1/v2 reader already carries.
+/// [`DIR_RULES`] and the caps. The current version must match its checked-in
+/// artifact byte for byte; earlier documents remain historical artifacts.
 #[cfg(test)]
 pub(crate) fn bundle_grammar_json() -> String {
     let directories: Vec<serde_json::Value> = DIR_RULES
@@ -834,6 +840,9 @@ pub(crate) fn bundle_grammar_json() -> String {
         "caps": {
             "fileBytes": MAX_FILE_BYTES,
             "screenAssetBytes": MAX_SCREEN_ASSET_BYTES,
+            "screenAssets": crate::issue::app_screen_decl::MAX_ASSETS,
+            "screenBytes": crate::issue::app_screen_decl::MAX_TOTAL_BYTES,
+            "screenManifestBytes": crate::issue::app_screen_decl::MAX_MANIFEST_BYTES,
             "bundleBytes": MAX_APP_BYTES,
             "files": MAX_FILES,
             "skillManifestBytes": SKILL_MANIFEST_BYTES,
@@ -906,18 +915,16 @@ mod bundle_grammar_tests {
         assert!(!bundle_path_ok(&format!("assets/{}.svg", "a".repeat(125))));
     }
 
-    /// The live artifact. Parity is checked against the current version only:
-    /// the v1 and v2 documents are historical and stay untouched, so a v1/v2
-    /// reader keeps the shape it was published with.
+    /// The live artifact. Earlier published versions stay untouched so readers
+    /// can continue to interpret the versions they already carry.
     fn grammar_path() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
             "contracts/bundle-grammar/v{GRAMMAR_VERSION}/grammar.json"
         ))
     }
 
-    /// The published document is generated, never hand-written: this test is
-    /// the only thing keeping `contracts/bundle-grammar/v3/grammar.json` equal
-    /// to the predicate consumers are expected to apply.
+    /// The published document is generated, never hand-written: this test
+    /// keeps the current artifact equal to the predicate consumers apply.
     #[test]
     fn published_artifact_matches_the_predicate() {
         let path = grammar_path();
@@ -1190,8 +1197,11 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
 /// Most files a bundle may carry.
 const MAX_FILES: usize = 128;
 
-/// Largest bundle, all files together — an A1 app is text.
-pub(crate) const MAX_APP_BYTES: u64 = 2 * 1024 * 1024;
+/// Largest bundle, all files together — an A1 app is text. The number is
+/// stated once in `cadence_core::app_screen_decl::MAX_TOTAL_BYTES` (a screen's
+/// assets share this budget); this alias keeps the native name without a
+/// second literal that could drift.
+pub(crate) const MAX_APP_BYTES: u64 = cadence_core::app_screen_decl::MAX_TOTAL_BYTES;
 
 /// The `app.md` definition: the frontmatter fields plus the body, the
 /// guide agents read. `needs.connections` declares the slots the app's
@@ -2237,17 +2247,20 @@ fn validate_snapshot(
         return Err(Error::rejected("app bundle exceeds its file limit"));
     }
     if files.iter().map(|(_, text)| text.len() as u64).sum::<u64>() > MAX_APP_BYTES {
-        return Err(Error::rejected(
-            "app bundle exceeds its aggregate byte limit",
-        ));
+        return Err(Error::rejected(format!(
+            "app bundle exceeds its {MAX_APP_BYTES}-byte aggregate limit"
+        )));
     }
     let mut warnings = Vec::new();
     // Portable inspection must not consult a machine's state or inherit its
     // operator exceptions. Native validation retains its existing allowlist.
     let no_host_exceptions = crate::secret::Allowlist::default();
     for (name, text) in &files {
-        if text.len() as u64 > file_cap(name) {
-            return Err(Error::rejected("app bundle file exceeds its limit"));
+        let cap = file_cap(name);
+        if text.len() as u64 > cap {
+            return Err(Error::rejected(format!(
+                "app bundle file {name:?} exceeds its {cap}-byte limit"
+            )));
         }
         let findings = match &compatibility {
             CompatibilityCheck::RequireNative => {
