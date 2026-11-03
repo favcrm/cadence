@@ -8,15 +8,17 @@
 //! facts plus exactly one next command. That one grant also requests the
 //! optional owner-only `billing.read` (never `billing.cancel`); a declined
 //! or member-narrowed grant still signs in and reports billing unavailable.
-//! The checks themselves stay in `cadence_agent::setup`; `--json` and every
-//! pipe keep their existing records and never prompt, sign in or call the
-//! network — an explicit `--hosted`/`--register` with `--json` is refused
-//! before any of that.
+//! The checks themselves stay in `cadence_agent::setup`; `--json` keeps its
+//! existing records and never prompts, signs in or calls the network — an
+//! explicit `--hosted`/`--register` with `--json` is refused before any of
+//! that. Without `--json` a pipe is asked the one scope question too (one
+//! line on stdin, the question on stderr); `--local`/`--hosted`/`--register`
+//! skip the read for automation.
 
 use std::io::Write;
 
 use cadence_agent::remote_cli::RemoteTarget;
-use cadence_agent::setup::{Handover, PlanFact, SignInFact, LIVE_INSTRUCTION};
+use cadence_agent::setup::{Handover, PlanFact, SavedLogins, SignInFact, LIVE_INSTRUCTION};
 
 use super::*;
 
@@ -71,7 +73,7 @@ pub(super) fn run(
         ));
     }
     let saved = cadence_agent::setup::saved_hosted_logins();
-    let mut sign_in = saved_fact(saved.as_deref());
+    let mut sign_in = saved_fact(saved.as_ref());
     let mut target: Option<RemoteTarget> = None;
     let mut sign_in_failed = false;
     let decision = decide(choice, json, &state_dir, &sign_in);
@@ -144,7 +146,7 @@ pub(super) fn run(
                 )
             }),
         board_url: cadence_agent::setup::board_url(&state_dir, port),
-        plan: plan_fact(target.as_ref(), json, saved.as_deref()),
+        plan: plan_fact(target.as_ref(), json, saved.as_ref(), sign_in_failed),
         sign_in,
         instruction: LIVE_INSTRUCTION.to_string(),
     };
@@ -174,10 +176,11 @@ fn decide(choice: ScopeChoice, json: bool, state_dir: &Path, sign_in: &SignInFac
         ScopeChoice::Hosted => Decision::SignIn,
         ScopeChoice::Register => Decision::Register,
         ScopeChoice::Ask => {
-            let saved_org = org::selected_org_readonly()
-                .ok()
-                .flatten()
-                .is_some_and(|name| !name.is_empty());
+            // An unreadable registry counts as present, as documented above.
+            let saved_org = match org::selected_org_readonly() {
+                Ok(name) => name.is_some_and(|name| !name.is_empty()),
+                Err(_) => true,
+            };
             let tracker_present =
                 cadence_agent::issue::default_dir().map_or(true, |dir| dir.exists());
             let first_run = sign_in.is_signed_out()
@@ -295,9 +298,9 @@ fn hosted(
     Ok(grant)
 }
 
-fn saved_fact(saved: Option<&[String]>) -> SignInFact {
+fn saved_fact(saved: Option<&SavedLogins>) -> SignInFact {
     match saved {
-        Some(slugs) => SignInFact::saved(slugs),
+        Some(saved) => SignInFact::saved(saved),
         None => SignInFact::unknown("the hosted credential store could not be inspected"),
     }
 }
@@ -305,7 +308,21 @@ fn saved_fact(saved: Option<&[String]>) -> SignInFact {
 /// The offer is read only when this run verified a hosted sign-in and the
 /// output is for a person: `--json` is a machine path that keeps its
 /// existing records and never calls the billing API.
-fn plan_fact(target: Option<&RemoteTarget>, json: bool, saved: Option<&[String]>) -> PlanFact {
+fn plan_fact(
+    target: Option<&RemoteTarget>,
+    json: bool,
+    saved: Option<&SavedLogins>,
+    approval_failed: bool,
+) -> PlanFact {
+    // A run that attempted an approval which did not complete cannot say
+    // there is no plan: the browser may have created or approved a workspace
+    // that is billed. "none" is only for a run that attempted nothing.
+    if approval_failed {
+        return PlanFact::unknown(
+            "not read: this run's browser approval did not complete, so it cannot say whether \
+             a workspace exists or is billed; the offer stays in the workspace dashboard",
+        );
+    }
     match (target, json) {
         (Some(target), false) => {
             cadence_agent::setup::plan_fact(&cadence_agent::setup::billing_offer(target))
@@ -321,7 +338,7 @@ fn plan_fact(target: Option<&RemoteTarget>, json: bool, saved: Option<&[String]>
                  cannot say whether this machine is billed; the offer stays in the workspace \
                  dashboard",
             ),
-            Some(slugs) if !slugs.is_empty() => PlanFact::unknown(
+            Some(saved) if !saved.is_empty() => PlanFact::unknown(
                 "not read: this run verified no hosted sign-in, and a saved login is not \
                  re-read here; the offer stays in the workspace dashboard",
             ),
@@ -508,4 +525,32 @@ fn emit_scope(state_dir: &Path, json: bool, handover: &Handover) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cad1922_failed_approval_never_reports_plan_none() {
+        let empty = SavedLogins::default();
+        // Nothing attempted and nothing saved: nothing is billed.
+        assert_eq!(plan_fact(None, false, Some(&empty), false).state, "none");
+        // An approval that did not complete may have created a billed
+        // workspace in the browser: unknown, whatever the store holds.
+        for saved in [Some(&empty), None] {
+            let fact = plan_fact(None, false, saved, true);
+            assert_eq!(fact.state, "unknown", "{}", fact.detail);
+            assert!(fact.detail.contains("did not complete"), "{}", fact.detail);
+        }
+        // A saved login whose workspace cannot be named is unknown too.
+        let unnamed = SavedLogins {
+            slugs: Vec::new(),
+            unnamed: true,
+        };
+        assert_eq!(
+            plan_fact(None, false, Some(&unnamed), false).state,
+            "unknown"
+        );
+    }
 }

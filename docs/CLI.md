@@ -154,6 +154,12 @@ cadence dev reload [--build <path>]            # restart from a local binary
 cadence dev status | down | env | ls | reset <name>
 ```
 
+`reload`, `down` and `reset` delete or restart a sandbox, so they refuse in a
+shell that `dev env` exported (the exports name the sandbox's own roots, and a
+marker is not proof). Run them from a clean shell: `env -u CADENCE_STATE_DIR
+-u CADENCE_PM_DIR -u XDG_CONFIG_HOME -u CADENCE_PROFILE cadence dev down <name>`.
+The refusal prints that command.
+
 Dev commands stay local even when the saved org selects hosted production.
 They do not change that selection or access the hosted org's credentials,
 transport or container wake path. An explicitly remote `--org` or
@@ -281,7 +287,7 @@ enqueue only and refuses `--wait`.
 ## Cadence home, overrides and isolation (CAD-1922)
 
 One resolver (`src/home.rs`) answers every Cadence path, and `cadence doctor
-host` reports the branch it took under the `layout` check. It only resolves:
+--host` reports the branch it took under the `layout` check. It only resolves:
 nothing here creates, moves, copies or deletes an installation's data.
 
 **A first run** — no existing tracker, state directory or hosted config is
@@ -307,8 +313,13 @@ existing installation's directories are never re-chmod'ed.
 state `$XDG_STATE_HOME/cadence` or `~/.local/state/cadence`, vault
 `<tracker>/wiki`, hosted config and credentials `$XDG_CONFIG_HOME/cadence`.
 Any one of those present keeps every path on the legacy branch, so resolution
-cannot switch a live install away from its data. The branch is sticky: once
-`~/.cadence` holds `state/`, `tracker/` or `config/`, a legacy path that turns
+cannot switch a live install away from its data. A bare `state/`, `tracker/` or
+`config/` directory under `~/.cadence` — an `overview-gh.json` cache, lane
+worktrees under `~/.cadence/wt` — is not an installation and never overrides a
+legacy one; `cadence doctor --host` reports such a stray home, and nothing in
+it is removed. The branch is sticky: once `~/.cadence` holds real installation
+data (the tracker's `pm.yaml`, the daemon database `state/cadence.sqlite3`, or
+the hosted `config/orgs.json` / `config/remote-auth/credential.json`), a legacy path that turns
 up later (a stray `~/pm`, an old saved binding) can neither flip the
 installation nor be preferred silently — **both at once is refused**, naming
 every root, so nothing is guessed. A probe that cannot be answered (a
@@ -351,11 +362,13 @@ were.
 - `CADENCE_PM_DIR` — tracker, in either layout. Overrides only the tracker.
 - `CADENCE_STATE_DIR` — runtime state, in either layout. Overrides only the
   state dir.
-- `--state-dir` — the same per command, and what a sandbox passes.
+- `--state-dir` — the same per command, and what a sandbox passes. Naming a
+  legacy root counts as the same explicit choice of that installation as the
+  exported variable.
 - `--auth-dir` — hosted credentials, per command.
 
 None of these chooses the layout, with one exception: exporting
-`CADENCE_STATE_DIR` or `CADENCE_PM_DIR` *at a legacy root* (`$XDG_STATE_HOME/
+`CADENCE_STATE_DIR` or `CADENCE_PM_DIR`, or passing `--state-dir`, *at a legacy root* (`$XDG_STATE_HOME/
 cadence`, `~/.local/state/cadence`, `~/pm`) is an explicit choice of that
 installation, and it resolves to the legacy branch — creating that directory
 would otherwise make the installation ambiguous on the next run. Every other
@@ -367,13 +380,15 @@ flip the vault or the hosted config mid-run.
 is a symlink: that root is authoritative for credentials, so a planted link
 above it would redirect them.
 
-`XDG_CONFIG_HOME` names the config root of an installation that already
-exists — a legacy install, or a consolidated one that already holds a config
-there — and of any run given an explicit `CADENCE_HOME`, where it names the
-credential root whether or not it exists yet. A genuine first run keeps its
-config under its own home even when the variable is exported: writing the
-first credential into the legacy root would make the next run see both layouts
-and refuse the installation as ambiguous. Inside the consolidated home a
+`XDG_CONFIG_HOME` names the config root of a legacy installation, and of any
+run given an explicit `CADENCE_HOME`, where it names the credential root
+whether or not it exists yet. A consolidated installation — a genuine first
+run, or one already living in `~/.cadence` — keeps its config under its own
+home even when the variable is exported: writing the first credential into the
+legacy root would make the next run see both layouts and refuse the
+installation as ambiguous. With no `HOME` at all, an absolute
+`XDG_CONFIG_HOME` still names the hosted config root, so hosted-only use needs
+no home. Inside the consolidated home a
 symlinked `~/.cadence`, `~/.cadence/config` or credential directory is refused
 rather than followed.
 

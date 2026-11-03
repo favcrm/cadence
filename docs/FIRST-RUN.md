@@ -81,7 +81,7 @@ Trial and paid subscription are separate states:
 
 | State | Meaning |
 | --- | --- |
-| `skipped` | A subscription is active: `No new plan needed.` |
+| `skipped` | A subscription is active: the plan line ends `No new plan needed.` |
 | `trial_active`, `trial_eligible`, `trial_used`, `trial_expired`, `trial_failed`, `trial_unknown` | The cardless registration trial, exactly as the server policy reports it. It never opens a Checkout and never converts to a paid plan by itself. |
 | `checkout_pending`, `checkout_open`, `checkout_completed`, `checkout_unknown` | An outstanding Checkout. `open` carries the one URL to resume; `completed` is Stripe-complete but not reconciled; `pending` and `unknown` fence a new Checkout. No second Checkout is started. |
 | `checkout_settled` | A Checkout completed and was reconciled, so it fences nothing. Whether a new paid action may start comes from the offer's own `available`/`blocked`; the terminal still opens nothing. |
@@ -158,10 +158,14 @@ stays the durable snapshot. `cadence status` reports work, not billing.
 
 A sign-in this run verified is `verified`. A login this machine already
 holds is `saved`: the credential file is named, never read, so it is not
-verified and may be expired. A failed approval is `failed` with the
+verified and may be expired. That includes the `credential.json` that
+`cadence auth login` writes, whose workspace this run does not read: it is
+`saved` without a slug and the plan is `unknown`. A failed approval is `failed` with the
 issuer's own message; a workspace the browser created, if any, is not
 bound to this machine because no credential was saved. A store that cannot
-be inspected is `unknown`, never `signed out`.
+be inspected is `unknown`, never `signed out`. A run whose approval did not
+complete reports the plan as `unknown`, never `none`: the browser may have
+created a workspace this machine did not bind.
 
 `scope` is the scope this run selected, not what the credential store
 happens to hold: `1`/`--local` stays local even when a hosted login is

@@ -942,12 +942,16 @@ pub(crate) fn resolved(path: &Path) -> PathBuf {
 /// marker is a hand-writable file and any caller can export any path, so
 /// neither may exempt a production dir. Production's own roots are
 /// therefore resolved from the host's defaults alone — `$HOME` and
-/// `$XDG_*`, never `$CADENCE_HOME`, which a sandbox pins to itself — and
-/// none is dropped because it happens to sit at or under the candidate
+/// `$XDG_*`, plus an exported `$CADENCE_HOME` named as the installation it
+/// is (a sandbox's children no longer carry one) — and none is dropped because it happens to sit at or under the candidate
 /// root: a marker planted in the production tracker stays a production
 /// tracker.
 ///
-/// Nothing a caller exports is exempt either. `CADENCE_PROFILE`,
+/// This inventory exempts nothing a caller exports; the one exemption lives
+/// in [`refuse_overlap`] and only the read-only guard
+/// ([`refuse_production_readonly`]) takes it, for an export exactly equal to
+/// one of the sandbox's own dirs. The deleting verbs never do.
+/// `CADENCE_PROFILE`,
 /// `CADENCE_HOME`, `CADENCE_STATE_DIR`, `CADENCE_PM_DIR` and
 /// `XDG_CONFIG_HOME` are same-uid environment, not identity: a genuine
 /// installation may be configured at `<root>/state`, `<root>/pm` or
@@ -1090,6 +1094,21 @@ fn refuse_overlap(sb: &Sandbox, exported: bool, own_exports_are_ours: bool) -> R
             .iter()
             .any(|p| p.starts_with(&live) || live.starts_with(p))
         {
+            // A shell pointed at this sandbox by `dev env` exports its own
+            // roots, and the deleting verbs cannot tell that from a marker
+            // planted at a live installation. Name the clean-shell remedy.
+            if label.starts_with("the exported ") && ours.iter().any(|own| own == &live) {
+                return Err(Error::rejected(format!(
+                    "sandbox '{name}' at {root} overlaps {label} {dir} — refusing: this verb \
+                     deletes or restarts the sandbox and accepts no export as proof, even one \
+                     `cadence dev env` wrote. Nothing was changed. Run it from a clean shell: \
+                     `env -u CADENCE_STATE_DIR -u CADENCE_PM_DIR -u XDG_CONFIG_HOME -u \
+                     CADENCE_PROFILE cadence dev <down|reload|reset> {name}`",
+                    name = sb.name,
+                    root = sb.root.display(),
+                    dir = dir.display()
+                )));
+            }
             return Err(Error::rejected(format!(
                 "sandbox '{}' at {} overlaps {label} {} — refusing; point \
                  CADENCE_SANDBOX_ROOT at a scratch dir, or `unset CADENCE_STATE_DIR \
@@ -2352,7 +2371,12 @@ fn ls() -> Result<Value> {
 mod tests {
     use super::*;
 
-    struct Cad1922SandboxEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    /// Holds the shared CAD-1922 environment lock for the test's whole life,
+    /// so no two tests rewrite `HOME`/`CADENCE_*` at once.
+    struct Cad1922SandboxEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl Cad1922SandboxEnv {
         fn isolated(home: &Path) -> Self {
@@ -2366,12 +2390,16 @@ mod tests {
                 "XDG_STATE_HOME",
                 "XDG_CONFIG_HOME",
             ];
-            let saved = Self(
-                names
+            let guard = crate::home::CAD1922_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let saved = Self {
+                saved: names
                     .iter()
                     .map(|&name| (name, std::env::var_os(name)))
                     .collect(),
-            );
+                _lock: guard,
+            };
             for name in names {
                 std::env::remove_var(name);
             }
@@ -2382,7 +2410,7 @@ mod tests {
 
     impl Drop for Cad1922SandboxEnv {
         fn drop(&mut self) {
-            for (name, value) in &self.0 {
+            for (name, value) in &self.saved {
                 match value {
                     Some(value) => std::env::set_var(name, value),
                     None => std::env::remove_var(name),
@@ -2444,7 +2472,7 @@ mod tests {
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(root.join(MARKER), r#"{"name":"smoke","allow_global":true}"#).unwrap();
         let mut env = Cad1922SandboxEnv::isolated(&home);
-        env.0
+        env.saved
             .push((ALLOW_GLOBAL_ENV, std::env::var_os(ALLOW_GLOBAL_ENV)));
         std::env::set_var("CADENCE_SANDBOX_ROOT", fixture.path());
         std::env::set_var("CADENCE_PROFILE", "sandbox:smoke");
@@ -2488,6 +2516,72 @@ mod tests {
         assert_eq!(active_home().unwrap(), Some(root.clone()));
         assert!(!root.join("config").exists());
         assert!(!production.join("config").exists());
+    }
+
+    /// A sandbox daemon removes `CADENCE_HOME`, so its upload workspace must
+    /// come from the checked sandbox root, never from the host's `$HOME`.
+    #[test]
+    fn cad1922_sandbox_workspace_never_binds_the_host_home() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("host");
+        std::fs::create_dir_all(home.join(".cadence")).unwrap();
+        let _env = Cad1922SandboxEnv::isolated(&home);
+        std::env::set_var("CADENCE_SANDBOX_ROOT", fixture.path().join("sandboxes"));
+        let sb = Sandbox::open("iso").unwrap();
+        std::fs::create_dir_all(sb.state_dir()).unwrap();
+        std::fs::create_dir_all(sb.pm_dir()).unwrap();
+        std::fs::write(sb.marker(), r#"{"name":"iso"}"#).unwrap();
+        std::env::set_var("CADENCE_PROFILE", sb.profile());
+        let host_workspace = home.join(".cadence/workspace");
+
+        // The failure this pins: without the sandbox root the instance
+        // binds the host's workspace.
+        let unbound = crate::home::workspace_for_instance(&sb.pm_dir(), None, None, None).unwrap();
+        assert_eq!(unbound, host_workspace);
+
+        let root = active_home().unwrap();
+        assert_eq!(root.as_deref(), Some(sb.root.as_path()));
+        let bound =
+            crate::home::workspace_for_instance(&sb.pm_dir(), root.as_deref(), None, None).unwrap();
+        assert_eq!(bound, sb.root.join("workspace"));
+        assert!(!bound.starts_with(&home));
+        // A caller's CADENCE_HOME captured in the env cannot override it.
+        let bound = crate::home::workspace_for_instance(
+            &sb.pm_dir(),
+            root.as_deref(),
+            Some(home.join(".cadence").to_str().unwrap()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(bound, sb.root.join("workspace"));
+    }
+
+    /// `dev env` exports the sandbox's own roots; the deleting verbs still
+    /// refuse them, and the refusal names the clean-shell command.
+    #[test]
+    fn cad1922_refusal_in_an_exported_shell_names_the_clean_shell_command() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = Cad1922SandboxEnv::isolated(&home);
+        std::env::set_var("CADENCE_SANDBOX_ROOT", fixture.path().join("sandboxes"));
+        let sb = Sandbox::open("kk").unwrap();
+        std::fs::create_dir_all(sb.state_dir()).unwrap();
+        std::fs::write(sb.marker(), r#"{"name":"kk"}"#).unwrap();
+        refuse_production(&sb).unwrap();
+
+        std::env::set_var("CADENCE_STATE_DIR", sb.state_dir());
+        std::env::set_var("CADENCE_PM_DIR", sb.pm_dir());
+        std::env::set_var("XDG_CONFIG_HOME", sb.config_dir());
+        std::env::set_var("CADENCE_PROFILE", sb.profile());
+        let error = refuse_production(&sb).unwrap_err().to_string();
+        assert!(error.contains("overlap"), "{error}");
+        assert!(error.contains("clean shell"), "{error}");
+        assert!(error.contains("env -u CADENCE_STATE_DIR"), "{error}");
+        assert!(
+            error.contains("cadence dev <down|reload|reset> kk"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -1073,8 +1073,12 @@ impl Shared {
         // the same lease/fence the write path holds; resolved before the
         // `Arc` so `lease` can move into the struct.
         let wiki_pm_dir = pm_dir_of(&opts.provider_env)?;
+        // A sandbox daemon is its own home: pass its checked root so the
+        // upload workspace never falls back to the host's `~/.cadence`.
+        let sandbox_root = crate::sandbox::active_home()?;
         let upload_workspace_dir = crate::home::workspace_for_instance(
             &wiki_pm_dir,
+            sandbox_root.as_deref(),
             opts.provider_env.var("CADENCE_HOME").as_deref(),
             opts.provider_env.var("HOME").as_deref(),
         )?;

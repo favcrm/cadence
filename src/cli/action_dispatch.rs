@@ -188,6 +188,10 @@ pub(super) fn self_actor_payload(alias: &str, show: &Value) -> Value {
 }
 
 pub(super) fn run_cli(cli: Cli) -> Result<i32> {
+    // CAD-1922: the home resolver treats `--state-dir` at a legacy root as
+    // the same evidence as an exported `CADENCE_STATE_DIR`; record it before
+    // anything resolves a path.
+    cadence_agent::home::note_state_dir_flag(cli.state_dir.as_deref());
     // Offline syntax discovery: no org, state, tracker, login, or daemon.
     if matches!(
         cli.command,

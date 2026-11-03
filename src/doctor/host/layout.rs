@@ -58,6 +58,22 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
              production path is consulted"
             .to_string()
     }))
+    .chain({
+        let stray = if layout.source == crate::home::Source::Legacy {
+            crate::home::stray_home_entries(&layout.root)
+        } else {
+            Vec::new()
+        };
+        (!stray.is_empty()).then(|| {
+            format!(
+                "{} holds {} but no installation data (no tracker pm.yaml, daemon \
+                 database or hosted config) — ignored beside the legacy installation; \
+                 nothing was removed, and it may hold worktrees or other data",
+                layout.root.display(),
+                stray.join(", ")
+            )
+        })
+    })
     .chain(
         (layout.marker_present && layout.source == crate::home::Source::Legacy).then(|| {
             format!(

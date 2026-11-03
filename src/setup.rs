@@ -1231,7 +1231,8 @@ pub fn cli(
             println!("\nboard: {}", ctx.board_url());
         } else {
             println!(
-                "\nboard: {} (not started — this run is hosted; `cadence ui start` starts it)",
+                "\nboard: {} (not started — this run did not choose this machine; \
+                 `cadence ui start` starts it)",
                 ctx.board_url()
             );
         }
@@ -1302,31 +1303,45 @@ impl SignInFact {
 
     /// A login this machine already holds. The credential files are named
     /// only; their contents, endpoint and expiry are never re-read here,
-    /// so this is `saved` and never `verified`.
-    pub fn saved(slugs: &[String]) -> Self {
-        let (slug, detail) = match slugs {
-            [] => (None, "no hosted login on this machine".to_string()),
-            [one] => (
+    /// so this is `saved` and never `verified`. A credential whose
+    /// workspace cannot be named is still a saved login, never signed out.
+    pub fn saved(saved: &SavedLogins) -> Self {
+        let slugs = saved.slugs.as_slice();
+        let (slug, detail) = match (slugs, saved.unnamed) {
+            ([], false) => (None, "no hosted login on this machine".to_string()),
+            ([one], false) => (
                 Some(one.clone()),
                 format!(
                     "a saved login for {one} is on this machine — not verified by this run, \
                      and it may be expired"
                 ),
             ),
-            many => (
+            ([], true) => (
+                None,
+                "a saved hosted login is on this machine (from `cadence auth login`), but \
+                 this run cannot name its workspace — not verified by this run, and it may \
+                 be expired; `cadence org list` names it"
+                    .to_string(),
+            ),
+            (many, _) => (
                 None,
                 format!(
-                    "saved hosted logins for {} — none verified by this run and any may be \
+                    "saved hosted logins for {}{} — none verified by this run and any may be \
                      expired; `cadence org list` names them",
-                    many.join(", ")
+                    many.join(", "),
+                    if saved.unnamed {
+                        " and one whose workspace this run cannot name"
+                    } else {
+                        ""
+                    }
                 ),
             ),
         };
         Self {
-            state: if slug.is_some() || !slugs.is_empty() {
-                "saved"
-            } else {
+            state: if saved.is_empty() {
                 "signed_out"
+            } else {
+                "saved"
             },
             slug,
             endpoint: None,
@@ -1480,32 +1495,55 @@ fn valid_slug(slug: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// The workspace slugs this machine holds a hosted login for: the
-/// credential file names only, never their contents. `None` means the
-/// store could not be inspected — never "signed out".
-pub fn saved_hosted_logins() -> Option<Vec<String>> {
-    let dir = crate::remote_auth::auth_dir(None).ok()?;
-    let entries = match std::fs::read_dir(&dir) {
+/// What the credential store holds, by file name only — never contents.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedLogins {
+    /// Workspace slugs named by `cli-<slug>.json` credential files.
+    pub slugs: Vec<String>,
+    /// A credential exists whose workspace this inspection cannot name:
+    /// `cadence auth login` stores `credential.json`, whose workspace is
+    /// inside the file. It is a saved login all the same.
+    pub unnamed: bool,
+}
+
+impl SavedLogins {
+    pub fn is_empty(&self) -> bool {
+        self.slugs.is_empty() && !self.unnamed
+    }
+}
+
+/// The hosted logins this machine holds: the credential file names only,
+/// never their contents. `None` means the store could not be inspected —
+/// never "signed out".
+pub fn saved_hosted_logins() -> Option<SavedLogins> {
+    saved_logins_in(&crate::remote_auth::auth_dir(None).ok()?)
+}
+
+fn saved_logins_in(dir: &Path) -> Option<SavedLogins> {
+    let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(SavedLogins::default()),
         Err(_) => return None,
     };
-    let mut slugs = Vec::new();
-    for entry in entries.flatten() {
+    let mut saved = SavedLogins::default();
+    for entry in entries {
+        // A listing that fails part-way cannot say the store is empty.
+        let entry = entry.ok()?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(slug) = name
+        if name == "credential.json" {
+            saved.unnamed = true;
+        } else if let Some(slug) = name
             .strip_prefix("cli-")
             .and_then(|rest| rest.strip_suffix(".json"))
-        else {
-            continue;
-        };
-        if valid_slug(slug) {
-            slugs.push(slug.to_string());
+        {
+            if valid_slug(slug) {
+                saved.slugs.push(slug.to_string());
+            }
         }
     }
-    slugs.sort();
-    Some(slugs)
+    saved.slugs.sort();
+    Some(saved)
 }
 
 /// What the billing read produced: the server's offer, or the exact reason
@@ -1832,7 +1870,7 @@ fn subscription_state(
     match subscription.state.as_str() {
         "active" => Ok(PlanState::new(
             "subscription_active",
-            format!("Subscription active at {as_of}; no new plan is needed."),
+            format!("Subscription active at {as_of}. No new plan needed."),
         )),
         "past_due" => Ok(PlanState::new(
             "subscription_past_due",
@@ -2072,6 +2110,41 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+
+    /// `cadence auth login` stores `credential.json`, not `cli-<slug>.json`:
+    /// a signed-in machine must never be reported signed out.
+    #[test]
+    fn cad1922_auth_login_credential_counts_as_a_saved_login() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(saved_logins_in(dir.path()), Some(SavedLogins::default()));
+        assert!(SignInFact::saved(&SavedLogins::default()).is_signed_out());
+
+        std::fs::write(dir.path().join("credential.json"), b"{}").unwrap();
+        let saved = saved_logins_in(dir.path()).unwrap();
+        assert!(saved.unnamed && saved.slugs.is_empty() && !saved.is_empty());
+        let fact = SignInFact::saved(&saved);
+        assert_eq!(fact.state, "saved");
+        assert!(!fact.is_signed_out());
+        assert_eq!(fact.slug, None);
+        assert!(
+            fact.detail.contains("cannot name its workspace"),
+            "{}",
+            fact.detail
+        );
+
+        std::fs::write(dir.path().join("cli-acme.json"), b"{}").unwrap();
+        let both = SignInFact::saved(&saved_logins_in(dir.path()).unwrap());
+        assert_eq!(both.state, "saved");
+        assert_eq!(both.slug, None);
+        assert!(both.detail.contains("acme"), "{}", both.detail);
+
+        // A missing store is empty; one that cannot be listed is unknown.
+        assert_eq!(
+            saved_logins_in(&dir.path().join("absent")),
+            Some(SavedLogins::default())
+        );
+        assert_eq!(saved_logins_in(&dir.path().join("credential.json")), None);
+    }
 
     #[test]
     fn cad1922_active_trial_and_open_checkout_are_independent_handover_facts() {
