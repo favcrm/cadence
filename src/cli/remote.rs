@@ -2195,7 +2195,12 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             action: Some(AuditAction::Reviewers { project, action }),
             ..
         } => match action {
-            None => printed(hosted_gate::reviewers(target, wake_timeout, project)?),
+            None => {
+                let project = project
+                    .as_deref()
+                    .ok_or_else(|| Error::rejected("audit reviewers needs --project"))?;
+                printed(hosted_gate::reviewers(target, wake_timeout, project)?)
+            }
             Some(super::audit::ReviewersAction::Set { project, reviewer }) => {
                 // The eligibility map is the workspace owner's own act: the
                 // stored login is not an agent's to spend (the CAD-1586 rule).
