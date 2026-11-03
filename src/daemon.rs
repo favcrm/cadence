@@ -1692,24 +1692,33 @@ impl Shared {
             .as_str()
             .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
         self.gate_image_receiver_before_bytes(&message.alias, &message.id)?;
-        let image = self.store.app_media_context_image(asset_id)?;
-        if rows[0]["revision"].as_i64() != Some(image.asset.revision)
-            || rows[0]["sha256"].as_str() != Some(image.original.sha256.as_str())
-        {
-            return Err(Error::rejected(
-                "attached library image no longer matches the retained original",
-            ));
-        }
-        self.with_turn_image_current(&message.alias, &message.id, &image.original, || {
-            if self.store.app_media_revision(asset_id)? != image.asset.revision {
+        // CAD-2078: the pin names the bytes' own digest, so an imported
+        // workspace asset can ride a turn exactly like a provider-produced
+        // one. The resolver refuses anything that is not a verified
+        // workspace asset, and stale pins refuse.
+        let pinned_revision = rows[0]["revision"]
+            .as_i64()
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let pinned_sha = rows[0]["sha256"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let image = self
+            .store
+            .app_media_pinned_display(asset_id, pinned_revision, pinned_sha)?;
+        let revision = image.asset.revision;
+        let authority = match &image.original {
+            Some(original) => app_media_rpc::OriginalAuthority::Provider(original),
+            None => app_media_rpc::OriginalAuthority::Imported,
+        };
+        let media_type = image.media_type;
+        let bytes = image.bytes;
+        self.with_turn_image_current(&message.alias, &message.id, authority, || {
+            if self.store.app_media_revision(asset_id)? != revision {
                 return Err(Error::rejected(
                     "attached library image changed before delivery",
                 ));
             }
-            Ok(vec![crate::adapter::TurnImage {
-                media_type: image.media_type,
-                bytes: image.bytes,
-            }])
+            Ok(vec![crate::adapter::TurnImage { media_type, bytes }])
         })
     }
 

@@ -244,3 +244,38 @@ fn display_material_resolves_an_imported_asset_for_consumers() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn a_pinned_library_image_resolves_by_its_own_bytes_for_either_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+    let created = import(&s, "image/png", IMPORT_BYTES, "receipt-p", "import-p").unwrap();
+    let asset_id = created["receipt"]["asset_id"].as_str().unwrap();
+    let digest = crate::store::app_runs::artifact_digest(IMPORT_BYTES);
+
+    // CAD-2078: the pin names revision + the bytes' digest, so an imported
+    // asset resolves exactly as a provider-produced one would.
+    let image = s
+        .app_media_pinned_display(asset_id, 1, &digest)
+        .expect("an imported asset satisfies the same pin");
+    assert_eq!(image.bytes, IMPORT_BYTES);
+    assert_eq!(image.sha256, digest);
+    assert!(
+        image.original.is_none(),
+        "imported custody has no producer proof"
+    );
+
+    // A stale revision or a different digest refuses, whatever the provenance.
+    assert!(s.app_media_pinned_display(asset_id, 2, &digest).is_err());
+    assert!(s
+        .app_media_pinned_display(
+            asset_id,
+            1,
+            &crate::store::app_runs::artifact_digest(b"other")
+        )
+        .is_err());
+    // Anything that is not a verified workspace asset refuses too.
+    assert!(s
+        .app_media_pinned_display(&format!("med-{}", "9".repeat(32)), 1, &digest)
+        .is_err());
+}
