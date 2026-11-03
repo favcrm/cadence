@@ -357,8 +357,15 @@ Refusals happen locally, before a byte is sent: `issue new` without
 `--id`/`--status`; `issue comment` with `--author` or `--kind`; `issue
 set` without `--if-rev`, with an empty revision, with `--force`, or
 naming more than one ticket. `--file` bodies are read client-side (`-` = stdin) and
-bounded by the 32 KB cap — never remote paths. `issue
-edit/attach`, provider verbs and operator verbs are not on the wire.
+bounded by the 32 KB cap — never remote paths. `issue edit`, provider verbs
+and operator verbs are not on the wire.
+
+When this build rejects a command locally as unavailable for a hosted org,
+the refusal names the command and confirms that no request was sent. Check the
+hosted CLI documentation for alternatives on that workspace. Switching to a
+local org selects a different tracker; it does not complete the hosted task.
+Authorization refusals and uncertain outcomes after dispatch retain their
+separate semantics.
 
 `issue set` is compare-and-swap: send the `rev` from `issue show`
 (`--if-rev`); a stale revision answers the conflict payload (HTTP 409

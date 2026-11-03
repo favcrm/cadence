@@ -22,9 +22,12 @@ fn unsupported(verb: &str, flag: &str, why: &str) -> Error {
 /// server's `arguments` object accepts. A command outside the set — or a
 /// flag that cannot cross the wire faithfully — refuses locally; nothing
 /// is sent (contract I2: an allowlist, not a tunnel).
-fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String, Value>)> {
+fn verb_for(
+    command: &Commands,
+    command_path: Option<&str>,
+) -> Result<(&'static str, serde_json::Map<String, Value>)> {
     if let Commands::Wiki { action } = command {
-        return wiki_for(action);
+        return wiki_for(action, command_path);
     }
     let mut args = serde_json::Map::new();
     let verb = match command {
@@ -959,11 +962,11 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                         args.insert("query".into(), query);
                     }
                 }
-                _ => return Err(unavailable(command)),
+                _ => return Err(unavailable(command_path)),
             }
             "platform_call"
         }
-        _ => return Err(unavailable(command)),
+        _ => return Err(unavailable(command_path)),
     };
     Ok((verb, args))
 }
@@ -1112,7 +1115,10 @@ fn remote_send_args(
 /// `enumerate` (search carries `q`, ls does not), `cat` is `read`, a text
 /// `put` is `write`. The argument names are the local CLI's own. Blob upload,
 /// index, mkdir/mv/rm and history have no remote mapping and refuse here.
-fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String, Value>)> {
+fn wiki_for(
+    action: &WikiAction,
+    command_path: Option<&str>,
+) -> Result<(&'static str, serde_json::Map<String, Value>)> {
     let mut args = serde_json::Map::new();
     let verb = match action {
         WikiAction::Upload { .. } => {
@@ -1184,13 +1190,7 @@ fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String
             }
             "write"
         }
-        _ => {
-            return Err(Error::rejected(
-                "`cadence wiki` this subcommand is not available on a remote org in this \
-                 build — remote wiki verbs are: wiki ls, wiki search, wiki cat, wiki put \
-                 (text), wiki cp. Use `--org local` or `cadence org switch` to run locally.",
-            ))
-        }
+        _ => return Err(unavailable(command_path)),
     };
     Ok((verb, args))
 }
@@ -1729,24 +1729,11 @@ fn team_for(
     }
 }
 
-fn unavailable(command: &Commands) -> Error {
-    // The refusal names the command so an agent can branch on it; the
-    // allowlisted alternatives are the only remote surface.
+fn unavailable(command_path: Option<&str>) -> Error {
     Error::rejected(format!(
-        "`cadence {}` is not available on a remote org in this build - \
-         remote verbs are: status, agent list, issue ls, \
-         issue show, issue log, issue new, issue comment, issue set, \
-         send/message send (--message required), message read, \
-         issue project policy, project new, issue project ls, wiki ls, \
-         wiki search, wiki cat, \
-         wiki put (text), wiki cp, \
-         team list, team invites, team invite, team revoke-invite, \
-         team set-role, team remove, delivery requirements, artifact put, \
-         artifact find, artifact show, audit approval, \
-         audit scope, audit approve (merge), audit verdicts, audit verdict, \
-         audit reviewers, audit identities, issue project delivery. \
-         Use `--org local` or `cadence org switch` to run locally.",
-        name(command)
+        "`cadence {}` is not available on a remote org in this build; nothing was sent. \
+         Check the hosted CLI documentation for available alternatives.",
+        command_path.unwrap_or("<command>")
     ))
 }
 
@@ -1773,7 +1760,7 @@ fn atty_remote_stdin() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
-/// A stable command name for the refusal — never a trust decision.
+/// A stable command name for authorization refusals — never a trust decision.
 fn name(command: &Commands) -> &'static str {
     match command {
         Commands::Issue { .. } => "issue <verb>",
@@ -1855,6 +1842,7 @@ pub(super) fn run(
     command: Commands,
     wake_timeout: u64,
     local_state: Option<std::path::PathBuf>,
+    command_path: Option<String>,
 ) -> Result<i32> {
     if let Commands::Org { action } = command {
         return org::run(action);
@@ -2088,7 +2076,7 @@ pub(super) fn run(
     ) {
         refuse_managed(&target, "project new")?;
     }
-    let (verb, args) = verb_for(&command)?;
+    let (verb, args) = verb_for(&command, command_path.as_deref())?;
     // CAD-1568: a remote send keeps its caller-chosen `--message` id for
     // reconciliation. An `unknown` outcome — the response was lost after
     // the call was attempted — may have recorded the message anyway; the
@@ -2727,7 +2715,7 @@ mod read_contract_tests {
     use cadence_agent::issue::cli::IssueAction;
 
     fn outcome(command: &Commands) -> std::result::Result<(&'static str, Value), String> {
-        match verb_for(command) {
+        match verb_for(command, None) {
             Ok((verb, args)) => Ok((verb, Value::Object(args))),
             Err(e) => Err(e.to_string()),
         }
@@ -3671,6 +3659,41 @@ mod read_contract_tests {
         })
         .unwrap_err();
         assert!(err.contains("not available on a remote org"), "{err}");
+    }
+
+    #[test]
+    fn unavailable_commands_keep_the_hosted_context_and_hide_arguments() {
+        for (argv, expected) in [
+            (
+                vec![
+                    "cadence",
+                    "issue",
+                    "edit",
+                    "CAD-1",
+                    "--unlink",
+                    "blocked_by:private-value",
+                ],
+                "`cadence issue edit`",
+            ),
+            (
+                vec!["cadence", "wiki", "mkdir", "private-value"],
+                "`cadence wiki mkdir`",
+            ),
+        ] {
+            let matches = super::super::help::root_command(false)
+                .try_get_matches_from(argv)
+                .unwrap();
+            let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+            let path = super::super::action_dispatch::command_path(&matches);
+            let err = verb_for(&cli.command, path.as_deref()).unwrap_err();
+            let message = err.to_string();
+            assert_eq!(err.kind(), "rejected");
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("private-value"), "{message}");
+            assert!(!message.contains("--org local"), "{message}");
+            assert!(!message.contains("org switch"), "{message}");
+            assert!(message.contains("nothing was sent"), "{message}");
+        }
     }
 }
 

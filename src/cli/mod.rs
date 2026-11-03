@@ -203,6 +203,9 @@ pub(crate) struct Cli {
     /// the client-only updater refuses instead of assuming none were typed.
     #[arg(skip)]
     command_line: Option<Vec<String>>,
+    /// Clap-validated subcommand names only, without any argument values.
+    #[arg(skip)]
+    command_path: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }

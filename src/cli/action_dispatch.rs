@@ -82,9 +82,11 @@ pub(crate) fn run() -> Result<i32> {
     let parsed = help::root_command(help::in_pane())
         .try_get_matches()
         .and_then(|m| {
+            let path = command_path(&m);
             let typed = command_line_ids(&m);
             <Cli as clap::FromArgMatches>::from_arg_matches(&m).map(|mut cli| {
                 cli.command_line = Some(typed);
+                cli.command_path = path;
                 cli
             })
         });
@@ -153,6 +155,18 @@ fn command_line_ids(m: &clap::ArgMatches) -> Vec<String> {
         .map(|(_, sub)| command_line_ids(sub))
         .unwrap_or_default();
     typed.chain(nested).collect()
+}
+
+/// Capture only Clap-validated subcommand names, never argument values.
+pub(super) fn command_path(matches: &clap::ArgMatches) -> Option<String> {
+    let (name, mut nested) = matches.subcommand()?;
+    let mut path = String::from(name);
+    while let Some((name, next)) = nested.subcommand() {
+        path.push(' ');
+        path.push_str(name);
+        nested = next;
+    }
+    Some(path)
 }
 
 /// The `cadence self` payload for a mailbox with no actor: the inbound
@@ -467,9 +481,13 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 project.as_deref(),
                 notes_dir.as_deref(),
             ),
-            org::Routed::Remote(target) => {
-                remote::run(target, cli.command, cli.wake_timeout, cli.state_dir)
-            }
+            org::Routed::Remote(target) => remote::run(
+                target,
+                cli.command,
+                cli.wake_timeout,
+                cli.state_dir,
+                cli.command_path,
+            ),
         };
     }
     // Hosted metadata never needs local sandbox adoption, permission replay,
@@ -490,7 +508,13 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 ));
             }
         };
-        return remote::run(target, cli.command, cli.wake_timeout, cli.state_dir);
+        return remote::run(
+            target,
+            cli.command,
+            cli.wake_timeout,
+            cli.state_dir,
+            cli.command_path,
+        );
     }
     // Published app lifecycle is hosted-only and must refuse before local
     // state/daemon startup, including on a client-only installation.
@@ -514,7 +538,13 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 "published app lifecycle requires --org <logged-in-workspace>; no local daemon or hosted request was started",
             )),
         };
-        return remote::run(target, cli.command, cli.wake_timeout, cli.state_dir);
+        return remote::run(
+            target,
+            cli.command,
+            cli.wake_timeout,
+            cli.state_dir,
+            cli.command_path,
+        );
     }
     // Hosted human team administration. A managed agent is refused before
     // org resolution, so a saved human login is never loaded. A local org
@@ -535,7 +565,13 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 ));
             }
         };
-        return remote::run(target, cli.command, cli.wake_timeout, cli.state_dir);
+        return remote::run(
+            target,
+            cli.command,
+            cli.wake_timeout,
+            cli.state_dir,
+            cli.command_path,
+        );
     }
     // CAD-1429: every `web` action is a hosted operation against one pinned
     // remote workspace. Resolve it once here; a local or unselected org
@@ -667,7 +703,13 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             // CAD-1019 slice 2: a remote org never opens local state or
             // adopts a sandbox profile — the allowlisted verb goes over
             // HTTPS; everything else refuses inside `remote::run`.
-            return remote::run(target, cli.command, cli.wake_timeout, cli.state_dir.clone());
+            return remote::run(
+                target,
+                cli.command,
+                cli.wake_timeout,
+                cli.state_dir.clone(),
+                cli.command_path,
+            );
         }
     };
     // CAD-310: a dev Cadence's state dir decides its profile and tracker,
