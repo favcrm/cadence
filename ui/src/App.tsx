@@ -1326,6 +1326,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             hosted={hosted}
             viewerSub={viewerSub}
             readOnly={readOnly}
+            readOnlyReason={block}
             actor={actor}
             onToast={say}
             navHref={hrefFor}
@@ -1405,9 +1406,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             <Wiki
               hosted={hosted}
               viewerSub={viewerSub}
+              operator={meta?.operator ?? null}
               route={route}
               navHref={hrefFor}
               readOnly={readOnly || meta === null}
+              readOnlyReason={block}
               actor={actor}
               onToast={say}
             />

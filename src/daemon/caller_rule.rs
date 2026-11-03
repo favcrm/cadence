@@ -1587,6 +1587,17 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "wiki_index_refresh",
         Rule::Handler("operator_connection (CAD-719)"),
     ),
+    // CAD-2018: the native trash browser. Operator-only and
+    // connection-bound like the index reads; no `wiki_as` and no
+    // identity field is accepted, so a relayed claim cannot enter.
+    (
+        "wiki_trash_list",
+        Rule::Handler("operator_connection; no wiki_as/identity field (CAD-2018)"),
+    ),
+    (
+        "wiki_trash_items",
+        Rule::Handler("operator_connection; no wiki_as/identity field (CAD-2018)"),
+    ),
     // CAD-129: submitting a test run is a mutation attributed to the
     // caller. Reading a job, its log, or the queue is not.
     (

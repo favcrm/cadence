@@ -9,17 +9,17 @@ export const HOSTED_UPLOAD_MAX_BYTES = 15 * 1024 * 1024;
 /** Worker blob status -> a plain sentence (an English locale key) and whether it needs attention. */
 export function statusText(status: string | undefined | null): { text: string; warn: boolean } | null {
   switch (status) {
-    case "pending": return { text: "extracting text — searchable once it finishes", warn: false };
+    case "pending": return { text: "text extraction was queued — search availability is not confirmed", warn: false };
     case "indexed": return { text: "indexed — searchable", warn: false };
     case "empty": return { text: "saved, but no text was found in it", warn: true };
     case "failed": return { text: "saved, but text extraction failed", warn: true };
-    case "unsupported": return { text: "saved, but this file type is not searchable", warn: true };
+    case "unsupported": return { text: "saved, but text in this file type cannot be searched", warn: true };
     default: return null;
   }
 }
 
-/** A hosted subject id is not a name: show "you" for the viewer, else a neutral label. */
-export function whoLabel(raw: string, viewerSub: string | null | undefined, t: (key: string) => string): string {
+/** Hosted attribution is a subject, not a display name; native authors are already labels. */
+export function whoLabel(raw: string, viewerSub: string | null | undefined, t: (key: string) => string, hosted?: boolean): string {
   if (viewerSub && raw === viewerSub) return t("you");
-  return raw.startsWith("usr_") ? t("a team member") : raw;
+  return hosted === false ? raw : t("a contributor");
 }
