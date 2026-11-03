@@ -386,16 +386,24 @@ export default function MemberChat({
             />
           </div>
 
-          {sendNote !== null && (
-            <div className="text-micro text-ink-500 px-1 pb-1" role="status">{sendNote}</div>
-          )}
           <div className="chatdock" data-chat-dock>
+            {/* Inside the dock: it is absolutely placed, so a note before it
+                would sit behind the composer. */}
+            {sendNote !== null && (
+              <div className="text-micro text-ink-500 px-1 pb-1" role="status">{sendNote}</div>
+            )}
             <SharedComposer
               density="full"
               storeKey={`member-assist:${scope}`}
               block={readOnly ? t("The board is read-only.") : null}
               // A `/` command is not sent here, and Enter must not look dead.
-              onNotice={(notice) => setSendNote(displayUiNotice(notice, t))}
+              onNotice={(notice) =>
+                setSendNote(
+                  typeof notice !== "string" && notice.key.startsWith("Unsupported command")
+                    ? t("Commands aren't available in this chat, so this wasn't sent. To send it as a message, start with something other than /.")
+                    : displayUiNotice(notice, t),
+                )
+              }
               onSend={({ body }) => {
                 void sendToAssistant(scope, body).then((receipt) => {
                   // The actual receipt decides the note: a queued-but-

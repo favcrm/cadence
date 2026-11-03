@@ -1502,6 +1502,7 @@ Object.assign(zhTW, {
   "Reasoning": "思考",
   "Finished": "已完成",
   "not available": "無法使用",
+  "Commands aren't available in this chat, so this wasn't sent. To send it as a message, start with something other than /.": "此對話無法使用指令，因此未傳送。如要以訊息傳送，請不要以 / 開頭。",
   "Just type your message. `/help` is the only command in this workspace right now.": "直接輸入訊息即可。此工作區目前只有 `/help` 這個指令。",
   "This command isn't available in this workspace. `/help` lists what is.": "此工作區無法使用這個指令。`/help` 會列出可用的指令。",
   "Thought for": "思考了",
