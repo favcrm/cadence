@@ -595,10 +595,18 @@ pub(super) fn parse_platform_input(raw: &str) -> Result<Value> {
 }
 
 fn print_platform_tools(listing: &Value) {
-    println!(
+    for line in platform_tool_lines(listing) {
+        println!("{line}");
+    }
+}
+
+/// The `platform tools` table as text, one row per tool. Split out so the
+/// unavailable rule is checkable without capturing stdout.
+fn platform_tool_lines(listing: &Value) -> Vec<String> {
+    let mut lines = vec![format!(
         "{:<20} {:<24} {:<7} {:<6} {:<9} {:<16}",
         "PLATFORM", "TOOL", "EFFECT", "DIRECT", "CONNECTED", "ACCOUNT"
-    );
+    )];
     for entry in listing["platforms"].as_array().into_iter().flatten() {
         let platform = entry["platform"].as_str().unwrap_or_default();
         let account = entry["default_account"].as_str().unwrap_or("");
@@ -607,12 +615,12 @@ fn print_platform_tools(listing: &Value) {
             // never prints as one. The reason follows the table.
             let available = decl["available"].as_bool().unwrap_or(true);
             if let Some(reason) = decl["unavailable"].as_str().filter(|_| !available) {
-                println!(
+                lines.push(format!(
                     "{platform} {} is unavailable: {reason}",
                     decl["tool"].as_str().unwrap_or_default()
-                );
+                ));
             }
-            println!(
+            lines.push(format!(
                 "{:<20} {:<24} {:<7} {:<6} {:<9} {:<16}",
                 platform,
                 decl["tool"].as_str().unwrap_or_default(),
@@ -630,9 +638,10 @@ fn print_platform_tools(listing: &Value) {
                     ""
                 },
                 account,
-            );
+            ));
         }
     }
+    lines
 }
 
 /// CAD-1974: the flags one `platform call` must carry, decided from the
@@ -703,6 +712,43 @@ mod tests {
 
     /// CAD-1974: the listing is what tells `platform call` it must carry a
     /// connection and a ceiling — never the tool's name.
+    /// CAD-1974: an unenrolled connector never prints as runnable, and the
+    /// listing's own reason is the one shown.
+    #[test]
+    fn an_unavailable_connected_read_prints_no_with_its_reason() {
+        let listing = json!({"platforms": [
+            {"platform": "agenticos-provider", "default_account": null,
+             "tools": [
+                {"tool":"search_console_report","effect":"read","direct":true,
+                 "connected_read":true,"available":true},
+                {"tool":"analytics_report","effect":"read","direct":true,
+                 "connected_read":true,"available":false,
+                 "unavailable":"no credential is enrolled for agenticos-provider"}]}
+        ]});
+        let text = platform_tool_lines(&listing).join("\n");
+        assert!(
+            text.contains("analytics_report is unavailable: no credential is enrolled"),
+            "{text}"
+        );
+        let unavailable_row = text
+            .lines()
+            .find(|line| {
+                line.starts_with("agenticos-provider") && line.contains("analytics_report")
+            })
+            .expect("the unavailable tool still prints a row");
+        assert!(
+            unavailable_row.contains(" no "),
+            "DIRECT must read `no`, not `yes`: {unavailable_row}"
+        );
+        let available_row = text
+            .lines()
+            .find(|line| {
+                line.starts_with("agenticos-provider") && line.contains("search_console_report")
+            })
+            .expect("the enrolled tool prints a row");
+        assert!(available_row.contains(" yes "), "{available_row}");
+    }
+
     #[test]
     fn a_connected_read_is_listed_as_one() {
         let list = listing();
