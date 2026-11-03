@@ -472,7 +472,10 @@ head. The merge gate also runs whichever `cadence` you point it at: set
 `CADENCE_BIN` when more than one build is on the host, or a stale client's
 missing hosted verb will read like a gate refusal.
 
-A hosted verdict counts only on the owner's attestations (AOS-473, CAD-2001):
+A hosted verdict counts only on the owner's attestations (AOS-473, CAD-2001),
+except a workflow-issued row (CAD-2081; the workflows are not shipped yet), which
+has no login and counts only for a principal in
+`docs/roles/review-workflow-principals.toml` at main's tip (AGENTS.md "Review"):
 the workspace owner binds each principal's GitHub login once for the workspace,
 then admits principals to a project's review set. A code verdict needs both,
 because the gate counts a hosted document by principal and excludes the author

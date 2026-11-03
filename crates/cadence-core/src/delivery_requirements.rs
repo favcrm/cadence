@@ -163,6 +163,7 @@ const HUMAN_PREFIXES: &[&str] = &[
     ".cargo/",
     "src/audit/",
     "src/delegation/",
+    "src/delivery/",
     "tests/common/",
     "config/",
 ];

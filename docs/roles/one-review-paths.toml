@@ -94,6 +94,7 @@ one_review_exclude = [
   "src/agent_uid/**",
   "src/pi_policy.rs",
   "src/confine.rs",
+  "src/runner.rs",
   # the production master's prompt and confinement policy
   "agents/**",
   # remote-CLI and board auth modules (CAD-1019, CAD-526/777)

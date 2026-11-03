@@ -46,7 +46,7 @@ unless ALL of these hold for the pinned head:
     the other gates pass; dry-run only checks an existing comment);
   * for a human-class diff (a path trigger, more than 1500 changed lines, any
     head-pinned note whose Risk is not exactly `auto`, or a workflow-issued
-    review on a trigger 1/3 or two-review path),
+    review on any change outside docs/roles/workflow-auto-paths.toml),
     `cadence audit approval` reports an approval in
     force for exactly this head. This script never records an approval.
 
@@ -132,10 +132,11 @@ HUMAN_PREFIXES = (".github/", "scripts/", "docs/roles/", ".config/", ".cargo/",
 # PR's base, is human too (CAD-1104). Unreadable means human (fail closed).
 RISK_PATHS_FILE = "docs/roles/risk-paths.toml"
 RISK_HUMAN_TABLES = ("schema", "trigger4", "trigger6", "trigger7")
-# CAD-2081: trust-boundary and secret paths keep TWO reviews, not an operator. A
-# workflow review can write `risk: auto` (a prompt-injected model can), so on these
-# paths a workflow row never replaces the operator's approval.
-RISK_WORKFLOW_OPERATOR_TABLES = ("trigger1", "trigger3")  # plus one_review_exclude
+# CAD-2081: a PR with a workflow-issued review needs the operator unless EVERY
+# changed path is on this allowlist, read at main's live tip. A workflow review can
+# write `risk: auto` (a prompt-injected model can), so no path is eligible by
+# default.
+WORKFLOW_AUTO_FILE = "docs/roles/workflow-auto-paths.toml"
 HUMAN_LINES = 1500  # risk-classes trigger 5
 HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml",
                    "package-lock.json", ".npmrc", "yarn.lock", "bun.lockb",
@@ -322,23 +323,28 @@ def risk_globs(toml_text, tables=RISK_HUMAN_TABLES):
     return globs if all(isinstance(g, str) for g in globs) else None
 
 
-def union_globs(*lists):
-    """The concatenation of glob lists, or None when any is unreadable (None)."""
-    return None if any(g is None for g in lists) else [g for lst in lists for g in lst]
+def workflow_auto_reasons(changes, toml_text):
+    """Why a PR with a workflow-issued review needs the operator's approval (CAD-2081).
 
-
-def workflow_operator_reasons(paths, globs):
-    """Why a workflow review needs the operator's approval on these paths (CAD-2081).
-
-    `globs` is the union scope approval already refuses on (trigger 1, trigger 3 and
-    one_review_exclude), read at the PR's base and at main's live tip; None means
-    one of them was unreadable. risk-paths is an allowlist, not a complete map, so
-    only a path in none of these lists may rest on a workflow review alone."""
+    A positive allowlist: every change must be a plain add or modify of a regular
+    file (100644, or an unchanged mode on a modify) on a path matching
+    WORKFLOW_AUTO_FILE's `[auto] paths`. A delete, rename (seen as a delete plus an
+    add), symlink, submodule or mode change, a path outside the list, an empty list
+    and a missing or unreadable file all need the operator."""
+    globs = glob_list(toml_text, ("auto", "paths"))
     if globs is None:
-        return ["cannot read the trigger 1/3 and two-review lists to place a workflow review (fail closed)"]
-    hit = [p for p in paths if any(glob_match(g, p) for g in globs)]
-    return ([f"a workflow review cannot stand in for the operator on trigger 1/3 or two-review path {hit[0]}"]
-            if hit else [])
+        return [f"cannot read {WORKFLOW_AUTO_FILE} at main's live tip, so a workflow review "
+                "cannot stand in for the operator (fail closed)"]
+    out = []
+    for status, old_mode, new_mode, path in changes:
+        odd = (not path or path.startswith("/") or "\\" in path or ".." in path
+               or any(seg in ("", ".") for seg in path.split("/")))
+        plain = ((status == "A" and old_mode == "000000" and new_mode == "100644")
+                 or (status == "M" and old_mode == new_mode and new_mode in REGULAR_MODES))
+        if odd or not plain or not any(glob_match(g, path) for g in globs):
+            out.append(path)
+    return ([f"a workflow review cannot stand in for the operator on paths outside "
+             f"{WORKFLOW_AUTO_FILE}: {', '.join(out[:5])}"] if out else [])
 
 
 def is_human_path(path, risk=()):
@@ -684,7 +690,8 @@ def read_identities():
 def workflow_principals(toml_text):
     """`principal -> {"kind", "workflow"}` from the allowlist text, or None when it
     is missing or malformed. An entry for any kind but a Standards or Spec/security
-    review, or without a workflow file path, is malformed, so one bad entry fails
+    review, without a workflow file path, or under a principal not named `svc_*`
+    (the reserved-principal guard relies on that prefix) is malformed, so one bad entry fails
     the whole list closed."""
     if toml_text is None:
         return None
@@ -693,7 +700,7 @@ def workflow_principals(toml_text):
     except (tomllib.TOMLDecodeError, KeyError, TypeError):
         return None
     if not isinstance(table, dict) or not all(
-            isinstance(k, str) and k and isinstance(v, dict)
+            isinstance(k, str) and k.startswith("svc_") and isinstance(v, dict)
             and v.get("kind") in WORKFLOW_KINDS
             and isinstance(v.get("workflow"), str)
             and re.fullmatch(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml", v["workflow"])
@@ -1618,7 +1625,14 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             rs, counted = check_reviews(verdicts, True, need_qa, authors, issue, hosted)
             reasons += rs
             combined = [n for n in counted if n.get("kind") == "combined"]
-            if len({reviewer_key(n, hosted) for n in combined}) != 1:
+            # Two counted workflow reviews, Standards plus Spec/security from distinct
+            # principals, are stricter than one combined review and satisfy it.
+            std = {reviewer_key(n, hosted) for n in counted
+                   if is_workflow_row(n) and n["kind"] == "standards"}
+            spec = {reviewer_key(n, hosted) for n in counted
+                    if is_workflow_row(n) and n["kind"] == "spec-security"}
+            two_workflow = any(a != b for a in std for b in spec)
+            if len({reviewer_key(n, hosted) for n in combined}) != 1 and not two_workflow:
                 reasons.append(f"active {klass} delivery requires exactly one independent combined review")
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
 
@@ -1627,32 +1641,17 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                             f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={base_oid}"])
     risk_text = risk_text if rc == 0 and base_oid else None
     risk = risk_globs(risk_text)
-    tip_risk = tip_one = None
-    if has_workflow:
-        # A tightening on main must reach an open PR, so the lists are also read at
-        # main's live tip and the union applies: the tip may only add restrictions.
-        # An unreadable tip copy refuses.
-        if main_tip:
-            rc, tip_risk, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
-                                   f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={main_tip}"])
-            tip_risk = tip_risk if rc == 0 else None
-            rc, tip_one, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
-                                  f"repos/{repo}/contents/{ONE_REVIEW_FILE}?ref={main_tip}"])
-            tip_one = tip_one if rc == 0 else None
-        tip_risk_globs = risk_globs(tip_risk)
-        risk = union_globs(risk, tip_risk_globs)
-        if tip_risk_globs is None:
-            reasons.append(f"cannot read {RISK_PATHS_FILE} at main's live tip (fail closed)")
-    why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the base or main's tip (fail closed)"]
+    why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the base (fail closed)"]
     why += [p for p in paths if is_human_path(p, risk or ())][:5]
     if lines > HUMAN_LINES:
         why.append(f"{lines} changed lines")
     if has_workflow:
-        why += workflow_operator_reasons(paths, union_globs(
-            risk_globs(risk_text, RISK_WORKFLOW_OPERATOR_TABLES),
-            risk_globs(tip_risk, RISK_WORKFLOW_OPERATOR_TABLES),
-            glob_list(one_text, ("one_review_exclude",)),
-            glob_list(tip_one, ("one_review_exclude",))))
+        auto_text = None
+        if main_tip:
+            rc, auto_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                                    f"repos/{repo}/contents/{WORKFLOW_AUTO_FILE}?ref={main_tip}"])
+            auto_text = auto_text if rc == 0 else None
+        why += workflow_auto_reasons(changes, auto_text)
     not_auto = [v for v in verdicts if v["risk"] != "auto"]
     if not_auto:
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")

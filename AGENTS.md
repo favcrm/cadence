@@ -155,24 +155,28 @@ the code you just wrote.
   refuses.
   Such a row has no login, so the author-login checks do not apply. Standards plus
   Spec/security from the two workflow principals satisfy the two-review
-  requirement; the `consequential` class wants a combined review, so it refuses
-  workflow rows.
+  requirement. The `consequential` class (an active delivery profile and an
+  ordinary one-review path) wants one combined review; two counted workflow
+  reviews, Standards plus Spec/security from distinct principals, are stricter and
+  satisfy it, so that class does not lose its route when the exception ends.
   What this proves: a fresh GitHub-hosted job ran workflow code from `main`,
   filed for a head live at filing. It does not prove good judgement. A workflow
   row may carry `risk: auto`, and a prompt-injected model can write it: a PR that
   fools both models skips the operator unless a human path or size trigger
-  applies. The gate therefore requires the operator's approval for a workflow
-  review on any path in trigger 1, trigger 3 or the one-review exclude list of
-  `docs/roles/one-review-paths.toml` (the same union a scope approval refuses on,
-  because risk-paths is an allowlist, not a complete map), and on rule-7 paths (the
-  rules and the gates, including `src/delivery/**`), which are human class. Those
-  lists are read at the PR's base and at main's live tip, and the union applies, so
-  a tightening on main reaches an open PR; an unreadable tip copy refuses. The tenant stops re-filing, not re-rolling: a run can be cancelled and
+  applies. The gate therefore inverts the rule: a PR with any workflow-issued row
+  needs the operator's approval unless EVERY changed path matches
+  `docs/roles/workflow-auto-paths.toml`, read at main's live tip, and every change
+  is a plain add or modify of a regular file (a delete, rename, symlink, executable
+  or mode change needs the operator). Nothing outside that list is eligible, so a
+  path no list names fails closed, and a missing or unreadable file means the
+  operator. It starts small (`docs/guides/**` and `design-plans/**/*.md`); a path is
+  added only after reading what it holds. Rule-7 paths, the size trigger and a
+  non-`auto` `Risk:` still force the operator as before. The tenant stops re-filing, not re-rolling: a run can be cancelled and
   re-dispatched, or an empty commit pushed, for a new head and a new verdict.
   A session holding admin can still rewrite the workflow or sign directly until
   agents lose admin. There is no Browser QA workflow: a `ui/` PR still needs a
-  Browser QA verdict from a session, and refuses without it. The exception path
-  is otherwise unchanged.
+  Browser QA verdict from a session, and refuses without it. `--exception` is
+  otherwise unchanged, but a workflow row that does not hold refuses under it too.
 - One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
@@ -324,7 +328,9 @@ looking.
   its principal's GitHub login (`cadence audit identities`) and admitted that
   principal to the project (`cadence audit reviewers --project <key>`); the
   gate counts principals, excludes the author by the attested login, and
-  refuses an unattested, contradictory or ambiguous note — see
+  refuses an unattested, contradictory or ambiguous note. The one exception is a
+  workflow-issued row (CAD-2081, "Review" above), which has no login and counts
+  only under its own rules — see
   `docs/guides/hosted-workspace.md` ("Reviewing software changes"; AOS-473,
   CAD-2001).
 - When more than one Cadence build is on the host, `CADENCE_BIN` selects the one

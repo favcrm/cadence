@@ -1,0 +1,25 @@
+# CAD-2081: the ONLY paths a workflow-issued review may carry to merge without the
+# operator. A PR with any workflow-issued verdict row needs the operator's approval
+# unless EVERY changed path matches `paths` below and every change is a plain add
+# or modify of a regular file (a delete, rename, symlink, executable or mode change
+# needs the operator). Nothing outside this list is eligible, so a path no list
+# names fails closed. `scripts/enqueue-reviewed` reads this file at the live tip of
+# `main`; a missing or unreadable file means every workflow-reviewed PR needs the
+# operator. It does not widen anything for owner-attested reviews, the size
+# trigger, or a verdict whose Risk is not `auto`.
+#
+# Why this is a list of what is allowed: a workflow review can say `risk: auto`, and
+# a prompt-injected model can write that, so the safe default for a path nobody has
+# classified is the operator. Add a path only after reading what it holds.
+#
+# Left out on purpose (each held identity, approval, secret, gate, execution or
+# install logic): src/wiki/** (caller access rules, approvals, the secret guard),
+# src/overview/** (spawns git and gh, approval-menu commands), src/doctor/** (host,
+# agent-uid, pane-identity and tailnet probes, redaction util), src/issue/**
+# (claim, finish guard, delivery policy and requirements, app guard), research/**
+# (executable acceptance drivers), tests/, .github/, .claude/, infra/, crates/,
+# scripts/, docs/roles/, src/protected_runtime/ and every other src/ path.
+# Changing this file is class `human` (risk-classes.md trigger 7).
+
+[auto]
+paths = ["docs/guides/**", "design-plans/**/*.md"]
