@@ -177,8 +177,9 @@ impl Shared {
 
     /// Re-prove the live mount behind this media request. Used where a
     /// preparation step ran outside the runtime snapshot (imported
-    /// custody preview) and the reply must not ride an earlier proof.
-    fn media_mount_reprove(&self, params: &Value) -> Result<()> {
+    /// custody preview and chat attach) and the reply must not ride an
+    /// earlier proof. Returns the context it proved.
+    fn media_mount_reprove(&self, params: &Value) -> Result<ToolContext> {
         let token = required_str(params, "token")?;
         let action_token = required_str(params, "action_token")?;
         let key = match params.get("key") {
@@ -218,7 +219,7 @@ impl Shared {
                 "media image context belongs to another installation",
             ));
         }
-        Ok(())
+        Ok(ctx)
     }
 
     fn with_media_mount_current<T>(
@@ -499,27 +500,40 @@ impl Shared {
                 ))
             }
         };
-        let image = self.store.app_media_context_image(asset_id)?;
-        if image.asset.revision != revision
-            || !matches!(
-                image.original.media_type.as_str(),
-                "image/png" | "image/jpeg"
-            )
+        // CAD-2051: an imported asset carries no provider original, so the
+        // display material comes from one resolver that knows both
+        // provenances; the authority still follows the bytes' own door.
+        let display = self
+            .store
+            .app_media_display_image(asset_id)?
+            .ok_or_else(|| Error::rejected("media asset is not in the workspace catalog"))?;
+        // The provider path always validated the PRODUCER-declared type and
+        // described the bytes with the stored one; keep both distinct, and
+        // use the custody type when there is no producing run.
+        let declared = display
+            .original
+            .as_ref()
+            .map(|original| original.media_type.clone())
+            .unwrap_or_else(|| display.media_type.clone());
+        if display.asset.revision != revision
+            || !matches!(declared.as_str(), "image/png" | "image/jpeg")
         {
             return Err(Error::rejected(
-                "media chat attach needs a current PNG or JPEG original",
+                "media chat attach needs a current PNG or JPEG image",
             ));
         }
-        let preview = crate::platform::agenticos_external::image::preview_jpeg(
-            &image.bytes,
-            image.media_type,
-        )
-        .map_err(|(_, reason)| Error::rejected(reason))?;
+        let title = display.asset.title;
+        let sha256 = display.sha256;
+        let media_type = display.media_type;
+        let proof = display.original;
+        let preview =
+            crate::platform::agenticos_external::image::preview_jpeg(&display.bytes, &media_type)
+                .map_err(|(_, reason)| Error::rejected(reason))?;
         const PREFIX: &str = "data:image/jpeg;base64,";
         let mut data_url = String::with_capacity(PREFIX.len() + preview.len().div_ceil(3) * 4);
         data_url.push_str(PREFIX);
         base64::engine::general_purpose::STANDARD.encode_string(preview, &mut data_url);
-        self.with_media_mount_current(params, &image.original, |ctx| {
+        let emit = |ctx: &ToolContext| -> Result<Value> {
             if self.store.app_media_revision(asset_id)? != revision {
                 return Err(Error::rejected(
                     "media chat attach reference changed during preparation",
@@ -552,12 +566,19 @@ impl Shared {
                     "args": {
                         "install_id": ctx.install_id, "context_id": ctx.context_id,
                         "asset_id": asset_id, "revision": revision,
-                        "sha256": image.original.sha256, "media_type": image.media_type,
-                        "title": image.asset.title, "preview": data_url,
+                        "sha256": sha256, "media_type": media_type,
+                        "title": title, "preview": data_url,
                     }
                 }
             }))
-        })
+        };
+        match proof {
+            Some(original) => self.with_media_mount_current(params, &original, emit),
+            None => {
+                let ctx = self.media_mount_reprove(params)?;
+                emit(&ctx)
+            }
+        }
     }
 
     /// `app_media_publish {action_token, token, key, origin, asset_id,
