@@ -47,15 +47,15 @@ const FORMER_FRAME_CAP: usize = 768 * KIB;
 /// declare. Every declaration is derived from these bodies, so the fixture is
 /// internally consistent until a test deliberately tampers with it.
 struct Screen {
-    tag: &'static str,
+    tag: String,
     contract: &'static str,
     assets: BTreeMap<String, String>,
 }
 
 impl Screen {
-    fn new(tag: &'static str) -> Self {
+    fn new(tag: impl Into<String>) -> Self {
         Screen {
-            tag,
+            tag: tag.into(),
             contract: "app-screens/v1",
             assets: BTreeMap::new(),
         }
@@ -704,4 +704,290 @@ fn cad2008_install_names_the_oversized_member_and_its_cap() {
         message.contains(cap.as_str()),
         "the install refusal names the member's {cap}-byte cap: {message}"
     );
+}
+
+/// A JS body that is valid UTF-8 with multi-byte characters: its byte length
+/// and its character count differ, so a size fact that counted characters
+/// cannot stand in for the installed bytes.
+fn utf8_js_body() -> String {
+    concat!(
+        "/*cadence-acceptance:utf8:begin*/",
+        "var greeting=\"héllo → 世界 🙂\";",
+        "/*cadence-acceptance:utf8:end*/",
+    )
+    .to_string()
+}
+
+/// The host-reported facts for these exact bodies: byte length and sha256.
+fn facts_of(bodies: &BTreeMap<String, String>) -> serde_json::Value {
+    let mut facts = serde_json::Map::new();
+    for (name, body) in bodies {
+        facts.insert(
+            name.clone(),
+            serde_json::json!({ "size": body.len(), "sha256": digest(body) }),
+        );
+    }
+    serde_json::Value::Object(facts)
+}
+
+/// One `app.screen.integrity` request, encoded exactly as the shared ABI takes
+/// it: one declaration, the facts for its bodies, and the number of screen
+/// packages the bundle declares.
+fn integrity_request_counting(
+    manifest: &str,
+    facts: &serde_json::Value,
+    screen_count: u64,
+) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "v": 1,
+        "op": "app.screen.integrity",
+        "input": {
+            "manifest": manifest,
+            "assets": facts,
+            "screen_count": screen_count,
+        },
+    }))
+    .expect("the request is bounded JSON")
+}
+
+/// The single-package request every other acceptance case sends.
+fn integrity_request(manifest: &str, facts: &serde_json::Value) -> Vec<u8> {
+    integrity_request_counting(manifest, facts, 1)
+}
+
+/// Run one request through the shared evaluator and decode its answer.
+fn run_op(request: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(&cadence_core::evaluate::evaluate(request))
+        .expect("the evaluator always answers JSON")
+}
+
+/// AOS-479: one validator serves both hosts, so one declaration must get the
+/// same answer from the native body path (`validate_map`), the native fact path
+/// (`validate_facts`) and the hosted operation (`app.screen.integrity`). The
+/// body carries multi-byte UTF-8, and the facts must report its real byte
+/// length — a character count is refused.
+#[test]
+fn cad2008_shared_core_admits_one_declaration_from_bodies_and_facts() {
+    let body = utf8_js_body();
+    assert!(
+        body.len() > body.chars().count(),
+        "the fixture must carry multi-byte UTF-8 so bytes and characters differ"
+    );
+    let screen = Screen::new("main").leaf("client.js", body.clone());
+    let (manifest, bodies) = screen.parts("demo");
+
+    let checked =
+        validate_map(&manifest, &bodies).expect("the native body path admits the declaration");
+    assert_eq!(checked.app(), "demo");
+    assert_eq!(checked.asset_count(), 1);
+
+    let mut native_facts = BTreeMap::new();
+    native_facts.insert(
+        "client.js".to_string(),
+        crate::issue::app_screen_decl::ScreenAssetFact {
+            size: body.len() as u64,
+            sha256: digest(&body),
+        },
+    );
+    let from_facts = crate::issue::app_screen_decl::validate_facts(&manifest, &native_facts)
+        .expect("the native fact path admits the same declaration");
+    assert_eq!(from_facts.app(), "demo");
+
+    let answer = run_op(&integrity_request(&manifest, &facts_of(&bodies)));
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["op"], "app.screen.integrity");
+    assert_eq!(answer["value"]["app"], "demo");
+
+    // The same declaration with a character-count fact does not describe the
+    // installed bytes, and the shared validator refuses it.
+    let mut characters = facts_of(&bodies);
+    characters["client.js"]["size"] = serde_json::json!(body.chars().count());
+    let refused = run_op(&integrity_request(&manifest, &characters));
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "invalid_manifest");
+
+    // A declaration that counted characters instead of bytes is not the
+    // installed body either: the native body path refuses it, and so does the
+    // operation run over the same bytes.
+    let mut declared = serde_json::from_str::<serde_json::Value>(&manifest)
+        .expect("the fixture declaration is JSON");
+    declared["assets"][0]["size"] = serde_json::json!(body.chars().count());
+    let declared = declared.to_string();
+    assert!(validate_map(&declared, &bodies).is_err());
+    let refused = run_op(&integrity_request(&declared, &facts_of(&bodies)));
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "invalid_manifest");
+}
+
+/// AOS-479: a same-length body swap keeps every declared size true, so only
+/// the digest can catch it — and the hosted fact path catches it while the
+/// declared bytes still pass, so the refusal is the digest and not the shape.
+#[test]
+fn cad2008_shared_core_refuses_same_length_tampered_bytes_from_facts() {
+    let body = js_body(64 * KIB);
+    let screen = Screen::new("main").leaf("client.js", body.clone());
+    let (manifest, bodies) = screen.parts("demo");
+    assert!(validate_map(&manifest, &bodies).is_ok());
+
+    let mut bytes = body.clone().into_bytes();
+    let index = bytes.len() / 2;
+    let original = bytes[index];
+    bytes[index] = if original == b'Z' { b'Q' } else { b'Z' };
+    let tampered = String::from_utf8(bytes).expect("the tamper stays ASCII");
+    assert_eq!(tampered.len(), body.len());
+    assert_ne!(tampered, body);
+
+    let swapped = facts_of(&BTreeMap::from([("client.js".to_string(), tampered)]));
+    assert_eq!(swapped["client.js"]["size"], body.len() as u64);
+    let refused = run_op(&integrity_request(&manifest, &swapped));
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "invalid_manifest");
+
+    let accepted = run_op(&integrity_request(&manifest, &facts_of(&bodies)));
+    assert_eq!(accepted["ok"], true, "{accepted}");
+}
+
+/// AOS-479: the facts are the caller's report, so the shared validator refuses
+/// facts that cannot describe the declared bytes — a wrong digest, a malformed
+/// digest, a missing fact and an undeclared extra fact — while the same
+/// declaration with correct facts passes.
+#[test]
+fn cad2008_shared_core_refuses_bad_missing_and_extra_facts() {
+    let body = js_body(4 * KIB);
+    let screen = Screen::new("main").leaf("client.js", body);
+    let (manifest, bodies) = screen.parts("demo");
+    let good = facts_of(&bodies);
+    assert_eq!(run_op(&integrity_request(&manifest, &good))["ok"], true);
+
+    let mut wrong = good.clone();
+    wrong["client.js"]["sha256"] = serde_json::json!(format!("sha256:{}", "0".repeat(64)));
+    let mut malformed = good.clone();
+    malformed["client.js"]["sha256"] = serde_json::json!("not-a-digest");
+    let mut extra = good.clone();
+    extra["styles.css"] = serde_json::json!({ "size": 0, "sha256": digest("") });
+
+    for (case, facts) in [
+        ("wrong digest", wrong),
+        ("malformed digest", malformed),
+        ("missing fact", serde_json::json!({})),
+        ("extra fact", extra),
+    ] {
+        let refused = run_op(&integrity_request(&manifest, &facts));
+        assert_eq!(refused["ok"], false, "{case}: {refused}");
+        assert_eq!(refused["code"], "invalid_manifest", "{case}: {refused}");
+    }
+}
+
+/// AOS-479: `tools` is the one map-valued declaration field, so a repeated
+/// alias would otherwise collapse to its last value. The shared validator
+/// refuses the duplicate through both entry points, while the same declaration
+/// carrying one alias is valid.
+#[test]
+fn cad2008_shared_core_refuses_a_duplicate_tool_alias_in_v2() {
+    let body = js_body(4 * KIB);
+    let screen = Screen::new("main").leaf("client.js", body);
+    let (v1, bodies) = screen.parts("demo");
+    let with_tools = |tools: &str| {
+        v1.replacen("\"app-screens/v1\"", "\"app-screens/v2\"", 1)
+            .replacen(
+                '{',
+                &format!("{{\"host_contract\":\"screen-media.v1\",\"tools\":{tools},"),
+                1,
+            )
+    };
+
+    let unique = with_tools("{\"media.read\":\"catalog\"}");
+    let duplicate = with_tools("{\"media.read\":\"catalog\",\"media.read\":\"catalog\"}");
+    // The injection replaces the declaration's opening brace, so the object it
+    // opens is closed by the declaration's own final brace. A fixture that
+    // closed it early would be malformed JSON and would refuse for the wrong
+    // reason, so both declarations are proved well-formed first.
+    for declaration in [&unique, &duplicate] {
+        assert!(
+            serde_json::from_str::<serde_json::Value>(declaration).is_ok(),
+            "the injected declaration must be well-formed JSON: {declaration}"
+        );
+    }
+    assert!(validate_map(&unique, &bodies).is_ok(), "{unique}");
+    let accepted = run_op(&integrity_request(&unique, &facts_of(&bodies)));
+    assert_eq!(accepted["ok"], true, "{accepted}");
+
+    assert!(validate_map(&duplicate, &bodies).is_err());
+    let refused = run_op(&integrity_request(&duplicate, &facts_of(&bodies)));
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "invalid_manifest");
+}
+
+/// `count` legitimate screen packages, each a valid declaration over the same
+/// real body, tagged so the bundle carries distinct packages.
+fn screen_packages(count: usize, body: &str) -> Vec<Screen> {
+    (0..count)
+        .map(|index| Screen::new(format!("pkg{index}")).leaf("client.js", body.to_string()))
+        .collect()
+}
+
+/// AOS-479: native package admission bounds one bundle at eight screen
+/// packages, and the shared operation carries the same bound in
+/// `screen_count`, so eight legitimate declarations — each a valid package over
+/// real body facts — pass both.
+#[test]
+fn cad2008_eight_screen_packages_are_admitted_by_native_and_core() {
+    let body = js_body(4 * KIB);
+    let screens = screen_packages(8, &body);
+    let files = bundle("demo", &screens.iter().collect::<Vec<_>>());
+    let tags = tags_in(&files).expect("eight screen packages are a legal bundle");
+    assert_eq!(tags.len(), 8);
+    assert!(
+        extract(&files, &tags[0]).is_ok(),
+        "each package is a valid declaration over its own bytes"
+    );
+
+    let (manifest, bodies) = screens[0].parts("demo");
+    let accepted = run_op(&integrity_request_counting(
+        &manifest,
+        &facts_of(&bodies),
+        8,
+    ));
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    assert_eq!(accepted["value"]["app"], "demo");
+}
+
+/// AOS-479: nine packages exceed native's bound, and the operation refuses the
+/// same set instead of admitting the declaration out of context. The identical
+/// declaration and facts still pass as a one-package bundle, so the refusal is
+/// the count and not the package.
+#[test]
+fn cad2008_nine_screen_packages_are_refused_by_native_and_core() {
+    let body = js_body(4 * KIB);
+    let screens = screen_packages(9, &body);
+    let files = bundle("demo", &screens.iter().collect::<Vec<_>>());
+    assert!(
+        tags_in(&files).is_err(),
+        "nine screen packages exceed the native bound"
+    );
+
+    let (manifest, bodies) = screens[0].parts("demo");
+    let facts = facts_of(&bodies);
+    let accepted = run_op(&integrity_request(&manifest, &facts));
+    assert_eq!(accepted["ok"], true, "{accepted}");
+
+    // A screen operation always represents at least one package: the same
+    // declaration and facts are refused as a zero-package set.
+    let zero = run_op(&integrity_request_counting(&manifest, &facts, 0));
+    assert_eq!(zero["ok"], false, "{zero}");
+
+    // The count is a u64 on every host. A value past a 32-bit `usize` is still
+    // a well-formed command, so it must refuse as an out-of-range package
+    // count — the package-set answer — never as a malformed command, and the
+    // answer cannot differ between x64 and wasm32.
+    let past_u32 = run_op(&integrity_request_counting(
+        &manifest,
+        &facts,
+        4_294_967_296,
+    ));
+    assert_eq!(past_u32["ok"], false, "{past_u32}");
+    assert_eq!(past_u32["code"], "invalid_manifest", "{past_u32}");
+
+    let refused = run_op(&integrity_request_counting(&manifest, &facts, 9));
+    assert_eq!(refused["ok"], false, "{refused}");
 }

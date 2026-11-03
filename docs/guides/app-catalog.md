@@ -563,6 +563,21 @@ read `value.compatible`. A legacy manifest declares no requirements, so it
 returns `declared: false` and no checks, not proof that a target can run it.
 Package inspection, tenant state and authorization are separate decisions.
 
+The `app.screen.integrity` command runs the same screen declaration/integrity
+guard natively (`src/issue/app_screen_decl.rs` is now a re-export of
+`crates/cadence-core/src/app_screen_decl.rs`) for a host that will not hand the
+rules core its asset bodies. It takes the exact `screens.json` text plus
+host-computed `size`/`sha256` facts for every installed asset leaf, and the
+number of `screens/<tag>/` packages the app declares — bounded by the one
+`MAX_SCREENS` the native bundle scan enforces, and checked before any
+declaration work. It returns the declared app tag only when the declaration and
+those facts agree. The facts and the count are the caller's report — the caller
+must hash the exact bytes it installed — and `invalid_manifest` refuses a wrong
+digest or size, an undeclared or missing leaf, a repeated object key, an
+over-count app, or any grammar/bound violation. The command accepts no asset
+bodies, so a multi-megabyte leaf cannot ride the ABI, and it grants no install,
+mount, execution or effect authority.
+
 ## Offline screen-frame previews and projection fixtures
 
 `cadence app frame-kit --out <dir> [--bundle <local-app-bundle>] [--parent-origin <origin>]`

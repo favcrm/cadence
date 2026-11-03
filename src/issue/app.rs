@@ -1197,8 +1197,11 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
 /// Most files a bundle may carry.
 const MAX_FILES: usize = 128;
 
-/// Largest bundle, all files together — an A1 app is text.
-pub(crate) const MAX_APP_BYTES: u64 = 2 * 1024 * 1024;
+/// Largest bundle, all files together — an A1 app is text. The number is
+/// stated once in `cadence_core::app_screen_decl::MAX_TOTAL_BYTES` (a screen's
+/// assets share this budget); this alias keeps the native name without a
+/// second literal that could drift.
+pub(crate) const MAX_APP_BYTES: u64 = cadence_core::app_screen_decl::MAX_TOTAL_BYTES;
 
 /// The `app.md` definition: the frontmatter fields plus the body, the
 /// guide agents read. `needs.connections` declares the slots the app's
