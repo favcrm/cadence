@@ -38,7 +38,12 @@ export interface TabContext {
   onSaved: () => void;
   /** The detail read failed. Roster tasks, when present, stay visible. */
   detailFailed: boolean;
+  /** This board answers the read with 501: it keeps no such details. That is
+   *  permanent, so it reads as neither a failure to retry nor an empty record. */
+  detailNotServed: boolean;
 }
+
+const NOT_RECORDED = "This board doesn’t record agent history.";
 
 function Panel({
   title,
@@ -226,6 +231,7 @@ function JobSummary({ text }: { text: string }) {
 function JobExcerpt({ c }: { c: TabContext }) {
   const t = useTranslate();
   const text = c.detail?.agent.instructions ?? c.role?.instructions ?? null;
+  if (!text && c.detailNotServed) return null;
   return text ? (
     <JobSummary text={text} />
   ) : (
@@ -249,37 +255,45 @@ function Overview({ c }: { c: TabContext }) {
         <Panel title="Up next" link="work" onTab={c.onTab}>
           {c.observed ? <AgentQueue agent={c.observed} /> : c.detailFailed ? unavailable : <Note>{t("Nothing queued.")}</Note>}
         </Panel>
-        <Panel title="Recent results" link="work" onTab={c.onTab}>
-          {c.detailFailed ? (
-            unavailable
-          ) : results.length ? (
-            <Rows>
-              {results.slice(0, 3).map((e) => (
-                <EventRow key={e.seq} e={e} />
-              ))}
-            </Rows>
-          ) : (
-            <Note>{t("No results yet.")}</Note>
-          )}
-        </Panel>
-        <Panel title="History" link="history" onTab={c.onTab}>
-          {c.detailFailed ? (
-            unavailable
-          ) : events.length ? (
-            <Rows>
-              {events.slice(-3).reverse().map((e) => (
-                <EventRow key={e.seq} e={e} />
-              ))}
-            </Rows>
-          ) : (
-            <Note>{t("No events yet.")}</Note>
-          )}
-        </Panel>
+        {c.detailNotServed ? (
+          <Note>{t(NOT_RECORDED)}</Note>
+        ) : (
+          <>
+            <Panel title="Recent results" link="work" onTab={c.onTab}>
+              {c.detailFailed ? (
+                unavailable
+              ) : results.length ? (
+                <Rows>
+                  {results.slice(0, 3).map((e) => (
+                    <EventRow key={e.seq} e={e} />
+                  ))}
+                </Rows>
+              ) : (
+                <Note>{t("No results yet.")}</Note>
+              )}
+            </Panel>
+            <Panel title="History" link="history" onTab={c.onTab}>
+              {c.detailFailed ? (
+                unavailable
+              ) : events.length ? (
+                <Rows>
+                  {events.slice(-3).reverse().map((e) => (
+                    <EventRow key={e.seq} e={e} />
+                  ))}
+                </Rows>
+              ) : (
+                <Note>{t("No events yet.")}</Note>
+              )}
+            </Panel>
+          </>
+        )}
       </div>
       <aside className="ap-side">
-        <Panel title="Job" link="job" onTab={c.onTab}>
-          <JobExcerpt c={c} />
-        </Panel>
+        {(!c.detailNotServed || c.detail?.agent.instructions || c.role?.instructions) && (
+          <Panel title="Job" link="job" onTab={c.onTab}>
+            <JobExcerpt c={c} />
+          </Panel>
+        )}
         <Panel title="Knowledge" link="knowledge" onTab={c.onTab}>
           <Chips
             items={[t("Workspace wiki"), ...(project ? [`${t("Project notes")}: ${project}`] : [t("Ticket's project notes")])]}
@@ -381,7 +395,9 @@ function Work({ c }: { c: TabContext }) {
         )}
       </Panel>
       <Panel title="Results" mark="results" onTab={c.onTab}>
-        {c.detailFailed && !detail ? (
+        {c.detailNotServed ? (
+          <Note>{t(NOT_RECORDED)}</Note>
+        ) : c.detailFailed && !detail ? (
           <Note>{t("Agent details are unavailable.")}</Note>
         ) : detail?.events_error && results.length === 0 ? (
           <p role="alert" className="text-label text-fail">
@@ -455,7 +471,11 @@ function History({ c }: { c: TabContext }) {
           {t("The event history could not be read:")} {detail.events_error}
         </p>
       )}
-      {rows.length ? (
+      {c.detailNotServed ? (
+        <Note>{t(NOT_RECORDED)}</Note>
+      ) : c.detailFailed && !detail ? (
+        <Note>{t("Agent details are unavailable.")}</Note>
+      ) : rows.length ? (
         <Rows>
           {rows.map((r) => (
             <Row
@@ -504,6 +524,11 @@ function Job({ c }: { c: TabContext }) {
       setSaving(false);
     }
   };
+  if (c.detailNotServed && c.role) {
+    return <Note>{t("This agent was hired as {role}.").replace("{role}", () => c.role!.title)}</Note>;
+  }
+  if (c.detailNotServed) return <Note>{t(NOT_RECORDED)}</Note>;
+  if (c.detailFailed && !c.detail) return <Note>{t("Agent details are unavailable.")}</Note>;
   if (!c.detail) return <Note>{t("Loading agent details…")}</Note>;
   if (served === null) {
     return (
@@ -752,6 +777,10 @@ function Settings({ c }: { c: TabContext }) {
               </div>
             ))}
           </dl>
+        ) : c.detailNotServed ? (
+          <Note>{t(NOT_RECORDED)}</Note>
+        ) : c.detailFailed ? (
+          <Note>{t("Agent details are unavailable.")}</Note>
         ) : (
           <Note>{t("Loading agent details…")}</Note>
         )}

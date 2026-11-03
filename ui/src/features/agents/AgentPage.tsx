@@ -1,5 +1,5 @@
 import { useContext, useEffect, useState } from "react";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { useWriteBlock, WriteGate } from "../auth/WriteGate";
@@ -103,6 +103,7 @@ export default function AgentPage({
   const t = useTranslate();
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [notServed, setNotServed] = useState(false);
   const [retry, setRetry] = useState(0);
 
   const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
@@ -116,11 +117,17 @@ export default function AgentPage({
     // A reload after a save keeps what is on screen; only a new alias resets.
     if (retry === 0) setDetail(null);
     setErr(null);
+    setNotServed(false);
     let live = true;
     api
       .agent(alias)
       .then((d) => live && setDetail(d))
-      .catch((e) => live && setErr(String(e.message ?? e)));
+      .catch((e) => {
+        if (!live) return;
+        // A 501 is this board's permanent answer, not a failed read to retry.
+        if (e instanceof ApiError && e.status === 501) setNotServed(true);
+        else setErr(String(e.message ?? e));
+      });
     return () => {
       live = false;
     };
@@ -211,6 +218,7 @@ export default function AgentPage({
     onTab,
     onSaved: () => setRetry((n) => n + 1),
     detailFailed: err !== null,
+    detailNotServed: notServed,
   };
 
   const cloudCards = (
@@ -268,7 +276,7 @@ export default function AgentPage({
 
   const notices = (
     <>
-      {!detail && !err && (
+      {!detail && !err && !notServed && (
         <p role="status" className="text-label text-ink-500 mb-3">
           {t("Loading agent details…")}
         </p>
@@ -353,7 +361,7 @@ export default function AgentPage({
                 title: t("This is a mailbox, not an agent"),
                 body: t("Mail waits here until an agent reads it."),
               }
-            : !profile && err !== null
+            : !profile && (err !== null || notServed)
               ? {
                   title: t("No agent named {alias}").replace("{alias}", () => alias),
                   body: t("It may have been removed. Pick another agent from the list."),
