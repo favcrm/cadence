@@ -34,7 +34,7 @@ paths = ["src/peer.rs", "src/daemon.rs", "src/daemon/identity.rs",
   "src/cli/platform.rs", "src/bin/cadence-agent-exec/**", "src/cli_actor.rs",
   "src/board_identity.rs", "src/device_login.rs",
   "src/remote_auth.rs", "src/remote_cli.rs", "src/remote_enrollment.rs",
-  "src/remote_cli/**", "src/remote_enrollment/**", "src/remote_*_acceptance.rs"]
+  "src/remote_cli/**", "src/remote_enrollment/**", "src/remote_*_acceptance.rs", "src/runner.rs"]
 
 # Trigger 2, schema and store version. Pre-approvable at ticket time.
 [schema]

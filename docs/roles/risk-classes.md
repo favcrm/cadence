@@ -53,7 +53,7 @@ The verdict notes are files the agents' uid can write: the author or the approve
 `delegable` names files, not directories, wherever code is involved: nothing that builds, runs in the browser (`ui/**` is trigger 1: the board runs with the operator's session) or acts on the host. Gate inputs and the tests that prove gates are trigger 7.
 
 - **delegable**: `src/issue/blocked.rs`, `src/issue/cli.rs`, `src/issue/context.rs`, `src/issue/groom.rs`, `src/issue/history.rs`, `src/issue/line_times.rs`, `src/issue/lint.rs`, `src/issue/retro.rs`, `src/issue/sprint.rs`, `src/issue/summary.rs`, `src/issue/sync.rs`, `src/issue/time.rs`, `src/issue/write.rs`, `src/cli/issue.rs`, `src/cli/milestone.rs`, `src/cli/project.rs`, `src/cli/status.rs`, `src/cli/overview.rs`, `src/cli/events.rs`, `src/cli/help.rs`, `docs/**`
-- **trigger1**: `src/peer.rs`, `src/daemon.rs`, `src/daemon/identity.rs`, `src/daemon/caller_rule.rs`, `src/daemon/slots_rpc.rs`, `src/adapter/pty/**`, `src/ui.rs`, `src/ui/**`, `ui/**`, `src/operator_auth.rs`, `src/tailnet_proof.rs`, `src/test_seam.rs`, `src/master_perm.rs`, `src/agent_uid/**`, `src/cli/agent_uid.rs`, `src/daemon/operator_rpc.rs`, `src/daemon/supervisor_grant.rs`, `src/daemon/installer_enrollment_wire.rs`, `src/platform/custody.rs`, `src/cli/platform.rs`, `src/bin/cadence-agent-exec/**`, `src/cli_actor.rs`, `src/board_identity.rs`, `src/device_login.rs`, `src/remote_auth.rs`, `src/remote_cli.rs`, `src/remote_enrollment.rs`, `src/remote_cli/**`, `src/remote_enrollment/**`, `src/remote_*_acceptance.rs`
+- **trigger1**: `src/peer.rs`, `src/daemon.rs`, `src/daemon/identity.rs`, `src/daemon/caller_rule.rs`, `src/daemon/slots_rpc.rs`, `src/adapter/pty/**`, `src/ui.rs`, `src/ui/**`, `ui/**`, `src/operator_auth.rs`, `src/tailnet_proof.rs`, `src/test_seam.rs`, `src/master_perm.rs`, `src/agent_uid/**`, `src/cli/agent_uid.rs`, `src/daemon/operator_rpc.rs`, `src/daemon/supervisor_grant.rs`, `src/daemon/installer_enrollment_wire.rs`, `src/platform/custody.rs`, `src/cli/platform.rs`, `src/bin/cadence-agent-exec/**`, `src/cli_actor.rs`, `src/board_identity.rs`, `src/device_login.rs`, `src/remote_auth.rs`, `src/remote_cli.rs`, `src/remote_enrollment.rs`, `src/remote_cli/**`, `src/remote_enrollment/**`, `src/remote_*_acceptance.rs`, `src/runner.rs`
 - **schema**: `src/store/schema.rs`, `src/remote_result_outbox.rs`
 - **trigger3**: `src/secret/**`, `src/cli/secret.rs`, `src/cli/connection.rs`, `src/session.rs`, `src/backup/mod.rs`, `src/continuity.rs`, `src/doctor/host/util.rs`, `src/issue/report.rs`, `src/issue/areas.rs`
 - **trigger4**: `Cargo.toml`, `Cargo.lock`, `build.rs`, `rust-toolchain.toml`, `.cargo/**`, `.config/**`, `**/package.json`, `**/pnpm-lock.yaml`, `.github/**`, `scripts/**`, `**/.github/**`, `**/.cargo/**`, `config/**`, `**/package-lock.json`, `**/yarn.lock`, `**/bun.lock`, `**/bun.lockb`, `**/.npmrc`, `**/build.rs`, `**/rust-toolchain.toml`, `**/Cargo.toml`, `**/Cargo.lock`
@@ -96,7 +96,8 @@ checks that the advisory links are separate https URLs; it proves neither head
 binding nor that Browser QA ran, and a verdict filed under the author's identity
 still refuses under it. The `solo_operator` delivery-profile
 field still exists in code; it is not this standard. A workflow-issued reviewer
-identity is a proposal, not shipped.
+identity (CAD-2081) is counted by the gate, but its workflows are not shipped yet;
+see AGENTS.md "Review".
 
 ### Review count by diff (CAD-957)
 A PR whose every change qualifies under the one-review allowlist

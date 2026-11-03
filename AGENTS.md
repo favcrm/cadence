@@ -141,13 +141,18 @@ the code you just wrote.
   `docs/roles/review-workflow-principals.toml` at the live tip of `main` (not the
   PR's base, which can lag; the tip never holds an unmerged PR, so a PR cannot add
   its own reviewer) and the row's kind is the one kind that principal may fill;
-  the PR's current base is `main`; the row records a `base_sha`; and the
+  the PR's current base is `main`; the row carries a `base_sha` (a presence and
+  format check only, it proves nothing about the base); and the
   principal's workflow file at the row's `workflow_sha` is a regular file
   byte-identical to the same file at main's tip. A re-run keeps the original
   commit's workflow for up to 30 days, so the comparison keeps a since-fixed
   workflow from still filing a pass. It covers the workflow file itself, not the
   actions it calls. An unlisted principal, a wrong kind, an unreadable tip or
-  allowlist, a retargeted PR or a non-pass row refuses and counts for nothing.
+  allowlist, a retargeted PR or a non-pass row refuses and counts for nothing, and
+  under `--exception` too. An owner-attested row that names a listed workflow
+  principal also counts for nothing; the list loads whenever a hosted document has
+  a row, and if it cannot be read only a workflow row or a `svc_*` owner row
+  refuses.
   Such a row has no login, so the author-login checks do not apply. Standards plus
   Spec/security from the two workflow principals satisfy the two-review
   requirement; the `consequential` class wants a combined review, so it refuses
@@ -157,14 +162,17 @@ the code you just wrote.
   row may carry `risk: auto`, and a prompt-injected model can write it: a PR that
   fools both models skips the operator unless a human path or size trigger
   applies. The gate therefore requires the operator's approval for a workflow
-  review on trigger 1 and 3 paths (trust boundary, identity, secrets), and the
-  rule-7 paths (the rules and the gates, including `src/delivery/**`) are human
-  class. The tenant stops re-filing, not re-rolling: a run can be cancelled and
+  review on any path in trigger 1, trigger 3 or the one-review exclude list of
+  `docs/roles/one-review-paths.toml` (the same union a scope approval refuses on,
+  because risk-paths is an allowlist, not a complete map), and on rule-7 paths (the
+  rules and the gates, including `src/delivery/**`), which are human class. Those
+  lists are read at the PR's base and at main's live tip, and the union applies, so
+  a tightening on main reaches an open PR; an unreadable tip copy refuses. The tenant stops re-filing, not re-rolling: a run can be cancelled and
   re-dispatched, or an empty commit pushed, for a new head and a new verdict.
   A session holding admin can still rewrite the workflow or sign directly until
   agents lose admin. There is no Browser QA workflow: a `ui/` PR still needs a
   Browser QA verdict from a session, and refuses without it. The exception path
-  is unchanged.
+  is otherwise unchanged.
 - One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
