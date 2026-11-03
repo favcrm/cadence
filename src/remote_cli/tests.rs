@@ -4785,3 +4785,76 @@ mod cad2083_acceptance {
         }
     }
 }
+
+/// CAD-2009: the platform-call seam keeps the two answers that prove the funded
+/// dispatch never ran a *definite* refusal. `501 not_implemented` means the
+/// tenant does not serve the verb, and `503 tracker_unavailable` is the native
+/// route's `pm_at` gate, opened before any verb runs — both precede the provider
+/// call, so neither may become the possible-charge unknown of a dispatched but
+/// unanswered call, and neither may be replayed.
+#[test]
+fn hosted_platform_call_pre_forward_refusals_stay_definite() {
+    const KEY: &str = "cad2009-pre-forward-acceptance-1";
+    for (status, line, code) in [
+        (501_u16, "501 Not Implemented", "not_implemented"),
+        (503, "503 Service Unavailable", "tracker_unavailable"),
+    ] {
+        let body = json!({"ok": false, "error": {"code": code}});
+        let (listener, seen, server) = finite_worker(2, move |i, socket, _req| {
+            if i == 0 {
+                write_answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                );
+            } else {
+                write_answer(socket, line, "", &body);
+            }
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let args = json!({
+            "operation": "call",
+            "tool": "generate_image",
+            "body": {"prompt": "synthetic pre-forward acceptance input"},
+            "key": KEY
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let out = call_verb_in(
+            &target,
+            "platform_call",
+            args,
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("a pre-forward refusal must not be automatically retried"),
+        );
+        server.join().unwrap();
+        let reqs = seen.lock().unwrap();
+        assert_eq!(
+            reqs.iter()
+                .filter(|req| req.path == "/__platform/cli/call")
+                .count(),
+            1,
+            "HTTP {status} ({code}): one forwarding attempt, never a replay"
+        );
+
+        let err = out.expect_err("a pre-effect refusal is not a successful tool receipt");
+        assert_eq!(
+            err.kind(),
+            "rejected",
+            "HTTP {status} ({code}) proves the dispatch never ran, so it is definite: {err}"
+        );
+        let text = err.to_string();
+        assert!(
+            !text.contains("charg"),
+            "an undispatched call cannot have charged: {text}"
+        );
+        assert!(
+            !text.contains("outcome_unknown") && !text.contains("may already have committed"),
+            "a proven pre-forward refusal is not an unknown outcome: {text}"
+        );
+    }
+}
