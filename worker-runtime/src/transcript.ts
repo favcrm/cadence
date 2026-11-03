@@ -94,6 +94,12 @@ export function projectedThreadEntries(
 /** The engine's reset record: earlier entries leave the model's context, not storage. */
 export const RESET_KIND = "pi.reset";
 
+/** The engine's compaction record: a summary for the model, not a message anyone sent. */
+export const COMPACTION_KIND = "pi.compaction";
+
+/** Where a reset falls among the messages: it settles an error before it. */
+const RESET_BOUNDARY = { role: "user", content: "", timestamp: 0 } as PiMessage;
+
 /** Shown where a conversation started over. */
 export const FRESH_START_TEXT =
   "Started fresh. The assistant no longer uses the messages above.";
@@ -137,17 +143,29 @@ export function threadEntries(
   includeThinking: boolean,
 ): ThreadEntry[] {
   const entries: ThreadEntry[] = [];
-  const all = records.flatMap((record) => record.model ?? []);
+  const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
+  const all = visible.flatMap((record) =>
+    record.kind === RESET_KIND
+      ? [RESET_BOUNDARY, ...(record.model ?? [])]
+      : (record.model ?? []),
+  );
   let position = -1;
-  for (const record of records) {
-    // A reset with nothing before it has nothing to mark.
-    if (record.kind === RESET_KIND && entries.length > 0) {
-      entries.push({
-        seq: entries.length + 1,
-        role: "system",
-        kind: "message",
-        text: FRESH_START_TEXT,
-      });
+  for (const record of visible) {
+    if (record.kind === RESET_KIND) {
+      position += 1;
+      // A reset with nothing before it, or right after another, marks nothing.
+      const previous = entries.at(-1);
+      if (
+        previous !== undefined &&
+        !(previous.role === "system" && previous.text === FRESH_START_TEXT)
+      ) {
+        entries.push({
+          seq: entries.length + 1,
+          role: "system",
+          kind: "message",
+          text: FRESH_START_TEXT,
+        });
+      }
     }
     const data = record.data;
     const messageId =

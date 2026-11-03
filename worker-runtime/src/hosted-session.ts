@@ -201,15 +201,13 @@ export class HostedSession<
       // Capture the watch before reading its snapshot so commits between the
       // initial read and subscription are buffered, not silently missed.
       const stream = await this.harness.session().events();
-      // Project before SSE 200, so a failing projection refuses like the master
+      // Read and project before SSE 200, so a failure refuses like the master
       // projection above rather than opening a body that errors and reconnects.
+      // The engine's own snapshot is the active context, which numbers from 1
+      // again after a reset: a reconnect must see the same `seq` as a page read.
       let snapshotEntries: ThreadEntry[];
       try {
-        snapshotEntries = projectedThreadEntries(
-          stream.snapshot.entries,
-          thinking,
-          this.options.projectThread,
-        );
+        snapshotEntries = await this.transcript(thinking);
       } catch {
         await stream.stop();
         return Response.json(

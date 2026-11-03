@@ -56697,6 +56697,8 @@ function projectedThreadEntries(records, includeThinking, project) {
   return project ? [...project(entries)] : entries;
 }
 var RESET_KIND = "pi.reset";
+var COMPACTION_KIND = "pi.compaction";
+var RESET_BOUNDARY = { role: "user", content: "", timestamp: 0 };
 var FRESH_START_TEXT = "Started fresh. The assistant no longer uses the messages above.";
 var HISTORY_PAGE = 500;
 async function readAllRecords(scan) {
@@ -56711,16 +56713,21 @@ async function readAllRecords(scan) {
 }
 function threadEntries(records, includeThinking) {
   const entries = [];
-  const all = records.flatMap((record) => record.model ?? []);
+  const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
+  const all = visible.flatMap((record) => record.kind === RESET_KIND ? [RESET_BOUNDARY, ...record.model ?? []] : record.model ?? []);
   let position = -1;
-  for (const record of records) {
-    if (record.kind === RESET_KIND && entries.length > 0) {
-      entries.push({
-        seq: entries.length + 1,
-        role: "system",
-        kind: "message",
-        text: FRESH_START_TEXT
-      });
+  for (const record of visible) {
+    if (record.kind === RESET_KIND) {
+      position += 1;
+      const previous = entries.at(-1);
+      if (previous !== undefined && !(previous.role === "system" && previous.text === FRESH_START_TEXT)) {
+        entries.push({
+          seq: entries.length + 1,
+          role: "system",
+          kind: "message",
+          text: FRESH_START_TEXT
+        });
+      }
     }
     const data = record.data;
     const messageId = record.kind === BOARD_MESSAGE_KIND && data !== null && typeof data === "object" && !Array.isArray(data) && typeof data.messageId === "string" ? data.messageId : undefined;
@@ -56885,7 +56892,7 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
       const stream = await this.harness.session().events();
       let snapshotEntries;
       try {
-        snapshotEntries = projectedThreadEntries(stream.snapshot.entries, thinking, this.options.projectThread);
+        snapshotEntries = await this.transcript(thinking);
       } catch {
         await stream.stop();
         return Response.json({
