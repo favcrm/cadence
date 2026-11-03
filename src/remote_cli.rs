@@ -3411,7 +3411,7 @@ fn artifact_receipt(answer: Value, bytes: &[u8]) -> Result<Value> {
     let hex = b"0123456789abcdef";
     if !Sha256::digest(bytes)
         .iter()
-        .zip(digest.as_bytes().chunks_exact(2))
+        .zip(digest.as_bytes().as_chunks::<2>().0.iter())
         .all(|(byte, pair)| {
             pair[0] == hex[(byte >> 4) as usize] && pair[1] == hex[(byte & 0x0f) as usize]
         })
