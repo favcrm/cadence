@@ -20,6 +20,7 @@ import {
   settlePending,
   threadItems,
   threadRuns,
+  failWithdrawn,
   inFlightTurnKey,
   unnamedTurnAnswered,
   itemMessage,
@@ -597,6 +598,16 @@ main().catch((e) => {
   );
   equal(inFlightTurnKey(answered, "ui-1"), null, "a landed answer is not still in flight");
   equal(inFlightTurnKey(answered, null, true), null, "a landed answer is not in flight for an unnamed turn either");
+  {
+    const held = (message: string) => ({ message, text: `text ${message}`, state: "sent" as const, at: 1 });
+    const before = { ...mergePage(null, { thread: { id: "t" }, entries: [] }), pending: [held("q-1"), held("q-2")] };
+    const after = failWithdrawn(before, ["q-1", "not-here"], "withdrawn", () => "fresh");
+    equal(after.pending[0].state, "failed", "a withdrawn row fails");
+    equal(after.pending[0].message, "fresh", "a withdrawn row gets a fresh id");
+    equal(after.pending[0].text, "text q-1", "a withdrawn row keeps its text");
+    equal(after.pending[1], before.pending[1], "a row that was not withdrawn is untouched");
+    equal(failWithdrawn(before, [], "x", () => "fresh"), before, "nothing withdrawn changes nothing");
+  }
   equal(unnamedTurnAnswered(answered), true, "a thread ending on an answer has no send waiting");
   equal(unnamedTurnAnswered(open), false, "an open run is still waiting");
   equal(
