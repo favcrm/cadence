@@ -80,6 +80,11 @@ struct Inbox {
     recovery_watermark: Option<u64>,
     recovery_notice_after: Option<String>,
     entries: Vec<Value>,
+    /// A skipped event may be the only signal for a change, so the next session
+    /// re-reads assignments. Omitted when unset: this struct refuses unknown
+    /// fields, and an older client must still be able to read the file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reread_assignments: bool,
 }
 
 fn folder(state: &Path) -> PathBuf {
@@ -356,6 +361,7 @@ fn load_inbox(state: &Path, binding: &WorkspaceBinding) -> Result<Inbox> {
         recovery_watermark: None,
         recovery_notice_after: None,
         entries: Vec::new(),
+        reread_assignments: false,
     });
     if inbox.version != 1
         || inbox.organization_id != binding.organization_id
@@ -608,7 +614,7 @@ fn guarded_http(
 /// An activation can return Ok with per-row refusals. Only an authoritative
 /// terminal/block or transfer to another claimant settles such an obligation;
 /// a queued/running row after a transient failure remains durable pending work.
-fn pickup_reconciled(coord: &mut Coordinator<BoardHttp>, value: &Value) -> Result<()> {
+fn pickup_reconciled<H: CoordHttp>(coord: &mut Coordinator<H>, value: &Value) -> Result<()> {
     coord.ensure_active()?;
     let refused = value["refused"].as_array();
     let Some(refused) = refused.filter(|rows| !rows.is_empty()) else {
@@ -616,6 +622,11 @@ fn pickup_reconciled(coord: &mut Coordinator<BoardHttp>, value: &Value) -> Resul
     };
     let client = coord.client_agent_id()?;
     for refusal in refused {
+        // This client will never settle a kind it cannot run, so waiting for
+        // one would hold back every later event.
+        if refusal["code"] == "unsupported_work_kind" {
+            continue;
+        }
         let id = refusal["assignment_id"]
             .as_str()
             .filter(|id| prefixed_id(id, "hla_"))
@@ -863,24 +874,29 @@ fn session(
             atomic(&binding.inbox_path(state), &inbox)?;
         }
         inbox = recover_notices(state, binding, &mut http, stop, notify)?;
-    } else if binding.resume_operation.is_some()
-        && inbox.resumed_operation != binding.resume_operation
-    {
-        let (_, rows) = coord.snapshot()?;
-        if is_assignment_default(&mut http, binding)? && !stop.load(Ordering::SeqCst) {
-            let picked = coord.pickup_rows(
-                rows,
-                binding.lane_name.as_deref(),
-                true,
-                binding.default_alias.as_deref(),
-                &mut deliver,
-            )?;
-            pickup_reconciled(&mut coord, &picked)?;
+    } else {
+        let resume = binding.resume_operation.is_some()
+            && inbox.resumed_operation != binding.resume_operation;
+        if resume || inbox.reread_assignments {
+            let (_, rows) = coord.snapshot()?;
+            if is_assignment_default(&mut http, binding)? && !stop.load(Ordering::SeqCst) {
+                let picked = coord.pickup_rows(
+                    rows,
+                    binding.lane_name.as_deref(),
+                    resume,
+                    binding.default_alias.as_deref(),
+                    &mut deliver,
+                )?;
+                pickup_reconciled(&mut coord, &picked)?;
+            }
+            let _lock = inbox_lock(state)?;
+            inbox = load_inbox(state, binding)?;
+            inbox.reread_assignments = false;
+            if resume {
+                inbox.resumed_operation = binding.resume_operation.clone();
+            }
+            atomic(&binding.inbox_path(state), &inbox)?;
         }
-        let _lock = inbox_lock(state)?;
-        inbox = load_inbox(state, binding)?;
-        inbox.resumed_operation = binding.resume_operation.clone();
-        atomic(&binding.inbox_path(state), &inbox)?;
     }
     let mut socket = http.events_socket(inbox.cursor, &binding.runner_id)?;
     let _ = pending.try_send(());
@@ -912,7 +928,7 @@ fn session(
         if event["version"] != VERSION {
             return Err(Error::rejected("hosted event version is invalid"));
         }
-        match event["type"].as_str() {
+        let retain = match event["type"].as_str() {
             Some("ready") => continue,
             Some("error") => {
                 if matches!(
@@ -950,6 +966,7 @@ fn session(
                 {
                     return Err(Error::rejected("assignment event is invalid"));
                 }
+                true
             }
             Some("agent_notified") => {
                 if event["kind"] != "fyi"
@@ -962,9 +979,14 @@ fn session(
                 {
                     return Err(Error::rejected("agent notice event is invalid"));
                 }
+                true
             }
-            _ => return Err(Error::rejected("hosted event type is invalid")),
-        }
+            // A newer board's event: acknowledged so the stream keeps moving,
+            // never kept or acted on. It may be the only signal for a change,
+            // so `record_event` asks for a snapshot on the next session.
+            Some(_) => false,
+            None => return Err(Error::rejected("hosted event type is invalid")),
+        };
         let seq = event["seq"]
             .as_u64()
             .filter(|seq| *seq > 0)
@@ -972,14 +994,7 @@ fn session(
         {
             let _lock = inbox_lock(state)?;
             inbox = load_inbox(state, binding)?;
-            if seq > inbox.cursor {
-                if inbox.entries.len() >= INBOX_LIMIT {
-                    return Err(Error::rejected(
-                        "hosted event inbox is full; observe and clear FYI notices",
-                    ));
-                }
-                inbox.entries.push(event);
-                inbox.cursor = seq; // Recipient sequences are sparse, not contiguous.
+            if record_event(&mut inbox, event, seq, retain)? {
                 atomic(&binding.inbox_path(state), &inbox)?;
             }
         }
@@ -995,6 +1010,28 @@ fn session(
     }
     let _ = socket.close(None);
     Ok(())
+}
+
+/// Apply one validated frame to the inbox. A skipped event still moves the
+/// cursor and needs no inbox room, and it asks the next session to re-read
+/// assignments over HTTPS. It keeps the cursor, so no retained event is dropped
+/// and no notice recovery runs. True when the inbox changed and must be saved.
+fn record_event(inbox: &mut Inbox, event: Value, seq: u64, retain: bool) -> Result<bool> {
+    if seq <= inbox.cursor {
+        return Ok(false);
+    }
+    if retain {
+        if inbox.entries.len() >= INBOX_LIMIT {
+            return Err(Error::rejected(
+                "hosted event inbox is full; observe and clear FYI notices",
+            ));
+        }
+        inbox.entries.push(event);
+    } else {
+        inbox.reread_assignments = true;
+    }
+    inbox.cursor = seq; // Recipient sequences are sparse, not contiguous.
+    Ok(true)
 }
 
 fn process<F: FnMut(&Kickoff) -> Result<Value>>(
@@ -1113,4 +1150,146 @@ fn process<F: FnMut(&Kickoff) -> Result<Value>>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod record_event_tests {
+    use super::*;
+
+    fn inbox(cursor: u64) -> Inbox {
+        Inbox {
+            version: 1,
+            organization_id: "ws_1".into(),
+            endpoint: "https://example.test".into(),
+            subject_id: "usr_1".into(),
+            issuer: "https://issuer.test".into(),
+            cursor,
+            initialized: true,
+            resumed_operation: None,
+            selected_operation: None,
+            recovery_watermark: None,
+            recovery_notice_after: None,
+            entries: Vec::new(),
+            reread_assignments: false,
+        }
+    }
+
+    #[test]
+    fn an_unset_reread_flag_leaves_the_file_readable_by_an_older_client() {
+        let text = serde_json::to_string(&inbox(1)).unwrap();
+        assert!(!text.contains("reread_assignments"), "{text}");
+        assert!(
+            !serde_json::from_str::<Inbox>(&text)
+                .unwrap()
+                .reread_assignments
+        );
+    }
+
+    /// Fails on any call: a refused row must settle without the board.
+    struct NoCalls;
+
+    impl CoordHttp for NoCalls {
+        fn send(&mut self, _: &str, _: &str, _: Option<&Value>) -> Result<Reply> {
+            panic!("a non-dev row reached the board");
+        }
+    }
+
+    #[test]
+    fn a_non_dev_row_settles_through_pickup_and_holds_nothing_back() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let mut coord = Coordinator::open(
+            NoCalls,
+            "ws_1".into(),
+            dir.path().into(),
+            Some("usr_1".into()),
+            Some("https://issuer.test".into()),
+            String::new(),
+        )
+        .ok()
+        .unwrap();
+        let stored = repo.path().display().to_string();
+        coord
+            .with_ledger(|ledger| {
+                ledger.repo = Some(stored.clone());
+                Ok(())
+            })
+            .unwrap();
+        let row = parse_assignment(&json!({
+            "version": super::super::VERSION,
+            "assignment_id": "hla_00000000-0000-4000-8000-000000000001",
+            "organization_id": "ws_1",
+            "issue_id": "CAD-1",
+            "action": "start",
+            "execution": "local",
+            "state": "queued",
+            "generation": 1,
+            "claim_id": null,
+            "target": "usr_1",
+            "created_by_subject_id": "usr_2",
+            "client_agent_id": null,
+            "guidance": null,
+            "reported_head_sha": null,
+            "text": null,
+            "kind": "review",
+        }))
+        .ok()
+        .unwrap();
+        let mut deliver = |_: &Kickoff| -> Result<Value> { panic!("work was delivered") };
+        let picked = coord
+            .pickup_rows(vec![row], None, false, Some("worker"), &mut deliver)
+            .ok()
+            .unwrap();
+        assert_eq!(picked["refused"][0]["code"], "unsupported_work_kind");
+        assert!(pickup_reconciled(&mut coord, &picked).is_ok());
+    }
+
+    #[test]
+    fn a_skipped_event_moves_the_cursor_and_keeps_nothing() {
+        let mut inbox = inbox(4);
+        assert!(record_event(&mut inbox, json!({"type": "new"}), 9, false).unwrap());
+        assert_eq!(inbox.cursor, 9);
+        assert!(inbox.entries.is_empty());
+        assert!(inbox.reread_assignments, "a skip must force a re-read");
+        assert!(inbox.initialized, "a skip must not run notice recovery");
+    }
+
+    #[test]
+    fn a_skipped_event_needs_no_inbox_room() {
+        let mut inbox = inbox(4);
+        inbox.entries = vec![json!({}); INBOX_LIMIT];
+        assert!(record_event(&mut inbox, json!({"type": "new"}), 5, false).unwrap());
+        assert_eq!(inbox.cursor, 5);
+        assert_eq!(inbox.entries.len(), INBOX_LIMIT);
+    }
+
+    #[test]
+    fn a_retained_event_is_kept_and_still_refused_when_full() {
+        let mut roomy = inbox(4);
+        assert!(record_event(&mut roomy, json!({"type": "x"}), 5, true).unwrap());
+        assert_eq!(roomy.entries.len(), 1);
+        assert!(!roomy.reread_assignments, "a known event needs no re-read");
+        let mut full = inbox(4);
+        full.entries = vec![json!({}); INBOX_LIMIT];
+        assert!(record_event(&mut full, json!({"type": "x"}), 5, true).is_err());
+        assert_eq!(full.cursor, 4);
+    }
+
+    #[test]
+    fn a_replayed_event_changes_nothing() {
+        let mut inbox = inbox(9);
+        assert!(!record_event(&mut inbox, json!({"type": "x"}), 9, true).unwrap());
+        assert!(inbox.entries.is_empty());
+    }
 }

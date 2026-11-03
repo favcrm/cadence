@@ -1,5 +1,5 @@
 import { useContext, useEffect, useState } from "react";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { useWriteBlock, WriteGate } from "../auth/WriteGate";
@@ -103,6 +103,7 @@ export default function AgentPage({
   const t = useTranslate();
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [notServed, setNotServed] = useState(false);
   const [retry, setRetry] = useState(0);
 
   const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
@@ -116,11 +117,18 @@ export default function AgentPage({
     // A reload after a save keeps what is on screen; only a new alias resets.
     if (retry === 0) setDetail(null);
     setErr(null);
+    setNotServed(false);
     let live = true;
     api
       .agent(alias)
       .then((d) => live && setDetail(d))
-      .catch((e) => live && setErr(String(e.message ?? e)));
+      .catch((e) => {
+        if (!live) return;
+        // The board's own "not implemented" is permanent, not a failed read to
+        // retry. Another 501, such as an outdated daemon, is an ordinary failure.
+        if (e instanceof ApiError && e.status === 501 && e.code === "not_implemented") setNotServed(true);
+        else setErr(String(e.message ?? e));
+      });
     return () => {
       live = false;
     };
@@ -196,6 +204,7 @@ export default function AgentPage({
           ["Hired", hiredText(figures?.hired_at)],
         ];
 
+  const unread = err !== null || (notServed && observed === undefined);
   const ctx: TabContext = {
     alias,
     profile,
@@ -210,7 +219,10 @@ export default function AgentPage({
     onOpenIssue,
     onTab,
     onSaved: () => setRetry((n) => n + 1),
-    detailFailed: err !== null,
+    // Without a roster row nothing is known about the agent, so this reads as
+    // the failure it is: the board's "not recorded" is only about a known agent.
+    detailFailed: unread,
+    detailNotServed: notServed && observed !== undefined,
   };
 
   const cloudCards = (
@@ -268,15 +280,22 @@ export default function AgentPage({
 
   const notices = (
     <>
-      {!detail && !err && (
+      {!detail && !err && !notServed && (
         <p role="status" className="text-label text-ink-500 mb-3">
           {t("Loading agent details…")}
         </p>
       )}
-      {err && (
+      {unread && (
         <p role="status" className="text-label text-ink-500 mb-3">
           {t("Some details aren’t available on this board.")}{" "}
-          <button type="button" className="lnk" onClick={() => setRetry((r) => r + 1)}>
+          <button
+            type="button"
+            className="lnk"
+            onClick={() => {
+              setRetry((r) => r + 1);
+              if (!observed) onRetryRoster();
+            }}
+          >
             {t("Retry")}
           </button>
         </p>
@@ -353,7 +372,7 @@ export default function AgentPage({
                 title: t("This is a mailbox, not an agent"),
                 body: t("Mail waits here until an agent reads it."),
               }
-            : !profile && err !== null
+            : !profile && (err !== null || notServed)
               ? {
                   title: t("No agent named {alias}").replace("{alias}", () => alias),
                   body: t("It may have been removed. Pick another agent from the list."),
@@ -373,7 +392,11 @@ export default function AgentPage({
         block={writeBlock}
         onBack={onBack}
         onOpenIssue={onOpenIssue}
-        notices={hired ? null : notices}
+        // With nothing known about the agent, the gate is already the one answer
+        // for an unread roster or a board that keeps no details. A known agent
+        // keeps its recovery banners, and a failed read for an unlisted agent
+        // keeps its Retry: a successful read is what would bring the page back.
+        notices={hired || (!profile && (!rosterLoaded || notServed)) ? null : notices}
         heading={
           <>
             <AgentAvatar
@@ -444,7 +467,7 @@ export default function AgentPage({
           <div className="ap-sub">
             <span>
               {categoryText ??
-                `${a?.role ?? observed?.role ?? t("Agent")} · ${a?.provider ?? observed?.provider ?? t("Loading provider")}${profile ? ` / ${profile.endpoint_kind}` : ""}`}
+                `${a?.role ?? observed?.role ?? t("Agent")} · ${a?.provider ?? observed?.provider ?? (unread || notServed ? t("Provider not reported") : t("Loading provider"))}${profile ? ` / ${profile.endpoint_kind}` : ""}`}
             </span>
             {badge && (
               <>

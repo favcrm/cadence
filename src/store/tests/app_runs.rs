@@ -2028,7 +2028,9 @@ fn cad2042_interrupted_backfill_resumes_and_converges() {
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert!(
-        indexes.iter().any(|name| name == "app_capability_results_source"),
+        indexes
+            .iter()
+            .any(|name| name == "app_capability_results_source"),
         "the page index is recreated: {indexes:?}"
     );
 }

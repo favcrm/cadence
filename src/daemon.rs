@@ -1077,11 +1077,10 @@ impl Shared {
         // the same lease/fence the write path holds; resolved before the
         // `Arc` so `lease` can move into the struct.
         let wiki_pm_dir = pm_dir_of(&opts.provider_env)?;
-        let upload_workspace_dir = crate::home::workspace_for_instance(
-            &wiki_pm_dir,
-            opts.provider_env.var("CADENCE_HOME").as_deref(),
-            opts.provider_env.var("HOME").as_deref(),
-        )?;
+        // A sandbox daemon is its own home; a stale sandbox profile is
+        // refused here rather than binding the host's workspace.
+        let upload_workspace_dir =
+            crate::home::workspace_for_provider_env(&wiki_pm_dir, &opts.provider_env)?;
         crate::home::validate_workspace_isolated(
             &upload_workspace_dir,
             state_dir,

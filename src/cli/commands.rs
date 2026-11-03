@@ -179,21 +179,55 @@ pub(crate) enum Commands {
     /// tracker, skill, daemon, board — and report provider CLIs (version
     /// and sign-in), the master agent (CAD-339) and the operator login
     /// (CAD-313). Anything already present is reported `ok` and left
-    /// untouched. Exit 1 when any check failed.
+    /// untouched. Exit 1 when any check failed, and when a requested
+    /// browser approval did not complete.
+    ///
+    /// On a real first run it first asks where the work lives — from a
+    /// terminal or a pipe: Enter signs in to hosted AgenticOS, `1` stays
+    /// on this machine, `2` creates a hosted workspace — at most one
+    /// browser approval, never a second device grant. That one approval
+    /// also requests the optional owner-only `billing.read` (never
+    /// `billing.cancel`); declining it, or a member who cannot consent it,
+    /// still completes the sign-in with the narrowed grant. A verified
+    /// hosted sign-in shows the server-authored plan, price, trial and
+    /// Checkout state; this terminal never opens a Checkout, cancels one
+    /// or takes a card, and the paid action stays an explicit browser
+    /// action. A hosted run, and a run whose approval did not complete,
+    /// reports the daemon and board without starting either. The run ends
+    /// with four facts — scope, sign-in, plan and board URL — and exactly
+    /// one next command.
     Setup {
         /// One JSON object per check, one per line:
         /// `{check, status, detail, fix}`; status is ok, created,
-        /// missing, failed or unknown; fix is a copy-paste command.
+        /// missing, failed or unknown; fix is a copy-paste command. The
+        /// last line is the `scope` record, which also carries the
+        /// `handover` facts. Never prompts, never signs in and never
+        /// calls the billing API; `--hosted`/`--register` are refused
+        /// with it.
         #[arg(long)]
         json: bool,
         /// Board port [default: the persisted `ui.json` port, else 3010].
         #[arg(long)]
         port: Option<u16>,
-        /// Do not open a browser. Setup never opens one yet — it prints
-        /// the board URL; accepted so `install.sh` and INSTALL-AGENT can
-        /// pass it today.
+        /// Do not open a browser: a hosted sign-in prints its URL and
+        /// code instead.
         #[arg(long)]
         no_open: bool,
+        /// Stay on this machine: no hosted sign-in, no browser and no
+        /// checkout. Also the answer for a pipe that sends no line, and
+        /// the one value that never waits on stdin.
+        #[arg(long, conflicts_with_all = ["hosted", "register"])]
+        local: bool,
+        /// Sign in to an existing hosted workspace with one browser
+        /// approval — the same device grant as `cadence login`. A hosted
+        /// run starts no local daemon or board. Refused with `--json`.
+        #[arg(long, conflicts_with_all = ["register", "json"])]
+        hosted: bool,
+        /// Create a hosted workspace in the browser, then approve this
+        /// CLI with the same single device grant as `cadence register`.
+        /// Refused with `--json`.
+        #[arg(long, conflicts_with = "json")]
+        register: bool,
     },
     /// Manage the persistent controller.
     Daemon {

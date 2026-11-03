@@ -11,13 +11,13 @@ mod agents;
 mod issues;
 mod providers;
 
-fn show_login_code(url: &str, code: &str, no_open: bool) -> Result<()> {
+pub(super) fn show_login_code(url: &str, code: &str, no_open: bool) -> Result<()> {
     eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
     open_login_url(url, no_open);
     Ok(())
 }
 
-fn show_register_code(url: &str, code: &str, no_open: bool) -> Result<()> {
+pub(super) fn show_register_code(url: &str, code: &str, no_open: bool) -> Result<()> {
     eprintln!("Complete registration and approve this CLI at: {url}\nDevice code: {code}");
     open_login_url(url, no_open);
     Ok(())
@@ -211,6 +211,10 @@ fn tracker_pin() -> Result<Option<PathBuf>> {
 }
 
 pub(super) fn run_cli(cli: Cli) -> Result<i32> {
+    // CAD-1922: the home resolver treats `--state-dir` at a legacy root as
+    // the same evidence as an exported `CADENCE_STATE_DIR`; record it before
+    // anything resolves a path.
+    cadence_agent::home::note_state_dir_flag(cli.state_dir.as_deref());
     // Offline syntax discovery: no org, state, tracker, login, or daemon.
     if matches!(
         cli.command,
@@ -694,6 +698,12 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         org::resolve_update(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     } else if matches!(cli.command, Commands::Dev { .. }) {
         org::resolve_dev(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
+    } else if matches!(cli.command, Commands::Setup { .. }) {
+        // CAD-1922: `setup` installs on this machine. The local-maintenance
+        // selector keeps a saved local connection's state/tracker pair,
+        // never routes a saved remote default over the allowlist, and
+        // refuses a remote `--org`/`CADENCE_ORG` instead of ignoring it.
+        org::resolve_setup(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     } else {
         org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     };

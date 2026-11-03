@@ -6,6 +6,8 @@ mod app_unknown_fence_privacy;
 mod auto_stop_timer;
 mod cad1210_pm_dir_guard;
 #[cfg(feature = "test-seam")]
+mod cad1922_daemon_workspace_refusal;
+#[cfg(feature = "test-seam")]
 mod cad1989_group_root_profile_read;
 #[cfg(feature = "test-seam")]
 mod cad1989_profile_context_refusal;
