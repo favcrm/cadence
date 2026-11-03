@@ -131,7 +131,6 @@ const ADVANCED: &[&str] = &[
     "report",
     "resume",
     "schema",
-
     "stop",
     "template",
     "test",
