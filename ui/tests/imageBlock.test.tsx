@@ -73,7 +73,7 @@ const JOB = "med_7b693b44d928437491a2c13e549f6e0b";
 const SIZE = 2202009; // 2.1 MB
 const host = {
   job: { state: "running" } as Record<string, unknown>,
-  jobMode: "ok" as "ok" | "network" | "malformed" | "missing",
+  jobMode: "ok" as "ok" | "network" | "malformed" | "missing" | "unavailable" | "other",
   bytesMode: "ok" as "ok" | "fail",
   html: false,
   statusReads: 0,
@@ -88,6 +88,8 @@ globalThis.fetch = (async (input: unknown) => {
     equal(url.searchParams.get("conversation"), "c1", "the status read names the conversation in view");
     if (host.jobMode === "network") throw new TypeError("network down");
     if (host.jobMode === "missing") return new Response("{}", { status: 404 });
+    if (host.jobMode === "unavailable") return new Response(JSON.stringify({ error: "capability_unavailable" }), { status: 503 });
+    if (host.jobMode === "other") return new Response("{}", { status: 500 });
     if (host.jobMode === "malformed") return new Response("<html>oops</html>", { status: 200 });
     return new Response(JSON.stringify(host.job), { status: 200, headers: { "Content-Type": "application/json" } });
   }
@@ -264,7 +266,7 @@ reset();
 }
 
 // ===== unreadable answers never become a result =====
-for (const mode of ["network", "malformed"] as const) {
+for (const mode of ["network", "malformed", "unavailable", "other"] as const) {
   reset();
   host.jobMode = mode;
   const m = await mount(React.createElement(ImageBlock, { entry: entry() }));

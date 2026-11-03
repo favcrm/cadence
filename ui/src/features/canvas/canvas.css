@@ -135,7 +135,7 @@
 .imgblock[data-shape="9:16"] .imgbox { aspect-ratio: 9 / 16; }
 .imgblock[data-shape="2:3"] .imgbox { aspect-ratio: 2 / 3; }
 /* Failed and unclear are short cards, not a picture's worth of empty box. */
-.imgbox[data-compact] { aspect-ratio: auto; }
+.imgblock .imgbox[data-compact] { aspect-ratio: auto; }
 .imgopen { position: absolute; inset: 0; display: block; width: 100%; height: 100%; padding: 0; border: 0; background: none; cursor: zoom-in; }
 .imgopen:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
 .imgopen img { display: block; width: 100%; height: 100%; object-fit: contain; animation: img-in 0.22s ease-out; }
@@ -183,8 +183,8 @@
 
 /* The same picture in the canvas: contained, never cropped. */
 .canvas-doc[data-artifact-view="image"] { display: flex; flex: 1; align-items: center; justify-content: center; min-height: 0; }
-.imgshot { position: relative; display: flex; max-width: 100%; max-height: 100%; overflow: hidden; border-radius: 8px; }
-.imgshot .canvas-image { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; }
+.imgshot { position: relative; display: block; max-width: 100%; overflow: hidden; border-radius: 8px; }
+.imgshot .canvas-image { display: block; max-width: 100%; max-height: calc(100dvh - 9rem); width: auto; height: auto; object-fit: contain; }
 
 @media (prefers-reduced-motion: reduce) {
   .imgwait, .imgdots i, .imgopen img { animation: none; }
