@@ -3241,25 +3241,6 @@ pub(crate) fn call_bounded(
     )
 }
 
-/// CAD-1568 revision: a `message_send` 2xx is a usable receipt only when it
-/// carries the complete correlated enqueue binding:
-///
-/// - `message` — the caller-chosen stable id echoed exactly (the
-///   reconciliation key a lost reply is retried under);
-/// - `state` — a known lifecycle state and `duplicate` — a real bool;
-/// - `alias` — the requested canonical recipient echoed exactly (only
-///   `master` is ever requested);
-/// - `workspace_id` — the immutable organization id for this destination
-///   (the `org_id` pinned at login, never the registry slug);
-/// - `sender_subject` — the authenticated human's canonical subject; when
-///   the saved login recorded one it must be exactly that subject;
-/// - `sender` — the retained `cli-<handle>` display attribution, nonempty;
-/// - `conversation` — the persisted message_conversation Home thread id
-///   the enqueue fixed, nonempty (returned again on duplicates/readback).
-///
-/// Anything less cannot establish that THIS send landed as THIS caller's
-/// message in the target workspace — the outcome is unknown and is
-/// reconciled by the stable id, never called a success or replayed.
 /// Whether a ticket message write's 2xx names the write that was asked for.
 /// The ticket id can come back in its stored case.
 fn ticket_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String, Value>) -> bool {
@@ -3281,6 +3262,25 @@ fn ticket_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String
         }
 }
 
+/// CAD-1568 revision: a `message_send` 2xx is a usable receipt only when it
+/// carries the complete correlated enqueue binding:
+///
+/// - `message` — the caller-chosen stable id echoed exactly (the
+///   reconciliation key a lost reply is retried under);
+/// - `state` — a known lifecycle state and `duplicate` — a real bool;
+/// - `alias` — the requested canonical recipient echoed exactly (only
+///   `master` is ever requested);
+/// - `workspace_id` — the immutable organization id for this destination
+///   (the `org_id` pinned at login, never the registry slug);
+/// - `sender_subject` — the authenticated human's canonical subject; when
+///   the saved login recorded one it must be exactly that subject;
+/// - `sender` — the retained `cli-<handle>` display attribution, nonempty;
+/// - `conversation` — the persisted message_conversation Home thread id
+///   the enqueue fixed, nonempty (returned again on duplicates/readback).
+///
+/// Anything less cannot establish that THIS send landed as THIS caller's
+/// message in the target workspace — the outcome is unknown and is
+/// reconciled by the stable id, never called a success or replayed.
 fn send_receipt_correlates(
     receipt: &Value,
     arguments: &Map<String, Value>,
