@@ -81,10 +81,19 @@ export default function ProjectSettings({
     setBusy(true);
     setError(null);
     try {
-      await api.setProjectPolicy(project, {
+      const wrote = await api.setProjectPolicy(project, {
         visibility: draft.visibility.replace("_", "-") as "workspace-visible" | "private",
         members: draft.members,
       });
+      // The response carries the record the server committed: apply it before
+      // clearing the draft, so the page never falls back to the pre-save
+      // baseline while the refresh is in flight (or forever, if it fails).
+      resource.write((prev) => ({
+        project,
+        recorded: true,
+        policy: wrote.policy,
+        private_available: prev?.private_available ?? true,
+      }));
       setEdits(null);
       onToast(t("Project policy saved."));
       void resource.refresh();

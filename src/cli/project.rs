@@ -48,8 +48,12 @@ pub(crate) enum ProjectCmd {
         /// Access policy recorded in the project's first commit. Private is
         /// refused until the isolation gate passes; workspace-visible is the
         /// default and the only visibility this build records.
-        #[arg(long, value_enum, default_value = "workspace-visible")]
-        visibility: PolicyVisibility,
+        ///
+        /// No clap default: a hosted create records no policy at all, so
+        /// naming the flag there must refuse rather than look like an
+        /// omission — including `--visibility workspace-visible`.
+        #[arg(long, value_enum)]
+        visibility: Option<PolicyVisibility>,
         /// Grant a caller access to a private project
         /// (`users/<handle>` or `operator`); repeatable. Because the policy is
         /// written once at creation, grants cannot be added later by
@@ -109,7 +113,9 @@ pub(super) fn run_project(state_dir: &Path, action: ProjectCmd) -> Result<i32> {
                 "project_new",
                 json!({"key": key, "repo": repo, "prefix": prefix, "goal": goal,
                        "agents": agents, "issue": issue,
-                       "visibility": visibility.wire(), "grants": grants}),
+                       "visibility": visibility
+                           .unwrap_or(PolicyVisibility::WorkspaceVisible).wire(),
+                       "grants": grants}),
             )?);
             Ok(0)
         }

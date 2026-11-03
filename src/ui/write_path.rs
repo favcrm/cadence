@@ -441,7 +441,11 @@ pub(crate) fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Val
 /// diverge. The body is `{visibility, members}` in the recorded spelling;
 /// `members` is the full grant list and replaces what was there, exactly
 /// like `issue project policy --grant`.
-fn project_policy_write(request: &mut Request, pm_dir: &Path, key: &str) -> HttpResp {
+///
+/// `actor` is the admitted caller's own spelling: the tracker trailer names
+/// whoever pressed Save, and a named owner's write must not be attributed to
+/// the shared `operator` identity.
+fn project_policy_write(request: &mut Request, pm_dir: &Path, key: &str, actor: &str) -> HttpResp {
     #[derive(Deserialize)]
     struct PolicyReq {
         visibility: String,
@@ -465,7 +469,7 @@ fn project_policy_write(request: &mut Request, pm_dir: &Path, key: &str) -> Http
         Ok(pm) => pm,
         Err(e) => return err_response(503, &e.to_string()),
     };
-    match issue_write::set_project_policy(&pm, key, visibility, &req.members, "operator") {
+    match issue_write::set_project_policy(&pm, key, visibility, &req.members, actor) {
         Ok(out) => json_response(out),
         // A key with no project answers like an absent one, the same way the
         // read arms do.
@@ -1267,9 +1271,15 @@ pub(crate) fn write_route(
             // CAD-1950: the one writer for a project's access policy — the
             // same `set_project_policy` the CLI calls, so version bumping,
             // grant validation and the commit cannot diverge.
-            RouteId::ProjectPolicy => {
-                project_policy_write(&mut request, pm_dir, bound.get("key").unwrap_or_default())
-            }
+            RouteId::ProjectPolicy => match caller.as_ref() {
+                Some(caller) => project_policy_write(
+                    &mut request,
+                    pm_dir,
+                    bound.get("key").unwrap_or_default(),
+                    caller.actor(),
+                ),
+                None => err_response(500, "unadmitted write"),
+            },
             RouteId::CatalogInstall => explorer_write(
                 &mut request,
                 state_dir,
