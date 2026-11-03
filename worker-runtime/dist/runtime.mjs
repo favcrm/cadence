@@ -56696,6 +56696,10 @@ function toolCallText(name, args) {
 function createdAt(timestamp) {
   return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0 ? { created: new Date(timestamp).toISOString() } : {};
 }
+function projectedThreadEntries(records, includeThinking, project) {
+  const entries = threadEntries(records, includeThinking);
+  return project ? [...project(entries)] : entries;
+}
 function threadEntries(records, includeThinking) {
   const entries = [];
   const all = records.flatMap((record) => record.model ?? []);
@@ -56862,13 +56866,26 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
         }, { status: 503 });
       }
       const stream = await this.harness.session().events();
+      let snapshotEntries;
+      try {
+        snapshotEntries = projectedThreadEntries(stream.snapshot.entries, thinking, this.options.projectThread);
+      } catch {
+        await stream.stop();
+        return Response.json({
+          ok: false,
+          error: {
+            code: "capability_unavailable",
+            message: "The thread projection is unavailable."
+          }
+        }, { status: 503 });
+      }
       return sessionEventResponse(stream, {
         snapshot: (send) => {
           send(`: connected
 
 `);
           send(masterFrame);
-          for (const entry of threadEntries(stream.snapshot.entries, thinking))
+          for (const entry of snapshotEntries)
             emit(entry, send);
         },
         events: async (_events, send) => {
@@ -56908,7 +56925,7 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
     };
   }
   async transcript(includeThinking) {
-    return threadEntries(await this.harness.session().messages(), includeThinking);
+    return projectedThreadEntries(await this.harness.session().messages(), includeThinking, this.options.projectThread);
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;
