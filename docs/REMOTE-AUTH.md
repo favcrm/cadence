@@ -459,6 +459,10 @@ nothing. `--if-rev` is also accepted locally, where it uses the same
 under-lock check; without it, local `issue set` keeps its existing
 unconditional behavior.
 
+For `issue new`, a success receipt must name the requested project and title.
+The tenant trims those inputs; the native route preserves the title. Both
+receipt forms are accepted, but a foreign project or title remains unknown.
+
 A wake retry is the only automatic retry — it fires only on the
 pre-forward `waking` verdict. A timeout, dropped connection, unusable
 success response or unproven error after forward leaves the mutation

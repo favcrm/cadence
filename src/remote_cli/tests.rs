@@ -5295,3 +5295,147 @@ fn cad2009_artifact_upload_unproven_worker_states_are_unknown_without_replay() {
         );
     }
 }
+
+// Independently authored CAD-2009 acceptance by the fresh-session Standards
+// reviewer. Append to src/remote_cli/tests.rs; reuse its existing strict
+// loopback HTTP `run` helper, not the private receipt predicate.
+// Producer evidence: AgenticOS apps/api/src/tenant-board/cli.ts:
+// requiredText (396-403), PROJECT_KEY (66), and issue_new (614-641).
+// The producer trims project input but does not lowercase it.
+// Formatting-only changes to this independently authored test are authorized;
+// changing its cases, expectations, seam, or assertions is not authorized.
+#[test]
+fn cad2009_issue_create_accepts_trimmed_project_but_not_a_foreign_project() {
+    for sent_project in [" synthetic ", "\u{feff}synthetic\u{feff}"] {
+        for (received_project, confirmed) in [("synthetic", true), ("foreign", false)] {
+            let args = json!({"project": sent_project, "title": "Synthetic receipt acceptance"});
+            let receipt = json!({
+                "issue": {"id": "SYN-1"},
+                "card": {
+                    "id": "SYN-1",
+                    "project": received_project,
+                    "title": "Synthetic receipt acceptance"
+                },
+                "warnings": []
+            });
+            let (result, requests) = run(
+                vec![(200, "", receipt.clone())],
+                "issue_new",
+                args.as_object().unwrap().clone(),
+                10,
+            );
+            // Both branches use the real authorize/call transport and the
+            // original credential-bound fixture; neither may bypass auth or
+            // replay a mutation after receiving its synthetic server answer.
+            assert_eq!(hits(&requests, "/__platform/cli/authorize"), 1);
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+            let authorize = requests
+                .iter()
+                .find(|request| request["path"] == "/__platform/cli/authorize")
+                .unwrap();
+            assert_eq!(authorize["body"]["organization_id"], ORG_ID);
+            assert!(authorize["body"]["requested_scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|scope| scope == "cli.write"));
+            if confirmed {
+                assert_eq!(
+                    result.unwrap(),
+                    receipt,
+                    "the producer-normalized project must confirm this create: {sent_project:?}"
+                );
+            } else {
+                let error = result.expect_err("a foreign project cannot confirm this create");
+                assert_eq!(error.kind(), "unknown", "{error}");
+                assert!(error.to_string().contains("issue ls"), "{error}");
+            }
+        }
+    }
+}
+
+// JS String.trim removes U+FEFF but not U+0085. The native IssueNew path
+// passes req.title to issue_write::new_issue (src/ui/cli_route.rs:704-719),
+// then Front::new stores title.to_string() (src/issue/model.rs:154-157).
+// Preserve that exact-title receipt too; do not impose tenant-only title
+// normalization on the native producer. These are synthetic native-shaped
+// replies at the HTTP client seam, not an execution of the native route.
+#[test]
+fn cad2009_issue_create_correlates_producer_title_without_overtrimming() {
+    for (case, sent_project, sent_title, received_title, confirmed) in [
+        (
+            "tenant trims BOM title",
+            "synthetic",
+            "\u{feff}Synthetic receipt acceptance\u{feff}",
+            "Synthetic receipt acceptance",
+            true,
+        ),
+        (
+            "NEL project cannot correlate with a trimmed project",
+            "\u{0085}synthetic\u{0085}",
+            "Synthetic receipt acceptance",
+            "Synthetic receipt acceptance",
+            false,
+        ),
+        (
+            "NEL title cannot correlate with a trimmed title",
+            "synthetic",
+            "\u{0085}Synthetic receipt acceptance\u{0085}",
+            "Synthetic receipt acceptance",
+            false,
+        ),
+        (
+            "native preserves exact BOM title",
+            "synthetic",
+            "\u{feff}Synthetic receipt acceptance\u{feff}",
+            "\u{feff}Synthetic receipt acceptance\u{feff}",
+            true,
+        ),
+        (
+            "native and tenant preserve exact NEL title",
+            "synthetic",
+            "\u{0085}Synthetic receipt acceptance\u{0085}",
+            "\u{0085}Synthetic receipt acceptance\u{0085}",
+            true,
+        ),
+    ] {
+        let args = json!({"project": sent_project, "title": sent_title});
+        let receipt = json!({
+            "issue": {"id": "SYN-1"},
+            "card": {
+                "id": "SYN-1",
+                "project": "synthetic",
+                "title": received_title
+            },
+            "warnings": []
+        });
+        let (result, requests) = run(
+            vec![(200, "", receipt.clone())],
+            "issue_new",
+            args.as_object().unwrap().clone(),
+            10,
+        );
+        assert_eq!(hits(&requests, "/__platform/cli/authorize"), 1, "{case}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{case}");
+        let authorize = requests
+            .iter()
+            .find(|request| request["path"] == "/__platform/cli/authorize")
+            .unwrap();
+        assert_eq!(authorize["body"]["organization_id"], ORG_ID, "{case}");
+        assert!(
+            authorize["body"]["requested_scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|scope| scope == "cli.write"),
+            "{case}"
+        );
+        if confirmed {
+            assert_eq!(result.unwrap(), receipt, "{case}");
+        } else {
+            let error = result.expect_err(case);
+            assert_eq!(error.kind(), "unknown", "{case}: {error}");
+            assert!(error.to_string().contains("issue ls"), "{case}: {error}");
+        }
+    }
+}

@@ -536,6 +536,27 @@ fn is_object_body(body: Option<&Value>) -> bool {
     body.is_some_and(Value::is_object)
 }
 
+/// The tenant's `requiredText` uses ECMAScript `String.trim`, whose whitespace
+/// differs from Rust's (notably U+FEFF is trimmed, while U+0085 is not).
+fn trim_tenant_text(value: &str) -> &str {
+    value.trim_matches(|c| {
+        matches!(
+            c,
+            '\u{0009}'..='\u{000d}'
+                | '\u{0020}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+        )
+    })
+}
+
 /// The issue-write receipt, correlated by the issue it names. The two surfaces
 /// answer two proven variants:
 ///
@@ -561,23 +582,25 @@ fn issue_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, V
     }
     match verb {
         // The server allocates the id, so a create is bound by the project and
-        // title that were sent (both contracts trim the title) and by a card
-        // that names the same ticket.
+        // title. The tenant trims both; the native route preserves the title.
         "issue_new" => {
-            let sent_title = arguments
-                .get("title")
+            let project = arguments
+                .get("project")
                 .and_then(Value::as_str)
-                .map(str::trim);
-            let title = reply
-                .pointer("/card/title")
-                .and_then(Value::as_str)
-                .map(str::trim);
+                .map(trim_tenant_text)
+                .filter(|project| !project.is_empty());
+            let sent_title = arguments.get("title").and_then(Value::as_str);
+            let title = reply.pointer("/card/title").and_then(Value::as_str);
             object("card")
                 && card_id == issue_id
-                && reply.pointer("/card/project").and_then(Value::as_str)
-                    == arguments.get("project").and_then(Value::as_str)
-                && sent_title.is_some()
-                && title == sent_title
+                && reply
+                    .pointer("/card/project")
+                    .and_then(Value::as_str)
+                    .zip(project)
+                    .is_some_and(|(got, want)| got == want)
+                && sent_title
+                    .zip(title)
+                    .is_some_and(|(sent, got)| got == sent || got == trim_tenant_text(sent))
         }
         // Either variant must name the ticket the comment was sent to.
         "issue_comment" => {
