@@ -1501,6 +1501,8 @@ Object.assign(zhTW, {
   // The worker-transcript turn: one head, one folded trace, the answer surface.
   "Reasoning": "思考",
   "Finished": "已完成",
+  "not available": "無法使用",
+  "This command isn't available in this workspace. `/help` lists what is.": "此工作區無法使用這個指令。`/help` 會列出可用的指令。",
   "Thought for": "思考了",
   "Thinking…": "思考中…",
   "Worker note": "工作紀錄",

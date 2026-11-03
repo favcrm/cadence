@@ -69,10 +69,13 @@ export default function MasterChips({
   master,
   row,
   readOnly,
+  canPickModel = true,
 }: {
   master: MasterState | null | undefined;
   row?: Agent;
   readOnly: boolean;
+  /** False when this board has no model list to pick from: a plain read-out. */
+  canPickModel?: boolean;
 }) {
   const t = useTranslate();
   // The id, for the tooltip and the catalogue; a hosted board's label is the id too.
@@ -93,11 +96,11 @@ export default function MasterChips({
   // the raw id rather than raising an error nobody asked to see.
   const [catalogue, setCatalogue] = useState<MasterModelsView | null>(null);
   useEffect(() => {
-    if (!model) return;
+    if (!model || !canPickModel) return;
     let current = true;
     api.masterModels().then((m) => { if (current) setCatalogue(masterModelsOptions(m)); }).catch(() => undefined);
     return () => { current = false; };
-  }, [model]);
+  }, [model, canPickModel]);
   const modelLabel = (view ?? catalogue)?.models.find((m) => m.id === modelId)?.label ?? model;
 
   // The picker's read: fetched on each open so the list never serves a
@@ -163,16 +166,20 @@ export default function MasterChips({
             type="button"
             key={`m:${model}`}
             className="chip chip-sans chip-in bg-ink-800 text-ink-300 chip-btn"
-            title={`${modelId ?? model} — ${
-              live ? t("Reported by the live provider session — pick a model") : t("Configured model — pick a model")
-            }`}
+            title={
+              canPickModel
+                ? `${modelId ?? model} — ${
+                    live ? t("Reported by the live provider session — pick a model") : t("Configured model — pick a model")
+                  }`
+                : modelId ?? model
+            }
             aria-expanded={open === "model"}
-            disabled={disabled}
+            disabled={disabled || !canPickModel}
             onClick={() => toggle("model")}
           >
             {live && <span className="livedot" aria-hidden />}
             {pending?.kind === "model" ? `${pending.id}…` : modelLabel}
-            <span aria-hidden> ▾</span>
+            {canPickModel && <span aria-hidden> ▾</span>}
           </button>
           {open === "model" && (
             <ChipMenu label={t("pick a model")} onClose={() => setOpen(null)}>

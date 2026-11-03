@@ -81,6 +81,18 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "stop", blurb: "Interrupt the running turn", kind: "act" },
 ];
 
+/** The verbs a board can run. A hosted board says so itself in `commands`:
+ *  nothing is offered there that would only fail, and `help` always is. Any
+ *  other board keeps the full list, because its `commands` is the provider's
+ *  partial list, not what the daemon accepts. */
+export function offeredCommands(
+  hosted: boolean | null | undefined,
+  advertised: readonly string[] | null | undefined,
+): SlashCommand[] {
+  if (hosted !== true) return SLASH_COMMANDS;
+  return SLASH_COMMANDS.filter((c) => c.name === "help" || (advertised ?? []).includes(c.name));
+}
+
 /** `/name` or `/name arg…` — null when the draft is not a command. */
 export function parseSlash(draft: string): { name: string; arg: string } | null {
   if (!draft.startsWith("/")) return null;
@@ -92,8 +104,8 @@ export function parseSlash(draft: string): { name: string; arg: string } | null 
 }
 
 /** Verbs whose name starts with `prefix` — the autocomplete rows. */
-export function slashMatches(prefix: string): SlashCommand[] {
-  return SLASH_COMMANDS.filter((c) => c.name.startsWith(prefix));
+export function slashMatches(prefix: string, commands: readonly SlashCommand[] = SLASH_COMMANDS): SlashCommand[] {
+  return commands.filter((c) => c.name.startsWith(prefix));
 }
 
 // ---- Command results as fields (CAD-551 r2) ----

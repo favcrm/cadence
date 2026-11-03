@@ -1,5 +1,6 @@
 import type { ThreadRef } from "../../lib/types";
 import SharedComposer from "../app-shell/chat/Composer";
+import type { SlashCommand } from "./master";
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { sendToMaster } from "./send";
 import { newMessageId } from "./thread";
@@ -21,6 +22,7 @@ export default function Composer({
   block,
   seed,
   onCommand,
+  commands,
   onSent,
   attachEnabled = true,
   attachDestination,
@@ -30,6 +32,7 @@ export default function Composer({
   block: string | null;
   seed: { text: string; n: number; refs?: ThreadRef[] };
   onCommand: (name: string, arg: string) => void;
+  commands?: readonly SlashCommand[];
   /** Enter or the button actually submitted — chat, slash, or an Ask-master draft. */
   onSent: () => void;
   attachEnabled?: boolean;
@@ -46,6 +49,7 @@ export default function Composer({
       block={block}
       seed={seed}
       onCommand={onCommand}
+      commands={commands}
       onSubmitted={onSent}
       onSend={({ body, refs, attachments, mediaRefs }) => {
         void sendToMaster(body, newMessageId(), refs, attachments, attachDestination?.conversation, undefined, mediaRefs);

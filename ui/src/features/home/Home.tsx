@@ -14,7 +14,9 @@ import {
   MASTER,
   masterStatus,
   restingStatus,
+  offeredCommands,
   SLASH_COMMANDS,
+  type SlashCommand,
   START_COMMAND,
   RESUME_COMMAND,
   turnState,
@@ -209,11 +211,13 @@ function HeaderMenu({
   master,
   row,
   readOnly,
+  canPickModel,
   scope,
 }: {
   master: MasterState | null | undefined;
   row: Agent | undefined;
   readOnly: boolean;
+  canPickModel: boolean;
   /** The header's scope line, moved here on a narrow screen. */
   scope: string;
 }) {
@@ -289,7 +293,7 @@ function HeaderMenu({
               </button>
             </div>
             <p className="assistant-scope" data-menu-scope>{scope}</p>
-            <MasterChips master={master} row={row} readOnly={readOnly} />
+            <MasterChips master={master} row={row} readOnly={readOnly} canPickModel={canPickModel} />
             <AssistantAboutButton className="assistant-menu-about" />
           </div>
         </>
@@ -363,6 +367,8 @@ interface CmdResult {
   running?: boolean;
   ok?: boolean;
   text?: string;
+  /** This board cannot run the command: nothing was sent, and nothing failed. */
+  unavailable?: boolean;
   /** A JSON answer — listed as fields, with raw JSON one toggle away. */
   value?: unknown;
 }
@@ -414,6 +420,8 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
         </span>
         {cmd.running ? (
           <span className="steps-running text-ink-500">{t("running…")}</span>
+        ) : cmd.unavailable ? (
+          <span className="text-ink-500">{t("not available")}</span>
         ) : cmd.ok === false ? (
           <span className="text-fail">{t("failed")}</span>
         ) : (
@@ -434,8 +442,8 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
 }
 
 /** `/help` — the catalog rendered as a GFM table. */
-function helpText(): string {
-  const rows = SLASH_COMMANDS.filter((c) => c.name !== "help").map(
+function helpText(commands: readonly SlashCommand[]): string {
+  const rows = commands.filter((c) => c.name !== "help").map(
     (c) => `| \`/${c.name}${c.arg ? ` ${c.arg}` : ""}\` | ${c.blurb} |`,
   );
   return `**Commands**\n\n| command | what it does |\n|---|---|\n${rows.join("\n")}`;
@@ -850,6 +858,8 @@ function MasterHome({
   const status = masterStatus(agents.data, missing);
   const writeBlock = useWriteBlock(readOnly);
   const block = composerBlock(writeBlock, status, hosted);
+  const offered = useMemo(() => offeredCommands(hosted, master.data?.commands), [hosted, master.data?.commands]);
+  const canPickModel = offered.some((c) => c.name === "model");
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
   // The seq watermark for the enter animation: items at or below the mount
@@ -1292,7 +1302,7 @@ function MasterHome({
     (name: string, arg: string) => {
       const id = ++cmdSeq.current;
       if (name === "help") {
-        setCmds((c) => [...c, { id, name, ok: true, text: helpText() }]);
+        setCmds((c) => [...c, { id, name, ok: true, text: helpText(offered) }]);
         return;
       }
       const known = SLASH_COMMANDS.find((c) => c.name === name);
@@ -1300,6 +1310,13 @@ function MasterHome({
         setCmds((c) => [
           ...c,
           { id, name, ok: false, text: `Unknown command — \`/help\` lists what the master accepts.` },
+        ]);
+        return;
+      }
+      if (!offered.includes(known)) {
+        setCmds((c) => [
+          ...c,
+          { id, name, unavailable: true, text: t("This command isn't available in this workspace. `/help` lists what is.") },
         ]);
         return;
       }
@@ -1324,7 +1341,7 @@ function MasterHome({
           ),
         );
     },
-    [],
+    [offered, t],
   );
 
   const runTurnCommand = useCallback((command: "stop" | "cancel", message: string) => {
@@ -1424,8 +1441,8 @@ function MasterHome({
                 <span className={`chip chip-sans ${headerChip.tone}`} data-assistant-status>
                   {headerChip.label}
                 </span>
-                <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
-                <HeaderMenu master={master.data} row={masterRow} readOnly={readOnly} scope={scopeDescriptor(actor.scope, t)} />
+                <MasterChips master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} />
+                <HeaderMenu master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} scope={scopeDescriptor(actor.scope, t)} />
               </div>
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
@@ -1557,6 +1574,7 @@ function MasterHome({
               block={block}
               seed={seed}
               onCommand={runCommand}
+              commands={offered}
               onSent={engage}
               stop={canStop ? { onStop: () => { if (runningMessage) runTurnCommand("stop", runningMessage); } } : null}
               attachEnabled={canAttach}
