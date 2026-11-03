@@ -3,7 +3,6 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
-import type { SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
@@ -42,7 +41,7 @@ import Conversation from "../app-shell/chat/Conversation";
 import { TurnBar } from "../app-shell/chat/TurnBar";
 import { usePendingPermission } from "../app-shell/chat/usePendingApproval";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
-import { earlierStep, useThreadStream } from "../app-shell/chat/conversationThread";
+import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat/conversationThread";
 import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
@@ -827,7 +826,7 @@ function MasterHome({
   // CAD-574: the rail's collapse is a layout concern — the grid column
   // narrows with it, so the state lives here and the rail renders it.
   const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
-  const [link, setLink] = useState<SseErrorState | "live" | null>("reconnecting");
+  const [link, setLink] = useState<StreamLink>("connecting");
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [cmds, setCmds] = useState<CmdResult[]>([]);
@@ -852,6 +851,13 @@ function MasterHome({
   const block = composerBlock(writeBlock, status, hosted);
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
+  // The seq watermark for the enter animation: items at or below the mount
+  // tail are history and render still; only what lands after rises in. Set
+  // here, before the first loaded render paints its rows, not in an effect
+  // that runs after they have already animated.
+  if (liveAfter.current === null && loaded) {
+    liveAfter.current = lastSeq(thread.data) ?? 0;
+  }
   const moreBefore = thread.data?.moreBefore === true;
   // The default master-state response already resolves Home before its first
   // transcript exists. Keep that server-issued binding when the empty thread
@@ -889,14 +895,18 @@ function MasterHome({
   const permissionPending = usePendingPermission(threadEntries);
   // Results older than this Home visit are history, not a live outcome.
   const liveSince = useMemo(() => Date.now(), []);
-  const streamReconnecting = link !== null && link !== "live";
+  // A first connection in progress is not an outage, so it shows no notice.
+  // Stop still waits for a live stream (`canStop`).
+  const streamReconnecting = link !== "live" && link !== "connecting";
   const turnBar = turnBarState(
     {
       master: master.data,
       entries: threadEntries,
       pendingMessages: (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message),
       awaitingApproval: permissionPending,
-      reconnecting: streamReconnecting,
+      // Actions stay off until the stream has proved the turn is current, even
+      // while a first connection shows no outage notice.
+      reconnecting: link !== "live",
       liveSince,
     },
     homeConversation ?? null,
@@ -915,7 +925,7 @@ function MasterHome({
   // turn runs. Never while the stream is down: that state is last known.
   const runningMessage =
     turnBar.kind === "working" || turnBar.kind === "writing" ? turnBar.stopMessage : null;
-  const canStop = writeBlock === null && !streamReconnecting && runningMessage !== null;
+  const canStop = writeBlock === null && loaded && link === "live" && runningMessage !== null;
   const aheadHref = useConversationDestination(
     turnBar.kind === "queued" ? turnBar.aheadConversation : null,
     master.data,
@@ -997,15 +1007,6 @@ function MasterHome({
       || thread.data?.conversation !== undefined),
     setLink,
   );
-
-  // The seq watermark for the enter animation: items at or below the
-  // mount tail are history — they render still; only what lands after
-  // rises in.
-  useEffect(() => {
-    if (liveAfter.current === null && loaded) {
-      liveAfter.current = lastSeq(thread.data) ?? 0;
-    }
-  }, [loaded, thread.data]);
 
   // Keep master_state honest: it follows the agents resource's
   // invalidations (turn boundaries land there) and the `master` stream

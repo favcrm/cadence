@@ -16,7 +16,6 @@ import {
 import { api, ApiError } from "../../../lib/api";
 import { privateSessionGeneration, usingPrivateOperation, withPrivateOperation, type PrivateOperation } from "../../../lib/privateSession";
 import { resources, threadReader } from "../../../lib/resources";
-import type { SseErrorState } from "../../../lib/sse";
 import { useQuery, useResource } from "../../../lib/useResource";
 import Link from "../../../ui/Link";
 import type { ThreadRef } from "../../../lib/types";
@@ -116,7 +115,7 @@ import { TurnBar } from "./TurnBar";
 import { isUnread, onSeenChanged, writeSeen, type SeenMap } from "./unreadSeen";
 import { setVisibleConversation, useDocumentVisible } from "./chatVisibility";
 import { useConversationDestination } from "./conversationNavigation";
-import { earlierStep, useThreadStream } from "./conversationThread";
+import { earlierStep, useThreadStream, type StreamLink } from "./conversationThread";
 
 /**
  * The host's ONE Conversation (CAD-1108): Home and every installed app render
@@ -671,7 +670,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const [composerNotice, setComposerNotice] = useState<UiNotice | null>(null);
   const [creating, setCreating] = useState(false);
   // The thread stream's link: down means the turn bar shows its last known state.
-  const [streamLink, setStreamLink] = useState<"live" | SseErrorState>("reconnecting");
+  const [streamLink, setStreamLink] = useState<StreamLink>("reconnecting");
   const [streamRevision, setStreamRevision] = useState(0);
   const onSnapshot = useCallback(() => setStreamRevision((revision) => revision + 1), []);
   const operationScope = `${installId}\u0000${mode.contextId}`;
