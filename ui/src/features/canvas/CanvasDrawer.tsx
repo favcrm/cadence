@@ -55,22 +55,6 @@ function chatRightEdge(pushed: number): number | null {
   return pane ? pane.getBoundingClientRect().right + pushed : null;
 }
 
-/** The running turn: one word and an indeterminate bar. The steps stay in the thread. */
-function WorkingStrip({ updating }: { updating: string | null }) {
-  const t = useTranslate();
-  return (
-    <div className="cv-work" role="status" aria-live="polite" data-canvas-working>
-      <div className="cv-live">
-        <span>{t("Working")}</span>
-        {updating ? <span className="artbadge">{updating}</span> : null}
-      </div>
-      <div className="cv-bar" aria-hidden>
-        <i className="cv-bar-run" />
-      </div>
-    </div>
-  );
-}
-
 /** The passage the operator selected inside the document, or "". */
 function selectedPassage(root: HTMLElement | null): string {
   const sel = window.getSelection();
@@ -148,7 +132,8 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
         <span className="cv-title">
           <b>{tab.title}</b>
           <span>
-            <span className={`artbadge ${working ? "" : "ok"}`}>{working ? t("drafting") : t("ready")}</span>
+            <span className={`artbadge ${working ? "" : "ok"}`} role="status">{working ? t("drafting") : t("ready")}</span>
+            {updating ? <span className="artbadge">{updating}</span> : null}
             {tab.kind} · v{tab.selected}
           </span>
         </span>
@@ -219,8 +204,12 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
             </button>
           </span>
         ) : null}
+        {working ? (
+          <div className="cv-bar" aria-hidden data-canvas-working>
+            <i className="cv-bar-run" />
+          </div>
+        ) : null}
       </header>
-      {working ? <WorkingStrip updating={updating} /> : null}
       <div className="cv-body" data-canvas-body>
         {state.status === "loading" ? <p className="text-label text-ink-500 p-3">{t("Loading…")}</p> : null}
         {state.status === "failed" ? <p className="text-label text-fail p-3" role="alert">{state.error}</p> : null}

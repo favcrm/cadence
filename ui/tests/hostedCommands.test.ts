@@ -120,6 +120,7 @@ async function main() {
   await type("/compact");
   await enter();
   assert(!requests.some((r) => r.startsWith("POST")), `an unavailable command sends nothing (got ${requests.join(", ")})`);
+  assert(box()?.value === "" && menu().length === 0, "a submitted command leaves the box empty and the menu closed");
   const card = host.querySelector('[data-cmd="compact"]');
   assert(card?.textContent?.includes("not available"), "the card says it is not available");
   assert(!card?.textContent?.includes("failed"), "an unavailable command did not fail");

@@ -450,6 +450,13 @@ export default function Composer({
     setMenuOffFor(null);
   };
 
+  // A command has gone: empty the box, which closes the menu, and keep focus.
+  const finishCommand = () => {
+    setDraft("");
+    setMenuOffFor(null);
+    if (refocusAfterSend) box.current?.focus();
+  };
+
   const submit = () => {
     const body = draft.trim();
     // `block` is also "not an operator" in an app pane — the box and
@@ -483,6 +490,7 @@ export default function Composer({
     if (cmd && !menu && onCommand !== undefined) {
       // A compact pane with its own commands (`/new`): exact verb.
       onCommand(cmd.name, cmd.arg);
+      finishCommand();
     } else if (cmd && !menu) {
       // An unsupported slash verb is never forwarded as chat — the
       // composer refuses it in place. Full-density menus cannot reach
@@ -491,6 +499,7 @@ export default function Composer({
       return;
     } else if (cmd) {
       onCommand?.(cmd.name, cmd.arg);
+      finishCommand();
     } else {
       // Capture the ready rows by key+generation, not by file id: two
       // distinct rows can legitimately share a dedup id, and a later row
