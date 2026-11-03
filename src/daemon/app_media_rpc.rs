@@ -385,6 +385,34 @@ impl Shared {
         })
     }
 
+    /// Imported custody has no producing run to re-prove and must outlive
+    /// the installation that imported it, so the receiver's own admission
+    /// is the whole currentness check here. One helper, so a change to the
+    /// receiver's admission or guard order lands for imported bytes too.
+    fn with_receiver_only_current<T>(
+        &self,
+        caller: &str,
+        message_id: &str,
+        read: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let Some(receiver) = self.image_receiver_scope(caller, message_id)? else {
+            return read();
+        };
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot(&pm, &receiver.0, |caller_snap, _| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.receiver_install_admitted(caller, message_id, &receiver, caller_snap)?;
+            read()
+        })
+    }
+
     /// Producing custody together with the persisted receiver, under one
     /// pm → custody → release section. No app stamp keeps the producer-only
     /// proof used by general pinned chat.
@@ -396,25 +424,7 @@ impl Shared {
         read: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let OriginalAuthority::Provider(original) = authority else {
-            // Imported custody has no producing run to re-prove and must
-            // outlive the installation that imported it, so only the
-            // receiver's own admission is current here.
-            if let Some(receiver) = self.image_receiver_scope(caller, message_id)? {
-                let pm = self.pm_at(&self.pm_dir()?)?;
-                return workspace::with_runtime_snapshot(&pm, &receiver.0, |caller_snap, _| {
-                    let _custody = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let _release = self
-                        .app_release_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    self.receiver_install_admitted(caller, message_id, &receiver, caller_snap)?;
-                    read()
-                });
-            }
-            return read();
+            return self.with_receiver_only_current(caller, message_id, read);
         };
         let Some(receiver) = self.image_receiver_scope(caller, message_id)? else {
             return self.with_media_source_current(original, read);

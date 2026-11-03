@@ -1424,9 +1424,9 @@ impl Shared {
         // CAD-2078 decision: this is not a display consumer. The refine
         // edit sends the retained PROVIDER original artifact as the source
         // reference, so an imported workspace asset — which has custody
-        // bytes and no provider original — is refused here by design.
-        // The refusal above names the reason; it protects against
-        // submitting a reference the provider cannot fetch.
+        // bytes and no provider original — is refused BY THIS CALL below;
+        // it protects against submitting a reference the provider cannot
+        // fetch.
         let image = self.store.app_media_context_image(asset_id)?;
         let original = image.original;
         let hex = sha256
