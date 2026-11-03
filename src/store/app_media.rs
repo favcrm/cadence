@@ -721,8 +721,11 @@ impl Store {
     /// names the revision and the digest of the bytes themselves, so the
     /// check is provenance-neutral: an imported workspace asset and a
     /// provider-produced one pass or refuse on the same terms, and
-    /// anything that is not a verified workspace asset answers `None`, and
-    /// each caller words its own refusal.
+    /// `None` means the pin no longer names these bytes, or the id names no
+    /// catalog asset, so each caller words its own refusal. A row that is
+    /// present but cannot be read as a verified asset — unsupported stored
+    /// type, custody digest mismatch — keeps its store error, because that
+    /// is a broken catalog row rather than a stale pin.
     pub(crate) fn app_media_pinned_display(
         &self,
         asset_id: &str,
