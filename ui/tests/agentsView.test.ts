@@ -237,6 +237,7 @@ async function render() {
         onTab: (next) => {
           tab = next;
         },
+        onToast: () => {},
         onRecruit: (on) => {
           recruiting = on;
         },
@@ -418,16 +419,32 @@ async function main() {
     );
   }
   assert(
-    reads.at(-1) === "/api/agents/blocked",
+    reads.includes("/api/agents/blocked"),
     "detail reads exact alias route",
   );
   failDetail = false;
   await click("Retry");
   assert(
     host.querySelector("main.agents-page")?.textContent?.includes("session-blocked") &&
-      !host.querySelector("[role='alert']"),
+      !host.textContent?.includes("Some details aren’t available"),
     "retry replaces failure with details",
   );
+  // An open drawer keeps Esc for itself: the page stays where it is.
+  await React.act(() =>
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    ),
+  );
+  assert((tab as string) !== "overview", "Escape closes the drawer, not the page");
+  tab = "skills";
+  await render();
+  assert(!host.querySelector("[data-drawer]"), "the settings drawer closes with its section");
+  assert(host.querySelectorAll(".ap-mrow").length === 4, "skills are rows");
+  await React.act(() => host.querySelector<HTMLElement>(".ap-mrow")!.click());
+  assert(host.querySelector("[data-drawer='agent-item']")?.textContent?.includes("Source"), "a row opens one drawer with its details");
+  assert(!host.querySelector(".ap-rows")?.textContent?.includes("Source"), "details live in the drawer, not the row");
+  tab = "history";
+  await render();
   await React.act(() =>
     document.body.dispatchEvent(
       new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
@@ -531,7 +548,17 @@ async function main() {
   tab = "settings";
   reads.length = 0;
   await render();
-  assert(host.querySelector(".ag-chat-gate") && !host.textContent?.includes("Loading agent details"), "a section link on a profile lands on its page, not a stuck read");
+  assert(host.querySelector("main.agents-page h1")?.textContent === "Writer" && !host.textContent?.includes("Loading agent details"), "a section link on a profile reaches that section, not a stuck read");
+  const notes = () => host.querySelector("[data-drawer='agent-settings']")?.textContent ?? "";
+  assert(notes().includes("agents/Writer/knowledge"), "a profile without a named root keeps its alias folder");
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [{ ...withProfile, wiki_root: "agents/ap_2" }] });
+  await render();
+  assert(notes().includes("agents/ap_2/knowledge"), "the notes link follows the folder the board names");
+  for (const [section, says] of [["instructions", "Write"], ["skills", "No skills are recorded"], ["tools", "cadence"], ["history", "no runtime"]] as const) {
+    tab = section;
+    await render();
+    assert(host.querySelector("#ap-panel")?.textContent?.includes(says), `a hosted profile reaches ${section}`);
+  }
   assert(!reads.includes("/api/agents/Writer"), "a profile is still not read as an agent");
   tab = "overview";
   const cloudAgent = { ...base, alias: "cloudy", provider: "agenticos-cloud", endpoint_kind: "cloud" } as Agent;
@@ -577,6 +604,7 @@ async function main() {
           onAsk: () => {},
           onOpenAgent: () => {},
           onTab: () => {},
+          onToast: () => {},
           onRecruit: () => {},
           onOpenIssue: () => {},
           onRetry: () => {},
@@ -586,7 +614,7 @@ async function main() {
     await flush();
     await flush();
   };
-  await mountFresh("owner", "work");
+  await mountFresh("owner", "history");
   assert(!freshHost.textContent?.includes("Loading agent details"), "a failed roster does not leave details loading forever");
   assert(freshHost.textContent?.includes("Some details aren’t available"), "a failed roster still reports the detail failure, with its Retry");
   assert(!freshHost.textContent?.includes("Nothing right now") && !freshHost.textContent?.includes("Nothing queued"), "a failed roster claims nothing about an agent's work");
@@ -624,6 +652,7 @@ async function main() {
           onAsk: () => {},
           onOpenAgent: () => {},
           onTab: () => {},
+          onToast: () => {},
           onRecruit: () => {},
           onOpenIssue: () => {},
           onRetry: () => {},
@@ -644,11 +673,11 @@ async function main() {
   assert(servedPanel.split(NOT_RECORDED).length === 2, "a 501 board says so once");
   for (const claim of ["No results yet.", "No events yet.", "Agent details are unavailable.", "no role text"])
     assert(!servedPanel.includes(claim), `a 501 board claims nothing it cannot know: ${claim}`);
-  assert(servedPanel.includes("Doing now") && servedPanel.includes("Up next"), "roster data still shows on a 501 board");
+  assert(servedPanel.includes("Doing now") && servedPanel.includes("Queue"), "roster data still shows on a 501 board");
   const servedMain = servedHost.querySelector("main.ag-chat")?.textContent ?? "";
   assert(!servedMain.includes("Some details aren’t available"), "a 501 is not reported as a failure");
   assert(!Array.from(servedHost.querySelectorAll(".ag-chat-main button")).some((b) => b.textContent?.trim() === "Retry"), "there is no Retry that can never succeed");
-  for (const section of ["history", "work", "job", "settings"] as const) {
+  for (const section of ["history", "instructions", "settings"] as const) {
     await mountServed("dev", section, liveRoster);
     const page = servedHost.textContent ?? "";
     assert(!page.includes("Loading agent details"), `the ${section} section does not stick on loading on a 501 board`);
@@ -661,7 +690,7 @@ async function main() {
     ["dev", failedRoster, "failed roster"],
     ["nobody", liveRoster, "unknown alias"],
   ] as const) {
-    for (const section of ["work", "settings", "history", "job"] as const) {
+    for (const section of ["settings", "history", "instructions"] as const) {
       await mountServed(alias, section, roster);
       const page = servedHost.textContent ?? "";
       for (const claim of unknownClaims)
@@ -694,6 +723,7 @@ async function main() {
   assert(!servedHost.querySelector(".rc-cats"), "no filters over a history the board doesn't keep");
   await mountServed("dev", "settings", liveRoster);
   assert(servedHost.textContent?.includes("doesn’t report runtime details"), "the runtime section says what is actually missing");
+  assert(!servedHost.querySelector("main.agents-page button:disabled"), "nothing on the page is a disabled promise");
   // A 501 for another reason, such as an outdated daemon, is an ordinary failure.
   detailNotServedCode = "unsupported_daemon";
   await mountServed("dev", "history", liveRoster);
@@ -705,17 +735,15 @@ async function main() {
   // A read still running says nothing about the agent, on a deep link.
   const unsettled = ["No events yet.", "No results yet.", "no role text"];
   holdDetail = true;
-  for (const section of ["history", "work"] as const) {
-    await mountServed("dev", section, liveRoster);
-    for (const claim of unsettled)
-      assert(!servedHost.textContent?.includes(claim), `${section}, read in flight: claims nothing yet: ${claim}`);
-    await React.act(async () => releaseDetail?.());
-    await flush();
-  }
+  await mountServed("dev", "history", liveRoster);
+  for (const claim of unsettled)
+    assert(!servedHost.textContent?.includes(claim), `history, read in flight: claims nothing yet: ${claim}`);
+  await React.act(async () => releaseDetail?.());
+  await flush();
   holdDetail = false;
-  await mountServed("dev", "work", { ...liveRoster, data: null, status: "loading" });
+  await mountServed("dev", "history", { ...liveRoster, data: null, status: "loading" });
   for (const claim of [...unsettled, "Nothing right now", "Nothing queued", "Nothing needs attention"])
-    assert(!servedHost.textContent?.includes(claim), `work, roster pending: claims nothing yet: ${claim}`);
+    assert(!servedHost.textContent?.includes(claim), `roster pending: claims nothing yet: ${claim}`);
   detailNotServed = false;
   await React.act(() => servedRoot.unmount());
   console.log("agents view checks passed");

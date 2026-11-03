@@ -6,9 +6,10 @@ import { navigate } from "../../lib/useLocation";
 import { setComposerDraft } from "../app-shell/chat/composerStore";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
-import { OPERATOR_HIRE_REASON } from "../auth/gate";
-import { HireBlock, WriteGate } from "../auth/WriteGate";
-import type { Agent, AgentAccess, AgentDetail, AgentRole } from "../../lib/types";
+import type { ToastMsg } from "../../ui/Toast";
+import DrawerShell from "../app-shell/shared/DrawerShell";
+import { WriteGate } from "../auth/WriteGate";
+import type { Agent, AgentAccess, AgentDetail, AgentRole, HiredProfile } from "../../lib/types";
 import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref, detailTasksNotOnRoster, partitionActiveTasks } from "./AgentBlocks";
 import Link from "../../ui/Link";
 import { ProfileBlock } from "./AgentProfile";
@@ -30,12 +31,15 @@ export interface TabContext {
   role: AgentRole | null;
   hosted: boolean;
   resume: string | null | undefined;
-  fenced: boolean | undefined;
-  lifecycle: string;
-  deadHolding: boolean;
   onOpenIssue: (id: string) => void;
-  onTab: (tab: AgentTab) => void;
   onSaved: () => void;
+  /** Set when this page is a profile with no runtime: nothing to read but itself. */
+  hired: HiredProfile | undefined;
+  /** This viewer may save, and the board can take the write now. */
+  writable: boolean;
+  toast: (kind: ToastMsg["kind"], text: string) => void;
+  /** Label and value of the agent's figures; "—" is not recorded. */
+  stats: [string, string][];
   /** The detail read failed. Roster tasks, when present, stay visible. */
   detailFailed: boolean;
   /** This board answers the read with 501: it keeps no such details. That is
@@ -50,29 +54,12 @@ function reading(c: TabContext): boolean {
   return !c.detail && !c.detailFailed && !c.detailNotServed;
 }
 
-function Panel({
-  title,
-  link,
-  onTab,
-  mark,
-  children,
-}: {
-  title: string;
-  link?: AgentTab;
-  onTab: (tab: AgentTab) => void;
-  mark?: string;
-  children: React.ReactNode;
-}) {
+function Panel({ title, mark, children }: { title: string; mark?: string; children: React.ReactNode }) {
   const t = useTranslate();
   return (
     <section data-work-panel={mark}>
       <div className="ap-panel-h">
         <h3>{t(title)}</h3>
-        {link && (
-          <button type="button" className="ap-link" onClick={() => onTab(link)}>
-            {t("View all")}
-          </button>
-        )}
       </div>
       {children}
     </section>
@@ -92,21 +79,43 @@ function Row({ left, right }: { left: React.ReactNode; right?: React.ReactNode }
   );
 }
 
-function Chips({ items, planned = [] }: { items: string[]; planned?: string[] }) {
+/** A list row is a name and one line; the details live in its drawer. */
+function ManageRow({ id, name, line, onOpen }: { id: string; name: string; line: string; onOpen: () => void }) {
+  return (
+    <button type="button" className="ap-mrow" data-record-id={id} onClick={onOpen}>
+      <b>{name}</b>
+      {line && <small>{line}</small>}
+    </button>
+  );
+}
+
+type Fact = [string, string | null | undefined];
+
+function Facts({ items }: { items: Fact[] }) {
   const t = useTranslate();
   return (
-    <div className="rc-kst-row">
-      {items.map((item) => (
-        <span key={item} className="rc-kst">
-          {item}
-        </span>
-      ))}
-      {planned.map((item) => (
-        <span key={item} className="rc-kst planned">
-          {t(item)} · {t("planned")}
-        </span>
-      ))}
-    </div>
+    <dl className="rc-kv">
+      {items
+        .filter(([, value]) => value !== null && value !== undefined && value !== "")
+        .map(([label, value]) => (
+          <div key={label} className="contents">
+            <dt>{t(label)}</dt>
+            <dd>{value}</dd>
+          </div>
+        ))}
+    </dl>
+  );
+}
+
+function ItemDrawer({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+  return (
+    <DrawerShell
+      kind="agent-item"
+      label={title}
+      title={title}
+      tabs={[{ id: "details", label: title, panel: <div className="ap-body">{children}</div> }]}
+      onClose={onClose}
+    />
   );
 }
 
@@ -168,9 +177,6 @@ function NowCard({ c, onlyDoing = false }: { c: TabContext; onlyDoing?: boolean 
           <Button size="sm" href={agentThreadHref(c.alias)}>
             {t("Open thread")}
           </Button>
-          <Button size="sm" disabled title={t("Stopping a turn is not wired from the board yet")}>
-            {t("Stop turn")}
-          </Button>
         </div>
       </div>
     );
@@ -213,111 +219,6 @@ function EventRow({ e }: { e: AgentDetail["events"][number] }) {
   );
 }
 
-/** The job as the mockup shows it: its first paragraph, then the bullets. */
-function JobSummary({ text }: { text: string }) {
-  const lines = text.split("\n").map((line) => line.trimEnd());
-  const bullets = lines.filter((line) => line.startsWith("- ")).map((line) => line.slice(2));
-  const lead = lines.filter((line) => line.trim() !== "" && !line.startsWith("- "));
-  return (
-    <div className="ap-lead ap-job-sum">
-      {lead.map((line) => (
-        <p key={line}>{line}</p>
-      ))}
-      {bullets.length > 0 && (
-        <ul className="rc-does">
-          {bullets.map((line) => (
-            <li key={line}>{line}</li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-function JobExcerpt({ c }: { c: TabContext }) {
-  const t = useTranslate();
-  const text = c.detail?.agent.instructions ?? c.role?.instructions ?? null;
-  if (text) return <JobSummary text={text} />;
-  if (reading(c)) return <Note>{t("Loading…")}</Note>;
-  if (c.detailFailed) return <Note>{t("Agent details are unavailable.")}</Note>;
-  return <p className="rc-note">{t("This agent has no role text on this board.")}</p>;
-}
-
-function Overview({ c }: { c: TabContext }) {
-  const t = useTranslate();
-  const events = c.detail?.events ?? [];
-  const results = resultRows(c.detail);
-  const project = c.detail?.agent.turn_project ?? null;
-  // A failed read is not an empty one: these sections come from the details.
-  const unavailable = <Note>{t("Agent details are unavailable.")}</Note>;
-  return (
-    <div className="ap-grid">
-      <div className="ap-main">
-        <Panel title="Doing now" onTab={c.onTab}>
-          <NowCard c={c} />
-        </Panel>
-        <Panel title="Up next" link="work" onTab={c.onTab}>
-          {c.observed ? <AgentQueue agent={c.observed} /> : c.detailFailed ? unavailable : <Note>{t(reading(c) ? "Loading…" : "Nothing queued.")}</Note>}
-        </Panel>
-        {c.detailNotServed ? (
-          <Note>{t(NOT_RECORDED)}</Note>
-        ) : (
-          <>
-            <Panel title="Recent results" link="work" onTab={c.onTab}>
-              {c.detailFailed ? (
-                unavailable
-              ) : results.length ? (
-                <Rows>
-                  {results.slice(0, 3).map((e) => (
-                    <EventRow key={e.seq} e={e} />
-                  ))}
-                </Rows>
-              ) : (
-                <Note>{t(reading(c) ? "Loading…" : "No results yet.")}</Note>
-              )}
-            </Panel>
-            <Panel title="History" link="history" onTab={c.onTab}>
-              {c.detailFailed ? (
-                unavailable
-              ) : events.length ? (
-                <Rows>
-                  {events.slice(-3).reverse().map((e) => (
-                    <EventRow key={e.seq} e={e} />
-                  ))}
-                </Rows>
-              ) : (
-                <Note>{t(reading(c) ? "Loading…" : "No events yet.")}</Note>
-              )}
-            </Panel>
-          </>
-        )}
-      </div>
-      <aside className="ap-side">
-        {(!c.detailNotServed || c.detail?.agent.instructions || c.role?.instructions) && (
-          <Panel title="Job" link="job" onTab={c.onTab}>
-            <JobExcerpt c={c} />
-          </Panel>
-        )}
-        <Panel title="Knowledge" link="knowledge" onTab={c.onTab}>
-          <Chips
-            items={[t("Workspace wiki"), ...(project ? [`${t("Project notes")}: ${project}`] : [t("Ticket's project notes")])]}
-            planned={["Its own memory"]}
-          />
-        </Panel>
-        <Panel title="Skills" link="skills" onTab={c.onTab}>
-          <Chips items={c.role?.skills ?? [...BUNDLED_SKILLS]} />
-        </Panel>
-        <Panel title="MCP & tools" link="tools" onTab={c.onTab}>
-          <Chips items={["cadence"]} planned={["Per-agent MCP"]} />
-        </Panel>
-        <Panel title="Model & usage" link="settings" onTab={c.onTab}>
-          {c.profile ? <ProfileBlock agent={c.profile} /> : <Note>{t(c.detailFailed ? "Agent details are unavailable." : "Loading agent details…")}</Note>}
-        </Panel>
-      </aside>
-    </div>
-  );
-}
-
 function attentionNotes(agent: TabContext["observed"], t: (english: string) => string): string[] {
   if (!agent) return [];
   const notes: string[] = [];
@@ -337,7 +238,7 @@ function attentionNotes(agent: TabContext["observed"], t: (english: string) => s
   return notes;
 }
 
-function Work({ c }: { c: TabContext }) {
+export function Work({ c }: { c: TabContext }) {
   const t = useTranslate();
   const detail = c.detail;
   const results = resultRows(detail);
@@ -348,7 +249,7 @@ function Work({ c }: { c: TabContext }) {
   const attentionCount = notes.length + (parts?.attention.length ?? 0);
   return (
     <div className="ap-body">
-      <Panel title="Doing now" mark="doing" onTab={c.onTab}>
+      <Panel title="Doing now" mark="doing">
         <NowCard c={c} onlyDoing />
         {c.observed && (
           <div className="mt-2">
@@ -356,7 +257,7 @@ function Work({ c }: { c: TabContext }) {
           </div>
         )}
       </Panel>
-      <Panel title="Queue" mark="queue" onTab={c.onTab}>
+      <Panel title="Queue" mark="queue">
         {c.observed ? <AgentQueue agent={c.observed} /> : <Note>{t(unavailable ? "Agent details are unavailable." : reading(c) ? "Loading…" : "Nothing queued.")}</Note>}
         {parts && <AssignedTaskList alias={c.alias} tasks={parts.queue} />}
         {detailOnly.length > 0 && (
@@ -389,7 +290,7 @@ function Work({ c }: { c: TabContext }) {
           </div>
         )}
       </Panel>
-      <Panel title="Needs attention" mark="attention" onTab={c.onTab}>
+      <Panel title="Needs attention" mark="attention">
         {notes.map((note) => (
           <p key={note} className="text-label text-warn">{note}</p>
         ))}
@@ -398,7 +299,7 @@ function Work({ c }: { c: TabContext }) {
           <Note>{t(unavailable ? "Needs attention could not be read." : reading(c) && !c.observed ? "Loading…" : "Nothing needs attention.")}</Note>
         )}
       </Panel>
-      <Panel title="Results" mark="results" onTab={c.onTab}>
+      <Panel title="Results" mark="results">
         {c.detailNotServed ? (
           <Note>{t(NOT_RECORDED)}</Note>
         ) : c.detailFailed && !detail ? (
@@ -417,9 +318,6 @@ function Work({ c }: { c: TabContext }) {
           <Note>{t(reading(c) ? "Loading…" : "No results yet.")}</Note>
         )}
       </Panel>
-      <Note>
-        {t("Work = tasks dispatched to it + tickets it owns, plus filed reports.")}
-      </Note>
     </div>
   );
 }
@@ -427,24 +325,35 @@ function Work({ c }: { c: TabContext }) {
 function History({ c }: { c: TabContext }) {
   const t = useTranslate();
   const [filter, setFilter] = useState<HistoryFilter>("all");
+  const [open, setOpen] = useState<string | null>(null);
   const detail = c.detail;
-  const inbox = (detail?.running ?? []).map((m) => ({
+  if (c.hired) return <Note>{t("No history yet: it has no runtime.")}</Note>;
+  const running = (detail?.running ?? []).map((m) => ({
     key: `m-${m.id}`,
-    kind: "turn running",
-    label: m.id,
-    sub: m.task ? t("task {task}").replace("{task}", () => String(m.task)) : (m.summary ?? ""),
-    at: m.created ? fmtTime(m.created) : "",
+    name: t("Turn running"),
+    line: m.summary ?? String(m.task ?? m.id),
     group: "turns" as const,
+    facts: [
+      ["Message", m.id],
+      ["Task", m.task],
+      ["Started", m.created ? fmtTime(m.created) : null],
+    ] as Fact[],
   }));
   const events = (detail?.events ?? []).map((e) => ({
     key: `e-${e.seq}`,
-    kind: e.kind,
-    label: `#${e.seq} ${e.kind}`,
-    sub: e.task_id ?? e.job_id ?? "",
-    at: fmtTime(e.at),
+    name: e.kind,
+    line: [e.task_id ?? e.job_id, fmtTime(e.at)].filter(Boolean).join(" · "),
     group: historyKind(e.kind),
+    facts: [
+      ["Event", `#${e.seq}`],
+      ["Task", e.task_id],
+      ["Job", e.job_id],
+      ["When", fmtTime(e.at)],
+    ] as Fact[],
   }));
-  const rows = [...inbox, ...events].filter((r) => filter === "all" || r.group === filter);
+  const all = [...running, ...events];
+  const rows = all.filter((r) => filter === "all" || r.group === filter);
+  const shown = all.find((r) => r.key === open);
   return (
     <div className="ap-body">
       {!c.detailNotServed && (
@@ -462,16 +371,6 @@ function History({ c }: { c: TabContext }) {
           ))}
         </div>
       )}
-      {detail && (
-        <p className="text-micro text-ink-500">
-          {t("{running} running · {queued} queued · {unknown} unknown")
-            .replace("{running}", String(detail.running.length))
-            .replace("{queued}", String(detail.queued))
-            .replace("{unknown}", String(detail.unknown))}
-          {" · "}
-          {t("last {count} events").replace("{count}", String(detail.events.length))}
-        </p>
-      )}
       {detail?.events_error && (
         <p role="alert" className="text-label text-fail">
           {t("The event history could not be read:")} {detail.events_error}
@@ -484,54 +383,49 @@ function History({ c }: { c: TabContext }) {
       ) : rows.length ? (
         <Rows>
           {rows.map((r) => (
-            <Row
-              key={r.key}
-              left={
-                <>
-                  {r.label} {r.sub && <small>{r.sub}</small>}
-                </>
-              }
-              right={r.at}
-            />
+            <ManageRow key={r.key} id={r.key} name={r.name} line={r.line} onOpen={() => setOpen(r.key)} />
           ))}
         </Rows>
       ) : (
         <Note>{t(reading(c) ? "Loading…" : "No events yet.")}</Note>
       )}
+      {shown && (
+        <ItemDrawer title={shown.name} onClose={() => setOpen(null)}>
+          <Facts items={shown.facts} />
+        </ItemDrawer>
+      )}
     </div>
   );
 }
 
-function Job({ c }: { c: TabContext }) {
+function Instructions({ c }: { c: TabContext }) {
   const t = useTranslate();
-  const hireBlock = useContext(HireBlock);
-  // The job is edited over the same operator-only route; say so in its own words.
-  const jobBlock = hireBlock === OPERATOR_HIRE_REASON ? "Only the operator can edit the job." : hireBlock;
-  // The board serves the saved text to the operator only; anyone else sees
-  // the role's job line in the hero and no text box.
+  // The board serves the saved text to the operator only.
   const served = c.detail?.agent.instructions ?? null;
   const [text, setText] = useState(served ?? "");
   const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [applies, setApplies] = useState<string | null>(null);
-  const operator = hireBlock === null;
+  if (c.hired) {
+    return c.hired.job ? (
+      <p className="rc-profile-job">{c.hired.job}</p>
+    ) : (
+      <Note>{t("Only the operator can read this agent’s instructions.")}</Note>
+    );
+  }
   const save = async () => {
-    if (!operator || saving) return;
+    if (!c.writable || saving) return;
     setSaving(true);
-    setErr(null);
-    setApplies(null);
     try {
       const out = await api.setAgentInstructions(c.alias, text);
-      setApplies(out.applies);
+      c.toast("ok", `${t("Saved.")} ${t(appliesText(out.applies))}`);
       c.onSaved();
     } catch (error) {
-      setErr(error instanceof ApiError || error instanceof Error ? error.message : String(error));
+      c.toast("err", error instanceof ApiError || error instanceof Error ? error.message : String(error));
     } finally {
       setSaving(false);
     }
   };
   if (c.detailNotServed) {
-    if (c.role?.instructions) return <JobSummary text={c.role.instructions} />;
+    if (c.role?.instructions) return <p className="rc-profile-job">{c.role.instructions}</p>;
     return <Note>{c.role ? t("This agent was hired as {role}.").replace("{role}", () => c.role!.title) : t("This board doesn’t show job text for this agent.")}</Note>;
   }
   if (c.detailFailed && !c.detail) return <Note>{t("Agent details are unavailable.")}</Note>;
@@ -550,181 +444,108 @@ function Job({ c }: { c: TabContext }) {
   }
   return (
     <div className="ap-body">
-      <label className="rc-fld">
-        <span className="lab">{t("Standing instructions")}</span>
-        <textarea
-          className="field rc-text"
-          style={{ minHeight: "17.5rem" }}
-          value={text}
-          readOnly={!operator}
-          onChange={(event) => setText(event.target.value)}
-        />
-        <span className="hint">
-          {c.role
-            ? t("Started from the {role} role. Edits change only this agent and apply from its next turn.").replace(
-                "{role}",
-                () => c.role!.title,
-              )
-            : t("Edits change only this agent.")}
-        </span>
-      </label>
-      {operator ? (
+      <textarea
+        className="field rc-text"
+        style={{ minHeight: "24rem" }}
+        aria-label={t("Instructions")}
+        value={text}
+        readOnly={!c.writable}
+        onChange={(event) => setText(event.target.value)}
+      />
+      {c.writable && (
         <div className="rc-sugs">
-          <Button variant="primary" size="sm" disabled={saving} onClick={() => void save()}>
-            {saving ? t("Saving…") : t("Save")}
-          </Button>
-          {c.role && (
+          {text !== served && (
+            <Button variant="primary" size="sm" disabled={saving} onClick={() => void save()}>
+              {saving ? t("Saving…") : t("Save")}
+            </Button>
+          )}
+          {c.role && text !== c.role.instructions && (
             <Button size="sm" onClick={() => setText(c.role!.instructions)}>
               {t("Reset to role")}
             </Button>
           )}
         </div>
-      ) : (
-        <Note>{jobBlock === null ? null : t(jobBlock)}</Note>
       )}
-      {applies && (
-        <p className="ap-saved" role="status">
-          {t("Saved.")} {t(appliesText(applies))}
-        </p>
-      )}
-      {err && (
-        <p role="alert" className="text-label text-fail">
-          {err}
-        </p>
-      )}
-    </div>
-  );
-}
-
-function Knowledge({ c }: { c: TabContext }) {
-  const t = useTranslate();
-  const project = c.detail?.agent.turn_project ?? null;
-  return (
-    <div className="ap-body">
-      <Panel title="Its memory" onTab={c.onTab}>
-        <Note>
-          {t(
-            "Planned: per-agent memory. Today memory is per project, proposed by agents and approved by two reviewers.",
-          )}
-        </Note>
-      </Panel>
-      <Panel title="Reads" onTab={c.onTab}>
-        <Rows>
-          <Row left={t("Workspace wiki")} right="global/" />
-          <Row
-            left={t("Project notes of the ticket it works on")}
-            right={
-              project
-                ? `projects/${project}/`
-                : t("projects/<key>/ — only while on that ticket")
-            }
-          />
-          <Row left={t("Files you attach in a thread")} right={t("per conversation")} />
-        </Rows>
-      </Panel>
-      <Panel title="Its notes" onTab={c.onTab}>
-        <Rows>
-          <div className="ap-row">
-            <span className="num">{`agents/${c.alias}/knowledge`}</span>
-            <Button
-              variant="ghost"
-              size="sm"
-              href={`/wiki/agents/${encodeURIComponent(c.alias)}/knowledge`}
-            >
-              {t("Open")}
-            </Button>
-          </div>
-        </Rows>
-      </Panel>
     </div>
   );
 }
 
 function Skills({ c }: { c: TabContext }) {
   const t = useTranslate();
+  const [open, setOpen] = useState<string | null>(null);
+  const named = c.role?.skills ?? [];
+  // A runtime loads every bundled skill. A profile has no runtime, so all that
+  // is known is what its role names, and a hand-written one names nothing.
+  const bundled = c.hired ? [] : BUNDLED_SKILLS.map((skill) => skill.name as string);
+  const names = [...bundled, ...named.filter((name) => !bundled.includes(name))];
+  const line = (name: string) =>
+    BUNDLED_SKILLS.find((skill) => skill.name === name)?.line ?? "Named by its role";
+  if (names.length === 0) return <Note>{t("No skills are recorded for this agent.")}</Note>;
   return (
     <div className="ap-body">
-      <Panel title="Skills" onTab={c.onTab}>
-        <Rows>
-          {BUNDLED_SKILLS.map((skill) => {
-            const on = c.role ? c.role.skills.includes(skill) : true;
-            return (
-              <div key={skill} className="ap-row">
-                <span>
-                  <b className="rt">{skill}</b> <span className="kind">{t("bundled")}</span>
-                </span>
-                <span className={`ap-pill ${on ? "on" : "off"}`}>{on ? t("on") : t("off")}</span>
-              </div>
-            );
-          })}
-        </Rows>
-      </Panel>
-      <Note>
-        {t(
-          "Today every agent on the machine loads all four bundled skills. On/off per agent is planned (per-home skills dir or Pi --skill).",
-        )}
-      </Note>
+      <Rows>
+        {names.map((name) => (
+          <ManageRow key={name} id={`skill-${name}`} name={name} line={t(line(name))} onOpen={() => setOpen(name)} />
+        ))}
+      </Rows>
+      {open && (
+        <ItemDrawer title={open} onClose={() => setOpen(null)}>
+          <p className="ap-drawer-lead">{t(line(open))}</p>
+          <Facts
+            items={[
+              ["Source", t(bundled.includes(open) ? "Bundled" : "Role")],
+              ["Loaded", t(bundled.includes(open) ? "In every session" : "Not recorded")],
+              ["Named by its role", c.role ? t(named.includes(open) ? "Yes" : "No") : null],
+            ]}
+          />
+        </ItemDrawer>
+      )}
     </div>
   );
 }
 
 function Tools({ c }: { c: TabContext }) {
   const t = useTranslate();
+  const [open, setOpen] = useState<string | null>(null);
+  const BUILT_IN = "cadence";
+  const line = (name: string) => (name === BUILT_IN ? "Tickets, threads and reports" : "Named by its role, not connected");
+  const names = [BUILT_IN, ...(c.role?.tools ?? []).filter((name) => name !== BUILT_IN)];
   return (
     <div className="ap-body">
-      <Panel title="MCP servers & connections" onTab={c.onTab}>
-        <Rows>
-          <div className="ap-row">
-            <span>
-              <b className="rt">cadence</b> <span className="kind">{t("built in")}</span>
-              <br />
-              <small>{t("Tickets, threads, reports")}</small>
-            </span>
-            <span className="ap-pill on">{t("on")}</span>
-          </div>
-          {(c.role?.tools ?? []).map((tool) => (
-            <div key={tool} className="ap-row">
-              <span>{tool}</span>
-              <small className="pl">{t("planned")}</small>
-            </div>
-          ))}
-        </Rows>
-        <div className="rc-sugs" style={{ marginTop: "0.65rem" }}>
-          <Button size="sm" disabled title={t("Per-agent MCP is planned (CAD-1754)")}>
-            ＋ {t("Add MCP server")}
-          </Button>
-          <Button size="sm" disabled title={t("Per-agent grants are planned (CAD-1754)")}>
-            ＋ {t("Connect an app")}
-          </Button>
-        </div>
-      </Panel>
-      <Panel title="Rules" onTab={c.onTab}>
-        <Rows>
-          <div className="ap-row">
-            <span>{t("Asks you before sending or publishing")}</span>
-            <small className="pl">{t("planned")}</small>
-          </div>
-          <div className="ap-row">
-            <span>
-              {c.role?.kind === "apps"
-                ? t("Read-only on app data")
-                : t("Works only in the ticket's worktree")}
-            </span>
-            <small>{t("enforced by confinement")}</small>
-          </div>
-        </Rows>
-      </Panel>
-      <Note>
-        {t(
-          "Today: no per-agent MCP config; Claude --allow and platform grants are CLI-only. Logins and keys never come with a role.",
-        )}
-      </Note>
+      <Rows>
+        {names.map((name) => (
+          <ManageRow key={name} id={`tool-${name}`} name={name} line={t(line(name))} onOpen={() => setOpen(name)} />
+        ))}
+      </Rows>
+      {open && (
+        <ItemDrawer title={open} onClose={() => setOpen(null)}>
+          <p className="ap-drawer-lead">{t(line(open))}</p>
+          <Facts items={[["Source", t(open === BUILT_IN ? "Built in" : "Role")]]} />
+        </ItemDrawer>
+      )}
     </div>
   );
 }
 
-function Settings({ c }: { c: TabContext }) {
+function ModelSection({ c }: { c: TabContext }) {
   const t = useTranslate();
+  if (c.hired) {
+    return (
+      <Panel title="Model">
+        <Facts items={[["Model", c.hired.model === "inherit" ? t("Inherit from the runtime") : c.hired.model]]} />
+      </Panel>
+    );
+  }
+  return (
+    <Panel title="Model, effort & usage">
+      {c.profile ? <ProfileBlock agent={c.profile} /> : <Note>{t(c.detailFailed ? "Agent details are unavailable." : "Loading agent details…")}</Note>}
+    </Panel>
+  );
+}
+
+function RuntimeSection({ c }: { c: TabContext }) {
+  const t = useTranslate();
+  if (c.hired) return null;
   const a = c.detail?.agent;
   const identity: [string, unknown][] = a
     ? [
@@ -739,42 +560,36 @@ function Settings({ c }: { c: TabContext }) {
       ]
     : [];
   const shown = (v: unknown) => v !== null && v !== undefined && v !== "";
-  const profile = c.profile;
-  const lifecycle = c.lifecycle;
   return (
-    <div className="ap-body">
-      <Panel title="Model, effort & usage" onTab={c.onTab}>
-        {profile ? <ProfileBlock agent={profile} /> : <Note>{t(c.detailFailed ? "Agent details are unavailable." : "Loading agent details…")}</Note>}
-      </Panel>
-      <Panel title="Runtime" onTab={c.onTab}>
-        {a ? (
-          <dl className="rc-kv">
-            <dt>{t("runtime")}</dt>
-            <dd>
-              {a.provider} / {a.endpoint_kind} ·{" "}
-              {c.observed && agentLocation(c.observed) === "cloud"
-                ? t("cloud")
-                : c.hosted
-                  ? t("agenticos gateway")
-                  : t("local")}
-            </dd>
-            <dt>{t("home")}</dt>
-            <dd>{a.cwd ?? "—"}</dd>
-            <dt>{t("team role")}</dt>
-            <dd>{a.team_role ?? c.observed?.team_role ?? "—"}</dd>
-            <dt>{t("profile")}</dt>
-            <dd>{typeof a.params?.profile === "string" ? a.params.profile : "—"}</dd>
-            {identity
-              .filter(([, v]) => shown(v))
-              .map(([k, v]) => (
-                <div key={k} className="contents">
-                  <dt>{k}</dt>
-                  <dd title={String(v)}>{String(v)}</dd>
-                </div>
-              ))}
-            {Object.entries(a.params ?? {})
-              .filter(([k]) => k !== "profile")
-              .map(([k, v]) => (
+    <Panel title="Runtime">
+      {a ? (
+        <dl className="rc-kv">
+          <dt>{t("runtime")}</dt>
+          <dd>
+            {a.provider} / {a.endpoint_kind} ·{" "}
+            {c.observed && agentLocation(c.observed) === "cloud"
+              ? t("cloud")
+              : c.hosted
+                ? t("agenticos gateway")
+                : t("local")}
+          </dd>
+          <dt>{t("home")}</dt>
+          <dd>{a.cwd ?? "—"}</dd>
+          <dt>{t("team role")}</dt>
+          <dd>{a.team_role ?? c.observed?.team_role ?? "—"}</dd>
+          <dt>{t("profile")}</dt>
+          <dd>{typeof a.params?.profile === "string" ? a.params.profile : "—"}</dd>
+          {identity
+            .filter(([, v]) => shown(v))
+            .map(([k, v]) => (
+              <div key={k} className="contents">
+                <dt>{k}</dt>
+                <dd title={String(v)}>{String(v)}</dd>
+              </div>
+            ))}
+          {Object.entries(a.params ?? {})
+            .filter(([k]) => k !== "profile")
+            .map(([k, v]) => (
               <div key={k} className="contents">
                 <dt title={`param ${k}`}>{k}</dt>
                 <dd title={typeof v === "string" ? v : JSON.stringify(v)}>
@@ -782,78 +597,77 @@ function Settings({ c }: { c: TabContext }) {
                 </dd>
               </div>
             ))}
-          </dl>
-        ) : c.detailNotServed ? (
-          <Note>{t("This board doesn’t report runtime details.")}</Note>
-        ) : c.detailFailed ? (
-          <Note>{t("Agent details are unavailable.")}</Note>
-        ) : (
-          <Note>{t("Loading agent details…")}</Note>
-        )}
-      </Panel>
+        </dl>
+      ) : c.detailNotServed ? (
+        <Note>{t("This board doesn’t report runtime details.")}</Note>
+      ) : c.detailFailed ? (
+        <Note>{t("Agent details are unavailable.")}</Note>
+      ) : (
+        <Note>{t("Loading agent details…")}</Note>
+      )}
       {c.resume && (
-        <Panel title="Resume command" onTab={c.onTab}>
-          <p className="text-label text-ink-400 mb-2">
+        <>
+          <p className="text-label text-ink-400 my-2">
             {c.observed?.resume_hint ?? t("For use in a terminal by the operator.")}
           </p>
           <pre className="ap-code">{c.resume}</pre>
-        </Panel>
+        </>
       )}
-      <Panel title="Lifecycle" onTab={c.onTab}>
-        <div className="rc-sugs">
-          {(c.fenced || c.deadHolding || lifecycle === "idle-holding") && (
-            <>
-              <Button size="sm" disabled title={t("Resume is not wired from the board yet")}>
-                {t("Resume")}
-              </Button>
-              <Button size="sm" variant="danger" disabled title={t("Claim release is not wired from the board yet")}>
-                {t("Release claim")}
-              </Button>
-            </>
-          )}
-          {(c.fenced || c.deadHolding) && (
-            <>
-              <Button size="sm" disabled title={t("Reassignment is not wired from the board yet")}>
-                {t("Reassign")}
-              </Button>
-              <Button
-                size="sm"
-                variant="danger"
-                disabled
-                title={t("Unfence runs from the To do rail, where the operator records the outcome")}
-              >
-                {t("Unfence")}
-              </Button>
-            </>
-          )}
-          {(lifecycle === "stale-inbox" || (profile && profile.queued > 0)) && (
-            <>
-              <Button size="sm" disabled title={t("Inbox draining is not wired from the board yet")}>
-                {t("Drain inbox")}
-              </Button>
-              <Button size="sm" variant="danger" disabled title={t("Archiving is not wired from the board yet")}>
-                {t("Archive")}
-              </Button>
-            </>
-          )}
-          {lifecycle === "active" && (
-            <Button size="sm" variant="danger" disabled title={t("Stopping a turn is not wired from the board yet")}>
-              {t("Stop")}
-            </Button>
-          )}
-          <Button size="sm" disabled title={t("Pause is not wired from the board yet")}>
-            {t("Pause")}
-          </Button>
-          <Button size="sm" disabled title={t("Restart is not wired from the board yet")}>
-            {t("Restart")}
-          </Button>
-          <Button size="sm" variant="danger" disabled title={t("Retiring is not wired from the board yet")}>
-            {t("Retire")}
+    </Panel>
+  );
+}
+
+function KnowledgeSection({ c }: { c: TabContext }) {
+  const t = useTranslate();
+  const project = c.detail?.agent.turn_project ?? null;
+  // A hosted profile's folder is keyed by its id, and the board names it. Only
+  // a native agent's folder is built from its alias.
+  const root = c.hired?.wiki_root ?? `agents/${c.alias}`;
+  const folder = `${root}/knowledge`;
+  return (
+    <Panel title="Knowledge">
+      <Rows>
+        <Row left={t("Workspace wiki")} right="global/" />
+        <Row
+          left={t("Project notes of the ticket it works on")}
+          right={project ? `projects/${project}/` : t("projects/<key>/ — only while on that ticket")}
+        />
+        <div className="ap-row">
+          <span className="num min-w-0 break-words">{folder}</span>
+          <Button variant="ghost" size="sm" href={`/wiki/${folder.split("/").map(encodeURIComponent).join("/")}`}>
+            {t("Open")}
           </Button>
         </div>
-        <Note>{t("read-only in this stage")}</Note>
-      </Panel>
+      </Rows>
+    </Panel>
+  );
+}
+
+/** The gear: everything about the agent that isn't one of its sections. */
+export function SettingsDrawer({ c, onClose }: { c: TabContext; onClose: () => void }) {
+  const t = useTranslate();
+  const body = (
+    <div className="ap-body">
+      <ModelSection c={c} />
+      {c.stats.some(([, value]) => value !== "—") && (
+        <Panel title="Figures">
+          <Facts items={c.stats.map(([label, value]) => [label, value])} />
+        </Panel>
+      )}
+      <RuntimeSection c={c} />
+      <KnowledgeSection c={c} />
+      {!c.hired && <Access c={c} />}
     </div>
+  );
+  return (
+    <DrawerShell
+      kind="agent-settings"
+      label={t("Agent settings")}
+      title={t("Settings")}
+      subtitle={c.alias}
+      tabs={[{ id: "settings", label: t("Settings"), panel: body }]}
+      onClose={onClose}
+    />
   );
 }
 
@@ -868,6 +682,7 @@ function Access({ c }: { c: TabContext }) {
   const t = useTranslate();
   const [access, setAccess] = useState<AgentAccess | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
+  const [notServed, setNotServed] = useState(false);
   useEffect(() => {
     let live = true;
     setAccess(null);
@@ -878,7 +693,9 @@ function Access({ c }: { c: TabContext }) {
         if (live) setAccess(data);
       })
       .catch((error: unknown) => {
-        if (live) setFailure(error instanceof ApiError ? error.message : String(error));
+        if (!live) return;
+        if (error instanceof ApiError && error.status === 501 && error.code === "not_implemented") setNotServed(true);
+        else setFailure(error instanceof ApiError ? error.message : String(error));
       });
     return () => {
       live = false;
@@ -905,17 +722,15 @@ function Access({ c }: { c: TabContext }) {
             {t("No callable capability inventory is reported for this agent yet.")}
           </p>
         )}
-        <div className="flex flex-wrap gap-2 mt-2">
-          <Button size="sm" onClick={() => c.onTab("skills")}>{t("Skills")}</Button>
-          <Button size="sm" onClick={() => c.onTab("tools")}>{t("MCP & tools")}</Button>
-        </div>
       </section>
 
       <section>
         <div className="ap-panel-h">
           <h3>{t("Connections")}</h3>
         </div>
-        {failure ? (
+        {notServed ? (
+          <p className="text-label text-ink-500">{t("This board doesn’t record connection access.")}</p>
+        ) : failure ? (
           <p className="text-label text-warn" role="alert">{t(failure)}</p>
         ) : access === null ? (
           <p className="text-label text-ink-500">{t("Reading connection access…")}</p>
@@ -999,14 +814,16 @@ function Access({ c }: { c: TabContext }) {
         <p className="text-micro text-ink-500 mt-1">
           {t("Credentials, decryption and management permits never reach this agent. Changing grants or custody is the operator's action in Settings.")}
         </p>
-        <div className="flex flex-wrap gap-2 mt-2">
-          <Button size="sm" onClick={() => navigate("/settings/permissions")}>
-            {t("Master permissions")}
-          </Button>
-          <Button size="sm" onClick={() => navigate("/settings/connections")}>
-            {t("Connections")}
-          </Button>
-        </div>
+        {c.writable && (
+          <div className="flex flex-wrap gap-2 mt-2">
+            <Button size="sm" onClick={() => navigate("/settings/permissions")}>
+              {t("Master permissions")}
+            </Button>
+            <Button size="sm" onClick={() => navigate("/settings/connections")}>
+              {t("Connections")}
+            </Button>
+          </div>
+        )}
       </section>
     </div>
   );
@@ -1014,23 +831,13 @@ function Access({ c }: { c: TabContext }) {
 
 export default function AgentTabBody({ tab, c }: { tab: AgentTab; c: TabContext }) {
   switch (tab) {
-    case "work":
-      return <Work c={c} />;
     case "history":
       return <History c={c} />;
-    case "job":
-      return <Job c={c} />;
-    case "knowledge":
-      return <Knowledge c={c} />;
     case "skills":
       return <Skills c={c} />;
     case "tools":
       return <Tools c={c} />;
-    case "access":
-      return <Access c={c} />;
-    case "settings":
-      return <Settings c={c} />;
     default:
-      return <Overview c={c} />;
+      return <Instructions c={c} />;
   }
 }

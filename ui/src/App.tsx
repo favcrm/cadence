@@ -1409,6 +1409,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               update((c) => ({ ...c, route: { screen: "agents", alias: null, ask: true } }))
             }
             onOpenAgent={openAgent}
+            onToast={say}
             onTab={(tab) =>
               update((c) => ({
                 ...c,

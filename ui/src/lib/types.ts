@@ -650,7 +650,8 @@ export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & { agents: Agent
 
 /** One profile of `GET /api/agents` (CAD-1989): who an agent is, with the
  *  aliases of the runtimes registered against it. */
-export type HiredProfile = Api.AgentProfile;
+/** `wiki_root` is the hosted board's: a native profile's folder is its alias. */
+export type HiredProfile = Api.AgentProfile & { wiki_root?: string };
 
 /** Best-effort destination for a verified app-scoped master turn. This is
  * navigation metadata only; the app route proves its binding independently. */

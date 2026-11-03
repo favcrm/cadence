@@ -58,13 +58,14 @@ check(appliesText("next_turn") === "Applies from its next turn", "next turn word
 check(appliesText("not_delivered").startsWith("Saved, but"), "undelivered wording is honest");
 
 // Tabs and history chips.
-check(parseAgentTab("job") === "job" && parseAgentTab("nope") === "overview", "unknown tab falls back");
+check(parseAgentTab("instructions") === "instructions" && parseAgentTab("nope") === "overview" && parseAgentTab("constructor") === "overview", "unknown tab falls back");
+check(parseAgentTab("job") === "instructions" && parseAgentTab("access") === "settings" && parseAgentTab("knowledge") === "settings" && parseAgentTab("work") === "overview", "a moved section's old link lands where it went");
 check(historyKind("report_filed") === "reports" && historyKind("memory_proposed") === "memory", "history kinds");
 
 // The agent page and catalogue ride the URL.
-const page = readLocation("/agents/dev-1", "?tab=job");
-check(page.route.screen === "agents" && page.route.alias === "dev-1" && page.route.tab === "job", "tab is read from the query");
-check(locationHref(page, "") === "/agents/dev-1?tab=job", "tab is written back");
+const page = readLocation("/agents/dev-1", "?tab=instructions");
+check(page.route.screen === "agents" && page.route.alias === "dev-1" && page.route.tab === "instructions", "tab is read from the query");
+check(locationHref(page, "") === "/agents/dev-1?tab=instructions", "tab is written back");
 const plain = readLocation("/agents/dev-1", "");
 check(locationHref(plain, "") === "/agents/dev-1", "overview keeps a clean URL");
 const recruit = readLocation("/agents", "?recruit=1");

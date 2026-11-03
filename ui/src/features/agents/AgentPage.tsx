@@ -2,14 +2,16 @@ import { useContext, useEffect, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
+import { IconSettings } from "../../ui/icons";
 import { useWriteBlock, WriteGate } from "../auth/WriteGate";
 import type { Agent, AgentDetail, HiredProfile } from "../../lib/types";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import AgentChat, { type ChatGate } from "./AgentChat";
 import { ConnectRuntime, ProfileDetails, workText } from "./ProfileSeat";
+import type { ToastMsg } from "../../ui/Toast";
 import { seatStatus } from "./SeatCard";
 import { RecoveryBlock } from "./AgentProfile";
-import AgentTabBody, { type TabContext } from "./AgentTabs";
+import AgentTabBody, { SettingsDrawer, Work, type TabContext } from "./AgentTabs";
 import {
   categoryLabel,
   durationText,
@@ -56,6 +58,21 @@ const TONE: Record<string, string> = {
   ink: "var(--color-ink-500)",
 };
 
+/** Whether the browser believes it has a connection. */
+function useOnline(): boolean {
+  const [online, setOnline] = useState(navigator.onLine);
+  useEffect(() => {
+    const update = () => setOnline(navigator.onLine);
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
+    return () => {
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
+    };
+  }, []);
+  return online;
+}
+
 /** The full agent page at `agents/<alias>`: hero, stats, tabs. It replaces
  *  the old drawer and carries every banner and guard the drawer had. */
 export default function AgentPage({
@@ -76,6 +93,7 @@ export default function AgentPage({
   onRetryAccess,
   hostedBoard,
   hiredWork,
+  onToast,
 }: {
   alias: string;
   observed?: Agent;
@@ -97,6 +115,7 @@ export default function AgentPage({
   hostedBoard: boolean;
   /** What a runtime-less profile's card names, if anything. */
   hiredWork: ProfileWork | null;
+  onToast: (kind: ToastMsg["kind"], text: string) => void;
 }) {
   const boardBlock = useContext(WriteGate);
   const writeBlock = useWriteBlock(operator !== true) ?? boardBlock;
@@ -106,9 +125,9 @@ export default function AgentPage({
   const [notServed, setNotServed] = useState(false);
   const [retry, setRetry] = useState(0);
 
+  const online = useOnline();
   const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
-  // A runtime-less profile has no sections to read, so every link lands on its page.
-  const chat = tab === "overview" || hired !== undefined;
+  const chat = tab === "overview";
   const leave = chat ? onBack : () => onTab("overview");
   useEffect(() => {
     // A runtime-less profile is not a registered agent: there is nothing to read.
@@ -138,6 +157,8 @@ export default function AgentPage({
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
+      // An open drawer takes Esc for itself, wherever focus is.
+      if (document.querySelector("[data-drawer]") !== null) return;
       const target = event.target;
       if (
         target instanceof HTMLElement &&
@@ -169,15 +190,14 @@ export default function AgentPage({
       }
     : observed;
   const isCloud = conversationalOnlyCloud(profile);
+  const mailbox = profile?.inbox === true || profile?.provider === "inbox";
   const fenced = detail?.fenced ?? observed?.fenced;
   const recovery = detail?.recovery ?? observed?.recovery;
   const resume = detail?.resume ?? observed?.resume;
   const lifecycle = profile ? lifecycleOf(profile) : "normal";
   const deadHolding = profile ? agentHoldsWorkButDead(profile) : false;
   const params = (a?.params ?? observed?.params) as Record<string, unknown> | undefined;
-  const role = profile
-    ? roleOf({ alias }, roles.data, profiles)
-    : null;
+  const role = profile || hired ? roleOf({ alias }, roles.data, profiles) : null;
   const badge = profile ? lifecycleBadge(profile, t) : null;
   const where = isCloud
     ? t("a cloud runtime")
@@ -213,12 +233,12 @@ export default function AgentPage({
     role,
     hosted,
     resume,
-    fenced,
-    lifecycle,
-    deadHolding,
     onOpenIssue,
-    onTab,
     onSaved: () => setRetry((n) => n + 1),
+    hired,
+    writable: operator === true && boardBlock === null && online,
+    toast: onToast,
+    stats,
     // Without a roster row nothing is known about the agent, so this reads as
     // the failure it is: the board's "not recorded" is only about a known agent.
     detailFailed: unread,
@@ -334,7 +354,6 @@ export default function AgentPage({
 
   if (chat) {
     const status = profile ? seatStatus(profile, t) : null;
-    const mailbox = profile?.inbox === true || profile?.provider === "inbox";
     const boardIsHosted = hostedBoard || hosted;
     const gate: ChatGate | null = !rosterLoaded
       ? {
@@ -386,9 +405,6 @@ export default function AgentPage({
         look={agentLook(alias, params)}
         expectation={t(dmExpectation(profile))}
         attach={!boardIsHosted}
-        actions={
-          gate === null && !isCloud ? <Button onClick={() => onTab("work")}>{t("Assign work")}</Button> : null
-        }
         block={writeBlock}
         onBack={onBack}
         onOpenIssue={onOpenIssue}
@@ -431,17 +447,20 @@ export default function AgentPage({
         }
         panel={
           hired ? (
-            <ProfileDetails
-              profile={hired}
-              work={hiredWork}
-              onOpenIssue={onOpenIssue}
-            />
+            <div className="ag-chat-panel-body">
+              <ProfileDetails
+                profile={hired}
+                work={hiredWork}
+                onOpenIssue={onOpenIssue}
+              />
+              <Button onClick={() => onTab("instructions")}>{t("Manage profile")}</Button>
+            </div>
           ) : isCloud ? (
             cloudCards
           ) : (
             <div className="ag-chat-panel-body">
-              <AgentTabBody key={`${alias}:panel:${detail ? "d" : "n"}`} tab="overview" c={ctx} />
-              <Button onClick={() => onTab("job")}>{t("Manage profile")}</Button>
+              <Work c={ctx} />
+              {!mailbox && <Button onClick={() => onTab("instructions")}>{t("Manage profile")}</Button>}
             </div>
           )
         }
@@ -449,87 +468,59 @@ export default function AgentPage({
     );
   }
 
+  const manageSubline = hired
+    ? hiredWork
+      ? workText(hiredWork, t)
+      : t("Idle · no runtime")
+    : [categoryText ?? a?.role ?? observed?.role ?? t("Agent"), badge?.label, t("runs on {where}").replace("{where}", () => where)]
+        .filter(Boolean)
+        .join(" · ");
+  // The drawer sits over Instructions, so opening it keeps a draft there.
+  const section = tab === "settings" ? "instructions" : tab;
   return (
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
       <button type="button" className="rc-back" onClick={leave}>
-        ← {alias}
+        ← {t("Chat")}
       </button>
       <header className="ap-hero">
         <AgentAvatar
-          slug={agentLook(alias, params)}
-          look={typeof params?.look === "string" ? params.look : undefined}
+          slug={hired ? "custom" : agentLook(alias, params)}
+          look={hired ? (hired.look ?? undefined) : typeof params?.look === "string" ? params.look : undefined}
           still={lifecycle !== "active"}
           active={lifecycle === "active"}
-          size={72}
+          size={48}
         />
         <div className="min-w-0">
           <h1>{alias}</h1>
           <div className="ap-sub">
-            <span>
-              {categoryText ??
-                `${a?.role ?? observed?.role ?? t("Agent")} · ${a?.provider ?? observed?.provider ?? (unread || notServed ? t("Provider not reported") : t("Loading provider"))}${profile ? ` / ${profile.endpoint_kind}` : ""}`}
-            </span>
-            {badge && (
-              <>
-                <span aria-hidden="true">·</span>
-                <span className="rc-dot" style={{ "--c": TONE[badge.tone] } as React.CSSProperties} />
-                <span>{badge.label}</span>
-              </>
-            )}
-            <span aria-hidden="true">·</span>
-            <span>{t("runs on {where}").replace("{where}", () => where)}</span>
+            <span>{manageSubline}</span>
           </div>
-          {observed && (
-            <p className="text-micro text-ink-500 mt-1">
-              {t("Group:")} {observed.group_root ? t("root") : observed.group}
-              {observed.team_role ? ` · ${t("Team role:")} ${observed.team_role}` : ""}
-            </p>
-          )}
-          {role && <p className="ap-job">{role.job}</p>}
         </div>
-        <div className="ap-acts">
-          <Button variant="primary" onClick={() => onTab("overview")}>
-            {t("Message")}
-          </Button>
-          {!isCloud && (
-            <>
-              <Button onClick={() => onTab("work")}>{t("Assign work")}</Button>
-              <Button variant="ghost" size="sm" disabled aria-label={t("More")} title={t("No more actions yet")}>
-                ⋯
-              </Button>
-            </>
-          )}
-        </div>
+        {!isCloud && !mailbox && (
+          <div className="ap-acts">
+            <Button variant="ghost" size="sm" aria-label={t("Agent settings")} title={t("Settings")} onClick={() => onTab("settings")}>
+              <IconSettings />
+            </Button>
+          </div>
+        )}
       </header>
 
       {cloudCards}
 
-      {notices}
+      {!hired && notices}
 
-      {!isCloud && (
+      {mailbox ? (
+        <p className="rc-note">{t("A mailbox has nothing to manage.")}</p>
+      ) : !isCloud && (
         <>
-          {stats.some(([, value]) => value !== "—") && (
-          <div className="ap-stats">
-            {stats.map(([label, value]) => (
-              <div
-                key={label}
-                className="ap-stat"
-                title={value === "—" ? t("Not recorded for this agent") : undefined}
-              >
-                <b className="num">{value}</b>
-                <small>{t(label)}</small>
-              </div>
-            ))}
-          </div>
-          )}
           <nav className="ap-tabs" role="tablist" aria-label={t("Agent sections")}>
-            {AGENT_TABS.filter((entry) => entry.id !== "overview").map((entry) => (
+            {AGENT_TABS.map((entry) => (
               <button
                 key={entry.id}
                 type="button"
                 role="tab"
                 id={`ap-tab-${entry.id}`}
-                aria-selected={tab === entry.id}
+                aria-selected={section === entry.id}
                 aria-controls="ap-panel"
                 className="ap-tab"
                 onClick={() => onTab(entry.id)}
@@ -538,9 +529,10 @@ export default function AgentPage({
               </button>
             ))}
           </nav>
-          <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${tab}`}>
-            <AgentTabBody key={`${alias}:${tab}:${detail ? "d" : "n"}`} tab={tab} c={ctx} />
+          <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${section}`}>
+            <AgentTabBody key={`${alias}:${section}:${detail ? "d" : "n"}`} tab={section} c={ctx} />
           </div>
+          {tab === "settings" && <SettingsDrawer c={ctx} onClose={() => onTab("instructions")} />}
         </>
       )}
     </main>
