@@ -99,11 +99,13 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 /// Every mutation is classified once in [`cli_effect`] / [`wiki_effect`]
 /// (with its reconciliation read), so a timeout, a dropped connection, a 5xx
 /// after forward, or a 2xx without a receipt stays explicitly unresolved.
-/// A 2xx must also carry the verb's own correlated receipt; a malformed or
-/// foreign receipt is the same unknown outcome, never a false success. The
-/// wiki `write` action is classified the same way on its own surface. A proven
-/// pre-effect refusal keeps its definite verdict. For `message_send`, the
-/// caller-chosen `message` id in
+/// A 2xx must also carry the verb's own correlated receipt: issue, project,
+/// wiki and team writes name the thing written, and settings writes answer
+/// their own bounded receipt. A malformed or foreign receipt is the same
+/// unknown outcome, never a false success. The wiki `write` action is
+/// classified the same way on its own surface. A proven pre-effect refusal
+/// keeps its definite verdict. For `message_send`, the caller-chosen `message`
+/// id in
 /// `arguments` is the reconciliation key: `message_read` returns the
 /// principal's own durable message by id, and resubmitting the same id
 /// dedupes server-side — never a blind replay. A 2xx proves the enqueue
@@ -308,7 +310,9 @@ const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or ma
 const RECONCILE_TEAM: &str =
     "the team change may or may not have been applied — inspect `team list` or \
      `team invites` with the same explicit --org before repeating it";
-const RECONCILE_SETTINGS: &str = "the settings change may or may not have been applied — read `settings agents snapshot` (and `history`) before repeating it";
+const RECONCILE_SETTINGS: &str = "the settings change may or may not have been applied — read `settings agents show` (and `settings agents history`) with the same explicit --org before repeating it";
+const RECONCILE_SETTINGS_GRANTS: &str = "the grant change may or may not have been applied — read `settings agents grant list` with the same explicit --org before repeating it";
+const RECONCILE_MASTER_STATUS: &str = "the master resume may or may not have been applied — read `master status` with the same explicit --org before repeating it";
 const RECONCILE_AUDIT_APPROVE: &str = "the approval may or may not have been recorded — read `audit approval` for the same repo and head before repeating it";
 const RECONCILE_AUDIT_APPROVE_PROJECT: &str = "the approval may or may not have been recorded — read `audit approval` for the same issue, repo and head before repeating it";
 const RECONCILE_AUDIT_VERDICT: &str = "the verdict may or may not have been recorded — read `audit verdicts` for the same head before repeating it";
@@ -413,7 +417,7 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if settings_op_scope(operation) == "settings.write" {
-                mutation(RECONCILE_SETTINGS)
+                mutation(settings_reconcile(operation))
             } else {
                 Effect::Read
             }
@@ -426,6 +430,21 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
         }
         Surface::Cli => cli_effect(verb),
         Surface::Wiki => wiki_effect(verb),
+    }
+}
+
+/// Operation-specific read for a settings mutation whose answer was lost or
+/// unusable. Ordinary config writes reconcile with `settings agents show`;
+/// grant mutations with `settings agents grant list` (where requests/grants
+/// live); the bounded master recovery with `master status`. Unknown operations
+/// take the conservative show/history default.
+fn settings_reconcile(operation: &str) -> &'static str {
+    match operation {
+        "master.resume" => RECONCILE_MASTER_STATUS,
+        "grant.request" | "grant.allow" | "grant.reject" | "grant.revoke" => {
+            RECONCILE_SETTINGS_GRANTS
+        }
+        _ => RECONCILE_SETTINGS,
     }
 }
 
@@ -706,6 +725,1067 @@ fn upload_receipt_correlates(
             .and_then(Value::as_str)
             .is_some_and(|rev| !rev.is_empty());
     digest || text || committed
+}
+
+/// A platform team mutation receipt names the entity this call changed, and
+/// the tenant parses it with the membership wire schema before answering:
+/// `{invite}` (id, email, role, status, createdAt, expiresAt), `{member}`
+/// (userId, name, email, role, joinedAt) and `{removed}` (the removed
+/// userId). The server normalizes an invite address to trimmed lowercase at
+/// its boundary and answers `201` for a new invite (the requested role) or
+/// `200` for an existing live pending invite, whose stored role may
+/// legitimately differ from the requested one. A reply that does not name
+/// the sent entity proves nothing about this write.
+fn team_receipt_correlates(
+    verb: &str,
+    status: u16,
+    reply: &Value,
+    arguments: &Map<String, Value>,
+) -> bool {
+    let invite = || reply.get("invite").filter(|value| value.is_object());
+    match verb {
+        "team_invite" => {
+            let (Some(invite), Some(email), Some(requested)) = (
+                invite(),
+                argument_text(arguments, "email"),
+                argument_text(arguments, "role"),
+            ) else {
+                return false;
+            };
+            let stored = membership_role(invite);
+            nonempty_text(invite.get("id")).is_some()
+                && nonempty_text(invite.get("email")).is_some()
+                && stored.is_some()
+                && nonempty_text(invite.get("createdAt")).is_some()
+                && nonempty_text(invite.get("expiresAt")).is_some()
+                && invite.get("status").and_then(Value::as_str) == Some("pending")
+                // `201` created the invite for the requested role; `200` is
+                // an existing live pending invite whose role is stored state.
+                && matches!(status, 200 | 201)
+                && (status != 201 || stored == Some(requested))
+                && invite
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .is_some_and(|got| normalized_email_matches(email, got))
+        }
+        "team_revoke_invite" => {
+            let (Some(invite), Some(id)) = (invite(), argument_text(arguments, "invite_id")) else {
+                return false;
+            };
+            status == 200
+                && nonempty_text(invite.get("email")).is_some()
+                && membership_role(invite).is_some()
+                && nonempty_text(invite.get("createdAt")).is_some()
+                && nonempty_text(invite.get("expiresAt")).is_some()
+                && invite.get("id").and_then(Value::as_str) == Some(id)
+                && invite.get("status").and_then(Value::as_str) == Some("revoked")
+        }
+        "team_set_role" => {
+            let (Some(member), Some(user), Some(requested)) = (
+                reply.get("member").filter(|value| value.is_object()),
+                argument_text(arguments, "user_id"),
+                argument_text(arguments, "role"),
+            ) else {
+                return false;
+            };
+            status == 200
+                && member.get("userId").and_then(Value::as_str) == Some(user)
+                && member.get("role").and_then(Value::as_str) == Some(requested)
+                && member.get("name").and_then(Value::as_str).is_some()
+                && member.get("email").and_then(Value::as_str).is_some()
+                && nonempty_text(member.get("joinedAt")).is_some()
+        }
+        "team_remove" => {
+            status == 200
+                && argument_text(arguments, "user_id")
+                    .is_some_and(|id| reply.get("removed").and_then(Value::as_str) == Some(id))
+        }
+        _ => false,
+    }
+}
+
+/// One sent argument, as the nonempty string the team argument shape
+/// already required.
+fn argument_text<'a>(arguments: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    arguments.get(key).and_then(Value::as_str)
+}
+
+/// A present wire string that the membership schema requires nonempty.
+fn nonempty_text(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+/// The stored membership role, when the reply carries the schema's enum.
+fn membership_role(value: &Value) -> Option<&str> {
+    value
+        .get("role")
+        .and_then(Value::as_str)
+        .filter(|role| matches!(*role, "owner" | "member"))
+}
+
+/// The tenant normalizes an invite address to trimmed lowercase
+/// (`createInviteRequestSchema`), so the receipt carries that canonical
+/// spelling; compare the sent address under the same normalization, without
+/// allocating.
+fn normalized_email_matches(sent: &str, received: &str) -> bool {
+    let received = received.trim();
+    !received.is_empty() && lowercase_chars(sent.trim()).eq(lowercase_chars(received))
+}
+
+fn lowercase_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().flat_map(char::to_lowercase)
+}
+
+/// A native settings save answers the committed snapshot document: a
+/// nonempty revision token plus the `config` document it wrote. The native
+/// `build_snapshot` always carries the five row tables and the two maps, so a
+/// document that omits any of them is not that operation's receipt (and a
+/// missing table must never read as "the row was removed").
+fn settings_snapshot_document(reply: &Value) -> bool {
+    let Some(config) = reply.get("config").filter(|config| config.is_object()) else {
+        return false;
+    };
+    reply
+        .get("revision")
+        .and_then(Value::as_str)
+        .is_some_and(|revision| !revision.is_empty())
+        && ["harnesses", "providers", "models", "profiles", "pins"]
+            .iter()
+            .all(|table| config.get(*table).and_then(Value::as_array).is_some())
+        && ["scope", "roleDefaults"]
+            .iter()
+            .all(|map| config.get(*map).is_some_and(Value::is_object))
+}
+
+fn settings_text<'a>(reply: &'a Value, key: &str) -> Option<&'a str> {
+    reply
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+fn settings_payload_text<'a>(
+    payload: Option<&'a Map<String, Value>>,
+    key: &str,
+) -> Option<&'a str> {
+    payload
+        .and_then(|payload| payload.get(key))
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+/// The rows of one config table, only when the document is well formed:
+/// every element is an object carrying a nonempty string identity. Native
+/// `parse_overlay` guarantees that shape for every successful save, so a
+/// malformed row means the snapshot cannot prove absence — a remove must
+/// never read a broken element as "the row is gone".
+fn settings_table<'a>(config: &'a Value, table: &str, identity: &str) -> Option<&'a [Value]> {
+    let rows = config.get(table).and_then(Value::as_array)?;
+    rows.iter()
+        .all(|row| nonempty_text(row.get(identity)).is_some())
+        .then_some(rows.as_slice())
+}
+
+fn settings_row<'a>(config: &'a Value, table: &str, id: &str) -> Option<&'a Value> {
+    settings_table(config, table, "id")?
+        .iter()
+        .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
+}
+
+fn settings_pin<'a>(config: &'a Value, pkg: &str, pinned: &str) -> Option<&'a Value> {
+    settings_table(config, "pins", "pkg")?.iter().find(|row| {
+        row.get("pkg").and_then(Value::as_str) == Some(pkg)
+            && row.get("pinned").and_then(Value::as_str) == Some(pinned)
+    })
+}
+
+/// `normalize_pin`'s canonical pair: `name@version` or `name version`.
+fn normalized_pin_pair(pin: &str) -> Option<(&str, &str)> {
+    if pin.is_empty() {
+        return None;
+    }
+    if let Some((name, version)) = pin.rsplit_once('@') {
+        if name.is_empty()
+            || version.is_empty()
+            || version.contains('@')
+            || name.chars().any(char::is_control)
+            || version.chars().any(char::is_control)
+        {
+            return None;
+        }
+        return Some((name, version));
+    }
+    let (name, version) = pin.split_once(' ')?;
+    if name.is_empty()
+        || version.is_empty()
+        || version.contains(' ')
+        || name.chars().any(char::is_control)
+        || version.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some((name, version))
+}
+
+/// `validate_model_id` trims a model id at the native boundary, so a request
+/// may carry surrounding spaces and still commit the canonical id.
+fn canonical_model_id(id: &str) -> &str {
+    id.trim()
+}
+
+/// `normalize_pin` keeps `name@version` and turns `name version` into
+/// `name@version`; an empty pin stays empty. A supplied pin is committed
+/// under that canonical spelling.
+fn provider_pin_matches(sent: &str, stored: &str) -> bool {
+    if sent.is_empty() {
+        return stored.is_empty();
+    }
+    if sent.contains('@') {
+        return stored == sent;
+    }
+    let Some((name, version)) = sent.split_once(' ') else {
+        return false;
+    };
+    !version.contains(' ')
+        && stored.len() == name.len() + 1 + version.len()
+        && stored.starts_with(name)
+        && stored.as_bytes().get(name.len()) == Some(&b'@')
+        && &stored[name.len() + 1..] == version
+}
+
+/// A supplied field the native merge stores verbatim must equal the committed
+/// row; an absent field keeps the stored value and is not checked.
+fn settings_field_matches(stored: &Value, sent: &Map<String, Value>, key: &str) -> bool {
+    match sent.get(key) {
+        None => true,
+        Some(value) => stored.get(key) == Some(value),
+    }
+}
+
+/// `opt_bool` treats an absent or null `thinking`/`images` as "preserve", so
+/// only a supplied boolean is binding.
+fn settings_tri_field_matches(stored: &Value, sent: &Map<String, Value>, key: &str) -> bool {
+    match sent.get(key) {
+        None | Some(Value::Null) => true,
+        Some(value) => stored.get(key) == Some(value),
+    }
+}
+
+/// A supplied model id (or a profile's model) commits under
+/// `validate_model_id`'s trimmed spelling.
+fn settings_canonical_model_matches(stored: &Value, sent: &Map<String, Value>, key: &str) -> bool {
+    match sent.get(key).and_then(Value::as_str) {
+        None => true,
+        Some(value) => stored.get(key).and_then(Value::as_str) == Some(canonical_model_id(value)),
+    }
+}
+
+/// A profile job is rendered and parsed with `trim()`, so the committed job
+/// is the trimmed request.
+fn settings_trimmed_field_matches(stored: &Value, sent: &Map<String, Value>, key: &str) -> bool {
+    match sent.get(key).and_then(Value::as_str) {
+        None => true,
+        Some(value) => stored.get(key).and_then(Value::as_str) == Some(value.trim()),
+    }
+}
+
+/// A supplied provider pin commits under `normalize_pin`'s canonical spelling;
+/// an absent pin keeps the stored value.
+fn settings_pin_field_matches(stored: &Value, sent: &Map<String, Value>) -> bool {
+    match sent.get("pin") {
+        None => true,
+        Some(value) => value.as_str().is_some_and(|sent_pin| {
+            stored
+                .get("pin")
+                .and_then(Value::as_str)
+                .is_some_and(|stored_pin| provider_pin_matches(sent_pin, stored_pin))
+        }),
+    }
+}
+
+/// `model.put`'s supplied scope is stored on the canonical model id; an
+/// absent scope keeps the stored value.
+fn settings_scope_matches(config: &Value, sent: &Map<String, Value>, id: &str) -> bool {
+    match sent.get("scope") {
+        None => true,
+        Some(value) => value.as_str().is_some_and(|scope| {
+            config
+                .get("scope")
+                .and_then(|scopes| scopes.get(id))
+                .and_then(Value::as_str)
+                == Some(scope)
+        }),
+    }
+}
+
+/// A patch `put` proves itself only when the committed row reflects every
+/// supplied field. The native merge stores supplied strings/bools verbatim,
+/// trims model ids and profile models, trims profile jobs, and normalizes a
+/// provider pin; a null `thinking`/`images` means "preserve".
+fn settings_put_applied(
+    operation: &str,
+    config: &Value,
+    payload: Option<&Map<String, Value>>,
+) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    match operation {
+        "harness.put" => settings_payload_text(Some(payload), "id").is_some_and(|id| {
+            settings_row(config, "harnesses", id).is_some_and(|row| {
+                ["label", "cli", "note"]
+                    .iter()
+                    .all(|key| settings_field_matches(row, payload, key))
+            })
+        }),
+        "provider.put" => settings_payload_text(Some(payload), "id").is_some_and(|id| {
+            settings_row(config, "providers", id).is_some_and(|row| {
+                ["label", "kind", "note", "gate", "paid"]
+                    .iter()
+                    .all(|key| settings_field_matches(row, payload, key))
+                    && settings_pin_field_matches(row, payload)
+            })
+        }),
+        "model.put" => settings_payload_text(Some(payload), "id").is_some_and(|id| {
+            let id = canonical_model_id(id);
+            settings_row(config, "models", id).is_some_and(|row| {
+                ["provider", "ctx", "out"]
+                    .iter()
+                    .all(|key| settings_field_matches(row, payload, key))
+                    && ["thinking", "images"]
+                        .iter()
+                        .all(|key| settings_tri_field_matches(row, payload, key))
+                    && settings_scope_matches(config, payload, id)
+            })
+        }),
+        "profile.put" => settings_payload_text(Some(payload), "id").is_some_and(|id| {
+            settings_row(config, "profiles", id).is_some_and(|row| {
+                settings_field_matches(row, payload, "role")
+                    && settings_canonical_model_matches(row, payload, "model")
+                    && settings_trimmed_field_matches(row, payload, "job")
+            })
+        }),
+        "pin.put" => {
+            let (Some(pkg), Some(pinned)) = (
+                settings_payload_text(Some(payload), "pkg"),
+                settings_payload_text(Some(payload), "pinned"),
+            ) else {
+                return false;
+            };
+            settings_pin(config, pkg, pinned).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// A patch remove proves itself only when the table is well formed and no row
+/// carries the sent identity. A malformed element is unknown, never an absent
+/// row.
+fn settings_remove_applied(
+    operation: &str,
+    config: &Value,
+    payload: Option<&Map<String, Value>>,
+) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    match operation {
+        "harness.remove" => settings_payload_text(Some(payload), "id")
+            .is_some_and(|id| settings_absent(config, "harnesses", id)),
+        "provider.remove" => settings_payload_text(Some(payload), "id")
+            .is_some_and(|id| settings_absent(config, "providers", id)),
+        "model.remove" => settings_payload_text(Some(payload), "id")
+            .is_some_and(|id| settings_absent(config, "models", canonical_model_id(id))),
+        "profile.remove" => settings_payload_text(Some(payload), "id")
+            .is_some_and(|id| settings_absent(config, "profiles", id)),
+        "pin.remove" => settings_payload_text(Some(payload), "pkg")
+            .is_some_and(|pkg| settings_pin_removed(config, pkg)),
+        _ => false,
+    }
+}
+
+fn settings_absent(config: &Value, table: &str, id: &str) -> bool {
+    settings_table(config, table, "id").is_some_and(|rows| {
+        rows.iter()
+            .all(|row| row.get("id").and_then(Value::as_str) != Some(id))
+    })
+}
+
+/// A removed pin may legitimately remain in the projected view when a
+/// Pi-extension provider row declares the same package (`pi_pins` re-adds
+/// provider pins). A remaining pin with no such provider source contradicts
+/// the removal.
+fn settings_pin_removed(config: &Value, pkg: &str) -> bool {
+    let Some(pins) = settings_table(config, "pins", "pkg") else {
+        return false;
+    };
+    let remaining: Vec<&Value> = pins
+        .iter()
+        .filter(|row| row.get("pkg").and_then(Value::as_str) == Some(pkg))
+        .collect();
+    if remaining.is_empty() {
+        return true;
+    }
+    settings_table(config, "providers", "id").is_some_and(|providers| {
+        remaining.iter().all(|row| {
+            let Some(pinned) = row.get("pinned").and_then(Value::as_str) else {
+                return false;
+            };
+            providers.iter().any(|provider| {
+                provider.get("kind").and_then(Value::as_str) == Some("Pi extension")
+                    && provider
+                        .get("pin")
+                        .and_then(Value::as_str)
+                        .and_then(normalized_pin_pair)
+                        == Some((pkg, pinned))
+            })
+        })
+    })
+}
+
+/// A rename proves itself only when the canonical new id is present and the
+/// old id is gone. Renaming to the same id is refused natively, so the two
+/// identities differ on success.
+fn settings_rename_applied(
+    operation: &str,
+    config: &Value,
+    payload: Option<&Map<String, Value>>,
+) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    let (table, canonical) = match operation {
+        "model.rename" => ("models", true),
+        "profile.rename" => ("profiles", false),
+        _ => return false,
+    };
+    let (Some(id), Some(to)) = (
+        settings_payload_text(Some(payload), "id"),
+        settings_payload_text(Some(payload), "to"),
+    ) else {
+        return false;
+    };
+    let (id, to) = if canonical {
+        (canonical_model_id(id), canonical_model_id(to))
+    } else {
+        (id, to)
+    };
+    settings_row(config, table, to).is_some() && settings_absent(config, table, id)
+}
+
+/// `present_overlay` never adds harnesses or profiles, so an applied document
+/// must be reflected as exactly the same identity set — an extra row is a
+/// stale or foreign receipt, not a policy projection.
+/// The applied identity sets are exact: `present_overlay` never adds
+/// harnesses or profiles, and after apply the policy is canonical to the sent
+/// overlay for providers and models. Model ids compare under
+/// `validate_model_id`'s trim; provider ids are exact.
+fn settings_same_id_set(config: &Value, table: &str, sent: &[Value], canonical: bool) -> bool {
+    let Some(stored) = settings_table(config, table, "id") else {
+        return false;
+    };
+    stored.len() == sent.len()
+        && stored.iter().all(|row| {
+            row.get("id").and_then(Value::as_str).is_some_and(|id| {
+                sent.iter().any(|sent| {
+                    sent.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|sent_id| {
+                            if canonical {
+                                canonical_model_id(sent_id) == id
+                            } else {
+                                sent_id == id
+                            }
+                        })
+                })
+            })
+        })
+        && sent.iter().all(|row| {
+            row.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|sent_id| {
+                    let id = if canonical {
+                        canonical_model_id(sent_id)
+                    } else {
+                        sent_id
+                    };
+                    stored
+                        .iter()
+                        .any(|stored| stored.get("id").and_then(Value::as_str) == Some(id))
+                })
+        })
+}
+
+/// `apply` replaces the whole overlay. The receipt proves every sent row is
+/// reflected with its documented fields, exact identity sets for harnesses,
+/// profiles, providers and models, the filtered Pi scope and role defaults,
+/// and the full (pkg,pinned) pin union of explicit pins plus Pi-extension
+/// provider pins.
+fn settings_apply_applied(config: &Value, payload: Option<&Map<String, Value>>) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    let Some(sent) = payload.get("config").and_then(Value::as_object) else {
+        return false;
+    };
+    let (
+        Some(harnesses),
+        Some(providers),
+        Some(models),
+        Some(profiles),
+        Some(scope),
+        Some(roles),
+        Some(pins),
+    ) = (
+        sent.get("harnesses").and_then(Value::as_array),
+        sent.get("providers").and_then(Value::as_array),
+        sent.get("models").and_then(Value::as_array),
+        sent.get("profiles").and_then(Value::as_array),
+        sent.get("scope").and_then(Value::as_object),
+        sent.get("roleDefaults").and_then(Value::as_object),
+        sent.get("pins").and_then(Value::as_array),
+    )
+    else {
+        return false;
+    };
+    harnesses.iter().all(|row| {
+        let Some(sent) = row.as_object() else {
+            return false;
+        };
+        sent.get("id").and_then(Value::as_str).is_some_and(|id| {
+            settings_row(config, "harnesses", id).is_some_and(|stored| {
+                ["id", "label", "cli", "note"]
+                    .iter()
+                    .all(|key| settings_field_matches(stored, sent, key))
+            })
+        })
+    }) && settings_same_id_set(config, "harnesses", harnesses, false)
+        && providers.iter().all(|row| {
+            let Some(sent) = row.as_object() else {
+                return false;
+            };
+            sent.get("id").and_then(Value::as_str).is_some_and(|id| {
+                settings_row(config, "providers", id).is_some_and(|stored| {
+                    ["id", "label", "kind", "note", "gate", "paid"]
+                        .iter()
+                        .all(|key| settings_field_matches(stored, sent, key))
+                        && settings_pin_field_matches(stored, sent)
+                })
+            })
+        })
+        && models.iter().all(|row| {
+            let Some(sent) = row.as_object() else {
+                return false;
+            };
+            sent.get("id").and_then(Value::as_str).is_some_and(|id| {
+                let id = canonical_model_id(id);
+                settings_row(config, "models", id).is_some_and(|stored| {
+                    settings_canonical_model_matches(stored, sent, "id")
+                        && ["provider", "ctx", "out"]
+                            .iter()
+                            .all(|key| settings_field_matches(stored, sent, key))
+                        && ["thinking", "images"]
+                            .iter()
+                            .all(|key| settings_apply_field_matches(stored, sent, key))
+                })
+            })
+        })
+        && profiles.iter().all(|row| {
+            let Some(sent) = row.as_object() else {
+                return false;
+            };
+            sent.get("id").and_then(Value::as_str).is_some_and(|id| {
+                settings_row(config, "profiles", id).is_some_and(|stored| {
+                    settings_field_matches(stored, sent, "id")
+                        && settings_field_matches(stored, sent, "role")
+                        && settings_canonical_model_matches(stored, sent, "model")
+                        && settings_trimmed_field_matches(stored, sent, "job")
+                })
+            })
+        })
+        && settings_same_id_set(config, "profiles", profiles, false)
+        && settings_apply_scope(config, scope, models, providers)
+        && roles.iter().all(|(role, value)| {
+            value.as_str().is_some_and(|model| {
+                config
+                    .get("roleDefaults")
+                    .and_then(|roles| roles.get(role))
+                    .and_then(Value::as_str)
+                    == Some(model)
+            })
+        })
+        && pins.iter().all(|row| settings_apply_pin(config, row))
+        && settings_apply_exact(config, sent)
+}
+
+/// `apply` stores `thinking`/`images` as the tri-state value itself: absent or
+/// null becomes null, a boolean stays that boolean.
+fn settings_apply_field_matches(stored: &Value, sent: &Map<String, Value>, key: &str) -> bool {
+    match sent.get(key) {
+        None | Some(Value::Null) => stored.get(key).is_none_or(Value::is_null),
+        Some(value) => stored.get(key) == Some(value),
+    }
+}
+
+/// `parse_overlay` stores a scope only for a Pi-extension model; a native-CLI
+/// or unknown model's entry is dropped. Every stored Pi scope must reflect
+/// the sent mode.
+fn settings_apply_scope(
+    config: &Value,
+    scope: &Map<String, Value>,
+    models: &[Value],
+    providers: &[Value],
+) -> bool {
+    scope.iter().all(|(id, value)| {
+        let Some(model) = models.iter().find(|row| {
+            row.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|model_id| canonical_model_id(model_id) == id.as_str())
+        }) else {
+            return true;
+        };
+        let Some(provider) = model.get("provider").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(kind) = providers
+            .iter()
+            .find(|row| row.get("id").and_then(Value::as_str) == Some(provider))
+            .and_then(|row| row.get("kind").and_then(Value::as_str))
+        else {
+            return false;
+        };
+        if kind == "native CLI" {
+            return true;
+        }
+        kind == "Pi extension"
+            && value.as_str().is_some_and(|mode| {
+                config
+                    .get("scope")
+                    .and_then(|scopes| scopes.get(id.as_str()))
+                    .and_then(Value::as_str)
+                    == Some(mode)
+            })
+    })
+}
+
+fn settings_apply_pin(config: &Value, sent: &Value) -> bool {
+    let Some(sent) = sent.as_object() else {
+        return false;
+    };
+    let (Some(pkg), Some(pinned)) = (
+        sent.get("pkg").and_then(Value::as_str),
+        sent.get("pinned").and_then(Value::as_str),
+    ) else {
+        return false;
+    };
+    settings_pin(config, pkg, pinned).is_some()
+}
+
+/// The post-apply projection is exact for the non-policy families and the
+/// filtered Pi scope/role defaults; pins may only add normalized Pi-extension
+/// provider specs.
+fn settings_apply_exact(config: &Value, sent: &Map<String, Value>) -> bool {
+    let (Some(providers), Some(models), Some(scope), Some(roles), Some(pins)) = (
+        sent.get("providers").and_then(Value::as_array),
+        sent.get("models").and_then(Value::as_array),
+        sent.get("scope").and_then(Value::as_object),
+        sent.get("roleDefaults").and_then(Value::as_object),
+        sent.get("pins").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    settings_same_id_set(config, "providers", providers, false)
+        && settings_same_id_set(config, "models", models, true)
+        && settings_apply_scope_exact(config, scope, models, providers)
+        && settings_apply_roles_exact(config, roles)
+        && settings_apply_pins_exact(config, pins, providers)
+}
+
+/// `parse_overlay` keeps a scope only for a Pi-extension model and drops
+/// native-CLI/unknown keys. The stored scope must equal that filtered map.
+fn settings_apply_scope_exact(
+    config: &Value,
+    scope: &Map<String, Value>,
+    models: &[Value],
+    providers: &[Value],
+) -> bool {
+    let mut expected: Vec<(&str, &str)> = Vec::new();
+    for (id, value) in scope {
+        let Some(model) = models.iter().find(|row| {
+            row.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|model_id| canonical_model_id(model_id) == id.as_str())
+        }) else {
+            continue;
+        };
+        let Some(provider) = model.get("provider").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(kind) = providers
+            .iter()
+            .find(|row| row.get("id").and_then(Value::as_str) == Some(provider))
+            .and_then(|row| row.get("kind").and_then(Value::as_str))
+        else {
+            return false;
+        };
+        if kind == "native CLI" {
+            continue;
+        }
+        if kind != "Pi extension" {
+            return false;
+        }
+        let Some(mode) = value.as_str() else {
+            return false;
+        };
+        expected.push((id.as_str(), mode));
+    }
+    let Some(stored) = config.get("scope").and_then(Value::as_object) else {
+        return false;
+    };
+    stored.len() == expected.len()
+        && stored.iter().all(|(key, value)| {
+            value.as_str().is_some_and(|mode| {
+                expected
+                    .iter()
+                    .any(|(id, expected_mode)| *id == key.as_str() && *expected_mode == mode)
+            })
+        })
+}
+
+fn settings_apply_roles_exact(config: &Value, roles: &Map<String, Value>) -> bool {
+    let Some(stored) = config.get("roleDefaults").and_then(Value::as_object) else {
+        return false;
+    };
+    stored.len() == roles.len()
+        && roles.iter().all(|(role, value)| {
+            value.as_str().is_some_and(|model| {
+                stored.get(role.as_str()).and_then(Value::as_str) == Some(model)
+            })
+        })
+}
+
+/// The post-apply `config.pins` is built from the policy's provider specs, so
+/// it is exactly the full (pkg,pinned) union of explicit sent pins and
+/// normalized Pi-extension provider pins (deduped), never a pkg-only subset.
+fn settings_apply_pins_exact(config: &Value, sent: &[Value], providers: &[Value]) -> bool {
+    let Some(stored) = settings_table(config, "pins", "pkg") else {
+        return false;
+    };
+    let mut expected: Vec<(&str, &str)> = Vec::new();
+    for row in sent {
+        let (Some(pkg), Some(pinned)) = (
+            row.get("pkg").and_then(Value::as_str),
+            row.get("pinned").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+        if !expected.iter().any(|(p, v)| *p == pkg && *v == pinned) {
+            expected.push((pkg, pinned));
+        }
+    }
+    for provider in providers {
+        if provider.get("kind").and_then(Value::as_str) != Some("Pi extension") {
+            continue;
+        }
+        let Some((pkg, pinned)) = provider
+            .get("pin")
+            .and_then(Value::as_str)
+            .and_then(normalized_pin_pair)
+        else {
+            continue;
+        };
+        if !expected.iter().any(|(p, v)| *p == pkg && *v == pinned) {
+            expected.push((pkg, pinned));
+        }
+    }
+    stored.len() == expected.len()
+        && stored.iter().enumerate().all(|(index, row)| {
+            let (Some(pkg), Some(pinned)) = (
+                row.get("pkg").and_then(Value::as_str),
+                row.get("pinned").and_then(Value::as_str),
+            ) else {
+                return false;
+            };
+            expected.iter().any(|(p, v)| *p == pkg && *v == pinned)
+                && !stored[..index].iter().any(|previous| {
+                    previous.get("pkg").and_then(Value::as_str) == Some(pkg)
+                        && previous.get("pinned").and_then(Value::as_str) == Some(pinned)
+                })
+        })
+        && expected.iter().all(|(pkg, pinned)| {
+            stored.iter().any(|row| {
+                row.get("pkg").and_then(Value::as_str) == Some(*pkg)
+                    && row.get("pinned").and_then(Value::as_str) == Some(*pinned)
+            })
+        })
+}
+
+/// The committed snapshot must show the effect this patch operation wrote:
+/// the row it put/removed/renamed, the scope it set, the role default it
+/// changed, or the document it applied. A snapshot that contradicts the
+/// operation proves nothing, so the outcome stays unknown.
+fn settings_target_applied(
+    operation: &str,
+    config: &Value,
+    payload: Option<&Map<String, Value>>,
+) -> bool {
+    match operation {
+        "harness.put" | "provider.put" | "model.put" | "profile.put" | "pin.put" => {
+            settings_put_applied(operation, config, payload)
+        }
+        "harness.remove" | "provider.remove" | "model.remove" | "profile.remove" | "pin.remove" => {
+            settings_remove_applied(operation, config, payload)
+        }
+        "model.rename" | "profile.rename" => settings_rename_applied(operation, config, payload),
+        "model.scope" => payload.is_some_and(|payload| {
+            settings_payload_text(Some(payload), "id")
+                .is_some_and(|id| settings_scope_matches(config, payload, canonical_model_id(id)))
+        }),
+        "role.set" => settings_payload_text(payload, "role")
+            .zip(settings_payload_text(payload, "model"))
+            .is_some_and(|(role, model)| {
+                config
+                    .get("roleDefaults")
+                    .and_then(|roles| roles.get(role))
+                    .and_then(Value::as_str)
+                    == Some(model)
+            }),
+        "role.clear" => settings_payload_text(payload, "role").is_some_and(|role| {
+            config
+                .get("roleDefaults")
+                .and_then(|roles| roles.get(role))
+                .and_then(Value::as_str)
+                == Some("")
+        }),
+        "apply" => settings_apply_applied(config, payload),
+        _ => false,
+    }
+}
+
+/// `catalog.import` adds each returned id to `config.models` with the
+/// requested provider in the same transaction, so the saved snapshot must
+/// show that binding. A listed id that is absent or bound to another
+/// provider contradicts the receipt.
+fn catalog_import_visible(reply: &Value, payload: Option<&Map<String, Value>>) -> bool {
+    let Some(provider) = settings_payload_text(payload, "provider") else {
+        return false;
+    };
+    let Some(ids) = reply.get("imported").and_then(Value::as_array) else {
+        return false;
+    };
+    if !ids
+        .iter()
+        .all(|id| id.as_str().is_some_and(|id| !id.is_empty()))
+    {
+        return false;
+    }
+    if !catalog_import_selected(ids, payload) {
+        return false;
+    }
+    let config = &reply["snapshot"]["config"];
+    ids.iter().all(|id| {
+        id.as_str().is_some_and(|id| {
+            settings_row(config, "models", id)
+                .and_then(|row| row.get("provider").and_then(Value::as_str))
+                == Some(provider)
+        })
+    })
+}
+
+/// An explicit `models` selection bounds which ids may be reported; `all-new`
+/// is server-discovered and skips only this subset check.
+fn catalog_import_selected(ids: &[Value], payload: Option<&Map<String, Value>>) -> bool {
+    match payload.and_then(|payload| payload.get("models")) {
+        Some(Value::String(selection)) if selection.as_str() == "all-new" => true,
+        Some(Value::Array(selection)) => ids.iter().all(|id| {
+            id.as_str()
+                .is_some_and(|id| selection.iter().any(|want| want.as_str() == Some(id)))
+        }),
+        _ => false,
+    }
+}
+
+/// `catalog.refresh` names the provider it fetched: the native source string
+/// is fixed to `omp models <provider> --json --no-extensions`.
+fn catalog_source_matches(source: &str, provider: &str) -> bool {
+    source
+        .strip_prefix("omp models ")
+        .and_then(|rest| rest.strip_suffix(" --json --no-extensions"))
+        == Some(provider)
+}
+
+/// The native grant binds the subject it was minted for: an internally
+/// tagged `kind` plus the connection identity (`agent`) or hosted principal
+/// (`cli-agent`). A receipt without that binding cannot be used as a grant.
+fn grant_bound_subject(subject: &Value) -> bool {
+    match subject.get("kind").and_then(Value::as_str) {
+        Some("agent") => {
+            subject.get("alias").and_then(Value::as_str).is_some()
+                && subject.get("generation").and_then(Value::as_str).is_some()
+                && subject.get("uid").and_then(Value::as_u64).is_some()
+        }
+        Some("cli-agent") => {
+            subject.get("actor").and_then(Value::as_str).is_some()
+                && subject.get("sub").and_then(Value::as_str).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// `profile.sync` reports every selected profile's Pi and Claude exports: a
+/// named profile must exist in the snapshot and produce exactly the two
+/// harness rows; the all-profile form derives the selection from the snapshot
+/// profiles (empty is allowed when there are none). Statuses stay the native
+/// `unmanaged`/`in sync` pair.
+fn settings_sync_files_exact(
+    config: &Value,
+    reply: &Value,
+    payload: Option<&Map<String, Value>>,
+) -> bool {
+    let Some(files) = reply.get("files").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(profiles) = settings_table(config, "profiles", "id") else {
+        return false;
+    };
+
+    if profiles.iter().enumerate().any(|(index, row)| {
+        row.get("id").and_then(Value::as_str).is_some_and(|id| {
+            profiles[..index]
+                .iter()
+                .any(|previous| previous.get("id").and_then(Value::as_str) == Some(id))
+        })
+    }) {
+        return false;
+    }
+    let named = settings_payload_text(payload, "profile");
+    if named.is_some_and(|id| {
+        !profiles
+            .iter()
+            .any(|row| row.get("id").and_then(Value::as_str) == Some(id))
+    }) {
+        return false;
+    }
+    let profile_count = if named.is_some() { 1 } else { profiles.len() };
+    let selected = |profile: &str| match named {
+        Some(id) => profile == id,
+        None => profiles
+            .iter()
+            .any(|row| row.get("id").and_then(Value::as_str) == Some(profile)),
+    };
+    let covered = |id: &str| {
+        ["pi", "claude"].iter().all(|harness| {
+            files.iter().any(|file| {
+                file.get("profile").and_then(Value::as_str) == Some(id)
+                    && file.get("harness").and_then(Value::as_str) == Some(*harness)
+            })
+        })
+    };
+    files.len() == profile_count * 2
+        && files.iter().enumerate().all(|(index, file)| {
+            let Some(profile) = file.get("profile").and_then(Value::as_str) else {
+                return false;
+            };
+            let Some(harness) = file.get("harness").and_then(Value::as_str) else {
+                return false;
+            };
+            selected(profile)
+                && matches!(harness, "pi" | "claude")
+                && matches!(
+                    file.get("status").and_then(Value::as_str),
+                    Some("unmanaged" | "in sync")
+                )
+                && file
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| !path.is_empty())
+                && !files[..index].iter().any(|previous| {
+                    previous.get("profile").and_then(Value::as_str) == Some(profile)
+                        && previous.get("harness").and_then(Value::as_str) == Some(harness)
+                })
+        })
+        && match named {
+            Some(id) => covered(id),
+            None => profiles
+                .iter()
+                .all(|row| row.get("id").and_then(Value::as_str).is_some_and(covered)),
+        }
+}
+
+/// A settings write answers its operation's own receipt family. The snapshot
+/// document covers the config writes; the nested shapes, the catalogue and
+/// the grant decisions answer their own bounded records. `fleet.check` is a
+/// read that changes nothing (its `settings.write` scope only satisfies the
+/// hosted contract), so its document is not a write receipt.
+fn settings_receipt_correlates(
+    operation: &str,
+    reply: &Value,
+    arguments: &Map<String, Value>,
+) -> bool {
+    let payload = arguments.get("payload").and_then(Value::as_object);
+    match operation {
+        "apply" | "harness.put" | "harness.remove" | "provider.put" | "provider.remove"
+        | "model.put" | "model.rename" | "model.remove" | "model.scope" | "role.set"
+        | "role.clear" | "profile.put" | "profile.rename" | "profile.remove" | "pin.put"
+        | "pin.remove" => {
+            settings_snapshot_document(reply)
+                && settings_target_applied(operation, &reply["config"], payload)
+        }
+        "catalog.import" => {
+            settings_snapshot_document(&reply["snapshot"]) && catalog_import_visible(reply, payload)
+        }
+        "profile.sync" => {
+            settings_snapshot_document(&reply["snapshot"])
+                && settings_sync_files_exact(&reply["snapshot"]["config"], reply, payload)
+        }
+        "catalog.refresh" => settings_payload_text(payload, "provider").is_some_and(|provider| {
+            reply
+                .get("source")
+                .and_then(Value::as_str)
+                .is_some_and(|source| catalog_source_matches(source, provider))
+                && settings_text(reply, "fetchedAt").is_some()
+                && reply.get("models").and_then(Value::as_array).is_some()
+        }),
+        "grant.request" => settings_text(reply, "request_id").is_some(),
+        "grant.allow" => {
+            settings_text(reply, "grant_id").is_some()
+                && reply.get("expires_at").and_then(Value::as_i64).is_some()
+                && reply.get("bound").is_some_and(|bound| {
+                    settings_text(bound, "operation").is_some()
+                        && bound
+                            .get("payload_sha256")
+                            .and_then(Value::as_str)
+                            .is_some_and(|digest| {
+                                digest.len() == 64
+                                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
+                        && bound.get("expected_revision").is_some_and(|revision| {
+                            revision.is_null() || revision.as_str().is_some()
+                        })
+                        && bound.get("subject").is_some_and(grant_bound_subject)
+                        && settings_text(bound, "org").is_some()
+                })
+        }
+        "grant.reject" => settings_payload_text(payload, "request_id").is_some_and(|sent| {
+            reply.get("request_id").and_then(Value::as_str) == Some(sent)
+                && reply.get("status").and_then(Value::as_str) == Some("rejected")
+        }),
+        "grant.revoke" => settings_payload_text(payload, "grant_id").is_some_and(|sent| {
+            reply.get("grant_id").and_then(Value::as_str) == Some(sent)
+                && reply.get("status").and_then(Value::as_str) == Some("revoked")
+        }),
+        "master.resume" => {
+            reply.get("alias").and_then(Value::as_str) == Some("master")
+                && matches!(
+                    reply.get("state").and_then(Value::as_str),
+                    Some("starting" | "attention")
+                )
+        }
+        "fleet.check" => true,
+        _ => false,
+    }
 }
 
 /// CAD-2001: the project-scoped review-evidence verbs. Every one carries an
@@ -4055,6 +5135,17 @@ fn call_verb_until_retry(
                 }
                 "project_policy" => !policy_receipt_correlates(reply, &arguments),
                 "project_new" => !project_receipt_correlates(reply, &arguments),
+                "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => {
+                    !team_receipt_correlates(verb, status, reply, &arguments)
+                }
+                REMOTE_SETTINGS_VERB => !settings_receipt_correlates(
+                    arguments
+                        .get("operation")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    reply,
+                    &arguments,
+                ),
                 "write" if matches!(surface, Surface::Wiki) && arguments.contains_key("text") => {
                     !wiki_write_receipt_correlates(reply, &arguments)
                 }
@@ -4079,12 +5170,15 @@ fn call_verb_until_retry(
         // a same-key replay; preserve its dedicated reconciliation guidance.
         let platform_outcome_unknown = platform_operation == Some("call")
             && !board_gate_refused(body.as_ref())
+            && !tracker_unavailable_before_verb(body.as_ref())
             && ((status == 409
                 && matches!(
                     refusal_code.as_deref(),
                     Some("uncertain" | "idempotency_in_progress")
                 ))
-                || (status >= 500 && body.as_ref().and_then(|b| b["state"].as_str()).is_none()));
+                || (status >= 500
+                    && status != 501
+                    && body.as_ref().and_then(|b| b["state"].as_str()).is_none()));
         let unknown_correlation = refusal_correlation(body.as_ref());
         // CAD-2001: a project-scoped gate verb the tenant cannot serve is a
         // release-order problem, not an availability blip and not "no

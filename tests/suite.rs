@@ -2264,7 +2264,7 @@ fn cad2009_unavailable_job_snapshot_never_claims_blocked_issue_is_ready() {
         assert_eq!(request["method"], "job_list");
         let response = serde_json::json!({"ok": true, "result": {"jobs": [{
             "id": "synthetic-job", "issue": "SYN-1", "state": "open",
-            "created": "2026-01-02", "tasks": {"blocked": 1}
+            "created": 1, "tasks": {"blocked": 1}
         }]}});
         writeln!(stream, "{response}").unwrap();
     });
@@ -2289,7 +2289,7 @@ fn cad2009_unavailable_job_snapshot_never_claims_blocked_issue_is_ready() {
             .unwrap();
         let response = serde_json::json!({"ok": true, "result": {"jobs": [{
             "id": "synthetic-job", "issue": "SYN-1", "state": "open",
-            "created": "2026-01-02", "tasks": "not-a-task-summary"
+            "created": 1, "tasks": "not-a-task-summary"
         }]}});
         writeln!(stream, "{response}").unwrap();
     });
@@ -2304,6 +2304,139 @@ fn cad2009_unavailable_job_snapshot_never_claims_blocked_issue_is_ready() {
     assert_eq!(malformed["job_state"]["state"], "malformed");
     assert_eq!(malformed["issues"][0]["ready"], false);
     std::fs::remove_file(&socket).unwrap();
+
+    // CAD-2009: reviewer-authored malformed-reply acceptance. Unusable
+    // bytes and jobs with unproved identity or lifecycle are malformed,
+    // not an absent runtime or an authoritative empty task snapshot.
+    let mut malformed_replies = vec![
+        b"{invalid-json}\n".to_vec(),
+        b"\xff\n".to_vec(),
+        // Syntactically valid JSON that is still not a job_list answer.
+        b"[]\n".to_vec(),
+        b"{ }\n".to_vec(),
+        b"{\"ok\":false,\"error\":{}}\n".to_vec(),
+    ];
+    for job in [
+        serde_json::json!({"id": "z", "issue": "SYN-1", "state": null,
+            "created": 2, "tasks": {}}),
+        serde_json::json!({"id": "z", "issue": "SYN-1", "created": 2, "tasks": {}}),
+        serde_json::json!({"id": "z", "issue": "SYN-1", "state": "unknown-state",
+            "created": 2, "tasks": {}}),
+        serde_json::json!({"issue": "SYN-1", "state": "open", "created": 2, "tasks": {}}),
+        serde_json::json!({"id": null, "issue": "SYN-1", "state": "open",
+            "created": 2, "tasks": {}}),
+        serde_json::json!({"id": 3, "issue": "SYN-1", "state": "open",
+            "created": 2, "tasks": {}}),
+        serde_json::json!({"id": "", "issue": "SYN-1", "state": "open",
+            "created": 2, "tasks": {}}),
+        serde_json::json!({"id": "z", "issue": "SYN-1", "state": "open",
+            "created": null, "tasks": {}}),
+        serde_json::json!({"id": "z", "issue": "SYN-1", "state": "open",
+            "tasks": {}}),
+        serde_json::json!({"id": "z", "issue": "SYN-1", "state": "open",
+            "created": "garbage", "tasks": {}}),
+    ] {
+        let reply = serde_json::json!({"ok": true, "result": {"jobs": [job, {
+            "id": "a", "issue": "SYN-1", "state": "open", "created": 1,
+            "tasks": {"blocked": 1}
+        }]}});
+        let mut response = serde_json::to_vec(&reply).unwrap();
+        response.push(b'\n');
+        malformed_replies.push(response);
+    }
+    for response in malformed_replies {
+        for ready in [false, true] {
+            let response = response.to_vec();
+            let listener = UnixListener::bind(&socket).unwrap();
+            let daemon = std::thread::spawn(move || {
+                let mut stream = accept_request(listener);
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                assert_eq!(request["method"], "job_list");
+                stream.write_all(&response).unwrap();
+            });
+            let output = run(ready);
+            daemon.join().unwrap();
+            std::fs::remove_file(&socket).unwrap();
+            if ready {
+                assert_eq!(output.status.code(), Some(70));
+                assert!(
+                    output.stdout.is_empty(),
+                    "malformed job state must not emit an authoritative ready list"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("malformed"),
+                    "the refusal must distinguish a malformed reply from an absent daemon"
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(body["job_state"]["state"], "malformed");
+                let issue = body["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["id"] == "SYN-1")
+                    .expect("a malformed daemon reply must preserve the tracker read");
+                assert_eq!(issue["ready"], false);
+            }
+        }
+    }
+
+    // A valid daemon error envelope is unavailable, not malformed: the
+    // reply is well-formed but carries no job table.
+    let refusal =
+        b"{\"ok\":false,\"error\":{\"kind\":\"internal\",\"message\":\"synthetic refusal\"}}\n"
+            .to_vec();
+    for ready in [false, true] {
+        let response = refusal.clone();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let mut stream = accept_request(listener);
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "job_list");
+            stream.write_all(&response).unwrap();
+        });
+        let output = run(ready);
+        daemon.join().unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        if ready {
+            assert!(
+                !output.status.success(),
+                "an unavailable job state must not produce a ready list"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("job state"),
+                "the refusal must explain that job state is unavailable"
+            );
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(body["job_state"]["state"], "unavailable");
+            let issue = body["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == "SYN-1")
+                .expect("an unavailable daemon still returns the tracker issue");
+            assert_eq!(issue["ready"], false);
+        }
+    }
 
     let unknown = run(true);
     assert!(

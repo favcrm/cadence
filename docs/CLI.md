@@ -669,6 +669,8 @@ on a table.
 For live local `issue ls` and `issue show`, JSON includes `job_state.state`:
 `known`, `unavailable`, or `malformed`. When job state is not known,
 readiness is not asserted; the unfiltered tracker read remains available.
+Malformed state includes invalid daemon response frames and issue-bound job
+rows without usable selection fields or task summaries.
 `issue ls --ready` and `--blocked` refuse rather than report an authoritative
 filtered list. Text output warns on stderr. Historical `--at` reads keep
 their historical derivation without consulting the daemon. Job and approval

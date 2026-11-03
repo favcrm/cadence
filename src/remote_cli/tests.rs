@@ -110,10 +110,10 @@ fn the_project_scoped_gate_verbs_are_registered_with_their_scopes() {
 
 #[test]
 fn a_tenant_that_cannot_serve_a_project_verb_names_the_release_order() {
-    // An older tenant refuses the name (501 / 400 / 409) rather than
+    // An older tenant refuses the name (501 / 400 / 409 / 503) rather than
     // answering, and the client must say so — never read it as "no evidence"
     // and never fall back to the repo-scoped verbs.
-    use super::{tenant_cannot_serve, PROJECT_SCOPED_GATE_VERBS};
+    use super::{mutating_cli_verb, tenant_cannot_serve, PROJECT_SCOPED_GATE_VERBS};
 
     for verb in PROJECT_SCOPED_GATE_VERBS {
         for (status, body) in [
@@ -149,6 +149,25 @@ fn a_tenant_that_cannot_serve_a_project_verb_names_the_release_order() {
             Some(&json!({"ok": false, "error": {"code": "not_permitted"}}))
         )
         .is_none());
+    }
+    // A tenant that predates the project verbs answers 503 for a capability
+    // it lacks. A read keeps the release-order refusal; a write with the same
+    // code is the mutation classifier's unknown outcome, so it is asserted
+    // separately (and must not be read as "nothing was recorded").
+    for verb in PROJECT_SCOPED_GATE_VERBS
+        .iter()
+        .copied()
+        .filter(|verb| !mutating_cli_verb(verb))
+    {
+        let why = tenant_cannot_serve(
+            verb,
+            503,
+            Some(&json!({"ok": false, "error": {"code": "capability_unavailable"}})),
+        )
+        .expect("a version signal");
+        assert!(why.contains("Release order"), "{verb}: {why}");
+        assert!(why.contains("repo-scoped"), "{verb}: {why}");
+        assert!(why.contains(verb), "{verb}: {why}");
     }
     // A project with no proven policy is a real refusal with its own remedy.
     let why = tenant_cannot_serve(
@@ -632,6 +651,8 @@ fn fake_worker(
                 };
                 let line = match status {
                     200 => "200 OK",
+                    201 => "201 Created",
+                    202 => "202 Accepted",
                     302 => "302 Found",
                     401 => "401 Unauthorized",
                     403 => "403 Forbidden",
@@ -1823,6 +1844,883 @@ fn a_lost_response_to_a_team_mutation_is_unknown_not_a_refusal() {
     assert!(!text.contains("retry later"), "{text}");
 }
 
+/// A team 2xx whose receipt does not name the row this call changed proves
+/// nothing about the write: it is the same unknown outcome a lost answer is,
+/// with the directory read named and the call never replayed.
+fn team_receipt_unknown(status: u16, verb: &str, args: Value, receipt: Value) {
+    let (result, requests) = run(
+        vec![(status, "", receipt.clone())],
+        verb,
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), "unknown", "{verb} {receipt}: {error}");
+    let text = error.to_string();
+    assert!(text.contains("team list"), "{verb} {receipt}: {text}");
+    assert!(!text.contains("retry later"), "{verb} {receipt}: {text}");
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "{verb} must not replay a write whose receipt did not prove it"
+    );
+}
+
+/// CAD-2009: each platform team write answers a receipt naming the row it
+/// changed — the normalized invite address, the revoked invite, the member's
+/// role, the removed id. The documented success shapes ride the real
+/// transport seam; a foreign or unusable receipt does not become success.
+#[test]
+fn cad2009_team_receipts_must_name_the_member_or_invite_they_changed() {
+    let invite = |id: &str, email: &str, role: &str, status: &str| {
+        json!({"invite": {
+            "id": id, "email": email, "role": role, "status": status,
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "expiresAt": "2026-01-08T00:00:00.000Z"}})
+    };
+    let member = |user: &str, role: &str| {
+        json!({"member": {
+            "userId": user, "name": "Synthetic", "email": "synthetic@example.test",
+            "role": role, "joinedAt": "2026-01-01T00:00:00.000Z"}})
+    };
+    let invite_args = json!({"email": " New@Example.TEST ", "role": "owner"});
+    let revoke_args = json!({"invite_id": "inv_1"});
+    let role_args = json!({"user_id": "usr_1", "role": "owner"});
+    let remove_args = json!({"user_id": "usr_1"});
+
+    for (status, verb, args, receipt) in [
+        (
+            201u16,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "new@example.test", "owner", "pending"),
+        ),
+        // A live pending invite already exists: the server returns it
+        // unchanged, so its stored role may legitimately differ from the
+        // role this call asked for.
+        (
+            200,
+            "team_invite",
+            json!({"email": "NEW@example.test", "role": "owner"}),
+            invite("inv_0", "new@example.test", "member", "pending"),
+        ),
+        (
+            200,
+            "team_revoke_invite",
+            revoke_args.clone(),
+            invite("inv_1", "new@example.test", "member", "revoked"),
+        ),
+        (
+            200,
+            "team_set_role",
+            role_args.clone(),
+            member("usr_1", "owner"),
+        ),
+        (
+            200,
+            "team_remove",
+            remove_args.clone(),
+            json!({"removed": "usr_1"}),
+        ),
+    ] {
+        let (result, requests) = run(
+            vec![(status, "", receipt.clone())],
+            verb,
+            args.as_object().unwrap().clone(),
+            10,
+        );
+        assert_eq!(result.unwrap(), receipt, "{verb} HTTP {status}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb}");
+    }
+
+    for (status, verb, args, receipt) in [
+        (200u16, "team_invite", invite_args.clone(), json!({})),
+        (
+            200,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "other@example.test", "owner", "pending"),
+        ),
+        // A new invite must record the requested role and stay pending.
+        (
+            201,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "new@example.test", "member", "pending"),
+        ),
+        (
+            201,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "new@example.test", "owner", "accepted"),
+        ),
+        (
+            200,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "new@example.test", "owner", "accepted"),
+        ),
+        // Only 200 and 201 are the documented invite answers; a 202 with a
+        // valid pending receipt is not proof the invite was created.
+        (
+            202,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "new@example.test", "owner", "pending"),
+        ),
+        (200, "team_revoke_invite", revoke_args.clone(), json!({})),
+        (
+            200,
+            "team_revoke_invite",
+            revoke_args.clone(),
+            invite("inv_2", "new@example.test", "member", "revoked"),
+        ),
+        (
+            200,
+            "team_revoke_invite",
+            revoke_args.clone(),
+            invite("inv_1", "new@example.test", "member", "pending"),
+        ),
+        (200, "team_set_role", role_args.clone(), json!({})),
+        (
+            200,
+            "team_set_role",
+            role_args.clone(),
+            member("usr_2", "owner"),
+        ),
+        (
+            200,
+            "team_set_role",
+            role_args.clone(),
+            member("usr_1", "member"),
+        ),
+        (200, "team_remove", remove_args.clone(), json!({})),
+        (
+            200,
+            "team_remove",
+            remove_args.clone(),
+            json!({"removed": "usr_2"}),
+        ),
+        (
+            200,
+            "team_remove",
+            remove_args.clone(),
+            json!({"removed": 7}),
+        ),
+    ] {
+        team_receipt_unknown(status, verb, args, receipt);
+    }
+}
+
+fn settings_args(operation: &str, payload: Value) -> Map<String, Value> {
+    json!({"operation": operation, "expected_revision": null, "payload": payload})
+        .as_object()
+        .unwrap()
+        .clone()
+}
+
+/// The native config-write result (`build_snapshot`): a revision token plus
+/// the whole config document. A 2xx that lacks either is not that receipt.
+fn config_snapshot(revision: &str) -> Value {
+    json!({
+        "revision": revision,
+        "config": {
+            "harnesses": [], "providers": [], "models": [], "profiles": [],
+            "scope": {},
+            "roleDefaults": {
+                "pm": "", "research": "", "architect": "", "dev": "",
+                "qa": "", "devops": "", "worker": ""
+            },
+            "pins": []
+        },
+        "observations": {"harnesses": {}, "models": {}, "profiles": {}},
+        "catalogs": {},
+        "history": [],
+        "retiredSources": []
+    })
+}
+
+fn settings_receipt_unknown(operation: &str, payload: Value, receipt: Value) {
+    let (result, requests) = run(
+        vec![(200, "", receipt.clone())],
+        "settings_agents",
+        settings_args(operation, payload),
+        10,
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), "unknown", "{operation} {receipt}: {error}");
+    let text = error.to_string();
+    assert!(
+        !text.contains("retry later"),
+        "{operation} {receipt}: {text}"
+    );
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "{operation} must not replay a write whose receipt did not prove it"
+    );
+}
+
+/// CAD-2009: a settings answer that does not prove the write must name an
+/// executable read for that operation class, with the same --org, and never
+/// invite a blind retry. It stays an unknown outcome.
+#[test]
+fn cad2009_settings_unknown_guidance_names_an_executable_read() {
+    for (operation, payload, read) in [
+        (
+            "harness.put",
+            json!({"id": "pi", "label": "Pi", "cli": "pi"}),
+            "settings agents show",
+        ),
+        (
+            "grant.revoke",
+            json!({"grant_id": "sg_1"}),
+            "settings agents grant list",
+        ),
+        ("master.resume", json!({}), "master status"),
+    ] {
+        let (result, requests) = run(
+            vec![(200, "", json!({}))],
+            "settings_agents",
+            settings_args(operation, payload),
+            10,
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), "unknown", "{operation}: {error}");
+        let text = error.to_string();
+        assert!(text.contains(read), "{operation}: {text}");
+        assert!(text.contains("--org"), "{operation}: {text}");
+        assert!(!text.contains("retry later"), "{operation}: {text}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{operation}");
+    }
+}
+
+/// CAD-2009: `grant.revoke` answers `{grant_id, status:"revoked"}`. A 2xx
+/// that omits the id, names another grant, claims another status or carries
+/// a different operation family proves nothing about this revocation.
+#[test]
+fn cad2009_settings_grant_revoke_requires_the_grant_it_revoked() {
+    let payload = json!({"grant_id": "sg_1"});
+    let revoked = json!({"grant_id": "sg_1", "status": "revoked"});
+    let (result, requests) = run(
+        vec![(200, "", revoked.clone())],
+        "settings_agents",
+        settings_args("grant.revoke", payload.clone()),
+        10,
+    );
+    assert_eq!(result.unwrap(), revoked);
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+
+    for receipt in [
+        json!({}),
+        json!({"grant_id": "sg_2", "status": "revoked"}),
+        json!({"grant_id": "sg_1", "status": "active"}),
+        config_snapshot("rev-2"),
+    ] {
+        settings_receipt_unknown("grant.revoke", payload.clone(), receipt);
+    }
+}
+
+/// CAD-2009: a config write answers the whole config snapshot (`revision`
+/// plus `config`). A bare object, a decision result or a revision without
+/// the document is not that receipt.
+#[test]
+fn cad2009_settings_config_writes_require_a_config_snapshot() {
+    let payload = json!({"id": "pi", "label": "Pi", "cli": "pi"});
+    let mut snapshot = config_snapshot("rev-2");
+    snapshot["config"]["harnesses"] = json!([
+        {"id": "pi", "label": "Pi", "cli": "pi", "note": ""}
+    ]);
+    let (result, requests) = run(
+        vec![(200, "", snapshot.clone())],
+        "settings_agents",
+        settings_args("harness.put", payload.clone()),
+        10,
+    );
+    assert_eq!(result.unwrap(), snapshot);
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+
+    for receipt in [
+        json!({}),
+        json!({"grant_id": "sg_1", "status": "revoked"}),
+        json!({"revision": "rev-2"}),
+        // A snapshot that omits the harness this call wrote contradicts it.
+        config_snapshot("rev-2"),
+    ] {
+        settings_receipt_unknown("harness.put", payload.clone(), receipt);
+    }
+
+    // harness.remove: a full snapshot without the removed row is the
+    // documented answer; a truncated `config:{}` is not proof the row is
+    // absent, so it stays unknown.
+    let remove_payload = json!({"id": "pi"});
+    settings_receipt_ok(
+        "harness.remove",
+        remove_payload.clone(),
+        config_snapshot("rev-3"),
+    );
+    settings_receipt_unknown(
+        "harness.remove",
+        remove_payload,
+        json!({"revision": "rev-2", "config": {}}),
+    );
+
+    // harness.put binds the fields it wrote: a snapshot that still names
+    // the old cli contradicts the request.
+    let cli_payload = json!({"id": "claude", "label": "Claude", "cli": "tmux"});
+    let mut cli_saved = config_snapshot("rev-3");
+    cli_saved["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}
+    ]);
+    settings_receipt_ok("harness.put", cli_payload.clone(), cli_saved);
+    let mut stale_cli = config_snapshot("rev-3");
+    stale_cli["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "claude", "note": ""}
+    ]);
+    settings_receipt_unknown("harness.put", cli_payload, stale_cli);
+
+    // provider.remove: a full snapshot without the provider is the answer;
+    // a malformed row is not proof of absence.
+    let provider_payload = json!({"id": "synthetic"});
+    settings_receipt_ok(
+        "provider.remove",
+        provider_payload.clone(),
+        config_snapshot("rev-3"),
+    );
+    let mut malformed_providers = config_snapshot("rev-3");
+    malformed_providers["config"]["providers"] = json!([null]);
+    settings_receipt_unknown("provider.remove", provider_payload, malformed_providers);
+
+    // pin.put: the snapshot must carry the requested pin, not another version.
+    let pin_payload = json!({"pkg": "synthetic", "pinned": "1.2.3"});
+    let mut pinned = config_snapshot("rev-3");
+    pinned["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "1.2.3"}]);
+    settings_receipt_ok("pin.put", pin_payload.clone(), pinned);
+    let mut stale_pin = config_snapshot("rev-3");
+    stale_pin["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "9.9.9"}]);
+    settings_receipt_unknown("pin.put", pin_payload, stale_pin);
+
+    // model.put trims the id at the native boundary: `" m1 "` persists as
+    // `m1`, and that documented snapshot row must remain a usable receipt.
+    let model_payload = json!({
+        "id": " m1 ", "provider": "synthetic", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    });
+    let mut model_snapshot = config_snapshot("rev-3");
+    model_snapshot["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "native CLI",
+        "pin": "", "gate": false, "paid": false, "note": ""
+    }]);
+    model_snapshot["config"]["models"] = json!([{
+        "id": "m1", "provider": "synthetic", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    }]);
+    settings_receipt_ok("model.put", model_payload, model_snapshot);
+}
+
+/// CAD-2009: `apply` commits the whole config document, so its snapshot must
+/// still carry the rows the request wrote; policy-projected extras are
+/// allowed, but a contradicting requested row is unknown.
+#[test]
+fn cad2009_settings_apply_binds_the_requested_config() {
+    let role_defaults = json!({
+        "pm": "", "research": "", "architect": "", "dev": "",
+        "qa": "", "devops": "", "worker": ""
+    });
+    let config = json!({
+        "harnesses": [{"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}],
+        "providers": [{
+            "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+            "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+        }],
+        "models": [],
+        "profiles": [],
+        "scope": {},
+        "roleDefaults": role_defaults.clone(),
+        "pins": []
+    });
+    let payload = json!({"config": config});
+    let mut applied = config_snapshot("rev-3");
+    applied["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}
+    ]);
+    // The sent explicit pins stay empty; the Pi-extension provider's pin is
+    // projected into the snapshot as the derived extra pin.
+    applied["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+        "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+    }]);
+    applied["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "1.2.3"}]);
+    applied["observations"]["harnesses"] = json!({
+        "claude": {"installed": null, "version": null, "live": 0}
+    });
+    settings_receipt_ok("apply", payload.clone(), applied);
+
+    let mut contradicted = config_snapshot("rev-3");
+    contradicted["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "claude", "note": ""}
+    ]);
+    settings_receipt_unknown("apply", payload.clone(), contradicted);
+
+    // An unchanged empty document is the documented apply answer.
+    let empty_config = json!({
+        "harnesses": [],
+        "providers": [],
+        "models": [],
+        "profiles": [],
+        "scope": {},
+        "roleDefaults": role_defaults,
+        "pins": []
+    });
+    let empty_payload = json!({"config": empty_config});
+    settings_receipt_ok("apply", empty_payload.clone(), config_snapshot("rev-3"));
+
+    // `present_overlay` never adds harnesses or profiles, so retaining an
+    // omitted one contradicts the applied document.
+    let mut retained_harness = config_snapshot("rev-3");
+    retained_harness["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}
+    ]);
+    retained_harness["observations"]["harnesses"] = json!({
+        "claude": {"installed": null, "version": null, "live": 0}
+    });
+    settings_receipt_unknown("apply", empty_payload.clone(), retained_harness);
+
+    let mut retained_profile = config_snapshot("rev-3");
+    retained_profile["config"]["profiles"] = json!([{
+        "id": "p1", "role": "dev", "model": "inherit", "job": "Synthetic job"
+    }]);
+    retained_profile["observations"]["profiles"] = json!({
+        "p1": {"version": "abcdef123456", "usedBy": [], "history": [], "files": []}
+    });
+    settings_receipt_unknown("apply", empty_payload.clone(), retained_profile);
+
+    // Two returned pins may share a package with different versions; the
+    // requested full (pkg,pinned) spec must match, not the first entry with
+    // that package.
+    let two_pin_config = json!({
+        "harnesses": [{"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}],
+        "providers": [{
+            "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+            "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+        }],
+        "models": [],
+        "profiles": [],
+        "scope": {},
+        "roleDefaults": role_defaults.clone(),
+        "pins": [{"pkg": "synthetic", "pinned": "9.9.9"}]
+    });
+    let two_pin_payload = json!({"config": two_pin_config});
+    let mut two_pins = config_snapshot("rev-3");
+    two_pins["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}
+    ]);
+    two_pins["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+        "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+    }]);
+    two_pins["config"]["pins"] = json!([
+        {"pkg": "synthetic", "pinned": "1.2.3"},
+        {"pkg": "synthetic", "pinned": "9.9.9"}
+    ]);
+    two_pins["observations"]["harnesses"] = json!({
+        "claude": {"installed": null, "version": null, "live": 0}
+    });
+    settings_receipt_ok("apply", two_pin_payload, two_pins);
+
+    // An extra pin with no sent explicit pin and no provider source is not a
+    // documented projection.
+    let mut unsourced_pin = config_snapshot("rev-3");
+    unsourced_pin["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "1.2.3"}]);
+    settings_receipt_unknown("apply", empty_payload.clone(), unsourced_pin);
+
+    // A provider pin with the same package but a different version is not
+    // proof of the requested full spec.
+    let mut wrong_version = config_snapshot("rev-3");
+    wrong_version["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+        "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+    }]);
+    wrong_version["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "9.9.9"}]);
+    settings_receipt_unknown("apply", payload.clone(), wrong_version);
+
+    // Exact apply: the returned document may not add a provider, model,
+    // role default or scope entry the sent document did not carry.
+    let exact_config = json!({
+        "harnesses": [{"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}],
+        "providers": [{
+            "id": "synthetic", "label": "Synthetic", "kind": "native CLI",
+            "pin": "", "gate": false, "paid": false, "note": ""
+        }],
+        "models": [{
+            "id": "m1", "provider": "synthetic", "ctx": "", "out": "",
+            "thinking": null, "images": null
+        }],
+        "profiles": [],
+        "scope": {},
+        "roleDefaults": role_defaults.clone(),
+        "pins": []
+    });
+    let exact_payload = json!({"config": exact_config});
+    let mut exact = config_snapshot("rev-3");
+    exact["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}
+    ]);
+    exact["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "native CLI",
+        "pin": "", "gate": false, "paid": false, "note": ""
+    }]);
+    exact["config"]["models"] = json!([{
+        "id": "m1", "provider": "synthetic", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    }]);
+    exact["observations"]["harnesses"] = json!({
+        "claude": {"installed": null, "version": null, "live": 0}
+    });
+    exact["observations"]["models"] = json!({"m1": {"live": 0}});
+    settings_receipt_ok("apply", exact_payload.clone(), exact.clone());
+
+    let mut extra_provider = exact.clone();
+    extra_provider["config"]["providers"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "other", "label": "Other", "kind": "native CLI",
+            "pin": "", "gate": false, "paid": false, "note": ""
+        }));
+    settings_receipt_unknown("apply", exact_payload.clone(), extra_provider);
+
+    let mut extra_model = exact.clone();
+    extra_model["config"]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "m2", "provider": "synthetic", "ctx": "", "out": "",
+            "thinking": null, "images": null
+        }));
+    settings_receipt_unknown("apply", exact_payload.clone(), extra_model);
+
+    let mut wrong_role = exact.clone();
+    wrong_role["config"]["roleDefaults"]["worker"] = json!("m1");
+    settings_receipt_unknown("apply", exact_payload.clone(), wrong_role);
+
+    let mut extra_scope = exact;
+    extra_scope["config"]["scope"] = json!({"m1": "off"});
+    settings_receipt_unknown("apply", exact_payload, extra_scope);
+
+    // Every provider-sourced pin must appear; a duplicate of one spec cannot
+    // stand in for the missing one.
+    let two_provider_config = json!({
+        "harnesses": [],
+        "providers": [
+            {"id": "alpha", "label": "Alpha", "kind": "Pi extension",
+             "pin": "alpha@1", "gate": true, "paid": false, "note": ""},
+            {"id": "beta", "label": "Beta", "kind": "Pi extension",
+             "pin": "beta@2", "gate": true, "paid": false, "note": ""}
+        ],
+        "models": [],
+        "profiles": [],
+        "scope": {},
+        "roleDefaults": role_defaults.clone(),
+        "pins": []
+    });
+    let two_provider_payload = json!({"config": two_provider_config});
+    let mut both_pins = config_snapshot("rev-3");
+    both_pins["config"]["providers"] = json!([
+        {"id": "alpha", "label": "Alpha", "kind": "Pi extension",
+         "pin": "alpha@1", "gate": true, "paid": false, "note": ""},
+        {"id": "beta", "label": "Beta", "kind": "Pi extension",
+         "pin": "beta@2", "gate": true, "paid": false, "note": ""}
+    ]);
+    both_pins["config"]["pins"] = json!([
+        {"pkg": "alpha", "pinned": "1"},
+        {"pkg": "beta", "pinned": "2"}
+    ]);
+    settings_receipt_ok("apply", two_provider_payload.clone(), both_pins);
+
+    let mut duplicated_pin = config_snapshot("rev-3");
+    duplicated_pin["config"]["providers"] = json!([
+        {"id": "alpha", "label": "Alpha", "kind": "Pi extension",
+         "pin": "alpha@1", "gate": true, "paid": false, "note": ""},
+        {"id": "beta", "label": "Beta", "kind": "Pi extension",
+         "pin": "beta@2", "gate": true, "paid": false, "note": ""}
+    ]);
+    duplicated_pin["config"]["pins"] = json!([
+        {"pkg": "alpha", "pinned": "1"},
+        {"pkg": "alpha", "pinned": "1"}
+    ]);
+    settings_receipt_unknown("apply", two_provider_payload, duplicated_pin);
+}
+
+/// CAD-2009: `pin.remove` proves the pin is gone, or that a provider row
+/// still sources it; a leftover pin with no source contradicts the removal.
+#[test]
+fn cad2009_settings_pin_remove_proves_absence_or_a_provider_source() {
+    let payload = json!({"pkg": "synthetic"});
+
+    // The documented removal answer: the pin is absent.
+    settings_receipt_ok("pin.remove", payload.clone(), config_snapshot("rev-3"));
+
+    // A provider row carrying the same pin sources a legitimate retention.
+    let mut sourced = config_snapshot("rev-3");
+    sourced["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+        "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+    }]);
+    sourced["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "1.2.3"}]);
+    settings_receipt_ok("pin.remove", payload.clone(), sourced);
+
+    // A leftover pin with no provider source is not proof of removal.
+    let mut unsourced = config_snapshot("rev-3");
+    unsourced["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "1.2.3"}]);
+    settings_receipt_unknown("pin.remove", payload, unsourced);
+}
+
+/// CAD-2009: the non-snapshot families are distinct — `profile.sync` nests
+/// its snapshot beside `files`, so a bare snapshot or a bare `files` array
+/// proves nothing about the sync.
+#[test]
+fn cad2009_settings_nested_and_decision_results_are_distinct_families() {
+    let payload = json!({});
+    let synced = json!({"snapshot": config_snapshot("rev-3"), "files": []});
+    let (result, requests) = run(
+        vec![(200, "", synced.clone())],
+        "settings_agents",
+        settings_args("profile.sync", payload.clone()),
+        10,
+    );
+    assert_eq!(result.unwrap(), synced);
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+
+    for receipt in [json!({}), json!({"files": []}), config_snapshot("rev-3")] {
+        settings_receipt_unknown("profile.sync", payload.clone(), receipt);
+    }
+
+    // A named profile must exist and yield exactly its pi and claude file
+    // rows; an empty or single-harness file list proves nothing.
+    let named_payload = json!({"profile": "p1"});
+    let mut named_snapshot = config_snapshot("rev-3");
+    named_snapshot["config"]["profiles"] = json!([{
+        "id": "p1", "role": "dev", "model": "inherit", "job": "Synthetic job"
+    }]);
+    named_snapshot["observations"]["profiles"] = json!({
+        "p1": {"version": "abcdef123456", "usedBy": [], "history": [], "files": []}
+    });
+    let named = json!({
+        "snapshot": named_snapshot.clone(),
+        "files": [
+            {"profile": "p1", "harness": "pi",
+             "path": "/tmp/synthetic/pi/p1/AGENT.md", "status": "unmanaged"},
+            {"profile": "p1", "harness": "claude",
+             "path": "/tmp/synthetic/claude/p1/CLAUDE.md", "status": "in sync"}
+        ]
+    });
+    settings_receipt_ok("profile.sync", named_payload.clone(), named);
+
+    settings_receipt_unknown(
+        "profile.sync",
+        named_payload.clone(),
+        json!({"snapshot": config_snapshot("rev-3"), "files": []}),
+    );
+    settings_receipt_unknown(
+        "profile.sync",
+        named_payload,
+        json!({
+            "snapshot": named_snapshot,
+            "files": [{"profile": "p1", "harness": "pi",
+                "path": "/tmp/synthetic/pi/p1/AGENT.md", "status": "unmanaged"}]
+        }),
+    );
+
+    // An all-profile receipt cannot duplicate a profile row or its file rows:
+    // duplicated totals must not stand in for distinct target coverage.
+    let mut duplicated_profiles = config_snapshot("rev-3");
+    duplicated_profiles["config"]["profiles"] = json!([
+        {"id": "p1", "role": "dev", "model": "inherit", "job": "Synthetic job"},
+        {"id": "p1", "role": "dev", "model": "inherit", "job": "Synthetic job"}
+    ]);
+    duplicated_profiles["observations"]["profiles"] = json!({
+        "p1": {"version": "abcdef123456", "usedBy": [], "history": [], "files": []}
+    });
+    settings_receipt_unknown(
+        "profile.sync",
+        json!({}),
+        json!({
+            "snapshot": duplicated_profiles,
+            "files": [
+                {"profile": "p1", "harness": "pi",
+                 "path": "/tmp/synthetic/pi/p1/AGENT.md", "status": "unmanaged"},
+                {"profile": "p1", "harness": "claude",
+                 "path": "/tmp/synthetic/claude/p1/CLAUDE.md", "status": "in sync"},
+                {"profile": "p1", "harness": "pi",
+                 "path": "/tmp/synthetic/pi/p1/AGENT.md", "status": "unmanaged"},
+                {"profile": "p1", "harness": "claude",
+                 "path": "/tmp/synthetic/claude/p1/CLAUDE.md", "status": "in sync"}
+            ]
+        }),
+    );
+}
+
+fn settings_receipt_ok(operation: &str, payload: Value, receipt: Value) {
+    let (result, requests) = run(
+        vec![(200, "", receipt.clone())],
+        "settings_agents",
+        settings_args(operation, payload),
+        10,
+    );
+    assert_eq!(result.unwrap(), receipt, "{operation}");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{operation}");
+}
+
+/// CAD-2009: the remaining native settings families answer their own
+/// documented shapes. A 2xx from another family proves nothing about the
+/// operation it answered, so it stays unknown.
+#[test]
+fn cad2009_settings_remaining_native_result_families_are_distinct() {
+    // grant.request: the server allocates the request id, so only its shape
+    // is provable.
+    let request_payload = json!({
+        "operation": "harness.put", "expected_revision": null,
+        "payload": {"id": "pi"}, "reason": "synthetic"
+    });
+    settings_receipt_ok(
+        "grant.request",
+        request_payload.clone(),
+        json!({"request_id": "sr_1"}),
+    );
+    settings_receipt_unknown("grant.request", request_payload, json!({}));
+
+    // grant.allow: native echoes the new grant id, its expiry and the bound
+    // operation/digest — never the request id it was asked under.
+    let allow_payload = json!({"request_id": "sr_1"});
+    settings_receipt_ok(
+        "grant.allow",
+        allow_payload.clone(),
+        json!({
+            "grant_id": "sg_1",
+            "expires_at": 1_800_000_000u64,
+            "bound": {
+                "operation": "harness.put",
+                "payload_sha256": "0".repeat(64),
+                "expected_revision": null,
+                "subject": {"kind": "agent", "alias": "synthetic", "generation": "g1", "uid": 1},
+                "org": "local"
+            }
+        }),
+    );
+    settings_receipt_unknown("grant.allow", allow_payload, json!({"grant_id": "sg_1"}));
+
+    // grant.reject: the answer echoes the request id it rejected.
+    let reject_payload = json!({"request_id": "sr_1"});
+    settings_receipt_ok(
+        "grant.reject",
+        reject_payload.clone(),
+        json!({"request_id": "sr_1", "status": "rejected"}),
+    );
+    settings_receipt_unknown(
+        "grant.reject",
+        reject_payload,
+        json!({"request_id": "sr_2", "status": "rejected"}),
+    );
+
+    // catalog.refresh: a listing, or the documented error-shaped answer the
+    // daemon returns when the provider catalog is unavailable.
+    let refresh_payload = json!({"provider": "synthetic"});
+    for receipt in [
+        json!({
+            "source": "omp models synthetic --json --no-extensions",
+            "fetchedAt": "2026-01-01T00:00:00Z",
+            "models": [{"id": "m1"}]
+        }),
+        json!({
+            "source": "omp models synthetic --json --no-extensions",
+            "fetchedAt": "2026-01-01T00:00:00Z",
+            "models": [],
+            "error": "no supported native catalog"
+        }),
+    ] {
+        settings_receipt_ok("catalog.refresh", refresh_payload.clone(), receipt);
+    }
+    // The source names the provider the call asked for; another provider's
+    // catalog is not this refresh's answer.
+    settings_receipt_unknown(
+        "catalog.refresh",
+        refresh_payload.clone(),
+        json!({
+            "source": "omp models other --json --no-extensions",
+            "fetchedAt": "2026-01-01T00:00:00Z",
+            "models": []
+        }),
+    );
+    settings_receipt_unknown(
+        "catalog.refresh",
+        refresh_payload,
+        json!({"source": "omp models synthetic --json --no-extensions"}),
+    );
+
+    // catalog.import: the saved snapshot plus the ids it added.
+    let import_payload = json!({"provider": "synthetic", "models": ["m1"]});
+    let mut imported_snapshot = config_snapshot("rev-4");
+    imported_snapshot["config"]["models"] = json!([{
+        "id": "m1", "provider": "synthetic", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    }]);
+    settings_receipt_ok(
+        "catalog.import",
+        import_payload.clone(),
+        json!({"snapshot": imported_snapshot, "imported": ["m1"]}),
+    );
+    // The ids it claims must be in the snapshot it returns, under the
+    // requested provider; a valid snapshot without the row proves nothing.
+    settings_receipt_unknown(
+        "catalog.import",
+        import_payload.clone(),
+        json!({"snapshot": config_snapshot("rev-4"), "imported": ["m1"]}),
+    );
+    let mut foreign_provider = config_snapshot("rev-4");
+    foreign_provider["config"]["models"] = json!([{
+        "id": "m1", "provider": "other", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    }]);
+    settings_receipt_unknown(
+        "catalog.import",
+        import_payload.clone(),
+        json!({"snapshot": foreign_provider, "imported": ["m1"]}),
+    );
+
+    // An id the request did not ask for is not this import's answer.
+    let mut wrong_import = config_snapshot("rev-4");
+    wrong_import["config"]["models"] = json!([{
+        "id": "m2", "provider": "synthetic", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    }]);
+    settings_receipt_unknown(
+        "catalog.import",
+        import_payload.clone(),
+        json!({"snapshot": wrong_import, "imported": ["m2"]}),
+    );
+    settings_receipt_unknown(
+        "catalog.import",
+        import_payload,
+        json!({"imported": ["m1"]}),
+    );
+
+    // master.resume: the canonical alias, either a start or the documented
+    // attention answer (a failed start is still a definite answer).
+    let resume_payload = json!({});
+    for receipt in [
+        json!({"alias": "master", "state": "starting"}),
+        json!({"alias": "master", "state": "attention"}),
+    ] {
+        settings_receipt_ok("master.resume", resume_payload.clone(), receipt);
+    }
+    settings_receipt_unknown(
+        "master.resume",
+        resume_payload,
+        json!({"alias": "other", "state": "starting"}),
+    );
+}
+
 // CAD-2009: independently authored by the ticket author; implementers must not edit.
 #[test]
 fn cad2009_lost_responses_to_issue_and_wiki_writes_remain_unknown() {
@@ -1934,6 +2832,46 @@ fn cad2009_project_mutation_capability_failure_remains_unknown() {
     let error = result.unwrap_err();
     assert_eq!(error.kind(), "unknown", "{error}");
     assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+/// CAD-2001: a tenant that cannot serve a project-scoped *read* (503
+/// capability_unavailable) is a release-order refusal — never "no evidence"
+/// and never a fallback to the older repo-scoped verb. The matching write
+/// stays unknown (above), because it may already have run.
+#[test]
+fn cad2009_project_read_capability_failure_names_the_release_order() {
+    let body = json!({"ok": false, "error": {"code": "capability_unavailable"}});
+    let args = json!({"project": "synthetic"});
+    for verb in [
+        "audit_approval_project",
+        "audit_verdicts_project",
+        "audit_reviewers_project",
+        "audit_identities",
+    ] {
+        let (result, requests) = run(
+            vec![(503, "", body.clone())],
+            verb,
+            args.as_object().unwrap().clone(),
+            10,
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), "rejected", "{verb}: {error}");
+        let text = error.to_string();
+        assert!(text.contains("Release order"), "{verb}: {text}");
+        assert!(text.contains("repo-scoped"), "{verb}: {text}");
+        assert!(!text.contains("no evidence"), "{verb}: {text}");
+        assert!(!text.contains("retry later"), "{verb}: {text}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb}");
+        for request in &requests {
+            if request["path"] == json!("/__platform/cli/call") {
+                assert_eq!(
+                    request["body"]["verb"].as_str(),
+                    Some(verb),
+                    "never fall back to the older repo-scoped verb"
+                );
+            }
+        }
+    }
 }
 
 #[test]

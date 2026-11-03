@@ -523,11 +523,9 @@ const TASK_STATES: &[&str] = &[
 /// state→count object (`{}` when the job has no tasks). A job bound to
 /// no issue is legitimate and its tasks are irrelevant to the board; a
 /// row with no `issue` property at all is schema drift, not proof of
-/// that. A *bound* row whose task summary cannot be read would
-/// otherwise derive as "no job outcome" — the same shape as a
-/// known-empty job table — so it is malformed instead: a missing or
-/// non-object `tasks`, an unknown task state, or a count that is not a
-/// non-negative integer.
+/// that. A *bound* row must also carry the identity, lifecycle state and
+/// creation value used to choose between jobs. Its task map must be an
+/// object with recognized states and non-negative integer counts.
 fn malformed_job_row(jobs: &[Value]) -> Option<String> {
     for (index, job) in jobs.iter().enumerate() {
         let Some(row) = job.as_object() else {
@@ -547,6 +545,23 @@ fn malformed_job_row(jobs: &[Value]) -> Option<String> {
             Some(Value::String(issue)) => issue,
             Some(_) => return Some(format!("job row {index} has a non-string issue")),
         };
+        if !row
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
+            return Some(format!("issue {issue}'s job has no usable id"));
+        }
+        if !row
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| crate::store::JOB_STATES.contains(&state))
+        {
+            return Some(format!("issue {issue}'s job has an invalid state"));
+        }
+        if !row.get("created").is_some_and(Value::is_number) {
+            return Some(format!("issue {issue}'s job has no usable creation time"));
+        }
         let Some(tasks) = row.get("tasks").and_then(Value::as_object) else {
             return Some(format!("issue {issue}'s job has no usable tasks summary"));
         };
@@ -586,6 +601,9 @@ pub fn fetch_job_state(state_dir: &Path) -> JobState {
             "daemon did not answer job_list within {}s",
             JOB_READ_BUDGET.as_secs()
         )),
+        Err(error) if error.code() == Some(crate::client::MALFORMED_DAEMON_RESPONSE) => {
+            JobState::Malformed(error.to_string())
+        }
         Err(error) => JobState::Unavailable(error.to_string()),
     }
 }

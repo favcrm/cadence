@@ -277,9 +277,15 @@ The gateway's real refusal shapes (AOS-243):
   audit mutations. A response can be lost after a write committed. A
   pre-forward state marker, a board-gate refusal, or `501` remains a refusal;
   checked `409` conflicts still mean not written.
-- An issue, wiki upload, delivery or audit receipt that fails the
-  operation's correlation checks is also `outcome_unknown`, not proof that
-  nothing was recorded.
+- An issue, wiki upload, team, settings, delivery or audit receipt that fails
+  the operation's correlation checks is also `outcome_unknown`, not proof
+  that nothing was recorded. Team and settings writes require a receipt
+  consistent with the requested change; reconcile an uncertain result using
+  `team list`, `team invites` or the appropriate `settings agents` read.
+  The native grant-request receipt contains only the new request id; the
+  grant-allow receipt does not echo the request id. Their shapes alone cannot
+  prove a request-to-grant correlation; inspect `settings agents grant list`
+  when that correlation is needed.
 - A `503` whose safe `error.code` is `mutation_outcome_uncertain` or
   `invite_email_uncertain` is the platform stating that a mutation may already
   have committed. It is its own category, not availability.
