@@ -7489,6 +7489,7 @@ mod cad2088_review_workflows {
     const MAIN2: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     const MB: &str = "ffffffffffffffffffffffffffffffffffffffff";
     const DIFFACC: &str = "application/vnd.github.v3.diff";
+    const JSONACC: &str = "application/vnd.github+json";
     const TOKEN1: &str = "Bearer aaa.bbb.ccc1";
     // Text no log, artifact or verdict line may carry unless it is meant to.
     const M: &str = "LEAKMARK7f3a91";
@@ -7512,8 +7513,10 @@ const hits = new Map();
 let minted = 0;
 const realSet = globalThis.setTimeout;
 globalThis.setTimeout = (f, _ms, ...a) => realSet(f, 0, ...a);
-const reply = (r) => {
+const reply = (r, init = {}) => {
   if (r.throw) throw new TypeError('fetch failed');
+  // fetch with redirect: 'error' fails on a redirect instead of following it (and sending its headers on).
+  if (r.status >= 300 && r.status < 400 && init.redirect === 'error') throw new TypeError('fetch failed');
   if (r.sse) {
     const enc = new TextEncoder();
     const body = new ReadableStream({
@@ -7532,14 +7535,14 @@ globalThis.fetch = async (url, init = {}) => {
   const method = init.method || 'GET';
   const idx = (sc.routes || []).findIndex((r) => url.includes(r.contains) && (!r.method || r.method === method) && (!r.accept || (init.headers || {}).accept === r.accept));
   const oidc = url.startsWith('http://oidc.test/');
-  const entry = { url, method, headers: init.headers || {}, body: init.body ?? null, unmatched: idx < 0 && !oidc };
+  const entry = { url, method, headers: init.headers || {}, body: init.body ?? null, redirect: init.redirect ?? null, unmatched: idx < 0 && !oidc };
   fs.appendFileSync(logf, JSON.stringify(entry) + '\n');
   if (idx >= 0) {
     const route = sc.routes[idx];
     const n = hits.get(idx) || 0; hits.set(idx, n + 1);
-    return reply(route.responses[Math.min(n, route.responses.length - 1)]);
+    return reply(route.responses[Math.min(n, route.responses.length - 1)], init);
   }
-  if (oidc) { minted++; return reply({ json: { value: `aaa.bbb.ccc${minted}` } }); }
+  if (oidc) { minted++; return reply({ json: { value: `aaa.bbb.ccc${minted}` } }, init); }
   throw new TypeError('fetch failed');
 };
 "##;
@@ -7972,18 +7975,22 @@ if (mode === 'keys') {
             ),
             route("git/ref/heads/main", w["main_seq"].clone()),
         ];
-        let pages = n / 100 + 1;
-        for page in 1..=pages.max(4) {
-            let body = if let Some(pj) = cmp["pages_json"].as_array() {
-                pj.get(page - 1).cloned().unwrap_or(json!({}))
-            } else {
-                let chunk = n.saturating_sub((page - 1) * 100).min(100);
-                let files: Vec<Value> = (0..chunk).map(|i| json!({ "filename": format!("f{}.rs", (page - 1) * 100 + i), "status": "modified" })).collect();
-                json!({ "status": cmp["status"], "merge_base_commit": { "sha": cmp["merge_base"] }, "files": files })
-            };
-            routes.push(route(&format!("&page={page}"), json!([{ "json": body }])));
+        // The live shape: the first read of the comparison lists up to 300 files (the cap); asking for page 2
+        // or later answers with `files: null`. Those routes come first so a paging reader is served that.
+        let listed = n.min(300);
+        let files: Vec<Value> = (0..listed)
+            .map(|i| json!({ "filename": format!("f{i}.rs"), "status": "modified" }))
+            .collect();
+        let first = if cmp["raw"].is_null() {
+            json!({ "status": cmp["status"], "merge_base_commit": { "sha": cmp["merge_base"] }, "files": files })
+        } else {
+            cmp["raw"].clone()
+        };
+        for page in 2..=4 {
+            routes.push(route(&format!("&page={page}"), json!([{ "json": { "status": cmp["status"], "merge_base_commit": { "sha": cmp["merge_base"] }, "files": null } }])));
         }
         let main = w["main"].as_str().unwrap_or(MAIN);
+        routes.push(json!({ "contains": format!("compare/{main}...{HEAD}"), "accept": JSONACC, "responses": [{ "json": first }] }));
         // The diff the PR's own (stale) base would give: served for whatever base the PR record names.
         let stale_bases = [
             w["ctx"]["pull"]["base_sha"].as_str().unwrap_or(CTX_BASE),
@@ -9230,7 +9237,12 @@ if (mode === 'keys') {
                     route_edit(Box::new({
                         let p = p.clone();
                         move |s| {
-                            set_route(s, "&page=1", None, json!([{ "status": 500, "text": p }]))
+                            set_route(
+                                s,
+                                "compare/",
+                                Some(JSONACC),
+                                json!([{ "status": 500, "text": p }]),
+                            )
                         }
                     })),
                 ),
@@ -9241,8 +9253,8 @@ if (mode === 'keys') {
                         move |s| {
                             set_route(
                                 s,
-                                "&page=1",
-                                None,
+                                "compare/",
+                                Some(JSONACC),
                                 json!([{ "json": { "status": p, "merge_base_commit": { "sha": p }, "files": [p] } }]),
                             )
                         }
@@ -10033,8 +10045,9 @@ if (mode === 'keys') {
             );
             assert_eq!(r.minted(), 1);
             assert!(
-                r.out.contains("stored outcome revise")
-                    && r.out.contains("differs from this run's pass"),
+                r.out.contains("::notice::duplicate of this run attempt's own earlier filing; stored outcome revise\n")
+                    && !r.out.contains("differs")
+                    && !r.out.contains("this run's"),
                 "{}",
                 r.out
             );
@@ -10831,9 +10844,6 @@ if (mode === 'keys') {
         for wf in all() {
             let page_ok = |status: &str, mb: Value, files: Value| json!({ "status": status, "merge_base_commit": { "sha": mb }, "files": files });
             let two = json!([{ "filename": "a" }, { "filename": "b" }]);
-            let hundred: Vec<Value> = (0..100)
-                .map(|i| json!({ "filename": format!("f{i}") }))
-                .collect();
             let cases: Vec<(&str, Value, &str)> = vec![
                 (
                     "identical",
@@ -10852,22 +10862,22 @@ if (mode === 'keys') {
                 ),
                 (
                     "no merge base",
-                    json!({ "cmp": { "pages_json": [{ "status": "ahead", "files": two }] , "files_n": 2 } }),
+                    json!({ "cmp": { "raw": { "status": "ahead", "files": two }, "files_n": 2 } }),
                     "malformed or has nothing to review",
                 ),
                 (
                     "short merge base",
-                    json!({ "cmp": { "pages_json": [page_ok("ahead", json!("abc123"), two.clone())], "files_n": 2 } }),
+                    json!({ "cmp": { "raw": page_ok("ahead", json!("abc123"), two.clone()), "files_n": 2 } }),
                     "malformed or has nothing to review",
                 ),
                 (
                     "merge base not text",
-                    json!({ "cmp": { "pages_json": [page_ok("ahead", json!(7), two.clone())], "files_n": 2 } }),
+                    json!({ "cmp": { "raw": page_ok("ahead", json!(7), two.clone()), "files_n": 2 } }),
                     "malformed or has nothing to review",
                 ),
                 (
                     "files not a list",
-                    json!({ "cmp": { "pages_json": [page_ok("ahead", json!(MB), json!("x"))], "files_n": 2 } }),
+                    json!({ "cmp": { "raw": page_ok("ahead", json!(MB), json!("x")), "files_n": 2 } }),
                     "malformed or has nothing to review",
                 ),
                 (
@@ -10881,19 +10891,34 @@ if (mode === 'keys') {
                     "does not cover the comparison",
                 ),
                 (
-                    "merge base moves between pages",
-                    json!({ "cmp": { "pages_json": [page_ok("ahead", json!(MB), json!(hundred)), page_ok("ahead", json!(MAIN2), two.clone())], "files_n": 101 } }),
-                    "changed while it was read",
+                    "files null",
+                    json!({ "cmp": { "raw": page_ok("ahead", json!(MB), Value::Null), "files_n": 2 } }),
+                    "malformed or has nothing to review",
+                ),
+                (
+                    "files missing",
+                    json!({ "cmp": { "raw": { "status": "ahead", "merge_base_commit": { "sha": MB } }, "files_n": 2 } }),
+                    "malformed or has nothing to review",
+                ),
+                (
+                    "300 files",
+                    json!({ "cmp": { "status": "ahead", "merge_base": MB, "files_n": 300 }, "diff": many(300) }),
+                    "too many files (300 or more)",
+                ),
+                (
+                    "a list capped at 300 for a real 450",
+                    json!({ "cmp": { "status": "ahead", "merge_base": MB, "files_n": 450 }, "diff": many(450) }),
+                    "too many files (300 or more)",
                 ),
                 (
                     "301 files",
                     json!({ "cmp": { "status": "ahead", "merge_base": MB, "files_n": 301 }, "diff": many(301) }),
-                    "too many files",
+                    "too many files (300 or more)",
                 ),
                 (
                     "1000 files",
                     json!({ "cmp": { "status": "ahead", "merge_base": MB, "files_n": 1000 }, "diff": many(20) }),
-                    "too many files",
+                    "too many files (300 or more)",
                 ),
             ];
             for (name, edit, reason) in cases {
@@ -10962,8 +10987,8 @@ if (mode === 'keys') {
             let mut sc = prepare_scenario(&w);
             set_route(
                 &mut sc,
-                "&page=1",
-                None,
+                "compare/",
+                Some(JSONACC),
                 json!([{ "status": 404, "text": "x" }]),
             );
             let r = run_job(&wf, "prepare", &sc, &[], &|_| {});
@@ -10978,23 +11003,49 @@ if (mode === 'keys') {
     }
 
     #[test]
-    fn a_pr_of_up_to_299_files_pages_and_is_covered() {
+    fn a_pr_of_up_to_299_files_is_read_once_and_covered() {
         let many = |n: usize| -> String {
             (0..n).map(|i| format!("diff --git a/f{i}.rs b/f{i}.rs\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/f{i}.rs\n@@ -0,0 +1 @@\n+x\n")).collect()
         };
         for wf in all() {
-            for (n, pages) in [(100, 2), (150, 2), (250, 3), (299, 3)] {
+            for n in [100, 150, 250, 299] {
                 let mut w = world(&wf);
                 w["cmp"]["files_n"] = json!(n);
                 w["diff"] = json!(many(n));
                 let r = prepare(&wf, &w, &[]);
                 assert_eq!(r.code, Some(0), "{}: {n} files: {}", wf.file, r.out);
-                let page_reqs = r
+                let json_reads: Vec<&Value> = r
                     .reqs
                     .iter()
-                    .filter(|q| q["url"].as_str().unwrap().contains("per_page=100&page="))
-                    .count();
-                assert_eq!(page_reqs, pages, "{}: {n} files", wf.file);
+                    .filter(|q| {
+                        q["url"].as_str().unwrap().contains("/compare/")
+                            && q["headers"]["accept"] == JSONACC
+                    })
+                    .collect();
+                assert_eq!(
+                    json_reads.len(),
+                    1,
+                    "{}: {n} files: the comparison must be read exactly once",
+                    wf.file
+                );
+                assert!(
+                    !json_reads[0]["url"].as_str().unwrap().contains("page="),
+                    "{}: {n} files: no paging",
+                    wf.file
+                );
+                assert!(
+                    r.reqs
+                        .iter()
+                        .all(|q| !q["url"].as_str().unwrap().contains("page=")),
+                    "{}: {n} files: a page was requested",
+                    wf.file
+                );
+                assert_eq!(
+                    r.hits("/compare/").len(),
+                    2,
+                    "{}: one JSON read and one diff read",
+                    wf.file
+                );
                 let input = r.read("out/review-input.json").unwrap();
                 assert_eq!(
                     input["diff"]
@@ -11200,6 +11251,91 @@ if (mode === 'keys') {
             // Nothing else in the visible note was lost to the stripping.
             for kept in ["bidi", "zero", "end"] {
                 assert!(line.contains(kept), "{}: {kept} lost: {line}", wf.file);
+            }
+        }
+    }
+
+    // ---- the model fetch: redirects and the stop reason -------------------------
+
+    #[test]
+    fn the_model_fetch_never_follows_a_redirect() {
+        for wf in all() {
+            let (input, _) = prepared(&wf);
+            let good = model_reply(&good_output(&wf).to_string(), "end_turn");
+            let r = run_review(&wf, &input, json!([good.clone()]), &[]);
+            assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+            for q in r.hits("api.anthropic.com") {
+                assert_eq!(
+                    q["redirect"], "error",
+                    "{}: the model fetch must carry redirect: 'error'",
+                    wf.file
+                );
+            }
+            // A redirect (which would carry the key to wherever it points) fails the call, once, with the
+            // line for a failed call, whatever the redirect status.
+            for status in [301, 302, 303, 307, 308] {
+                let redirect = json!([{ "status": status, "text": "" }, good.clone()]);
+                let r = run_review(&wf, &input, redirect, &[]);
+                assert!(
+                    r.failed() && r.out.contains("call failed or timed out"),
+                    "{}: {status}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert_eq!(
+                    r.hits("api.anthropic.com").len(),
+                    1,
+                    "{}: {status}: a redirect must not be retried",
+                    wf.file
+                );
+                assert!(r.files().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_conflicting_second_stop_reason_fails_closed_and_a_repeated_one_is_accepted() {
+        for wf in all() {
+            let (input, _) = prepared(&wf);
+            let good = good_output(&wf).to_string();
+            let stop = |reason: &str| json!({ "type": "message_delta", "delta": { "stop_reason": reason }, "usage": { "output_tokens": 1 } });
+            let with_stops = |stops: &[&str]| {
+                let mut ev = model_events(&good, None);
+                let at = ev.len() - 1;
+                for (i, s) in stops.iter().enumerate() {
+                    ev.insert(at + i, stop(s));
+                }
+                json!([{ "status": 200, "sse": ev }])
+            };
+            // The same reason repeated is one reason.
+            let r = run_review(&wf, &input, with_stops(&["end_turn", "end_turn"]), &[]);
+            assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+            assert!(r.read("out/review-output.json").is_some());
+            // Two reasons that differ, in either order, even when the last would be fine.
+            for stops in [
+                ["refusal", "end_turn"],
+                ["end_turn", "refusal"],
+                ["end_turn", "max_tokens"],
+                ["max_tokens", "end_turn"],
+            ] {
+                let r = run_review(&wf, &input, with_stops(&stops), &[]);
+                assert!(
+                    r.failed() && r.out.contains("stream failed"),
+                    "{}: {stops:?}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert_eq!(
+                    r.hits("api.anthropic.com").len(),
+                    1,
+                    "{}: {stops:?}",
+                    wf.file
+                );
+                assert!(
+                    r.read("out/review-output.json").is_none() && r.files().is_empty(),
+                    "{}: {stops:?} wrote output",
+                    wf.file
+                );
             }
         }
     }
