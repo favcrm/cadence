@@ -186,6 +186,12 @@ fn platform_tools(state_dir: &Path) -> Vec<PlatformTool> {
     ) else {
         return Vec::new();
     };
+    platform_tools_from(&listing)
+}
+
+/// The listing → advertised-tools projection, split out so the availability
+/// rule is testable without a daemon.
+fn platform_tools_from(listing: &Value) -> Vec<PlatformTool> {
     let mut rows: Vec<(&str, &str, bool, bool, &Value)> = Vec::new();
     for platform in listing["platforms"].as_array().into_iter().flatten() {
         let Some(platform_name) = platform["platform"].as_str() else {
@@ -195,6 +201,12 @@ fn platform_tools(state_dir: &Path) -> Vec<PlatformTool> {
             let Some(tool_name) = tool["tool"].as_str() else {
                 continue;
             };
+            // CAD-1974: an unavailable tool is not advertised. This surface
+            // cannot carry the enrollment step, so offering the name would
+            // promise a call the gate refuses.
+            if tool["available"].as_bool() == Some(false) {
+                continue;
+            }
             rows.push((
                 platform_name,
                 tool_name,
@@ -579,7 +591,7 @@ mod tests {
     #[test]
     fn a_connected_read_marshals_its_controls_as_flags() {
         let generated = [PlatformTool {
-            name: "agenticos_provider_search_console_report".into(),
+            name: "agenticos-provider_search_console_report".into(),
             platform: "agenticos-provider".into(),
             tool: "search_console_report".into(),
             description: "Report".into(),
@@ -587,7 +599,7 @@ mod tests {
             connected_read: true,
         }];
         let argv = command_args(
-            "agenticos_provider_search_console_report",
+            "agenticos-provider_search_console_report",
             &json!({"connection":"con_alpha","max_charge":25,"site_url":"sc-domain:x.test"}),
             &generated,
         )
@@ -610,24 +622,56 @@ mod tests {
         );
         // Both controls are required: a call missing either never becomes argv.
         assert!(command_args(
-            "agenticos_provider_search_console_report",
+            "agenticos-provider_search_console_report",
             &json!({"max_charge":25}),
             &generated
         )
         .is_err());
         assert!(command_args(
-            "agenticos_provider_search_console_report",
+            "agenticos-provider_search_console_report",
             &json!({"connection":"con_alpha"}),
             &generated
         )
         .is_err());
         let error = command_args(
-            "agenticos_provider_search_console_report",
+            "agenticos-provider_search_console_report",
             &json!({"connection":"con_alpha","max_charge":"25"}),
             &generated,
         )
         .unwrap_err();
         assert!(error.to_string().contains("max_charge"), "{error}");
+    }
+
+    /// CAD-1974: discovery never advertises a tool the gate would refuse for
+    /// want of an enrollment this surface cannot perform.
+    #[test]
+    fn an_unavailable_platform_tool_is_not_advertised() {
+        let listing = json!({"platforms": [
+            {"platform": "agenticos-provider",
+             "tools": [
+                {"tool":"search_console_report","effect":"read","direct":true,
+                 "connected_read":true,"available":true,"label":"Report"},
+                {"tool":"analytics_report","effect":"read","direct":true,
+                 "connected_read":true,"available":false,
+                 "unavailable":"no credential is enrolled for agenticos-provider — run ..."}]},
+            {"platform": "local",
+             "tools": [{"tool":"publish","effect":"send","direct":true,"available":true}]}
+        ]});
+        let tools = platform_tools_from(&listing);
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert!(
+            names.contains(&"agenticos-provider_search_console_report"),
+            "got {names:?}"
+        );
+        assert!(names.contains(&"local_publish"));
+        assert!(
+            !names.iter().any(|name| name.contains("analytics")),
+            "an unavailable tool must not be offered: {names:?}"
+        );
+        assert!(tools
+            .iter()
+            .find(|tool| tool.tool == "search_console_report")
+            .is_some_and(|tool| tool.connected_read));
     }
 
     #[test]

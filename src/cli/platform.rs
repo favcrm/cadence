@@ -603,12 +603,23 @@ fn print_platform_tools(listing: &Value) {
         let platform = entry["platform"].as_str().unwrap_or_default();
         let account = entry["default_account"].as_str().unwrap_or("");
         for decl in entry["tools"].as_array().into_iter().flatten() {
+            // CAD-1974: a tool with no enrolled account is not runnable, so it
+            // never prints as one. The reason follows the table.
+            let available = decl["available"].as_bool().unwrap_or(true);
+            if let Some(reason) = decl["unavailable"].as_str().filter(|_| !available) {
+                println!(
+                    "{platform} {} is unavailable: {reason}",
+                    decl["tool"].as_str().unwrap_or_default()
+                );
+            }
             println!(
                 "{:<20} {:<24} {:<7} {:<6} {:<9} {:<16}",
                 platform,
                 decl["tool"].as_str().unwrap_or_default(),
                 decl["effect"].as_str().unwrap_or_default(),
-                if decl["direct"].as_bool() == Some(true) {
+                if !available {
+                    "no"
+                } else if decl["direct"].as_bool() == Some(true) {
                     "yes"
                 } else {
                     "app"
