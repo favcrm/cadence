@@ -44,7 +44,7 @@ const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
 const { seatStatus } = require("../src/features/agents/SeatCard") as typeof import("../src/features/agents/SeatCard");
-const { profileWork } = require("../src/features/agents/agentView") as typeof import("../src/features/agents/agentView");
+const { profileMatchesFilter, profileMatchesSearch, profileWork } = require("../src/features/agents/agentView") as typeof import("../src/features/agents/agentView");
 const Agents = (
   require("../src/features/agents/Agents") as typeof import("../src/features/agents/Agents")
 ).default;
@@ -309,6 +309,12 @@ async function main() {
   assert(profileWork(claimed("result"), owned)?.id === "DEMO-2", "an ended claim does not outrank open owned work");
   const ended = profileWork(claimed("failed"), []);
   assert(ended?.id === "DEMO-9" && ended.state === "last" && ended.title === undefined, "an ended claim outside the list is the last work, by id alone");
+  const inFilter = (state: string, filter: Parameters<typeof profileMatchesFilter>[1]) => profileMatchesFilter(claimed(state), filter);
+  assert(inFilter("running", "working") && !inFilter("running", "idle"), "a running claim files under Working, not Idle");
+  assert(inFilter("blocked", "attention") && !inFilter("blocked", "idle"), "a blocked claim files under Needs attention");
+  assert(!inFilter("queued", "idle") && inFilter("queued", "current"), "a waiting claim is not idle and stays in Current");
+  assert(inFilter("result", "idle") && !inFilter("result", "working"), "an ended claim reads idle");
+  assert(profileMatchesSearch(claimed("running", "DEMO-9"), "demo-9"), "search finds the claimed issue id printed on the card");
   assert(profileWork(claimed("running", "DEMO-2"), owned)?.title === "Owned", "a claim takes its title from the issue list");
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [profile] });
   await render();

@@ -211,15 +211,22 @@ export function conversationalOnlyCloud(
   return a?.provider === "agenticos-cloud" && a?.endpoint_kind === "cloud";
 }
 
-/** A profile with no runtime is an idle seat: it shows where an idle agent
- *  would. A profile with runtimes is carried by their own rows. */
+/** A profile with no runtime is an idle seat unless it holds a live claim: the
+ *  filters then agree with what its card says. A profile with runtimes is carried
+ *  by their own rows. */
 export function profileMatchesFilter(p: HiredProfile, filter: AgentFilter): boolean {
-  return p.runtimes.length === 0 && ["all", "current", "idle"].includes(filter);
+  if (p.runtimes.length > 0) return false;
+  if (filter === "all" || filter === "current") return true;
+  const live = liveClaimState(p);
+  if (live === "working") return filter === "working";
+  if (live === "blocked") return filter === "attention";
+  if (live === "waiting") return false;
+  return filter === "idle";
 }
 
 export function profileMatchesSearch(p: HiredProfile, query: string): boolean {
   const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
-  const text = [p.alias, p.role, p.team_role, p.catalogue].filter(Boolean).join(" ").toLowerCase();
+  const text = [p.alias, p.role, p.team_role, p.catalogue, p.latest_claim?.issue_id].filter(Boolean).join(" ").toLowerCase();
   return terms.every((term) => text.includes(term));
 }
 
@@ -232,12 +239,16 @@ export interface ProfileWork {
 }
 
 const CLOSED_STATUSES = new Set(["done", "dropped"]);
-const LIVE_CLAIMS: Record<string, ProfileWork["state"]> = {
-  running: "working",
-  blocked: "blocked",
-  queued: "waiting",
-  waiting: "waiting",
-};
+const LIVE_CLAIMS = new Map<string, ProfileWork["state"]>([
+  ["running", "working"],
+  ["blocked", "blocked"],
+  ["queued", "waiting"],
+  ["waiting", "waiting"],
+]);
+
+function liveClaimState(p: HiredProfile): ProfileWork["state"] | undefined {
+  return p.latest_claim ? LIVE_CLAIMS.get(p.latest_claim.state) : undefined;
+}
 
 /** In order: a live claim, the newest open issue the profile owns, then the last
  *  it finished or stopped. `null` when the board records none, never an inferred
@@ -248,7 +259,7 @@ export function profileWork(p: HiredProfile, issues: IssueCard[]): ProfileWork |
     return title === undefined ? { id, state } : { id, title, state };
   };
   const claim = p.latest_claim;
-  const live = claim ? LIVE_CLAIMS[claim.state] : undefined;
+  const live = liveClaimState(p);
   if (claim && live) return titled(claim.issue_id, live);
   const owned = issues
     .filter((issue) => issue.owner === p.alias && !issue.container)
