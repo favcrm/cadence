@@ -115,6 +115,17 @@ pub(crate) struct MediaImport<'a> {
     pub request_id: &'a str,
 }
 
+/// Display material for one catalog asset, whichever provenance it has:
+/// imported workspace custody or a provider-produced original. Callers
+/// that only need to show or attach the asset use this instead of
+/// resolving `app_media_asset_origins` themselves.
+pub(crate) struct DisplayImage {
+    pub asset: MediaAsset,
+    pub media_type: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+
 /// One imported workspace image: the catalog row plus the verified
 /// custody bytes. Only the store's own readers see this shape; the
 /// frame still receives metadata only.
@@ -661,6 +672,30 @@ impl Store {
             )?;
             Ok(result)
         })
+    }
+
+    /// CAD-2051: display material for one catalog asset, imported or
+    /// provider-produced. An absent id is `None`; a stored row that fails
+    /// its own checks refuses rather than projecting.
+    pub(crate) fn app_media_display_image(&self, asset_id: &str) -> Result<Option<DisplayImage>> {
+        if let Some(imported) = self.app_media_imported_image(asset_id)? {
+            return Ok(Some(DisplayImage {
+                asset: imported.asset,
+                media_type: imported.media_type,
+                sha256: imported.sha256,
+                bytes: imported.bytes,
+            }));
+        }
+        if self.app_media_asset(asset_id)?.is_none() {
+            return Ok(None);
+        }
+        let image = self.app_media_context_image(asset_id)?;
+        Ok(Some(DisplayImage {
+            asset: image.asset,
+            media_type: image.original.media_type.clone(),
+            sha256: image.original.sha256.clone(),
+            bytes: image.bytes,
+        }))
     }
 
     /// CAD-1962: the verified custody bytes behind one imported asset.

@@ -213,3 +213,30 @@ fn an_imported_asset_is_a_draft_until_published_and_outlives_its_importer() {
     .unwrap();
     assert!(s.app_media_imported_image(&asset_id).is_err());
 }
+
+#[test]
+fn display_material_resolves_an_imported_asset_for_consumers() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+    let created = import(&s, "image/png", IMPORT_BYTES, "receipt-d", "import-d").unwrap();
+    let asset_id = created["receipt"]["asset_id"].as_str().unwrap();
+
+    let display = s.app_media_display_image(asset_id).unwrap().unwrap();
+    assert_eq!(
+        display.bytes, IMPORT_BYTES,
+        "the consumer gets the custody bytes"
+    );
+    assert_eq!(
+        display.sha256,
+        crate::store::app_runs::artifact_digest(IMPORT_BYTES),
+        "the digest is the verified custody digest"
+    );
+    assert_eq!(display.media_type, "image/png");
+    assert_eq!(display.asset.revision, 1);
+
+    // An unknown id resolves to nothing rather than an error.
+    assert!(s
+        .app_media_display_image(&format!("med-{}", "9".repeat(32)))
+        .unwrap()
+        .is_none());
+}
