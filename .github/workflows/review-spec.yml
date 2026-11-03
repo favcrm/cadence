@@ -1,13 +1,16 @@
 name: review-spec # per axis
 
 # CAD-2081 stage 3 (CAD-2088): the protected fresh-session spec review.
-# Dispatched on main with a PR number and head SHA. Three jobs, because any step
-# of an id-token job can mint a token and any step of the model job can read the
-# key, so no job holds both:
+# Dispatched on main with a PR number and head SHA (a dispatch from any other ref
+# fails in prepare). Three jobs, because any step of an id-token job can mint a
+# token and any step of the model job can read the key, so no job holds both:
 #   prepare  id-token, no secret, no model: reads the context and the diff.
 #   review   the environment's model key, no id-token, no checkout: one fresh
 #            model call on the diff, whose only output is a JSON schema.
-#   file     id-token, no key: validates that output and files the verdict.
+#   file     id-token, no model key: validates that output and files the verdict.
+# No model-derived, PR-derived or tenant-derived text is ever logged: messages are
+# fixed text, numbers and enum-checked names. Node is the runner image's own (20 or
+# newer, checked at the start of each script); the scripts use only its built-ins.
 # The tenant verifies the OIDC token (workflow_ref, ref, runner, audience) and
 # the live PR, and records the verdict under the service principal svc_review_spec
 # (kind spec-security; the kind comes from the proved workflow, never from this file).
@@ -16,7 +19,9 @@ name: review-spec # per axis
 # review-standards.yml is the same file: it may differ from this one ONLY in this
 # leading comment block and in lines containing the text "per axis" (the name,
 # run-name and concurrency group, KIND, CHECKS and the AXIS prompt). Delete those
-# lines from both files and the rest must be byte-identical.
+# lines from both files and the rest must be byte-identical. The sealing and
+# parseDiff helpers are repeated inside the jobs that use them (prepare: seal,
+# parseDiff; review: seal, unseal; file: unseal, parseDiff).
 #
 # Sealing: the private ticket (title, status, body) and the model's output are
 # never uploaded in the clear. prepare seals them (RSA-OAEP-SHA256 wrapping an
@@ -63,8 +68,7 @@ env:
 
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       id-token: write
@@ -79,9 +83,16 @@ jobs:
           import fs from 'node:fs';
           import crypto from 'node:crypto';
           const E = process.env, { PR, HEAD, REPO, PROJECT, TENANT, KIND } = E;
-          const die = (m) => { console.log(`::error::${m}`); process.exit(1); };
+          if (Number(process.versions.node.split('.')[0]) < 20) { console.log('::error::Node 20 or newer is required'); process.exit(1); }
+          // Log hygiene: only fixed text, numbers and enum-checked names are printed; nothing taken from
+          // the model output, the PR, the ticket or a response body reaches a log. clean() is a last guard.
+          const clean = (s) => String(s).replace(/[^\x20-\x7e]/g, '?').replace(/%/g, '?').replace(/::/g, ': :').slice(0, 300);
+          const out = (m) => console.log(clean(m));
+          const die = (m) => { console.log(`::error::${clean(m)}`); process.exit(1); };
+          process.on('uncaughtException', () => die('unexpected internal error; nothing filed'));
+          process.on('unhandledRejection', () => die('unexpected internal error; nothing filed'));
           const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-          // Sealing helpers: the same in every job that uses them.
+          // Sealing: RSA-OAEP-SHA256 wraps a random AES-256-GCM key; the AAD binds repo, PR, head and label.
           const aad = (l) => Buffer.from(`cadence-review-seal:v1:${REPO}:${PR}:${HEAD}:${l}`);
           const OAEP = { oaepHash: 'sha256', padding: crypto.constants.RSA_PKCS1_OAEP_PADDING };
           function seal(pub, label, obj) {
@@ -89,12 +100,6 @@ jobs:
             const c = crypto.createCipheriv('aes-256-gcm', k, iv); c.setAAD(aad(label));
             const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
             return { v: 1, k: crypto.publicEncrypt({ key: pub, ...OAEP }, k).toString('base64'), iv: iv.toString('base64'), tag: c.getAuthTag().toString('base64'), ct: ct.toString('base64') };
-          }
-          function unseal(priv, label, s) {
-            if (!s || s.v !== 1) throw new Error('bad seal');
-            const d = crypto.createDecipheriv('aes-256-gcm', crypto.privateDecrypt({ key: priv, ...OAEP }, Buffer.from(s.k, 'base64')), Buffer.from(s.iv, 'base64'));
-            d.setAAD(aad(label)); d.setAuthTag(Buffer.from(s.tag, 'base64'));
-            return JSON.parse(Buffer.concat([d.update(Buffer.from(s.ct, 'base64')), d.final()]).toString('utf8'));
           }
           function publicKey() {
             const pem = E.REVIEW_SEAL_PUBLIC_KEY || '';
@@ -104,9 +109,44 @@ jobs:
               die('repo variable REVIEW_SEAL_PUBLIC_KEY is missing or is not an RSA public key of at least 3072 bits; nothing filed, no model called');
             return k;
           }
-          function privateKey() {
-            try { return crypto.createPrivateKey(E.REVIEW_SEAL_PRIVATE_KEY || ''); } catch { die('environment secret REVIEW_SEAL_PRIVATE_KEY is missing or malformed; nothing filed'); }
+          // The new-side line numbers each file's hunks show (and the number of file sections). Every hunk is
+          // walked by its declared line counts, whether or not its file is known, so no diff content line can
+          // pass for a header. `+++` counts as a header only directly after `---`. A quoted file name is not
+          // decoded: its lines are walked but recorded nowhere, so nothing can cite it. Anything incomplete or
+          // binary is refused. The same function runs in prepare and in file.
+          class Refusal extends Error {}
+          function parseDiff(text) {
+            if (!text.endsWith('\n')) throw new Refusal('the diff is incomplete');
+            const lines = text.split('\n'); lines.pop();
+            const files = new Map();
+            let sections = 0, cur = null, o = 0, n = 0, nl = 0, old = false, m;
+            for (const line of lines) {
+              if (o > 0 || n > 0) {
+                const c = line[0];
+                if (c === '\\') continue;
+                if (c === '+') { cur?.add(nl); nl++; n--; continue; }
+                if (c === '-') { o--; continue; }
+                if (c === ' ' || line === '') { cur?.add(nl); nl++; o--; n--; continue; }
+                throw new Refusal('the diff has an incomplete hunk');
+              }
+              if (line.startsWith('diff --git ')) { sections++; cur = null; old = false; continue; }
+              if (line.startsWith('--- ')) { old = true; continue; }
+              if (old && line.startsWith('+++ ')) {
+                old = false; cur = null;
+                const name = line.slice(4).replace(/\t$/, '');
+                if (name.startsWith('b/')) { cur = files.get(name.slice(2)) ?? new Set(); files.set(name.slice(2), cur); }
+                continue;
+              }
+              old = false;
+              if (line.startsWith('Binary files ') || line === 'GIT binary patch') throw new Refusal('the diff has a binary section the reviewer cannot see');
+              if ((m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line))) {
+                o = m[1] === undefined ? 1 : Number(m[1]); n = m[3] === undefined ? 1 : Number(m[3]); nl = Number(m[2]);
+              }
+            }
+            if (o > 0 || n > 0) throw new Refusal('the diff has an incomplete hunk');
+            return { files, sections };
           }
+          if (E.GITHUB_REF !== 'refs/heads/main') die('this workflow only runs from main: dispatch it with --ref main');
           const pub = publicKey(); // before any token is minted or context read
           if (!/^[1-9][0-9]{0,8}$/.test(PR || '') || !/^[0-9a-f]{40}$/.test(HEAD || ''))
             die('inputs rejected: pr must be a number and head_sha a full lowercase 40-hex commit');
@@ -122,7 +162,7 @@ jobs:
             });
             if (!r.ok) die(`oidc mint failed: HTTP ${r.status}`);
             const j = await r.json();
-            if (typeof j.value !== 'string' || !j.value) die('oidc mint returned no token');
+            if (typeof j.value !== 'string' || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/.test(j.value)) die('oidc mint returned no usable token');
             console.log(`::add-mask::${j.value}`);
             return j.value;
           }
@@ -142,19 +182,20 @@ jobs:
 
           // A fork PR can never get a workflow verdict (the tenant refuses it too).
           const pr = await gh(`pulls/${PR}`);
-          if (!pr.ok) die(`cannot read PR ${PR}: HTTP ${pr.status}`);
+          if (!pr.ok) die(`cannot read the PR: HTTP ${pr.status}`);
           const live = await pr.json();
           if (!live.head?.repo || String(live.head.repo.full_name).toLowerCase() !== REPO.toLowerCase())
-            die(`PR ${PR} is from a fork: a workflow verdict is never filed for a fork, so nothing was filed; use a session review`);
-          if (live.state !== 'open' || live.merged) die(`PR ${PR} is not open`);
-          if (live.base?.ref !== 'main') die(`PR ${PR} does not target main`);
-          if (live.head.sha !== HEAD) die(`head moved: the PR is at ${String(live.head.sha).slice(0, 12)}, not ${HEAD.slice(0, 12)}`);
+            die('the PR is from a fork: a workflow verdict is never filed for a fork, so nothing was filed; use a session review');
+          if (live.state !== 'open' || live.merged) die('the PR is not open');
+          if (live.base?.ref !== 'main') die('the PR does not target main');
+          if (live.head.sha !== HEAD) die('head moved: the PR is no longer at the dispatched head');
+          if (!Number.isInteger(live.changed_files) || live.changed_files < 1) die('the PR reports no changed files');
 
           let ctx = null;
           for (let i = 1; i <= 3 && !ctx; i++) {
             const r = await tenant('context', { project: PROJECT });
             if (r.status === 200 && r.json?.state === 'ok') { ctx = r.json; break; }
-            if (r.status === 0 || r.status >= 500) { console.log(`context attempt ${i}: tenant unavailable (${r.status})`); await sleep(i * 5000); continue; }
+            if (r.status === 0 || r.status >= 500) { out(`context attempt ${i}: tenant unavailable (${r.status})`); await sleep(i * 5000); continue; }
             const code = codeOf(r);
             die(`context refused: HTTP ${r.status} ${code}${code === 'pull_request_fork' ? ' (fork PR: no workflow verdict is ever filed for a fork)' : ''}`);
           }
@@ -164,6 +205,11 @@ jobs:
             || ctx.pull?.base !== 'main' || ctx.pull?.head !== HEAD || !/^[0-9a-f]{40}$/.test(ctx.pull?.base_sha || '')
             || typeof issue !== 'string' || !/^[A-Za-z][A-Za-z0-9]{1,15}-[0-9]{1,9}$/.test(issue))
             die('context does not match the dispatch (kind, repo, pr, head, base or ticket id)');
+          // Bound what the model is sent: ticket and PR text 100 KB each, diff 300 KB, two repo docs 120 KB each.
+          const sz = (s) => (typeof s === 'string' ? Buffer.byteLength(s) : 1e9);
+          if (sz(ctx.ticket_body) > 100000 || sz(ctx.pull.title) + sz(ctx.pull.body) > 100000 || sz(ctx.pull.author) > 200
+            || sz(ctx.ticket.title) > 2000 || sz(ctx.ticket.status) > 100)
+            die('the ticket or the PR text is too large (or malformed) to review; nothing filed');
 
           // The diff is from the base the context returned, never from a re-read of the PR.
           const base = ctx.pull.base_sha;
@@ -171,36 +217,37 @@ jobs:
           if (!d.ok) die(`cannot read the diff: HTTP ${d.status}`);
           const diff = await d.text();
           if (Buffer.byteLength(diff) > 300000) die('diff is over 300 KB: too large to review, nothing filed');
-          const files = (diff.match(/^diff --git /gm) || []).length;
-          if (files === 0 || files !== live.changed_files) die(`diff covers ${files} files but the PR changes ${live.changed_files}: refusing a truncated diff`);
+          let sections;
+          try { sections = parseDiff(diff).sections; } catch (e) { die(e instanceof Refusal ? e.message : 'the diff cannot be read'); }
+          if (sections !== live.changed_files) die(`the diff has ${sections} file sections but the PR changes ${live.changed_files}: refusing a truncated diff`);
           // The standard the reviewer applies is read at the trusted base commit, never from the PR.
           const doc = async (p) => {
             const r = await gh(`contents/${p}?ref=${base}`, 'application/vnd.github.raw+json');
             if (!r.ok) die(`cannot read ${p} at base: HTTP ${r.status}`);
             const t = await r.text();
-            if (t.length > 120000) die(`${p} at base is too large`);
+            if (Buffer.byteLength(t) > 120000) die(`${p} at base is too large`);
             return t;
           };
-          const out = `${E.RUNNER_TEMP}/out`;
-          fs.mkdirSync(out, { recursive: true });
-          fs.writeFileSync(`${out}/review-input.json`, JSON.stringify({
+          const dir = `${E.RUNNER_TEMP}/out`;
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(`${dir}/review-input.json`, JSON.stringify({
             repo: REPO, pr: Number(PR), head: HEAD, base, issue, pull: ctx.pull,
-            sealed_ticket: seal(pub, 'ticket', { ticket: ctx.ticket, body: typeof ctx.ticket_body === 'string' ? ctx.ticket_body : '' }), diff,
+            sealed_ticket: seal(pub, 'ticket', { ticket: ctx.ticket, body: ctx.ticket_body }), diff,
             agents_md: await doc('AGENTS.md'), risk_classes: await doc('docs/roles/risk-classes.md'),
           }));
-          fs.writeFileSync(`${out}/file-input.json`, JSON.stringify({ repo: REPO, pr: Number(PR), head: HEAD, base, issue, diff }));
-          console.log(`prepared ${issue} PR ${PR} head ${HEAD.slice(0, 12)} base ${base.slice(0, 12)}: ${files} files, ${diff.length} diff bytes`);
+          fs.writeFileSync(`${dir}/file-input.json`, JSON.stringify({ repo: REPO, pr: Number(PR), head: HEAD, base, issue, diff }));
+          out(`prepared ${issue} PR ${PR} head ${HEAD.slice(0, 12)} base ${base.slice(0, 12)}: ${sections} files, ${diff.length} diff bytes`);
           JS
       # A public repo's artifacts are downloadable by any signed-in GitHub user, so
       # this one holds only public data (diff, PR text, repo docs) and the sealed
       # ticket; one day of retention.
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: review-input
           path: ${{ runner.temp }}/out/review-input.json
           retention-days: 1
           if-no-files-found: error
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: file-input
           path: ${{ runner.temp }}/out/file-input.json
@@ -209,12 +256,13 @@ jobs:
 
   review:
     needs: prepare
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    # Two requests of at most 10 minutes each, 20 seconds apart, plus start-up.
+    timeout-minutes: 25
     environment: cadence-review
     permissions: {}
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: review-input
           path: ${{ runner.temp }}/in
@@ -228,9 +276,16 @@ jobs:
           import fs from 'node:fs';
           import crypto from 'node:crypto';
           const E = process.env, { PR, HEAD, REPO } = E;
-          const die = (m) => { console.log(`::error::${m}`); process.exit(1); };
+          if (Number(process.versions.node.split('.')[0]) < 20) { console.log('::error::Node 20 or newer is required'); process.exit(1); }
+          // Log hygiene: only fixed text, numbers and enum-checked names are printed; nothing taken from
+          // the model output, the PR, the ticket or a response body reaches a log. clean() is a last guard.
+          const clean = (s) => String(s).replace(/[^\x20-\x7e]/g, '?').replace(/%/g, '?').replace(/::/g, ': :').slice(0, 300);
+          const out = (m) => console.log(clean(m));
+          const die = (m) => { console.log(`::error::${clean(m)}`); process.exit(1); };
+          process.on('uncaughtException', () => die('unexpected internal error; nothing filed'));
+          process.on('unhandledRejection', () => die('unexpected internal error; nothing filed'));
           const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-          // Sealing helpers: the same in every job that uses them.
+          // Sealing: RSA-OAEP-SHA256 wraps a random AES-256-GCM key; the AAD binds repo, PR, head and label.
           const aad = (l) => Buffer.from(`cadence-review-seal:v1:${REPO}:${PR}:${HEAD}:${l}`);
           const OAEP = { oaepHash: 'sha256', padding: crypto.constants.RSA_PKCS1_OAEP_PADDING };
           function seal(pub, label, obj) {
@@ -239,12 +294,6 @@ jobs:
             const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
             return { v: 1, k: crypto.publicEncrypt({ key: pub, ...OAEP }, k).toString('base64'), iv: iv.toString('base64'), tag: c.getAuthTag().toString('base64'), ct: ct.toString('base64') };
           }
-          function unseal(priv, label, s) {
-            if (!s || s.v !== 1) throw new Error('bad seal');
-            const d = crypto.createDecipheriv('aes-256-gcm', crypto.privateDecrypt({ key: priv, ...OAEP }, Buffer.from(s.k, 'base64')), Buffer.from(s.iv, 'base64'));
-            d.setAAD(aad(label)); d.setAuthTag(Buffer.from(s.tag, 'base64'));
-            return JSON.parse(Buffer.concat([d.update(Buffer.from(s.ct, 'base64')), d.final()]).toString('utf8'));
-          }
           function publicKey() {
             const pem = E.REVIEW_SEAL_PUBLIC_KEY || '';
             let k = null;
@@ -252,6 +301,12 @@ jobs:
             if (!k || k.asymmetricKeyType !== 'rsa' || k.asymmetricKeyDetails.modulusLength < 3072)
               die('repo variable REVIEW_SEAL_PUBLIC_KEY is missing or is not an RSA public key of at least 3072 bits; nothing filed, no model called');
             return k;
+          }
+          function unseal(priv, label, s) {
+            if (!s || s.v !== 1) throw new Error('bad seal');
+            const d = crypto.createDecipheriv('aes-256-gcm', crypto.privateDecrypt({ key: priv, ...OAEP }, Buffer.from(s.k, 'base64')), Buffer.from(s.iv, 'base64'));
+            d.setAAD(aad(label)); d.setAuthTag(Buffer.from(s.tag, 'base64'));
+            return JSON.parse(Buffer.concat([d.update(Buffer.from(s.ct, 'base64')), d.final()]).toString('utf8'));
           }
           function privateKey() {
             try { return crypto.createPrivateKey(E.REVIEW_SEAL_PRIVATE_KEY || ''); } catch { die('environment secret REVIEW_SEAL_PRIVATE_KEY is missing or malformed; nothing filed'); }
@@ -265,7 +320,6 @@ jobs:
           try { sealed = unseal(priv, 'ticket', input.sealed_ticket); } catch { die('the sealed ticket does not open (tampered or sealed to another key); no model called'); }
           input.ticket = sealed.ticket; input.ticket_body = sealed.body;
           const names = E.CHECKS.split(',');
-          // What this reviewer judges (per axis).
           const AXIS = `You review the Spec and security axis: does the change do what the ticket asks and stay safe. The checks are: ticket-requirements (every requirement and acceptance item of the ticket is implemented, and nothing it forbids is done), trust-boundaries (authentication, identity, credential, signature, secret and confinement logic is correct and not weakened), fail-closed (every error or unknown path refuses, and an infrastructure failure never produces a pass), risk-triggers (the risk-class triggers of the risk_classes block that the diff touches are identified; if the diff touches one, risk_level must be human).`; // per axis
           const system = [
             'You are one independent reviewer of a pull request in a code repository. You have no prior context: judge only what is given here.',
@@ -295,8 +349,9 @@ jobs:
             output_config: { effort: 'high', format: { type: 'json_schema', schema } },
             system, messages: [{ role: 'user', content: user }],
           });
+          // At most two requests (a retry only after a network error, 429 or 5xx), so one run can bill twice.
           let res = null;
-          for (let i = 1; i <= 4 && !res; i++) {
+          for (let i = 1; i <= 2 && !res; i++) {
             let r = null;
             try {
               r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -306,20 +361,20 @@ jobs:
             } catch {}
             if (r?.ok) { res = await r.json(); break; }
             const s = r ? r.status : 0;
-            if (s === 0 || s === 429 || s >= 500) { console.log(`model attempt ${i}: HTTP ${s}`); await sleep(i * 10000); continue; }
-            die(`model request refused: HTTP ${s}; nothing filed`);
+            if ((s === 0 || s === 429 || s >= 500) && i < 2) { out(`model attempt ${i}: HTTP ${s}`); await sleep(20000); continue; }
+            die(`model request failed: HTTP ${s}; nothing filed`);
           }
-          if (!res) die('model unavailable after 4 attempts; nothing filed');
-          if (res.stop_reason !== 'end_turn') die(`model stopped with ${res.stop_reason}; nothing filed`);
+          if (!res) die('model unavailable; nothing filed');
+          if (res.stop_reason !== 'end_turn') die(['refusal', 'max_tokens', 'pause_turn'].includes(res.stop_reason) ? `model stopped with ${res.stop_reason}; nothing filed` : 'model stopped early; nothing filed');
           const text = (res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
           let parsed;
           try { parsed = JSON.parse(text); } catch { die('model output is not JSON; nothing filed'); }
-          console.log(`model ${res.model}: ${res.usage?.input_tokens} in, ${res.usage?.output_tokens} out`);
+          out(`model ${E.REVIEW_MODEL}: ${Number(res.usage?.input_tokens) || 0} in, ${Number(res.usage?.output_tokens) || 0} out`);
           fs.mkdirSync(`${E.RUNNER_TEMP}/out`, { recursive: true });
           // The output may quote the ticket, so it is sealed like the ticket.
-          fs.writeFileSync(`${E.RUNNER_TEMP}/out/review-output.json`, JSON.stringify(seal(pub, 'review-output', { model: res.model, output: parsed })));
+          fs.writeFileSync(`${E.RUNNER_TEMP}/out/review-output.json`, JSON.stringify(seal(pub, 'review-output', { model: E.REVIEW_MODEL, output: parsed })));
           JS
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: review-output
           path: ${{ runner.temp }}/out/review-output.json
@@ -328,13 +383,13 @@ jobs:
 
   file:
     needs: review
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: cadence-review # for REVIEW_SEAL_PRIVATE_KEY only; no step references ANTHROPIC_API_KEY
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: '{file-input,review-output}'
           path: ${{ runner.temp }}/in
@@ -346,33 +401,63 @@ jobs:
           import fs from 'node:fs';
           import crypto from 'node:crypto';
           const E = process.env, { PR, HEAD, REPO, PROJECT, TENANT, KIND } = E;
-          const die = (m) => { console.log(`::error::${m}`); process.exit(1); };
+          if (Number(process.versions.node.split('.')[0]) < 20) { console.log('::error::Node 20 or newer is required'); process.exit(1); }
+          // Log hygiene: only fixed text, numbers and enum-checked names are printed; nothing taken from
+          // the model output, the PR, the ticket or a response body reaches a log. clean() is a last guard.
+          const clean = (s) => String(s).replace(/[^\x20-\x7e]/g, '?').replace(/%/g, '?').replace(/::/g, ': :').slice(0, 300);
+          const out = (m) => console.log(clean(m));
+          const die = (m) => { console.log(`::error::${clean(m)}`); process.exit(1); };
+          process.on('uncaughtException', () => die('unexpected internal error; nothing filed'));
+          process.on('unhandledRejection', () => die('unexpected internal error; nothing filed'));
           const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-          // Sealing helpers: the same in every job that uses them.
+          // Sealing: RSA-OAEP-SHA256 wraps a random AES-256-GCM key; the AAD binds repo, PR, head and label.
           const aad = (l) => Buffer.from(`cadence-review-seal:v1:${REPO}:${PR}:${HEAD}:${l}`);
           const OAEP = { oaepHash: 'sha256', padding: crypto.constants.RSA_PKCS1_OAEP_PADDING };
-          function seal(pub, label, obj) {
-            const k = crypto.randomBytes(32), iv = crypto.randomBytes(12);
-            const c = crypto.createCipheriv('aes-256-gcm', k, iv); c.setAAD(aad(label));
-            const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
-            return { v: 1, k: crypto.publicEncrypt({ key: pub, ...OAEP }, k).toString('base64'), iv: iv.toString('base64'), tag: c.getAuthTag().toString('base64'), ct: ct.toString('base64') };
-          }
           function unseal(priv, label, s) {
             if (!s || s.v !== 1) throw new Error('bad seal');
             const d = crypto.createDecipheriv('aes-256-gcm', crypto.privateDecrypt({ key: priv, ...OAEP }, Buffer.from(s.k, 'base64')), Buffer.from(s.iv, 'base64'));
             d.setAAD(aad(label)); d.setAuthTag(Buffer.from(s.tag, 'base64'));
             return JSON.parse(Buffer.concat([d.update(Buffer.from(s.ct, 'base64')), d.final()]).toString('utf8'));
           }
-          function publicKey() {
-            const pem = E.REVIEW_SEAL_PUBLIC_KEY || '';
-            let k = null;
-            if (!pem.includes('PRIVATE')) try { k = crypto.createPublicKey(pem); } catch {}
-            if (!k || k.asymmetricKeyType !== 'rsa' || k.asymmetricKeyDetails.modulusLength < 3072)
-              die('repo variable REVIEW_SEAL_PUBLIC_KEY is missing or is not an RSA public key of at least 3072 bits; nothing filed, no model called');
-            return k;
-          }
           function privateKey() {
             try { return crypto.createPrivateKey(E.REVIEW_SEAL_PRIVATE_KEY || ''); } catch { die('environment secret REVIEW_SEAL_PRIVATE_KEY is missing or malformed; nothing filed'); }
+          }
+          // The new-side line numbers each file's hunks show (and the number of file sections). Every hunk is
+          // walked by its declared line counts, whether or not its file is known, so no diff content line can
+          // pass for a header. `+++` counts as a header only directly after `---`. A quoted file name is not
+          // decoded: its lines are walked but recorded nowhere, so nothing can cite it. Anything incomplete or
+          // binary is refused. The same function runs in prepare and in file.
+          class Refusal extends Error {}
+          function parseDiff(text) {
+            if (!text.endsWith('\n')) throw new Refusal('the diff is incomplete');
+            const lines = text.split('\n'); lines.pop();
+            const files = new Map();
+            let sections = 0, cur = null, o = 0, n = 0, nl = 0, old = false, m;
+            for (const line of lines) {
+              if (o > 0 || n > 0) {
+                const c = line[0];
+                if (c === '\\') continue;
+                if (c === '+') { cur?.add(nl); nl++; n--; continue; }
+                if (c === '-') { o--; continue; }
+                if (c === ' ' || line === '') { cur?.add(nl); nl++; o--; n--; continue; }
+                throw new Refusal('the diff has an incomplete hunk');
+              }
+              if (line.startsWith('diff --git ')) { sections++; cur = null; old = false; continue; }
+              if (line.startsWith('--- ')) { old = true; continue; }
+              if (old && line.startsWith('+++ ')) {
+                old = false; cur = null;
+                const name = line.slice(4).replace(/\t$/, '');
+                if (name.startsWith('b/')) { cur = files.get(name.slice(2)) ?? new Set(); files.set(name.slice(2), cur); }
+                continue;
+              }
+              old = false;
+              if (line.startsWith('Binary files ') || line === 'GIT binary patch') throw new Refusal('the diff has a binary section the reviewer cannot see');
+              if ((m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line))) {
+                o = m[1] === undefined ? 1 : Number(m[1]); n = m[3] === undefined ? 1 : Number(m[3]); nl = Number(m[2]);
+              }
+            }
+            if (o > 0 || n > 0) throw new Refusal('the diff has an incomplete hunk');
+            return { files, sections };
           }
           const rd = (p) => JSON.parse(fs.readFileSync(`${E.RUNNER_TEMP}/in/${p}`, 'utf8'));
           const input = rd('file-input/file-input.json');
@@ -381,72 +466,52 @@ jobs:
           if (input.head !== HEAD || String(input.pr) !== PR || input.repo !== REPO) die('file input is not for this dispatch');
           if (!/^[A-Za-z][A-Za-z0-9]{1,15}-[0-9]{1,9}$/.test(input.issue || '')) die('file input has no valid ticket id');
           const names = E.CHECKS.split(',');
+          const san = (s, n = 300) => String(s).replace(/[\u0000-\u001f\u007f<>`\u2028\u2029]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n);
 
-          // The new-side line numbers each file's hunks show. Hunks are walked by their
-          // declared line counts, so a diff line that merely looks like a file header or
-          // a hunk header (all of them are added or context text) cannot add a citation.
-          function parseDiff(text) {
-            const files = new Map();
-            let cur = null, o = 0, n = 0, nl = 0, m;
-            for (const line of text.split('\n')) {
-              if (o > 0 || n > 0) {
-                const c = line[0];
-                if (c === '\\') continue;
-                if (c === '+') { cur.add(nl++); n--; continue; }
-                if (c === '-') { o--; continue; }
-                if (c === ' ' || line === '') { cur.add(nl++); o--; n--; continue; }
-                o = n = 0;
-              }
-              if (line.startsWith('diff --git ')) { cur = null; continue; }
-              if ((m = /^\+\+\+ b\/(.+)$/.exec(line))) { cur = files.get(m[1]) ?? new Set(); files.set(m[1], cur); continue; }
-              if (cur && (m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line))) {
-                o = m[1] === undefined ? 1 : Number(m[1]); n = m[3] === undefined ? 1 : Number(m[3]); nl = Number(m[2]);
-              }
-            }
-            return files;
-          }
-          // Everything the verdict says comes from this function: the schema-shaped
-          // output, checked field by field. It returns the request fields or refuses.
-          function validate(out, diffFiles) {
-            const bad = (m) => { throw new Error(m); };
+          // Everything the verdict says comes from this function: the schema-shaped output, checked
+          // field by field. Its messages are fixed text and enum-checked check names only.
+          function validate(output, diffFiles) {
+            const bad = (m) => { throw new Refusal(m); };
             const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
             const only = (o, keys) => Object.keys(o).length === keys.length && keys.every((k) => k in o);
-            if (!isObj(out) || !only(out, ['outcome', 'risk_level', 'risk_triggers', 'checks'])) bad('output has the wrong shape');
-            if (!Array.isArray(out.checks) || out.checks.length !== names.length) bad('output must hold each required check exactly once');
-            const seen = new Set(); const lines = []; let fails = 0, passes = 0;
-            for (const c of out.checks) {
+            if (!isObj(output) || !only(output, ['outcome', 'risk_level', 'risk_triggers', 'checks'])) bad('output has the wrong shape');
+            if (!Array.isArray(output.checks) || output.checks.length !== names.length) bad('output must hold each required check exactly once');
+            const seen = new Set(); const lines = []; const results = {}; let fails = 0, passes = 0;
+            for (const c of output.checks) {
               if (!isObj(c) || !only(c, ['name', 'result', 'note', 'citations'])) bad('a check has the wrong shape');
-              if (!names.includes(c.name) || seen.has(c.name)) bad('a check name is unknown or repeated');
+              if (typeof c.name !== 'string' || !names.includes(c.name) || seen.has(c.name)) bad('a check name is unknown or repeated');
               seen.add(c.name);
               if (!['pass', 'fail', 'na'].includes(c.result) || typeof c.note !== 'string' || !Array.isArray(c.citations)) bad(`check ${c.name} has bad fields`);
-              for (const k of c.citations) {
-                if (!isObj(k) || !only(k, ['file', 'line']) || typeof k.file !== 'string' || !Number.isInteger(k.line)) bad(`check ${c.name} has a malformed citation`);
-                if (!diffFiles.get(k.file)?.has(k.line)) bad(`check ${c.name} cites ${k.file}:${k.line}, which is not a line of the diff`);
-              }
-              if (c.result === 'na' ? c.citations.length !== 0 : c.citations.length === 0) bad(`check ${c.name} is ${c.result} with ${c.citations.length} citations`);
+              c.citations.forEach((k, i) => {
+                if (!isObj(k) || !only(k, ['file', 'line']) || typeof k.file !== 'string' || !Number.isInteger(k.line)) bad(`check ${c.name} citation ${i + 1} is malformed`);
+                if (!diffFiles.get(k.file)?.has(k.line)) bad(`check ${c.name} citation ${i + 1} is not a line of the diff`);
+              });
+              if (c.result === 'na' ? c.citations.length !== 0 : c.citations.length === 0) bad(`check ${c.name} has the wrong number of citations for its result`);
+              results[c.name] = c.result;
               if (c.result === 'fail') fails++;
               if (c.result === 'pass') passes++;
-              const note = c.note.replace(/[\u0000-\u001f\u007f<>`]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300);
-              lines.push(`- ${c.name}: ${c.result.toUpperCase()}${note ? ` - ${note}` : ''}${c.citations.length ? ` [${c.citations.map((k) => `${k.file}:${k.line}`).join(', ')}]` : ''}`);
+              const note = san(c.note);
+              lines.push(`- ${c.name}: ${c.result.toUpperCase()}${note ? ` - ${note}` : ''}${c.citations.length ? ` [${c.citations.map((k) => `${san(k.file, 200)}:${k.line}`).join(', ')}]` : ''}`);
             }
             const outcome = fails > 0 ? 'revise' : 'pass';
-            if (out.outcome !== outcome) bad('outcome contradicts the checks');
+            if (output.outcome !== outcome) bad('outcome contradicts the checks');
             if (outcome === 'pass' && passes < 2) bad('a pass needs at least two checks that pass with citations');
+            if (outcome === 'pass' && results['ticket-requirements'] === 'na') bad('a pass needs ticket-requirements judged, not na');
             let risk;
-            if (out.risk_level === 'auto' && Array.isArray(out.risk_triggers) && out.risk_triggers.length === 0) risk = 'auto';
-            else if (out.risk_level === 'human' && Array.isArray(out.risk_triggers) && out.risk_triggers.length > 0
-              && out.risk_triggers.every((t) => Number.isInteger(t) && t >= 1 && t <= 7) && new Set(out.risk_triggers).size === out.risk_triggers.length)
-              risk = `human (${[...out.risk_triggers].sort((a, b) => a - b).join(', ')})`;
+            if (output.risk_level === 'auto' && Array.isArray(output.risk_triggers) && output.risk_triggers.length === 0) risk = 'auto';
+            else if (output.risk_level === 'human' && Array.isArray(output.risk_triggers) && output.risk_triggers.length > 0
+              && output.risk_triggers.every((t) => Number.isInteger(t) && t >= 1 && t <= 7) && new Set(output.risk_triggers).size === output.risk_triggers.length)
+              risk = `human (${[...output.risk_triggers].sort((a, b) => a - b).join(', ')})`;
             else bad('risk is not auto or human with trigger numbers 1 to 7');
-            const body = [`Workflow review (${KIND}) of PR ${PR} at head ${HEAD}, model ${review.model}.`, '', ...lines, '', `Risk: ${risk}`].join('\n');
+            const body = [`Workflow review (${KIND}) of PR ${PR} at head ${HEAD}, model ${san(review.model, 60)}.`, '', ...lines, '', `Risk: ${risk}`].join('\n');
             return { project: PROJECT, issue: input.issue, outcome, title_outcome: outcome, section_outcome: outcome, risk, body };
           }
 
           let payload;
-          try { payload = validate(review.output, parseDiff(input.diff)); } catch (e) { die(`${e.message}; nothing filed`); }
+          try { payload = validate(review.output, parseDiff(input.diff).files); } catch (e) { die(`${e instanceof Refusal ? e.message : 'the review output cannot be validated'}; nothing filed`); }
 
           // A fresh token for every attempt; the identical payload each time, so a retry
-          // after a lost response reads back as a duplicate of the same run.
+          // after a lost response reads back as a duplicate of the same run attempt.
           async function mint() {
             const aud = `cadence-review:${REPO}:${PR}:${HEAD}`;
             const r = await fetch(`${E.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${encodeURIComponent(aud)}`, {
@@ -454,11 +519,11 @@ jobs:
             });
             if (!r.ok) die(`oidc mint failed: HTTP ${r.status}`);
             const j = await r.json();
-            if (typeof j.value !== 'string' || !j.value) die('oidc mint returned no token');
+            if (typeof j.value !== 'string' || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/.test(j.value)) die('oidc mint returned no usable token');
             console.log(`::add-mask::${j.value}`);
             return j.value;
           }
-          const summary = (t) => { if (E.GITHUB_STEP_SUMMARY) fs.appendFileSync(E.GITHUB_STEP_SUMMARY, `${t}\n`); };
+          const summary = (t) => { if (E.GITHUB_STEP_SUMMARY) fs.appendFileSync(E.GITHUB_STEP_SUMMARY, `${clean(t)}\n`); };
           for (let i = 1; i <= 3; i++) {
             const token = await mint();
             let status = 0, json = null;
@@ -475,15 +540,15 @@ jobs:
               const stored = json.verdict?.outcome;
               if (!['pass', 'revise'].includes(stored) || json.head !== HEAD || json.pr !== Number(PR)) die('the tenant answered with an unexpected record; check the board');
               // The stored row is the verdict, not this run's opinion.
-              if (json.duplicate) console.log(`::notice::duplicate of this run's own earlier filing; stored outcome ${stored}${stored === payload.outcome ? '' : ` (differs from this run's ${payload.outcome})`}`);
-              console.log(`filed ${KIND} verdict for ${input.issue} PR ${PR} head ${HEAD.slice(0, 12)}: outcome ${stored}, duplicate ${json.duplicate === true}`);
+              if (json.duplicate) console.log(`::notice::${clean(`duplicate of this run attempt's own earlier filing; stored outcome ${stored}${stored === payload.outcome ? '' : ` (differs from this run's ${payload.outcome})`}`)}`);
+              out(`filed ${KIND} verdict for ${input.issue} PR ${PR} head ${HEAD.slice(0, 12)}: outcome ${stored}, duplicate ${json.duplicate === true}`);
               summary(`${KIND} ${input.issue} PR ${PR} ${HEAD.slice(0, 12)}: ${stored}${json.duplicate ? ' (duplicate)' : ''}`);
               process.exit(0);
             }
-            if (status === 0 || status >= 500) { console.log(`file attempt ${i}: tenant unavailable (${status})`); await sleep(i * 5000); continue; }
+            if (status === 0 || status >= 500) { out(`file attempt ${i}: tenant unavailable (${status})`); await sleep(i * 5000); continue; }
             if (status === 409 && code === 'verdict_exists')
-              die('a verdict from this principal already stands for this head: first row wins, so this run filed nothing');
-            if (status === 409 && code === 'token_replayed') { console.log(`file attempt ${i}: token replayed, minting a new one`); continue; }
+              die('a verdict from this principal already stands for this head (written by an earlier attempt of this run whose response was lost, or by another run): first row wins, so this attempt wrote no new row; read the stored verdict from the board');
+            if (status === 409 && code === 'token_replayed') { out(`file attempt ${i}: token replayed, minting a new one`); continue; }
             die(`verdict refused: HTTP ${status} ${code}${code === 'pull_request_fork' ? ' (fork PR: no workflow verdict is ever filed for a fork)' : ''}`);
           }
           die('tenant unavailable after 3 attempts; nothing filed');
