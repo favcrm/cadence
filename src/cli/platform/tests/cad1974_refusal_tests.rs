@@ -8,6 +8,7 @@ fn cad1974_refusal_missing_both_flags_names_connection_first() -> Result<()> {
         ToolFacts {
             direct: true,
             connected_read: true,
+            unavailable: None,
         },
         None,
         None,
@@ -29,6 +30,7 @@ fn cad1974_refusal_connection_alone_names_missing_max_charge() -> Result<()> {
         ToolFacts {
             direct: true,
             connected_read: true,
+            unavailable: None,
         },
         Some("con_marketing_read_1974".to_owned()),
         None,
@@ -50,6 +52,7 @@ fn cad1974_refusal_plain_tool_rejects_max_charge_alone() -> Result<()> {
         ToolFacts {
             direct: true,
             connected_read: false,
+            unavailable: None,
         },
         None,
         Some(101),
@@ -68,6 +71,7 @@ fn cad1974_refusal_connected_read_preserves_connection_and_minor_units() -> Resu
             ToolFacts {
                 direct: true,
                 connected_read: true,
+                unavailable: None,
             },
             Some("con_marketing_read_1974".to_owned()),
             Some(max_charge),
@@ -88,6 +92,7 @@ fn cad1974_refusal_plain_tool_without_flags_remains_admitted() -> Result<()> {
         ToolFacts {
             direct: true,
             connected_read: false,
+            unavailable: None,
         },
         None,
         None,

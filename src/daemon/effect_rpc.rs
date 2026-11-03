@@ -59,6 +59,87 @@ fn cap_str(s: &mut String, cap: usize) {
     s.truncate(end);
 }
 
+/// CAD-1974: what a caller must state before a connected read runs — the
+/// connection it reads and the charge it accepts. `Ok(None)` is an ordinary
+/// tool call, and a stray field on one of those refuses rather than being
+/// dropped on the floor.
+pub(super) struct ConnectedReadArgs {
+    pub connection: String,
+    pub max_charge_minor: u64,
+}
+
+/// The provider's own connection handle, validated as an opaque id rather than
+/// as one of our identifiers: AgenticOS mints `con_<uuid>`, so the local
+/// `[a-z0-9-]` rule would reject every real connection before it ran.
+pub(super) fn provider_connection_id(raw: &str) -> Result<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 128
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(Error::rejected(
+            "platform call: 'connection' must be the provider's connection id \
+             (1-128 of A-Z a-z 0-9 _ - . :)",
+        ));
+    }
+    Ok(trimmed)
+}
+
+pub(super) fn connected_read_admission(
+    table: &crate::contract_fixture::ToolTable,
+    reported: Option<&str>,
+    tool: &str,
+    params: &Value,
+) -> Result<Option<ConnectedReadArgs>> {
+    let declared = table.declared(tool).is_some_and(|decl| decl.connected_read);
+    let connection = optional_str(params, "connection");
+    let max_charge = params
+        .get("max_charge_minor")
+        .filter(|value| !value.is_null());
+    if !declared {
+        if connection.is_some() {
+            return Err(Error::rejected(
+                "platform call: 'connection' belongs to a connected read; this tool takes none",
+            ));
+        }
+        if max_charge.is_some() {
+            return Err(Error::rejected(
+                "platform call: 'max_charge_minor' belongs to a connected read; this tool \
+                 takes none",
+            ));
+        }
+        return Ok(None);
+    }
+    if classify_call(table, reported, tool) != Effect::Read {
+        return Err(Error::rejected(
+            "platform call: a connected read must declare a read effect",
+        ));
+    }
+    let connection = provider_connection_id(connection.ok_or_else(|| {
+        Error::rejected(
+            "platform call: a connected read names the connection it reads — pass 'connection'",
+        )
+    })?)?
+    .to_string();
+    let max_charge_minor = max_charge
+        .ok_or_else(|| {
+            Error::rejected(
+                "platform call: a connected read needs the charge the caller accepts before \
+                 it runs — pass 'max_charge_minor'",
+            )
+        })?
+        .as_u64()
+        .ok_or_else(|| {
+            Error::usage("platform call: 'max_charge_minor' must be a non-negative integer")
+        })?;
+    Ok(Some(ConnectedReadArgs {
+        connection,
+        max_charge_minor,
+    }))
+}
+
 impl Shared {
     /// `platform_call {platform, tool, input?, account?, task?,
     /// request?}` — an agent's platform call. The caller is the
@@ -132,55 +213,16 @@ impl Shared {
 
         let reported = adapter.reported_manifest_version();
         let table = adapter.table();
-        // CAD-1974: a reviewed connected read names the connection it reads and
-        // the charge the caller accepts — both, before any platform traffic,
-        // and only on a tool whose reviewed entry declares it.
-        let connected_read = table.declared(tool).is_some_and(|decl| decl.connected_read);
-        let connection =
-            match optional_str(params, "connection") {
-                Some(connection) if connected_read => {
-                    Some(identifier(connection, "Connection")?.to_string())
-                }
-                Some(_) => return Err(Error::rejected(
-                    "platform call: 'connection' belongs to a connected read; this tool takes none",
-                )),
-                None => None,
-            };
-        let max_charge_minor = match params.get("max_charge_minor") {
-            None | Some(Value::Null) => None,
-            Some(_) if !connected_read => {
-                return Err(Error::rejected(
-                    "platform call: 'max_charge_minor' belongs to a connected read; this tool takes none",
-                ));
-            }
-            Some(value) => Some(value.as_u64().ok_or_else(|| {
-                Error::usage("platform call: 'max_charge_minor' must be a non-negative integer")
-            })?),
-        };
-        if connected_read && classify_call(table, reported.as_deref(), tool) != Effect::Read {
-            return Err(Error::rejected(
-                "platform call: a connected read must declare a read effect",
-            ));
-        }
+        // CAD-1974: the connected-read rule lives in one function so the RPC and
+        // its tests cannot disagree about it.
+        let connected = connected_read_admission(table, reported.as_deref(), tool, params)?;
         match classify_call(table, reported.as_deref(), tool) {
             Effect::Read | Effect::Draft => {
                 let draft = table.effect_of(tool) == Effect::Draft;
                 // The actor label is the event/draft-log identity only; a
                 // send never reaches here without an agent.
                 let actor = agent.as_deref().unwrap_or("operator");
-                if connected_read {
-                    let connection = connection.ok_or_else(|| {
-                        Error::rejected(
-                            "platform call: a connected read names the connection it reads — \
-                             pass 'connection'",
-                        )
-                    })?;
-                    let max_charge = max_charge_minor.ok_or_else(|| {
-                        Error::rejected(
-                            "platform call: a connected read needs the charge the caller \
-                             accepts before it runs — pass 'max_charge_minor'",
-                        )
-                    })?;
+                if let Some(call) = connected {
                     // A caller's own handle makes a resubmission a replay
                     // rather than a second charge; the platform derives the
                     // ledger key from it.
@@ -194,8 +236,8 @@ impl Shared {
                         &account,
                         tool,
                         &input,
-                        &connection,
-                        max_charge,
+                        &call.connection,
+                        call.max_charge_minor,
                         &key,
                         &adapter,
                     );
@@ -243,21 +285,35 @@ impl Shared {
         let mut platforms: Vec<(&String, &Arc<dyn PlatformAdapter>)> =
             self.platforms.iter().collect();
         platforms.sort_by(|left, right| left.0.cmp(right.0));
+        // CAD-1974: a connected read is only runnable once some account of its
+        // platform is enrolled. An unconfigured connector is listed with the
+        // reason, never as a call the gate would refuse at the credential step.
+        let enrolled = self.store.platform_credentials().unwrap_or_default();
         let mut out = Vec::new();
         for (platform, adapter) in platforms {
             let table = adapter.table();
+            let configured = enrolled.iter().any(|record| &record.platform == platform);
             let mut tools: Vec<Value> = table
                 .tools
                 .iter()
                 .map(|decl| {
-                    json!({
+                    let available = !decl.connected_read || configured;
+                    let mut row = json!({
                         "tool": decl.tool.clone(),
                         "effect": decl.effect.clone(),
                         "scopes": decl.scopes.clone(),
                         "label": decl.label.clone(),
                         "direct": adapter.direct_call(&decl.tool),
                         "connected_read": decl.connected_read,
-                    })
+                        "available": available,
+                    });
+                    if !available {
+                        row["unavailable"] = json!(format!(
+                            "no credential is enrolled for {platform} — run `cadence platform \
+                             enroll {platform} --account <handle> --scope provider.read`"
+                        ));
+                    }
+                    row
                 })
                 .collect();
             tools.sort_by(|left, right| left["tool"].as_str().cmp(&right["tool"].as_str()));
@@ -461,19 +517,30 @@ impl Shared {
         } else {
             platform::load_credential(&self.store, &self.platform_custody, platform_name, account)?
         };
-        let result = adapter
-            .execute_connected_read(
-                account,
-                &bytes,
-                &crate::platform::ConnectedRead {
-                    tool,
-                    input,
-                    connection,
-                    max_charge_minor,
-                    idempotency_key,
-                },
-            )
-            .map_err(Error::rejected)?;
+        let result = match adapter.execute_connected_read(
+            account,
+            &bytes,
+            &crate::platform::ConnectedRead {
+                tool,
+                input,
+                connection,
+                max_charge_minor,
+                idempotency_key,
+            },
+        ) {
+            Ok(result) => result,
+            Err(message) => {
+                // The refusal is the platform's text, not ours, and the
+                // credential is still in scope here. A downstream that echoes
+                // it must never be the place this is caught.
+                if platform::refuse_leak("platform refusal", &message, &bytes).is_err() {
+                    return Err(Error::internal(
+                        "the platform refusal would carry the enrolled credential — withheld",
+                    ));
+                }
+                return Err(Error::rejected(message));
+            }
+        };
         platform::refuse_leak("platform result", &result.to_string(), &bytes)?;
         let _ = self.store.event_public(
             agent,
@@ -1237,6 +1304,10 @@ pub(crate) type PlatformMap = HashMap<String, Arc<dyn PlatformAdapter>>;
 /// The test-only crash seam between the durable `decided` write and
 /// execution (`ServeOptions::effect_execute_gate`).
 pub(crate) type EffectExecuteGate = Arc<dyn Fn(&EffectRow) -> bool + Send + Sync>;
+
+#[cfg(test)]
+#[path = "effect_rpc/cad1974_admission_tests.rs"]
+mod cad1974_admission_tests;
 
 #[cfg(all(test, unix, feature = "test-seam"))]
 #[path = "effect_rpc/platform_call_floor_tests.rs"]

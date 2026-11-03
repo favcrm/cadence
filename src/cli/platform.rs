@@ -181,9 +181,10 @@ pub(crate) enum PlatformAction {
         /// somebody else's account is not a read the caller asked for.
         #[arg(long)]
         connection: Option<String>,
-        /// CAD-1974: the most real money this call may cost, in the platform's
-        /// minor units (USD cents). Required by a `connected_read` tool: the
-        /// caller states the ceiling it accepts before anything runs.
+        /// CAD-1974: the most real money this call may cost, in USD
+        /// micro-units (1 USD = 1,000,000 units). Required by a
+        /// `connected_read` tool: the caller states the ceiling it accepts
+        /// before anything runs. Forwarded unchanged — no conversion here.
         #[arg(long)]
         max_charge: Option<u64>,
     },
@@ -388,6 +389,12 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
             }
             let tools = rpc("platform_tools", listing)?;
             let (owner, facts) = resolve_platform_tool(&tools, tool, platform.as_deref())?;
+            // A connector nobody has enrolled cannot run, and the listing says
+            // why: refusing here keeps the reason the daemon computed instead
+            // of a later "no credential" from a different layer.
+            if let Some(reason) = facts.unavailable {
+                return Err(Error::rejected(reason.to_string()));
+            }
             if !facts.direct {
                 return Err(Error::rejected(format!(
                     "'{tool}' on '{owner}' has no plain platform call; it runs through \
@@ -477,18 +484,21 @@ pub(super) fn run(state_dir: PathBuf, action: PlatformAction) -> Result<i32> {
 /// `platform call` can run it; `connected_read` is whether that call must name
 /// its connection and ceiling first (CAD-1974).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ToolFacts {
+pub(super) struct ToolFacts<'a> {
     pub(super) direct: bool,
     pub(super) connected_read: bool,
+    /// The listing's own reason when this tool cannot run yet — a connected
+    /// read with no enrolled account. `None` means runnable.
+    pub(super) unavailable: Option<&'a str>,
 }
 
 /// One tool's owning platform from the listing. `platform` narrows it;
 /// without it the tool must have exactly one owner.
-fn resolve_platform_tool(
-    listing: &Value,
+fn resolve_platform_tool<'a>(
+    listing: &'a Value,
     tool: &str,
     platform: Option<&str>,
-) -> Result<(String, ToolFacts)> {
+) -> Result<(String, ToolFacts<'a>)> {
     let mut owners = Vec::new();
     for entry in listing["platforms"].as_array().into_iter().flatten() {
         let Some(name) = entry["platform"].as_str() else {
@@ -508,6 +518,7 @@ fn resolve_platform_tool(
                 ToolFacts {
                     direct: decl["direct"].as_bool().unwrap_or(false),
                     connected_read: decl["connected_read"].as_bool().unwrap_or(false),
+                    unavailable: decl["unavailable"].as_str(),
                 },
             ));
         }
@@ -618,7 +629,7 @@ fn print_platform_tools(listing: &Value) {
 /// takes neither, so a stray flag refuses instead of being dropped.
 fn connected_read_flags(
     tool: &str,
-    facts: ToolFacts,
+    facts: ToolFacts<'_>,
     connection: Option<String>,
     max_charge: Option<u64>,
 ) -> Result<(Option<String>, Option<u64>)> {
@@ -672,7 +683,8 @@ mod tests {
 
     #[test]
     fn a_tool_resolves_to_its_one_owner() {
-        let (owner, facts) = resolve_platform_tool(&listing(), "post_draft", None).unwrap();
+        let list = listing();
+        let (owner, facts) = resolve_platform_tool(&list, "post_draft", None).unwrap();
         assert_eq!(owner, "agenticos");
         assert!(facts.direct);
         assert!(!facts.connected_read);
@@ -682,8 +694,8 @@ mod tests {
     /// connection and a ceiling — never the tool's name.
     #[test]
     fn a_connected_read_is_listed_as_one() {
-        let (owner, facts) =
-            resolve_platform_tool(&listing(), "search_console_report", None).unwrap();
+        let list = listing();
+        let (owner, facts) = resolve_platform_tool(&list, "search_console_report", None).unwrap();
         assert_eq!(owner, "agenticos-provider");
         assert!(
             facts.direct,
@@ -721,10 +733,12 @@ mod tests {
         let read = ToolFacts {
             direct: true,
             connected_read: true,
+            unavailable: None,
         };
         let plain = ToolFacts {
             direct: true,
             connected_read: false,
+            unavailable: None,
         };
         assert_eq!(
             connected_read_flags("t", read, Some("con_a".into()), Some(25)).unwrap(),
@@ -744,7 +758,8 @@ mod tests {
 
     #[test]
     fn an_app_run_only_tool_is_listed_but_not_direct() {
-        let (owner, facts) = resolve_platform_tool(&listing(), "generate_image", None).unwrap();
+        let list = listing();
+        let (owner, facts) = resolve_platform_tool(&list, "generate_image", None).unwrap();
         assert_eq!(owner, "account-images");
         assert!(!facts.direct, "account images run only inside an app run");
     }
