@@ -30,23 +30,26 @@ pub(crate) enum SkillAction {
     Sync,
 }
 
+/// Read the copy bundled in this executable, without consulting home or state.
+pub(super) fn show(name: &str, file: Option<&str>) -> Result<i32> {
+    match cadence_agent::skill::show(name, file)? {
+        cadence_agent::skill::ShowOutput::Manifest(manifest) => print_json(&manifest),
+        cadence_agent::skill::ShowOutput::File(text) => print!("{text}"),
+    }
+    Ok(0)
+}
+
 pub(super) fn run(_state_dir: PathBuf, action: SkillAction) -> Result<i32> {
-    let home = home_dir()?;
     match action {
         SkillAction::Install { name } => {
+            let home = home_dir()?;
             let report = cadence_agent::skill::sync(&home, true, name.as_deref())?;
             print_json(&report);
         }
-        SkillAction::Status => print_json(&cadence_agent::skill::status(&home)),
-        SkillAction::Show { name, file } => {
-            match cadence_agent::skill::show(&name, file.as_deref())? {
-                cadence_agent::skill::ShowOutput::Manifest(manifest) => {
-                    print_json(&manifest);
-                }
-                cadence_agent::skill::ShowOutput::File(text) => print!("{text}"),
-            }
-        }
+        SkillAction::Status => print_json(&cadence_agent::skill::status(&home_dir()?)),
+        SkillAction::Show { name, file } => return show(&name, file.as_deref()),
         SkillAction::Sync => {
+            let home = home_dir()?;
             if cadence_agent::sandbox::profile().is_some() {
                 print_json(&json!({
                     "skipped": true,

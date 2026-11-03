@@ -229,10 +229,24 @@ pub(crate) fn client_org(action: org::OrgAction) -> Result<i32> {
     org::run(action)
 }
 
-/// Route a non-update command from a client-only installation. Only an
-/// actual remote org may proceed (over the org's own transport); a local
-/// result, saved default or pin refuses before sandbox adoption or any RPC.
+/// Route a non-update command from a client-only installation. Bundled skill
+/// reads are offline; other commands require a remote org before any RPC.
 pub(crate) fn route_client_only(cli: Cli) -> Result<i32> {
+    if let Commands::Skill {
+        action: SkillAction::Show { name, file },
+    } = &cli.command
+    {
+        if cli.state_dir.is_none()
+            && std::env::var_os("CADENCE_ALIAS").is_none()
+            && std::env::var_os("CADENCE_GRANT_TOKEN").is_none()
+        {
+            eprintln!(
+                "Reading bundled guidance from this Cadence installation; \
+                 workspace selection does not apply."
+            );
+            return skill::show(name, file.as_deref());
+        }
+    }
     let tracker = std::env::var_os("CADENCE_PM_DIR")
         .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
         .transpose()?;
