@@ -3,7 +3,6 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
-import type { SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
@@ -14,7 +13,10 @@ import {
   kvRows,
   MASTER,
   masterStatus,
+  restingStatus,
+  offeredCommands,
   SLASH_COMMANDS,
+  type SlashCommand,
   START_COMMAND,
   RESUME_COMMAND,
   turnState,
@@ -39,10 +41,11 @@ import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "
 import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
 import Conversation from "../app-shell/chat/Conversation";
+import { useDockHeight } from "./useDockHeight";
 import { TurnBar } from "../app-shell/chat/TurnBar";
 import { usePendingPermission } from "../app-shell/chat/usePendingApproval";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
-import { earlierStep, useThreadStream } from "../app-shell/chat/conversationThread";
+import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat/conversationThread";
 import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
@@ -66,6 +69,9 @@ import { agentOn } from "../../lib/agentOn";
 import SinceCard from "./SinceCard";
 import {
   discardPending,
+  failWithdrawn,
+  inFlightTurnKey,
+  unnamedTurnAnswered,
   lastSeq,
   newMessageId,
   openStep,
@@ -207,11 +213,13 @@ function HeaderMenu({
   master,
   row,
   readOnly,
+  canPickModel,
   scope,
 }: {
   master: MasterState | null | undefined;
   row: Agent | undefined;
   readOnly: boolean;
+  canPickModel: boolean;
   /** The header's scope line, moved here on a narrow screen. */
   scope: string;
 }) {
@@ -287,7 +295,7 @@ function HeaderMenu({
               </button>
             </div>
             <p className="assistant-scope" data-menu-scope>{scope}</p>
-            <MasterChips master={master} row={row} readOnly={readOnly} />
+            <MasterChips master={master} row={row} readOnly={readOnly} canPickModel={canPickModel} />
             <AssistantAboutButton className="assistant-menu-about" />
           </div>
         </>
@@ -361,6 +369,8 @@ interface CmdResult {
   running?: boolean;
   ok?: boolean;
   text?: string;
+  /** This board cannot run the command: nothing was sent, and nothing failed. */
+  unavailable?: boolean;
   /** A JSON answer — listed as fields, with raw JSON one toggle away. */
   value?: unknown;
 }
@@ -412,6 +422,8 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
         </span>
         {cmd.running ? (
           <span className="steps-running text-ink-500">{t("running…")}</span>
+        ) : cmd.unavailable ? (
+          <span className="text-ink-500">{t("not available")}</span>
         ) : cmd.ok === false ? (
           <span className="text-fail">{t("failed")}</span>
         ) : (
@@ -432,10 +444,12 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
 }
 
 /** `/help` — the catalog rendered as a GFM table. */
-function helpText(): string {
-  const rows = SLASH_COMMANDS.filter((c) => c.name !== "help").map(
+function helpText(commands: readonly SlashCommand[]): string {
+  const rows = commands.filter((c) => c.name !== "help").map(
     (c) => `| \`/${c.name}${c.arg ? ` ${c.arg}` : ""}\` | ${c.blurb} |`,
   );
+  // A board that runs nothing else has no table worth showing.
+  if (rows.length === 0) return "Just type your message. `/help` is the only command in this workspace right now.";
   return `**Commands**\n\n| command | what it does |\n|---|---|\n${rows.join("\n")}`;
 }
 
@@ -538,6 +552,7 @@ const ThreadList = memo(function ThreadList({
   liveAfter,
   onRetry,
   working,
+  queued,
   stale,
 }: {
   items: ThreadItem[];
@@ -557,7 +572,10 @@ const ThreadList = memo(function ThreadList({
   ) => void;
   /** The live turn: its own `message` id picks the row the activity
    *  belongs to; `since` drives the elapsed clock. Null otherwise. */
-  working: { message: string | null; since: number | null } | null;
+  /** `unnamed`: the host verified a turn is working but gave no id for it. */
+  working: { message: string | null; since: number | null; unnamed?: boolean } | null;
+  /** Messages still queued behind the running turn: a run's send skips them. */
+  queued: string[];
   /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
   stale: boolean;
 }) {
@@ -590,6 +608,25 @@ const ThreadList = memo(function ThreadList({
   const fallbackItem =
     working && anchorItem === null && shown.length > 0 ? shown[shown.length - 1] : null;
   const activityItem = anchorItem ?? fallbackItem;
+  // Once this send already has reasoning or tool rows, those rows ARE the
+  // turn. A second empty assistant (face, "now", dots) under them is the
+  // splash: hosted agent entries often carry no message id, so the anchor
+  // misses them and the fallback used to append another head.
+  const flightKey = inFlightTurnKey(shown, working?.message ?? null, working?.unnamed === true);
+  // A hire proposal paints as flat rows, never as a ThreadTurn, so the
+  // suppression below would leave that still-working turn with no
+  // indicator at all. Keep the fallback activity for a flat run.
+  const flightFlat = (() => {
+    if (flightKey === null) return false;
+    const start = shown.findIndex((item) => item.key === flightKey);
+    if (start < 0) return false;
+    for (let i = start; i < shown.length; i++) {
+      const item = shown[i];
+      if (item.type === "operator" || item.type === "pending") break;
+      if (item.type === "hire") return true;
+    }
+    return false;
+  })();
   if (items.length === 0 && !moreBefore) return null;
   return (
     <>
@@ -607,11 +644,15 @@ const ThreadList = memo(function ThreadList({
         readOnly={readOnly}
         liveAfter={liveAfter}
         running={working?.message ?? null} /* null while a send is only submitting */
+        runningUnnamed={working?.unnamed === true}
+        queued={queued}
         legacyTranscript={!items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
         onRetry={onRetry}
         onDiscard={discard}
         activity={(item) => {
+          if (flightKey !== null && !flightFlat) return null;
+          if (working?.unnamed === true && unnamedTurnAnswered(shown)) return null;
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
           // The anchored row shows this turn's own newest entry time. A
@@ -639,6 +680,9 @@ const ThreadList = memo(function ThreadList({
             anchorItem === null || item.type === "operator" || item.type === "pending";
           return {
             kind: "row",
+            // One assistant turn: face, "now", and the typing bubble. HomeList
+            // paints it as its own row under the message, and keeps that row's
+            // key when the real steps arrive, so the head does not splash.
             node: needsTypingTurn ? <ThreadTurn items={[]} running /> : <AssistantNameRow at={at} live={live} />,
             position: below ? "after" : "before",
             ...(anchorItem === null ? { fallback: true as const } : {}),
@@ -795,7 +839,7 @@ function MasterHome({
   // CAD-574: the rail's collapse is a layout concern — the grid column
   // narrows with it, so the state lives here and the rail renders it.
   const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
-  const [link, setLink] = useState<SseErrorState | "live" | null>("reconnecting");
+  const [link, setLink] = useState<StreamLink>("connecting");
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [cmds, setCmds] = useState<CmdResult[]>([]);
@@ -818,8 +862,17 @@ function MasterHome({
   const status = masterStatus(agents.data, missing);
   const writeBlock = useWriteBlock(readOnly);
   const block = composerBlock(writeBlock, status, hosted);
+  const offered = useMemo(() => offeredCommands(hosted, master.data?.commands), [hosted, master.data?.commands]);
+  const canPickModel = offered.some((c) => c.name === "model");
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
+  // The seq watermark for the enter animation: items at or below the mount
+  // tail are history and render still; only what lands after rises in. Set
+  // here, before the first loaded render paints its rows, not in an effect
+  // that runs after they have already animated.
+  if (liveAfter.current === null && loaded) {
+    liveAfter.current = lastSeq(thread.data) ?? 0;
+  }
   const moreBefore = thread.data?.moreBefore === true;
   // The default master-state response already resolves Home before its first
   // transcript exists. Keep that server-issued binding when the empty thread
@@ -857,14 +910,18 @@ function MasterHome({
   const permissionPending = usePendingPermission(threadEntries);
   // Results older than this Home visit are history, not a live outcome.
   const liveSince = useMemo(() => Date.now(), []);
-  const streamReconnecting = link !== null && link !== "live";
+  // A first connection in progress is not an outage, so it shows no notice.
+  // Stop still waits for a live stream (`canStop`).
+  const streamReconnecting = link !== "live" && link !== "connecting";
   const turnBar = turnBarState(
     {
       master: master.data,
       entries: threadEntries,
       pendingMessages: (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message),
       awaitingApproval: permissionPending,
-      reconnecting: streamReconnecting,
+      // Actions stay off until the stream has proved the turn is current, even
+      // while a first connection shows no outage notice.
+      reconnecting: link !== "live",
       liveSince,
     },
     homeConversation ?? null,
@@ -879,11 +936,28 @@ function MasterHome({
     turnBar.kind === "approval" ||
     turnBar.kind === "sending" ||
     turnBar.kind === "queued";
+  // The header's plain-word status. A state this list does not know is shown
+  // as it is, never rounded up to "Available".
+  const headerChip = (() => {
+    const warn = "bg-warn/10 text-warn";
+    const ok = "bg-ok/15 text-ok";
+    if (status.kind === "unknown") return { label: status.kind, tone: "bg-ink-800 text-ink-400" };
+    if (status.kind !== "running") return { label: status.kind === "absent" ? t("not started") : status.kind, tone: warn };
+    if (streamReconnecting && activeTurn) {
+      return { label: link === "stopped" ? t("stream stopped") : t("reconnecting…"), tone: warn };
+    }
+    if (turnBar.kind === "approval") return { label: t("Needs you"), tone: warn };
+    if (turnBar.kind === "queued") return { label: t("Queued"), tone: ok };
+    // A turn in another conversation still occupies this assistant.
+    if (activeTurn || master.data?.turn?.state === "working") return { label: t("Working"), tone: ok };
+    const word = restingStatus(status.state);
+    return word === null ? { label: status.state, tone: warn } : { label: t(word), tone: ok };
+  })();
   // CAD-1880: Stop sits in the composer's send slot while this pane's own
   // turn runs. Never while the stream is down: that state is last known.
   const runningMessage =
     turnBar.kind === "working" || turnBar.kind === "writing" ? turnBar.stopMessage : null;
-  const canStop = writeBlock === null && !streamReconnecting && runningMessage !== null;
+  const canStop = writeBlock === null && loaded && link === "live" && runningMessage !== null;
   const aheadHref = useConversationDestination(
     turnBar.kind === "queued" ? turnBar.aheadConversation : null,
     master.data,
@@ -937,7 +1011,12 @@ function MasterHome({
   // honest "behind a turn" line instead of claiming to type.
   const workingActivity =
     turn.kind === "working"
-      ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
+      ? {
+          message: turn.message,
+          since: typeof turn.since === "number" ? turn.since : null,
+          // Hosted boards report a running turn with `message: null`.
+          unnamed: !turn.message,
+        }
       : turn.kind === "submitting"
         ? { message: null, since: null }
         : null;
@@ -960,15 +1039,6 @@ function MasterHome({
       || thread.data?.conversation !== undefined),
     setLink,
   );
-
-  // The seq watermark for the enter animation: items at or below the
-  // mount tail are history — they render still; only what lands after
-  // rises in.
-  useEffect(() => {
-    if (liveAfter.current === null && loaded) {
-      liveAfter.current = lastSeq(thread.data) ?? 0;
-    }
-  }, [loaded, thread.data]);
 
   // Keep master_state honest: it follows the agents resource's
   // invalidations (turn boundaries land there) and the `master` stream
@@ -1150,25 +1220,13 @@ function MasterHome({
   // The dock's measured height is the thread's bottom padding and the
   // pill's floor (`--dock-h`, styles.css); while pinned, a growing dock
   // (a longer draft, a wrapped hint) keeps the tail in view.
-  useEffect(() => {
-    const dock = dockRef.current;
-    if (!dock || typeof ResizeObserver === "undefined") return;
-    const apply = () => {
-      // Judge "on the tail" before the new padding lands: a strip that
-      // appears (Queued) must not push the last bubble under the dock.
-      const el = scrollRef.current;
-      const onTail = el ? atTail(el.scrollTop, el.scrollHeight, el.clientHeight) : false;
-      document.documentElement.style.setProperty("--dock-h", `${dock.offsetHeight}px`);
+  const keepDockTail = useCallback(
+    (onTail: boolean) => {
       if (follow.current.pinned || onTail) scrollPanel("jump");
-    };
-    const ro = new ResizeObserver(apply);
-    ro.observe(dock);
-    apply();
-    return () => {
-      ro.disconnect();
-      document.documentElement.style.removeProperty("--dock-h");
-    };
-  }, [scrollPanel]);
+    },
+    [scrollPanel],
+  );
+  useDockHeight(dockRef, scrollRef, keepDockTail);
 
   const lastKey = items.length ? items[items.length - 1].key : "";
   useEffect(() => {
@@ -1231,12 +1289,29 @@ function MasterHome({
   };
 
 
+  const handBackWithdrawn = useCallback((r: MasterCommandResult) => {
+    if (!r.withdrawn?.length) return;
+    const withdrawn = r.withdrawn;
+    const state = resources.masterThread.get().data;
+    if (state) {
+      resources.masterThread.write((current) =>
+        failWithdrawn(current ?? state, withdrawn, t("Withdrawn when the turn was stopped. Retry to send it again."), newMessageId),
+      );
+    }
+    // A message sent from another tab has no row here to hand back.
+    if (!state || withdrawn.some((message) => !state.pending.some((row) => row.message === message))) {
+      // Its own card: the caller's card is about to take the command's result.
+      const id = ++cmdSeq.current;
+      setCmds((c) => [...c, { id, name: "stop", ok: true, text: t("A queued message was withdrawn too. Send it again if you still need it.") }]);
+    }
+  }, [t]);
+
   /** One `/` verb → the board's command route; its answer is a card. */
   const runCommand = useCallback(
     (name: string, arg: string) => {
       const id = ++cmdSeq.current;
       if (name === "help") {
-        setCmds((c) => [...c, { id, name, ok: true, text: helpText() }]);
+        setCmds((c) => [...c, { id, name, ok: true, text: t(helpText(offered)) }]);
         return;
       }
       const known = SLASH_COMMANDS.find((c) => c.name === name);
@@ -1247,10 +1322,18 @@ function MasterHome({
         ]);
         return;
       }
+      if (!offered.includes(known)) {
+        setCmds((c) => [
+          ...c,
+          { id, name, unavailable: true, text: t("This command isn't available in this workspace. `/help` lists what is.") },
+        ]);
+        return;
+      }
       setCmds((c) => [...c, { id, name, arg: arg || undefined, running: true }]);
       api
         .masterCommand(name, arg || undefined)
         .then((r) => {
+          handBackWithdrawn(r);
           const { text, value } = fmtCommandResult(r);
           setCmds((c) =>
             c.map((x) => (x.id === id ? { ...x, running: false, ok: r.ok, text, value } : x)),
@@ -1268,7 +1351,7 @@ function MasterHome({
           ),
         );
     },
-    [],
+    [offered, t, handBackWithdrawn],
   );
 
   const runTurnCommand = useCallback((command: "stop" | "cancel", message: string) => {
@@ -1278,10 +1361,11 @@ function MasterHome({
       .masterCommand(command, undefined, undefined, message)
       .then((r) => {
         void resources.masterState.refresh();
+        handBackWithdrawn(r);
         if (!r.ok) setCmds((c) => [...c, { id, name: command, ok: false, text: "The master did not accept the command." }]);
       })
       .catch((e: ApiError) => setCmds((c) => [...c, { id, name: command, ok: false, text: e.message }]));
-  }, [writeBlock]);
+  }, [writeBlock, handBackWithdrawn]);
 
   const onEarlier = useCallback(() => {
     const step = earlierStep(resources.masterThread, threadReader(MASTER), limit);
@@ -1365,22 +1449,11 @@ function MasterHome({
             <div className="assistant-heading-text">
               <div className="assistant-heading-name">
                 <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(actor.read, actor.scope, t)}</h1>
-                <span
-                  className={`chip ${
-                    status.kind === "running"
-                      ? "bg-ok/15 text-ok"
-                      : status.kind === "unknown"
-                        ? "bg-ink-800 text-ink-400"
-                        : "bg-warn/10 text-warn"
-                  }`}
-                >
-                  {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
+                <span className={`chip chip-sans ${headerChip.tone}`} data-assistant-status>
+                  {headerChip.label}
                 </span>
-                <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
-                <HeaderMenu master={master.data} row={masterRow} readOnly={readOnly} scope={scopeDescriptor(actor.scope, t)} />
-                {streamReconnecting && activeTurn && status.kind === "running" && (
-                  <span className="text-micro text-ink-500" data-stale>{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
-                )}
+                <MasterChips master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} />
+                <HeaderMenu master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} scope={scopeDescriptor(actor.scope, t)} />
               </div>
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
@@ -1433,6 +1506,7 @@ function MasterHome({
               liveAfter={liveAfter.current ?? 0}
               onRetry={onRetrySend}
               working={workingActivity}
+              queued={(master.data?.queue ?? []).map((q) => q.message)}
               stale={streamReconnecting && activeTurn}
             />
             {cmds.map((c) => (
@@ -1511,6 +1585,7 @@ function MasterHome({
               block={block}
               seed={seed}
               onCommand={runCommand}
+              commands={offered}
               onSent={engage}
               stop={canStop ? { onStop: () => { if (runningMessage) runTurnCommand("stop", runningMessage); } } : null}
               attachEnabled={canAttach}

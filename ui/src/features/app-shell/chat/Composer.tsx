@@ -88,6 +88,8 @@ export interface ComposerProps {
    * (`/new`) pass it too; without it every submission is a send.
    */
   onCommand?: (name: string, arg: string) => void;
+  /** The verbs the menu offers, when this board cannot run them all. */
+  commands?: readonly SlashCommand[];
   /** A real send completed validation — deliver `body` (with `refs`).
    *  The returned promise settles when the destination's pending row
    *  owns the envelope; a rejected promise keeps the draft and files. */
@@ -353,6 +355,7 @@ export default function Composer({
   storeKey,
   seed,
   onCommand,
+  commands,
   onSend,
   onSubmitted,
   refocusAfterSend,
@@ -438,7 +441,7 @@ export default function Composer({
   const slash = menu ? parseSlash(draft) : null;
   const verbDraft = menu && draft.startsWith("/") && !draft.includes(" ") ? draft.slice(1) : null;
   const matches =
-    verbDraft !== null && draft !== menuOffFor ? slashMatches(verbDraft.toLowerCase()) : [];
+    verbDraft !== null && draft !== menuOffFor ? slashMatches(verbDraft.toLowerCase(), commands) : [];
   useEffect(() => setHi(0), [verbDraft]);
   const hiClamped = Math.min(hi, Math.max(0, matches.length - 1));
 

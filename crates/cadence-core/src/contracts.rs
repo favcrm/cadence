@@ -3,9 +3,9 @@
 //! crate's lib test, which the required CI `test` job runs on every PR and in
 //! the merge queue.
 use crate::board_api::{
-    AgentRegisterReq, AgentsResponse, CommentReq, ConversationReq, IssueDetail, IssuesResponse,
-    LinkReq, MasterState, MetaResponse, NewIssueReq, PatchReq, RefReq, ReportReq, ThreadMessageReq,
-    ThreadPage,
+    AgentProfileReq, AgentRegisterReq, AgentsResponse, CommentReq, ConversationReq, IssueDetail,
+    IssuesResponse, LinkReq, MasterState, MetaResponse, NewIssueReq, PatchReq, RefReq, ReportReq,
+    ThreadMessageReq, ThreadPage,
 };
 use crate::evaluate::{Refused, Request, Success};
 use crate::issue::IssueCard;
@@ -85,6 +85,10 @@ pub fn committed_schemas() -> Vec<(&'static str, String)> {
         (
             "contracts/board-api/v1/request-agent-register.schema.json",
             pretty(schemars::schema_for!(AgentRegisterReq)),
+        ),
+        (
+            "contracts/board-api/v1/request-agent-profile.schema.json",
+            pretty(schemars::schema_for!(AgentProfileReq)),
         ),
         (
             "contracts/board-api/v1/request-thread-message.schema.json",

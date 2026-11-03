@@ -3036,6 +3036,8 @@ impl Shared {
             }
             "agent_register" => self.rpc_register(params, peer_pid),
             "agent_roles" => self.rpc_agent_roles(),
+            "agent_profile_create" => self.rpc_agent_profile_create(params, peer_pid),
+            "agent_profile_context" => self.rpc_agent_profile_context(params, peer_pid),
             "agent_instructions_set" => self.rpc_instructions_set(params, peer_pid),
             "model_defaults_get" => self.rpc_model_defaults_get(),
             "model_defaults_set" => self.rpc_model_defaults_set(params, peer_pid),
@@ -3152,7 +3154,12 @@ impl Shared {
                             )
                     })
                     .count();
-                Ok(json!({"agents": agents, "live": live}))
+                let profiles = crate::agent_settings::profile_list(
+                    &self.store,
+                    &self.store.agents()?,
+                    self.operator_evidence(peer_pid).is_ok(),
+                )?;
+                Ok(json!({"agents": agents, "live": live, "profiles": profiles}))
             }
             "agent_identity" => {
                 if !params.as_object().is_some_and(|fields| fields.is_empty()) {
@@ -3959,6 +3966,7 @@ impl Shared {
             "app_media_read" => self.rpc_app_media_read(params, peer_pid),
             "app_media_chat_attach" => self.rpc_app_media_chat_attach(params, peer_pid),
             "app_media_publish" => self.rpc_app_media_publish(params, peer_pid),
+            "app_media_import" => self.rpc_app_media_import(params, peer_pid),
             "app_tool_revoke" => self.rpc_app_tool_revoke(params, peer_pid),
             "app_tool_result" | "app_tool_results" => self.rpc_app_tool_result(params, peer_pid),
             "app_run_capability_call" => self.rpc_app_capability(method, params, peer_pid),

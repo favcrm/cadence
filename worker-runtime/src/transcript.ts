@@ -1,7 +1,12 @@
 import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import type { EntryRecord } from "@earendil-works/pi-durable";
-import { BOARD_MESSAGE_KIND, type ThreadEntry } from "./contract.ts";
+import {
+  BOARD_MESSAGE_KIND,
+  type ThreadEntry,
+  type ThreadProjection,
+} from "./contract.ts";
+import { appPayload, parseEntryAppScope } from "./operation-scope.ts";
 
 /** The private engine's default retry.maxRetries: attempts 1..3 retry. */
 const PI_MAX_RETRIES = 3;
@@ -67,6 +72,65 @@ function toolCallText(name: string, args: Record<string, unknown>): string {
   return json === undefined || json === "{}" ? name : `${name} ${json}`;
 }
 
+/** A message's recorded time, or nothing: a time is never invented. */
+function createdAt(timestamp: unknown): { created: string } | Record<string, never> {
+  return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0
+    ? { created: new Date(timestamp).toISOString() }
+    : {};
+}
+
+/**
+ * The entries every thread read reports: the engine's mapping, then the host's
+ * projection when it has one, so a paged read and both stream paths agree.
+ */
+export function projectedThreadEntries(
+  records: readonly EntryRecord[],
+  includeThinking: boolean,
+  project?: ThreadProjection,
+): ThreadEntry[] {
+  const entries = threadEntries(records, includeThinking);
+  return project ? [...project(entries)] : entries;
+}
+
+/** The engine's reset record: earlier entries leave the model's context, not storage. */
+export const RESET_KIND = "pi.reset";
+
+/** The engine's compaction record: a summary for the model, not a message anyone sent. */
+export const COMPACTION_KIND = "pi.compaction";
+
+/** Where a reset falls among the messages: it settles an error before it. */
+const RESET_BOUNDARY = { role: "user", content: "", timestamp: 0 } as PiMessage;
+
+/** Shown where a conversation started over. */
+export const FRESH_START_TEXT =
+  "Started fresh. The assistant no longer uses the messages above.";
+
+/** How many records one history read asks the engine for. */
+const HISTORY_PAGE = 500;
+
+/** One scan of a conversation's stored records, as the engine pages them. */
+export type EntryScan<C> = (
+  cursor: C | undefined,
+  limit: number,
+) => Promise<{ readonly items: readonly EntryRecord[]; readonly next?: C }>;
+
+/**
+ * Every stored record, oldest first. The board reads this, not the active
+ * context: a thread's `seq` is the position in this list, so it must not restart
+ * when a reset or a compaction narrows what the model sees. An open stream and
+ * the board's merge both rely on `seq` only ever growing.
+ */
+export async function readAllRecords<C>(scan: EntryScan<C>): Promise<EntryRecord[]> {
+  const records: EntryRecord[] = [];
+  let cursor: C | undefined;
+  do {
+    const page = await scan(cursor, HISTORY_PAGE);
+    records.push(...page.items);
+    cursor = page.next;
+  } while (cursor !== undefined);
+  return records;
+}
+
 /**
  * Map the engine's committed records, including durable input metadata, into
  * the board's entries.
@@ -80,9 +144,30 @@ export function threadEntries(
   includeThinking: boolean,
 ): ThreadEntry[] {
   const entries: ThreadEntry[] = [];
-  const all = records.flatMap((record) => record.model ?? []);
+  const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
+  const all = visible.flatMap((record) =>
+    record.kind === RESET_KIND
+      ? [RESET_BOUNDARY, ...(record.model ?? [])]
+      : (record.model ?? []),
+  );
   let position = -1;
-  for (const record of records) {
+  for (const record of visible) {
+    if (record.kind === RESET_KIND) {
+      position += 1;
+      // A reset with nothing before it, or right after another, marks nothing.
+      const previous = entries.at(-1);
+      if (
+        previous !== undefined &&
+        !(previous.role === "system" && previous.text === FRESH_START_TEXT)
+      ) {
+        entries.push({
+          seq: entries.length + 1,
+          role: "system",
+          kind: "message",
+          text: FRESH_START_TEXT,
+        });
+      }
+    }
     const data = record.data;
     const messageId =
       record.kind === BOARD_MESSAGE_KIND &&
@@ -92,6 +177,21 @@ export function threadEntries(
       typeof data.messageId === "string"
         ? data.messageId
         : undefined;
+    // The app scope travels with the stored entry, so a reconnect, a rebuild
+    // and a replayed retry all project the envelope the operation was admitted
+    // with, never a scope re-derived from the caller. A stored scope that does
+    // not validate fails the read: serving the entry without it would present
+    // an operation as Home, which is a silent weakening of its envelope.
+    // Only a row whose `data` is an object can claim a scope: a stored row
+    // with any other `data` is rendered as it was before scopes existed, and
+    // its execution path (`operationAppScope`) stays strict and refuses it.
+    const app =
+      data !== null && typeof data === "object" && !Array.isArray(data)
+        ? parseEntryAppScope(record.kind, data)
+        : null;
+    // The board's own operator-entry payload carries the verified binding as
+    // `{install_id, context_id?}`, which is what its retry sends back.
+    const payload = app === null ? undefined : { app: appPayload(app) };
     for (const message of record.model ?? []) {
       position += 1;
       // Tool results live in their own message, paired to the assistant tool
@@ -107,6 +207,7 @@ export function threadEntries(
           role: "agent",
           kind: "tool_result",
           text,
+          ...createdAt(message.timestamp),
           payload: {
             tool_use_id: message.toolCallId,
             ...(message.isError ? { is_error: true as const } : {}),
@@ -138,6 +239,7 @@ export function threadEntries(
             role: "agent",
             kind: "thinking",
             text: part.thinking.trim(),
+            ...createdAt(message.timestamp),
             ...(part.redacted === true
               ? { payload: { redacted: true as const } }
               : {}),
@@ -153,6 +255,7 @@ export function threadEntries(
               part.name,
               part.arguments as Record<string, unknown>,
             ),
+            ...createdAt(message.timestamp),
             payload: { tool_use_id: part.id },
           });
           continue;
@@ -165,9 +268,11 @@ export function threadEntries(
           role: operator ? "operator" : agent ? "agent" : "system",
           kind: agent ? (final ? "turn_result" : "assistant_text") : "message",
           text: part.text,
+          ...createdAt(message.timestamp),
           ...(operator && messageId !== undefined
             ? { message: messageId }
             : {}),
+          ...(operator && payload !== undefined ? { payload } : {}),
         });
       }
       if (message.role === "assistant" && terminalError(all, position)) {
@@ -176,6 +281,7 @@ export function threadEntries(
           role: "agent",
           kind: "turn_result",
           text: "",
+          ...createdAt(message.timestamp),
           payload: {
             status: "failed",
             error: failedTurnReason(message.errorMessage),

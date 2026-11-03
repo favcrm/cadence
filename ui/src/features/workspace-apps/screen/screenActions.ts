@@ -5,7 +5,7 @@ import { rememberContext } from "../contextSelection";
 import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type PublishDestination, type WorkspaceRun } from "../workspaceApps";
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
 import { accountLabel, connectReturnTo, destinationBindings, isPublishToolkit, sendSlot, bindingToUse } from "../socialConnect";
-import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
+import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaImportArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
 import type { ScreenActions } from "./screenLifecycle";
 import type { Planner, SlotPlan } from "./screenSlot";
 
@@ -75,6 +75,10 @@ export function plainRefusal(error: unknown): ActionRefusal {
   if (error.code === "draft_in_use") return { code: "draft_in_use", text: "This draft is approved or published, so it can't be discarded." };
   if (error.code === "stale_revision") return { code: "stale_revision", text: "That changed somewhere else. Reload and try again." };
   if (error.code === "draft_not_found") return { code: "draft_not_found", text: "That draft is no longer here." };
+  // SOC-54: the host keeps every retained read, so the remaining refusal is a
+  // profile that left Settings. `stale_source` stays mapped for an older daemon
+  // that still applies the latest-fetch-only rule.
+  if (error.code === "source_not_saved") return { code: "source_not_saved", text: "That profile is no longer a saved source. Re-add it in Settings." };
   if (error.code === "stale_source") return { code: "stale_source", text: "That post was fetched again since; clone it as a new post." };
   const text = error.message.toLowerCase();
   if (text.includes("320 pixels")) return { code: "image_too_small", text: "Use a photo at least 320 pixels on each side." };
@@ -148,6 +152,26 @@ async function mediaPublish(args: Record<string, unknown>, ui: { actionToken?: s
       action_token: actionToken,
       asset_id: checked.asset_id as string,
       expected_revision: checked.expected_revision as number,
+      request_id: checked.request_id as string,
+    });
+    return { ok: true, data: out };
+  } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+}
+
+/** CAD-1962 — `media.import`: promote ONE retained image this
+ *  installation owns into the shared workspace library, as a draft. The
+ *  daemon re-proves the mount, the declared `media.import` permission and
+ *  the custody before copying, so the frame only names the receipt and a
+ *  request id. */
+async function mediaImport(args: Record<string, unknown>, ui: { actionToken?: string }): Promise<ActionResult> {
+  const checked = mediaImportArgs(args);
+  const actionToken = ui.actionToken;
+  if (!checked || typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken))
+    return refuse("bad_args", "That request is not valid.");
+  try {
+    const out = await workspaceApps.mediaImport({
+      action_token: actionToken,
+      receipt_id: checked.receipt_id as string,
       request_id: checked.request_id as string,
     });
     return { ok: true, data: out };
@@ -475,6 +499,7 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "media.read": () => mediaRead(args, ui),
     "media.chat.attach": () => mediaChatAttach(args, ui),
     "media.publish": () => mediaPublish(args, ui),
+    "media.import": () => mediaImport(args, ui),
   };
   return Promise.resolve().then(table[verb as (typeof CALL_VERBS)[number]]).catch((error: unknown): ActionResult => ({ ok: false, refusal: plainRefusal(error) }));
 }

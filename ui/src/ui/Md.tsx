@@ -125,11 +125,21 @@ function codeBlock(children: ReactNode): { lang: string; code: string } {
 function CodeBlock({ children }: { children?: ReactNode }) {
   const t = useTranslate();
   const { lang, code } = codeBlock(children);
+  return (
+    <CodeSurface label={lang || t("code")} code={code}>
+      {children}
+    </CodeSurface>
+  );
+}
+
+/** One code surface: label, Copy and a scrollable, keyboard-reachable body. */
+export function CodeSurface({ label, code, children }: { label: string; code: string; children?: ReactNode }) {
+  const t = useTranslate();
   const [copied, setCopied] = useState(false);
   return (
     <div className="codeblock">
       <div className="codeblock-bar">
-        <span className="codeblock-lang num">{lang || t("code")}</span>
+        <span className="codeblock-lang num">{label}</span>
         <button
           type="button"
           className="lnk codeblock-copy"
@@ -146,7 +156,7 @@ function CodeBlock({ children }: { children?: ReactNode }) {
           {copied ? t("Copied") : t("Copy")}
         </button>
       </div>
-      <pre>{children}</pre>
+      <pre tabIndex={0} aria-label={label}>{children}</pre>
     </div>
   );
 }

@@ -20,7 +20,6 @@ const role = (id: string, category: string, title: string, job: string): AgentRo
   tools: [],
   first_tasks: [],
   instructions: "",
-  model: { id: "m", source: "role_default" },
 });
 const roles = [
   role("quotation", "business", "Quotation", "Turns a request into a quote."),
@@ -34,6 +33,8 @@ check(nextAlias("developer", []) === "developer-1", "first name");
 check(nextAlias("developer", ["developer-1", "developer-2"]) === "developer-3", "skips taken names");
 check(aliasProblem("developer-1", ["developer-1"]) !== null, "a taken name is refused");
 check(aliasProblem("bad name", []) !== null, "a name outside the alias grammar is refused");
+check(aliasProblem("-dev", []) !== null, "a leading dash is refused");
+check(aliasProblem("Dev", []) !== null, "an uppercase name is refused");
 check(aliasProblem("developer-1", []) === null, "a free name passes");
 
 // Suggested for you: from installed apps; nothing matching hides the section.
@@ -76,5 +77,6 @@ check(hiredText(null) === "—" && hiredText(1_792_000_000).length > 3, "hired d
 
 // A roster row carries only the catalogue id; the role resolves from it.
 const payload = { categories: [], roles, install: { hosted: false, provider: "pi", endpoint_kind: "managed" } };
-check(roleOf({ catalogue: "developer" }, payload)?.id === "developer", "role from the served catalogue id");
-check(roleOf({}, payload) === null, "no catalogue id, no role");
+const hired = [{ id: "dev-1", catalogue: "developer", runtimes: ["rt-1"] }] as never;
+check(roleOf({ alias: "rt-1" }, payload, hired)?.id === "developer", "role from the runtime's profile");
+check(roleOf({ alias: "other" }, payload, hired) === null, "no profile, no role");

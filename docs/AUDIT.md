@@ -35,29 +35,81 @@ Three read-only verbs serve `scripts/enqueue-reviewed` (CAD-959), which
 decides before a merge what the audit reports after it:
 
 ```bash
-cadence audit approval --pr 84 --head <full-sha>   # JSON; exit 0 only when an approval is in force for exactly that head
-cadence audit verdicts --issue CAD-92 --pr 84 --head <full-sha>   # head-pinned verdict notes, plus why others were skipped
+cadence audit approval --project cadence --issue CAD-92 --pr 84 --head <full-sha>   # JSON; exit 0 only when an approval is in force for exactly that head
+cadence audit verdicts --project cadence --issue CAD-92 --pr 84 --head <full-sha>   # head-pinned verdicts for the selected org, plus why others were skipped
 cadence audit scope --issue CAD-92   # CAD-1106: ticket scope pre-approvals (id, body digest, recorded_via, revoked); exit 0 when the store answered
 ```
+
+CAD-2001: on a hosted org the approval and verdict reads are project-scoped.
+`--project` is required and is the issue's own project — never inferred from
+`--repo` or the cwd, and never a repo's first project — and `audit approval`
+also requires `--issue`, because an approval is unique per project, issue,
+repo, PR and head. The tenant re-checks the live issue→project relation and the
+project's declared repo on every read, so a moved or removed issue is refused
+rather than answered as countable. A local selection refuses `--project` and
+`--issue`: the local store and the notes folder carry no project attribution,
+and claiming one would be a scope nothing checked.
 
 `audit scope` only lists records; `scripts/enqueue-reviewed` decides which one
 counts (digest equals the sha256 of the trimmed current ticket body,
 `recorded_via` `operator-connection`, not revoked).
 
-`audit verdicts` uses the same note parser as the audit. A reviewer is the
-first whitespace token of `From:`, lower-cased (the rest is prose). Its kind
-comes from the exact title (`Standards`, `Spec/security`, `Browser QA`,
+`audit verdicts` answers for the org this invocation selects: `--org` and
+`CADENCE_ORG` route it exactly as they route every other verb, so an unknown,
+conflicting or unreadable selection refuses — it never reads the notes folder
+instead — and a hosted org reads its own record (and refuses when it cannot)
+rather than this machine's notes. A local selection parses the notes directory
+offline, with the same note parser as the audit; a reviewer is the first
+whitespace token of `From:`, lower-cased (the rest is prose). Its kind comes
+from the exact title (`Standards`, `Spec/security`, `Browser QA`,
 `Review (standards+spec)`); anything else is `other`. Symlinked notes are
-skipped, never followed. Neither verb writes anything or talks to the daemon.
+skipped, never followed. Neither `approval` nor `verdicts` writes anything —
+the verdict read does not even take the registry lock — and the local read
+needs no daemon, state dir or `HOME`.
+
+The document says where it came from (AOS-473): `origin` is `local` for the
+note parse and `hosted` for the org's record, and the merge gate applies the
+attested rule only to `hosted`. A hosted read takes `--project` and `--repo`
+(the default repo is the cwd checkout's github.com origin), sends both, and
+refuses an answer naming another project or repository; each hosted entry
+carries `repo`, `reviewer_id` and `github_login`. A local read refuses
+`--repo` and `--project`, because notes are neither repo- nor project-scoped.
+The binding itself is the workspace owner's record — the GitHub login once for
+the workspace, and the project's review set as principals:
+
+```bash
+cadence audit identities   # JSON: the workspace's principal→GitHub-login attestation map
+cadence audit identities set --identity user_a=alice --identity user_b=bob   # owner only, `audit.approve`; replaces the whole map
+cadence audit reviewers --project cadence   # JSON: that project's eligible principals, joined to the attested logins
+cadence audit reviewers set --project cadence --reviewer user_a --reviewer user_b   # owner only, `audit.approve`; replaces the project's whole set
+```
+
+Both writes require the same opt-in `audit.approve` login as `audit approve`.
+Eligibility is a project fact and the login is a workspace attestation, so a
+project set names principals only: a `--reviewer login=subject` row is refused
+with the two-step remedy. A principal with no attested login reads back as
+`github_login: null` and its verdicts cannot count yet. Leaving a reviewer out
+of the project's set stops new verdicts for that project only: rows already
+filed keep their stored principal and login and stay countable for their head,
+because evidence must never be erasable — an owner must not be able to hide a
+`revise` by unbinding.
 
 Two operator verbs write the approval evidence the report reads (see
 [Operator approval evidence](#operator-approval-evidence-the-human-class-gate)):
 
 ```bash
-cadence audit approve --pr 84 --head 011d212bb5314e5c2dee959e7156732728a31018 \
+cadence audit approve --project cadence --issue CAD-92 --pr 84 \
+    --head 011d212bb5314e5c2dee959e7156732728a31018 \
     --source "chris in chat 2026-09-20T22:33Z"   # --repo defaults to the cwd's origin
 cadence audit revoke merge-pr84-011d212bb531 --source "chris" --reason "head moved"
 ```
+
+On a hosted org the merge approval names its project and the ticket it
+authorizes as well as the exact head: the tenant records it uniquely per
+project, issue, repo, PR and head, so an approval for another ticket never
+answers this one, and the receipt must echo exactly what was sent. A local
+approval is repo-scoped and refuses `--project`; `--issue` there remains the
+CAD-1106 scope pre-approval (`--action scope`) and never mixes with `--pr`.
 
 ## Each row
 

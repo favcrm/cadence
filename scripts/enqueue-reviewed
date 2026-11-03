@@ -25,13 +25,43 @@ unless ALL of these hold for the pinned head:
     or one (`Review (standards+spec)`) when every change is on the one-review
     list (docs/roles/one-review-paths.toml, CAD-957, read at the PR's base
     commit so a PR cannot widen its own list). A `ui/` change also needs a
-    Browser QA pass;
+    Browser QA pass. AOS-473: a document whose `origin` is `hosted` is counted
+    by the owner's attestation instead — the row must name this repo and carry
+    a reviewer_id and a github_login, distinct reviewers are principals, the
+    author check compares the attested login, and one login fills at most one
+    slot (two counted principals behind one login refuse the set). Two hosted
+    rows of one reviewer and kind that share a stamp are refused unless they
+    carry the same evidence, login included. A local document (or one from an
+    older client, which has no marker) counts exactly as before. CAD-2001: the
+    hosted reads are project-scoped. `cadence delivery requirements` says
+    where its answer came from (`origin: "hosted"`), and the gate then passes
+    the ticket's project — the one the requirements binding already names and
+    this script already checks against the ticket — to `cadence audit
+    verdicts --project` and `cadence audit approval --project --issue`. The
+    project is never derived from the repo or the cwd, and a hosted read that
+    cannot name it is refused rather than answered from repo-scoped evidence;
   * a ticket comment for this head lists those verdict notes (created after
     the other gates pass; dry-run only checks an existing comment);
   * for a human-class diff (a path trigger, more than 1500 changed lines, or
     any head-pinned note whose Risk is not exactly `auto`),
     `cadence audit approval` reports an approval in
     force for exactly this head. This script never records an approval.
+
+CAD-1946 temporary exception: `--exception --advisory standards=<url> --advisory
+spec-security=<url>` (and `browser-qa=<url>` for a `ui/` change) waives only the
+missing authenticated reviewer attestation, and on a hosted routine PR the readiness
+proof hosted can't produce yet, which the evidence names. Every other rule still
+holds, a filed non-pass verdict still refuses, the operator must have approved this exact head
+(no scope fallback), and the signature and evidence say it is an exception. The
+advisory links are findings from separately assigned sessions, not verdicts: the
+gate cannot prove their independence, and the operator accepts that. Ends at
+`EXCEPTION_ENDS` in scripts/delivery-gate.
+
+CAD-2001 release order: the tenant server must serve the project-scoped gate
+verbs before this client sends them. An older tenant refuses the verb names
+(HTTP 501/400/409/503) and the client says so — "update the tenant server
+first, then this Cadence client" — which this gate reports as a refusal, never
+as "no evidence was filed" and never by falling back to the repo-scoped reads.
 
 Then it signs (repo, pr, head) with the delivery-gate key (--gate-key) and posts
 the signature on the PR (CAD-1925: the merge queue's `delivery-gate` job holds
@@ -513,36 +543,174 @@ def required_check_reasons(repo, head, base_oid, required, rollup, runs):
 
 # ---- verdict notes (parsed by `cadence audit verdicts`) --------------------
 
-def read_verdicts(notes_dir, issue, pr, head):
-    """(verdicts, skipped) from the audit's own note parser. Raises on failure."""
-    rc, out, err = run(["cadence", "audit", "verdicts", "--issue", issue, "--pr", str(pr),
-                        "--head", head, "--notes-dir", notes_dir])
+def read_verdicts(notes_dir, issue, pr, head, project=None):
+    """(verdicts, skipped, origin) from the audit's own verdict reader.
+
+    AOS-473: the document says where it came from. `hosted` is the org's own
+    record, whose rows carry the owner's reviewer attestation; `local` — and
+    an older client, which sends no marker — keeps the existing counting. Any
+    other value is a document this gate cannot classify, so it refuses rather
+    than guess.
+
+    CAD-2001: a hosted read is project-scoped. `project` is the ticket's own
+    project (from the requirements binding, never the repo's), and it is
+    passed as `--project`; the document must name that same project. A local
+    selection is never given a project — local notes carry none — so the
+    project argument is absent exactly when the org is local. Raises on
+    failure."""
+    argv = ["cadence", "audit", "verdicts", "--issue", issue, "--pr", str(pr),
+            "--head", head, "--notes-dir", notes_dir]
+    if project is not None:
+        argv += ["--project", project]
+    rc, out, err = run(argv)
     try:
         doc = json.loads(out)
         verdicts, skipped = doc["verdicts"], doc.get("skipped", [])
+        origin = doc.get("origin", "local")
         keys = ("name", "stamp", "reviewer", "kind", "outcome", "title_outcome", "section_outcome", "risk")
-        if rc != 0 or not all(isinstance(v, dict) and all(k in v for k in keys) for v in verdicts):
+        if rc != 0 or not isinstance(verdicts, list) or not all(isinstance(v, dict) and all(k in v for k in keys) for v in verdicts):
             raise ValueError("unexpected shape")
-        return verdicts, skipped
     except (ValueError, KeyError, TypeError, AttributeError):
-        detail = (err or out).strip()[:200]
+        detail = (err or out).strip()[:400]
         raise RuntimeError(
             f"cannot read the verdict notes via `cadence audit verdicts` (rc {rc}): {detail}"
             + stale_cli_hint(detail)
         )
+    if origin not in ("local", "hosted"):
+        raise RuntimeError(
+            f"the verdict document names origin {origin!r}, which is neither local nor hosted; "
+            "refusing to guess which counting rule applies")
+    # The document must be the scope the gate asked for, in both directions: a
+    # hosted answer must name this project, and a local answer must not stand
+    # in for a project-scoped read.
+    if origin == "hosted":
+        if project is None:
+            raise RuntimeError(
+                "the hosted verdict document is project-scoped but the gate had no project "
+                "to ask for; refusing to count it")
+        if doc.get("project") != project:
+            raise RuntimeError(
+                f"the hosted verdict document names project {doc.get('project')!r}, not "
+                f"{project!r}; refusing to count another project's evidence")
+    elif project is not None:
+        raise RuntimeError(
+            f"the selected org answered a local verdict document for project {project!r}; "
+            "refusing to count it as that project's evidence")
+    return verdicts, skipped, origin
 
 
-def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
+def read_identities():
+    """`login -> subject_id` from the workspace's principal attestation map.
+
+    CAD-2049: the author exclusion has to resolve the PR author's login to a
+    principal before it can exclude that principal. `cadence audit identities`
+    is the owner's record of that join, and the read is admitted to the live
+    human owner only: a refusal is a refusal, never an empty map."""
+    rc, out, err = run(["cadence", "audit", "identities"])
+    try:
+        doc = json.loads(out)
+        rows = doc["identities"]
+        if rc != 0 or not isinstance(rows, list):
+            raise ValueError("unexpected shape")
+        mapping = {}
+        for row in rows:
+            login = (row.get("github_login") or "").strip().lower()
+            subject = (row.get("subject_id") or "").strip()
+            if login and subject:
+                mapping[login] = subject
+        return mapping
+    except (ValueError, KeyError, TypeError, AttributeError):
+        detail = (err or out).strip()[:200]
+        raise RuntimeError(
+            f"cannot read the workspace identity map via `cadence audit identities` (rc {rc}): "
+            f"{detail}" + stale_cli_hint(detail))
+
+
+def reviewer_key(v, hosted):
+    """The identity a verdict counts as. A hosted row counts the attested
+    principal (`reviewer_id`), never the login string: two logins for one
+    person are one reviewer, and one login for two people is two. A local
+    note counts its `From:` reviewer, as before (AOS-473)."""
+    if hosted is not None:
+        return (v.get("reviewer_id") or "").strip() or (v.get("reviewer") or "").strip()
+    return v.get("reviewer") or ""
+
+
+def unbound_reason(n, hosted):
+    """Why a hosted verdict cannot count, or "" when it can (AOS-473).
+
+    A hosted row is evidence only on the owner's attestation for this repo:
+    the row must name the PR's repo and carry both the principal and the
+    login the owner bound to it. An unproven row never falls back to local
+    counting, and the refusal names the remedy that actually applies."""
+    problems, remedy = [], []
+    row_repo = (n.get("repo") or "").strip()
+    if not row_repo:
+        problems.append("names no repo")
+        remedy.append("read the verdicts with --repo <owner/name>")
+    elif row_repo.lower() != hosted["repo"].lower():
+        problems.append(f"names repo {row_repo}, not the PR's repo {hosted['repo']}")
+        remedy.append("run the gate in the PR's checkout: the hosted read binds the "
+                      "cwd's github.com origin")
+    if not (n.get("reviewer_id") or "").strip():
+        problems.append("has no attested reviewer_id")
+        remedy.append("the workspace owner must attest the reviewer for this repo "
+                      "(`cadence audit reviewers set`)")
+    if not (n.get("github_login") or "").strip():
+        problems.append("has no attested github_login")
+        remedy.append("the workspace owner must attest the reviewer for this repo "
+                      "(`cadence audit reviewers set`)")
+    if not problems:
+        return ""
+    return (f"hosted verdict {n['name']} cannot count: it " + ", and it ".join(problems)
+            + " — " + "; ".join(dict.fromkeys(remedy)))
+
+
+def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
+                  exception=False):
     """(reasons, counted notes).
+
+    `exception` (CAD-1946) drops only the counts of missing verdicts. A filed
+    non-pass, an unorderable row or a non-independent row still refuses.
 
     Every head-pinned note counts toward a refusal, whatever its kind or file
     name: a non-pass note refuses unless the SAME reviewer has a later-stamped
     pass of a recognised kind, and an unstamped non-pass note always refuses.
-    Notes are ordered by the file-name stamp, never mtime."""
+    Notes are ordered by the file-name stamp, never mtime.
+
+    `hosted` is `{"repo": owner/name}` when the document came from the org.
+    Then a counted row must be attested for this repo and the author check
+    compares the attested login (AOS-473). Without it, the counting is the
+    local one, unchanged.
+
+    A hosted document appends corrections, so two of its rows for one reviewer
+    and one kind that share a stamp state no order: neither is the current
+    evidence, and a same-second pass filed next to a revise would otherwise
+    resolve to whichever row sorted first once a later pass of another kind
+    superseded the non-pass scan. Equal stamps are only harmless when the rows
+    carry the same evidence — outcome, title, section, and (hosted) the attested
+    login, because a principal re-bound from a non-author login to the author's
+    could otherwise file a second same-second pass and have the earlier
+    non-author row counted. The refusal stands independently of any newer row of
+    another kind. A local document keeps exactly the rule it had: its notes are
+    filed by hand, and only the newest-stamp tie below applies to them.
+
+    A hosted login fills at most one review slot: when one normalized login
+    carries two counted principals (serial rebinding), the set refuses and
+    those rows count for nothing."""
     reasons, counted = [], []
+    identity = lambda v: reviewer_key(v, hosted)
+
+    def evidence(n):
+        fields = (n["outcome"], n["title_outcome"], n["section_outcome"])
+        if hosted is None:
+            return fields
+        return fields + ((n.get("github_login") or "").strip().lower(),)
+
+    ambiguous = set()  # (identity, kind) whose latest stamp holds disagreeing rows
     by_reviewer = {}
     for v in verdicts:
-        by_reviewer.setdefault(v["reviewer"], []).append(v)
+        by_reviewer.setdefault(identity(v), []).append(v)
     for who, notes in sorted(by_reviewer.items()):
         stamped = [n for n in notes if n["stamp"]]
         passes = [n for n in stamped if n["outcome"] == "pass" and n["kind"] != "other"]
@@ -555,6 +723,18 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
             reasons.append(
                 f"verdict by {who or '(no reviewer)'} on this head is not a pass "
                 f"(outcome '{n['outcome']}', title '{n['title_outcome']}', section '{n['section_outcome']}'){why}: {n['name']}")
+        if hosted is not None:
+            by_kind = {}
+            for n in stamped:
+                by_kind.setdefault(n["kind"], []).append(n)
+            for kind, rows in sorted(by_kind.items()):
+                newest = max(r["stamp"] for r in rows)
+                top = [r for r in rows if r["stamp"] == newest]
+                if len(top) > 1 and len({evidence(r) for r in top}) > 1:
+                    ambiguous.add((who, kind))
+                    reasons.append(
+                        f"cannot order two {kind} verdicts by {who or '(no reviewer)'} with the same "
+                        f"stamp {newest}: {' and '.join(sorted(r['name'] for r in top))}")
         if stamped:
             newest = max(n["stamp"] for n in stamped)
             names = sorted({n["name"] for n in stamped if n["stamp"] == newest})
@@ -565,22 +745,72 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
     for v in verdicts:
         if v["kind"] == "other" or not v["stamp"]:
             continue
-        cur = latest.get((v["reviewer"], v["kind"]))
+        key = (identity(v), v["kind"])
+        if key in ambiguous:
+            continue  # no order, so no current evidence
+        cur = latest.get(key)
         if cur is None or v["stamp"] > cur["stamp"]:
-            latest[(v["reviewer"], v["kind"])] = v
+            latest[key] = v
     for n in latest.values():
-        who = n["reviewer"]
+        who = identity(n)
         if n["outcome"] != "pass":
             continue  # already refused above unless superseded
         if not who:
-            reasons.append(f"verdict note has no 'From:' reviewer: {n['name']}")
+            reasons.append(
+                f"hosted verdict {n['name']} has no reviewer_id to count by" if hosted is not None
+                else f"verdict note has no 'From:' reviewer: {n['name']}")
+            continue
+        if hosted is not None:
+            unbound = unbound_reason(n, hosted)
+            if unbound:
+                reasons.append(unbound)
+            elif (n.get("github_login") or "").strip().lower() in authors:
+                reasons.append(
+                    f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
+                    f"the owner attested that login as the PR author")
+            elif not hosted.get("author_principal"):
+                # CAD-2049: without the author's principal, no row can be proven
+                # not to be the author's — a second login is not a second person.
+                reasons.append(
+                    f"verdict {n['name']} cannot be proven independent: the PR author "
+                    f"{hosted.get('author_login') or '(unknown login)'} has no attested principal "
+                    "(`cadence audit identities set --identity <subject>=<login>`)")
+            elif (n.get("reviewer_id") or "").strip() == hosted["author_principal"]:
+                reasons.append(
+                    f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
+                    f"its principal is the PR author's ({hosted['author_principal']})")
+            else:
+                counted.append(n)
         elif who in authors:
             reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']})")
         else:
             counted.append(n)
-    by = lambda kind: {n["reviewer"] for n in counted if n["kind"] == kind}
+    if hosted is not None:
+        # One attested login must not fill two review slots. Serial rebinding —
+        # alice->A files Standards, the owner replaces the map with alice->B and
+        # B files Spec/security — yields two principals behind one login, which
+        # is one person holding both slots. Refuse, and drop those rows so they
+        # satisfy no count at all.
+        by_login = {}
+        for n in counted:
+            by_login.setdefault((n.get("github_login") or "").strip().lower(), set()).add(identity(n))
+        shared = {login: ids for login, ids in by_login.items() if len(ids) > 1}
+        if shared:
+            for login, principals in sorted(shared.items()):
+                names = sorted(n["name"] for n in counted
+                               if (n.get("github_login") or "").strip().lower() == login)
+                reasons.append(
+                    f"login {login} is attested to {len(principals)} principals "
+                    f"({', '.join(sorted(principals))}) across this document, so one person "
+                    f"would fill more than one review slot: {' and '.join(names)} — the owner "
+                    f"must keep one login bound to one principal")
+            counted = [n for n in counted
+                       if (n.get("github_login") or "").strip().lower() not in shared]
+    by = lambda kind: {identity(n) for n in counted if n["kind"] == kind}
     std, spec, combined = by("standards"), by("spec-security"), by("combined")
     two = bool(std) and bool(spec) and any(a != b for a in std for b in spec)
+    if exception:
+        return reasons, counted
     if qualifies_one:
         if not (combined or two):
             reasons.append(f"no pass verdict for {issue} pinned to this head (one review is required)")
@@ -594,6 +824,38 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
     if need_qa and not by("browser-qa"):
         reasons.append(f"a ui/ change needs a pass Browser QA verdict for {issue} pinned to this head, from someone other than the author")
     return reasons, counted
+
+
+def exception_routine(klass, active, origin, readiness, ci_url):
+    """(refusals, waives readiness) for an exception on a routine PR (CAD-1946).
+
+    Hosted has no readiness record yet, and the exception names that waiver. A
+    present proof must still match the run, and a local org must still have one."""
+    if klass != "routine" or not active:
+        return [], False
+    if readiness is None:
+        if origin == "hosted":
+            return [], True
+        return ["active routine delivery has no fresh native readiness proof for this exact binding"], False
+    if ci_url is not None and ci_url != readiness["ci_run_url"]:
+        return ["native routine readiness CI run is not the actual successful ci.yml run at this head"], False
+    return [], False
+
+
+ADVISORY_KINDS = ("standards", "spec-security", "browser-qa")
+
+
+def advisory_reasons(advisory, need_qa):
+    """Refusals for the exception's advisory links (CAD-1946)."""
+    kinds = ["standards", "spec-security"] + (["browser-qa"] if need_qa else [])
+    reasons = [f"the exception needs --advisory {k}=<https url>" for k in kinds if k not in advisory]
+    reasons += [f"unknown advisory kind {k!r}" for k in sorted(advisory) if k not in ADVISORY_KINDS]
+    reasons += [f"advisory {k} is not an https url: {v!r}" for k, v in sorted(advisory.items())
+                if not re.fullmatch(r"https://\S+", v)]
+    picked = [advisory[k] for k in kinds if k in advisory]
+    if len(set(picked)) != len(picked):
+        reasons.append("the advisory links must be separate records, one per review")
+    return reasons
 
 
 def check_comment(comments, head, counted, base_ref, required=()):
@@ -662,6 +924,13 @@ def requirements_inspection(issue, repo, pr, head):
                    ("issue", "project", "repo", "pr", "head", "base", "base_ref", "merge_base", "policy_digest")}
         if not isinstance(binding["project"], str) or not binding["project"]:
             raise ValueError("requirements response has no project binding")
+        # CAD-2001: where the answer came from decides which evidence scope the
+        # later reads must carry. A hosted answer marks itself; the daemon's own
+        # answer carries no marker. Anything else is a document this gate cannot
+        # classify, so it refuses instead of guessing a scope.
+        origin = result.get("origin")
+        if origin is not None and origin != "hosted":
+            raise ValueError(f"requirements response names origin {origin!r}, not hosted")
         readiness = result.get("readiness")
         if readiness is not None:
             if not isinstance(readiness, dict):
@@ -678,17 +947,29 @@ def requirements_inspection(issue, repo, pr, head):
                     or readiness["outcome_report"].split("/")[-1] in ("", ".", "..")
                     or any(unicodedata.category(char) == "Cc" for char in readiness["outcome_report"])):
                 raise ValueError("routine readiness does not bind to this issue, PR, head, base and policy")
-        return {"binding": binding, "requirements": req, "readiness": readiness}
+        return {"binding": binding, "requirements": req, "readiness": readiness,
+                "origin": origin}
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise RuntimeError(f"cannot use authoritative `cadence delivery requirements` result: {e}; {(err or out).strip()[:200]}")
 
 
-def check_approval(repo, pr, head, report, evidence=None):
-    rc, out, err = run(["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo])
+def check_approval(repo, pr, head, report, evidence=None, project=None, issue=None):
+    """Is an operator approval in force for exactly this head?
+
+    CAD-2001: a hosted approval is project-scoped and names the ticket it
+    authorizes, so `project` and `issue` are passed whenever the org is hosted
+    (they come from the ticket's own requirements binding). A local approval is
+    repo-scoped and takes neither. The client refuses a hosted call that cannot
+    name them, so a missing project can never be answered from repo-scoped
+    evidence; that refusal is reported as the refusal it is."""
+    argv = ["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo]
+    if project is not None:
+        argv += ["--project", project, "--issue", issue]
+    rc, out, err = run(argv)
     try:
         state = json.loads(out)
     except ValueError:
-        return [f"cannot read the operator approval via `cadence audit approval` (rc {rc}): {(err or out).strip()[:200]}"]
+        return [f"cannot read the operator approval via `cadence audit approval` (rc {rc}): {(err or out).strip()[:400]}"]
     if (rc == 0 and state.get("state") == "in-force"
             and state.get("recorded_via") in APPROVAL_RECORDED_VIA
             and isinstance(state.get("approval_id"), str) and state["approval_id"]):
@@ -1046,24 +1327,77 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         except RuntimeError as e:
             reasons.append(str(e))
 
+    # CAD-2001: a hosted org's evidence is project-scoped, and the project is
+    # the ticket's own — the one `delivery requirements` just bound and this
+    # script already compared with the ticket above. It is never the repo's
+    # project and never a cwd default. A local org passes nothing: its notes
+    # carry no project attribution.
+    hosted_project = None
+    if authority is not None and authority["origin"] == "hosted":
+        hosted_project = authority["binding"]["project"]
+
     verdicts, counted = [], []
+    origin = "local"
     if issue:
         try:
-            verdicts, skipped = read_verdicts(args.notes_dir, issue, pr, head)
+            verdicts, skipped, origin = read_verdicts(args.notes_dir, issue, pr, head,
+                                                      hosted_project)
             for sk in skipped:
-                report.append(f"skipped note {sk['name']}: {sk['reason']}")
+                report.append(f"skipped note {sk.get('name', '?')}: {sk.get('reason', sk)}")
             for v in verdicts:
                 if v["kind"] == "other":
                     report.append(f"ignored note {v['name']}: its title names no known review kind")
         except RuntimeError as e:
             reasons.append(str(e))
+        # AOS-473: the origin the document names decides the counting rule. A
+        # hosted document is the org's attested record for this repo; anything
+        # else keeps the local rule. A failed read leaves no verdicts to count.
+        # CAD-2001: a hosted document also had to name the ticket's project —
+        # `read_verdicts` refuses one that does not.
+        hosted = None
+        if origin == "hosted":
+            author_login = ((view.get("author") or {}).get("login") or "").strip()
+            # CAD-2049: read the map only when there is a row to count. The read
+            # is the owner's, and the CAD-1946 exception needs no verdicts, so a
+            # caller with nothing to count is never refused over it.
+            identities = {}
+            if verdicts:
+                try:
+                    identities = read_identities()
+                except RuntimeError as e:
+                    reasons.append(str(e))
+            hosted = {"repo": repo, "project": hosted_project,
+                      "author_login": author_login,
+                      "author_principal": identities.get(author_login.lower(), "")}
+            report.append(f"verdict origin: hosted ({repo}, project {hosted_project}); "
+                          "counting attested principals")
+            if verdicts:
+                report.append("PR author principal: "
+                              + (hosted["author_principal"]
+                                 or f"unattested ({author_login or 'no login'})"))
         active = authority is not None and authority["requirements"]["activation"] == "active"
         klass = authority["requirements"]["class"] if authority else None
         counted = []
-        if not active or klass == "strict":
+        if args.exception:
+            rc, ends, err = run([sys.executable, GATE_SCRIPT, "exception-open"])
+            if rc != 0:
+                reasons.append((err or ends).strip()[:200] or "the review exception is closed")
+            ends = ends.strip()
+            reasons += advisory_reasons(args.advisory, need_qa)
+            routine_reasons, waives_readiness = exception_routine(
+                klass, active, origin, authority["readiness"] if authority else None, ci_url)
+            reasons += routine_reasons
+            rs, counted = check_reviews(verdicts, False, need_qa, authors, issue, hosted,
+                                        exception=True)
+            reasons += rs
+            report.append(f"review EXCEPTION until {ends}: reviewer attestation waived")
+            required_comment_evidence.append(f"Review exception until: {ends}")
+            required_comment_evidence.extend(f"Advisory review: {k} = {v}"
+                                             for k, v in sorted(args.advisory.items()))
+        elif not active or klass == "strict":
             native_one = bool(authority and authority["requirements"]["reviews"] == 1)
             effective_one = one and native_one
-            rs, counted = check_reviews(verdicts, effective_one, need_qa, authors, issue)
+            rs, counted = check_reviews(verdicts, effective_one, need_qa, authors, issue, hosted)
             reasons += rs
         elif klass == "routine":
             if authority["readiness"] is None:
@@ -1073,12 +1407,12 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                 if ci_url is not None and ci_url != ready["ci_run_url"]:
                     reasons.append("native routine readiness CI run is not the actual successful ci.yml run at this head")
             if need_qa:
-                reasons += check_reviews(verdicts, True, True, authors, issue)[0]
+                reasons += check_reviews(verdicts, True, True, authors, issue, hosted)[0]
         elif klass == "consequential":
-            rs, counted = check_reviews(verdicts, True, need_qa, authors, issue)
+            rs, counted = check_reviews(verdicts, True, need_qa, authors, issue, hosted)
             reasons += rs
             combined = [n for n in counted if n.get("kind") == "combined"]
-            if len({n.get("reviewer") for n in combined}) != 1:
+            if len({reviewer_key(n, hosted) for n in combined}) != 1:
                 reasons.append(f"active {klass} delivery requires exactly one independent combined review")
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
 
@@ -1096,8 +1430,9 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
     if why:
         report.append("class: human (" + "; ".join(why) + ")")
-        rs = check_approval(repo, pr, head, report, approval_evidence)
-        if rs:  # legacy CAD-1106 scope fallback only
+        rs = check_approval(repo, pr, head, report, approval_evidence,
+                            hosted_project, issue)
+        if rs and not args.exception:  # legacy CAD-1106 scope fallback only
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
                              risk_text, one_text, verdicts, counted, report, approval_evidence)
             if sr:
@@ -1108,9 +1443,10 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     else:
         report.append("class: auto (every head-pinned note says Risk: auto; no path or size trigger)")
     authoritative_operator = bool(authority and authority["requirements"]["operator_approval"])
-    if authoritative_operator and not why:
-        rs = check_approval(repo, pr, head, report, approval_evidence)
-        if rs:
+    if (authoritative_operator or args.exception) and not why:
+        rs = check_approval(repo, pr, head, report, approval_evidence,
+                            hosted_project, issue)
+        if rs and not args.exception:
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
                              risk_text, one_text, verdicts, counted, report, approval_evidence)
             if sr:
@@ -1129,6 +1465,9 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                         binding=authority["binding"] if authority else None,
                         requirements=authority["requirements"] if authority else None,
                         readiness=authority["readiness"] if authority else None)
+        if args.exception:
+            evidence["exception"] = {"ends": ends, "advisory": dict(args.advisory),
+                                     "waives_readiness": waives_readiness}
         evidence["ci_run"] = ci_url
         evidence["ci_proofs"] = proofs
     return reasons, report
@@ -1170,6 +1509,14 @@ def evidence_body(evidence):
                       f"Native CI run: {readiness['ci_run_id']} {readiness['ci_run_url']}"))
     if evidence.get("approval"):
         lines.append("Operator approval id: " + evidence["approval"])
+    exception = evidence.get("exception")
+    if exception:
+        waived = "authenticated reviewer attestation"
+        if exception.get("waives_readiness"):
+            waived += ", routine readiness (hosted has none)"
+        lines.append(f"EXCEPTION, not a normal gate pass. Waived: {waived}.")
+        lines.append(f"Review exception until: {exception['ends']}")
+        lines.extend(f"Advisory review: {k} = {v}" for k, v in sorted(exception["advisory"].items()))
     return "\n".join(lines)
 
 
@@ -1220,7 +1567,8 @@ def post_gate_signature(args, repo):
     delivery-gate job verifies it (CAD-1925). Reasons on failure."""
     key = os.path.expanduser(args.gate_key)
     rc, out, err = run([sys.executable, GATE_SCRIPT, "sign", "--repo", repo, "--pr", str(args.pr),
-                        "--head", args.head, "--key", key])
+                        "--head", args.head, "--key", key]
+                       + (["--exception"] if args.exception else []))
     if rc != 0 or not out.strip():
         return [f"delivery-gate signature failed: {(err or out).strip()[:200]}"]
     rc, out, err = run(["gh", "pr", "comment", str(args.pr), "-R", repo, "--body-file", "-"],
@@ -1256,7 +1604,50 @@ def enqueue(args, repo):
     return 1
 
 
+def self_test():
+    """CAD-2049: the independence rule over fixed documents. No network, no files.
+
+    The gate cannot approve its own change, so this is the reproducible check
+    the ticket asks for: it runs the counting function the gate runs, over the
+    three shapes that decide the rule."""
+    def row(name, reviewer_id, login, kind="combined", outcome="pass"):
+        return {"name": name, "stamp": "20261103-000000", "reviewer": login,
+                "reviewer_id": reviewer_id, "github_login": login, "repo": "o/r",
+                "kind": kind, "outcome": outcome, "title_outcome": outcome,
+                "section_outcome": outcome, "risk": "auto"}
+
+    def hosted(author_login, author_principal):
+        return {"repo": "o/r", "project": "p", "author_login": author_login,
+                "author_principal": author_principal}
+
+    cases = [
+        ("same principal under another login refuses",
+         hosted("author", "usr_author"), row("a.md", "usr_author", "author2"),
+         "not independent"),
+        ("an unattested author proves nothing",
+         hosted("author", ""), row("b.md", "usr_other", "reviewer"),
+         "no attested principal"),
+        ("a distinct attested principal counts",
+         hosted("author", "usr_author"), row("c.md", "usr_other", "reviewer"),
+         None),
+    ]
+    failures = 0
+    for label, h, verdict, expected in cases:
+        reasons, counted = check_reviews([verdict], True, False, {"author"}, "CAD-1", h)
+        if expected is None:
+            ok = not reasons and len(counted) == 1
+            detail = "; ".join(reasons) or f"counted {len(counted)}"
+        else:
+            ok = bool(reasons) and not counted and any(expected in r for r in reasons)
+            detail = "; ".join(reasons) or "no refusal"
+        print(f"{'ok  ' if ok else 'FAIL'} {label}: {detail}")
+        failures += 0 if ok else 1
+    return 0 if not failures else 1
+
+
 def main(argv):
+    if "--self-test" in argv:
+        return self_test()
     ap = argparse.ArgumentParser(prog=ME, description="Enqueue a PR only when review, checks and approval hold.")
     ap.add_argument("pr", type=int)
     ap.add_argument("--head", required=True, help="the full 40-hex head SHA the review covered")
@@ -1266,10 +1657,19 @@ def main(argv):
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--gate-key", default=os.environ.get("CADENCE_DELIVERY_GATE_KEY", DEFAULT_GATE_KEY),
                     help="the delivery-gate SSH signing key (CAD-1925)")
+    ap.add_argument("--exception", action="store_true",
+                    help="CAD-1946: waive only the missing reviewer attestation; needs --advisory")
+    ap.add_argument("--advisory", action="append", default=[], metavar="KIND=URL",
+                    help="a separate advisory review: standards, spec-security or browser-qa")
     ap.add_argument("--poll-secs", type=float, default=30)
     ap.add_argument("--poll-interval", type=float, default=2)
     args = ap.parse_args(argv)
     args.head = args.head.lower()
+    pairs = [a.partition("=") for a in args.advisory]
+    args.advisory = {k: v for k, _, v in pairs}
+    if len(args.advisory) != len(pairs) or (pairs and not args.exception):
+        print(f"{ME}: --advisory takes one KIND=URL per kind, with --exception", file=sys.stderr)
+        return 2
     if args.pr < 1 or not FULL_SHA.match(args.head):
         print(f"{ME}: --head must be the full 40-hex SHA and <pr> a positive number", file=sys.stderr)
         return 2

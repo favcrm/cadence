@@ -23,6 +23,25 @@ export interface GenerationIdentity {
   readonly cutoff: string;
 }
 
+/**
+ * The host-verified app scope of one operation.
+ *
+ * `installId` names the installed app and `contextId` one of its contexts;
+ * `contextId` is absent (or `null`) for an installation-only binding. The host
+ * proves both against its own canonical store before it submits, so the runtime
+ * only validates the shape and never accepts a scope from model output or from
+ * a browser field. Home is the absence of a scope, not a scope with empty
+ * parts.
+ *
+ * Both parts follow the board's binding grammar (1–128 characters of
+ * `[A-Za-z0-9_-]`), so the binding the transcript projects is exactly the
+ * `{install_id, context_id?}` object a retry can send back.
+ */
+export type AppScope = {
+  readonly installId: string;
+  readonly contextId?: string;
+};
+
 /** One stored transcript entry, as the board renders it. */
 export interface ThreadEntry {
   seq: number;
@@ -31,6 +50,8 @@ export interface ThreadEntry {
   text: string;
   /** The recorded message id of the operator input, never inferred from text. */
   message?: string;
+  /** When the engine recorded this message (ISO 8601). Absent when it has no real time. */
+  created?: string;
   payload?: {
     redacted?: true;
     tool_use_id?: string;
@@ -38,6 +59,19 @@ export interface ThreadEntry {
     /** Safe terminal failure projection; never raw provider diagnostics. */
     status?: "failed";
     error?: string;
+    /**
+     * The verified app binding of an operator input, in the board's own stored
+     * shape (`{install_id, context_id?}`), so a retry can send the original
+     * binding back unchanged.
+     */
+    app?: { install_id: string; context_id?: string };
+    /** A host's artifact card, with the board's `kind: "artifact"`; never the content. */
+    id?: string;
+    version?: number;
+    kind?: string;
+    title?: string;
+    bytes?: number;
+    digest?: string;
   };
 }
 
@@ -51,6 +85,13 @@ export interface ToolInvocation {
   readonly taskId: number;
   /** Epoch milliseconds, from the engine's run clock. */
   now(): number;
+  /**
+   * The app scope of the turn this call belongs to: the common scope of every
+   * input of the run, as those operations were admitted. Absent for a Home
+   * operation. A call with no active run to attribute it to is refused, never
+   * run as Home.
+   */
+  readonly app?: AppScope;
 }
 
 /** Per-call cancellation surface. */
@@ -173,7 +214,27 @@ export interface ThreadContext {
  * `requestModel` is the only model path: the runtime never calls a provider,
  * holds provider credentials or chooses a fallback route.
  */
+/** A host's addition to the board's thread entries; see `projectThread`. */
+export type ThreadProjection = (
+  entries: readonly ThreadEntry[],
+) => readonly ThreadEntry[];
+
 export interface HostedSessionOptions {
+  /**
+   * Add host entries to what the board reads, on every thread path. It sees a
+   * copy of the projection, and changes neither stored records nor what the
+   * model receives. Absent, the runtime's entries are returned unchanged.
+   *
+   * Clients resume from `seq`, so a projection must be synchronous and
+   * repeatable, and return ascending positive safe integers that stay stable as
+   * the thread grows. Anchor an entry to the record it belongs to (a tool
+   * result's `tool_use_id`, not a position), so it is present from the moment
+   * that record is, and never add one at or before a `seq` a client may hold.
+   * Owner and member views number differently, so derive `seq` from the entries
+   * given. A batch runs only on a session commit, so state changed outside one
+   * appears at the next commit or reconnect. A throw refuses the read.
+   */
+  readonly projectThread?: ThreadProjection;
   /** The platform default alias this deployment sends. */
   readonly modelAlias: string;
   /**
@@ -231,13 +292,19 @@ export interface AskResult {
 
 /** One submission the runtime has not settled yet. */
 export interface PendingOperation {
+  /** The id the input was submitted under: the board's message id for a send. */
+  readonly operationId: string;
   readonly status: "queued" | "running" | "parked";
 }
 
 /** Cheap header state for a conversation. */
 export interface HostedState {
   readonly running: boolean;
+  /** The running operation's id, so the board can name and stop that turn. */
+  readonly message: string | null;
   readonly queued: number;
+  /** The queued operations' ids: stopping the running turn withdraws them. */
+  readonly queuedMessages: readonly string[];
   readonly model: string;
 }
 
@@ -258,4 +325,6 @@ export const OPERATIONAL_SKILL_VERSION = "tenant-operations-1";
 export interface MasterStatus {
   readonly running: boolean;
   readonly queued: number;
+  /** The running turn's message id. Absent or null means it is not known. */
+  readonly message?: string | null;
 }

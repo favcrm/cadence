@@ -72,6 +72,8 @@ model registry or nested-execution API.
 two optional domain-data callbacks on `HostedSessionOptions`: `identity()`
 returns the current personal profile or workspace identity, and
 `threadContext()` returns the thread's public projection. Both carry data only.
+A host may also supply `projectThread` to add entries, such as artifact cards, to
+what every thread read reports; its contract is on `HostedSessionOptions`.
 Prompt text, model messages, engine hooks and SDK types are not accepted
 through them, and a generic host that supplies neither keeps its current
 behavior.
@@ -88,6 +90,95 @@ operation, never to an operation already running, and a malformed or
 unavailable identity refuses the operation instead of falling back to a generic
 prompt. The summarizer's `completeSimple` path keeps its original
 normalization, authentication and transport.
+
+**Hosted app scope.** `HostedSession.submit(text, operationId, app?)` and
+`ask(prompt, operationId?, app?)` accept the host-verified `AppScope` of the
+turn: `{ installId, contextId? }`, with `contextId` absent for an
+installation-only binding and both parts in the board's binding grammar (1–128
+characters of `[A-Za-z0-9_-]`). The host proves both against its own canonical
+store before it submits; the runtime only validates the shape, so a browser
+field, a model message or a scope read from somewhere else is never carried as
+verified scope. Omitting `app` is Home, and a Home operation's context is
+unchanged.
+
+The engine deduplicates a submission by request id alone — a repeated id
+returns its existing submission after comparing the submission type, never its
+text or metadata — so the runtime owns the check: the first admission of an
+operation id records a SHA-256 digest of its text and its app scope in the
+session object's `tenant_operation_scopes` table, an identical retry is the
+same operation, and a retry that changes the text or the scope is refused
+before the engine is asked. Text is hashed as a JSON string so distinct UTF-16
+strings, including unpaired surrogates, cannot collapse to the same UTF-8
+replacement character. Rows written by the earlier candidate digest refuse
+replay rather than being silently reinterpreted. The text itself is never
+copied into that table, so the guard leaves no readable message behind when the
+engine's own reset or
+compaction retires its copy; the rows are kept because they are the operation
+ids' bindings, and dropping one would let a replay be re-bound. A refused
+admission writes nothing, and the binding is the session's SQLite, not one
+instance's memory, so queueing, retries and crash recovery keep the envelope.
+Before its first reservation the guard also asks the engine whether it already
+holds that operation id in any state — queued, placed or settled. An id the
+engine knows but this guard never admitted was submitted by a build that
+predates the table, so the engine, not the caller, is the only authority for
+what that operation was. The guard therefore adopts it only as the Home envelope
+the engine's own records prove: the exact text the engine stored, placed as the
+board's own message entry carrying that operation id and no app scope. A placed
+input's text and metadata are read from the entry it was placed as; a queued
+input has no entry yet, so its draft is read from the engine's own inbox
+document. Placing an input and dropping its draft is one engine commit, so a
+draft the inbox no longer holds is re-read once from the submission itself and
+recovered from the entry it now names — never re-read in a loop — and only a
+record that proves neither is refused. An identical retry of such an operation
+replays across the deployment, and the adopted row is the recovered envelope,
+never the caller's, so a later retry that changes the text or sends an app scope
+is refused like any other. Everything else refuses rather than re-binds — a
+different text, any app scope, another submission type, an entry of another kind
+or with any field beyond `messageId`, a text the engine no longer stores, and a
+record that cannot be read — because the engine would replay its own stored turn
+while the guard recorded another. Nothing is ever adopted from the request being
+admitted.
+
+The admitted envelope is also placed with the input entry (`messageId` and
+`app`), so the transcript, a rebuilt object and a replayed retry all read the
+same durable record. The board's operator entry projects that stored binding as
+`payload.app` in its own shape, `{install_id, context_id?}` — the same object a
+`thread_send` retry sends back — and never re-derives one from a caller. A
+stored scope that does not validate fails that read or stream instead of being
+presented as Home.
+
+Inside a turn, the operation's scope reaches both the model and its tools. A
+run can hold more than one input — the engine appends each steering input to
+the live run — so the runtime attributes a run only when every one of its
+inputs carries the same scope, and refuses a run that mixes scopes instead of
+attributing it to one input. Each model request then carries a private,
+factual scope statement injected through `beforeRequest` (never a transcript
+entry) with just the validated `install_id`/`context_id` and the explicit
+limitation that it conveys no tool authority, permission or approval; the
+statement is context, never enforcement.
+
+Enforcement is a positive per-attempt attestation at the provider boundary.
+The engine only *reports* a hook error and continues the attempt, so a refusal
+raised in the hook would not stop the request. Instead the session installs a
+guard on its own `Models` at construction, and every attempt the hook serves
+authors one fresh message object into the session's set: the statement for an
+app turn, and for Home a content-identical clone of the request's last
+conversation message (no text is added or changed). `Models.streamSimple`
+refuses any request that carries none of them, before the provider is called,
+which settles the turn unanswered. A skipped hook, or a hook that cannot
+establish the scope — an unattributable run, a mixed run, a malformed stored
+scope — authors nothing and is therefore refused rather than sent unscoped. A
+fresh object per attempt is what makes an attestation un-reusable by any later
+request. Compaction's summarizer keeps the original unguarded path, and the
+operation guard composes with the identity guard on the same `Models`: both
+checks run, in install order.
+
+Each tool call receives `ToolInvocation.app`, the same resolved scope, after
+the refusal and live-authorization checks, so structured admission stays the
+authority. A tool call with no active run to attribute it to is refused,
+never run as Home. A malformed stored scope or a mixed run
+therefore refuses the request or the execution rather than acting outside the
+envelope.
 
 Each `/thread-stream` connection reads `threadContext()` once. Its metadata
 composes into the `master` frame under the runtime's own fields, so business
@@ -137,12 +228,37 @@ cadence --org acme team invites
 cadence --org acme team list
 ```
 
-The teammate accepts the workspace invitation through the platform and runs
-`cadence login acme` on their own machine/account. Each person has their own
-saved credential and private configuration; never copy the owner's credential,
-browser cookie or another agent's state. A member can approve ordinary CLI/wiki
+### Join in the browser (no install)
+
+The teammate can accept the invitation and use the shared board without
+installing anything. They open the invitation link from the email, sign in with
+the address that received it, choose **Join company** to accept, then choose
+**Open app**. The board then shows the workspaces they belong to; picking one
+opens that workspace's board. Nothing on this path creates a credential,
+registers an agent or installs a CLI.
+
+If the browser cannot join, the cause changes the next step:
+
+- **Wrong account** — sign out and sign in with the address that received the
+  invitation.
+- **Expired, revoked or already used** — ask a workspace owner to invite that
+  address again.
+- **No matching workspace** — the invitation was not accepted under this
+  account, the workspace is archived, or the slug hint supplied to `cadence
+  login <slug>` names a workspace this account does not belong to. An
+  invitation does not create membership by itself; ask an owner to check
+  `cadence --org <slug> team list`. If the login hint is wrong, restart
+  `cadence login` without a hint to choose an eligible workspace, or use the
+  correct slug.
+
+### Connect a computer (optional)
+
+`cadence login acme` is for the machine that will run Cadence, not a
+requirement for reading or updating the board. Each person has their own saved
+credential and private configuration; never copy the owner's credential, browser
+cookie or another agent's state. A member can approve ordinary CLI/wiki
 collaboration. App lifecycle changes below require a current **human owner**.
-Invitation acceptance, credential consent and local-agent registration are
+Invitation acceptance, credential consent and local agent registration are
 separate actions; installing an app does not perform any of them.
 
 ```sh
@@ -168,11 +284,10 @@ Three IDs have different lifetimes:
 The daemon retains stable agent IDs across disconnect/reconnect. Labels,
 `client_agent_id`, adapter metadata and any of these IDs confer no permission.
 There is one explicitly selected assignment default per member/workspace; extra
-sessions do not race it for claims. For an additional explicit FYI-only alias,
-use the lower-level supported surface:
+sessions do not race it for claims. For an additional explicit FYI-only alias:
 
 ```sh
-cadence --org acme local-agent connect --alias my-reviewer --fyi-only
+cadence --org acme agent connect --alias my-reviewer --fyi-only
 ```
 
 This preserves the assignment default and multiplexes notices on the same
@@ -186,6 +301,40 @@ Sources: [`cli/commands.rs` (`TeamAction`)](../../src/cli/commands.rs),
 [`cli/agent.rs`](../../src/cli/agent.rs),
 [`cli/local_agent.rs`](../../src/cli/local_agent.rs),
 [hosted login](../REMOTE-AUTH.md#hosted-login-and-remote-org-transport-cad-1019-cad-1329).
+
+## Workspace platform tools
+
+The hosted workspace owns its tool catalog and account selection. List it with
+`cli.read`, or call an eligible tool with `cli.write`:
+
+```sh
+cadence --org acme platform tools
+cadence --org acme platform call generate_image --input '{"prompt":"A blue circle"}'
+```
+
+An eligible call can charge the workspace balance. The tool's own effect and
+authorization checks still apply. An absent tool returns not found; an
+unavailable catalog is reported as unavailable rather than as an empty list.
+Hosted calls refuse `--platform`, `--account` and `--project` instead of
+silently changing the selected workspace.
+
+The CLI derives a replay key from the tool and input. If the first call was
+recorded, repeating the command recovers that outcome instead of charging
+twice; a call never recorded may start on retry.
+To deliberately run the same input again, pass a fresh `--request <handle>`;
+keep that handle and the same input when reconciling an uncertain outcome.
+Use `--query <json>` for query fields and `--input <json>` for a body; pass both
+when the tool needs both. The replay key includes both fields.
+
+An image submission may return a queued job. Poll its returned `data.job.id`
+with the same workspace and `cli.write` grant:
+
+```sh
+cadence --org acme platform call get_media_job --query '{"jobId":"med_job_from_submit"}'
+```
+
+Polling can complete and settle the existing job. A succeeded job includes
+retained artifact references; this CLI does not download the image bytes.
 
 ## A teammate's own-agent collaboration flow
 
@@ -241,14 +390,14 @@ starting. Load the profile, then use the project's actual integration ref:
 ```sh
 cadence --org acme agent context ap_<profile-id>
 cadence --org acme issue start <issue-id> --repo /absolute/path/to/checkout --profile ap_<profile-id> --base <integration-ref>
-cadence --org acme local-agent report <assignment-id> --state blocked --text "waiting for the owner"
+cadence --org acme agent report <assignment-id> --state blocked --text "waiting for the owner"
 ```
 
 `--profile` claims under `session-<profile-id>` without a daemon and targets
 only the named issue. Inspect the receipt for the claim, lane and reporting
 instructions. The board checks claim and generation on reports, but the
 profile-derived client ID is not proof of a distinct session identity.
-`--profile` does not read profile content; load it with `context`. The
+`--profile` does not read profile content; load it with `context`. Hiring creates only such a profile (CAD-1989): no runtime, provider, sandbox or model is chosen, nothing launches, and `model` stays `inherit` until a runtime resolves it or one is set explicitly. A native board reads a profile the same way with `cadence agent context <alias>`. The
 authenticated caller, not the profile, carries authority.
 
 Profile claims depend on the deployed board and client versions. An older
@@ -256,7 +405,9 @@ board may still require the member's registered default alias; report that
 refusal rather than borrowing an alias or assuming another board has the
 same behavior.
 
-`--base <ref>` cuts the lane from that ref and echoes it in the receipt; without
+`--base <ref>` cuts the lane from that ref and echoes it in the receipt; a branch
+base that origin carries resolves to origin's current tip, and an unreachable
+origin refuses; without
 it the lane follows the checkout's own resolution. The alias path refuses
 `--base` rather than ignoring it. A board that predates profile claims refuses
 the field: the claim then proceeds without it, under the same client id and
@@ -279,13 +430,67 @@ checks and limitations. A profile or separate session alone does not prove a
 distinct authenticated principal, and in-chat findings are not automatically
 a gate-counted verdict.
 
-Hosted `audit verdict` and `audit verdicts` exist in some versions, but their
-current identity and native-verdict semantics are not proven equivalent
-(CAD-1542, AOS-473); CAD-1981 also tracks a verdict read that can select the
-wrong organization. Preserve the findings and report the blocker rather than
-counting those records as native gate evidence or impersonating a reviewer.
-The repository's approved merge path and any required operator decision remain
-in force; a missing hosted gate is not a pass.
+```sh
+cadence --org acme audit verdict --project <project-key> --repo <owner/name> \
+  --issue <issue-id> --pr <number> \
+  --head <full-sha> --kind standards --outcome pass --risk auto --file findings.md
+```
+
+`--project` is the issue's project and is required: the evidence is that
+project's, and the project is never inferred from `--repo` or the cwd. The org
+refuses a repo the project has not declared (`repo_not_bound`), an issue that
+resolves to another project (`project_mismatch`), a caller the owner has not
+made eligible for the project (`reviewer_not_bound`) and a caller with no
+attested login (`identity_unattested`). `--kind` is `standards`,
+`spec-security`, `combined` or `browser-qa` (the kinds the merge gate counts;
+`spec` is retired); `--outcome` is `pass` or `revise`, and `--title-outcome` /
+`--section-outcome` default to it. The reviewer is the authenticated caller,
+never an argument. A repeat of the same kind, head and findings returns the
+latest row with `duplicate: true`; a changed outcome appends a correction, and
+the gate reads the latest row per reviewer and kind.
+
+Read them back under the same org with `cadence --org acme audit verdicts
+--project <project-key> --repo <owner/name> --issue <issue-id> --pr <number>
+--head <full-sha>`; a hosted selection answers from the org, never from local
+notes, and refuses an answer naming another project, repository, issue or
+head. The merge gate also runs whichever `cadence` you point it at: set
+`CADENCE_BIN` when more than one build is on the host, or a stale client's
+missing hosted verb will read like a gate refusal.
+
+A hosted verdict counts only on the owner's attestations (AOS-473, CAD-2001):
+the workspace owner binds each principal's GitHub login once for the workspace,
+then admits principals to a project's review set. A code verdict needs both,
+because the gate counts a hosted document by principal and excludes the author
+by the attested login:
+
+```sh
+cadence --org acme audit identities set \
+  --identity <subject-id>=<github-login> [--identity ...]
+cadence --org acme audit reviewers set --project <project-key> \
+  --reviewer <subject-id> [--reviewer ...]
+cadence --org acme audit reviewers --project <project-key>   # read both joins back
+cadence --org acme audit identities                           # the workspace map
+```
+
+Both writes are the owner's own act: they need the opt-in `audit.approve`
+login (`cadence login --audit-approve`), and an agent's call is refused.
+Leaving a principal out of the project's set stops new verdicts for that
+project only; rows already filed keep their stored principal and login and
+stay countable for the head they reviewed. A principal listed with no attested
+login reads back with `github_login: null` and its verdicts cannot count yet.
+Never impersonate a reviewer: the verdict names the authenticated caller, and
+the owner's attestations are the only thing that makes that caller count.
+Where the org cannot answer, the gate refuses; a missing hosted read is not a
+pass, and the repository's approved merge path and any required operator
+decision remain in force.
+
+CAD-2001 release order: the tenant server must serve the project-scoped review
+verbs before this client sends them. An older tenant refuses the names
+(`not_implemented`/`invalid_request`/`container_required`/
+`capability_unavailable`) and the client says so — update the tenant server
+first, then this Cadence client. The client never falls back to the older
+repo-scoped evidence when the project is known, and the gate treats that
+refusal as a refusal, never as "no verdicts were filed".
 
 To give the other teammate an informational pointer, obtain their exact `lag_`
 ID from `agent directory`, then send an explicit FYI:

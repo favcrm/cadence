@@ -251,18 +251,26 @@ looking.
   not require that daemon. Do not connect a runner blindly when it might claim
   unrelated waiting work. Agent identity is established by the supported
   authenticated path, not by supplying an alias or borrowing a human login.
-- Review evidence binds to the exact head: the merge gate counts distinct
-  reviewers, refuses the author's own, and voids every verdict when the head
-  moves. Read it back with `cadence audit verdicts` and confirm a verdict counts
+- Review evidence binds to the exact head and, on a hosted workspace, to the
+  issue's project (CAD-2001): the merge gate counts distinct reviewers, refuses
+  the author's own, and voids every verdict when the head moves. Read it back
+  with `cadence audit verdicts --project <key>` and confirm a verdict counts
   before treating a review as landed; in-chat findings are not automatically
-  gate evidence. A hosted `audit verdict` is not the per-PR note the native gate
-  reads (the tenant records artifact reviews), so never count it as one or
-  impersonate a reviewer — see `docs/guides/hosted-workspace.md` ("Reviewing
-  software changes"; CAD-1542, CAD-1981, AOS-473).
+  gate evidence. The project is explicit — never derived from the repository or
+  the cwd. A hosted verdict counts only when the workspace owner has attested
+  its principal's GitHub login (`cadence audit identities`) and admitted that
+  principal to the project (`cadence audit reviewers --project <key>`); the
+  gate counts principals, excludes the author by the attested login, and
+  refuses an unattested, contradictory or ambiguous note — see
+  `docs/guides/hosted-workspace.md` ("Reviewing software changes"; AOS-473,
+  CAD-2001).
 - When more than one Cadence build is on the host, `CADENCE_BIN` selects the one
   the gate invokes. A hosted-verb refusal can come from the client, the deployed
   service or an operation the tenant does not support: confirm the capability,
   report the exact refusal, and do not assume a stale client or bypass the gate.
+  A tenant that predates the project-scoped review verbs is refused by name —
+  the release order is the tenant server first, then this client — and that
+  refusal is never a pass.
 - Hosted project work and local software delivery are distinct. If the merge gate
   refuses, report its exact refusal; an exception remains operator-controlled and
   does not grant an agent merge or approval authority.
@@ -300,7 +308,10 @@ Do not substitute a comment or another identity for the required proof.
 - The operator records a `human` approval from an operator connection (not
   an agent pane or endpoint): `cadence audit approve --pr <n> --head
   <full-sha> --source "<who decided, where>"`. A note or ticket comment is
-  not approval evidence (`docs/AUDIT.md`).
+  not approval evidence (`docs/AUDIT.md`). On a hosted org that form is
+  refused; the hosted form names the project and ticket: `cadence audit
+  approve --project <key> --issue <ID> --pr <n> --head <full-sha> --source
+  "<who>"` (see `docs/AUDIT.md`, CAD-2001).
 - Approve once per ticket: the operator may run `cadence audit approve
   --issue <ID> --action scope` once, and `scripts/enqueue-reviewed` then
   accepts it for every in-scope PR of that ticket. Traps: the ticket body
@@ -338,6 +349,15 @@ limitation; only an authorized operator can decide an exception.
   favcrm/cadence --disable-auto`; re-enable it, pinned to the new head, only
   after that head passes review.
 - `--admin` only in a declared emergency, never as routine.
+- Temporary path (CAD-1946, remove this note when it ends): while the hosted
+  reviewer attestation cannot be produced, `scripts/enqueue-reviewed <pr>
+  --head <sha> --exception --advisory standards=<url> --advisory
+  spec-security=<url>` (plus `--advisory browser-qa=<url>` for a `ui/` change)
+  waives only the missing reviewer attestation and, on a hosted routine PR, the
+  readiness proof hosted cannot yet produce; the evidence names both. The advisory reviews are PR
+  comments posted by separately assigned sessions, and the operator approves
+  each exact head. The path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`
+  (2026-11-10).
 
 ### Checks: trust exit codes, not filtered text
 
@@ -362,7 +382,8 @@ limitation; only an authorized operator can decide an exception.
   back to a local build. `CADENCE_PRE_PUSH_LOCAL=1` is the explicit
   emergency path and runs the same plan on this host. `scripts/pre-push
   --tests` is a focused diagnostic, not a prerequisite before review;
-  required CI and the merge-group regression floor are unchanged. Review
+  required CI (fmt, clippy, build, ui, delivery-gate required; cross-build runs but is not yet required) is unchanged, and the
+  suite runs in `tests.yml` on a schedule and on demand (CAD-1970). Review
   and operator approval stay authoritative. Neither a remote run nor a
   green suite proves the ticket's outcome. The split
   manifests are retired; do not run `split-map-sync` until a reviewed
