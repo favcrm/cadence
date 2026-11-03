@@ -42,6 +42,7 @@ import {
   activeSendId,
   discardPending,
   sendBefore,
+  EMPTY_THREAD,
   failWithdrawn,
   inFlightTurnKey,
   unnamedTurnAnswered,

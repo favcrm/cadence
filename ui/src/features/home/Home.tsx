@@ -69,6 +69,7 @@ import { agentOn } from "../../lib/agentOn";
 import SinceCard from "./SinceCard";
 import {
   discardPending,
+  EMPTY_THREAD,
   failWithdrawn,
   inFlightTurnKey,
   unnamedTurnAnswered,
