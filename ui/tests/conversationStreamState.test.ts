@@ -48,11 +48,12 @@ const snapshot = (message: string): MasterState => ({
 const thread = conversationThread("conv-stream");
 thread.write(() => ({ exists: true, conversation: "conv-stream", entries: [{ seq: 10, role: "operator", kind: "message", text: "Request", message: "m-old" }], pending: [] }));
 resources.masterState.write(() => snapshot("m-old"));
+let graceMs: number | undefined;
 function Harness() {
   const data = useResource(thread);
   const master = useResource(resources.masterState);
   const [link, setLink] = React.useState<StreamLink>("reconnecting");
-  useThreadStream(thread, "/api/threads/master/stream?conversation=conv-stream", true, setLink);
+  useThreadStream(thread, "/api/threads/master/stream?conversation=conv-stream", true, setLink, undefined, graceMs);
   const state = turnBarState({ master: master.data, entries: data.data?.entries ?? [], pendingMessages: [], awaitingApproval: false, reconnecting: link !== "live" }, "conv-stream");
   // CAD-1880: the running turn paints no dock row; Stop is the composer's
   // send slot, enabled only once the stream is live.
@@ -143,6 +144,19 @@ async function main() {
   await settle();
   const failed = host.querySelector("main")?.getAttribute("data-link");
   assert(failed !== "live" && failed !== "connecting", `a failed first attempt reports an outage (got ${failed})`);
+  // A first attempt that hangs must not read as healthy forever.
+  await React.act(async () => { root.render(null); });
+  await settle();
+  graceMs = 1;
+  await mount();
+  const silentSince = Date.now();
+  while (host.querySelector("main")?.getAttribute("data-link") === "connecting" && Date.now() - silentSince < 2000) {
+    await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
+  }
+  assert(host.querySelector("main")?.getAttribute("data-link") === "reconnecting", "a silent first attempt becomes an outage after its grace");
+  await React.act(async () => { emit(`event: master\ndata: ${JSON.stringify(snapshot("m-next"))}\n\n`); });
+  await settle();
+  assert(host.querySelector("main")?.getAttribute("data-link") === "live", "a late first frame still goes live");
   off();
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();

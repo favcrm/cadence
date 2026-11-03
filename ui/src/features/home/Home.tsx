@@ -900,7 +900,9 @@ function MasterHome({
       entries: threadEntries,
       pendingMessages: (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message),
       awaitingApproval: permissionPending,
-      reconnecting: streamReconnecting,
+      // Actions stay off until the stream has proved the turn is current, even
+      // while a first connection shows no outage notice.
+      reconnecting: link !== "live",
       liveSince,
     },
     homeConversation ?? null,
