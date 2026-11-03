@@ -128,7 +128,10 @@ pub use migration::{
 /// operation policy, approved manifest, one-use approval, quotes, immutable
 /// dispatch rows, protected ledger and the metadata-only credential-entry
 /// tables).
-pub const SCHEMA_VERSION: i64 = 60;
+///
+/// v61 (CAD-1962) adds workspace custody for an image an installation
+/// imported into the shared media library, plus its accepted-intent ledger.
+pub const SCHEMA_VERSION: i64 = 61;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

@@ -63,76 +63,6 @@ var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require
   throw Error('Dynamic require of "' + x + '" is not supported');
 });
 
-// node_modules/@earendil-works/pi-telemetry/dist/metrics.js
-function createTypedMetrics(metrics, schemas) {
-  const definitions = new Map;
-  for (const schema of schemas) {
-    for (const [name, definition] of Object.entries(schema.metrics ?? {}))
-      definitions.set(name, definition);
-  }
-  return {
-    counter: (name) => metrics.counter(name, definitions.get(name)),
-    upDownCounter: (name) => metrics.upDownCounter(name, definitions.get(name)),
-    histogram: (name) => metrics.histogram(name, definitions.get(name))
-  };
-}
-
-// node_modules/@earendil-works/pi-telemetry/dist/noop.js
-async function startNoopSpan(_options, callback) {
-  return callback(noopTelemetrySpan);
-}
-var noopCounter, noopUpDownCounter, noopHistogram, NOOP_TELEMETRY_METRICS, NOOP_TELEMETRY_PROPAGATION, noopTelemetrySpan, NOOP_TELEMETRY_CONTEXT;
-var init_noop = __esm(() => {
-  noopCounter = Object.freeze({ add: () => {} });
-  noopUpDownCounter = Object.freeze({ add: () => {} });
-  noopHistogram = Object.freeze({ record: () => {} });
-  NOOP_TELEMETRY_METRICS = Object.freeze({
-    counter: () => noopCounter,
-    upDownCounter: () => noopUpDownCounter,
-    histogram: () => noopHistogram
-  });
-  NOOP_TELEMETRY_PROPAGATION = Object.freeze({
-    inject: () => {
-      return;
-    },
-    extract: () => NOOP_TELEMETRY_CONTEXT
-  });
-  noopTelemetrySpan = {
-    metrics: NOOP_TELEMETRY_METRICS,
-    propagation: NOOP_TELEMETRY_PROPAGATION,
-    startSpan: startNoopSpan,
-    addLink: () => {},
-    addEvent: () => {},
-    setAttributes: () => {},
-    setStatus: () => {}
-  };
-  Object.freeze(noopTelemetrySpan);
-  NOOP_TELEMETRY_CONTEXT = noopTelemetrySpan;
-});
-
-// node_modules/@earendil-works/pi-telemetry/dist/memory.js
-var contextCarriers;
-var init_memory = __esm(() => {
-  init_noop();
-  contextCarriers = new WeakMap;
-});
-
-// node_modules/@earendil-works/pi-telemetry/dist/index.js
-function defineTelemetrySchema(schema) {
-  return schema;
-}
-function bindTypedSpanStarter(telemetryContext) {
-  const startSpan = (name, attributes, callback) => telemetryContext.startSpan({ name, attributes }, (span) => callback(span, bindTypedSpanStarter(span)));
-  return startSpan;
-}
-function createTypedSpanStarter(telemetryContext, _schemas) {
-  return bindTypedSpanStarter(telemetryContext);
-}
-var init_dist = __esm(() => {
-  init_noop();
-  init_memory();
-});
-
 // node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js
 class FifoQueue {
   incoming = [];
@@ -615,6 +545,76 @@ class InMemoryModelsStore {
     this.entries.delete(providerId);
   }
 }
+
+// node_modules/@earendil-works/pi-telemetry/dist/metrics.js
+function createTypedMetrics(metrics, schemas) {
+  const definitions = new Map;
+  for (const schema of schemas) {
+    for (const [name, definition] of Object.entries(schema.metrics ?? {}))
+      definitions.set(name, definition);
+  }
+  return {
+    counter: (name) => metrics.counter(name, definitions.get(name)),
+    upDownCounter: (name) => metrics.upDownCounter(name, definitions.get(name)),
+    histogram: (name) => metrics.histogram(name, definitions.get(name))
+  };
+}
+
+// node_modules/@earendil-works/pi-telemetry/dist/noop.js
+async function startNoopSpan(_options, callback) {
+  return callback(noopTelemetrySpan);
+}
+var noopCounter, noopUpDownCounter, noopHistogram, NOOP_TELEMETRY_METRICS, NOOP_TELEMETRY_PROPAGATION, noopTelemetrySpan, NOOP_TELEMETRY_CONTEXT;
+var init_noop = __esm(() => {
+  noopCounter = Object.freeze({ add: () => {} });
+  noopUpDownCounter = Object.freeze({ add: () => {} });
+  noopHistogram = Object.freeze({ record: () => {} });
+  NOOP_TELEMETRY_METRICS = Object.freeze({
+    counter: () => noopCounter,
+    upDownCounter: () => noopUpDownCounter,
+    histogram: () => noopHistogram
+  });
+  NOOP_TELEMETRY_PROPAGATION = Object.freeze({
+    inject: () => {
+      return;
+    },
+    extract: () => NOOP_TELEMETRY_CONTEXT
+  });
+  noopTelemetrySpan = {
+    metrics: NOOP_TELEMETRY_METRICS,
+    propagation: NOOP_TELEMETRY_PROPAGATION,
+    startSpan: startNoopSpan,
+    addLink: () => {},
+    addEvent: () => {},
+    setAttributes: () => {},
+    setStatus: () => {}
+  };
+  Object.freeze(noopTelemetrySpan);
+  NOOP_TELEMETRY_CONTEXT = noopTelemetrySpan;
+});
+
+// node_modules/@earendil-works/pi-telemetry/dist/memory.js
+var contextCarriers;
+var init_memory = __esm(() => {
+  init_noop();
+  contextCarriers = new WeakMap;
+});
+
+// node_modules/@earendil-works/pi-telemetry/dist/index.js
+function defineTelemetrySchema(schema) {
+  return schema;
+}
+function bindTypedSpanStarter(telemetryContext) {
+  const startSpan = (name, attributes, callback) => telemetryContext.startSpan({ name, attributes }, (span) => callback(span, bindTypedSpanStarter(span)));
+  return startSpan;
+}
+function createTypedSpanStarter(telemetryContext, _schemas) {
+  return bindTypedSpanStarter(telemetryContext);
+}
+var init_dist = __esm(() => {
+  init_noop();
+  init_memory();
+});
 
 // node_modules/@earendil-works/pi-ai/dist/telemetry.js
 function createInstruments(adapter) {
@@ -14969,6 +14969,7 @@ __export(exports_x509_transport_state_browser, {
 });
 
 // src/hosted-session.ts
+init_models();
 import { DurableObject } from "cloudflare:workers";
 
 // node_modules/@earendil-works/chord/dist/context/index.js
@@ -15060,9 +15061,6 @@ function abortError(signal) {
   const reason = signal.reason;
   return reason instanceof Error ? reason : new DOMException("The operation was aborted", "AbortError");
 }
-
-// src/hosted-session.ts
-init_models();
 // node_modules/@earendil-works/pi-durable/dist/harness/define.js
 function hook(task, handlers) {
   return { task: task.definition.name, handlers };
@@ -56188,7 +56186,7 @@ function masterState(model, status, conversationId, metadata) {
       streaming: status.running,
       compacting: false
     },
-    commands: ["stop"],
+    commands: ["new", "stop"],
     turn: status.running ? {
       state: "working",
       message: status.message ?? null,
@@ -56553,10 +56551,10 @@ function operationContextExtension(load, authored) {
 }
 
 // src/company-outputs.generated.ts
-var COMPANY_OUTPUTS_FINGERPRINT = "tenant-company-outputs-e9404e33c74a7101";
+var COMPANY_OUTPUTS_FINGERPRINT = "tenant-company-outputs-3d08fa107575a2ee";
 var COMPANY_OUTPUTS_SKILL = {
   name: "company-outputs",
-  version: "e9404e33c74a7101",
+  version: "3d08fa107575a2ee",
   description: "Prepare and reuse a company's quotes, quotations, invoices, proposals, tenders, reports, letters, slides and page mockups, and save a good result as a reusable template. Use when someone asks for one of these, asks to use or change their template, or asks to save something as a template. Produces drafts only; nothing is sent, issued or approved.",
   body: `# Company outputs
 
@@ -56569,11 +56567,13 @@ Check which tools or commands this session actually has before relying on one. \
 | Capability | What it does |
 |---|---|
 | Company facts | Read the company's details, price list and past decisions |
+| Find past work | Find and reopen what was produced earlier |
 | Find template | See the company's templates and their versions |
 | Read template | Open one exact version: its guidelines and reference files |
 | Calculate | Work out amounts in code, not in your head |
 | Render | Produce a filled output from a template and structured data, with amounts calculated in code |
 | Show | Put a result on the canvas beside the conversation |
+| Save file | Store a result in the workspace for people to find later. This does not show it on a canvas |
 | Save draft | Record a new template version as an unapproved draft |
 | Approve | The owner's act alone. You never do this |
 
@@ -56620,11 +56620,13 @@ Use this lookup only to find the command or tool. A listed command is not proof 
 | Capability | Hosted workspace |
 |---|---|
 | Company facts | \`wiki_search\`, \`wiki_list\`, \`wiki_read\` |
+| Find past work | Not available yet |
 | Find template | Not available yet |
 | Read template | Not available yet |
 | Calculate | Not available yet |
 | Render | Not available yet |
 | Show | Not available yet |
+| Save file | Not available yet |
 | Save draft | Not available yet |
 | Approve | Not available yet |
 
@@ -57029,11 +57031,39 @@ function projectedThreadEntries(records, includeThinking, project) {
   const entries = threadEntries(records, includeThinking);
   return project ? [...project(entries)] : entries;
 }
+var RESET_KIND = "pi.reset";
+var COMPACTION_KIND = "pi.compaction";
+var RESET_BOUNDARY = { role: "user", content: "", timestamp: 0 };
+var FRESH_START_TEXT = "Started fresh. The assistant no longer uses the messages above.";
+var HISTORY_PAGE = 500;
+async function readAllRecords(scan) {
+  const records = [];
+  let cursor;
+  do {
+    const page = await scan(cursor, HISTORY_PAGE);
+    records.push(...page.items);
+    cursor = page.next;
+  } while (cursor !== undefined);
+  return records;
+}
 function threadEntries(records, includeThinking) {
   const entries = [];
-  const all = records.flatMap((record) => record.model ?? []);
+  const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
+  const all = visible.flatMap((record) => record.kind === RESET_KIND ? [RESET_BOUNDARY, ...record.model ?? []] : record.model ?? []);
   let position = -1;
-  for (const record of records) {
+  for (const record of visible) {
+    if (record.kind === RESET_KIND) {
+      position += 1;
+      const previous = entries.at(-1);
+      if (previous !== undefined && !(previous.role === "system" && previous.text === FRESH_START_TEXT)) {
+        entries.push({
+          seq: entries.length + 1,
+          role: "system",
+          kind: "message",
+          text: FRESH_START_TEXT
+        });
+      }
+    }
     const data = record.data;
     const messageId = record.kind === BOARD_MESSAGE_KIND && data !== null && typeof data === "object" && !Array.isArray(data) && typeof data.messageId === "string" ? data.messageId : undefined;
     const app = data !== null && typeof data === "object" && !Array.isArray(data) ? parseEntryAppScope(record.kind, data) : null;
@@ -57212,7 +57242,7 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
       const stream = await this.harness.session().events();
       let snapshotEntries;
       try {
-        snapshotEntries = projectedThreadEntries(stream.snapshot.entries, thinking, this.options.projectThread);
+        snapshotEntries = await this.transcript(thinking);
       } catch {
         await stream.stop();
         return Response.json({
@@ -57269,7 +57299,8 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
     };
   }
   async transcript(includeThinking) {
-    return projectedThreadEntries(await this.harness.session().messages(), includeThinking, this.options.projectThread);
+    const conversation = await this.harness.conversation(this.harness.session().id);
+    return projectedThreadEntries(await readAllRecords((cursor, limit) => conversation.entries({ order: "ascending" }, limit, cursor, BACKGROUND_CONTEXT)), includeThinking, this.options.projectThread);
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;

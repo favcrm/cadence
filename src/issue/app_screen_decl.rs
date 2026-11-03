@@ -92,6 +92,11 @@ pub const MAY_MEDIA_CHAT_ATTACH: &str = "media.chat.attach";
 /// metadata mutation `app_media_publish` serves. Read rights alone
 /// never carry it, and no tools alias can hold it.
 pub const MAY_MEDIA_PUBLISH: &str = "media.publish";
+/// CAD-1962: the permission a `screen-media.v1` screen declares to copy
+/// one of its own retained images into the shared workspace library.
+/// Write rights: read and publish never imply it, and no tools alias can
+/// hold it.
+pub const MAY_MEDIA_IMPORT: &str = "media.import";
 pub const HOST_CONTRACT_RECORDS: &str = "screen-records.v1";
 pub const MAY_RECORDS_CALL: &str = "records.call";
 pub const MAY_RECORDS_SLOT: &str = "records.slot";
@@ -944,7 +949,10 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
                     || (media_contract
                         && matches!(
                             name,
-                            MAY_MEDIA_READ | MAY_MEDIA_PUBLISH | MAY_MEDIA_CHAT_ATTACH
+                            MAY_MEDIA_READ
+                                | MAY_MEDIA_PUBLISH
+                                | MAY_MEDIA_IMPORT
+                                | MAY_MEDIA_CHAT_ATTACH
                         ))
             };
         if !granted {

@@ -92,6 +92,45 @@ export function projectedThreadEntries(
   return project ? [...project(entries)] : entries;
 }
 
+/** The engine's reset record: earlier entries leave the model's context, not storage. */
+export const RESET_KIND = "pi.reset";
+
+/** The engine's compaction record: a summary for the model, not a message anyone sent. */
+export const COMPACTION_KIND = "pi.compaction";
+
+/** Where a reset falls among the messages: it settles an error before it. */
+const RESET_BOUNDARY = { role: "user", content: "", timestamp: 0 } as PiMessage;
+
+/** Shown where a conversation started over. */
+export const FRESH_START_TEXT =
+  "Started fresh. The assistant no longer uses the messages above.";
+
+/** How many records one history read asks the engine for. */
+const HISTORY_PAGE = 500;
+
+/** One scan of a conversation's stored records, as the engine pages them. */
+export type EntryScan<C> = (
+  cursor: C | undefined,
+  limit: number,
+) => Promise<{ readonly items: readonly EntryRecord[]; readonly next?: C }>;
+
+/**
+ * Every stored record, oldest first. The board reads this, not the active
+ * context: a thread's `seq` is the position in this list, so it must not restart
+ * when a reset or a compaction narrows what the model sees. An open stream and
+ * the board's merge both rely on `seq` only ever growing.
+ */
+export async function readAllRecords<C>(scan: EntryScan<C>): Promise<EntryRecord[]> {
+  const records: EntryRecord[] = [];
+  let cursor: C | undefined;
+  do {
+    const page = await scan(cursor, HISTORY_PAGE);
+    records.push(...page.items);
+    cursor = page.next;
+  } while (cursor !== undefined);
+  return records;
+}
+
 /**
  * Map the engine's committed records, including durable input metadata, into
  * the board's entries.
@@ -105,9 +144,30 @@ export function threadEntries(
   includeThinking: boolean,
 ): ThreadEntry[] {
   const entries: ThreadEntry[] = [];
-  const all = records.flatMap((record) => record.model ?? []);
+  const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
+  const all = visible.flatMap((record) =>
+    record.kind === RESET_KIND
+      ? [RESET_BOUNDARY, ...(record.model ?? [])]
+      : (record.model ?? []),
+  );
   let position = -1;
-  for (const record of records) {
+  for (const record of visible) {
+    if (record.kind === RESET_KIND) {
+      position += 1;
+      // A reset with nothing before it, or right after another, marks nothing.
+      const previous = entries.at(-1);
+      if (
+        previous !== undefined &&
+        !(previous.role === "system" && previous.text === FRESH_START_TEXT)
+      ) {
+        entries.push({
+          seq: entries.length + 1,
+          role: "system",
+          kind: "message",
+          text: FRESH_START_TEXT,
+        });
+      }
+    }
     const data = record.data;
     const messageId =
       record.kind === BOARD_MESSAGE_KIND &&
