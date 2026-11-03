@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslate } from "../../lib/locale";
-import Md from "../../ui/Md";
+import Md, { CodeSurface } from "../../ui/Md";
 import { artifactBytes } from "./artifactClient";
 import { CSV_MAX_COLS, CSV_MAX_ROWS, parseCsv } from "./csv";
 import type { ArtifactKind } from "./canvasStore";
@@ -9,6 +9,9 @@ export interface Loaded {
   bytes: ArrayBuffer;
   mime: string;
 }
+
+/** How an HTML artifact is shown: in its sandboxed frame, or its source. */
+export type HtmlView = "rendered" | "source";
 
 /** The sandboxed document an HTML artifact renders in: an opaque origin
  *  (`sandbox=""` on the frame — never allow-same-origin), plus a policy
@@ -121,11 +124,13 @@ export default function ArtifactView({
   title,
   data,
   contentRef,
+  htmlView = "rendered",
 }: {
   kind: ArtifactKind;
   title: string;
   data: Loaded;
   contentRef: React.RefObject<HTMLDivElement | null>;
+  htmlView?: HtmlView;
 }) {
   const t = useTranslate();
   switch (kind) {
@@ -137,7 +142,18 @@ export default function ArtifactView({
       );
     case "csv":
       return <CsvView text={decode(data)} contentRef={contentRef} />;
-    case "html":
+    case "html": {
+      if (htmlView === "source") {
+        // ignoreBOM: the source shows every stored character, a leading BOM included.
+        const source = new TextDecoder("utf-8", { ignoreBOM: true }).decode(data.bytes);
+        return (
+          <div ref={contentRef} className="canvas-doc cv-source" data-artifact-view="html-source">
+            <CodeSurface label="html" code={source}>
+              <code>{source}</code>
+            </CodeSurface>
+          </div>
+        );
+      }
       return (
         <iframe
           className="canvas-frame"
@@ -148,6 +164,7 @@ export default function ArtifactView({
           srcDoc={htmlFrameDocument(decode(data))}
         />
       );
+    }
     case "image":
       return (
         <div className="canvas-doc" data-artifact-view="image">
