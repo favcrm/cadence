@@ -681,7 +681,7 @@ host.job = finished;
     return v;
   };
   for (const sel of [".answer .issue-reader td:first-child", ".answer .issue-reader th:first-child", ".chat-bubble.issue-reader td:first-child"]) {
-    equal(last(sel, "min-width"), "6rem", `${sel}: the first column keeps room for a word`);
+    equal(last(sel, "min-width"), "9rem", `${sel}: the first column keeps room for a word`);
     if (sel.includes("td")) equal(last(sel, "overflow-wrap"), "anywhere", `${sel}: break-word would let a long value widen the whole chat`);
     assert(last(sel, "white-space") !== "nowrap", `${sel}: it may wrap`);
   }

@@ -944,7 +944,7 @@ pre {
 .answer .issue-reader td:first-child,
 .chat-bubble.issue-reader th:first-child,
 .chat-bubble.issue-reader td:first-child {
-  min-width: 6rem;
+  min-width: 9rem;
 }
 .answer .issue-reader blockquote {
   padding: .65rem .85rem;
