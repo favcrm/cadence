@@ -17,6 +17,7 @@ import {
   durationText,
   hiredText,
   roleOf,
+  roleOfProfile,
   runsOnText,
   type RolesState,
 } from "./agentRoles";
@@ -197,7 +198,11 @@ export default function AgentPage({
   const lifecycle = profile ? lifecycleOf(profile) : "normal";
   const deadHolding = profile ? agentHoldsWorkButDead(profile) : false;
   const params = (a?.params ?? observed?.params) as Record<string, unknown> | undefined;
-  const role = profile || hired ? roleOf({ alias }, roles.data, profiles) : null;
+  const role = hired
+    ? roleOfProfile(hired, roles.data)
+    : profile
+      ? roleOf({ alias }, roles.data, profiles)
+      : null;
   const badge = profile ? lifecycleBadge(profile, t) : null;
   const where = isCloud
     ? t("a cloud runtime")

@@ -1,4 +1,4 @@
-import { aliasProblem, appliesText, durationText, hiredText, matchesRole, nextAlias, roleOf, suggestedRoles } from "../src/features/agents/agentRoles";
+import { aliasProblem, appliesText, durationText, hiredText, matchesRole, nextAlias, roleOf, roleOfProfile, suggestedRoles } from "../src/features/agents/agentRoles";
 import { historyKind, parseAgentTab } from "../src/features/agents/agentTabModel";
 import { locationHref, readLocation } from "../src/lib/router";
 import type { AgentRole } from "../src/lib/types";
@@ -81,3 +81,5 @@ const payload = { categories: [], roles, install: { hosted: false, provider: "pi
 const hired = [{ id: "dev-1", catalogue: "developer", runtimes: ["rt-1"] }] as never;
 check(roleOf({ alias: "rt-1" }, payload, hired)?.id === "developer", "role from the runtime's profile");
 check(roleOf({ alias: "other" }, payload, hired) === null, "no profile, no role");
+check(roleOfProfile({ catalogue: "developer", runtimes: [] } as never, payload)?.id === "developer", "a profile with no runtime still has its role");
+check(roleOfProfile({ catalogue: null, runtimes: [] } as never, payload) === null, "a hand-written profile has no role");

@@ -152,8 +152,6 @@ textarea.rc-text { min-height: 7.5rem; resize: vertical; line-height: 1.5; width
   .rc-search { margin-left: 0; min-width: 0; width: 100%; }
   .rc-cats { flex-wrap: nowrap; overflow-x: auto; width: 100%; padding-bottom: 0.15rem; }
   .rc-cat { white-space: nowrap; }
-  .ap-hero { grid-template-columns: auto minmax(0, 1fr); }
-  .ap-acts { grid-column: 1 / -1; }
   .ap-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .ap-grid { grid-template-columns: minmax(0, 1fr); }
 }
