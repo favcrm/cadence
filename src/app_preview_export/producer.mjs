@@ -104,8 +104,6 @@ function sessionKey() {
 var generation = 0;
 var privateSessionGeneration = () => generation;
 new ConditionalGet((input, init) => fetch(input, init), () => `${sessionKey() ?? ""}:${privateSessionGeneration()}`);
-//#endregion
-//#region src/features/workspace-apps/screen/screenProtocol.ts
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
 *  port. `call` verbs run directly: the install's own config and drafts, and
 *  (CAD-1918, operator decision) the app's own publish confirmation and
@@ -121,6 +119,7 @@ var CALL_VERBS = [
 	"open-link",
 	"screen.drawer.open",
 	"screen.drawer.close",
+	"screen.drawer.context",
 	"social.drafts.list",
 	"social.drafts.show",
 	"social.drafts.create",
@@ -128,6 +127,8 @@ var CALL_VERBS = [
 	"social.drafts.discard",
 	"social.drafts.publish.stage",
 	"social.sources.show",
+	"social.sources.page",
+	"social.sources.get",
 	"social.sources.save",
 	"social.destinations.list",
 	"publish.destination.use",
@@ -165,7 +166,7 @@ var MEDIA_VERBS = [
 /** The verbs a screen.v2 PUSH advertises in `actions` — media verbs are
 *  deliberately absent; the channel appends a mount's declared media
 *  rights itself. */
-var ACTION_VERBS = [.../* @__PURE__ */ new Set([...CALL_VERBS.filter((v) => !MEDIA_VERBS.includes(v)), ...SLOT_VERBS.filter((v) => v !== ORIGINAL_DOWNLOAD_VERB)])];
+var ACTION_VERBS = [.../* @__PURE__ */ new Set([...CALL_VERBS.filter((v) => !MEDIA_VERBS.includes(v) && v !== "screen.drawer.context"), ...SLOT_VERBS.filter((v) => v !== ORIGINAL_DOWNLOAD_VERB)])];
 var RECORD_CALL_VERBS = [
 	"records.list",
 	"records.show",
@@ -878,7 +879,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 //#region scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
-var CONTRACT = "app-screen-projection-fixtures/8";
+var CONTRACT = "app-screen-projection-fixtures/9";
 var NOW = 1799999e3;
 var SCENARIOS = [
 	"empty",

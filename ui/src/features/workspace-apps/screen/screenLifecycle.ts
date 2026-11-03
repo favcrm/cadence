@@ -1,5 +1,5 @@
 import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_DRAWER_CLOSE, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
   type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
@@ -54,7 +54,7 @@ export interface ScreenActions {
    *  `screen-surfaces.v1` capability: an independent open mounts a separate
    *  drawer frame in the shell's own fixed overlay instead of promoting
    *  this frame. */
-  onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize): void;
+  onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize, context?: unknown): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
@@ -277,6 +277,11 @@ export class ScreenChannel extends FrameChannel {
    *  private parent token); the ready opt-in and call args cannot choose
    *  it. */
   surfaceRole: ScreenSurfaceRole = "primary";
+  /** SOC-55 — the bounded context this host-created drawer child was opened
+   *  with. It is host-local data, never authority, and lives only on this
+   *  child mount; a reopen starts with a new channel. */
+  drawerContext: unknown = null;
+  setDrawerContext(context: unknown): void { this.drawerContext = context ?? null; }
   private surfaceState: { role: ScreenSurfaceRole; modal: boolean } | null = null;
   private surfaceSent: string | null = null;
   /** CAD-1615 — tell the child which surface its frame is in (legacy). The
@@ -337,7 +342,7 @@ export class ScreenChannel extends FrameChannel {
   private drawerVerbs(): readonly ScreenDrawerVerb[] | null {
     if (this.shape !== "v2" || !(this.wantsPresentation || this.wantsSurfaces) ||
         !this.actions?.onScreenDrawer || !this.receipt.action_token) return null;
-    return this.surfaceRole === "drawer" ? [SCREEN_DRAWER_CLOSE] : SCREEN_DRAWER_VERBS;
+    return this.surfaceRole === "drawer" ? SCREEN_DRAWER_CHILD_VERBS : SCREEN_DRAWER_VERBS;
   }
   protected drawerCapable(): readonly ScreenDrawerVerb[] | false { return this.drawerVerbs() ?? false; }
   /** One validated host-local presentation request. It is never dispatched
@@ -355,12 +360,20 @@ export class ScreenChannel extends FrameChannel {
       reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "bad_args", text: "That request is not valid." } });
       return;
     }
+    if (parsed.mode === "context") {
+      reply({ v: 2, op: "reply", id: request.id, ok: true, data: { context: this.drawerContext } });
+      return;
+    }
+    if (parsed.mode === "drawer" && "context" in parsed && !independent) {
+      reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "This app cannot pass context to a drawer here." } });
+      return;
+    }
     if (parsed.mode === "outlet") {
       onDrawer("outlet", undefined, independent);
       reply({ v: 2, op: "reply", id: request.id, ok: true, data: { mode: "outlet" } });
       return;
     }
-    onDrawer("drawer", parsed.surface, independent, parsed.size);
+    onDrawer("drawer", parsed.surface, independent, parsed.size, parsed.context);
     reply({ v: 2, op: "reply", id: request.id, ok: true, data: { mode: "drawer", surface: parsed.surface } });
   }
   private calls = 0;
