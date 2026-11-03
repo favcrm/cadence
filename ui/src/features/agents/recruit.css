@@ -249,3 +249,7 @@ summary.ag-side-group .num { margin-left: auto; }
   .ag-chat { padding: 0.625rem 0.75rem; }
   .ag-chat-back { display: inline-grid; place-items: center; }
 }
+@media (max-width: 680px) {
+  .ag-chat-head { flex-wrap: wrap; }
+  .ag-chat-title { flex: 1 1 calc(100% - 6rem); }
+}

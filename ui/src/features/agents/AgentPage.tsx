@@ -2,7 +2,7 @@ import { useContext, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
-import { WriteGate } from "../auth/WriteGate";
+import { useWriteBlock, WriteGate } from "../auth/WriteGate";
 import type { Agent, AgentDetail, HiredProfile } from "../../lib/types";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import AgentChat, { type ChatGate } from "./AgentChat";
@@ -19,6 +19,7 @@ import {
   type RolesState,
 } from "./agentRoles";
 import { AGENT_TABS, type AgentTab } from "./agentTabModel";
+import { dmExpectation } from "../threads/threadsView";
 import {
   agentHoldsWorkButDead,
   agentLocation,
@@ -69,6 +70,10 @@ export default function AgentPage({
   hosted,
   groups,
   rosterLoaded,
+  rosterFailed,
+  onRetryRoster,
+  operator,
+  hostedBoard,
   hiredWork,
 }: {
   alias: string;
@@ -84,21 +89,27 @@ export default function AgentPage({
   groups: string[];
   /** The team list has answered, so a missing alias really is missing. */
   rosterLoaded: boolean;
+  rosterFailed: boolean;
+  onRetryRoster: () => void;
+  operator: boolean;
+  hostedBoard: boolean;
   /** What a runtime-less profile's card names, if anything. */
   hiredWork: ProfileWork | null;
 }) {
-  const writeBlock = useContext(WriteGate);
+  const boardBlock = useContext(WriteGate);
+  const writeBlock = useWriteBlock(!operator) ?? boardBlock;
   const t = useTranslate();
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
 
   const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
-  const chat = tab === "overview";
+  // A runtime-less profile has no sections to read, so every link lands on its page.
+  const chat = tab === "overview" || hired !== undefined;
   const leave = chat ? onBack : () => onTab("overview");
   useEffect(() => {
     // A runtime-less profile is not a registered agent: there is nothing to read.
-    if (hired) return;
+    if (hired || !rosterLoaded) return;
     // A reload after a save keeps what is on screen; only a new alias resets.
     if (retry === 0) setDetail(null);
     setErr(null);
@@ -110,7 +121,7 @@ export default function AgentPage({
     return () => {
       live = false;
     };
-  }, [alias, retry, hired]);
+  }, [alias, retry, hired, rosterLoaded]);
 
   // Esc leaves the page, unless it is closing something inside it.
   useEffect(() => {
@@ -199,6 +210,59 @@ export default function AgentPage({
     detailFailed: err !== null,
   };
 
+  const cloudCards = (
+    <>
+      {cloud.length > 0 && (
+        <section className="ap-cloud" aria-label={t("Cloud runtime")}>
+          {cloud.map((c) => (
+            <div key={c.id} className="ap-cloud-card">
+              <div className="ap-sub">
+                <strong>{t("Cloud runtime")}</strong>
+                <span aria-hidden="true">·</span>
+                <span>{c.runtime}</span>
+                <span aria-hidden="true">·</span>
+                <span>{c.state}</span>
+                {c.principal && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span>
+                      {c.principal.kind === "agent"
+                        ? `${t("enrolled peer")} ${c.principal.label}`
+                        : t("operator connection")}
+                    </span>
+                  </>
+                )}
+              </div>
+              <p className="text-micro text-ink-500">
+                {t("Model:")} {c.model ?? t("gateway label pending")} · {t("Remote agent:")} {c.remote_agent_id}
+              </p>
+              <p className="text-micro text-ink-500">
+                {t("Capabilities:")} {t("conversation")}
+                {", "}
+                {t("no tools, MCP, skills, approvals or shell")}
+              </p>
+              {(c.sessions ?? []).length > 1 && (
+                <ul className="text-micro text-ink-500">
+                  {(c.sessions ?? []).map((s) => (
+                    <li key={s.conversation_id}>
+                      {s.thread?.link ? (
+                        <a href={s.thread.link}>{s.thread.id}</a>
+                      ) : (
+                        s.thread?.id ?? s.conversation_id
+                      )}
+                      {" · "}
+                      {s.remote_session_id}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ))}
+        </section>
+      )}
+    </>
+  );
+
   const notices = (
     <>
       {!detail && !err && (
@@ -249,28 +313,54 @@ export default function AgentPage({
   if (chat) {
     const status = profile ? seatStatus(profile, t) : null;
     const mailbox = profile?.inbox === true || profile?.provider === "inbox";
-    const gate: ChatGate | null = hired
+    const boardIsHosted = hostedBoard || hosted;
+    const gate: ChatGate | null = !rosterLoaded
       ? {
-          title: t("{alias} can’t reply here yet").replace("{alias}", () => alias),
-          body: t("It has no runtime connected to this board. Connect one to talk to it here."),
-          extra: <ConnectRuntime profile={hired} hosted={hosted} groups={groups} />,
+          title: rosterFailed ? t("Could not load agents") : t("Loading agents…"),
+          body: "",
+          extra: rosterFailed ? <Button onClick={onRetryRoster}>{t("Retry")}</Button> : undefined,
         }
-      : mailbox
-        ? {
-            title: t("This is a mailbox, not an agent"),
-            body: t("Mail waits here until an agent reads it."),
-          }
-        : rosterLoaded && !profile && err !== null
+      : !operator
+        ? boardIsHosted
           ? {
-              title: t("No agent named {alias}").replace("{alias}", () => alias),
-              body: t("It may have been removed. Pick another agent from the list."),
+              title: t("Your assistant is on Home"),
+              body: t("Conversations with agents here are for the workspace operator."),
+              extra: <Button href="/">{t("Open Home")}</Button>,
             }
-          : null;
+          : {
+              title: boardBlock ?? t("Conversations with agents are for the operator"),
+              body: t("You can still see what this agent is working on."),
+            }
+        : hired
+          ? {
+              title: t("{alias} can’t reply here yet").replace("{alias}", () => alias),
+              body: boardIsHosted
+                ? t("Chat with a profile isn’t available on hosted boards yet. It works on issues started under its profile.")
+                : t("It has no runtime connected to this board. Connect one to talk to it here."),
+              extra: <ConnectRuntime profile={hired} hosted={boardIsHosted} groups={groups} />,
+            }
+          : mailbox
+            ? {
+                title: t("This is a mailbox, not an agent"),
+                body: t("Mail waits here until an agent reads it."),
+              }
+            : !profile && err !== null
+              ? {
+                  title: t("No agent named {alias}").replace("{alias}", () => alias),
+                  body: t("It may have been removed. Pick another agent from the list."),
+                }
+              : null;
     const faceLook = hired ? (hired.look ?? undefined) : typeof params?.look === "string" ? params.look : undefined;
     return (
       <AgentChat
         alias={alias}
         gate={gate}
+        look={agentLook(alias, params)}
+        expectation={t(dmExpectation(profile))}
+        attach={!boardIsHosted}
+        actions={
+          gate === null && !isCloud ? <Button onClick={() => onTab("work")}>{t("Assign work")}</Button> : null
+        }
         block={writeBlock}
         onBack={onBack}
         onOpenIssue={onOpenIssue}
@@ -285,7 +375,7 @@ export default function AgentPage({
               size={34}
             />
             <div className="ag-chat-title min-w-0">
-              <h1 tabIndex={-1}>{alias}</h1>
+              <h1>{alias}</h1>
               <p>
                 {hired ? (
                   <>
@@ -314,6 +404,8 @@ export default function AgentPage({
               work={hiredWork}
               onOpenIssue={onOpenIssue}
             />
+          ) : isCloud ? (
+            cloudCards
           ) : (
             <div className="ag-chat-panel-body">
               <AgentTabBody key={`${alias}:panel:${detail ? "d" : "n"}`} tab="overview" c={ctx} />
@@ -378,54 +470,7 @@ export default function AgentPage({
         </div>
       </header>
 
-      {cloud.length > 0 && (
-        <section className="ap-cloud" aria-label={t("Cloud runtime")}>
-          {cloud.map((c) => (
-            <div key={c.id} className="ap-cloud-card">
-              <div className="ap-sub">
-                <strong>{t("Cloud runtime")}</strong>
-                <span aria-hidden="true">·</span>
-                <span>{c.runtime}</span>
-                <span aria-hidden="true">·</span>
-                <span>{c.state}</span>
-                {c.principal && (
-                  <>
-                    <span aria-hidden="true">·</span>
-                    <span>
-                      {c.principal.kind === "agent"
-                        ? `${t("enrolled peer")} ${c.principal.label}`
-                        : t("operator connection")}
-                    </span>
-                  </>
-                )}
-              </div>
-              <p className="text-micro text-ink-500">
-                {t("Model:")} {c.model ?? t("gateway label pending")} · {t("Remote agent:")} {c.remote_agent_id}
-              </p>
-              <p className="text-micro text-ink-500">
-                {t("Capabilities:")} {t("conversation")}
-                {", "}
-                {t("no tools, MCP, skills, approvals or shell")}
-              </p>
-              {(c.sessions ?? []).length > 1 && (
-                <ul className="text-micro text-ink-500">
-                  {(c.sessions ?? []).map((s) => (
-                    <li key={s.conversation_id}>
-                      {s.thread?.link ? (
-                        <a href={s.thread.link}>{s.thread.id}</a>
-                      ) : (
-                        s.thread?.id ?? s.conversation_id
-                      )}
-                      {" · "}
-                      {s.remote_session_id}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          ))}
-        </section>
-      )}
+      {cloudCards}
 
       {notices}
 

@@ -134,14 +134,20 @@ let failDetail = true;
 let releaseDetail: (() => void) | null = null;
 let holdDetail = false;
 const reads: string[] = [];
+const threadReads: string[] = [];
+let threadExtra: Record<string, unknown> = {};
+let viewerIsOperator = true;
+let viewerHosted = false;
 globalThis.fetch = async (input, init) => {
   if (init?.method && init.method !== "GET")
     throw new Error("Agents must not write");
   const path = new URL(String(input), "http://localhost").pathname;
-  if (path.startsWith("/api/threads/"))
-    return new Response(JSON.stringify({ entries: [], cursor: 0, more_before: false }), {
+  if (path.startsWith("/api/threads/")) {
+    threadReads.push(path);
+    return new Response(JSON.stringify({ entries: [], cursor: 0, more_before: false, ...threadExtra }), {
       headers: { "Content-Type": "application/json" },
     });
+  }
   reads.push(path);
   if (holdDetail)
     await new Promise<void>((resolve) => {
@@ -207,6 +213,9 @@ async function render() {
   await React.act(() =>
     root.render(
       React.createElement(LocaleProvider, null, React.createElement(Agents, {
+        key: `${viewerIsOperator}`,
+        operator: viewerIsOperator,
+        hostedBoard: viewerHosted,
         state,
         issues: issueState,
         open,
@@ -483,6 +492,54 @@ async function main() {
       !host.textContent?.includes("0 across all projects"),
     "unloaded agent collection is not an empty collection",
   );
+  // CAD-2054 review: who may see a conversation, and what each page claims.
+  failDetail = false;
+  issueState = loaded(issues);
+  const dock = () => host.querySelector("[data-chat-dock]")?.textContent ?? "";
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
+  viewerIsOperator = false;
+  open = "dev";
+  tab = "overview";
+  threadReads.length = 0;
+  await render();
+  assert(!host.querySelector("[data-composer]"), "a non-operator gets no composer");
+  assert(dock().includes("for the operator"), "a non-operator is told why");
+  assert(threadReads.length === 0, "a non-operator does not read an agent's conversation, as on Threads");
+  viewerHosted = true;
+  await render();
+  assert(dock().includes("Your assistant is on Home"), "a hosted member is sent to their assistant");
+  viewerHosted = false;
+  viewerIsOperator = true;
+  state = { ...state, data: null, status: "loading" };
+  threadReads.length = 0;
+  await render();
+  assert(!host.querySelector("[data-composer]") && threadReads.length === 0, "nothing is read or offered before the roster answers");
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
+  open = "inbox";
+  await render();
+  assert(dock().includes("mailbox") && !host.querySelector("[data-composer]"), "a mailbox has no composer");
+  const withProfile = { id: "ap_2", alias: "Writer", role: "worker", team_role: "worker", catalogue: null, look: null, job: "Write", model: "inherit", runtimes: [] } as unknown as import("../src/lib/types").HiredProfile;
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [withProfile] });
+  open = "Writer";
+  tab = "settings";
+  reads.length = 0;
+  await render();
+  assert(host.querySelector(".ag-chat-gate") && !host.textContent?.includes("Loading agent details"), "a section link on a profile lands on its page, not a stuck read");
+  assert(!reads.includes("/api/agents/Writer"), "a profile is still not read as an agent");
+  tab = "overview";
+  const cloudAgent = { ...base, alias: "cloudy", provider: "agenticos-cloud", endpoint_kind: "cloud" } as Agent;
+  state = loaded({ daemon: "reachable", agents: [...agents, cloudAgent], totals: null, ...fresh });
+  open = "cloudy";
+  await render();
+  await click("Details");
+  const cloudPanel = host.querySelector(".ag-chat-panel")?.textContent ?? "";
+  assert(!cloudPanel.includes("Doing now") && !cloudPanel.includes("MCP & tools"), "a conversational-only cloud agent claims no local work panels");
+  threadExtra = { cloud_withheld: "denied" };
+  open = "dev";
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
+  await render();
+  assert(host.textContent?.includes("Cloud content unavailable") && !host.textContent?.includes("No messages with dev"), "a withheld thread does not read as empty");
+  threadExtra = {};
   await React.act(() => root.unmount());
   console.log("agents view checks passed");
 }

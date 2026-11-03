@@ -66,7 +66,12 @@ export default function Agents({
   onRecruit,
   onOpenIssue,
   onRetry,
+  operator,
+  hostedBoard,
 }: {
+  /** The viewer may read and send agent conversations (as Threads requires). */
+  operator: boolean;
+  hostedBoard: boolean;
   state: ResourceState<AgentsPayload>;
   issues: ResourceState<IssueCard[]>;
   open: string | null;
@@ -189,6 +194,10 @@ export default function Agents({
         hosted={hosted}
         groups={groups}
         rosterLoaded={payload != null}
+        rosterFailed={payload == null && state.status === "failed"}
+        onRetryRoster={onRetry}
+        operator={operator}
+        hostedBoard={hostedBoard}
         hiredWork={openHired ? profileWork(openHired, issueCards) : null}
       />
     );

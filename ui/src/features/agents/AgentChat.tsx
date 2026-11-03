@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
+import { displayUiNotice } from "../../lib/uiNotice";
 import { useResource } from "../../lib/useResource";
 import type { ThreadRef } from "../../lib/types";
 import Button from "../../ui/Button";
 import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
 import { AssistantActorProvider, type AssistantActorValue } from "../assistant/AssistantIdentity";
+import type { AvatarLook } from "../assistant/identity";
 import { atTail, tailTop } from "../home/dock";
+import { CloudContentNotice } from "../home/ThreadView";
 import {
   applyEarlier,
   discardPending,
@@ -19,7 +22,6 @@ import {
 import { useDockHeight } from "../home/useDockHeight";
 import { threadReader } from "../../lib/resources";
 import { subscribeThreadsChanged } from "../threads/threadsClient";
-import { agentLook } from "./AgentAvatar";
 import { agentThreadStore, sendToAgent } from "./agentThread";
 
 /** How a chat page leaves the composer out: a plain reason in its place. */
@@ -30,6 +32,10 @@ export default function AgentChat({
   alias,
   heading,
   gate,
+  look,
+  expectation,
+  attach,
+  actions,
   notices,
   panel,
   block,
@@ -40,6 +46,13 @@ export default function AgentChat({
   heading: ReactNode;
   /** Nothing can answer here, so no composer is offered. */
   gate: ChatGate | null;
+  /** The avatar for this agent's turns, as its heading shows it. */
+  look: AvatarLook;
+  /** What a message will do here, as Threads says it. */
+  expectation: string;
+  /** The board stores uploads for chat. A hosted board does not. */
+  attach: boolean;
+  actions?: ReactNode;
   notices?: ReactNode;
   panel: ReactNode;
   block: string | null;
@@ -59,7 +72,8 @@ export default function AgentChat({
   useEffect(() => {
     if (!panelOpen) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !event.defaultPrevented && closePanelIfOverlay()) event.preventDefault();
+      if (event.key !== "Escape" || event.defaultPrevented || document.querySelector("dialog[open]")) return;
+      if (closePanelIfOverlay()) event.preventDefault();
     };
     document.addEventListener("keydown", onKey, true);
     return () => document.removeEventListener("keydown", onKey, true);
@@ -73,6 +87,7 @@ export default function AgentChat({
             ←
           </button>
           {heading}
+          {actions}
           <button
             type="button"
             ref={panelButton}
@@ -84,7 +99,7 @@ export default function AgentChat({
           </button>
         </header>
         {notices}
-        <AgentConversation alias={alias} gate={gate} block={block} onOpenIssue={onOpenIssue} />
+        <AgentConversation alias={alias} gate={gate} look={look} expectation={expectation} attach={attach} block={block} onOpenIssue={onOpenIssue} />
       </section>
       {panelOpen && (
         <aside className="ag-chat-panel" aria-label={t("{alias} details").replace("{alias}", () => alias)}>
@@ -111,15 +126,22 @@ export default function AgentChat({
 function AgentConversation({
   alias,
   gate,
+  look,
+  expectation,
+  attach,
   block,
   onOpenIssue,
 }: {
   alias: string;
   gate: ChatGate | null;
+  look: AvatarLook;
+  expectation: string;
+  attach: boolean;
   block: string | null;
   onOpenIssue: (id: string) => void;
 }) {
   const t = useTranslate();
+  const [sendNote, setSendNote] = useState<string | null>(null);
   const store = agentThreadStore(alias);
   const thread = useResource(store);
   const [limit, setLimit] = useState(WINDOW);
@@ -135,9 +157,9 @@ function AgentConversation({
   // Opening an agent is opening its chat: on a wide screen the caret lands in
   // the composer. A phone keeps its keyboard down until asked.
   useEffect(() => {
-    if (!window.matchMedia("(min-width: 901px)").matches) return;
+    if (gate !== null || !window.matchMedia("(min-width: 901px)").matches) return;
     dockRef.current?.querySelector<HTMLTextAreaElement>("textarea")?.focus({ preventScroll: true });
-  }, []);
+  }, [gate === null]);
 
   // No stream names this thread's rows, so a gentle poll carries a live reply;
   // a Threads frame refreshes it sooner. A gated page has nothing to wait for.
@@ -146,7 +168,7 @@ function AgentConversation({
     const refresh = () => void store.refresh();
     refresh();
     const timer = setInterval(refresh, 6000);
-    const unsubscribe = subscribeThreadsChanged(refresh);
+    const unsubscribe = subscribeThreadsChanged(() => store.invalidate());
     return () => {
       clearInterval(timer);
       unsubscribe();
@@ -157,9 +179,13 @@ function AgentConversation({
     const el = scrollRef.current;
     if (el) el.scrollTop = tailTop(el.scrollHeight, el.clientHeight);
   }, []);
-  useDockHeight(dockRef, scrollRef, (tail) => {
-    if (tail) toTail();
-  });
+  const keepDockTail = useCallback(
+    (tail: boolean) => {
+      if (tail) toTail();
+    },
+    [toTail],
+  );
+  useDockHeight(dockRef, scrollRef, keepDockTail);
   useEffect(() => {
     if (onTail.current) toTail();
   }, [items, toTail]);
@@ -190,26 +216,29 @@ function AgentConversation({
     () => ({
       scope: "workspace",
       alias,
-      read: { state: "ready", identity: { name: alias, tone: null, look: agentLook(alias), revision: 0 } },
+      read: { state: "ready", identity: { name: alias, tone: null, look, revision: 0 } },
       personal: null,
       workspace: null,
     }),
-    [alias],
+    [alias, look],
   );
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
-  const failed = thread.error !== null && thread.error !== undefined;
+  const failed = gate === null && thread.error !== null && thread.error !== undefined;
+  const withheld = thread.data?.cloudWithheld;
 
   return (
     <AssistantActorProvider actor={actor}>
       <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
         {failed && (
           <div className="card px-3.5 py-3 mt-3 text-label text-warn break-words" role="alert">
-            {t("The thread could not be read —")} {thread.error}{" "}
+            {loaded ? t("The latest refresh failed — showing the last history it read.") : t("The thread could not be read —")}{" "}
+            {thread.error}{" "}
             <button className="lnk" onClick={() => void store.refresh()}>
               {t("Retry")}
             </button>
           </div>
         )}
+        {gate === null && <CloudContentNotice withheld={withheld} />}
         {!gate && !loaded && !failed && (
           <p className="text-label text-ink-500 pt-3">{t("Reading the thread…")}</p>
         )}
@@ -222,14 +251,14 @@ function AgentConversation({
             onTail.current = atTail(el.scrollTop, el.scrollHeight, el.clientHeight);
           }}
         >
-          {loaded && !failed && items.length === 0 && !gate && (
+          {loaded && !failed && withheld == null && items.length === 0 && !gate && (
             <div className="chat-empty">
               <p className="text-label text-ink-400">
                 {t("No messages with {alias} yet.").replace("{alias}", () => alias)}
               </p>
             </div>
           )}
-          {hidden > 0 || thread.data?.moreBefore === true ? (
+          {!gate && (hidden > 0 || thread.data?.moreBefore === true) ? (
             <div className="flex justify-center">
               <button className="lnk text-label disabled:opacity-50" disabled={loadingEarlier} onClick={onEarlier}>
                 {loadingEarlier ? t("Loading…") : t("Load earlier messages")}
@@ -259,21 +288,35 @@ function AgentConversation({
               {gate.extra}
             </div>
           ) : (
+            <>
+            <div className="text-micro text-ink-500 px-1 pb-1" role="status">
+              {sendNote ?? expectation}
+            </div>
             <SharedComposer
               density="full"
               storeKey={`threads:${alias}`}
               block={block}
+              // A `/` command is not sent here, and Enter must not look dead.
+              onNotice={(notice) =>
+                setSendNote(
+                  typeof notice !== "string" && notice.key.startsWith("Unsupported command")
+                    ? t("Commands aren't available in this chat, so this wasn't sent. To send it as a message, start with something other than /.")
+                    : displayUiNotice(notice, t),
+                )
+              }
               onSend={({ body, refs, attachments }) => {
+                setSendNote(null);
                 onTail.current = true;
                 void sendToAgent(alias, body, undefined, refs, attachments);
               }}
               refocusAfterSend
-              attach
+              attach={attach}
               className="card p-2.5 relative"
               placeholder={t("Message {alias}…").replace("{alias}", () => alias)}
               ariaLabel={t("Message to {alias}").replace("{alias}", () => alias)}
               formProps={{ "data-composer": "" }}
             />
+            </>
           )}
         </div>
       </div>

@@ -1370,6 +1370,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
         {route.screen === "agents" && (
           <Agents
+            key={meta.session?.id ?? ""}
+            operator={meta.operator === true}
+            hostedBoard={meta.hosted === true}
             state={agentsState}
             issues={issuesState}
             open={route.alias}
