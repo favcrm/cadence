@@ -2964,6 +2964,43 @@ impl Store {
         }
     }
 
+    /// CAD-1608: replies already routed to `recipient` for peer sends made
+    /// by `sender_uid`. Each row is returned once. The mark is an event in
+    /// the same transaction as the read, so a second call cannot observe
+    /// the same routed `worker_result` again and this method never inserts
+    /// a message.
+    pub fn take_peer_replies(&self, recipient: &str, sender_uid: &str) -> Result<Vec<Message>> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let ids: Vec<String> = tx.query_vec(
+                "SELECT m.id FROM messages m
+                 JOIN messages origin ON origin.id = m.origin
+                 WHERE m.alias = ?1
+                   AND m.source = 'worker_result'
+                   AND origin.source = 'peer'
+                   AND origin.sender_uid = ?2
+                   AND NOT EXISTS (
+                     SELECT 1 FROM events e
+                     WHERE e.alias = ?1
+                       AND e.kind = 'peer_reply_taken'
+                       AND json_extract(e.payload, '$.message') = m.id
+                   )
+                 ORDER BY m.created",
+                params![recipient, sender_uid],
+                |row| row.get(0),
+            )?;
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                let message = self.message_in(&tx, &id)?.ok_or_else(|| {
+                    Error::internal("peer reply disappeared inside its read transaction")
+                })?;
+                Self::event(&tx, recipient, "peer_reply_taken", json!({"message": &id}))?;
+                out.push(message);
+            }
+            Ok(out)
+        })
+    }
+
     /// Whether an agent caller may read this message body. The row must
     /// name the alias, and a known recipient UID must be the alias's
     /// CURRENT UID; a legacy NULL UID counts only from the current

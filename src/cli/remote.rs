@@ -1328,6 +1328,15 @@ pub(super) fn run(
                     .unwrap_or_else(cadence_agent::client::state_dir)?;
                 return cloud_agent::run(state, action.clone());
             }
+            // A selected hosted org must not turn a local peer send into
+            // a remote verb. The caller is the local daemon connection.
+            AgentAction::Peer { action } => {
+                let state = local_state
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(cadence_agent::client::state_dir)?;
+                return super::peer::run(state, action.clone());
+            }
             _ => {}
         }
         if let Some(bridge) = action.bridge() {

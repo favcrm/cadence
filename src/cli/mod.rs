@@ -65,6 +65,7 @@ mod milestone;
 mod monitor;
 mod org;
 mod overview;
+mod peer;
 mod plan;
 mod platform;
 mod project;

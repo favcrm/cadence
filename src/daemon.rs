@@ -288,6 +288,7 @@ mod needs_rpc;
 mod next_action;
 mod notify_driver;
 mod operator_rpc;
+mod peer_rpc;
 mod plans_rpc;
 mod platform_rpc;
 mod pm_activity_rpc;
@@ -3543,6 +3544,9 @@ impl Shared {
             }
             "agent_send" => self.rpc_send_from(params, peer_pid),
             "agent_ask" => self.rpc_ask(params, peer_pid),
+            "peer_list" => self.rpc_peer_list(params, peer_pid),
+            "peer_send" => self.rpc_peer_send(params, peer_pid),
+            "peer_replies" => self.rpc_peer_replies(params, peer_pid),
             "thread_read" => self.rpc_thread_read(params, peer_pid),
             "activity_query" => self.rpc_activity_query(params, peer_pid),
             "activity_export" => self.rpc_activity_export(params, peer_pid),

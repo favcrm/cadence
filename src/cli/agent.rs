@@ -2,6 +2,7 @@
 
 use super::cloud_agent;
 use super::local_agent;
+use super::peer;
 use super::*;
 
 /// `agent show` lists this many terminal messages by default (CAD-879);
@@ -590,6 +591,13 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         cancel: bool,
     },
+    /// List a group peer, send one message, or read the routed reply.
+    /// The sender is this connection. This is not `agent list` and not
+    /// `cadence send`.
+    Peer {
+        #[command(subcommand)]
+        action: peer::PeerAction,
+    },
     /// Inspect or reconcile a Worker/Pi connection. Connecting is
     /// `agent connect --cloud`, not a verb here. `--placement cloud` is
     /// only a list filter. A turn is `cadence send <alias>`.
@@ -1044,6 +1052,7 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                 .collect();
             client::rpc(&state_dir, "agent_restore", json!({"expected": entries}))?
         }
+        AgentAction::Peer { action } => return peer::run(state_dir, action),
         AgentAction::Cloud { action } => return cloud_agent::run(state_dir, action),
         AgentAction::Connect {
             cloud: true,

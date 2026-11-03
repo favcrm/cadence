@@ -51,7 +51,7 @@ fn agent_mcp_config(agent: &Agent, log_path: &Path) -> Result<Value> {
     // inventory the MCP server lists, so a generated platform tool cannot be
     // discoverable but undispatchable (or vice versa). Managed Codex runs
     // with approvalPolicy=never, so every reviewed tool is approved here;
-    // the server still returns only the static five plus direct-callable
+    // the server still returns only the static tool list plus direct-callable
     // adapter tools.
     let generated = crate::mcp_agent::generated_tool_names(
         crate::platform::inventory()
@@ -111,6 +111,7 @@ fn check_agent_mcp(transport: &Transport, thread_id: &str, alias: &str) -> Resul
                     "app_run_artifact",
                 ]
                 .iter()
+                .chain(["peer_list", "peer_send", "peer_replies"].iter())
                 .all(|name| server["tools"].get(*name).is_some())
             {
                 return Err(Error::provider(format!(
@@ -1112,7 +1113,9 @@ impl ProviderAdapter for CodexAdapter {
             }
             instructions.push_str(
                 "Use the cadence MCP tools for Cadence identity, wiki search/read, issue reads, \
-                 and an assigned app dependency artifact. wiki_search is lexical AND over at most \
+                 peer_list, peer_send, and peer_replies, \
+                 and an assigned app dependency artifact. A peer send reports a disposition only; \
+                 it grants no approval and does not steer or mutate a task. wiki_search is lexical AND over at most \
                  12 tokens: send scoped keywords (vendor, operation or field, exact version or \
                  identifier) in the collection the question is authorized for, at most 3 variants \
                  and 20 merged candidates per question, then wiki_read at most 8 sources and cite \

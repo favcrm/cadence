@@ -368,6 +368,28 @@ live Cloudflare/model qualification. That requires an explicitly authorized
 isolated tenant/model route and a real split-UID peer runtime, separately from
 source checks, reviews, deployment and installation.
 
+## Agent peers (CAD-1608)
+
+`cadence agent peer` is the agent-facing send. It is not `agent list` and not
+`cadence send`. The sender is the calling connection. There is no sender flag.
+
+```sh
+cadence agent peer list
+cadence agent peer send <alias> --text "..." --recipient-uid <uid>
+cadence agent peer replies
+```
+
+`list` returns the caller's recorded alias and uid, and each group peer's
+transport and reachability. A peer is the caller's upstream, or another agent
+whose upstream is that same alias. The caller is not listed. Two agents with
+no upstream are not peers. `send` queues one message through the existing
+store and answers with this attempt's disposition: `queued`, `delivered`,
+`refused`, `held`, or `unknown`. That disposition is not a completed task, an
+approval, or a claim that a model acted. An unknown disposition is not
+retried. Reusing a message id changes nothing. A `recipient_uid` that does not
+match the live peer is refused before a row is written. `replies` returns
+each routed reply once. A reply does not steer, approve, or mutate a task.
+
 ## Settings > Agents management (CAD-1586)
 
 `cadence settings agents` manages the same authoritative document and revision

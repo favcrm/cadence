@@ -92,6 +92,7 @@ mod cad1545_runtime_ownership_acceptance;
 mod cad1548_agents_settings_refusal_acceptance;
 mod cad1586_settings_management_acceptance;
 mod cad1591_peer_provenance_acceptance;
+mod cad1608_peer_interface_acceptance;
 mod cad1614_operator_attribution_acceptance;
 mod cad1624_omp_gate_refusal_acceptance;
 mod cad1638_guest_directory_refusal;

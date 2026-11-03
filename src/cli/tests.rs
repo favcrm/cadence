@@ -1869,3 +1869,25 @@ fn cloud_connection_lives_under_agent() {
     assert!(connect.contains("--local"), "{connect}");
     assert!(!connect.contains("accept-assistant-consent"), "{connect}");
 }
+
+/// CAD-1608: the compact peer surface is `agent peer`, not a new top-level noun.
+#[test]
+fn peer_interface_lives_under_agent() {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    assert!(cmd.find_subcommand("peer").is_none());
+    let help = cmd
+        .find_subcommand_mut("agent")
+        .expect("agent")
+        .find_subcommand_mut("peer")
+        .expect("agent peer")
+        .render_help()
+        .to_string();
+    for verb in ["list", "send", "replies"] {
+        assert!(help.contains(verb), "agent peer help omits {verb}:\n{help}");
+    }
+    assert!(
+        !help.contains("--sender"),
+        "a peer command must not take a sender field:\n{help}"
+    );
+}

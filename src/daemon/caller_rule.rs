@@ -178,6 +178,24 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
              Steer — the operator or the recipient's PM (CAD-158)",
         ),
     ),
+    (
+        "peer_list",
+        Rule::Handler(
+            "rpc_peer_list: a live registered agent only; the sender record is that connection (CAD-1608)",
+        ),
+    ),
+    (
+        "peer_send",
+        Rule::Handler(
+            "rpc_peer_send: a live registered agent sending to one group peer; sender, reply route, source and authority fields are daemon-derived (CAD-1608)",
+        ),
+    ),
+    (
+        "peer_replies",
+        Rule::Handler(
+            "rpc_peer_replies: the same live agent reads each routed peer reply once (CAD-1608)",
+        ),
+    ),
     ("thread_read", Rule::Read),
     // CAD-1374: the owner activity trail. The handler always proves the
     // operator connection; a present public_session must also be a live
