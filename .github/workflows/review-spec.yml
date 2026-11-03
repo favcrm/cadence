@@ -1,4 +1,4 @@
-name: review-spec
+name: review-spec # per axis
 
 # CAD-2081 stage 3 (CAD-2088): the protected fresh-session spec review.
 # Dispatched on main with a PR number and head SHA. Three jobs, because any step
@@ -13,12 +13,23 @@ name: review-spec
 # (kind spec-security; the kind comes from the proved workflow, never from this file).
 # scripts/enqueue-reviewed compares THIS FILE's blob at the verdict's
 # workflow_sha with main's tip, so all review logic stays inline here. The twin
-# review-standards.yml differs only in the values marked "per axis".
+# review-standards.yml is the same file: it may differ from this one ONLY in this
+# leading comment block and in lines containing the text "per axis" (the name,
+# run-name and concurrency group, KIND, CHECKS and the AXIS prompt). Delete those
+# lines from both files and the rest must be byte-identical.
+#
+# Sealing: the private ticket (title, status, body) and the model's output are
+# never uploaded in the clear. prepare seals them (RSA-OAEP-SHA256 wrapping an
+# AES-256-GCM key, bound to repo, PR, head and label) to the public key in the
+# repo Actions variable REVIEW_SEAL_PUBLIC_KEY, and fails closed without it. Only
+# review and file hold the private key (environment secret REVIEW_SEAL_PRIVATE_KEY).
+# Public data (the diff, PR text, repository docs) travels in plain artifacts.
 #
 # Needs, created by the operator and not by this file: the `cadence-review`
 # environment (deployment branches limited to main, no required reviewers) with
-# the secret ANTHROPIC_API_KEY. Without the branch limit, a workflow edited on a
-# side branch could read the key.
+# secrets ANTHROPIC_API_KEY (referenced by review only) and REVIEW_SEAL_PRIVATE_KEY
+# (review and file), and the repo variable REVIEW_SEAL_PUBLIC_KEY. Without the
+# branch limit, a workflow edited on a side branch could read the secrets.
 
 on:
   workflow_dispatch:
@@ -32,12 +43,12 @@ on:
         required: true
         type: string
 
-run-name: review-spec PR ${{ inputs.pr }} at ${{ inputs.head_sha }}
+run-name: review-spec PR ${{ inputs.pr }} at ${{ inputs.head_sha }} # per axis
 
 permissions: {}
 
 concurrency:
-  group: review-spec-${{ inputs.pr }}-${{ inputs.head_sha }}
+  group: review-spec-${{ inputs.pr }}-${{ inputs.head_sha }} # per axis
   cancel-in-progress: false
 
 env:
@@ -62,12 +73,41 @@ jobs:
       - name: Read the context and the diff
         env:
           GH_TOKEN: ${{ github.token }}
+          REVIEW_SEAL_PUBLIC_KEY: ${{ vars.REVIEW_SEAL_PUBLIC_KEY }}
         run: |
           node --input-type=module - <<'JS'
           import fs from 'node:fs';
+          import crypto from 'node:crypto';
           const E = process.env, { PR, HEAD, REPO, PROJECT, TENANT, KIND } = E;
           const die = (m) => { console.log(`::error::${m}`); process.exit(1); };
           const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          // Sealing helpers: the same in every job that uses them.
+          const aad = (l) => Buffer.from(`cadence-review-seal:v1:${REPO}:${PR}:${HEAD}:${l}`);
+          const OAEP = { oaepHash: 'sha256', padding: crypto.constants.RSA_PKCS1_OAEP_PADDING };
+          function seal(pub, label, obj) {
+            const k = crypto.randomBytes(32), iv = crypto.randomBytes(12);
+            const c = crypto.createCipheriv('aes-256-gcm', k, iv); c.setAAD(aad(label));
+            const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
+            return { v: 1, k: crypto.publicEncrypt({ key: pub, ...OAEP }, k).toString('base64'), iv: iv.toString('base64'), tag: c.getAuthTag().toString('base64'), ct: ct.toString('base64') };
+          }
+          function unseal(priv, label, s) {
+            if (!s || s.v !== 1) throw new Error('bad seal');
+            const d = crypto.createDecipheriv('aes-256-gcm', crypto.privateDecrypt({ key: priv, ...OAEP }, Buffer.from(s.k, 'base64')), Buffer.from(s.iv, 'base64'));
+            d.setAAD(aad(label)); d.setAuthTag(Buffer.from(s.tag, 'base64'));
+            return JSON.parse(Buffer.concat([d.update(Buffer.from(s.ct, 'base64')), d.final()]).toString('utf8'));
+          }
+          function publicKey() {
+            const pem = E.REVIEW_SEAL_PUBLIC_KEY || '';
+            let k = null;
+            if (!pem.includes('PRIVATE')) try { k = crypto.createPublicKey(pem); } catch {}
+            if (!k || k.asymmetricKeyType !== 'rsa' || k.asymmetricKeyDetails.modulusLength < 3072)
+              die('repo variable REVIEW_SEAL_PUBLIC_KEY is missing or is not an RSA public key of at least 3072 bits; nothing filed, no model called');
+            return k;
+          }
+          function privateKey() {
+            try { return crypto.createPrivateKey(E.REVIEW_SEAL_PRIVATE_KEY || ''); } catch { die('environment secret REVIEW_SEAL_PRIVATE_KEY is missing or malformed; nothing filed'); }
+          }
+          const pub = publicKey(); // before any token is minted or context read
           if (!/^[1-9][0-9]{0,8}$/.test(PR || '') || !/^[0-9a-f]{40}$/.test(HEAD || ''))
             die('inputs rejected: pr must be a number and head_sha a full lowercase 40-hex commit');
           const gh = (p, accept = 'application/vnd.github+json') => fetch(`https://api.github.com/repos/${REPO}/${p}`, {
@@ -144,15 +184,16 @@ jobs:
           const out = `${E.RUNNER_TEMP}/out`;
           fs.mkdirSync(out, { recursive: true });
           fs.writeFileSync(`${out}/review-input.json`, JSON.stringify({
-            repo: REPO, pr: Number(PR), head: HEAD, base, issue, pull: ctx.pull, ticket: ctx.ticket,
-            ticket_body: ctx.ticket_body, diff,
+            repo: REPO, pr: Number(PR), head: HEAD, base, issue, pull: ctx.pull,
+            sealed_ticket: seal(pub, 'ticket', { ticket: ctx.ticket, body: typeof ctx.ticket_body === 'string' ? ctx.ticket_body : '' }), diff,
             agents_md: await doc('AGENTS.md'), risk_classes: await doc('docs/roles/risk-classes.md'),
           }));
           fs.writeFileSync(`${out}/file-input.json`, JSON.stringify({ repo: REPO, pr: Number(PR), head: HEAD, base, issue, diff }));
           console.log(`prepared ${issue} PR ${PR} head ${HEAD.slice(0, 12)} base ${base.slice(0, 12)}: ${files} files, ${diff.length} diff bytes`);
           JS
-      # The review input holds the ticket body, and a public repo's artifacts are
-      # downloadable by any signed-in GitHub user: one day of retention is the floor.
+      # A public repo's artifacts are downloadable by any signed-in GitHub user, so
+      # this one holds only public data (diff, PR text, repo docs) and the sealed
+      # ticket; one day of retention.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: review-input
@@ -180,18 +221,52 @@ jobs:
       - name: Review the diff with a fresh model session
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REVIEW_SEAL_PRIVATE_KEY: ${{ secrets.REVIEW_SEAL_PRIVATE_KEY }}
+          REVIEW_SEAL_PUBLIC_KEY: ${{ vars.REVIEW_SEAL_PUBLIC_KEY }}
         run: |
           node --input-type=module - <<'JS'
           import fs from 'node:fs';
           import crypto from 'node:crypto';
-          const E = process.env;
+          const E = process.env, { PR, HEAD, REPO } = E;
           const die = (m) => { console.log(`::error::${m}`); process.exit(1); };
           const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          // Sealing helpers: the same in every job that uses them.
+          const aad = (l) => Buffer.from(`cadence-review-seal:v1:${REPO}:${PR}:${HEAD}:${l}`);
+          const OAEP = { oaepHash: 'sha256', padding: crypto.constants.RSA_PKCS1_OAEP_PADDING };
+          function seal(pub, label, obj) {
+            const k = crypto.randomBytes(32), iv = crypto.randomBytes(12);
+            const c = crypto.createCipheriv('aes-256-gcm', k, iv); c.setAAD(aad(label));
+            const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
+            return { v: 1, k: crypto.publicEncrypt({ key: pub, ...OAEP }, k).toString('base64'), iv: iv.toString('base64'), tag: c.getAuthTag().toString('base64'), ct: ct.toString('base64') };
+          }
+          function unseal(priv, label, s) {
+            if (!s || s.v !== 1) throw new Error('bad seal');
+            const d = crypto.createDecipheriv('aes-256-gcm', crypto.privateDecrypt({ key: priv, ...OAEP }, Buffer.from(s.k, 'base64')), Buffer.from(s.iv, 'base64'));
+            d.setAAD(aad(label)); d.setAuthTag(Buffer.from(s.tag, 'base64'));
+            return JSON.parse(Buffer.concat([d.update(Buffer.from(s.ct, 'base64')), d.final()]).toString('utf8'));
+          }
+          function publicKey() {
+            const pem = E.REVIEW_SEAL_PUBLIC_KEY || '';
+            let k = null;
+            if (!pem.includes('PRIVATE')) try { k = crypto.createPublicKey(pem); } catch {}
+            if (!k || k.asymmetricKeyType !== 'rsa' || k.asymmetricKeyDetails.modulusLength < 3072)
+              die('repo variable REVIEW_SEAL_PUBLIC_KEY is missing or is not an RSA public key of at least 3072 bits; nothing filed, no model called');
+            return k;
+          }
+          function privateKey() {
+            try { return crypto.createPrivateKey(E.REVIEW_SEAL_PRIVATE_KEY || ''); } catch { die('environment secret REVIEW_SEAL_PRIVATE_KEY is missing or malformed; nothing filed'); }
+          }
           const input = JSON.parse(fs.readFileSync(`${E.RUNNER_TEMP}/in/review-input.json`, 'utf8'));
-          if (input.head !== E.HEAD || String(input.pr) !== E.PR) die('review input is not for this dispatch');
+          if (input.head !== HEAD || String(input.pr) !== PR) die('review input is not for this dispatch');
+          // Fail closed before spending on the model: the pair must work, and the ticket must open.
+          const pub = publicKey(), priv = privateKey();
+          try { if (unseal(priv, 'selftest', seal(pub, 'selftest', { ok: 1 })).ok !== 1) throw 0; } catch { die('REVIEW_SEAL_PUBLIC_KEY and REVIEW_SEAL_PRIVATE_KEY are not a pair; no model called'); }
+          let sealed;
+          try { sealed = unseal(priv, 'ticket', input.sealed_ticket); } catch { die('the sealed ticket does not open (tampered or sealed to another key); no model called'); }
+          input.ticket = sealed.ticket; input.ticket_body = sealed.body;
           const names = E.CHECKS.split(',');
-          // per axis: what this reviewer judges.
-          const AXIS = `You review the Spec and security axis: does the change do what the ticket asks and stay safe. The checks are: ticket-requirements (every requirement and acceptance item of the ticket is implemented, and nothing it forbids is done), trust-boundaries (authentication, identity, credential, signature, secret and confinement logic is correct and not weakened), fail-closed (every error or unknown path refuses, and an infrastructure failure never produces a pass), risk-triggers (the risk-class triggers of the risk_classes block that the diff touches are identified; if the diff touches one, risk_level must be human).`;
+          // What this reviewer judges (per axis).
+          const AXIS = `You review the Spec and security axis: does the change do what the ticket asks and stay safe. The checks are: ticket-requirements (every requirement and acceptance item of the ticket is implemented, and nothing it forbids is done), trust-boundaries (authentication, identity, credential, signature, secret and confinement logic is correct and not weakened), fail-closed (every error or unknown path refuses, and an infrastructure failure never produces a pass), risk-triggers (the risk-class triggers of the risk_classes block that the diff touches are identified; if the diff touches one, risk_level must be human).`; // per axis
           const system = [
             'You are one independent reviewer of a pull request in a code repository. You have no prior context: judge only what is given here.',
             AXIS,
@@ -241,7 +316,8 @@ jobs:
           try { parsed = JSON.parse(text); } catch { die('model output is not JSON; nothing filed'); }
           console.log(`model ${res.model}: ${res.usage?.input_tokens} in, ${res.usage?.output_tokens} out`);
           fs.mkdirSync(`${E.RUNNER_TEMP}/out`, { recursive: true });
-          fs.writeFileSync(`${E.RUNNER_TEMP}/out/review-output.json`, JSON.stringify({ model: res.model, output: parsed }));
+          // The output may quote the ticket, so it is sealed like the ticket.
+          fs.writeFileSync(`${E.RUNNER_TEMP}/out/review-output.json`, JSON.stringify(seal(pub, 'review-output', { model: res.model, output: parsed })));
           JS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -254,6 +330,7 @@ jobs:
     needs: review
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: cadence-review # for REVIEW_SEAL_PRIVATE_KEY only; no step references ANTHROPIC_API_KEY
     permissions:
       id-token: write
     steps:
@@ -262,14 +339,45 @@ jobs:
           pattern: '{file-input,review-output}'
           path: ${{ runner.temp }}/in
       - name: Validate the output and file the verdict
+        env:
+          REVIEW_SEAL_PRIVATE_KEY: ${{ secrets.REVIEW_SEAL_PRIVATE_KEY }}
         run: |
           node --input-type=module - <<'JS'
           import fs from 'node:fs';
+          import crypto from 'node:crypto';
           const E = process.env, { PR, HEAD, REPO, PROJECT, TENANT, KIND } = E;
           const die = (m) => { console.log(`::error::${m}`); process.exit(1); };
           const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          // Sealing helpers: the same in every job that uses them.
+          const aad = (l) => Buffer.from(`cadence-review-seal:v1:${REPO}:${PR}:${HEAD}:${l}`);
+          const OAEP = { oaepHash: 'sha256', padding: crypto.constants.RSA_PKCS1_OAEP_PADDING };
+          function seal(pub, label, obj) {
+            const k = crypto.randomBytes(32), iv = crypto.randomBytes(12);
+            const c = crypto.createCipheriv('aes-256-gcm', k, iv); c.setAAD(aad(label));
+            const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
+            return { v: 1, k: crypto.publicEncrypt({ key: pub, ...OAEP }, k).toString('base64'), iv: iv.toString('base64'), tag: c.getAuthTag().toString('base64'), ct: ct.toString('base64') };
+          }
+          function unseal(priv, label, s) {
+            if (!s || s.v !== 1) throw new Error('bad seal');
+            const d = crypto.createDecipheriv('aes-256-gcm', crypto.privateDecrypt({ key: priv, ...OAEP }, Buffer.from(s.k, 'base64')), Buffer.from(s.iv, 'base64'));
+            d.setAAD(aad(label)); d.setAuthTag(Buffer.from(s.tag, 'base64'));
+            return JSON.parse(Buffer.concat([d.update(Buffer.from(s.ct, 'base64')), d.final()]).toString('utf8'));
+          }
+          function publicKey() {
+            const pem = E.REVIEW_SEAL_PUBLIC_KEY || '';
+            let k = null;
+            if (!pem.includes('PRIVATE')) try { k = crypto.createPublicKey(pem); } catch {}
+            if (!k || k.asymmetricKeyType !== 'rsa' || k.asymmetricKeyDetails.modulusLength < 3072)
+              die('repo variable REVIEW_SEAL_PUBLIC_KEY is missing or is not an RSA public key of at least 3072 bits; nothing filed, no model called');
+            return k;
+          }
+          function privateKey() {
+            try { return crypto.createPrivateKey(E.REVIEW_SEAL_PRIVATE_KEY || ''); } catch { die('environment secret REVIEW_SEAL_PRIVATE_KEY is missing or malformed; nothing filed'); }
+          }
           const rd = (p) => JSON.parse(fs.readFileSync(`${E.RUNNER_TEMP}/in/${p}`, 'utf8'));
-          const input = rd('file-input/file-input.json'), review = rd('review-output/review-output.json');
+          const input = rd('file-input/file-input.json');
+          let review;
+          try { review = unseal(privateKey(), 'review-output', rd('review-output/review-output.json')); } catch { die('the sealed review output does not open (tampered or sealed to another key); nothing filed'); }
           if (input.head !== HEAD || String(input.pr) !== PR || input.repo !== REPO) die('file input is not for this dispatch');
           if (!/^[A-Za-z][A-Za-z0-9]{1,15}-[0-9]{1,9}$/.test(input.issue || '')) die('file input has no valid ticket id');
           const names = E.CHECKS.split(',');
