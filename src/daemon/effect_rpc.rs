@@ -132,12 +132,74 @@ impl Shared {
 
         let reported = adapter.reported_manifest_version();
         let table = adapter.table();
+        // CAD-1974: a reviewed connected read names the connection it reads and
+        // the charge the caller accepts — both, before any platform traffic,
+        // and only on a tool whose reviewed entry declares it.
+        let connected_read = table.declared(tool).is_some_and(|decl| decl.connected_read);
+        let connection =
+            match optional_str(params, "connection") {
+                Some(connection) if connected_read => {
+                    Some(identifier(connection, "Connection")?.to_string())
+                }
+                Some(_) => return Err(Error::rejected(
+                    "platform call: 'connection' belongs to a connected read; this tool takes none",
+                )),
+                None => None,
+            };
+        let max_charge_minor = match params.get("max_charge_minor") {
+            None | Some(Value::Null) => None,
+            Some(_) if !connected_read => {
+                return Err(Error::rejected(
+                    "platform call: 'max_charge_minor' belongs to a connected read; this tool takes none",
+                ));
+            }
+            Some(value) => Some(value.as_u64().ok_or_else(|| {
+                Error::usage("platform call: 'max_charge_minor' must be a non-negative integer")
+            })?),
+        };
+        if connected_read && classify_call(table, reported.as_deref(), tool) != Effect::Read {
+            return Err(Error::rejected(
+                "platform call: a connected read must declare a read effect",
+            ));
+        }
         match classify_call(table, reported.as_deref(), tool) {
             Effect::Read | Effect::Draft => {
                 let draft = table.effect_of(tool) == Effect::Draft;
                 // The actor label is the event/draft-log identity only; a
                 // send never reaches here without an agent.
                 let actor = agent.as_deref().unwrap_or("operator");
+                if connected_read {
+                    let connection = connection.ok_or_else(|| {
+                        Error::rejected(
+                            "platform call: a connected read names the connection it reads — \
+                             pass 'connection'",
+                        )
+                    })?;
+                    let max_charge = max_charge_minor.ok_or_else(|| {
+                        Error::rejected(
+                            "platform call: a connected read needs the charge the caller \
+                             accepts before it runs — pass 'max_charge_minor'",
+                        )
+                    })?;
+                    // A caller's own handle makes a resubmission a replay
+                    // rather than a second charge; the platform derives the
+                    // ledger key from it.
+                    let key = match optional_str(params, "request") {
+                        Some(request) => format!("read-{request}"),
+                        None => format!("read-{}", uuid::Uuid::new_v4().simple()),
+                    };
+                    return self.execute_connected_read(
+                        actor,
+                        &platform,
+                        &account,
+                        tool,
+                        &input,
+                        &connection,
+                        max_charge,
+                        &key,
+                        &adapter,
+                    );
+                }
                 self.execute_immediate(actor, &platform, &account, tool, &input, draft, &adapter)
             }
             Effect::Send => match agent.as_deref() {
@@ -194,6 +256,7 @@ impl Shared {
                         "scopes": decl.scopes.clone(),
                         "label": decl.label.clone(),
                         "direct": adapter.direct_call(&decl.tool),
+                        "connected_read": decl.connected_read,
                     })
                 })
                 .collect();
@@ -370,6 +433,58 @@ impl Shared {
         Ok(json!({
             "result": "executed",
             "effect": if draft { "draft" } else { "read" },
+            "platform_result": result,
+        }))
+    }
+
+    /// CAD-1974: one admitted connected read. Unlike [`Self::execute_immediate`]
+    /// there is no draft log and no unattended fallback: the caller's
+    /// connection and ceiling travel with the call, the platform owns the
+    /// price, the claim and the receipt, and its answer is printed unchanged.
+    /// The identity fields and the call stay separate arguments on purpose:
+    /// they come from different sources and must not be confusable.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_connected_read(
+        &self,
+        agent: &str,
+        platform_name: &str,
+        account: &str,
+        tool: &str,
+        input: &Value,
+        connection: &str,
+        max_charge_minor: u64,
+        idempotency_key: &str,
+        adapter: &Arc<dyn PlatformAdapter>,
+    ) -> Result<Value> {
+        let bytes = if adapter.credentialless() {
+            Vec::new()
+        } else {
+            platform::load_credential(&self.store, &self.platform_custody, platform_name, account)?
+        };
+        let result = adapter
+            .execute_connected_read(
+                account,
+                &bytes,
+                &crate::platform::ConnectedRead {
+                    tool,
+                    input,
+                    connection,
+                    max_charge_minor,
+                    idempotency_key,
+                },
+            )
+            .map_err(Error::rejected)?;
+        platform::refuse_leak("platform result", &result.to_string(), &bytes)?;
+        let _ = self.store.event_public(
+            agent,
+            "platform_called",
+            json!({"platform": platform_name, "account": account,
+                   "tool": tool, "effect": "read", "connected": true}),
+        );
+        self.wake();
+        Ok(json!({
+            "result": "executed",
+            "effect": "read",
             "platform_result": result,
         }))
     }

@@ -5935,6 +5935,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     crate::platform::agenticos::attach(&mut opts, &hosted)?;
     crate::platform::agenticos_external::attach(&mut opts)?;
     crate::platform::agenticos_web::attach(&mut opts, state_dir)?;
+    // CAD-1974: read-only marketing provider tools. Registered always so the
+    // listing can explain itself; a call with no enrolled account refuses at
+    // the credential step.
+    crate::platform::agenticos_provider::attach(&mut opts)?;
     // CAD-1640: one reviewed inventory, snapshotted after every adapter is
     // registered. The MCP server and the managed Codex allowlist both derive
     // their names from it, so they cannot drift.

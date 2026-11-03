@@ -176,6 +176,16 @@ pub(crate) enum PlatformAction {
         /// Project whose default account applies.
         #[arg(long)]
         project: Option<String>,
+        /// CAD-1974: the provider connection this read reads — required by a
+        /// tool listed with `connected_read`. Never inferred: a read of
+        /// somebody else's account is not a read the caller asked for.
+        #[arg(long)]
+        connection: Option<String>,
+        /// CAD-1974: the most real money this call may cost, in the platform's
+        /// minor units (USD cents). Required by a `connected_read` tool: the
+        /// caller states the ceiling it accepts before anything runs.
+        #[arg(long)]
+        max_charge: Option<u64>,
     },
     /// List the per-project default platform accounts.
     Defaults,
@@ -359,6 +369,8 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
             platform,
             account,
             project,
+            connection,
+            max_charge,
         } => {
             if query.is_some() {
                 return Err(Error::rejected(
@@ -375,13 +387,18 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
                 listing["project"] = json!(project);
             }
             let tools = rpc("platform_tools", listing)?;
-            let (owner, direct) = resolve_platform_tool(&tools, tool, platform.as_deref())?;
-            if !direct {
+            let (owner, facts) = resolve_platform_tool(&tools, tool, platform.as_deref())?;
+            if !facts.direct {
                 return Err(Error::rejected(format!(
                     "'{tool}' on '{owner}' has no plain platform call; it runs through \
                      its own reviewed path"
                 )));
             }
+            // CAD-1974: a connected read states its connection and the charge
+            // it accepts. Decided here, before the daemon loads a credential,
+            // so an incomplete call never reaches the platform.
+            let (connection, max_charge) =
+                connected_read_flags(tool, facts, connection.clone(), *max_charge)?;
             let mut params = json!({
                 "platform": owner,
                 "tool": tool,
@@ -395,6 +412,12 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
             }
             if let Some(request) = request {
                 params["request"] = json!(request);
+            }
+            if let Some(connection) = connection {
+                params["connection"] = json!(connection);
+            }
+            if let Some(max_charge) = max_charge {
+                params["max_charge_minor"] = json!(max_charge);
             }
             print_json(&rpc("platform_call", params)?);
         }
@@ -450,13 +473,22 @@ pub(super) fn run(state_dir: PathBuf, action: PlatformAction) -> Result<i32> {
     run_platform(&state_dir, &action)
 }
 
+/// What a listing row says about one tool. `direct` is whether a plain
+/// `platform call` can run it; `connected_read` is whether that call must name
+/// its connection and ceiling first (CAD-1974).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ToolFacts {
+    pub(super) direct: bool,
+    pub(super) connected_read: bool,
+}
+
 /// One tool's owning platform from the listing. `platform` narrows it;
 /// without it the tool must have exactly one owner.
 fn resolve_platform_tool(
     listing: &Value,
     tool: &str,
     platform: Option<&str>,
-) -> Result<(String, bool)> {
+) -> Result<(String, ToolFacts)> {
     let mut owners = Vec::new();
     for entry in listing["platforms"].as_array().into_iter().flatten() {
         let Some(name) = entry["platform"].as_str() else {
@@ -471,7 +503,13 @@ fn resolve_platform_tool(
             .flatten()
             .find(|decl| decl["tool"].as_str() == Some(tool))
         {
-            owners.push((name.to_string(), decl["direct"].as_bool().unwrap_or(false)));
+            owners.push((
+                name.to_string(),
+                ToolFacts {
+                    direct: decl["direct"].as_bool().unwrap_or(false),
+                    connected_read: decl["connected_read"].as_bool().unwrap_or(false),
+                },
+            ));
         }
     }
     match owners.len() {
@@ -547,15 +585,15 @@ pub(super) fn parse_platform_input(raw: &str) -> Result<Value> {
 
 fn print_platform_tools(listing: &Value) {
     println!(
-        "{:<16} {:<24} {:<7} {:<6} {:<16}",
-        "PLATFORM", "TOOL", "EFFECT", "DIRECT", "ACCOUNT"
+        "{:<20} {:<24} {:<7} {:<6} {:<9} {:<16}",
+        "PLATFORM", "TOOL", "EFFECT", "DIRECT", "CONNECTED", "ACCOUNT"
     );
     for entry in listing["platforms"].as_array().into_iter().flatten() {
         let platform = entry["platform"].as_str().unwrap_or_default();
         let account = entry["default_account"].as_str().unwrap_or("");
         for decl in entry["tools"].as_array().into_iter().flatten() {
             println!(
-                "{:<16} {:<24} {:<7} {:<6} {:<16}",
+                "{:<20} {:<24} {:<7} {:<6} {:<9} {:<16}",
                 platform,
                 decl["tool"].as_str().unwrap_or_default(),
                 decl["effect"].as_str().unwrap_or_default(),
@@ -564,15 +602,56 @@ fn print_platform_tools(listing: &Value) {
                 } else {
                     "app"
                 },
+                if decl["connected_read"].as_bool() == Some(true) {
+                    "yes"
+                } else {
+                    ""
+                },
                 account,
             );
         }
     }
 }
 
+/// CAD-1974: the flags one `platform call` must carry, decided from the
+/// listing's own declaration. A connected read needs both; any other tool
+/// takes neither, so a stray flag refuses instead of being dropped.
+fn connected_read_flags(
+    tool: &str,
+    facts: ToolFacts,
+    connection: Option<String>,
+    max_charge: Option<u64>,
+) -> Result<(Option<String>, Option<u64>)> {
+    if !facts.connected_read {
+        if connection.is_some() || max_charge.is_some() {
+            return Err(Error::usage(format!(
+                "--connection and --max-charge belong to a connected read; \
+                 '{tool}' takes neither"
+            )));
+        }
+        return Ok((None, None));
+    }
+    let connection = connection.ok_or_else(|| {
+        Error::usage(format!(
+            "'{tool}' reads one connection: pass --connection <id>"
+        ))
+    })?;
+    let max_charge = max_charge.ok_or_else(|| {
+        Error::usage(format!(
+            "'{tool}' is a priced read: pass --max-charge <minor units>"
+        ))
+    })?;
+    Ok((Some(connection), Some(max_charge)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CAD-1974 independent (non-author) refusal check: pins the admission rule
+    // this batch adds, written by a reviewer rather than the implementer.
+    #[path = "cad1974_refusal_tests.rs"]
+    mod cad1974_refusal_tests;
 
     fn listing() -> Value {
         json!({"platforms": [
@@ -584,15 +663,33 @@ mod tests {
              "tools": [{"tool":"post_draft","effect":"draft","scopes":["draft"],"label":"Draft","direct":true},
                        {"tool":"publish_post","effect":"send","scopes":["publish"],"label":null,"direct":true}]},
             {"platform": "local", "manifest_version": null, "default_account": null,
-             "tools": [{"tool":"publish","effect":"send","scopes":["publish"],"label":null,"direct":true}]}
+             "tools": [{"tool":"publish","effect":"send","scopes":["publish"],"label":null,"direct":true}]},
+            {"platform": "agenticos-provider", "manifest_version": "cadence-provider-tools@1",
+             "default_account": null,
+             "tools": [{"tool":"search_console_report","effect":"read","scopes":["provider.read"],"label":"Report","direct":true,"connected_read":true}]}
         ]})
     }
 
     #[test]
     fn a_tool_resolves_to_its_one_owner() {
-        let (owner, direct) = resolve_platform_tool(&listing(), "post_draft", None).unwrap();
+        let (owner, facts) = resolve_platform_tool(&listing(), "post_draft", None).unwrap();
         assert_eq!(owner, "agenticos");
-        assert!(direct);
+        assert!(facts.direct);
+        assert!(!facts.connected_read);
+    }
+
+    /// CAD-1974: the listing is what tells `platform call` it must carry a
+    /// connection and a ceiling — never the tool's name.
+    #[test]
+    fn a_connected_read_is_listed_as_one() {
+        let (owner, facts) =
+            resolve_platform_tool(&listing(), "search_console_report", None).unwrap();
+        assert_eq!(owner, "agenticos-provider");
+        assert!(
+            facts.direct,
+            "it is a plain platform call, with two required flags"
+        );
+        assert!(facts.connected_read);
     }
 
     #[test]
@@ -618,11 +715,38 @@ mod tests {
         assert!(error.to_string().contains("does not declare"), "{error}");
     }
 
+    /// CAD-1974: the four flag shapes, decided before any daemon call.
+    #[test]
+    fn a_connected_read_requires_both_flags_and_other_tools_take_neither() {
+        let read = ToolFacts {
+            direct: true,
+            connected_read: true,
+        };
+        let plain = ToolFacts {
+            direct: true,
+            connected_read: false,
+        };
+        assert_eq!(
+            connected_read_flags("t", read, Some("con_a".into()), Some(25)).unwrap(),
+            (Some("con_a".to_string()), Some(25))
+        );
+        let error = connected_read_flags("t", read, None, Some(25)).unwrap_err();
+        assert!(error.to_string().contains("--connection"), "{error}");
+        let error = connected_read_flags("t", read, Some("con_a".into()), None).unwrap_err();
+        assert!(error.to_string().contains("--max-charge"), "{error}");
+        let error = connected_read_flags("t", plain, Some("con_a".into()), Some(25)).unwrap_err();
+        assert!(error.to_string().contains("takes neither"), "{error}");
+        assert_eq!(
+            connected_read_flags("t", plain, None, None).unwrap(),
+            (None, None)
+        );
+    }
+
     #[test]
     fn an_app_run_only_tool_is_listed_but_not_direct() {
-        let (owner, direct) = resolve_platform_tool(&listing(), "generate_image", None).unwrap();
+        let (owner, facts) = resolve_platform_tool(&listing(), "generate_image", None).unwrap();
         assert_eq!(owner, "account-images");
-        assert!(!direct, "account images run only inside an app run");
+        assert!(!facts.direct, "account images run only inside an app run");
     }
 
     #[test]

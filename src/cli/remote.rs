@@ -914,6 +914,8 @@ fn verb_for(
                     platform,
                     account,
                     project,
+                    connection,
+                    max_charge,
                 } => {
                     if platform.is_some() {
                         return Err(unsupported(
@@ -934,6 +936,27 @@ fn verb_for(
                             "platform call",
                             "--project",
                             "a hosted workspace resolves its own project",
+                        ));
+                    }
+                    // CAD-1974: the connected-read door is the local
+                    // `agenticos-provider` adapter. The hosted board has no
+                    // route for it in this build, so the flags refuse here
+                    // rather than being dropped from a call that then reads
+                    // the wrong account.
+                    if connection.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--connection",
+                            "a hosted workspace has no connected-read door in this build; \
+                             run the read against the local agenticos-provider account",
+                        ));
+                    }
+                    if max_charge.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--max-charge",
+                            "a hosted workspace has no connected-read door in this build; \
+                             run the read against the local agenticos-provider account",
                         ));
                     }
                     let body = match input {
@@ -2751,6 +2774,8 @@ mod read_contract_tests {
             platform: None,
             account: None,
             project: None,
+            connection: None,
+            max_charge: None,
         })
     }
 
@@ -2866,6 +2891,8 @@ mod read_contract_tests {
                     platform: Some("agenticos".into()),
                     account: None,
                     project: None,
+                    connection: None,
+                    max_charge: None,
                 },
             ),
             (
@@ -2878,6 +2905,8 @@ mod read_contract_tests {
                     platform: None,
                     account: Some("work".into()),
                     project: None,
+                    connection: None,
+                    max_charge: None,
                 },
             ),
         ] {

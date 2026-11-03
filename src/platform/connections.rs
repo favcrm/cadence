@@ -314,12 +314,14 @@ mod tests {
                     effect: Some("read".into()),
                     scopes: vec!["provider.read".into()],
                     label: None,
+                    connected_read: false,
                 },
                 ToolDecl {
                     tool: "generate_image".into(),
                     effect: Some("draft".into()),
                     scopes: vec!["provider.draft".into()],
                     label: None,
+                    connected_read: false,
                 },
             ],
         };
