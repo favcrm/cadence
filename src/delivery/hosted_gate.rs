@@ -2021,4 +2021,143 @@ mod tests {
             "{err}"
         );
     }
+
+    // CAD-2081 acceptance for the hosted workflow-row reader, authored from the
+    // ticket by someone other than the implementer; implementers must not edit it.
+    fn workflow_entry(kind: &str, principal: &str) -> Value {
+        let mut row = entry(
+            "favcrm/cadence",
+            kind,
+            principal,
+            "ignored",
+            "20261103120000",
+        );
+        let obj = row.as_object_mut().unwrap();
+        obj.remove("github_login");
+        obj.insert("reviewer".into(), json!(principal));
+        obj.insert("identity_source".into(), json!("workflow-oidc"));
+        let (sha, base) = ("d".repeat(40), "e".repeat(40));
+        for (k, v) in [
+            ("run_id", "9001"),
+            ("run_attempt", "1"),
+            ("workflow_sha", sha.as_str()),
+            ("jti", "jti-0123456789ab"),
+            ("base_sha", base.as_str()),
+        ] {
+            obj.insert(k.into(), json!(v));
+        }
+        row
+    }
+
+    fn doc_with(row: Value) -> Value {
+        let mut doc = hosted_doc();
+        doc["verdicts"] = json!([row]);
+        doc
+    }
+
+    #[test]
+    fn a_workflow_row_has_no_login_and_must_name_its_run_and_base() {
+        // A well-formed workflow row is read, carries its run evidence, and has no login.
+        let (read, code) = verdicts_answer(
+            &doc_with(workflow_entry("standards", "svc_std")),
+            &binding(),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        let row = &read["verdicts"][0];
+        assert_eq!(row["identity_source"], "workflow-oidc");
+        assert!(row.get("github_login").is_none(), "{row}");
+        for field in ["run_id", "run_attempt", "workflow_sha", "jti", "base_sha"] {
+            assert!(
+                row[field].as_str().is_some_and(|v| !v.is_empty()),
+                "{field}"
+            );
+        }
+        // A null login is the same as none.
+        let mut null_login = workflow_entry("standards", "svc_std");
+        null_login["github_login"] = json!(null);
+        assert!(verdicts_answer(&doc_with(null_login), &binding()).is_ok());
+
+        // A workflow row that names a login contradicts itself.
+        for login in [json!("alice"), json!(""), json!(7)] {
+            let mut row = workflow_entry("standards", "svc_std");
+            row["github_login"] = login.clone();
+            assert!(
+                verdicts_answer(&doc_with(row), &binding()).is_err(),
+                "login {login}"
+            );
+        }
+        // Each run field is required, and an empty one is missing (base_sha too: a
+        // row that records no base proves nothing about the branch it was filed for).
+        for field in ["run_id", "run_attempt", "workflow_sha", "jti", "base_sha"] {
+            let mut gone = workflow_entry("spec-security", "svc_spec");
+            gone.as_object_mut().unwrap().remove(field);
+            assert!(
+                verdicts_answer(&doc_with(gone), &binding()).is_err(),
+                "{field} absent"
+            );
+            let mut empty = workflow_entry("spec-security", "svc_spec");
+            empty[field] = json!(" ");
+            assert!(
+                verdicts_answer(&doc_with(empty), &binding()).is_err(),
+                "{field} blank"
+            );
+        }
+        // An identity_source this reader does not know is refused, not read as attested.
+        for source in [
+            json!("oidc"),
+            json!("workflow"),
+            json!(""),
+            json!("WORKFLOW-OIDC"),
+            json!(1),
+            json!(true),
+        ] {
+            let mut row = workflow_entry("standards", "svc_std");
+            row["identity_source"] = source.clone();
+            assert!(
+                verdicts_answer(&doc_with(row), &binding()).is_err(),
+                "source {source}"
+            );
+        }
+        // ...including on a row that also carries a login, which would otherwise read
+        // as an owner attestation under a source nobody defined.
+        for source in ["oidc", "workflow", "WORKFLOW-OIDC", "", "owner"] {
+            let mut row = entry(
+                "favcrm/cadence",
+                "standards",
+                "user_a",
+                "alice",
+                "20261103120000",
+            );
+            row["identity_source"] = json!(source);
+            assert!(
+                verdicts_answer(&doc_with(row), &binding()).is_err(),
+                "attested {source:?}"
+            );
+        }
+        // The owner-attested path still needs its login: naming the source, or
+        // leaving it out, does not excuse the missing attestation.
+        for source in [Some("owner-attested"), None, Some("")] {
+            let mut row = entry(
+                "favcrm/cadence",
+                "standards",
+                "user_a",
+                "alice",
+                "20261103120000",
+            );
+            row.as_object_mut().unwrap().remove("github_login");
+            if let Some(s) = source {
+                row["identity_source"] = json!(s);
+            }
+            assert!(
+                verdicts_answer(&doc_with(row), &binding()).is_err(),
+                "source {source:?}"
+            );
+        }
+        // ...and an owner-attested row still reads, with no run fields invented for it.
+        let (kept, _) = verdicts_answer(&hosted_doc(), &binding()).unwrap();
+        assert_eq!(kept["verdicts"][0]["identity_source"], "owner-attested");
+        assert_eq!(kept["verdicts"][0]["github_login"], "alice");
+        assert!(kept["verdicts"][0].get("workflow_sha").is_none());
+    }
 }

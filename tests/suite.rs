@@ -577,3 +577,686 @@ jobs:
         other => panic!("expected a queue-guard rejection, got {other:?}"),
     }
 }
+
+// CAD-2081 acceptance for workflow-issued review verdicts, authored from the ticket
+// by someone other than the implementer; implementers must not edit it.
+//
+// Each case drives the real `scripts/enqueue-reviewed --dry-run` in a throwaway git
+// checkout against a stubbed `gh` and `cadence` (tests/fixtures/cad2081_gate_stub.py).
+// The hosted row reader is covered in src/delivery/hosted_gate.rs.
+mod cad2081_workflow_verdicts {
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const STUB: &str = include_str!("fixtures/cad2081_gate_stub.py");
+    const REPO: &str = "favcrm/cadence";
+    const STD_FILE: &str = ".github/workflows/review-standards.yml";
+    const SPEC_FILE: &str = ".github/workflows/review-spec.yml";
+    const ALLOWLIST: &str = "docs/roles/review-workflow-principals.toml";
+    const GOOD_ALLOWLIST: &str = "[principals.svc_std]\nkind = \"standards\"\n\
+        workflow = \".github/workflows/review-standards.yml\"\n\
+        [principals.svc_spec]\nkind = \"spec-security\"\n\
+        workflow = \".github/workflows/review-spec.yml\"\n";
+
+    struct Fixture {
+        dir: tempfile::TempDir,
+        base: String,
+        head: String,
+        ui_head: String,
+        self_edit_head: String,
+        differs: String,
+        no_file: String,
+        tip: String,
+        tip_same: String,
+        hosted_gate_head: String,
+        remote_cli_head: String,
+        secret_head: String,
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = cadence_agent::reaper::output(
+            Command::new("git")
+                .current_dir(dir)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args),
+        )
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn put(dir: &Path, path: &str, text: &str) {
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, text).unwrap();
+    }
+
+    fn commit(dir: &Path, message: &str) -> String {
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "--allow-empty", "-m", message]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    impl Fixture {
+        fn new() -> Fixture {
+            Fixture::build(false)
+        }
+
+        /// The same repository with the standards workflow a symlink at the base.
+        fn with_symlinked_workflow() -> Fixture {
+            Fixture::build(true)
+        }
+
+        fn build(symlinked: bool) -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let d = dir.path();
+            git(d, &["init", "-q", "-b", "main"]);
+            if symlinked {
+                put(
+                    d,
+                    ".github/workflows/review-standards-impl.yml",
+                    "standards workflow v1\n",
+                );
+                std::os::unix::fs::symlink("review-standards-impl.yml", d.join(STD_FILE)).unwrap();
+            } else {
+                put(d, STD_FILE, "standards workflow v1\n");
+            }
+            put(d, SPEC_FILE, "spec workflow v1\n");
+            put(d, "README", "base\n");
+            let base = commit(d, "base");
+            // A superseded workflow, and one without the file, off the base.
+            git(d, &["checkout", "-q", "-b", "old", &base]);
+            put(d, STD_FILE, "standards workflow v0\n");
+            let differs = commit(d, "old standards workflow");
+            git(d, &["checkout", "-q", "-b", "gone", &base]);
+            std::fs::remove_file(d.join(STD_FILE)).unwrap();
+            let no_file = commit(d, "no standards workflow");
+            // A PR that rewrites its own standards workflow.
+            git(d, &["checkout", "-q", "-b", "selfedit", &base]);
+            put(d, STD_FILE, "standards workflow v2, written by the PR\n");
+            put(d, "notes/change.txt", "x\n");
+            let self_edit_head = commit(d, "pr rewrites its own reviewer");
+            git(d, &["checkout", "-q", "-b", "ui", &base]);
+            put(d, "ui/app.txt", "x\n");
+            let ui_head = commit(d, "ui change");
+            // PRs that touch only a gate or trust-boundary source file.
+            git(d, &["checkout", "-q", "-b", "hostedgate", &base]);
+            put(d, "src/delivery/hosted_gate.rs", "// x\n");
+            let hosted_gate_head = commit(d, "touch the hosted gate");
+            git(d, &["checkout", "-q", "-b", "remotecli", &base]);
+            put(d, "src/remote_cli.rs", "// x\n");
+            let remote_cli_head = commit(d, "touch the remote client");
+            git(d, &["checkout", "-q", "-b", "secretpath", &base]);
+            put(d, "src/secret/x.rs", "// x\n");
+            let secret_head = commit(d, "touch secret handling");
+            // main has moved on since the PR's base: a live tip with a newer standards
+            // workflow, published as origin/main so either a fetch or the API can see it.
+            git(d, &["checkout", "-q", "-b", "tipmain", &base]);
+            if !symlinked {
+                put(d, STD_FILE, "standards workflow v3, live on main\n");
+            }
+            let tip = commit(d, "main moves the standards workflow");
+            let origin = d.join(".origin.git");
+            git(d, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+            git(d, &["remote", "add", "origin", origin.to_str().unwrap()]);
+            git(d, &["push", "-q", "origin", "tipmain:refs/heads/main"]);
+            git(d, &["fetch", "-q", "origin"]);
+            git(d, &["checkout", "-q", "-b", "tip2", &tip]);
+            let tip_same = commit(d, "an unrelated change after the tip");
+            git(d, &["checkout", "-q", "main"]);
+            put(d, "notes/change.txt", "x\n");
+            let head = commit(d, "ordinary change");
+            Fixture {
+                dir,
+                base,
+                head,
+                ui_head,
+                self_edit_head,
+                differs,
+                no_file,
+                tip,
+                tip_same,
+                hosted_gate_head,
+                remote_cli_head,
+                secret_head,
+            }
+        }
+
+        fn base_files(&self) -> Value {
+            json!({
+                ".github/workflows/ci.yml": "jobs:\n  ci:\n    runs-on: x\n",
+                "docs/roles/risk-paths.toml":
+                    "[schema]\npaths = []\n[trigger1]\npaths = []\n[trigger3]\npaths = []\n[trigger4]\npaths = []\n[trigger6]\npaths = []\n[trigger7]\npaths = []\n",
+                ALLOWLIST: GOOD_ALLOWLIST,
+            })
+        }
+
+        /// The base as it really is: the repository's own risk-paths file.
+        fn real_base_files(&self) -> Value {
+            let mut files = self.base_files();
+            let real = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/roles/risk-paths.toml");
+            files["docs/roles/risk-paths.toml"] = json!(std::fs::read_to_string(real).unwrap());
+            files
+        }
+
+        fn wrow(&self, name: &str, stamp: &str, principal: &str, kind: &str) -> Value {
+            json!({"name": name, "stamp": stamp, "reviewer": principal, "reviewer_id": principal,
+                   "repo": REPO, "kind": kind, "outcome": "pass", "title_outcome": "pass",
+                   "section_outcome": "pass", "risk": "auto", "identity_source": "workflow-oidc",
+                   "run_id": "9001", "run_attempt": "1", "workflow_sha": self.tip,
+                   "jti": "jti-0123456789ab", "base_sha": self.base})
+        }
+
+        fn std(&self) -> Value {
+            self.wrow(
+                "20261103-000100-std.md",
+                "20261103-000100",
+                "svc_std",
+                "standards",
+            )
+        }
+
+        fn spec(&self) -> Value {
+            self.wrow(
+                "20261103-000200-spec.md",
+                "20261103-000200",
+                "svc_spec",
+                "spec-security",
+            )
+        }
+
+        fn owner(&self, name: &str, stamp: &str, id: &str, login: &str, kind: &str) -> Value {
+            json!({"name": name, "stamp": stamp, "reviewer": login, "reviewer_id": id,
+                   "github_login": login, "repo": REPO, "kind": kind, "outcome": "pass",
+                   "title_outcome": "pass", "section_outcome": "pass", "risk": "auto",
+                   "identity_source": "owner-attested"})
+        }
+
+        fn identities() -> Value {
+            json!([{"github_login": "authorlogin", "subject_id": "usr_author"},
+                   {"github_login": "alice", "subject_id": "usr_alice"},
+                   {"github_login": "bob", "subject_id": "usr_bob"}])
+        }
+
+        /// Run the real gate in dry-run mode: (exit code, stdout, stderr).
+        fn gate(&self, case: &Scenario) -> (i32, String, String) {
+            let bin = self.dir.path().join(".stubs");
+            std::fs::create_dir_all(&bin).unwrap();
+            for name in ["gh", "cadence"] {
+                let path = bin.join(name);
+                std::fs::write(&path, STUB).unwrap();
+                std::fs::set_permissions(
+                    &path,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                )
+                .unwrap();
+            }
+            let head = case.head.clone().unwrap_or_else(|| self.head.clone());
+            let mut by_ref = serde_json::Map::new();
+            by_ref.insert(
+                self.base.clone(),
+                case.base_files.clone().unwrap_or_else(|| self.base_files()),
+            );
+            let tip_files = case
+                .tip_files
+                .clone()
+                .unwrap_or_else(|| case.base_files.clone().unwrap_or_else(|| self.base_files()));
+            by_ref.insert(self.tip.clone(), tip_files.clone());
+            by_ref.insert("main".into(), tip_files);
+            if let Some(files) = &case.head_files {
+                by_ref.insert(head.clone(), files.clone());
+            }
+            let scenario = json!({
+                "repo": REPO, "pr": 7, "title": "CAD-1: add the thing", "head": head,
+                "base": case.base_ref, "base_oid": self.base, "tip": self.tip, "author": "authorlogin",
+                "files_by_ref": by_ref, "verdicts": case.rows,
+                "identities": case.identities.clone().unwrap_or_else(Self::identities),
+            });
+            let scenario_path = self.dir.path().join(".scenario.json");
+            std::fs::write(&scenario_path, serde_json::to_vec(&scenario).unwrap()).unwrap();
+            let script: PathBuf =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/enqueue-reviewed");
+            let out = cadence_agent::reaper::output(
+                Command::new("python3")
+                    .arg(script)
+                    .args([
+                        "7",
+                        "--head",
+                        &head,
+                        "--repo",
+                        REPO,
+                        "--dry-run",
+                        "--notes-dir",
+                        "/nonexistent",
+                    ])
+                    .current_dir(self.dir.path())
+                    .env_clear()
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env("HOME", self.dir.path())
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("CADENCE_BIN", bin.join("cadence"))
+                    .env("CAD2081_SCENARIO", &scenario_path),
+            )
+            .unwrap();
+            (
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        }
+    }
+
+    struct Scenario {
+        rows: Vec<Value>,
+        base_ref: String,
+        head: Option<String>,
+        base_files: Option<Value>,
+        head_files: Option<Value>,
+        tip_files: Option<Value>,
+        identities: Option<Value>,
+    }
+
+    fn scenario(rows: Vec<Value>) -> Scenario {
+        Scenario {
+            rows,
+            base_ref: "main".into(),
+            head: None,
+            base_files: None,
+            head_files: None,
+            tip_files: None,
+            identities: None,
+        }
+    }
+
+    fn refused(f: &Fixture, case: Scenario, why: &str) {
+        let (code, stdout, stderr) = f.gate(&case);
+        assert_eq!(
+            code, 1,
+            "expected a refusal containing {why:?}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(why),
+            "no refusal containing {why:?}\nstderr: {stderr}"
+        );
+        assert!(!stdout.contains("every rule holds"), "{stdout}");
+    }
+
+    #[test]
+    fn two_allowlisted_workflow_principals_satisfy_the_review_requirement() {
+        let f = Fixture::new();
+        let (code, stdout, stderr) = f.gate(&scenario(vec![f.std(), f.spec()]));
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("every rule holds"), "{stdout}");
+        assert!(stdout.contains("svc_std standards"), "{stdout}");
+        assert!(stdout.contains("svc_spec spec-security"), "{stdout}");
+        // One axis alone is not two reviews.
+        refused(&f, scenario(vec![f.std()]), "no pass Spec/security verdict");
+        refused(&f, scenario(vec![f.spec()]), "no pass Standards verdict");
+    }
+
+    #[test]
+    fn a_workflow_row_counts_only_for_an_allowlisted_principal_and_its_own_kind() {
+        let f = Fixture::new();
+        // identity_source is a claim, not a credential.
+        let mut forged = f.spec();
+        forged["reviewer_id"] = json!("svc_other");
+        forged["reviewer"] = json!("svc_other");
+        refused(
+            &f,
+            scenario(vec![f.std(), forged]),
+            "svc_other is not in docs/roles/review-workflow-principals.toml",
+        );
+        // A listed principal filing the other axis, or a third kind, is refused.
+        for (principal, kind) in [
+            ("svc_std", "spec-security"),
+            ("svc_spec", "standards"),
+            ("svc_std", "combined"),
+        ] {
+            let mut row = f.wrow("20261103-000300-x.md", "20261103-000300", principal, kind);
+            if kind == "combined" {
+                row["name"] = json!("20261103-000300-c.md");
+            }
+            let rows = if principal == "svc_std" {
+                vec![row, f.spec()]
+            } else {
+                vec![f.std(), row]
+            };
+            refused(
+                &f,
+                scenario(rows),
+                &format!("principal {principal} may file only"),
+            );
+        }
+        // A listed principal's row that does not say it is a workflow row is not counted by login.
+        let mut disguised = f.owner(
+            "20261103-000100-std.md",
+            "20261103-000100",
+            "svc_std",
+            "alice",
+            "standards",
+        );
+        disguised["identity_source"] = json!("owner-attested");
+        refused(
+            &f,
+            scenario(vec![disguised, f.spec()]),
+            "is not a workflow-issued row",
+        );
+        // A workflow row for another repository.
+        let mut elsewhere = f.std();
+        elsewhere["repo"] = json!("favcrm/other");
+        refused(&f, scenario(vec![elsewhere, f.spec()]), "names repo");
+    }
+
+    #[test]
+    fn a_missing_or_malformed_allowlist_at_mains_tip_refuses_every_workflow_row() {
+        let f = Fixture::new();
+        let rows = || vec![f.std(), f.spec()];
+        let cannot = "cannot read docs/roles/review-workflow-principals.toml at main's live tip";
+        let mut missing = f.base_files();
+        missing.as_object_mut().unwrap().remove(ALLOWLIST);
+        let mut case = scenario(rows());
+        case.base_files = Some(missing);
+        refused(&f, case, cannot);
+        for bad in [
+            "[principals.svc_std\nkind =".to_string(),
+            "title = \"no principals\"\n".to_string(),
+            GOOD_ALLOWLIST.replace("kind = \"standards\"", "kind = \"combined\""),
+            GOOD_ALLOWLIST.replace("kind = \"spec-security\"", "kind = \"browser-qa\""),
+            GOOD_ALLOWLIST.replace(".github/workflows/review-spec.yml", "scripts/evil.yml"),
+            GOOD_ALLOWLIST.replace("workflow = \".github/workflows/review-spec.yml\"\n", ""),
+            String::new(),
+        ] {
+            let mut files = f.base_files();
+            files[ALLOWLIST] = json!(bad);
+            let mut case = scenario(rows());
+            case.base_files = Some(files);
+            refused(&f, case, cannot);
+        }
+        // The allowlist is main's: a PR that adds its own reviewer, or a whole
+        // allowlist, changes nothing about what counts.
+        let mut absent_at_base = f.base_files();
+        absent_at_base.as_object_mut().unwrap().remove(ALLOWLIST);
+        let mut case = scenario(rows());
+        case.base_files = Some(absent_at_base);
+        case.head_files = Some(json!({ALLOWLIST: GOOD_ALLOWLIST}));
+        refused(&f, case, cannot);
+        let mut narrow = f.base_files();
+        narrow[ALLOWLIST] = json!(GOOD_ALLOWLIST
+            .split("[principals.svc_spec]")
+            .next()
+            .unwrap());
+        let mut case = scenario(rows());
+        case.base_files = Some(narrow);
+        case.head_files = Some(json!({ALLOWLIST: GOOD_ALLOWLIST}));
+        refused(
+            &f,
+            case,
+            "svc_spec is not in docs/roles/review-workflow-principals.toml",
+        );
+    }
+
+    #[test]
+    fn a_workflow_revise_refuses_even_when_a_later_pass_follows() {
+        let f = Fixture::new();
+        let mut revise = f.spec();
+        revise["outcome"] = json!("revise");
+        revise["section_outcome"] = json!("revise");
+        revise["name"] = json!("20261103-000150-spec.md");
+        revise["stamp"] = json!("20261103-000150");
+        refused(&f, scenario(vec![f.std(), revise.clone()]), "is not a pass");
+        // The later pass (spec() is stamped after the revise) does not erase it.
+        refused(
+            &f,
+            scenario(vec![f.std(), revise, f.spec()]),
+            "is not a pass",
+        );
+    }
+
+    #[test]
+    fn a_workflow_run_of_a_workflow_that_is_not_mains_refuses_by_name() {
+        let f = Fixture::new();
+        let mut old = f.std();
+        old["workflow_sha"] = json!(f.differs);
+        refused(
+            &f,
+            scenario(vec![old, f.spec()]),
+            &format!("{STD_FILE} at workflow commit"),
+        );
+        let mut old = f.std();
+        old["workflow_sha"] = json!(f.differs);
+        refused(
+            &f,
+            scenario(vec![old, f.spec()]),
+            "differs from main's live tip",
+        );
+        // A different commit carrying the same file as main's tip still counts.
+        let mut same = f.std();
+        same["workflow_sha"] = json!(f.tip_same);
+        let (code, stdout, stderr) = f.gate(&scenario(vec![same, f.spec()]));
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        // The comparison is with main, not with the PR's own head: a PR that rewrites
+        // its reviewer cannot be reviewed by the rewrite.
+        let mut own = f.std();
+        own["workflow_sha"] = json!(f.self_edit_head);
+        let mut case = scenario(vec![own, f.spec()]);
+        case.head = Some(f.self_edit_head.clone());
+        refused(&f, case, &format!("{STD_FILE} at workflow commit"));
+    }
+
+    #[test]
+    fn a_workflow_commit_the_gate_cannot_read_refuses_rather_than_skips() {
+        let f = Fixture::new();
+        for (sha, why) in [
+            (json!("b".repeat(40)), "cannot be compared"),
+            (json!("abc1234"), "is not a full commit SHA"),
+            (json!(null), "is not a full commit SHA"),
+            (json!(f.no_file), "is not a regular file"),
+        ] {
+            let mut row = f.std();
+            row["workflow_sha"] = sha.clone();
+            refused(&f, scenario(vec![row, f.spec()]), why);
+        }
+        let mut row = f.spec();
+        row.as_object_mut().unwrap().remove("workflow_sha");
+        refused(&f, scenario(vec![f.std(), row]), "is not a full commit SHA");
+    }
+
+    #[test]
+    fn two_good_rows_do_not_count_once_the_prs_base_is_not_main() {
+        let f = Fixture::new();
+        let mut case = scenario(vec![f.std(), f.spec()]);
+        case.base_ref = "staging".into();
+        refused(&f, case, "the PR's base is now 'staging', not main");
+    }
+
+    #[test]
+    fn a_workflow_row_that_records_no_base_commit_refuses() {
+        let f = Fixture::new();
+        for broken in [None, Some(""), Some("main"), Some("e5e5")] {
+            let mut row = f.std();
+            match broken {
+                None => {
+                    row.as_object_mut().unwrap().remove("base_sha");
+                }
+                Some(v) => row["base_sha"] = json!(v),
+            }
+            refused(&f, scenario(vec![row, f.spec()]), "records no base_sha");
+        }
+    }
+
+    #[test]
+    fn a_ui_change_still_needs_browser_qa_after_two_workflow_passes() {
+        let f = Fixture::new();
+        let mut case = scenario(vec![f.std(), f.spec()]);
+        case.head = Some(f.ui_head.clone());
+        refused(&f, case, "a ui/ change needs a pass Browser QA verdict");
+        // The same two rows pass an ordinary change, so the refusal is the ui/ rule's.
+        let (code, _, stderr) = f.gate(&scenario(vec![f.std(), f.spec()]));
+        assert_eq!(code, 0, "{stderr}");
+    }
+
+    #[test]
+    fn owner_attested_rows_and_the_author_refusal_are_unchanged() {
+        let f = Fixture::new();
+        let alice = || {
+            f.owner(
+                "20261103-000100-a.md",
+                "20261103-000100",
+                "usr_alice",
+                "alice",
+                "standards",
+            )
+        };
+        let bob = || {
+            f.owner(
+                "20261103-000200-b.md",
+                "20261103-000200",
+                "usr_bob",
+                "bob",
+                "spec-security",
+            )
+        };
+        let (code, stdout, stderr) = f.gate(&scenario(vec![alice(), bob()]));
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("alice standards"), "{stdout}");
+        // CAD-2049: the author's own attested row is refused...
+        let author = f.owner(
+            "20261103-000200-b.md",
+            "20261103-000200",
+            "usr_author",
+            "authorlogin",
+            "spec-security",
+        );
+        refused(&f, scenario(vec![alice(), author]), "is not independent");
+        // ...and so is a row that cannot be proven to be someone else's.
+        let mut case = scenario(vec![alice(), bob()]);
+        case.identities = Some(json!([{"github_login": "alice", "subject_id": "usr_alice"},
+                                      {"github_login": "bob", "subject_id": "usr_bob"}]));
+        refused(&f, case, "has no attested principal");
+        // The allowlist does not weaken it: a workflow pass beside the author's row still refuses.
+        let author = f.owner(
+            "20261103-000100-a.md",
+            "20261103-000100",
+            "usr_author",
+            "authorlogin",
+            "standards",
+        );
+        refused(&f, scenario(vec![author, f.spec()]), "is not independent");
+    }
+
+    #[test]
+    fn the_allowlist_and_workflow_are_read_at_mains_live_tip() {
+        let f = Fixture::new();
+        // A principal removed on main since the PR's base no longer counts, on a PR behind main.
+        let mut revoked = f.base_files();
+        revoked[ALLOWLIST] = json!(GOOD_ALLOWLIST
+            .split("[principals.svc_spec]")
+            .next()
+            .unwrap());
+        let mut case = scenario(vec![f.std(), f.spec()]);
+        case.tip_files = Some(revoked);
+        refused(
+            &f,
+            case,
+            "svc_spec is not in docs/roles/review-workflow-principals.toml",
+        );
+        // A fresh run from the tip counts, though the PR's base still has the older workflow.
+        let (code, stdout, stderr) = f.gate(&scenario(vec![f.std(), f.spec()]));
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        // A run of the workflow as it was at the PR's base no longer matches main's.
+        let mut stale = f.std();
+        stale["workflow_sha"] = json!(f.base);
+        refused(
+            &f,
+            scenario(vec![stale, f.spec()]),
+            "differs from main's live tip",
+        );
+    }
+
+    #[test]
+    fn a_pr_touching_only_gate_or_trust_boundary_source_still_needs_an_approval() {
+        let f = Fixture::new();
+        for head in [&f.hosted_gate_head, &f.remote_cli_head, &f.secret_head] {
+            let mut case = scenario(vec![f.std(), f.spec()]);
+            case.head = Some(head.clone());
+            case.base_files = Some(f.real_base_files());
+            let (code, stdout, stderr) = f.gate(&case);
+            assert_eq!(code, 1, "{head}\nstdout: {stdout}\nstderr: {stderr}");
+            assert!(stdout.contains("class: human"), "{head}\n{stdout}");
+            assert!(
+                stderr.contains("no operator approval recorded"),
+                "{head}\n{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlinked_workflow_never_counts_even_at_the_same_blob() {
+        let f = Fixture::with_symlinked_workflow();
+        let (code, stdout, stderr) = f.gate(&scenario(vec![f.std(), f.spec()]));
+        assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stderr.contains("workflow verdict 20261103-000100-std.md cannot count"),
+            "{stderr}"
+        );
+        assert!(!stdout.contains("every rule holds"), "{stdout}");
+    }
+
+    #[test]
+    fn the_allowlist_in_the_repository_is_the_tenants_map() {
+        // The reviewed map in the tenant (agenticos-v2 PR 1689, review-workflows.ts).
+        let want = [
+            ("svc_review_standards", "standards", STD_FILE),
+            ("svc_review_spec", "spec-security", SPEC_FILE),
+        ];
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(ALLOWLIST);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is not in the repository: {e}", path.display()));
+        let doc: toml::Table = text.parse().unwrap();
+        let table = doc["principals"].as_table().unwrap();
+        assert_eq!(table.len(), want.len(), "{table:?}");
+        for (principal, kind, workflow) in want {
+            let entry = table[principal].as_table().unwrap();
+            assert_eq!(entry["kind"].as_str(), Some(kind), "{principal}");
+            assert_eq!(entry["workflow"].as_str(), Some(workflow), "{principal}");
+        }
+        // And the gate counts exactly those principals when it reads that file.
+        let f = Fixture::new();
+        let mut files = f.base_files();
+        files[ALLOWLIST] = json!(text);
+        let rows = vec![
+            f.wrow(
+                "20261103-000100-std.md",
+                "20261103-000100",
+                "svc_review_standards",
+                "standards",
+            ),
+            f.wrow(
+                "20261103-000200-spec.md",
+                "20261103-000200",
+                "svc_review_spec",
+                "spec-security",
+            ),
+        ];
+        let mut case = scenario(rows);
+        case.base_files = Some(files);
+        let (code, stdout, stderr) = f.gate(&case);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    }
+}

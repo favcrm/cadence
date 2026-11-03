@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Test double for `gh` and `cadence`, as seen by scripts/enqueue-reviewed.
+
+CAD-2081 acceptance support: the suite installs this file twice, as `gh` and as
+`cadence`, and points CAD2081_SCENARIO at a JSON document describing the PR, the
+org's verdict rows and the files each ref carries. It answers only what the gate
+asks and nothing else, so an unexpected question fails loudly.
+"""
+import json
+import os
+import re
+import sys
+
+S = json.load(open(os.environ["CAD2081_SCENARIO"]))
+NAME = os.path.basename(sys.argv[0])
+ARGS = sys.argv[1:]
+RUN_URL = f"https://github.com/{S['repo']}/actions/runs/101"
+
+
+def out(doc):
+    print(json.dumps(doc))
+    sys.exit(0)
+
+
+def fail(msg, rc=1):
+    print(msg, file=sys.stderr)
+    sys.exit(rc)
+
+
+def gh():
+    if ARGS[:2] == ["pr", "view"]:
+        out({"number": S["pr"], "state": "OPEN", "title": S["title"], "headRefName": "feature",
+             "headRefOid": S["head"], "baseRefName": S["base"], "baseRefOid": S["base_oid"],
+             "mergeStateStatus": "CLEAN", "autoMergeRequest": None, "statusCheckRollup": [],
+             "author": {"login": S["author"]}})
+    if ARGS[:1] != ["api"]:
+        fail(f"stub gh: unexpected {ARGS}", 3)
+    path = next(a for a in ARGS[1:] if a.startswith("repos/"))
+    repo = S["repo"]
+    if path == f"repos/{repo}/git/ref/heads/main":
+        print(S["tip"])
+        sys.exit(0)
+    if path.startswith(f"repos/{repo}/rules/branches/"):
+        out([{"type": "required_status_checks", "parameters": {"required_status_checks": [
+            {"context": "ci", "integration_id": 15368}]}}])
+    if path.endswith("/protection"):
+        fail("Branch not protected (HTTP 404)")
+    if path.startswith(f"repos/{repo}/actions/runs?head_sha={S['head']}"):
+        out({"total_count": 1, "workflow_runs": [{
+            "id": 101, "run_number": 5, "run_attempt": 1, "workflow_id": 77,
+            "path": ".github/workflows/ci.yml", "check_suite_id": 55, "head_sha": S["head"],
+            "event": "pull_request", "status": "completed", "conclusion": "success",
+            "run_started_at": "2026-11-03T10:00:00Z", "html_url": RUN_URL}]})
+    if "/check-runs?" in path:
+        out({"total_count": 1, "check_runs": [{
+            "id": 9, "name": "ci", "head_sha": S["head"], "status": "completed",
+            "conclusion": "success", "started_at": "2026-11-03T10:00:01Z",
+            "app": {"id": 15368, "slug": "github-actions"}, "check_suite": {"id": 55}}]})
+    m = re.fullmatch(rf"repos/{re.escape(repo)}/contents/(.+)\?ref=([^&]+)", path)
+    if m:
+        # The ref matters: a file read at the head is not a file read at the base.
+        text = S["files_by_ref"].get(m.group(2), {}).get(m.group(1))
+        if text is None:
+            fail("Not Found (HTTP 404)")
+        print(text, end="")
+        sys.exit(0)
+    fail(f"stub gh: unexpected api {path}", 3)
+
+
+def cadence():
+    if ARGS[:3] == ["issue", "show", "CAD-1"]:
+        names = " ".join(v["name"] for v in S["verdicts"])
+        body = f"{S['head']}\nBase branch: {S['base']}\nGreen CI run: {RUN_URL}\n{names}\n"
+        out({"id": "CAD-1", "project": "cadence", "owner": None, "claim": None,
+             "comments": [{"body": body}]})
+    if ARGS[:2] == ["delivery", "requirements"]:
+        digest = "sha256:" + "0" * 64
+        out({"issue": "CAD-1", "project": "cadence", "repo": S["repo"].lower(), "pr": S["pr"],
+             "head": S["head"], "base": S["base_oid"], "base_ref": S["base"],
+             "merge_base": S["base_oid"], "policy_digest": digest, "origin": "hosted",
+             "requirements": {"class": "strict", "activation": "no_profile", "reviews": 2,
+                              "review_kind": "standards_and_spec", "security_capable": False,
+                              "operator_approval": False, "browser_qa": False,
+                              "full_checks": True, "policy_digest": digest, "reasons": []},
+             "readiness": None})
+    if ARGS[:2] == ["audit", "verdicts"]:
+        if ARGS[ARGS.index("--project") + 1] != "cadence":
+            fail("stub cadence: verdicts read without the ticket's project", 3)
+        out({"origin": "hosted", "project": "cadence", "verdicts": S["verdicts"], "skipped": []})
+    if ARGS[:2] == ["audit", "identities"]:
+        out({"identities": S["identities"]})
+    if ARGS[:2] == ["audit", "approval"]:
+        print(json.dumps({"state": "missing", "reason": "no approval recorded"}))
+        sys.exit(1)
+    fail(f"stub cadence: unexpected {ARGS}", 3)
+
+
+{"gh": gh, "cadence": cadence}[NAME]()
