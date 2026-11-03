@@ -87,7 +87,8 @@ note parse and `hosted` for the org's record, and the merge gate applies the
 attested rule only to `hosted`. A hosted read takes `--project` and `--repo`
 (the default repo is the cwd checkout's github.com origin), sends both, and
 refuses an answer naming another project or repository; each hosted entry
-carries `repo`, `reviewer_id` and `github_login`. A local read refuses
+carries `repo`, `reviewer_id` and `github_login`, except a workflow-issued row
+(CAD-2081), which has no `github_login`. A local read refuses
 `--repo` and `--project`, because notes are neither repo- nor project-scoped.
 The binding itself is the workspace owner's record — the GitHub login once for
 the workspace, and the project's review set as principals:

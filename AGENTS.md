@@ -135,6 +135,13 @@ the code you just wrote.
   author's identity still refuses under the exception, so a same-login
   session posts its findings as a PR comment and files no verdict. A second
   attested human is not required.
+- **The changed set is anchored to main's live tip.** GitHub's PR base SHA can stay
+  older than the real merge base after main is merged into the branch, so a PR
+  that merges main and restores an old file diffs as docs-only against it.
+  `scripts/enqueue-reviewed` therefore diffs a main-based PR from the merge base
+  with main's live tip (the changed files, line count and every path class read
+  from that diff) and refuses if the tip cannot be read. A PR on another base keeps
+  the PR's base.
 - **Workflow-issued reviews (CAD-2081; the workflows are not shipped yet).** The
   gate counts a hosted row whose `identity_source` is `workflow-oidc` only when
   all of these hold, each read at gate time: its principal is in
@@ -163,20 +170,19 @@ the code you just wrote.
   filed for a head live at filing. It does not prove good judgement. A workflow
   row may carry `risk: auto`, and a prompt-injected model can write it: a PR that
   fools both models skips the operator unless a human path or size trigger
-  applies. The gate therefore inverts the rule: a PR with any workflow-issued row
-  needs the operator's approval unless EVERY changed path matches
-  `docs/roles/workflow-auto-paths.toml`, read at main's live tip, and every change
-  is a plain add or modify of a regular file (a delete, rename, symlink, executable
-  or mode change needs the operator). Nothing outside that list is eligible, so a
-  path no list names fails closed, and a missing or unreadable file means the
-  operator. It starts as `design-plans/**/*.md` only, so nearly every PR still
-  needs one operator approval after two workflow reviews; widening it is a later,
-  deliberate decision, made only after reading what a path holds. Whatever the list
-  says, a path with a segment starting with `.` or a file named AGENTS.md, CLAUDE.md
-  or GEMINI.md is never eligible, and a modify must keep mode 100644. `cadence
-  delivery requirements` does not report this rule; the script adds it. Rule-7
-  paths, the size trigger and a non-`auto` `Risk:` still force the operator as
-  before. The tenant stops re-filing, not re-rolling: a run can be cancelled and
+    applies. The gate therefore inverts the rule: a PR with any workflow-issued
+  row needs the operator's approval unless EVERY changed path matches
+  `docs/roles/workflow-auto-paths.toml`, read at main's live tip, and every
+  change is a plain add or modify (mode 100644). That list is EMPTY (`paths =
+  []`) and the reader and rules stay, so today the operator approves every
+  merge, and workflow rows only satisfy the two reviews. Enabling a path later
+  is one reviewed line and a later, deliberate decision, made only after reading
+  what the path holds. Whatever the list says, a path with a segment starting
+  with `.` or a basename starting `agents.`, `claude.` or `gemini.` is never
+  eligible. `cadence delivery requirements` does not report this rule; the
+  script adds it. Rule-7 paths, the size trigger and a non-`auto` `Risk:` also
+  force the operator. A workflow row that is not a pass refuses in every class.
+  The tenant stops re-filing, not re-rolling: a run can be cancelled and
   re-dispatched, or an empty commit pushed, for a new head and a new verdict. A
   session holding admin can still rewrite the workflow or sign directly until
   agents lose admin. There is no Browser QA workflow: a `ui/` PR still needs a

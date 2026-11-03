@@ -137,7 +137,7 @@ RISK_HUMAN_TABLES = ("schema", "trigger4", "trigger6", "trigger7")
 # write `risk: auto` (a prompt-injected model can), so no path is eligible by
 # default.
 WORKFLOW_AUTO_FILE = "docs/roles/workflow-auto-paths.toml"
-WORKFLOW_NEVER_BASENAMES = ("agents.md", "claude.md", "gemini.md")  # compared lower-case
+WORKFLOW_NEVER_PREFIXES = ("agents.", "claude.", "gemini.")  # basename prefixes, lower-case
 HUMAN_LINES = 1500  # risk-classes trigger 5
 HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml",
                    "package-lock.json", ".npmrc", "yarn.lock", "bun.lockb",
@@ -283,23 +283,36 @@ def parse_raw_diff(raw):
     return out
 
 
-def pr_changes(pr, head, base, base_oid):
+def pr_changes(pr, head, base, base_oid, main_tip=None):
     """(changes, changed_lines) of the PR, from git in the current checkout:
     fetch the base and the PR head when either commit is absent, then diff the
     merge base to the pinned head with no rename detection (a rename is a
-    delete plus an add, so both ends are seen). Raises on any failure."""
+    delete plus an add, so both ends are seen). Raises on any failure.
+
+    CAD-2081: GitHub's `baseRefOid` can stay older than the real merge base after
+    main is merged into the branch, so a PR that merges main and restores an old
+    file diffs as docs-only against it. For a PR based on `main`, `main_tip` (main's
+    live tip, never empty) replaces `baseRefOid` as the merge-base anchor; an
+    unreadable tip raises. Any other base keeps the PR's base."""
+    anchor = base_oid
+    if base == "main":
+        if not main_tip:
+            raise RuntimeError("cannot read main's live tip, so the changed set cannot be anchored to it (fail closed)")
+        anchor = main_tip
     def have(sha):
         return run(["git", "cat-file", "-e", f"{sha}^{{commit}}"])[0] == 0
-    if not (have(head) and have(base_oid)):
+    if not (have(head) and have(base_oid) and have(anchor)):
         rc, _, err = run(["git", "fetch", "--quiet", "--no-tags", "origin", base, f"refs/pull/{pr}/head"])
         if rc != 0:
             raise RuntimeError(f"git fetch of {base} and refs/pull/{pr}/head failed: {err.strip()}")
-    for sha in (head, base_oid):
+        if not have(anchor):
+            run(["git", "fetch", "--quiet", "--no-tags", "origin", anchor])
+    for sha in (head, base_oid, anchor):
         if not have(sha):
             raise RuntimeError(f"commit {sha} is not in this checkout (run from a checkout of the repo)")
-    rc, mb, err = run(["git", "merge-base", base_oid, head])
-    if rc != 0 or not FULL_SHA.match(mb.strip()):
-        raise RuntimeError(f"no merge base of {base_oid} and {head}: {err.strip()}")
+    rc, mb, err = run(["git", "merge-base", anchor, head])
+    if rc != 0 or not FULL_SHA.fullmatch(mb.strip()):
+        raise RuntimeError(f"no merge base of {anchor} and {head}: {err.strip()}")
     mb = mb.strip()
     rc, out, err = run(["git", "diff", "--raw", "-z", "--no-renames", "--no-abbrev", mb, head])
     if rc != 0:
@@ -332,28 +345,34 @@ def workflow_auto_reasons(changes, toml_text):
     A positive allowlist: every change must be a plain add or modify of a regular
     file with new mode 100644 (a modify keeps its mode) on a path matching
     WORKFLOW_AUTO_FILE's `[auto] paths`. A delete, rename (seen as a delete plus an
-    add), symlink, submodule, executable or mode change, a path outside the list, an
-    empty list and a missing or unreadable file all need the operator. Whatever the
-    list says, a path with a segment starting with `.` (.github, .claude,
-    .gitattributes) or a basename of AGENTS.md, CLAUDE.md or GEMINI.md (any case,
-    any directory: they can load as agent instructions) is never eligible."""
+    add), symlink, submodule, executable or mode change, a path not on the list and a
+    missing or unreadable file all need the operator. An EMPTY list is valid and
+    means every path needs the operator. Whatever the list says, a path with a
+    segment starting with `.` (.github, .claude, .gitattributes) or a basename
+    starting `agents.`, `claude.` or `gemini.` (any case, any directory: they can
+    load as agent instructions) is never eligible."""
     globs = glob_list(toml_text, ("auto", "paths"))
     if globs is None:
         return [f"cannot read {WORKFLOW_AUTO_FILE} at main's live tip, so a workflow review "
                 "cannot stand in for the operator (fail closed)"]
     out = []
     for status, old_mode, new_mode, path in changes:
-        odd = (not path or path.startswith("/") or "\\" in path or ".." in path
-               or any(seg in ("", ".") for seg in path.split("/")))
-        plain = ((status == "A" and old_mode == "000000" and new_mode == "100644")
-                 or (status == "M" and old_mode == "100644" and new_mode == "100644"))
         segs = path.split("/")
-        reserved = (any(seg.startswith(".") for seg in segs)
-                    or segs[-1].lower() in WORKFLOW_NEVER_BASENAMES)
-        if odd or reserved or not plain or not any(glob_match(g, path) for g in globs):
-            out.append(path)
-    return ([f"a workflow review cannot stand in for the operator on paths outside "
-             f"{WORKFLOW_AUTO_FILE}: {', '.join(out[:5])}"] if out else [])
+        if (not path or path.startswith("/") or "\\" in path or ".." in path
+                or any(seg in ("", ".") for seg in segs)):
+            why = "an odd path name"
+        elif any(seg.startswith(".") for seg in segs) or segs[-1].lower().startswith(WORKFLOW_NEVER_PREFIXES):
+            why = "a hidden or agent-instruction file name"
+        elif not ((status == "A" and old_mode == "000000" and new_mode == "100644")
+                  or (status == "M" and old_mode == "100644" and new_mode == "100644")):
+            why = "not a plain add or modify of a 100644 file"
+        elif not any(glob_match(g, path) for g in globs):
+            why = f"not on the list in {WORKFLOW_AUTO_FILE}"
+        else:
+            continue
+        out.append(f"{path} ({why})")
+    return ([f"a workflow review cannot stand in for the operator: {'; '.join(out[:5])}"]
+            if out else [])
 
 
 def is_human_path(path, risk=()):
@@ -1451,8 +1470,9 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                 reasons.append(str(e))
 
     # Changed paths (modes included) and size, straight from git.
+    live_tip = live_main_tip(repo) if base == "main" else ""
     try:
-        changes, lines = pr_changes(pr, head, base, base_oid)
+        changes, lines = pr_changes(pr, head, base, base_oid, live_tip)
     except RuntimeError as e:
         reasons.append(f"cannot list the changed files of PR #{pr}: {e}")
         changes, lines = [], 0
@@ -1581,7 +1601,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             # might reserve; ordinary owner rows never need the list.
             wf_principals = None
             if verdicts:
-                main_tip = live_main_tip(repo)
+                main_tip = live_tip or live_main_tip(repo)
                 if main_tip:
                     rc, wf_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
                                           f"repos/{repo}/contents/{WORKFLOW_PRINCIPALS_FILE}?ref={main_tip}"])
@@ -1630,6 +1650,11 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                     reasons.append("native routine readiness CI run is not the actual successful ci.yml run at this head")
             if need_qa:
                 reasons += check_reviews(verdicts, True, True, authors, issue, hosted)[0]
+            # A workflow row that is not a pass refuses whatever the class, so it
+            # stays true when hosted readiness ships. Owner rows are unchanged here.
+            reasons += [f"workflow verdict {v['name']} is not a pass (outcome '{v['outcome']}'): "
+                        "a workflow review that is not a pass always refuses"
+                        for v in verdicts if is_workflow_row(v) and v["outcome"] != "pass"]
         elif klass == "consequential":
             rs, counted = check_reviews(verdicts, True, need_qa, authors, issue, hosted)
             reasons += rs
