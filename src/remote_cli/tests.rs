@@ -3150,3 +3150,37 @@ fn hosted_platform_catalog_in_progress_reply_remains_a_read_refusal() {
         "a catalog read must not claim a possible paid dispatch: {text}"
     );
 }
+
+#[test]
+fn artifact_verbs_are_reads_and_a_store_refusal_is_named() {
+    use super::{artifact_refusal, artifact_tenant_too_old, mutating_cli_verb, REMOTE_VERBS};
+    for verb in ["artifact_find", "artifact_show", "artifact_read"] {
+        assert!(REMOTE_VERBS.contains(&verb), "{verb}");
+        assert!(!mutating_cli_verb(verb), "{verb}");
+    }
+    let refused = artifact_refusal(
+        400,
+        Some(&serde_json::json!({"error": {"code": "invalid_request", "message": "not a pdf"}})),
+    );
+    assert!(refused.to_string().contains("not a pdf"));
+    // Only the store's own codes are echoed; any other body goes through the safe decoder.
+    let other = artifact_refusal(
+        403,
+        Some(&serde_json::json!({"error": {"code": "secret", "message": "leak-me"}})),
+    );
+    assert!(!other.to_string().contains("leak-me"));
+    // A success that does not name these bytes is not a proven success.
+    use super::artifact_receipt;
+    let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let good = serde_json::json!({"file": {"id": "art-1", "version": 1, "digest": digest}});
+    assert!(artifact_receipt(good, b"abc").is_ok());
+    for bad in [
+        serde_json::json!({}),
+        serde_json::json!({"file": {"id": "art-1", "version": 1, "digest": "00"}}),
+    ] {
+        assert_eq!(artifact_receipt(bad, b"abc").unwrap_err().kind(), "unknown");
+    }
+    let old = artifact_tenant_too_old("artifact_find", 501, "read");
+    assert!(old.contains("update the tenant server first"));
+    assert!(!old.contains("unavailable"));
+}
