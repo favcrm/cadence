@@ -24,7 +24,7 @@ import {
   IdentitySnapshots,
   type IdentitySnapshotSql,
 } from "./identity-snapshots.ts";
-import { masterState } from "./master.ts";
+import { masterState, operationStatus } from "./master.ts";
 import { defaultModel, meteredBinding, withDefaultModel } from "./model.ts";
 import {
   companyOutputSkills,
@@ -169,14 +169,14 @@ export class HostedSession<
         const master = this.options.threadContext
           ? this.validatedThreadContext(await this.options.threadContext())
           : null;
-        const model = await this.modelLabel();
+        const status = await this.state();
         // Serialize the actual composed payload once, before opening a watch
         // or returning SSE 200. Metadata may contain non-JSON values, while
         // reserved fields it cannot override must retain runtime precedence.
         masterFrame = `event: master\ndata: ${JSON.stringify(
           masterState(
-            model,
-            { running: false, queued: 0 },
+            status.model,
+            status,
             master?.conversationId ?? null,
             master?.metadata,
           ),
@@ -209,8 +209,7 @@ export class HostedSession<
           // The board flips its link to `live` on a `master` frame and on
           // nothing else, so a stream that never sends one reads
           // "reconnecting" forever — the stale banner then never clears.
-          // This object is the master: it answered, and it holds no live
-          // native turn, so the honest snapshot is idle. A host projection
+          // It reports this object's real turn state. A host projection
           // composes under those runtime fields and cannot replace them.
           send(masterFrame);
           for (const entry of threadEntries(stream.snapshot.entries, thinking))
@@ -369,12 +368,20 @@ export class HostedSession<
       this.pendingOperations(),
       this.modelLabel(),
     ]);
-    return {
-      running: pending.some((operation) => operation.status === "running"),
-      queued: pending.filter((operation) => operation.status === "queued")
-        .length,
-      model,
-    };
+    return { ...operationStatus(pending), model };
+  }
+
+  /**
+   * Stop the turn with this id. The id is required: the engine reads a missing
+   * one as "abort this session" even when nothing has been asked to stop.
+   * Stopping a running turn aborts its conversation, and the engine withdraws
+   * the conversation's queued inputs with it: a caller reads `queuedMessages`
+   * first and hands those back to the person who sent them. False when nothing
+   * matched.
+   */
+  async stopOperation(operationId: string): Promise<boolean> {
+    if (!operationId) return false;
+    return this.harness.session().abort(operationId);
   }
 
   private recordResolvedModel(served: string): void {

@@ -1,7 +1,21 @@
-import type { MasterStatus } from "./contract.ts";
+import type { HostedState, MasterStatus, PendingOperation } from "./contract.ts";
 
 /** Application-owned business identity for the thread header. */
 export type MasterMetadata = Readonly<Record<string, unknown>>;
+
+/** The header's turn facts, from what the engine has not settled. */
+export function operationStatus(
+  pending: readonly PendingOperation[],
+): Pick<HostedState, "running" | "message" | "queued" | "queuedMessages"> {
+  const running = pending.find((operation) => operation.status === "running");
+  const queued = pending.filter((operation) => operation.status === "queued");
+  return {
+    running: running !== undefined,
+    message: running?.operationId ?? null,
+    queued: queued.length,
+    queuedMessages: queued.map((operation) => operation.operationId),
+  };
+}
 
 /**
  * The board's master payload, in one place.
@@ -45,11 +59,13 @@ export function masterState(
             streaming: status.running,
             compacting: false,
           },
-    commands: [],
+    // What the board host relays to this session. The composer offers these
+    // and nothing else, so a verb is listed only once the host has its route.
+    commands: ["stop"],
     turn: status.running
       ? {
           state: "working",
-          message: null,
+          message: status.message ?? null,
           conversation: conversationId,
           app_origin: null,
           summary: null,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { masterState } from "../src/master.ts";
+import { masterState, operationStatus } from "../src/master.ts";
 
 /**
  * The master payload both the HTTP header and the stream frame use. The
@@ -54,7 +54,7 @@ describe("master payload", () => {
     });
     expect(state.queued).toBe(0);
     expect(state.queue).toEqual([]);
-    expect(state.commands).toEqual([]);
+    expect(state.commands).toEqual(["stop"]);
     // Business identity survives without overriding the runtime's authority.
     expect(state.identity).toEqual({ look: "guard" });
   });
@@ -74,5 +74,26 @@ describe("master payload", () => {
     expect(state.toJSON).toBe("ordinary business data");
     expect(state.provider).toBe("cadence");
     expect(state.model).toBe("alias");
+  });
+
+  // CAD-2015: the board names, and can stop, the running turn.
+  it("names the running operation, and never a queued or parked one", () => {
+    expect(
+      operationStatus([
+        { operationId: "queued-1", status: "queued" },
+        { operationId: "parked-1", status: "parked" },
+        { operationId: "running-1", status: "running" },
+      ]),
+    ).toEqual({ running: true, message: "running-1", queued: 1, queuedMessages: ["queued-1"] });
+    expect(
+      operationStatus([{ operationId: "parked-1", status: "parked" }]),
+    ).toEqual({ running: false, message: null, queued: 0, queuedMessages: [] });
+    const named = masterState("alias", { running: true, queued: 0, message: "running-1" }, "conv-1");
+    expect((named.turn as { message: unknown }).message).toBe("running-1");
+  });
+
+  it("keeps a null turn id valid for a caller that does not know it", () => {
+    const unnamed = masterState("alias", { running: true, queued: 0 }, "conv-1");
+    expect((unnamed.turn as { message: unknown }).message).toBeNull();
   });
 });

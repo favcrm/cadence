@@ -31,6 +31,8 @@ export interface ThreadEntry {
   text: string;
   /** The recorded message id of the operator input, never inferred from text. */
   message?: string;
+  /** When the engine recorded this message (ISO 8601). Absent when it has no real time. */
+  created?: string;
   payload?: {
     redacted?: true;
     tool_use_id?: string;
@@ -231,13 +233,19 @@ export interface AskResult {
 
 /** One submission the runtime has not settled yet. */
 export interface PendingOperation {
+  /** The id the input was submitted under: the board's message id for a send. */
+  readonly operationId: string;
   readonly status: "queued" | "running" | "parked";
 }
 
 /** Cheap header state for a conversation. */
 export interface HostedState {
   readonly running: boolean;
+  /** The running operation's id, so the board can name and stop that turn. */
+  readonly message: string | null;
   readonly queued: number;
+  /** The queued operations' ids: stopping the running turn withdraws them. */
+  readonly queuedMessages: readonly string[];
   readonly model: string;
 }
 
@@ -258,4 +266,6 @@ export const OPERATIONAL_SKILL_VERSION = "tenant-operations-1";
 export interface MasterStatus {
   readonly running: boolean;
   readonly queued: number;
+  /** The running turn's message id. Absent or null means it is not known. */
+  readonly message?: string | null;
 }

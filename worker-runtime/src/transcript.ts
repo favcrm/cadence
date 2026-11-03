@@ -67,6 +67,13 @@ function toolCallText(name: string, args: Record<string, unknown>): string {
   return json === undefined || json === "{}" ? name : `${name} ${json}`;
 }
 
+/** A message's recorded time, or nothing: a time is never invented. */
+function createdAt(timestamp: unknown): { created: string } | Record<string, never> {
+  return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0
+    ? { created: new Date(timestamp).toISOString() }
+    : {};
+}
+
 /**
  * Map the engine's committed records, including durable input metadata, into
  * the board's entries.
@@ -107,6 +114,7 @@ export function threadEntries(
           role: "agent",
           kind: "tool_result",
           text,
+          ...createdAt(message.timestamp),
           payload: {
             tool_use_id: message.toolCallId,
             ...(message.isError ? { is_error: true as const } : {}),
@@ -138,6 +146,7 @@ export function threadEntries(
             role: "agent",
             kind: "thinking",
             text: part.thinking.trim(),
+            ...createdAt(message.timestamp),
             ...(part.redacted === true
               ? { payload: { redacted: true as const } }
               : {}),
@@ -153,6 +162,7 @@ export function threadEntries(
               part.name,
               part.arguments as Record<string, unknown>,
             ),
+            ...createdAt(message.timestamp),
             payload: { tool_use_id: part.id },
           });
           continue;
@@ -165,6 +175,7 @@ export function threadEntries(
           role: operator ? "operator" : agent ? "agent" : "system",
           kind: agent ? (final ? "turn_result" : "assistant_text") : "message",
           text: part.text,
+          ...createdAt(message.timestamp),
           ...(operator && messageId !== undefined
             ? { message: messageId }
             : {}),
@@ -176,6 +187,7 @@ export function threadEntries(
           role: "agent",
           kind: "turn_result",
           text: "",
+          ...createdAt(message.timestamp),
           payload: {
             status: "failed",
             error: failedTurnReason(message.errorMessage),
