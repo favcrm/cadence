@@ -966,8 +966,8 @@ fn session(
                 true
             }
             // A newer board's event: acknowledged so the stream keeps moving,
-            // never kept or acted on. Events only invalidate; HTTPS stays the
-            // authority, so skipping one loses no work.
+            // never kept or acted on. It may be the only signal for a change,
+            // so `record_event` asks for a snapshot on the next session.
             Some(_) => false,
             None => return Err(Error::rejected("hosted event type is invalid")),
         };
@@ -997,7 +997,9 @@ fn session(
 }
 
 /// Apply one validated frame to the inbox. A skipped event still moves the
-/// cursor and needs no inbox room. True when the inbox changed and must be saved.
+/// cursor and needs no inbox room, and it marks the inbox uninitialized so the
+/// next session re-reads the assignments over HTTPS, as a replay gap does.
+/// True when the inbox changed and must be saved.
 fn record_event(inbox: &mut Inbox, event: Value, seq: u64, retain: bool) -> Result<bool> {
     if seq <= inbox.cursor {
         return Ok(false);
@@ -1009,6 +1011,8 @@ fn record_event(inbox: &mut Inbox, event: Value, seq: u64, retain: bool) -> Resu
             ));
         }
         inbox.entries.push(event);
+    } else {
+        inbox.initialized = false;
     }
     inbox.cursor = seq; // Recipient sequences are sparse, not contiguous.
     Ok(true)
@@ -1159,6 +1163,7 @@ mod record_event_tests {
         assert!(record_event(&mut inbox, json!({"type": "new"}), 9, false).unwrap());
         assert_eq!(inbox.cursor, 9);
         assert!(inbox.entries.is_empty());
+        assert!(!inbox.initialized, "a skip must force a re-read");
     }
 
     #[test]
@@ -1175,6 +1180,7 @@ mod record_event_tests {
         let mut roomy = inbox(4);
         assert!(record_event(&mut roomy, json!({"type": "x"}), 5, true).unwrap());
         assert_eq!(roomy.entries.len(), 1);
+        assert!(roomy.initialized, "a known event needs no re-read");
         let mut full = inbox(4);
         full.entries = vec![json!({}); INBOX_LIMIT];
         assert!(record_event(&mut full, json!({"type": "x"}), 5, true).is_err());
