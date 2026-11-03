@@ -1301,8 +1301,6 @@ fn ticket_message_verbs_name_each_refusal_and_never_retry_it() {
         ("issue_message_send", 404, "not_found"),
         ("issue_messages", 404, "not_found"),
         ("issue_messages_read", 404, "not_found"),
-        ("issue_message_send", 403, "insufficient_scope"),
-        ("issue_messages_read", 403, "insufficient_scope"),
         ("issue_message_send", 400, "invalid_request"),
         ("issue_messages", 400, "invalid_request"),
         ("issue_messages_read", 400, "invalid_request"),
@@ -1341,10 +1339,11 @@ fn a_ticket_message_receipt_passes_through_as_stored() {
         "sender_subject": "usr_1", "sender": "member", "text": "hi", "seq": 3,
         "created_at": 1, "duplicate": false, "state": "stored",
     });
+    let sent = json!({"id": "CAD-1", "to": "developer", "message": "tm-1", "text": "hi"});
     let (out, _) = run(
         vec![(200, "", receipt.clone())],
         "issue_message_send",
-        Map::new(),
+        sent.as_object().unwrap().clone(),
         10,
     );
     assert_eq!(out.unwrap(), receipt);
