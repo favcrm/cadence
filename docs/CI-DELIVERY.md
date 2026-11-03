@@ -442,7 +442,7 @@ separate merge-queue runner pool remain follow-ups; neither is deployed.
 CAD-479 tracks measurement of affected-test selection; the queue retains
 the full suite. Timing artifacts from CAD-638 provide evidence for balanced
 shards. Neither optimization is a reason to reduce required coverage.
-Independent review remains required by AGENTS.md; a required GitHub
+Fresh-session review remains required by AGENTS.md; a required GitHub
 review bridge must report both PR-head and merge-group checks before
 activating it in branch protection. CAD-120 tracks reviewer identity
 integration. Real-provider acceptance remains CAD-434; the fake-provider

@@ -102,7 +102,7 @@ exactly that commit. Managed endpoints (codex/claude) never run
 a last line `SHA: <40-hex>` — the daemon reads the last such line as the
 reported revision.
 
-A ticket the master dispatched goes to independent review when you file
+A ticket the master dispatched goes to fresh-session review when you file
 its `done` report with the head and the PR (`sha: <40-hex>` and
 `pr: https://github.com/<owner>/<repo>/pull/<n>` in the frontmatter).
 A REVISE comes back to you as a message: fix it on the same branch, push,
@@ -679,11 +679,17 @@ During implementation and handoff:
   as an admitted gate. Reuse eligible evidence and avoid duplicate full suites.
 - Self-check before handoff, including a simplification pass over your own
   diff (dead code, duplication, abstractions the change does not need; your
-  changed lines only, no behaviour change). Obtain the independent review
-  required by the project's policy; bind its verdict to the actual revision
-  and list checks run, skipped and limitations. An OMP session can perform a
-  genuine review, but a profile or separate session alone does not prove a
-  distinct authenticated principal or a gate-counted verdict.
+  changed lines only, no behaviour change). Obtain the review
+  the project's policy requires; bind its verdict to the actual revision and
+  list checks run, skipped and limitations. The standard is a fresh-session
+  review: a session that is not the author and inherits no conversation or
+  context from the work (a subagent qualifies; a fork or a resumed authoring
+  session does not). Brief it with the PR, the exact head and the ticket, not
+  your conclusions, and call it a fresh-session review, never independent
+  parties. The merge gate does not enforce this yet: it counts attested
+  principals, so a separate session alone is not a gate-counted verdict, and
+  merges use the temporary `--exception --advisory ...` path until
+  `EXCEPTION_ENDS` (2026-11-10). Do not propose a second attested human.
 - Make review converge. First inspect the complete change against acceptance;
   verify each blocking finding with a concrete failure scenario and source
   evidence before sending it to the author. Report the class of bug and all

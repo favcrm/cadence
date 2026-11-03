@@ -69,7 +69,7 @@ the code you just wrote.
 - The evidence is what the computed class requires. `routine` needs the
   required base CI on the exact head and genuine ticket-outcome evidence
   — no mandatory review, and no fabricated PASS to stand in for one.
-  `consequential` and `strict` add one or two independent reviews of
+  `consequential` and `strict` add one or two fresh-session reviews of
   the code against the ticket, as the class states. Do not add routine
   unit tests, snapshot or fixture tests, stress runs, sandbox demos or
   evidence ledgers unless the ticket asks for one. For a bug fix, show
@@ -95,12 +95,12 @@ the code you just wrote.
   on another. The evaluator returns three classes:
   - `routine` — required base CI plus genuine ticket-outcome evidence;
     zero mandatory reviews; no fabricated PASS.
-  - `consequential` — one independent combined review and the full check
+  - `consequential` — one fresh-session combined review and the full check
     floor; no operator approval.
   - `strict` — the floor the evaluator falls back to: any activation other
     than the default lean policy — a malformed section, a custom section
     that is not operator-approved or was removed after approval, or a
-    policy that is not the default once its solo-operator and
+    policy that is not the default once its `solo_operator` and
     integration-branch fields are cleared — path lists that cannot be
     read, incomplete or unsafe diff evidence, a delete, rename, type or
     mode change, a path or change shape outside the known one-review
@@ -109,14 +109,33 @@ the code you just wrote.
     fewer: one combined review on the one-review list, else two (Standards
     and Spec/security), and the operator floor on human-class paths and
     over 1500 changed lines.
-- One independent review by default, covering standards and spec, when
+- **Review standard (operator decision 2026-11-03, CAD-1946).** A review is
+  valid when a fresh-context session that is not the author does it; a
+  subagent qualifies. Fresh means it inherits no conversation or context from
+  the work: a forked subagent or a resumed authoring session does not count,
+  and its brief points at the change (PR, exact head, ticket) without the
+  author's conclusions. A second model vendor is optional. A separate human or
+  account is not required. Records say "fresh-session review" and never claim
+  independent parties. Standards and Spec/security stay two separate passes
+  where two are required. Owner approval of the exact head still applies on
+  `human`-class paths, and always for send, publish, spend and deploy.
+- **What the gate enforces today.** Not this standard. `scripts/enqueue-reviewed`
+  counts verdicts by attested principal and, since CAD-2049, refuses a
+  principal that is the author's, so it cannot tell a fresh session from the
+  author when both act under one login. Until it can, merge through the
+  temporary exception (`--exception --advisory standards=<url> --advisory
+  spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
+  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10). Do not
+  propose registering a second attested human to satisfy the gate. A
+  workflow-issued reviewer identity is a proposal, not shipped.
+- One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
-  two reviews — Standards and Spec/security — from different reviewers. No
-  reviewer may be the author; prefer a different model vendor.
+  two reviews, Standards and Spec/security, as separate passes. No reviewer
+  may be the author.
 - A reviewer who sees auth, identity, credential, signature, secret or
   confinement logic in a one-review PR returns REVISE, names the trigger in
-  `Risk:`, and asks for the second reviewer. When unsure, two.
+  `Risk:`, and asks for the second pass. When unsure, two.
 - Notes never block. REVISE only for a correctness, security or
   ticket-requirement gap. Everything else — wording, docs, comments, style,
   extra tests — is a note: PASS with notes, and the author files one
@@ -126,16 +145,13 @@ the code you just wrote.
 - A reviewer of a PR that changes or deletes a check states that no gate
   check and no isolation or fail-closed default was weakened, naming what
   was checked.
-- A `human` trigger needs the operator as the second check. One reviewer
-  plus the operator is enough only outside triggers 1 and 3; inside them
-  two independent reviewers are required and the operator's approval does
-  not stand in for the second reviewer. On a project whose `delivery:`
-  policy declares a solo-operator lane, one independent registered-identity
-  reviewer (never the author) may cover both axes when the operator
-  approves that head. The operator's approval substitutes for the second
-  reviewer, never for independence, and never lowers Browser QA, the
-  `qa-verdict` status or the risk class itself. Browser QA at desktop and
-  narrow widths when the PR changes `ui/**`.
+- A `human` trigger needs the operator as the second check. One fresh-session
+  review plus the operator is enough only outside triggers 1 and 3; inside
+  them two separate passes (Standards and Spec/security) are required and the
+  operator's approval does not stand in for the second pass. The operator's
+  approval of the exact head never lowers Browser QA, the `qa-verdict`
+  status or the risk class itself. Browser QA at desktop and narrow widths
+  when the PR changes `ui/**`.
 - Bot reviews (Devin Review, CodeRabbit and similar) are advisory: before a
   PASS, the reviewer blocks on or refutes each severe bug and each critical
   security finding. Never make a bot's check a required check, and never
@@ -252,7 +268,7 @@ looking.
   unrelated waiting work. Agent identity is established by the supported
   authenticated path, not by supplying an alias or borrowing a human login.
 - Review evidence binds to the exact head and, on a hosted workspace, to the
-  issue's project (CAD-2001): the merge gate counts distinct reviewers, refuses
+  issue's project (CAD-2001): the merge gate counts distinct attested principals, refuses
   the author's own, and voids every verdict when the head moves. Read it back
   with `cadence audit verdicts --project <key>` and confirm a verdict counts
   before treating a review as landed; in-chat findings are not automatically
@@ -355,8 +371,9 @@ limitation; only an authorized operator can decide an exception.
   spec-security=<url>` (plus `--advisory browser-qa=<url>` for a `ui/` change)
   waives only the missing reviewer attestation and, on a hosted routine PR, the
   readiness proof hosted cannot yet produce; the evidence names both. The advisory reviews are PR
-  comments posted by separately assigned sessions, and the operator approves
-  each exact head. The path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`
+  comments from fresh-session reviews (see the review standard above); the gate
+  cannot prove freshness, and the operator accepts that and approves each
+  exact head. The path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`
   (2026-11-10).
 
 ### Checks: trust exit codes, not filtered text
@@ -448,7 +465,7 @@ Cadence's setting is the source of truth; this file names no model.
   substitute another. If the requested model is not in `config.models`, or
   its scope does not cover the role that would run it, or its
   authentication is unavailable, stop and report it. This never waives
-  independent review, head-pinned verdicts, Browser QA, operator approval or
+  fresh-session review, head-pinned verdicts, Browser QA, operator approval or
   production-safety rules.
 - Scope is the rule: a `master`-scoped model is master-only, a
   `worker`-scoped model serves workers and reviewers. Never route a worker

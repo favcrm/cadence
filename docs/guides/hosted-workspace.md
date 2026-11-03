@@ -335,11 +335,18 @@ cadence --org acme issue set <issue-id> status=done --if-rev <issue-rev>
 ### Reviewing software changes
 
 The owning repository's delivery policy determines the required reviews,
-checks and approvals. An independent OMP session can produce genuine review
-findings; record the actual reviewer/session, repository, full head, outcome,
-checks and limitations. A profile or separate session alone does not prove a
-distinct authenticated principal, and in-chat findings are not automatically
-a gate-counted verdict.
+checks and approvals. The review standard (operator decision 2026-11-03) is a
+fresh-session review: a session that is not the author and inherits no
+conversation or context from the work, including a subagent (a fork or a
+resumed authoring session does not count). Record the actual reviewer/session,
+repository, full head, outcome, checks and limitations, and call it a
+fresh-session review, never an independent party. The gate does not enforce
+that standard yet: it counts hosted verdicts by attested principal and refuses
+the author's, so a profile or separate session alone does not make a
+gate-counted verdict, and in-chat findings are not one either. Until the gate
+can tell a fresh session from the author, merges use the temporary
+`--exception --advisory ...` path (ends at `EXCEPTION_ENDS` in
+`scripts/delivery-gate`, 2026-11-10); see AGENTS.md "Review").
 
 ```sh
 cadence --org acme audit verdict --project <project-key> --repo <owner/name> \

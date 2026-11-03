@@ -1,4 +1,4 @@
-# CAD-957: the ALLOWLIST of paths whose PRs need ONE independent review
+# CAD-957: the ALLOWLIST of paths whose PRs need ONE fresh-session review
 # (standards + spec). Read by AGENTS.md "Review" and by scripts (CAD-959).
 # Changing this file is class `human` (risk-classes.md trigger 7).
 #

@@ -26,15 +26,19 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    (fmt, clippy, build, ui, delivery-gate required; cross-build runs but is
    not yet required) is unchanged, and the suite runs in
    `tests.yml` on a schedule and on demand (CAD-1970).
-4. Under strict requirements, one independent reviewer; two for auth, identity,
-   secrets, the daemon trees and UI paths (`docs/roles/one-review-paths.toml`
-   lists what gets one).
+4. Under strict requirements, one fresh-session review; two separate passes
+   (Standards and Spec/security) for auth, identity, secrets, the daemon trees
+   and UI paths (`docs/roles/one-review-paths.toml` lists what gets one). A
+   fresh-session review is a non-author session with no inherited context,
+   including a subagent (AGENTS.md "Review standard"). The merge gate does not
+   enforce that yet; merges use the temporary `--exception` until
+   `EXCEPTION_ENDS` (2026-11-10).
 5. The version-one delivery tiers apply to clean default-equivalent policies
    by default after the reviewed implementation is installed; the introducing
    PR must still satisfy the current trusted-base gates. Routine changes need
    green exact-head CI and genuine
    ticket-outcome evidence, with no mandatory review; consequential changes
-   need one independent combined standards/spec review. Sensitive changes
+   need one fresh-session combined standards/spec review. Sensitive changes
    keep the existing strict review, operator, Browser QA and full-check
    requirements. Unknown, incomplete, protected-mode, deletion and mixed
    sensitive cases retain strict legacy floors. Explicitly approved custom
@@ -93,7 +97,7 @@ One bounded author simplification pass precedes review. Stop when acceptance
 and required verification are complete; do not add planning documents,
 reviewers, repeated checks or handoffs merely to make the process look thorough.
 Reuse unchanged-head evidence and reviewer context as described below. Never
-trade away approval, independent review required by the effective policy,
+trade away approval, fresh-session review required by the effective policy,
 isolation or fail-closed guards to save time.
 
 For a slow cycle, inspect existing `cadence issue retro <ID> --json` evidence
@@ -360,7 +364,7 @@ Do not force-push a branch with auto-merge enabled; disable it first.
 
 ## One final operator handoff
 
-Finish independent review and CI, post the ticket evidence, then request a
+Finish fresh-session review and CI, post the ticket evidence, then request a
 merge approval on the **literal full SHA** just reviewed. Example syntax
 (the example SHA must be replaced with the actual reviewed head before use):
 
@@ -408,9 +412,9 @@ number of operator/reviewer handoffs as well as CI elapsed/runner minutes.
 Review count follows AGENTS.md "Review" and the effective delivery policy:
 eligible routine changes need no mandatory review, consequential changes one
 combined review, and sensitive/unknown cases retain strict floors. Under the
-strict path, use one independent review by default, two for excluded paths in
-`docs/roles/one-review-paths.toml` (subject to the documented solo-operator
-rule), and operator approval for human risk. Automating evidence collection,
+strict path, use one fresh-session review by default, two separate passes for excluded
+paths in `docs/roles/one-review-paths.toml`, and operator approval for human
+risk. Automating evidence collection,
 reviewer state, head-drift notifications or an operator decision UI is a separate reviewed
 implementation—not a license to self-approve. Likewise, consolidating required
 build/UI checks or changing branch protection requires baseline measurements
