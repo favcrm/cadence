@@ -484,11 +484,17 @@ describe("projectedThreadEntries", () => {
 
   it("applies the host's projection without changing the stored records", () => {
     const before = JSON.stringify(records);
-    const seen = projectedThreadEntries(records, false, (entries) => [
-      ...entries,
-      { seq: entries.length + 1, role: "agent", kind: "artifact", text: "" },
-    ]);
-    expect(seen.map((entry) => entry.kind).at(-1)).toBe("artifact");
+    // Anchored to an entry and renumbered from there, as the contract asks: what
+    // follows the anchor moves by one, consistently, on every read.
+    const seen = projectedThreadEntries(records, false, (entries) =>
+      entries.flatMap((entry, index) =>
+        index === 0
+          ? [entry, { seq: 2, role: "agent", kind: "artifact", text: "" }]
+          : [{ ...entry, seq: entry.seq + 1 }],
+      ),
+    );
+    expect(seen.map((entry) => entry.kind)).toContain("artifact");
+    expect(seen.map((entry) => entry.seq)).toEqual(seen.map((_, index) => index + 1));
     expect(seen).toHaveLength(threadEntries(records, false).length + 1);
     expect(JSON.stringify(records)).toBe(before);
   });

@@ -56050,6 +56050,16 @@ class IdentitySnapshots {
 }
 
 // src/master.ts
+function operationStatus(pending) {
+  const running = pending.find((operation) => operation.status === "running");
+  const queued = pending.filter((operation) => operation.status === "queued");
+  return {
+    running: running !== undefined,
+    message: running?.operationId ?? null,
+    queued: queued.length,
+    queuedMessages: queued.map((operation) => operation.operationId)
+  };
+}
 function masterState(model, status, conversationId, metadata) {
   const state = {
     ...metadata,
@@ -56067,10 +56077,10 @@ function masterState(model, status, conversationId, metadata) {
       streaming: status.running,
       compacting: false
     },
-    commands: [],
+    commands: ["stop"],
     turn: status.running ? {
       state: "working",
-      message: null,
+      message: status.message ?? null,
       conversation: conversationId,
       app_origin: null,
       summary: null,
@@ -56679,6 +56689,9 @@ function toolCallText(name, args) {
   const json = JSON.stringify(args);
   return json === undefined || json === "{}" ? name : `${name} ${json}`;
 }
+function createdAt(timestamp) {
+  return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0 ? { created: new Date(timestamp).toISOString() } : {};
+}
 function projectedThreadEntries(records, includeThinking, project) {
   const entries = threadEntries(records, includeThinking);
   return project ? [...project(entries)] : entries;
@@ -56700,6 +56713,7 @@ function threadEntries(records, includeThinking) {
           role: "agent",
           kind: "tool_result",
           text,
+          ...createdAt(message.timestamp),
           payload: {
             tool_use_id: message.toolCallId,
             ...message.isError ? { is_error: true } : {}
@@ -56722,6 +56736,7 @@ function threadEntries(records, includeThinking) {
             role: "agent",
             kind: "thinking",
             text: part.thinking.trim(),
+            ...createdAt(message.timestamp),
             ...part.redacted === true ? { payload: { redacted: true } } : {}
           });
           continue;
@@ -56732,6 +56747,7 @@ function threadEntries(records, includeThinking) {
             role: "agent",
             kind: "tool_call",
             text: toolCallText(part.name, part.arguments),
+            ...createdAt(message.timestamp),
             payload: { tool_use_id: part.id }
           });
           continue;
@@ -56745,6 +56761,7 @@ function threadEntries(records, includeThinking) {
           role: operator ? "operator" : agent ? "agent" : "system",
           kind: agent ? final ? "turn_result" : "assistant_text" : "message",
           text: part.text,
+          ...createdAt(message.timestamp),
           ...operator && messageId !== undefined ? { message: messageId } : {}
         });
       }
@@ -56754,6 +56771,7 @@ function threadEntries(records, includeThinking) {
           role: "agent",
           kind: "turn_result",
           text: "",
+          ...createdAt(message.timestamp),
           payload: {
             status: "failed",
             error: failedTurnReason(message.errorMessage)
@@ -56829,9 +56847,9 @@ data: ${JSON.stringify(entry)}
       let masterFrame;
       try {
         const master = this.options.threadContext ? this.validatedThreadContext(await this.options.threadContext()) : null;
-        const model = await this.modelLabel();
+        const status = await this.state();
         masterFrame = `event: master
-data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, master?.conversationId ?? null, master?.metadata))}
+data: ${JSON.stringify(masterState(status.model, status, master?.conversationId ?? null, master?.metadata))}
 
 `;
       } catch {
@@ -56844,13 +56862,26 @@ data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, master?
         }, { status: 503 });
       }
       const stream = await this.harness.session().events();
+      let snapshotEntries;
+      try {
+        snapshotEntries = projectedThreadEntries(stream.snapshot.entries, thinking, this.options.projectThread);
+      } catch {
+        await stream.stop();
+        return Response.json({
+          ok: false,
+          error: {
+            code: "capability_unavailable",
+            message: "The thread projection is unavailable."
+          }
+        }, { status: 503 });
+      }
       return sessionEventResponse(stream, {
         snapshot: (send) => {
           send(`: connected
 
 `);
           send(masterFrame);
-          for (const entry of projectedThreadEntries(stream.snapshot.entries, thinking, this.options.projectThread))
+          for (const entry of snapshotEntries)
             emit(entry, send);
         },
         events: async (_events, send) => {
@@ -56941,11 +56972,12 @@ data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, master?
       this.pendingOperations(),
       this.modelLabel()
     ]);
-    return {
-      running: pending.some((operation) => operation.status === "running"),
-      queued: pending.filter((operation) => operation.status === "queued").length,
-      model
-    };
+    return { ...operationStatus(pending), model };
+  }
+  async stopOperation(operationId) {
+    if (!operationId)
+      return false;
+    return this.harness.session().abort(operationId);
   }
   recordResolvedModel(served) {
     if (this.resolvedModel === served)

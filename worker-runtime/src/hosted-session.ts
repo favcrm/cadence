@@ -196,6 +196,28 @@ export class HostedSession<
       // Capture the watch before reading its snapshot so commits between the
       // initial read and subscription are buffered, not silently missed.
       const stream = await this.harness.session().events();
+      // Project before SSE 200, so a failing projection refuses like the master
+      // projection above rather than opening a body that errors and reconnects.
+      let snapshotEntries: ThreadEntry[];
+      try {
+        snapshotEntries = projectedThreadEntries(
+          stream.snapshot.entries,
+          thinking,
+          this.options.projectThread,
+        );
+      } catch {
+        await stream.stop();
+        return Response.json(
+          {
+            ok: false,
+            error: {
+              code: "capability_unavailable",
+              message: "The thread projection is unavailable.",
+            },
+          },
+          { status: 503 },
+        );
+      }
       function emit(entry: ThreadEntry, send: (frame: string) => void): void {
         if (entry.seq <= last) return;
         send(
@@ -212,12 +234,7 @@ export class HostedSession<
           // It reports this object's real turn state. A host projection
           // composes under those runtime fields and cannot replace them.
           send(masterFrame);
-          for (const entry of projectedThreadEntries(
-            stream.snapshot.entries,
-            thinking,
-            this.options.projectThread,
-          ))
-            emit(entry, send);
+          for (const entry of snapshotEntries) emit(entry, send);
         },
         events: async (_events, send) => {
           for (const entry of await this.transcript(thinking))
