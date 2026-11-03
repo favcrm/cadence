@@ -3487,6 +3487,149 @@ mod read_contract_tests {
         .is_err());
     }
 
+    // CAD-2083 acceptance, written from the ticket by the reviewer: real argv,
+    // the real verb map, and the tenant's own grammar (`TICKET_ROLE`,
+    // `TICKET_MESSAGE_ID`, `TICKET_MESSAGE_BODY_MAX`, `Number.isSafeInteger`).
+    fn cad2083_argv(args: &[String]) -> std::result::Result<(&'static str, Value), String> {
+        use clap::Parser;
+        let mut argv = vec!["cadence".to_string(), "--org".into(), "acme".into()];
+        argv.extend_from_slice(args);
+        let cli = crate::cli::Cli::try_parse_from(argv).map_err(|e| e.to_string())?;
+        outcome(&cli.command)
+    }
+
+    fn cad2083_say(to: &str, from: Option<&str>, message: &str, text: &str) -> Vec<String> {
+        let mut args: Vec<String> = ["issue", "say", "CAD-1"].map(Into::into).to_vec();
+        args.push(format!("--to={to}"));
+        if let Some(from) = from {
+            args.push(format!("--from={from}"));
+        }
+        args.push(format!("--message={message}"));
+        args.push(format!("--text={text}"));
+        args
+    }
+
+    #[test]
+    fn cad2083_argv_sends_exactly_the_keys_the_tenant_admits() {
+        assert_eq!(
+            cad2083_argv(&cad2083_say("developer", Some("reviewer"), "tm-1", "hi")).unwrap(),
+            (
+                "issue_message_send",
+                json!({"id": "CAD-1", "to": "developer", "from": "reviewer",
+                    "message": "tm-1", "text": "hi"})
+            )
+        );
+        // The tenant's `exactKeys` and role check refuse a null: unset is absent.
+        assert_eq!(
+            cad2083_argv(&cad2083_say("developer", None, "tm-1", "hi")).unwrap(),
+            (
+                "issue_message_send",
+                json!({"id": "CAD-1", "to": "developer", "message": "tm-1", "text": "hi"})
+            )
+        );
+        let argv =
+            |args: &[&str]| cad2083_argv(&args.iter().map(ToString::to_string).collect::<Vec<_>>());
+        assert_eq!(
+            argv(&["issue", "messages", "CAD-1"]).unwrap(),
+            ("issue_messages", json!({"id": "CAD-1"}))
+        );
+        assert_eq!(
+            argv(&[
+                "issue",
+                "messages",
+                "CAD-1",
+                "--to",
+                "developer",
+                "--after",
+                "0"
+            ])
+            .unwrap(),
+            (
+                "issue_messages",
+                json!({"id": "CAD-1", "to": "developer", "after": 0})
+            )
+        );
+        assert_eq!(
+            argv(&[
+                "issue",
+                "messages-read",
+                "CAD-1",
+                "--role",
+                "developer",
+                "--through",
+                "7"
+            ])
+            .unwrap(),
+            (
+                "issue_messages_read",
+                json!({"id": "CAD-1", "role": "developer", "through": 7})
+            )
+        );
+        // `--role` and `--through` are both required by the tenant.
+        assert!(argv(&["issue", "messages-read", "CAD-1", "--role", "developer"]).is_err());
+        assert!(argv(&["issue", "messages-read", "CAD-1", "--through", "7"]).is_err());
+    }
+
+    #[test]
+    fn cad2083_values_follow_the_tenant_grammar_before_the_wire() {
+        let refused = |args: Vec<String>| {
+            let err = cad2083_argv(&args).unwrap_err();
+            assert!(err.contains("nothing was sent"), "{args:?}: {err}");
+        };
+        let long_role = "r".repeat(32);
+        for good in ["a", "a-", "a1", long_role.as_str()] {
+            cad2083_argv(&cad2083_say(good, Some(good), "tm-1", "hi")).unwrap();
+        }
+        let too_long_role = "r".repeat(33);
+        for bad in [
+            "",
+            "-a",
+            "1a",
+            "A",
+            "a_b",
+            "é",
+            "a\n",
+            too_long_role.as_str(),
+        ] {
+            refused(cad2083_say(bad, None, "tm-1", "hi"));
+            refused(cad2083_say("developer", Some(bad), "tm-1", "hi"));
+        }
+        let long_id = "m".repeat(64);
+        for good in ["1", "a-", "0-0", "sys", "sysx-1", long_id.as_str()] {
+            cad2083_argv(&cad2083_say("developer", None, good, "hi")).unwrap();
+        }
+        let too_long_id = "m".repeat(65);
+        for bad in ["", "-a", "A", "a_b", "sys-1", "a\n", too_long_id.as_str()] {
+            refused(cad2083_say("developer", None, bad, "hi"));
+        }
+        // The cap is UTF-8 bytes, not characters.
+        cad2083_argv(&cad2083_say("developer", None, "tm-1", &"é".repeat(8_000))).unwrap();
+        refused(cad2083_say(
+            "developer",
+            None,
+            "tm-1",
+            &format!("{}x", "é".repeat(8_000)),
+        ));
+        for blank in ["   ", " \n\t"] {
+            refused(cad2083_say("developer", None, "tm-1", blank));
+        }
+        let seq = |flag: &str, value: &str| -> Vec<String> {
+            let mut args: Vec<String> = match flag {
+                "--after" => ["issue", "messages", "CAD-1"].map(Into::into).to_vec(),
+                _ => ["issue", "messages-read", "CAD-1", "--role", "developer"]
+                    .map(Into::into)
+                    .to_vec(),
+            };
+            args.push(format!("{flag}={value}"));
+            args
+        };
+        for flag in ["--after", "--through"] {
+            cad2083_argv(&seq(flag, "9007199254740991")).unwrap();
+            refused(seq(flag, "9007199254740992"));
+            assert!(cad2083_argv(&seq(flag, "-1")).is_err());
+        }
+    }
+
     #[test]
     fn issue_review_sends_the_digest_it_was_given_and_refuses_a_bad_one() {
         let digest = "7743ce348d9284d677a185f33295b92266cc435a5b5f775029b300066d26693a";

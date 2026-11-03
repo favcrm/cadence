@@ -3269,3 +3269,336 @@ fn artifact_verbs_are_reads_and_a_store_refusal_is_named() {
     assert!(old.contains("update the tenant server first"));
     assert!(!old.contains("unavailable"));
 }
+
+// CAD-2083 acceptance, written from the ticket by the reviewer rather than the
+// implementer. It drives the real client path (`call_verb_in`, or the real local
+// dispatch) with the statuses and bodies the tenant's `tenantCliCall` answers.
+mod cad2083_acceptance {
+    use super::*;
+
+    fn tenant_refusal(code: &str) -> Value {
+        json!({"ok": false, "error": {"code": code, "message": "Tenant remote call refused."}})
+    }
+
+    fn arguments(value: Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    fn say() -> Map<String, Value> {
+        arguments(json!({"id": "CAD-1", "to": "developer", "message": "tm-1", "text": "hi"}))
+    }
+
+    fn mark() -> Map<String, Value> {
+        arguments(json!({"id": "CAD-1", "role": "developer", "through": 7}))
+    }
+
+    fn list() -> Map<String, Value> {
+        arguments(json!({"id": "CAD-1", "to": "developer"}))
+    }
+
+    fn call_body(requests: &[Value]) -> Value {
+        let calls: Vec<_> = requests
+            .iter()
+            .filter(|r| r["path"] == json!("/__platform/cli/call"))
+            .collect();
+        assert_eq!(calls.len(), 1, "exactly one call, never a retry");
+        calls[0]["body"].clone()
+    }
+
+    fn minted_scopes(requests: &[Value]) -> Vec<String> {
+        requests
+            .iter()
+            .find(|r| r["path"] == json!("/__platform/cli/authorize"))
+            .unwrap()["body"]["requested_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn each_verb_reaches_the_tenant_and_its_answer_is_printed_as_sent() {
+        let stored = json!({
+            "message": "tm-1", "id": "CAD-1", "to": "developer", "from": null,
+            "sender_subject": "usr_1", "sender": "member", "text": "hi", "seq": 3,
+            "created_at": 1, "duplicate": true, "state": "stored",
+        });
+        // `read_through` is what the tenant returned, not the `through` asked for.
+        let marked = json!({"id": "CAD-1", "role": "developer", "read_through": 3});
+        let page = json!({
+            "id": "CAD-1", "messages": [], "more": true,
+            "unread": {"developer": 2}, "unread_more": true,
+        });
+        for (verb, args, answer, scope) in [
+            ("issue_message_send", say(), stored, "cli.write"),
+            ("issue_messages_read", mark(), marked, "cli.write"),
+            ("issue_messages", list(), page, "cli.read"),
+        ] {
+            let (out, requests) = run(vec![(200, "", answer.clone())], verb, args.clone(), 10);
+            assert_eq!(out.unwrap(), answer, "{verb}: the answer was changed");
+            let body = call_body(&requests);
+            assert_eq!(body["verb"], json!(verb));
+            assert_eq!(body["arguments"], Value::Object(args), "{verb}");
+            // The tenant admits a verb only inside its required scope.
+            assert!(
+                minted_scopes(&requests).iter().any(|s| s == scope),
+                "{verb} never asked for {scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_refusal_is_named_and_is_never_retried() {
+        for (verb, args, status, code) in [
+            ("issue_message_send", say(), 409u16, "message_id_conflict"),
+            ("issue_message_send", say(), 404, "not_found"),
+            ("issue_messages", list(), 404, "not_found"),
+            ("issue_messages_read", mark(), 404, "not_found"),
+            ("issue_message_send", say(), 403, "insufficient_scope"),
+            ("issue_messages_read", mark(), 403, "insufficient_scope"),
+            // What a relay that predates the verbs answers.
+            ("issue_message_send", say(), 400, "invalid_request"),
+            ("issue_messages", list(), 400, "invalid_request"),
+            ("issue_messages_read", mark(), 400, "invalid_request"),
+        ] {
+            let (out, requests) = run(vec![(status, "", tenant_refusal(code))], verb, args, 10);
+            let err = out.unwrap_err();
+            assert_eq!(err.code(), Some(code), "{verb} {status}: {err}");
+            assert_eq!(err.kind(), "rejected", "{verb} {status}: {err}");
+            call_body(&requests);
+        }
+    }
+
+    #[test]
+    fn a_tenant_that_predates_the_verbs_is_named_and_is_not_an_outage() {
+        for (verb, args) in [
+            ("issue_message_send", say()),
+            ("issue_messages", list()),
+            ("issue_messages_read", mark()),
+        ] {
+            let (out, requests) = run(
+                vec![(501, "", tenant_refusal("not_implemented"))],
+                verb,
+                args,
+                10,
+            );
+            let err = out.unwrap_err();
+            assert_eq!(err.code(), Some("not_implemented"), "{verb}: {err}");
+            assert_eq!(err.kind(), "rejected", "{verb}: {err}");
+            let shown = err.to_string();
+            for outage in ["unavailable", "retry", "coordination"] {
+                assert!(
+                    !shown.contains(outage),
+                    "{verb} reads as an outage: {shown}"
+                );
+            }
+            call_body(&requests);
+        }
+    }
+
+    #[test]
+    fn a_lost_write_answer_is_unknown_and_is_never_retried() {
+        for (verb, args) in [
+            ("issue_message_send", say()),
+            ("issue_messages_read", mark()),
+        ] {
+            let (out, requests) = run(vec![(500, "", json!({}))], verb, args.clone(), 10);
+            let err = out.unwrap_err();
+            assert_eq!(err.kind(), "unknown", "{verb} 500: {err}");
+            call_body(&requests);
+            let (kind, calls) = dropped_call_answer(verb, args);
+            assert_eq!(kind, "unknown", "{verb}: a dropped connection");
+            assert_eq!(calls, 1, "{verb}: a dropped connection was retried");
+        }
+    }
+
+    /// A worker that mints an envelope, then hangs up instead of answering.
+    fn dropped_call_answer(verb: &str, args: Map<String, Value>) -> (&'static str, usize) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.try_clone().unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let seen = calls.clone();
+        thread::spawn(move || loop {
+            let Ok((socket, _)) = server.accept() else {
+                return;
+            };
+            let (socket, req) = read_request(socket);
+            if req.path == "/__platform/cli/authorize" {
+                answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                );
+            } else {
+                *seen.lock().unwrap() += 1;
+                drop(socket);
+            }
+        });
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        store_credential(&dir, &target.endpoint);
+        let err = call_verb_in(&target, verb, args, 10, &dir, |_| {}, |_| {}).unwrap_err();
+        let calls = *calls.lock().unwrap();
+        (err.kind(), calls)
+    }
+
+    #[test]
+    fn a_refusal_decided_before_the_verb_ran_never_reads_as_unknown() {
+        let board_gate = json!({"ok": false, "error": {
+            "code": "board_unreachable", "hop": "board",
+            "request_id": "00000000-0000-4000-8000-000000000000",
+        }});
+        for (verb, args) in [
+            ("issue_message_send", say()),
+            ("issue_messages_read", mark()),
+        ] {
+            for (status, body) in [
+                // The board's own gate.
+                (503u16, board_gate.clone()),
+                // The worker's pre-forward state.
+                (503, json!({"state": "wake_failed", "code": "wake_failed"})),
+                // A read-only login over the real relay: the mint narrows the
+                // envelope to `cli.read`, then the call answers a bare 401.
+                (401, tenant_refusal("unauthorized")),
+            ] {
+                let (out, requests) = run(vec![(status, "", body)], verb, args.clone(), 10);
+                let err = out.unwrap_err();
+                assert_ne!(err.kind(), "unknown", "{verb} {status}: {err}");
+                call_body(&requests);
+            }
+        }
+        // A read changes nothing, so its lost answer is never a possible write.
+        let (out, requests) = run(vec![(500, "", json!({}))], "issue_messages", list(), 10);
+        assert_ne!(out.unwrap_err().kind(), "unknown");
+        call_body(&requests);
+    }
+
+    /// The real relay, for what the shared fake cannot show: the mint narrows the
+    /// requested scopes to the live grant (403 `forbidden` when none is left), and
+    /// the call answers `reply` byte for byte.
+    fn relay_answer(
+        verb: &str,
+        args: Map<String, Value>,
+        grant: &'static [&'static str],
+        status: &'static str,
+        reply: &'static str,
+    ) -> Result<RemoteAnswer> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.try_clone().unwrap();
+        thread::spawn(move || loop {
+            let Ok((socket, _)) = server.accept() else {
+                return;
+            };
+            let (mut socket, req) = read_request(socket);
+            if req.path == "/__platform/cli/authorize" {
+                let scope: Vec<_> = req.body["requested_scopes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| grant.iter().any(|g| s.as_str() == Some(g)))
+                    .cloned()
+                    .collect();
+                if scope.is_empty() {
+                    answer(socket, "403 Forbidden", "", &tenant_refusal("forbidden"));
+                } else {
+                    answer(
+                        socket,
+                        "200 OK",
+                        "",
+                        &json!({"version": CLI_VERSION, "envelope": "h.e.1", "scope": scope}),
+                    );
+                }
+            } else {
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+        });
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        store_credential(&dir, &target.endpoint);
+        call_verb_in(&target, verb, args, 10, &dir, |_| {}, |_| {})
+    }
+
+    #[test]
+    fn a_read_only_login_is_named_over_the_real_relay() {
+        for (verb, args) in [
+            ("issue_message_send", say()),
+            ("issue_messages_read", mark()),
+        ] {
+            let err = relay_answer(
+                verb,
+                args,
+                &["cli.read"],
+                "401 Unauthorized",
+                r#"{"ok":false,"error":{"code":"unauthorized","message":"refused"}}"#,
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), Some("insufficient_scope"), "{verb}: {err}");
+            assert!(!err.to_string().contains("expired"), "{verb}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_write_answer_without_its_receipt_is_unknown_never_a_refusal_or_a_success() {
+        for (verb, args) in [
+            ("issue_message_send", say()),
+            ("issue_messages_read", mark()),
+        ] {
+            for reply in ["", "<html>ok</html>", "{}"] {
+                let kind = relay_answer(
+                    verb,
+                    args.clone(),
+                    &["cli.read", "cli.write"],
+                    "200 OK",
+                    reply,
+                )
+                .err()
+                .map(|e| e.kind());
+                assert_eq!(kind, Some("unknown"), "{verb} answered {reply:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_org_refuses_all_three_verbs_and_touches_nothing() {
+        use crate::issue::cli::{run as issue_run, IssueAction};
+        for action in [
+            IssueAction::Say {
+                id: "CAD-1".into(),
+                to: "developer".into(),
+                from: None,
+                message: "tm-1".into(),
+                text: Some("hi".into()),
+                file: None,
+            },
+            IssueAction::Messages {
+                id: "CAD-1".into(),
+                to: None,
+                after: None,
+            },
+            IssueAction::MessagesRead {
+                id: "CAD-1".into(),
+                role: "developer".into(),
+                through: 1,
+            },
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let err = issue_run(&action, state.path()).unwrap_err();
+            assert_eq!(err.kind(), "rejected", "{err}");
+            assert!(err.to_string().contains("hosted"), "{err}");
+            assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+        }
+    }
+}
