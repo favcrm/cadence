@@ -226,26 +226,23 @@ jobs:
           const mr = await gh('git/ref/heads/main');
           const mainSha = mr.ok ? (await mr.json())?.object?.sha : null;
           if (!/^[0-9a-f]{40}$/.test(mainSha || '')) die('cannot resolve main to a commit');
-          let mergeBase = null, listed = 0;
-          for (let page = 1; page <= 3; page++) {
-            const cr = await gh(`compare/${mainSha}...${HEAD}?per_page=100&page=${page}`);
-            if (!cr.ok) die(`cannot read the comparison with main: HTTP ${cr.status}`);
-            const cmp = await cr.json();
-            if (!/^[0-9a-f]{40}$/.test(cmp.merge_base_commit?.sha || '') || !Array.isArray(cmp.files) || !['ahead', 'diverged'].includes(cmp.status)) die('the comparison with main is malformed or has nothing to review; nothing filed');
-            if (mergeBase !== null && mergeBase !== cmp.merge_base_commit.sha) die('the comparison with main changed while it was read; nothing filed');
-            mergeBase = cmp.merge_base_commit.sha;
-            listed += cmp.files.length;
-            if (cmp.files.length < 100) break;
-            if (page === 3) die('the PR changes too many files to review; nothing filed');
-          }
+          // One read: GitHub lists at most 300 files in a comparison and does not page them, so a list at the
+          // cap cannot be proved complete.
+          const cr = await gh(`compare/${mainSha}...${HEAD}`);
+          if (!cr.ok) die(`cannot read the comparison with main: HTTP ${cr.status}`);
+          const cmp = await cr.json();
+          if (!/^[0-9a-f]{40}$/.test(cmp.merge_base_commit?.sha || '') || !Array.isArray(cmp.files) || !['ahead', 'diverged'].includes(cmp.status)) die('the comparison with main is malformed or has nothing to review; nothing filed');
+          if (cmp.files.length >= 300) die('the PR changes too many files (300 or more): completeness cannot be proved at the comparison cap, so it is too large to review; nothing filed');
+          const mergeBase = cmp.merge_base_commit.sha, listed = cmp.files.length;
           const d = await gh(`compare/${mainSha}...${HEAD}`, 'application/vnd.github.v3.diff');
           if (!d.ok) die(`cannot read the diff: HTTP ${d.status}`);
           const diff = await d.text();
           if (Buffer.byteLength(diff) > 300000) die('diff is over 300 KB: too large to review, nothing filed');
           let sections;
           try { sections = parseDiff(diff).sections; } catch (e) { die(e instanceof Refusal ? e.message : 'the diff cannot be read'); }
-          // Coverage is judged against the file list of this same comparison, never the PR's changed_files.
-          // They can differ only if the diff was cut short or padded, so that is the one case that refuses.
+          // Coverage is judged against the file list of this same comparison, never the PR's changed_files. The
+          // list is complete (under the 300 cap), so a different section count means the diff was cut short by
+          // GitHub or padded; that is the one case that refuses.
           if (listed < 1 || sections !== listed) die('the diff does not cover the comparison with main (truncated or padded): refusing it');
           // The standard the reviewer applies is read at the pinned main (the rules in force when this merges),
           // never from the PR; the PR cannot change main.
@@ -394,7 +391,7 @@ jobs:
           // run never pays for two generations.
           async function ask() {
             const r = await fetch('https://api.anthropic.com/v1/messages', {
-              method: 'POST', body, signal: AbortSignal.timeout(900000),
+              method: 'POST', body, redirect: 'error', signal: AbortSignal.timeout(900000),
               headers: { 'x-api-key': E.ANTHROPIC_API_KEY, 'anthropic-version': '2026-10-21', 'content-type': 'application/json' },
             });
             if (!r.ok) return { status: r.status };
@@ -409,7 +406,7 @@ jobs:
                 if (!line) continue;
                 let d; try { d = JSON.parse(line.slice(6)); } catch { failed = true; continue; }
                 if (d.type === 'content_block_delta' && d.delta?.type === 'text_delta' && typeof d.delta.text === 'string') { text += d.delta.text; if (text.length > 60000) big = true; }
-                else if (d.type === 'message_delta' && typeof d.delta?.stop_reason === 'string') stop = d.delta.stop_reason;
+                else if (d.type === 'message_delta' && typeof d.delta?.stop_reason === 'string') { if (stop === null) stop = d.delta.stop_reason; else if (stop !== d.delta.stop_reason) failed = true; }
                 else if (d.type === 'error') failed = true;
               }
             }
@@ -537,7 +534,8 @@ jobs:
           const san = (s, n = 300) => String(s).replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff<>`]/g, ' ').replace(/\b[a-z][a-z0-9+.-]*:\/\/\S*/gi, '(url)').replace(/\b(?:www\.|(?:mailto|javascript|vbscript|data|file|tel|sms):)\S*/gi, '(url)').replace(/\[/g, '(').replace(/\]/g, ')').replace(/!(?=\()/g, '').replace(/\s+/g, ' ').trim().slice(0, n);
 
           // Everything the verdict says comes from this function: the schema-shaped output, checked
-          // field by field. Its messages are fixed text and enum-checked check names only.
+          // field by field. The reason is never printed (the caller prints one fixed line); the messages
+          // below only document each rule.
           function validate(output, diffFiles) {
             const bad = (m) => { throw new Refusal(m); };
             const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
@@ -608,7 +606,7 @@ jobs:
               const stored = json.verdict?.outcome;
               if (!['pass', 'revise'].includes(stored) || json.head !== HEAD || json.pr !== Number(PR)) die('the tenant answered with an unexpected record; check the board');
               // The stored row is the verdict, not this run's opinion.
-              if (json.duplicate) console.log(`::notice::${clean(`duplicate of this run attempt's own earlier filing; stored outcome ${stored}${stored === payload.outcome ? '' : ` (differs from this run's ${payload.outcome})`}`)}`);
+              if (json.duplicate) console.log(`::notice::${clean(`duplicate of this run attempt's own earlier filing; stored outcome ${stored}`)}`);
               out(`filed ${KIND} verdict for ${input.issue} PR ${PR} head ${HEAD.slice(0, 12)}: outcome ${stored}, duplicate ${json.duplicate === true}`);
               summary(`${KIND} ${input.issue} PR ${PR} ${HEAD.slice(0, 12)}: ${stored}${json.duplicate ? ' (duplicate)' : ''}`);
               process.exit(0);
