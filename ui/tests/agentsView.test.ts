@@ -131,6 +131,8 @@ const issues: IssueCard[] = [
   },
 ] as IssueCard[];
 let failDetail = true;
+let detailNotServed = false;
+let detailNotServedCode = "not_implemented";
 let releaseDetail: (() => void) | null = null;
 let holdDetail = false;
 const reads: string[] = [];
@@ -152,6 +154,10 @@ globalThis.fetch = async (input, init) => {
   if (holdDetail)
     await new Promise<void>((resolve) => {
       releaseDetail = resolve;
+    });
+  if (detailNotServed)
+    return new Response(JSON.stringify({ ok: false, error: { code: detailNotServedCode, message: "This isn't available in this workspace." } }), {
+      status: 501,
     });
   if (failDetail)
     return new Response(JSON.stringify({ error: "Detail unavailable" }), {
@@ -592,9 +598,126 @@ async function main() {
   await flush();
   const failedPanel = freshHost.querySelector(".ag-chat-panel")?.textContent ?? "";
   assert(failedPanel.includes("Agent details are unavailable."), "the panel says its details could not be read");
-  for (const empty of ["Nothing queued.", "No results yet.", "No events yet."])
+  for (const empty of ["Nothing queued.", "No results yet.", "No events yet.", "no role text"])
     assert(!failedPanel.includes(empty), `the panel claims nothing about unread details: ${empty}`);
   await React.act(() => freshRoot.unmount());
+  // A board that answers 501 keeps no details: permanent, so nothing to retry.
+  detailNotServed = true;
+  failDetail = false;
+  const servedHost = document.createElement("div");
+  document.body.append(servedHost);
+  const servedRoot = createRoot(servedHost);
+  const mountServed = async (alias: string, section: typeof tab, roster: typeof state) => {
+    await React.act(() =>
+      servedRoot.render(
+        React.createElement(LocaleProvider, null, React.createElement(Agents, {
+          key: `${alias}:${section}`,
+          operator: true,
+          onRetryAccess: () => {},
+          hostedBoard: true,
+          state: roster,
+          issues: issueState,
+          open: alias,
+          tab: section,
+          recruit: false,
+          ask: false,
+          onAsk: () => {},
+          onOpenAgent: () => {},
+          onTab: () => {},
+          onRecruit: () => {},
+          onOpenIssue: () => {},
+          onRetry: () => {},
+        })),
+      ),
+    );
+    await flush();
+    await flush();
+  };
+  const liveRoster: typeof state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
+  await mountServed("dev", "overview", liveRoster);
+  const notServedButton = Array.from(servedHost.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Details");
+  assert(notServedButton, "the details panel opens on a 501 board");
+  await React.act(() => notServedButton.click());
+  await flush();
+  const servedPanel = servedHost.querySelector(".ag-chat-panel")?.textContent ?? "";
+  const NOT_RECORDED = "This board doesn’t record agent history.";
+  assert(servedPanel.split(NOT_RECORDED).length === 2, "a 501 board says so once");
+  for (const claim of ["No results yet.", "No events yet.", "Agent details are unavailable.", "no role text"])
+    assert(!servedPanel.includes(claim), `a 501 board claims nothing it cannot know: ${claim}`);
+  assert(servedPanel.includes("Doing now") && servedPanel.includes("Up next"), "roster data still shows on a 501 board");
+  const servedMain = servedHost.querySelector("main.ag-chat")?.textContent ?? "";
+  assert(!servedMain.includes("Some details aren’t available"), "a 501 is not reported as a failure");
+  assert(!Array.from(servedHost.querySelectorAll(".ag-chat-main button")).some((b) => b.textContent?.trim() === "Retry"), "there is no Retry that can never succeed");
+  for (const section of ["history", "work", "job", "settings"] as const) {
+    await mountServed("dev", section, liveRoster);
+    const page = servedHost.textContent ?? "";
+    assert(!page.includes("Loading agent details"), `the ${section} section does not stick on loading on a 501 board`);
+    assert(!page.includes("No events yet.") && !page.includes("No results yet."), `the ${section} section claims no empty history on a 501 board`);
+  }
+  // Only a known agent reads as "not recorded". Without a roster row nothing is
+  // known, so a 501 claims nothing about its work, on any section.
+  const unknownClaims = ["Nothing right now", "Nothing queued", "Nothing needs attention", "Loading agent details", "Loading provider", "No events yet.", "No results yet.", NOT_RECORDED];
+  for (const [alias, roster, label] of [
+    ["dev", failedRoster, "failed roster"],
+    ["nobody", liveRoster, "unknown alias"],
+  ] as const) {
+    for (const section of ["work", "settings", "history", "job"] as const) {
+      await mountServed(alias, section, roster);
+      const page = servedHost.textContent ?? "";
+      for (const claim of unknownClaims)
+        assert(!page.includes(claim), `${label}, ${section}, 501: claims nothing it cannot know: ${claim}`);
+      assert(page.includes("Some details aren’t available"), `${label}, ${section}, 501: reports that details are missing`);
+    }
+  }
+  // The panel on an unknown agent claims no role text it could not read.
+  await mountServed("nobody", "overview", liveRoster);
+  const unknownDetails = Array.from(servedHost.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Details");
+  assert(unknownDetails, "the panel opens for an unknown agent");
+  await React.act(() => unknownDetails.click());
+  await flush();
+  assert(!servedHost.querySelector(".ag-chat-panel")?.textContent?.includes("no role text"), "an unread read claims no role text");
+  assert(!servedHost.querySelector(".ag-chat-main")?.textContent?.includes("Some details"), "a missing agent has one answer, the gate");
+  // An ordinary failed read for an unlisted agent can still recover, so it keeps its Retry.
+  detailNotServed = false;
+  failDetail = true;
+  await mountServed("dev", "overview", liveRoster); // A new page, so this read is its own.
+  await mountServed("nobody", "overview", liveRoster);
+  const failedUnlisted = servedHost.querySelector(".ag-chat-main")?.textContent ?? "";
+  assert(failedUnlisted.includes("Some details aren’t available") && failedUnlisted.includes("Retry"), "a failed read for an unlisted agent keeps its line and Retry");
+  failDetail = false;
+  // A failed roster must not hide what a served read says about the agent.
+  await mountServed("blocked", "overview", failedRoster);
+  assert(servedHost.querySelector(".ag-chat-main")?.textContent?.includes("Recovery required"), "a failed roster keeps a fenced agent's recovery banner");
+  detailNotServed = true;
+  await mountServed("dev", "history", liveRoster);
+  assert(servedHost.textContent?.includes(NOT_RECORDED), "a known agent's history says it isn't recorded");
+  assert(!servedHost.querySelector(".rc-cats"), "no filters over a history the board doesn't keep");
+  await mountServed("dev", "settings", liveRoster);
+  assert(servedHost.textContent?.includes("doesn’t report runtime details"), "the runtime section says what is actually missing");
+  // A 501 for another reason, such as an outdated daemon, is an ordinary failure.
+  detailNotServedCode = "unsupported_daemon";
+  await mountServed("dev", "history", liveRoster);
+  assert(!servedHost.textContent?.includes(NOT_RECORDED), "another 501 does not claim the board keeps no history");
+  assert(servedHost.textContent?.includes("Some details aren’t available") && servedHost.textContent?.includes("Retry"), "another 501 keeps its Retry");
+  detailNotServedCode = "not_implemented";
+  await mountServed("nobody", "overview", liveRoster);
+  assert(servedHost.querySelector(".ag-chat-gate")?.textContent?.includes("No agent named nobody"), "an unknown agent on a 501 board is still reported as missing");
+  // A read still running says nothing about the agent, on a deep link.
+  const unsettled = ["No events yet.", "No results yet.", "no role text"];
+  holdDetail = true;
+  for (const section of ["history", "work"] as const) {
+    await mountServed("dev", section, liveRoster);
+    for (const claim of unsettled)
+      assert(!servedHost.textContent?.includes(claim), `${section}, read in flight: claims nothing yet: ${claim}`);
+    await React.act(async () => releaseDetail?.());
+    await flush();
+  }
+  holdDetail = false;
+  await mountServed("dev", "work", { ...liveRoster, data: null, status: "loading" });
+  for (const claim of [...unsettled, "Nothing right now", "Nothing queued", "Nothing needs attention"])
+    assert(!servedHost.textContent?.includes(claim), `work, roster pending: claims nothing yet: ${claim}`);
+  detailNotServed = false;
+  await React.act(() => servedRoot.unmount());
   console.log("agents view checks passed");
 }
 main().catch(async (error) => {

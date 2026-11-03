@@ -655,16 +655,11 @@ fn verb_for(
         } => {
             // Exact shared arguments. Visibility is the canonical spelling
             // (`workspace-visible` | `private`), never the serde rename of
-            // the tracker enum. Grants replace the recorded list; an empty
+            // the tracker enum; `wire()` is that one spelling, shared with the
+            // daemon's parser. Grants replace the recorded list; an empty
             // list is sent as `[]`, not omitted. No role, actor, or org.
-            let visibility = match visibility {
-                cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible => {
-                    "workspace-visible"
-                }
-                cadence_agent::issue::cli::PolicyVisibility::Private => "private",
-            };
             args.insert("project".into(), json!(key));
-            args.insert("visibility".into(), json!(visibility));
+            args.insert("visibility".into(), json!(visibility.wire()));
             args.insert("grants".into(), json!(grants));
             "project_policy"
         }
@@ -686,8 +681,25 @@ fn verb_for(
                     goal,
                     agents,
                     issue,
+                    visibility,
+                    grants,
                 },
         } => {
+            // CAD-1950: the hosted create contract is `{key, name, prefix?}`
+            // and records no access policy. Accepting the flags here would
+            // drop them silently, so they refuse before a request exists —
+            // the same rule the local-only flags above follow. `--visibility`
+            // is checked by presence, not value: even the local default
+            // spelled out on the command line is a request this verb cannot
+            // honour. The policy is set afterwards with
+            // `issue project policy`, which is hosted.
+            if visibility.is_some() || !grants.is_empty() {
+                return Err(Error::rejected(
+                    "remote `project new` records no access policy — --visibility \
+                     and --grant are local-only; create the project, then set its \
+                     policy with `cadence issue project policy`; nothing was sent",
+                ));
+            }
             let mut local = Vec::new();
             if repo.is_some() {
                 local.push("--repo");
@@ -3794,6 +3806,8 @@ mod read_contract_tests {
                 goal: None,
                 agents: vec![],
                 issue: None,
+                visibility: None,
+                grants: vec![],
             },
         })
         .unwrap();
@@ -3814,6 +3828,8 @@ mod read_contract_tests {
                 goal: None,
                 agents: vec![],
                 issue: None,
+                visibility: None,
+                grants: vec![],
             },
         })
         .unwrap_err();
@@ -3827,10 +3843,49 @@ mod read_contract_tests {
                 goal: None,
                 agents: vec![],
                 issue: None,
+                visibility: None,
+                grants: vec![],
             },
         })
         .unwrap_err();
         assert!(err.contains("--repo"), "{err}");
+
+        // CAD-1950: the hosted create contract carries no access policy, so
+        // the policy flags refuse rather than being dropped; the policy is
+        // set afterwards with `issue project policy`. The last case is the
+        // one a value comparison missed: `workspace-visible` is the local
+        // default, but naming it here is still a request this verb cannot
+        // honour, so it refuses by presence.
+        for (visibility, grants) in [
+            (
+                Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+                Vec::new(),
+            ),
+            (
+                Some(cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible),
+                vec!["users/alex".to_string()],
+            ),
+            (
+                Some(cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible),
+                Vec::new(),
+            ),
+        ] {
+            let err = outcome(&Commands::Project {
+                action: ProjectCmd::New {
+                    key: "ops".into(),
+                    name: Some("Operations".into()),
+                    repo: None,
+                    prefix: None,
+                    goal: None,
+                    agents: vec![],
+                    issue: None,
+                    visibility,
+                    grants,
+                },
+            })
+            .unwrap_err();
+            assert!(err.contains("issue project policy"), "{err}");
+        }
 
         let (verb, args) = outcome(&Commands::Issue {
             action: IssueAction::Project {
