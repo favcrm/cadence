@@ -936,16 +936,15 @@ pre {
 .answer .issue-reader tbody tr + tr td {
   border-top: 1px solid color-mix(in srgb, var(--color-ink-800) 60%, transparent);
 }
-/* `anywhere` counts every character as a break point when the table sizes
-   its columns, so one long unbreakable value in a later column squeezed the
-   first to a few pixels and split its words ("Artifa/ct"). `break-word`
-   wraps only an overflowing word, so the first column keeps its longest
-   word whole while the other columns still wrap a long hash. */
+/* With `anywhere` a long unbreakable value in a later column squeezed the
+   first to a few pixels and split its words ("Artifa/ct"). A floor on the
+   first column keeps its words whole, while `anywhere` still lets any long
+   value wrap, so the table never outgrows the column. */
 .answer .issue-reader th:first-child,
 .answer .issue-reader td:first-child,
 .chat-bubble.issue-reader th:first-child,
 .chat-bubble.issue-reader td:first-child {
-  overflow-wrap: break-word;
+  min-width: 6rem;
 }
 .answer .issue-reader blockquote {
   padding: .65rem .85rem;

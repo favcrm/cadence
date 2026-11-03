@@ -50,7 +50,8 @@ const { ThreadTurn } = require("../src/features/home/ThreadView") as typeof impo
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const canvasStore = require("../src/features/canvas/canvasStore") as typeof import("../src/features/canvas/canvasStore");
 const thread = require("../src/features/home/thread") as typeof import("../src/features/home/thread");
-const { POLL_MS, LONG_WAIT_MS } = require("../src/features/canvas/ImageBlock");
+const { POLL_MS, LONG_WAIT_MS, GIVE_UP_MS } = require("../src/features/canvas/ImageBlock");
+const { ImageConversation } = require("../src/features/canvas/imageConversation");
 
 const settle = () => React.act(async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); });
 async function advance(ms: number) {
@@ -70,22 +71,33 @@ async function advance(ms: number) {
 
 // ---- the host, stateful ----
 const JOB = "med_7b693b44d928437491a2c13e549f6e0b";
+const JOB2 = "med_second0000000000000000000000000";
 const SIZE = 2202009; // 2.1 MB
 const host = {
   job: { state: "running" } as Record<string, unknown>,
-  jobMode: "ok" as "ok" | "network" | "malformed" | "missing" | "unavailable" | "other",
-  bytesMode: "ok" as "ok" | "fail",
+  jobMode: "ok" as "ok" | "network" | "malformed" | "missing" | "unavailable" | "other" | "denied" | "forbidden",
+  bytesMode: "ok" as "ok" | "fail" | "missing",
   html: false,
   statusReads: 0,
   byteReads: 0,
   versions: 1,
+  expect: "c1",
+  bytesMime: "image/png",
+  mimeSize: 0,
+  lastArtifact: "",
 };
 const finished = { state: "finished", artifact: { id: "art-img1", version: 1, kind: "image", title: "Red apple on a white surface", bytes: SIZE, digest: "a".repeat(64) } };
 globalThis.fetch = (async (input: unknown) => {
   const url = new URL(String(input), "http://localhost");
+  if (url.pathname === `/api/image-jobs/${JOB2}`) {
+    host.statusReads++;
+    return new Response(JSON.stringify({ state: "finished", artifact: { id: "art-img2", version: 1, kind: "image", title: "Second", bytes: 1048576, digest: "d".repeat(64) } }), { status: 200 });
+  }
   if (url.pathname === `/api/image-jobs/${JOB}`) {
     host.statusReads++;
-    equal(url.searchParams.get("conversation"), "c1", "the status read names the conversation in view");
+    equal(url.searchParams.get("conversation"), host.expect, "the status read names the conversation in view");
+    if (host.jobMode === "denied") return new Response("{}", { status: 401 });
+    if (host.jobMode === "forbidden") return new Response(JSON.stringify({ error: "membership_changed" }), { status: 403 });
     if (host.jobMode === "network") throw new TypeError("network down");
     if (host.jobMode === "missing") return new Response("{}", { status: 404 });
     if (host.jobMode === "unavailable") return new Response(JSON.stringify({ error: "capability_unavailable" }), { status: 503 });
@@ -93,12 +105,25 @@ globalThis.fetch = (async (input: unknown) => {
     if (host.jobMode === "malformed") return new Response("<html>oops</html>", { status: 200 });
     return new Response(JSON.stringify(host.job), { status: 200, headers: { "Content-Type": "application/json" } });
   }
+  if (url.pathname === "/api/member-assistant/state") {
+    return new Response(JSON.stringify({ conversation_id: "cm1", assistant: { org: "o", sub: "u", assistant_id: "a", alias: "assistant", conversation_id: "cm1", state: "ready", bootstrap_state: null } }), { status: 200 });
+  }
+  if (url.pathname === "/api/member-assistant/history") {
+    return new Response(JSON.stringify({ conversation: { id: "cm1", alias: "assistant" }, entries: [
+      { seq: 1, role: "member", kind: "message", text: "make an apple", message: "m1" },
+      { seq: 2, role: "agent", kind: "image_job", text: "", message: "m1", created: new Date(now - 5000).toISOString(), payload },
+      { seq: 3, role: "agent", kind: "turn_result", text: "Started.", message: "m1" },
+    ], more_before: false }), { status: 200 });
+  }
   if (url.pathname.startsWith("/api/artifacts/")) {
     host.byteReads++;
-    equal(url.searchParams.get("conversation"), "c1", "the bytes read names the conversation in view");
+    host.lastArtifact = url.pathname;
+    equal(url.searchParams.get("conversation"), host.expect, "the bytes read names the conversation in view");
     if (host.bytesMode === "fail") return new Response("{}", { status: 500 });
+    if (host.bytesMode === "missing") return new Response("{}", { status: 404 });
+    if (url.pathname.startsWith("/api/artifacts/art-img2")) return new Response(new Uint8Array(1048576), { status: 200, headers: { "Content-Type": "image/png" } });
     if (url.pathname.startsWith("/api/artifacts/art-html1")) return new Response("<p>hello</p>", { status: 200, headers: { "Content-Type": "text/html" } });
-    return new Response(new Uint8Array(SIZE), { status: 200, headers: { "Content-Type": "image/png" } });
+    return new Response(new Uint8Array(SIZE), { status: 200, headers: { "Content-Type": host.bytesMime } });
   }
   throw new Error(`Unexpected request ${url.pathname}`);
 }) as typeof fetch;
@@ -151,11 +176,11 @@ const el = (root: ParentNode, sel: string) => root.querySelector(sel) as HTMLEle
 const COST = /\$|cost|price|charge|credit|balance|HKD|USD|pay|fee/i;
 
 type Mounted = { box: HTMLElement; root: ReturnType<typeof createRoot>; unmount: () => Promise<void>; render: (node: any) => Promise<void> };
-async function mount(node: any, drawer = false): Promise<Mounted & { host: HTMLElement }> {
+async function mount(node: any, drawer = false, conversation: string | null = "c1"): Promise<Mounted & { host: HTMLElement }> {
   const hostEl = document.createElement("div");
   document.body.append(hostEl);
   const root = createRoot(hostEl);
-  const wrap = (n: any) => React.createElement(LocaleProvider, null, n, drawer ? React.createElement(CanvasDrawer) : null);
+  const wrap = (n: any) => React.createElement(LocaleProvider, null, React.createElement(ImageConversation.Provider, { value: conversation }, n), drawer ? React.createElement(CanvasDrawer) : null);
   await React.act(async () => { root.render(wrap(node)); });
   await settle();
   return {
@@ -170,6 +195,8 @@ function reset() {
   host.job = { state: "running" };
   host.jobMode = "ok";
   host.bytesMode = "ok";
+  host.bytesMime = "image/png";
+  host.expect = "c1";
   host.statusReads = 0;
   host.byteReads = 0;
   withObserver = false;
@@ -366,6 +393,7 @@ withObserver = true;
 host.job = finished;
 {
   const m = await mount(React.createElement(ImageBlock, { entry: entry() }));
+  equal(host.statusReads, 0, "no status read while the box is far from the viewport");
   equal(host.byteReads, 0, "no bytes while the box is far from the viewport");
   assert(!el(m.host, "img"), "no image yet");
   assert(box(m), "the box holds the place");
@@ -380,8 +408,112 @@ host.bytesMode = "fail";
 {
   const m = await mount(React.createElement(ImageBlock, { entry: entry() }));
   assert(box(m) && !el(m.host, "img"), "no image without bytes, and the box stays");
-  assert(text(m).includes("This image isn't available."), "a quiet line says so");
-  assert(!el(m.host, ".imgover"), "no overlay without a picture");
+  assert(!text(m).includes("isn't available"), "a temporary byte fault is not 'unavailable'");
+  await advance(5000 * 4);
+  assert(host.byteReads >= 2 && host.byteReads <= 4, `the byte read is retried with backoff (${host.byteReads})`);
+  host.bytesMode = "ok";
+  await advance(60_000);
+  assert(el(m.host, "img"), "the image appears when the bytes come back");
+  await m.unmount();
+}
+for (const [what, setup] of [
+  ["a 404 on the bytes", () => { host.bytesMode = "missing"; }],
+  ["bytes that are not an image", () => { host.bytesMime = "text/html"; }],
+] as const) {
+  reset();
+  host.job = finished;
+  setup();
+  const m = await mount(React.createElement(ImageBlock, { entry: entry() }));
+  assert(box(m) && !el(m.host, "img"), `${what}: no image, and the box stays`);
+  assert(text(m).includes("This image isn't available."), `${what}: a quiet line says so`);
+  assert(!el(m.host, ".imgover"), `${what}: no overlay without a picture`);
+  const reads = host.byteReads;
+  await advance(60_000);
+  equal(host.byteReads, reads, `${what}: it is final, not retried`);
+  await m.unmount();
+}
+
+// ===== lost access stops the polling =====
+for (const mode of ["denied", "forbidden"] as const) {
+  reset();
+  host.jobMode = mode;
+  const m = await mount(React.createElement(ImageBlock, { entry: entry() }));
+  assert(text(m).includes("This image isn't available."), `${mode}: reads unavailable`);
+  await advance(5 * 60_000);
+  equal(host.statusReads, 1, `${mode}: no further reads`);
+  await m.unmount();
+}
+
+// ===== a running job past 24 hours is unconfirmed =====
+reset();
+{
+  const old = new Date(now - GIVE_UP_MS - 60_000).toISOString();
+  const m = await mount(React.createElement(ImageBlock, { entry: entry({}, old) }));
+  assert(text(m).includes("We can't confirm this image yet"), "running after 24 h reads unconfirmed");
+  assert(!text(m).includes("Still creating"), "not Still creating forever");
+  assert(el(m.host, "button.imgact"), "with Check again");
+  await advance(5 * 60_000);
+  equal(host.statusReads, 1, "and polling has stopped");
+  host.job = finished;
+  await React.act(async () => { (el(m.host, "button.imgact") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await settle();
+  assert(el(m.host, "img"), "Check again finds a saved image");
+  await m.unmount();
+  reset();
+  host.job = finished;
+  const m2 = await mount(React.createElement(ImageBlock, { entry: entry({}, old) }));
+  assert(el(m2.host, "img") && !text(m2).includes("We can't confirm"), "a saved image older than 24 h is unaffected");
+  await m2.unmount();
+  reset();
+  const m3 = await mount(React.createElement(ImageBlock, { entry: entry({}, new Date(now - GIVE_UP_MS + 120_000).toISOString()) }));
+  assert(text(m3).includes("Still creating"), "just inside 24 h it still runs");
+  await m3.unmount();
+}
+
+// ===== a block never carries one job to another =====
+reset();
+host.job = finished;
+{
+  const m = await mount(React.createElement(ImageBlock, { entry: entry() }));
+  const first = (el(m.host, "img") as HTMLImageElement).getAttribute("src");
+  assert(first, "job one shows its picture");
+  await m.render(React.createElement(ImageBlock, { entry: entry({ job_id: JOB2, title: "Second" }) }));
+  await advance(POLL_MS);
+  equal(block(m)!.getAttribute("data-job"), JOB2, "the block now names job two");
+  assert(host.lastArtifact.includes("art-img2"), `job two's bytes were read: ${host.lastArtifact}`);
+  const second = (el(m.host, "img") as HTMLImageElement).getAttribute("src");
+  assert(second && second !== first, "and its own picture shows, not job one's");
+  assert(el(m.host, ".imgover")!.textContent!.includes("1.0 MB"), "with its own size");
+  await m.unmount();
+}
+
+// ===== no conversation, no request =====
+reset();
+{
+  const m = await mount(React.createElement(ImageBlock, { entry: entry() }), false, null);
+  await advance(30_000);
+  equal(host.statusReads, 0, "outside a host nothing is read");
+  assert(box(m), "the box still holds its place");
+  await m.unmount();
+}
+// The conversation comes from the host, never from the canvas store.
+reset();
+canvasStore.resetCanvas("another", null, "home");
+host.job = finished;
+{
+  const m = await mount(React.createElement(ImageBlock, { entry: entry() }), false, "c1");
+  assert(el(m.host, "img"), "a stale canvas conversation does not matter");
+  await m.unmount();
+}
+reset();
+canvasStore.resetCanvas(null, null, "home");
+host.job = finished;
+{
+  const m = await mount(React.createElement(ImageBlock, { entry: entry() }), true, "c1");
+  assert(el(m.host, "img"), "a host that feeds no canvas still loads its images");
+  await React.act(async () => { (el(m.host, "button.imgopen") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await settle();
+  assert(el(m.host, "[data-canvas-drawer]"), "and its click still opens the canvas");
   await m.unmount();
 }
 
@@ -515,6 +647,24 @@ for (const sheet of [false, true]) {
   await m.unmount();
 }
 
+// ===== the hosted member chat feeds no canvas, and still loads its image =====
+reset();
+canvasStore.resetCanvas(null, null, "home");
+host.expect = "cm1";
+host.job = finished;
+{
+  const MemberChat = require("../src/features/home/MemberChat").default;
+  const m = await mount(React.createElement(MemberChat, { scope: "s1:u1", readOnly: false, onOpenIssue: () => undefined }), true);
+  for (let i = 0; i < 6; i++) await advance(1000);
+  assert(el(m.host, ".imgblock"), "the member chat renders the image block");
+  assert(host.statusReads >= 1, "and reads the job");
+  assert(el(m.host, "img"), `and shows the picture: ${text(m).slice(0, 200)}`);
+  await React.act(async () => { (el(m.host, "button.imgopen") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await settle();
+  assert(el(m.host, "[data-canvas-drawer]"), "and a click opens the canvas");
+  await m.unmount();
+}
+
 // ===== the table =====
 {
   // Run from ui/, like the rest of the suite.
@@ -531,7 +681,8 @@ for (const sheet of [false, true]) {
     return v;
   };
   for (const sel of [".answer .issue-reader td:first-child", ".answer .issue-reader th:first-child", ".chat-bubble.issue-reader td:first-child"]) {
-    equal(last(sel, "overflow-wrap"), "break-word", `${sel}: the first column wraps only a word that overflows`);
+    equal(last(sel, "min-width"), "6rem", `${sel}: the first column keeps room for a word`);
+    if (sel.includes("td")) equal(last(sel, "overflow-wrap"), "anywhere", `${sel}: break-word would let a long value widen the whole chat`);
     assert(last(sel, "white-space") !== "nowrap", `${sel}: it may wrap`);
   }
   equal(last(".answer .issue-reader td", "overflow-wrap"), "anywhere", "a later column still wraps a long hash");

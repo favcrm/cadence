@@ -30,7 +30,8 @@ export type JobStatus =
   | { state: "running" | "failed" | "unclear" }
   | { state: "finished"; artifact: ArtifactRef };
 
-/** `missing` is a 404: the job is not there for this conversation. */
+/** `missing` is a 404, or a 401/403 (access to the conversation is gone): the
+ *  job is not readable here, and asking again will not change that. */
 export type JobRead = { kind: "status"; status: JobStatus } | { kind: "missing" };
 
 /** Parse a status body; null when it is not the contract's shape. A
@@ -52,7 +53,7 @@ export function readImageJob(jobId: string, conversation: string, signal?: Abort
   return usingPrivateOperation(undefined, async (op) => {
     const url = `/api/image-jobs/${encodeURIComponent(jobId)}?conversation=${encodeURIComponent(conversation)}`;
     const resp = await privateFetch(url, { headers: sessionHeaders(), signal }, op);
-    if (resp.status === 404) return { kind: "missing" } as const;
+    if (resp.status === 404 || resp.status === 401 || resp.status === 403) return { kind: "missing" } as const;
     if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
     const body: unknown = await resp.json();
     op.assertCurrent();

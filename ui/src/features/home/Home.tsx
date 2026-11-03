@@ -24,6 +24,7 @@ import {
   type TurnState,
 } from "./master";
 import { useCanvasFeed } from "../canvas/feed";
+import { ImageConversation } from "../canvas/imageConversation";
 import Composer from "./Composer";
 import {
   AssistantAboutButton,
@@ -1495,6 +1496,7 @@ function MasterHome({
             )}
 
             <CredentialRequestList conversationId={homeConversation} className="mx-1" />
+            <ImageConversation.Provider value={homeConversation ?? null}>
             <ThreadList
               items={items}
               limit={limit}
@@ -1509,6 +1511,7 @@ function MasterHome({
               queued={(master.data?.queue ?? []).map((q) => q.message)}
               stale={streamReconnecting && activeTurn}
             />
+            </ImageConversation.Provider>
             {cmds.map((c) => (
               <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
             ))}
