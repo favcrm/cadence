@@ -2,7 +2,7 @@ import type { HostedState, MasterStatus, PendingOperation } from "./contract.js"
 /** Application-owned business identity for the thread header. */
 export type MasterMetadata = Readonly<Record<string, unknown>>;
 /** The header's turn facts, from what the engine has not settled. */
-export declare function operationStatus(pending: readonly PendingOperation[]): Pick<HostedState, "running" | "message" | "queued">;
+export declare function operationStatus(pending: readonly PendingOperation[]): Pick<HostedState, "running" | "message" | "queued" | "queuedMessages">;
 /**
  * The board's master payload, in one place.
  *

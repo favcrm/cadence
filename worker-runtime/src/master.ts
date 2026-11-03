@@ -6,12 +6,14 @@ export type MasterMetadata = Readonly<Record<string, unknown>>;
 /** The header's turn facts, from what the engine has not settled. */
 export function operationStatus(
   pending: readonly PendingOperation[],
-): Pick<HostedState, "running" | "message" | "queued"> {
+): Pick<HostedState, "running" | "message" | "queued" | "queuedMessages"> {
   const running = pending.find((operation) => operation.status === "running");
+  const queued = pending.filter((operation) => operation.status === "queued");
   return {
     running: running !== undefined,
     message: running?.operationId ?? null,
-    queued: pending.filter((operation) => operation.status === "queued").length,
+    queued: queued.length,
+    queuedMessages: queued.map((operation) => operation.operationId),
   };
 }
 

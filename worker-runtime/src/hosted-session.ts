@@ -374,8 +374,9 @@ export class HostedSession<
    * Stop the turn with this id. The id is required: the engine reads a missing
    * one as "abort this session" even when nothing has been asked to stop.
    * Stopping a running turn aborts its conversation, and the engine withdraws
-   * the conversation's queued inputs with it, so a caller that can see a queue
-   * must say so. False when nothing matched.
+   * the conversation's queued inputs with it: a caller reads `queuedMessages`
+   * first and hands those back to the person who sent them. False when nothing
+   * matched.
    */
   async stopOperation(operationId: string): Promise<boolean> {
     if (!operationId) return false;

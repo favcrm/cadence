@@ -56052,10 +56052,12 @@ class IdentitySnapshots {
 // src/master.ts
 function operationStatus(pending) {
   const running = pending.find((operation) => operation.status === "running");
+  const queued = pending.filter((operation) => operation.status === "queued");
   return {
     running: running !== undefined,
     message: running?.operationId ?? null,
-    queued: pending.filter((operation) => operation.status === "queued").length
+    queued: queued.length,
+    queuedMessages: queued.map((operation) => operation.operationId)
   };
 }
 function masterState(model, status, conversationId, metadata) {

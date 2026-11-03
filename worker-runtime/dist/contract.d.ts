@@ -218,6 +218,8 @@ export interface HostedState {
     /** The running operation's id, so the board can name and stop that turn. */
     readonly message: string | null;
     readonly queued: number;
+    /** The queued operations' ids: stopping the running turn withdraws them. */
+    readonly queuedMessages: readonly string[];
     readonly model: string;
 }
 /**

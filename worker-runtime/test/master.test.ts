@@ -84,10 +84,10 @@ describe("master payload", () => {
         { operationId: "parked-1", status: "parked" },
         { operationId: "running-1", status: "running" },
       ]),
-    ).toEqual({ running: true, message: "running-1", queued: 1 });
+    ).toEqual({ running: true, message: "running-1", queued: 1, queuedMessages: ["queued-1"] });
     expect(
       operationStatus([{ operationId: "parked-1", status: "parked" }]),
-    ).toEqual({ running: false, message: null, queued: 0 });
+    ).toEqual({ running: false, message: null, queued: 0, queuedMessages: [] });
     const named = masterState("alias", { running: true, queued: 0, message: "running-1" }, "conv-1");
     expect((named.turn as { message: unknown }).message).toBe("running-1");
   });
