@@ -2417,8 +2417,8 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             Some("container_required"),
         ) => Some((
             "container_required",
-            "a hosted workspace cannot serve this: it needs a company runtime this \
-             workspace does not have. Retrying will not help, and nothing was changed",
+            "a hosted workspace cannot serve this command. Retrying will not help, and \
+             nothing was changed",
         )),
         // CAD-1999: the hosted project registry's own typed refusals. A key
         // that already exists as a ticket-only project conflicts exactly like
