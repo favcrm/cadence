@@ -586,6 +586,14 @@ async function main() {
   assert(!freshHost.textContent?.includes("Nothing right now") && !freshHost.textContent?.includes("Nothing queued"), "a failed roster claims nothing about an agent's work");
   await mountFresh("foreign", "overview");
   assert(freshHost.textContent?.includes("Could not load agents") && !freshHost.textContent?.includes("Loading agent details"), "the page gives one answer, with no loading line beside the failure");
+  const detailsButton = Array.from(freshHost.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Details");
+  assert(detailsButton, "the details panel can be opened");
+  await React.act(() => detailsButton.click());
+  await flush();
+  const failedPanel = freshHost.querySelector(".ag-chat-panel")?.textContent ?? "";
+  assert(failedPanel.includes("Agent details are unavailable."), "the panel says its details could not be read");
+  for (const empty of ["Nothing queued.", "No results yet.", "No events yet."])
+    assert(!failedPanel.includes(empty), `the panel claims nothing about unread details: ${empty}`);
   await React.act(() => freshRoot.unmount());
   console.log("agents view checks passed");
 }
