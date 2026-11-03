@@ -1854,7 +1854,7 @@ impl<H: CoordHttp> Coordinator<H> {
             value["actor"] = Value::Null;
             value["guidance"] = json!({
                 "code": "connect_local_agent",
-                "text": "This assignment is waiting for your local agent. Run `cadence local-agent connect --alias <alias> --repo <checkout>`. It was not sent to a hosted runner.",
+                "text": "This assignment is waiting for your local agent. Run `cadence agent connect --alias <alias> --repo <checkout>`. It was not sent to a hosted runner.",
             });
             return Ok(value);
         };
@@ -1975,7 +1975,7 @@ impl<H: CoordHttp> Coordinator<H> {
             "actor": "external_session",
             "guidance": {
                 "code": "report_from_this_session",
-                "text": "This session holds the claim. Report with `cadence local-agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
+                "text": "This session holds the claim. Report with `cadence agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
             },
         });
         if let Some(base) = base_ref {

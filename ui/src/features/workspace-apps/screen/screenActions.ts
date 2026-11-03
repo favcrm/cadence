@@ -75,6 +75,10 @@ export function plainRefusal(error: unknown): ActionRefusal {
   if (error.code === "draft_in_use") return { code: "draft_in_use", text: "This draft is approved or published, so it can't be discarded." };
   if (error.code === "stale_revision") return { code: "stale_revision", text: "That changed somewhere else. Reload and try again." };
   if (error.code === "draft_not_found") return { code: "draft_not_found", text: "That draft is no longer here." };
+  // SOC-54: the host keeps every retained read, so the remaining refusal is a
+  // profile that left Settings. `stale_source` stays mapped for an older daemon
+  // that still applies the latest-fetch-only rule.
+  if (error.code === "source_not_saved") return { code: "source_not_saved", text: "That profile is no longer a saved source. Re-add it in Settings." };
   if (error.code === "stale_source") return { code: "stale_source", text: "That post was fetched again since; clone it as a new post." };
   const text = error.message.toLowerCase();
   if (text.includes("320 pixels")) return { code: "image_too_small", text: "Use a photo at least 320 pixels on each side." };

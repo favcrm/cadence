@@ -481,6 +481,8 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // Setup: create one agent row through the daemon's `agent_register`
     // (`rpc_register`). Operator-only; the daemon's own gate still applies.
     route("POST", "/api/agents", RouteClass::OperatorOnly),
+    // CAD-1989: a hire saves a profile; no runtime row is written.
+    route("POST", "/api/agent-profiles", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/resume", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/unfence", RouteClass::OperatorOnly),
     route(

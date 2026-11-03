@@ -32,13 +32,26 @@ unless ALL of these hold for the pinned head:
     slot (two counted principals behind one login refuse the set). Two hosted
     rows of one reviewer and kind that share a stamp are refused unless they
     carry the same evidence, login included. A local document (or one from an
-    older client, which has no marker) counts exactly as before;
+    older client, which has no marker) counts exactly as before. CAD-2001: the
+    hosted reads are project-scoped. `cadence delivery requirements` says
+    where its answer came from (`origin: "hosted"`), and the gate then passes
+    the ticket's project — the one the requirements binding already names and
+    this script already checks against the ticket — to `cadence audit
+    verdicts --project` and `cadence audit approval --project --issue`. The
+    project is never derived from the repo or the cwd, and a hosted read that
+    cannot name it is refused rather than answered from repo-scoped evidence;
   * a ticket comment for this head lists those verdict notes (created after
     the other gates pass; dry-run only checks an existing comment);
   * for a human-class diff (a path trigger, more than 1500 changed lines, or
     any head-pinned note whose Risk is not exactly `auto`),
     `cadence audit approval` reports an approval in
     force for exactly this head. This script never records an approval.
+
+CAD-2001 release order: the tenant server must serve the project-scoped gate
+verbs before this client sends them. An older tenant refuses the verb names
+(HTTP 501/400/409/503) and the client says so — "update the tenant server
+first, then this Cadence client" — which this gate reports as a refusal, never
+as "no evidence was filed" and never by falling back to the repo-scoped reads.
 
 Then it signs (repo, pr, head) with the delivery-gate key (--gate-key) and posts
 the signature on the PR (CAD-1925: the merge queue's `delivery-gate` job holds
@@ -520,16 +533,26 @@ def required_check_reasons(repo, head, base_oid, required, rollup, runs):
 
 # ---- verdict notes (parsed by `cadence audit verdicts`) --------------------
 
-def read_verdicts(notes_dir, issue, pr, head):
+def read_verdicts(notes_dir, issue, pr, head, project=None):
     """(verdicts, skipped, origin) from the audit's own verdict reader.
 
     AOS-473: the document says where it came from. `hosted` is the org's own
     record, whose rows carry the owner's reviewer attestation; `local` — and
     an older client, which sends no marker — keeps the existing counting. Any
     other value is a document this gate cannot classify, so it refuses rather
-    than guess. Raises on failure."""
-    rc, out, err = run(["cadence", "audit", "verdicts", "--issue", issue, "--pr", str(pr),
-                        "--head", head, "--notes-dir", notes_dir])
+    than guess.
+
+    CAD-2001: a hosted read is project-scoped. `project` is the ticket's own
+    project (from the requirements binding, never the repo's), and it is
+    passed as `--project`; the document must name that same project. A local
+    selection is never given a project — local notes carry none — so the
+    project argument is absent exactly when the org is local. Raises on
+    failure."""
+    argv = ["cadence", "audit", "verdicts", "--issue", issue, "--pr", str(pr),
+            "--head", head, "--notes-dir", notes_dir]
+    if project is not None:
+        argv += ["--project", project]
+    rc, out, err = run(argv)
     try:
         doc = json.loads(out)
         verdicts, skipped = doc["verdicts"], doc.get("skipped", [])
@@ -538,7 +561,7 @@ def read_verdicts(notes_dir, issue, pr, head):
         if rc != 0 or not isinstance(verdicts, list) or not all(isinstance(v, dict) and all(k in v for k in keys) for v in verdicts):
             raise ValueError("unexpected shape")
     except (ValueError, KeyError, TypeError, AttributeError):
-        detail = (err or out).strip()[:200]
+        detail = (err or out).strip()[:400]
         raise RuntimeError(
             f"cannot read the verdict notes via `cadence audit verdicts` (rc {rc}): {detail}"
             + stale_cli_hint(detail)
@@ -547,6 +570,22 @@ def read_verdicts(notes_dir, issue, pr, head):
         raise RuntimeError(
             f"the verdict document names origin {origin!r}, which is neither local nor hosted; "
             "refusing to guess which counting rule applies")
+    # The document must be the scope the gate asked for, in both directions: a
+    # hosted answer must name this project, and a local answer must not stand
+    # in for a project-scoped read.
+    if origin == "hosted":
+        if project is None:
+            raise RuntimeError(
+                "the hosted verdict document is project-scoped but the gate had no project "
+                "to ask for; refusing to count it")
+        if doc.get("project") != project:
+            raise RuntimeError(
+                f"the hosted verdict document names project {doc.get('project')!r}, not "
+                f"{project!r}; refusing to count another project's evidence")
+    elif project is not None:
+        raise RuntimeError(
+            f"the selected org answered a local verdict document for project {project!r}; "
+            "refusing to count it as that project's evidence")
     return verdicts, skipped, origin
 
 
@@ -799,6 +838,13 @@ def requirements_inspection(issue, repo, pr, head):
                    ("issue", "project", "repo", "pr", "head", "base", "base_ref", "merge_base", "policy_digest")}
         if not isinstance(binding["project"], str) or not binding["project"]:
             raise ValueError("requirements response has no project binding")
+        # CAD-2001: where the answer came from decides which evidence scope the
+        # later reads must carry. A hosted answer marks itself; the daemon's own
+        # answer carries no marker. Anything else is a document this gate cannot
+        # classify, so it refuses instead of guessing a scope.
+        origin = result.get("origin")
+        if origin is not None and origin != "hosted":
+            raise ValueError(f"requirements response names origin {origin!r}, not hosted")
         readiness = result.get("readiness")
         if readiness is not None:
             if not isinstance(readiness, dict):
@@ -815,17 +861,29 @@ def requirements_inspection(issue, repo, pr, head):
                     or readiness["outcome_report"].split("/")[-1] in ("", ".", "..")
                     or any(unicodedata.category(char) == "Cc" for char in readiness["outcome_report"])):
                 raise ValueError("routine readiness does not bind to this issue, PR, head, base and policy")
-        return {"binding": binding, "requirements": req, "readiness": readiness}
+        return {"binding": binding, "requirements": req, "readiness": readiness,
+                "origin": origin}
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise RuntimeError(f"cannot use authoritative `cadence delivery requirements` result: {e}; {(err or out).strip()[:200]}")
 
 
-def check_approval(repo, pr, head, report, evidence=None):
-    rc, out, err = run(["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo])
+def check_approval(repo, pr, head, report, evidence=None, project=None, issue=None):
+    """Is an operator approval in force for exactly this head?
+
+    CAD-2001: a hosted approval is project-scoped and names the ticket it
+    authorizes, so `project` and `issue` are passed whenever the org is hosted
+    (they come from the ticket's own requirements binding). A local approval is
+    repo-scoped and takes neither. The client refuses a hosted call that cannot
+    name them, so a missing project can never be answered from repo-scoped
+    evidence; that refusal is reported as the refusal it is."""
+    argv = ["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo]
+    if project is not None:
+        argv += ["--project", project, "--issue", issue]
+    rc, out, err = run(argv)
     try:
         state = json.loads(out)
     except ValueError:
-        return [f"cannot read the operator approval via `cadence audit approval` (rc {rc}): {(err or out).strip()[:200]}"]
+        return [f"cannot read the operator approval via `cadence audit approval` (rc {rc}): {(err or out).strip()[:400]}"]
     if (rc == 0 and state.get("state") == "in-force"
             and state.get("recorded_via") in APPROVAL_RECORDED_VIA
             and isinstance(state.get("approval_id"), str) and state["approval_id"]):
@@ -1183,11 +1241,21 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         except RuntimeError as e:
             reasons.append(str(e))
 
+    # CAD-2001: a hosted org's evidence is project-scoped, and the project is
+    # the ticket's own — the one `delivery requirements` just bound and this
+    # script already compared with the ticket above. It is never the repo's
+    # project and never a cwd default. A local org passes nothing: its notes
+    # carry no project attribution.
+    hosted_project = None
+    if authority is not None and authority["origin"] == "hosted":
+        hosted_project = authority["binding"]["project"]
+
     verdicts, counted = [], []
     origin = "local"
     if issue:
         try:
-            verdicts, skipped, origin = read_verdicts(args.notes_dir, issue, pr, head)
+            verdicts, skipped, origin = read_verdicts(args.notes_dir, issue, pr, head,
+                                                      hosted_project)
             for sk in skipped:
                 report.append(f"skipped note {sk.get('name', '?')}: {sk.get('reason', sk)}")
             for v in verdicts:
@@ -1198,9 +1266,12 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         # AOS-473: the origin the document names decides the counting rule. A
         # hosted document is the org's attested record for this repo; anything
         # else keeps the local rule. A failed read leaves no verdicts to count.
-        hosted = {"repo": repo} if origin == "hosted" else None
+        # CAD-2001: a hosted document also had to name the ticket's project —
+        # `read_verdicts` refuses one that does not.
+        hosted = {"repo": repo, "project": hosted_project} if origin == "hosted" else None
         if hosted is not None:
-            report.append(f"verdict origin: hosted ({repo}); counting attested principals")
+            report.append(f"verdict origin: hosted ({repo}, project {hosted_project}); "
+                          "counting attested principals")
         active = authority is not None and authority["requirements"]["activation"] == "active"
         klass = authority["requirements"]["class"] if authority else None
         counted = []
@@ -1240,7 +1311,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
     if why:
         report.append("class: human (" + "; ".join(why) + ")")
-        rs = check_approval(repo, pr, head, report, approval_evidence)
+        rs = check_approval(repo, pr, head, report, approval_evidence,
+                            hosted_project, issue)
         if rs:  # legacy CAD-1106 scope fallback only
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
                              risk_text, one_text, verdicts, counted, report, approval_evidence)
@@ -1253,7 +1325,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         report.append("class: auto (every head-pinned note says Risk: auto; no path or size trigger)")
     authoritative_operator = bool(authority and authority["requirements"]["operator_approval"])
     if authoritative_operator and not why:
-        rs = check_approval(repo, pr, head, report, approval_evidence)
+        rs = check_approval(repo, pr, head, report, approval_evidence,
+                            hosted_project, issue)
         if rs:
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
                              risk_text, one_text, verdicts, counted, report, approval_evidence)

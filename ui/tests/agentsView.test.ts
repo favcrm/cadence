@@ -67,7 +67,7 @@ const base: Agent = {
   fenced: false,
   on: [],
 };
-const fresh = { by_issue: {}, refresh_error: false, snapshot_age_secs: 0, stale: false };
+const fresh = { by_issue: {}, profiles: [], refresh_error: false, snapshot_age_secs: 0, stale: false };
 const agents: Agent[] = [
   {
     ...base,

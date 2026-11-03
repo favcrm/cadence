@@ -1,7 +1,8 @@
 //! CAD-1752: the built-in role catalogue a hire copies from.
 //!
-//! A role is a recipe, not a clone: hiring copies its `instructions` into
-//! the new agent and records the catalogue id in `params`. Logins, keys,
+//! A role is a recipe, not a clone: hiring copies its `instructions` into a
+//! settings profile (CAD-1989) and records the catalogue id on it; no agent
+//! is created. A runtime registers against the profile later. Logins, keys,
 //! MCP servers, grants and history are never part of a role. `team_role`
 //! only routes the model (it must be one of `model_defaults::TEAM_ROLES`).
 

@@ -7,13 +7,6 @@
     "alias": {
       "type": "string"
     },
-    "catalogue": {
-      "description": "CAD-1752: hire from this role of `GET /api/agent-roles`.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
     "cwd": {
       "type": [
         "string",
@@ -33,13 +26,7 @@
       ]
     },
     "location": {
-      "description": "Start blank only; a `catalogue` hire takes the runtime from the install.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "look": {
+      "description": "Start blank only.",
       "type": [
         "string",
         "null"

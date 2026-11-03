@@ -973,12 +973,17 @@ business: no `--ready`, no forced claims; the output prints the queued
 message id and the worker's probe verdict so the operator knows
 whether it lands now or when the pane idles.
 
-**Task context delivery (CAD-1822, CAD-1846).** Plain dispatch, explicit
-`dispatch --job --spec`, and native issue-linked job task dispatch use the
+**Task context delivery (CAD-1822, CAD-1846, CAD-2001).** Plain dispatch,
+explicit `dispatch --job --spec`, and native issue-linked job task dispatch use the
 same project-source and current-policy lesson selection for the actual
 worker's role. They pin the task contract and the assigned project's tracked
 sources, but only when that project's tracked
-`docs/cadence/project-context.yaml` at HEAD sets `agent_delivery: true`.
+`docs/cadence/projects/<key>/project-context.yaml` — or, when that is not
+tracked, `docs/cadence/project-context.yaml` — at HEAD sets
+`agent_delivery: true`. One checkout can serve several projects, so the
+per-project path is preferred and lets each project keep its own opt-in;
+the shared default serves only the project its `project:` names, and a
+manifest naming another project is refused, never read as this project's.
 Absent or false leaves every existing dispatch path unchanged. A
 tracked manifest the daemon cannot read or parse cannot prove the
 opt-in, so delivery stays off and dispatch is unchanged; once
@@ -1824,7 +1829,8 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/issues/:id/activity` | the merged activity stream only |
 | `GET /api/issues/:id/history?limit=N` | parsed git history for the issue — same entries as `issue log` (default limit 50, `400` on a bad limit); an epic's stage move is a `stage` entry with `from`, `to` and `note`, a plan decision a `plan` entry (CAD-432) |
 | `GET /api/issues/:id/artifacts/:name` | one artifact file — inline for a small safe list (`text/plain` for md/txt/logs/code, images), **`Content-Disposition: attachment` for everything else, always for html/svg/xml/js/pdf**. Every artifact response carries `Content-Security-Policy: sandbox; default-src 'none'` and `Cache-Control: no-store`; names must satisfy the write grammar (no `/`, no leading dot); symlinks → `404` |
-| `GET /api/agents` | worker agent rows enriched with the exact task/issue binding (`agent.tasks` × `jobs.issue_id`) + running/queued/fenced/parked totals and `by_issue` for card strips; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down |
+| `GET /api/agents` | worker agent rows enriched with the exact task/issue binding (`agent.tasks` × `jobs.issue_id`) + running/queued/fenced/parked totals and `by_issue` for card strips; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down; `profiles` (CAD-1989) lists the Settings > Agents profiles as `{id, alias, role, team_role, catalogue, look, job, model, runtimes}` (`job` is the operator's: the board's shared payload always carries `null`, and the daemon returns it only to a proven operator), `runtimes` being the aliases registered with `--profile <id>` (empty means "Idle · no runtime") |
+| `POST /api/agent-profiles` | `{alias, catalogue, job?, model?}` — CAD-1989: a hire saves a Settings > Agents profile from the catalogue role and nothing else: no runtime row, no home directory, no launch. `job` is sent only when edited (else the role's instructions); `model` is `inherit` unless one registered model is chosen (an explicit model stays strict). Operator only over the daemon's `agent_profile_create`; `409 alias_taken` when a profile or a runtime has the alias. A runtime attaches later with `cadence join <group> <provider> --profile <id>` and `cadence agent context <id>` reads the profile (the operator, or the agent whose own runtime is registered against it; anyone else is refused). The alias grammar is lowercase letters, digits and dashes, starting with a letter or digit; a runtime cannot take an alias a profile holds. The job is readable by the operator and a runtime registered against the profile; a group-root agent that registers a member against a profile also reads it (its `join` needs it for the briefing) | `201 {profile}` |
 | `GET /api/agents/:alias` | the agent drawer: `agent_show` + last 20 events + `tasks`/`on` bindings + `recovery`/`resume` commands; `404` on unknown alias, `400` on alias grammar |
 | `GET /api/memories?project=&status=&type=&component=&path=` | memory cards from projects readable by the caller — same filters as `memory ls`; `memory_errors` includes load failures only for readable projects |
 | `GET /api/memories/:project/:slug` | one readable memory: frontmatter, body and evidence analysis; Wiki citations use the proven board caller's access. An unattributed or refused caller is refused rather than treated as anonymous; inaccessible and unknown memories share a generic `404`, `400` on grammar |

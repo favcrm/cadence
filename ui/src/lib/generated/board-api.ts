@@ -35,6 +35,30 @@ export type ActorIdentity = {
   scope: "workspace";
 };
 
+/** One agent profile of `GET /api/agents` (CAD-1989). */
+export interface AgentProfile {
+  alias: string;
+  catalogue?: string | null;
+  id: string;
+  /** The operator's to read: absent from the board's shared payload. */
+  job?: string | null;
+  look?: string | null;
+  /** `inherit` or a model id. */
+  model: string;
+  role: string;
+  runtimes: string[];
+  team_role: string;
+}
+
+/** `POST /api/agent-profiles` (CAD-1989): hire a catalogue role as a profile.
+ * `job` is sent only when edited; `model` is absent or `inherit` unless picked. */
+export interface AgentProfileReq {
+  alias: string;
+  catalogue: string;
+  job?: string | null;
+  model?: string | null;
+}
+
 /** A provider allowance record as the store keeps it. The envelope is fixed;
  * `data` is the provider's own report (for Codex, its rate-limit buckets). */
 export interface AgentQuota {
@@ -58,14 +82,11 @@ export interface AgentQuota {
  * not a daemon field: `cloud` pins provider and endpoint kind to `sandbox`. */
 export interface AgentRegisterReq {
   alias: string;
-  /** CAD-1752: hire from this role of `GET /api/agent-roles`. */
-  catalogue?: string | null;
   cwd?: string | null;
   endpoint_kind?: string | null;
   instructions?: string | null;
-  /** Start blank only; a `catalogue` hire takes the runtime from the install. */
+  /** Start blank only. */
   location?: string | null;
-  look?: string | null;
   model_policy?: string | null;
   params?: string | null;
   provider?: string | null;
@@ -162,6 +183,9 @@ export interface AgentsResponse {
   /** Issue id to its bound agent strip. */
   by_issue: Record<string, CardAgent[]>;
   daemon: DaemonReach;
+  /** CAD-1989: the settings profiles, each with the runtime aliases
+   * registered against it. */
+  profiles: AgentProfile[];
   refresh_error: boolean;
   snapshot_age_secs: number;
   stale: boolean;

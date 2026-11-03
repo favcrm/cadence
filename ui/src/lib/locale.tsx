@@ -180,6 +180,20 @@ function browserLocale(): Locale {
   return "en";
 }
 
+Object.assign(zhTW, {
+  "Add {name}": "新增 {name}", "Adding…": "正在新增…", "Added {name}.": "已新增 {name}。",
+  "{name} was added as {role}": "{name} 已新增為{role}", "Idle · no runtime": "閒置 · 尚無執行環境",
+  "Connect a runtime": "連接執行環境", "Read the profile:": "讀取設定檔：",
+  "Start a session on an issue under this profile:": "在此設定檔下對議題開始工作階段：",
+  "Register a runtime against it (provider: {providers}):": "將執行環境註冊至此設定檔（供應商：{providers}）：",
+  "A runtime joins a group. Create one first:": "執行環境須加入群組，請先建立一個：",
+  "Then register a runtime against the profile (provider: {providers}):": "接著將執行環境註冊至設定檔（供應商：{providers}）：",
+  "Use lowercase letters, digits and dashes, starting with a letter or digit.": "請使用小寫字母、數字與連字號，並以字母或數字開頭。",
+  "Profile {alias}": "設定檔 {alias}", "Inherit from the runtime": "由執行環境決定",
+  "A model you pick is used as chosen or refused, never swapped.": "您選擇的模型會照選用，或被拒絕，絕不會被替換。",
+  "Nothing runs until a runtime connects.": "連接執行環境之前不會執行任何工作。", "(recorded on the profile)": "（記錄於設定檔）",
+});
+
 /** Browser-only choice for signed-out and local sign-ins (CAD-1331). Not an account write. */
 const LOCAL_LOCALE_KEY = "cadence-locale";
 

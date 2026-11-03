@@ -756,6 +756,7 @@ pub(crate) fn agents_payload_typed(
             agents: vec![],
             totals: None,
             by_issue: BTreeMap::new(),
+            profiles: vec![],
         };
     };
     let task_map = jobs
@@ -957,6 +958,7 @@ pub(crate) fn agents_payload_typed(
         agents: out,
         totals: Some(totals),
         by_issue,
+        profiles: list["profiles"].as_array().cloned().unwrap_or_default(),
     }
 }
 
@@ -980,7 +982,8 @@ pub(crate) fn agent_detail(
         state_dir,
         "agent_show",
         json!({"alias": alias, "active_only": true,
-               "include_catalogue_instructions": operator, "include_stats": true}),
+               "include_catalogue_instructions": operator,
+               "include_profile_instructions": operator, "include_stats": true}),
     )
     .map_err(|e| e.to_string())?;
     let agent = &show["agent"];

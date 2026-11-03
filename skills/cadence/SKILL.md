@@ -14,8 +14,8 @@ hosted coding or review session need not have either.
 `cadence --help` lists the core verbs only, in groups:
 
 - Me: `self`, `inbox`
-- Work: `issue`, `plan`
-- Agents: `send`, `dispatch`, `join`, `agent`
+- Work: `issue` (`issue epic propose|approve|reject` is the plan write; `plan ls` and `plan show` remain)
+- Agents: `agent` (`agent join` adds a worker). `send` and `dispatch` still parse; `message send` is the canonical enqueue
 - Build: `build-slot`, `secret`
 - Fleet: `status`, `doctor`
 - Knowledge: `memory`, `wiki`
@@ -463,6 +463,34 @@ Fresh joins get a `bootstrap-<alias>` kickoff plus the briefing file;
 `join --no-bootstrap` skips both. An inbox is the right `reply_to`/
 group root when results should accumulate for a non-agent consumer —
 the queue is durable and `inbox --wait` blocks instead of polling.
+
+## Onboarding a person (invite, board, optional CLI)
+
+When someone new is joining a workspace, start from their goal, not from an
+install. Ask which they need:
+
+- **The shared board only** — open the invitation link, sign in with the
+  address that received it, choose **Join company**, then **Open app**. No
+  install, CLI credential or agent registration is involved.
+- **Cadence on their own computer** — install on that machine, then
+  `cadence login <slug>`. Consent picks what this connection may use; the saved
+  command default is separate and changes only with `--use`.
+- **A shared or bot machine** — say before any authorization that the
+  credential is stored on that machine and anyone with filesystem access may be
+  able to use it. Continue only if the user trusts that machine.
+
+Never ask for a password, one-time code, cookie, device code or token in chat,
+and never copy another person's credential or browser cookie. A workspace
+invitation, credential consent and local-agent registration are three separate
+actions; completing one does not perform the others. Do not offer `cadence
+setup` to a hosted user who only needs the board.
+
+When the user asks for something the deployed board does not support, check
+rather than assume: `cadence commands "<words>"`, `cadence schema <verb>` and
+`cadence --help` describe the installed build, and `cadence --org <slug> ...`
+tells you what the live workspace answers. Report an unavailable hosted
+operation as unavailable — do not substitute a local tracker or invent success.
+A login that works says nothing about a specific verb being supported.
 
 ## Business knowledge (company questions)
 

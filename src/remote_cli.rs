@@ -32,6 +32,17 @@
 //!   safe: the refusal came back before the verb ran. `wake_failed`
 //!   (`runtime_stopped`/`not_found`/`unavailable`) and every other failure
 //!   end the command — never a redirect chase, never another org, never local.
+//!
+//! CAD-2001 adds the project-scoped review-evidence verbs
+//! ([`PROJECT_SCOPED_GATE_VERBS`]). Each carries an explicit `project`, and
+//! the two approvals also carry the `issue` they authorize, so no read can
+//! answer from another project's evidence and no write is authorized by a
+//! repo's first project. They are newer than the tenant that serves them: the
+//! release order is the tenant server first, then this client, and a tenant
+//! that does not know the name is refused by [`tenant_cannot_serve`] with
+//! that order named. The older repo-scoped verbs stay in the tenant for old
+//! clients; this build never sends them for the gate or the operator and
+//! never falls back to them when the project is known.
 
 use base64::Engine;
 use serde_json::{json, Map, Value};
@@ -159,6 +170,21 @@ pub const REMOTE_VERBS: &[&str] = &[
     // as the merge approval, because an attestation is the owner's own act.
     "audit_reviewers",
     "audit_reviewers_set",
+    // CAD-2001: the project-scoped review-evidence path. Every one of these
+    // carries an explicit `project` (and `issue` for the approvals), so a
+    // read can never answer from another project's evidence and a write can
+    // never be authorized by a repo's first project. The tenant serves the
+    // repo-scoped verbs above to old clients; this build never sends them for
+    // the gate or the operator, and a tenant that predates these names is
+    // refused with the release order named — never a silent fallback.
+    "audit_approval_project",
+    "audit_verdicts_project",
+    "audit_verdict_project",
+    "audit_approve_project",
+    "audit_reviewers_project",
+    "audit_reviewers_project_set",
+    "audit_identities",
+    "audit_identities_set",
 ];
 
 /// Scope a cli authorize request asks for. Existing container verbs keep
@@ -173,20 +199,31 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_verdicts"
         | "audit_reviewers"
         | "audit_scope"
+        | "audit_approval_project"
+        | "audit_verdicts_project"
+        | "audit_reviewers_project"
+        | "audit_identities"
         | "agent_profile_list"
         | "agent_profile_context"
         | "agent_roles"
         | "project_ls" => &["cli.read"],
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
-        "audit_verdict" => &["cli.write"],
+        "audit_verdict" | "audit_verdict_project" => &["cli.write"],
         // CAD-1999: creating a project is a workspace-structure write; the
         // board also requires a live human owner. Reading the registry is a
         // plain cli.read above.
         "project_new" => &["cli.write"],
-        "audit_approve" | "audit_reviewers_set" | "delivery_policy_set" => {
-            &["cli.write", "audit.approve"]
-        }
+        // CAD-2001: attesting project eligibility or a principal's GitHub
+        // identity decides whose verdicts count, so both writes need the same
+        // `audit.approve` login as the merge approval — and the tenant admits
+        // them for the live human owner only.
+        "audit_approve"
+        | "audit_approve_project"
+        | "audit_reviewers_set"
+        | "audit_reviewers_project_set"
+        | "audit_identities_set"
+        | "delivery_policy_set" => &["cli.write", "audit.approve"],
         "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
         _ => &["cli.read", "cli.write"],
     }
@@ -221,6 +258,10 @@ fn mutating_cli_verb(verb: &str) -> bool {
             | "issue_review"
             | "audit_verdict"
             | "audit_reviewers_set"
+            | "audit_verdict_project"
+            | "audit_approve_project"
+            | "audit_reviewers_project_set"
+            | "audit_identities_set"
             | "project_new"
     ) || team_mutation_verb(verb)
 }
@@ -237,7 +278,13 @@ fn lost_mutation_note(verb: &str) -> &'static str {
         "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it"
     } else if verb == "audit_reviewers_set" {
         "the attestation may or may not have been recorded — read `audit reviewers` for the same repo before repeating it"
-    } else if verb == "audit_verdict" {
+    } else if verb == "audit_reviewers_project_set" {
+        "the project's eligibility map may or may not have been recorded — read `audit reviewers` for the same project before repeating it"
+    } else if verb == "audit_identities_set" {
+        "the identity attestations may or may not have been recorded — read `audit identities` before repeating it"
+    } else if verb == "audit_approve_project" {
+        "the approval may or may not have been recorded — read `audit approval` for the same issue, repo and head before repeating it"
+    } else if verb == "audit_verdict" || verb == "audit_verdict_project" {
         "the verdict may or may not have been recorded — read `audit verdicts` for the same head before repeating it"
     } else if verb == "issue_review" {
         "the verdict may or may not have been recorded — read the same issue before repeating it; a reviewer holds one verdict per revision"
@@ -257,6 +304,82 @@ fn board_gate_refused(body: Option<&Value>) -> bool {
     body.and_then(|b| b.pointer("/error/hop"))
         .and_then(Value::as_str)
         == Some("board")
+}
+
+/// CAD-2001: the project-scoped review-evidence verbs. Every one carries an
+/// explicit `project` — plus `issue` for the two approvals — so the answer is
+/// that project's evidence and no other's. They are newer than the tenant
+/// that must serve them, so a refusal meaning "this tenant does not know that
+/// verb" is reported as a release-order problem (see
+/// [`tenant_cannot_serve`]): never a pass, and never a fallback to the older
+/// repo-scoped verbs, which stay served for old clients only.
+pub const PROJECT_SCOPED_GATE_VERBS: &[&str] = &[
+    "audit_approval_project",
+    "audit_verdicts_project",
+    "audit_verdict_project",
+    "audit_approve_project",
+    "audit_reviewers_project",
+    "audit_reviewers_project_set",
+    "audit_identities",
+    "audit_identities_set",
+];
+
+/// Why a project-scoped verb could not be served, when the answer means "this
+/// tenant cannot serve that call". Two shapes say it:
+///
+/// - the verb is unknown — the tenant board answers `501 not_implemented`, an
+///   older relay rejects the name in its strict request schema
+///   (`400 invalid_request`), and `409 container_required` marks a verb the
+///   tenant routes to a runtime it does not have here;
+/// - the tenant's own store cannot answer (`503 capability_unavailable`).
+///
+/// The release order is the tenant server first, then this client. The
+/// message names that order and says what was not read or recorded; it never
+/// lets the caller read the refusal as "no evidence was filed" or as a reason
+/// to fall back to repo-scoped evidence.
+fn tenant_cannot_serve(verb: &str, status: u16, body: Option<&Value>) -> Option<String> {
+    let state = body.and_then(|b| b["state"].as_str()).unwrap_or_default();
+    if state == "waking" || state == "wake_failed" {
+        return None;
+    }
+    let code = body
+        .and_then(|b| b.pointer("/error/code"))
+        .and_then(Value::as_str);
+    let nothing = if mutating_cli_verb(verb) {
+        "Nothing was recorded"
+    } else {
+        "Nothing was read"
+    };
+    // A project the tenant has no proven policy for is a real refusal, not a
+    // version problem: name the remedy instead of the release order.
+    if status == 409 && code == Some("project_policy_unavailable") {
+        return Some(format!(
+            "the tenant stores no access policy for that project, so `{verb}` was refused \
+             before it ran — the owner records the project's policy first. {nothing}"
+        ));
+    }
+    let cannot_serve = match status {
+        501 => true,
+        400 => matches!(code, Some("invalid_request" | "unknown_verb")),
+        404 => matches!(code, Some("unknown_verb" | "not_implemented")),
+        409 => true,
+        503 => matches!(
+            code,
+            Some("capability_unavailable" | "not_implemented" | "unknown_verb")
+        ),
+        _ => false,
+    };
+    if !cannot_serve {
+        return None;
+    }
+    Some(format!(
+        "the tenant could not serve `{verb}` (HTTP {status}{}) — CAD-2001 moved the merge \
+         gate's review evidence to the project scope, and the tenant must serve these verbs. \
+         Release order: update the tenant server first, then this Cadence client; a tenant \
+         that predates them refuses the name, and this client never falls back to the older \
+         repo-scoped evidence. {nothing}",
+        code.map_or(String::new(), |c| format!(", {c}"))
+    ))
 }
 
 /// Argument keys a platform team verb may carry. Other verbs keep their
@@ -3152,6 +3275,22 @@ fn call_verb_until_retry(
             && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
             && !board_gate_refused(body.as_ref());
         let unknown_correlation = refusal_correlation(body.as_ref());
+        // CAD-2001: a project-scoped gate verb the tenant cannot serve is a
+        // release-order problem, not an availability blip and not "no
+        // evidence". Report it before the generic decoder can call it
+        // retryable. A checked write conflict keeps its own verdict: the call
+        // ran and proved nothing was written.
+        if PROJECT_SCOPED_GATE_VERBS.contains(&verb) {
+            let checked_conflict = body.as_ref().is_some_and(|b| {
+                b.get("conflict").is_some()
+                    || b.pointer("/error/code").and_then(Value::as_str) == Some("revision_conflict")
+            });
+            if !checked_conflict {
+                if let Some(why) = tenant_cannot_serve(verb, status, body.as_ref()) {
+                    return Err(reject(why));
+                }
+            }
+        }
         match classify(status, retry_after, body) {
             Verdict::Done(Err(_e)) if team_mutation_unknown => {
                 return Err(ambiguous_mutation_error(status, unknown_correlation));

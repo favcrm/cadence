@@ -626,9 +626,11 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
         | AuditAction::Verdicts { .. }
         | AuditAction::Scope { .. }
         | AuditAction::Verdict { .. }
-        | AuditAction::Reviewers { .. } => {
+        | AuditAction::Reviewers { .. }
+        | AuditAction::Identities { .. } => {
             unreachable!(
-                "audit approval/verdicts/scope/verdict/reviewers are handled in cli::audit::run"
+                "audit approval/verdicts/scope/verdict/reviewers/identities are handled in \
+                 cli::audit::run"
             )
         }
         AuditAction::Designate {

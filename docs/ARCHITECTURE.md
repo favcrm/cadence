@@ -88,14 +88,18 @@ Resource admission and provider quota are also different. A free build slot does
 not prove provider allowance, and attaching/detaching a terminal does not prove
 its provider process ended. Reclamation must prove ownership at action time.
 
-### Task context delivery (CAD-1822, CAD-1846)
+### Task context delivery (CAD-1822, CAD-1846, CAD-2001)
 
 A project opts in by setting `agent_delivery: true` in its tracked
-`docs/cadence/project-context.yaml` at HEAD; absent or false leaves every
-existing dispatch path unchanged. A manifest the daemon cannot read or parse
-cannot prove the opt-in, so delivery stays off; once `agent_delivery: true` is
-parsed, an invalid manifest, a missing required source or an over-cap payload
-refuses. An
+`docs/cadence/projects/<key>/project-context.yaml` at HEAD, or — when that
+per-project manifest is not tracked — in `docs/cadence/project-context.yaml`,
+which must name the same project in its `project:` field (a checkout can serve
+several projects, so the per-project path is preferred and a manifest naming
+another project is refused, never read as this project's). Absent or false
+leaves every existing dispatch path unchanged. A manifest the daemon cannot
+read or parse cannot prove the opt-in, so delivery stays off; once
+`agent_delivery: true` is parsed, an invalid manifest, a missing required
+source or an over-cap payload refuses. An
 opted-in issue-bound managed dispatch pins one deterministic schema-2 task
 manifest (`src/context_pack.rs`) before the kickoff becomes claimable.
 Plain issue dispatch, explicit issue `--job` and native issue-linked task

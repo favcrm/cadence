@@ -137,12 +137,37 @@ cadence --org acme team invites
 cadence --org acme team list
 ```
 
-The teammate accepts the workspace invitation through the platform and runs
-`cadence login acme` on their own machine/account. Each person has their own
-saved credential and private configuration; never copy the owner's credential,
-browser cookie or another agent's state. A member can approve ordinary CLI/wiki
+### Join in the browser (no install)
+
+The teammate can accept the invitation and use the shared board without
+installing anything. They open the invitation link from the email, sign in with
+the address that received it, choose **Join company** to accept, then choose
+**Open app**. The board then shows the workspaces they belong to; picking one
+opens that workspace's board. Nothing on this path creates a credential,
+registers an agent or installs a CLI.
+
+If the browser cannot join, the cause changes the next step:
+
+- **Wrong account** — sign out and sign in with the address that received the
+  invitation.
+- **Expired, revoked or already used** — ask a workspace owner to invite that
+  address again.
+- **No matching workspace** — the invitation was not accepted under this
+  account, the workspace is archived, or the slug hint supplied to `cadence
+  login <slug>` names a workspace this account does not belong to. An
+  invitation does not create membership by itself; ask an owner to check
+  `cadence --org <slug> team list`. If the login hint is wrong, restart
+  `cadence login` without a hint to choose an eligible workspace, or use the
+  correct slug.
+
+### Connect a computer (optional)
+
+`cadence login acme` is for the machine that will run Cadence, not a
+requirement for reading or updating the board. Each person has their own saved
+credential and private configuration; never copy the owner's credential, browser
+cookie or another agent's state. A member can approve ordinary CLI/wiki
 collaboration. App lifecycle changes below require a current **human owner**.
-Invitation acceptance, credential consent and local-agent registration are
+Invitation acceptance, credential consent and local agent registration are
 separate actions; installing an app does not perform any of them.
 
 ```sh
@@ -168,11 +193,10 @@ Three IDs have different lifetimes:
 The daemon retains stable agent IDs across disconnect/reconnect. Labels,
 `client_agent_id`, adapter metadata and any of these IDs confer no permission.
 There is one explicitly selected assignment default per member/workspace; extra
-sessions do not race it for claims. For an additional explicit FYI-only alias,
-use the lower-level supported surface:
+sessions do not race it for claims. For an additional explicit FYI-only alias:
 
 ```sh
-cadence --org acme local-agent connect --alias my-reviewer --fyi-only
+cadence --org acme agent connect --alias my-reviewer --fyi-only
 ```
 
 This preserves the assignment default and multiplexes notices on the same
@@ -241,14 +265,14 @@ starting. Load the profile, then use the project's actual integration ref:
 ```sh
 cadence --org acme agent context ap_<profile-id>
 cadence --org acme issue start <issue-id> --repo /absolute/path/to/checkout --profile ap_<profile-id> --base <integration-ref>
-cadence --org acme local-agent report <assignment-id> --state blocked --text "waiting for the owner"
+cadence --org acme agent report <assignment-id> --state blocked --text "waiting for the owner"
 ```
 
 `--profile` claims under `session-<profile-id>` without a daemon and targets
 only the named issue. Inspect the receipt for the claim, lane and reporting
 instructions. The board checks claim and generation on reports, but the
 profile-derived client ID is not proof of a distinct session identity.
-`--profile` does not read profile content; load it with `context`. The
+`--profile` does not read profile content; load it with `context`. Hiring creates only such a profile (CAD-1989): no runtime, provider, sandbox or model is chosen, nothing launches, and `model` stays `inherit` until a runtime resolves it or one is set explicitly. A native board reads a profile the same way with `cadence agent context <alias>`. The
 authenticated caller, not the profile, carries authority.
 
 Profile claims depend on the deployed board and client versions. An older
@@ -280,40 +304,66 @@ distinct authenticated principal, and in-chat findings are not automatically
 a gate-counted verdict.
 
 ```sh
-cadence --org acme audit verdict --repo <owner/name> --issue <issue-id> --pr <number> \
+cadence --org acme audit verdict --project <project-key> --repo <owner/name> \
+  --issue <issue-id> --pr <number> \
   --head <full-sha> --kind standards --outcome pass --risk auto --file findings.md
 ```
 
-`--repo` is the repository the verdict is about (default: the cwd checkout's
-github.com origin); the org refuses a repo the project has not declared
-(`repo_not_bound`) and a caller the owner has not attested for it
-(`reviewer_not_bound`). `--kind` is `standards`, `spec-security`, `combined` or
-`browser-qa` (the kinds the merge gate counts; `spec` is retired);
-`--outcome` is `pass` or `revise`, and `--title-outcome` / `--section-outcome`
-default to it. The reviewer is the authenticated caller, never an argument. A
-repeat of the same kind, head and findings returns the latest row with
-`duplicate: true`; a changed outcome appends a correction, and the gate reads
-the latest row per reviewer and kind.
+`--project` is the issue's project and is required: the evidence is that
+project's, and the project is never inferred from `--repo` or the cwd. The org
+refuses a repo the project has not declared (`repo_not_bound`), an issue that
+resolves to another project (`project_mismatch`), a caller the owner has not
+made eligible for the project (`reviewer_not_bound`) and a caller with no
+attested login (`identity_unattested`). `--kind` is `standards`,
+`spec-security`, `combined` or `browser-qa` (the kinds the merge gate counts;
+`spec` is retired); `--outcome` is `pass` or `revise`, and `--title-outcome` /
+`--section-outcome` default to it. The reviewer is the authenticated caller,
+never an argument. A repeat of the same kind, head and findings returns the
+latest row with `duplicate: true`; a changed outcome appends a correction, and
+the gate reads the latest row per reviewer and kind.
 
 Read them back under the same org with `cadence --org acme audit verdicts
---repo <owner/name> --issue <issue-id> --pr <number> --head <full-sha>`; a
-hosted selection answers from the org, never from local notes, and refuses an
-answer naming another repository. The merge gate also runs whichever `cadence`
-you point it at: set `CADENCE_BIN` when more than one build is on the host, or
-a stale client's missing hosted verb will read like a gate refusal.
+--project <project-key> --repo <owner/name> --issue <issue-id> --pr <number>
+--head <full-sha>`; a hosted selection answers from the org, never from local
+notes, and refuses an answer naming another project, repository, issue or
+head. The merge gate also runs whichever `cadence` you point it at: set
+`CADENCE_BIN` when more than one build is on the host, or a stale client's
+missing hosted verb will read like a gate refusal.
 
-A hosted verdict counts only on the owner's attestation (AOS-473): the
-workspace owner binds the login to the principal per repository with
-`cadence --org acme audit reviewers set --repo <owner/name> --reviewer
-<github-login>=<subject-id>`, and the gate then counts a hosted document by
-principal and excludes the author by the attested login. An unbound caller's
-verdict is refused (`reviewer_not_bound`) and a row whose repo or binding is
-missing never counts; `cadence --org acme audit reviewers --repo <owner/name>`
-reads the bindings back. Never impersonate a reviewer: the verdict names the
-authenticated caller, and the owner's attestation is the only thing that makes
-that caller count. Where the org cannot answer, the gate refuses; a missing
-hosted read is not a pass, and the repository's approved merge path and any
-required operator decision remain in force.
+A hosted verdict counts only on the owner's attestations (AOS-473, CAD-2001):
+the workspace owner binds each principal's GitHub login once for the workspace,
+then admits principals to a project's review set. A code verdict needs both,
+because the gate counts a hosted document by principal and excludes the author
+by the attested login:
+
+```sh
+cadence --org acme audit identities set \
+  --identity <subject-id>=<github-login> [--identity ...]
+cadence --org acme audit reviewers set --project <project-key> \
+  --reviewer <subject-id> [--reviewer ...]
+cadence --org acme audit reviewers --project <project-key>   # read both joins back
+cadence --org acme audit identities                           # the workspace map
+```
+
+Both writes are the owner's own act: they need the opt-in `audit.approve`
+login (`cadence login --audit-approve`), and an agent's call is refused.
+Leaving a principal out of the project's set stops new verdicts for that
+project only; rows already filed keep their stored principal and login and
+stay countable for the head they reviewed. A principal listed with no attested
+login reads back with `github_login: null` and its verdicts cannot count yet.
+Never impersonate a reviewer: the verdict names the authenticated caller, and
+the owner's attestations are the only thing that makes that caller count.
+Where the org cannot answer, the gate refuses; a missing hosted read is not a
+pass, and the repository's approved merge path and any required operator
+decision remain in force.
+
+CAD-2001 release order: the tenant server must serve the project-scoped review
+verbs before this client sends them. An older tenant refuses the names
+(`not_implemented`/`invalid_request`/`container_required`/
+`capability_unavailable`) and the client says so — update the tenant server
+first, then this Cadence client. The client never falls back to the older
+repo-scoped evidence when the project is known, and the gate treats that
+refusal as a refusal, never as "no verdicts were filed".
 
 To give the other teammate an informational pointer, obtain their exact `lag_`
 ID from `agent directory`, then send an explicit FYI:

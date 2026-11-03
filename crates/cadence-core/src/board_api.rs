@@ -324,6 +324,26 @@ pub struct AgentsPayload {
     pub totals: Option<AgentTotals>,
     /// Issue id to its bound agent strip.
     pub by_issue: BTreeMap<String, Vec<CardAgent>>,
+    /// CAD-1989: the settings profiles, each with the runtime aliases
+    /// registered against it.
+    #[schemars(with = "Vec<AgentProfile>")]
+    pub profiles: Vec<Value>,
+}
+
+/// One agent profile of `GET /api/agents` (CAD-1989).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct AgentProfile {
+    pub id: String,
+    pub alias: String,
+    pub role: String,
+    pub team_role: String,
+    pub catalogue: Option<String>,
+    pub look: Option<String>,
+    /// The operator's to read: absent from the board's shared payload.
+    pub job: Option<String>,
+    /// `inherit` or a model id.
+    pub model: String,
+    pub runtimes: Vec<String>,
 }
 
 /// `GET /api/agents`: the roster beside its snapshot's freshness.
@@ -929,7 +949,7 @@ pub struct CommentReq {
 #[serde(deny_unknown_fields)]
 pub struct AgentRegisterReq {
     pub alias: String,
-    /// Start blank only; a `catalogue` hire takes the runtime from the install.
+    /// Start blank only.
     pub location: Option<String>,
     pub provider: Option<String>,
     pub endpoint_kind: Option<String>,
@@ -940,9 +960,17 @@ pub struct AgentRegisterReq {
     pub sandbox: Option<String>,
     pub instructions: Option<String>,
     pub params: Option<String>,
-    /// CAD-1752: hire from this role of `GET /api/agent-roles`.
-    pub catalogue: Option<String>,
-    pub look: Option<String>,
+}
+
+/// `POST /api/agent-profiles` (CAD-1989): hire a catalogue role as a profile.
+/// `job` is sent only when edited; `model` is absent or `inherit` unless picked.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfileReq {
+    pub alias: String,
+    pub catalogue: String,
+    pub job: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]

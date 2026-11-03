@@ -735,7 +735,11 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
     let agents = agents_payload_typed(state_dir, list.clone(), jobs.as_ref());
     let agents_fp = list.map(|l| {
         let rows = serde_json::to_value(&agents.agents).expect("agent rows serialize");
-        value_fp(&json!([rows_fp(&l["agents"]), rows_fp(&rows)]))
+        value_fp(&json!([
+            rows_fp(&l["agents"]),
+            rows_fp(&rows),
+            &agents.profiles
+        ]))
     });
     let outcomes = jobs
         .as_ref()
@@ -1641,11 +1645,17 @@ impl Model {
         if !snap.failed && (jobs || agents || error_moved) {
             // Bindings and totals can move without an agent row moving.
             let served = self.served_agents(&snap);
+            // The frame is shared by every stream reader, and the profile's
+            // job is the operator's: it never rides the stream.
+            let mut profiles = served["profiles"].clone();
+            for profile in profiles.as_array_mut().into_iter().flatten() {
+                profile["job"] = Value::Null;
+            }
             frames.push(frame(
                 "agent_meta",
                 &json!({
                     "daemon": served["daemon"], "totals": served["totals"],
-                    "by_issue": served["by_issue"],
+                    "by_issue": served["by_issue"], "profiles": profiles,
                     "snapshot_age_secs": served["snapshot_age_secs"],
                     "stale": served["stale"], "refresh_error": served["refresh_error"],
                 }),
@@ -1710,6 +1720,7 @@ mod tests {
                 ..AgentTotals::default()
             }),
             by_issue: BTreeMap::new(),
+            profiles: vec![],
         }
     }
 
@@ -2134,6 +2145,43 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_meta_frame_carries_no_profile_job() {
+        let fetch: Fetch = Box::new(|_| DaemonSnap {
+            at: Instant::now(),
+            outcomes: Default::default(),
+            jobs_fp: Some(1),
+            agents: AgentsPayload {
+                profiles: vec![serde_json::json!({
+                    "id": "dev-1", "alias": "dev-1", "job": "PRIVATE STANDING JOB",
+                    "runtimes": [],
+                })],
+                ..versioned(1)
+            },
+            agents_fp: Some(1),
+            approvals: Arc::new(Default::default()),
+            failed: false,
+            agents_down: false,
+        });
+        let model = Arc::new(Model::new(
+            Path::new("/nonexistent/state"),
+            Path::new("/nonexistent/pm"),
+            fetch,
+        ));
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        let meta = frames
+            .iter()
+            .find(|f| f.starts_with("event: agent_meta\n"))
+            .unwrap_or_else(|| panic!("no agent_meta: {frames:?}"));
+        assert!(
+            meta.contains("dev-1"),
+            "the profile still rides the frame: {meta}"
+        );
+        assert!(!meta.contains("PRIVATE STANDING JOB"), "job leaked: {meta}");
+    }
+
+    #[test]
     fn the_stream_reports_an_unreachable_daemon_over_last_good_rows() {
         let (model, _) = fake_daemon_failing(|_| {}, None, |n| n == 2);
         let mut watch = blank_watch();
@@ -2345,6 +2393,7 @@ mod tests {
                                 resume: None,
                             }],
                         )]),
+                        profiles: vec![],
                     }
                 },
                 agents_fp: (!failed).then_some(1),

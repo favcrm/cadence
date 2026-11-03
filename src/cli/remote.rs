@@ -1439,7 +1439,8 @@ fn unavailable(command: &Commands) -> Error {
          wiki put (text), wiki cp, settings agents <verb>, master status, \
          team list, team invites, team invite, team revoke-invite, \
          team set-role, team remove, delivery requirements, audit approval, \
-         audit scope, audit approve (merge), issue project delivery. \
+         audit scope, audit approve (merge), audit verdicts, audit verdict, \
+         audit reviewers, audit identities, issue project delivery. \
          Use `--org local` or `cadence org switch` to run locally.",
         name(command)
     ))
@@ -1626,9 +1627,6 @@ pub(super) fn run(
         if let Some(bridge) = action.bridge() {
             return local_agent::run(&target, &bridge, wake_timeout, local_state);
         }
-    }
-    if let Commands::LocalAgent { action } = &command {
-        return local_agent::run(&target, action, wake_timeout, local_state);
     }
     if let Commands::App { action } = &command {
         return super::hosted_app::run(&target, action);
@@ -1862,10 +1860,62 @@ pub(super) fn run(
     }
 }
 
+/// The explicit project a hosted gate call is scoped to. CAD-2001: the review
+/// evidence is project-scoped, so a missing project is an error — it is never
+/// inferred from `--repo` or the cwd checkout's origin, and no repo's first
+/// project is ever selected.
+fn project_arg(project: &Option<String>) -> Result<&str> {
+    project.as_deref().ok_or_else(|| {
+        Error::rejected(
+            "a hosted `audit` call needs an explicit --project <key>: the review evidence is \
+             project-scoped, and the project is never inferred from the repo or the cwd. \
+             Nothing was sent",
+        )
+    })
+}
+
+/// The explicit issue a hosted approval is about. An approval is unique per
+/// issue in its project, so an approval recorded for another ticket can never
+/// answer this one.
+fn issue_arg(issue: &Option<String>) -> Result<&str> {
+    issue.as_deref().ok_or_else(|| {
+        Error::rejected(
+            "a hosted `audit approval|approve` needs an explicit --issue <ID>: the approval is \
+             that issue's, and one recorded for another ticket never answers it. Nothing was \
+             sent",
+        )
+    })
+}
+
+/// The exact `{project, repo, issue, pr, head}` binding every project-scoped
+/// gate call carries. Each part is validated before a request exists.
+fn binding(
+    project: &Option<String>,
+    repo: &str,
+    issue: &str,
+    pr: u64,
+    head: &str,
+) -> Result<cadence_agent::delivery::hosted_gate::GateBinding> {
+    cadence_agent::delivery::hosted_gate::GateBinding::new(
+        project_arg(project)?,
+        repo,
+        issue,
+        pr,
+        head,
+    )
+}
+
 /// CAD-1946: the merge gate's commands against a hosted org — the reads
 /// `scripts/enqueue-reviewed` makes and the operator's merge approval.
 /// `None` for every other command. Output and exit codes match the local
 /// commands; the checks live in [`cadence_agent::delivery::hosted_gate`].
+///
+/// CAD-2001: every read and the approval are project-scoped. `--project` and
+/// `--issue` are required here (a hosted call without them refuses rather
+/// than guessing), and the tenant serves the project-scoped verbs. An older
+/// tenant refuses those names, which
+/// [`cadence_agent::remote_cli::PROJECT_SCOPED_GATE_VERBS`] reports as the
+/// release-order problem it is — never as "no evidence".
 fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> Result<Option<i32>> {
     use cadence_agent::delivery::hosted_gate;
     let repo_or_origin = |repo: &Option<String>| -> Result<String> {
@@ -1890,7 +1940,14 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             0,
         )),
         Commands::Audit {
-            action: Some(AuditAction::Approval { pr, head, repo }),
+            action:
+                Some(AuditAction::Approval {
+                    pr,
+                    head,
+                    issue,
+                    project,
+                    repo,
+                }),
             ..
         } => {
             let head = super::audit::full_head(head)?;
@@ -1898,9 +1955,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             printed(hosted_gate::approval(
                 target,
                 wake_timeout,
-                &repo,
-                *pr,
-                &head,
+                &binding(project, &repo, issue_arg(issue)?, *pr, &head)?,
             )?)
         }
         Commands::Audit {
@@ -1917,6 +1972,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     file,
                     text,
                     repo,
+                    project,
                 }),
             ..
         } => {
@@ -1976,10 +2032,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             let recorded = hosted_gate::verdict(
                 target,
                 wake_timeout,
-                &repo,
-                issue.trim(),
-                *pr,
-                &head,
+                &binding(project, &repo, issue, *pr, &head)?,
                 kind,
                 outcome,
                 title_outcome,
@@ -1996,6 +2049,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     pr,
                     head,
                     repo,
+                    project,
                     ..
                 }),
             ..
@@ -2005,28 +2059,37 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             printed(hosted_gate::verdicts(
                 target,
                 wake_timeout,
-                &repo,
-                issue.trim(),
-                *pr,
-                &head,
+                &binding(project, &repo, issue, *pr, &head)?,
             )?)
         }
         Commands::Audit {
-            action: Some(AuditAction::Reviewers { repo, action }),
+            action: Some(AuditAction::Reviewers { project, action }),
             ..
         } => match action {
-            None => printed(hosted_gate::reviewers(
-                target,
-                wake_timeout,
-                &repo_or_origin(repo)?,
-            )?),
-            Some(super::audit::ReviewersAction::Set { repo, reviewer }) => {
-                // The attestation is the workspace owner's own act: the stored
-                // login is not an agent's to spend (the CAD-1586 rule).
+            None => printed(hosted_gate::reviewers(target, wake_timeout, project)?),
+            Some(super::audit::ReviewersAction::Set { project, reviewer }) => {
+                // The eligibility map is the workspace owner's own act: the
+                // stored login is not an agent's to spend (the CAD-1586 rule).
                 refuse_managed(target, "audit reviewers set")?;
-                let pairs = super::audit::reviewer_pairs(reviewer)?;
+                let subjects = super::audit::reviewer_subjects(reviewer)?;
                 printed((
-                    hosted_gate::set_reviewers(target, wake_timeout, repo, &pairs)?,
+                    hosted_gate::set_reviewers(target, wake_timeout, project, &subjects)?,
+                    0,
+                ))
+            }
+        },
+        Commands::Audit {
+            action: Some(AuditAction::Identities { action }),
+            ..
+        } => match action {
+            None => printed(hosted_gate::identities(target, wake_timeout)?),
+            Some(super::audit::IdentitiesAction::Set { identity }) => {
+                // Attesting a login decides whose verdicts count, so it is the
+                // owner's own act exactly like the merge approval.
+                refuse_managed(target, "audit identities set")?;
+                let pairs = super::audit::identity_pairs(identity)?;
+                printed((
+                    hosted_gate::set_identities(target, wake_timeout, &pairs)?,
                     0,
                 ))
             }
@@ -2047,22 +2110,26 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     repo,
                     action,
                     id,
+                    project,
                 }),
             ..
         } => {
             refuse_managed(target, "audit approve")?;
-            if issue.is_some() || *delegated || scope.is_some() || id.is_some() || action != "merge"
-            {
+            if *delegated || scope.is_some() || id.is_some() || action != "merge" {
                 return Err(Error::usage(
-                    "remote `audit approve` records a merge approval only: --issue/--action \
-                     scope, --delegated, --scope and --id are not available on a hosted org. \
-                     Nothing was sent.",
+                    "remote `audit approve` records a merge approval only: --delegated, \
+                     --scope and --id are not available on a hosted org. Nothing was sent.",
                 ));
             }
             let pr = pr.ok_or_else(|| Error::rejected("--pr is required"))?;
             let head = super::audit::full_head(head.as_deref().unwrap_or_default())?;
             let repo = repo_or_origin(repo)?;
-            let receipt = hosted_gate::approve(target, wake_timeout, &repo, pr, &head, source)?;
+            let receipt = hosted_gate::approve(
+                target,
+                wake_timeout,
+                &binding(project, &repo, issue_arg(issue)?, pr, &head)?,
+                source,
+            )?;
             printed((receipt, 0))
         }
         Commands::Issue {
@@ -2094,7 +2161,9 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
 }
 
 /// The stored login is the human owner's; a managed caller spending it
-/// would act as the owner (the CAD-1586 rule in [`run`]).
+/// would act as the owner (the CAD-1586 rule in [`run`]). It covers the merge
+/// approval, the project eligibility map and the workspace identity
+/// attestation: each decides whose verdicts count.
 fn refuse_managed(target: &RemoteTarget, command: &str) -> Result<()> {
     if target.identity.is_some()
         || std::env::var_os("CADENCE_ALIAS").is_some()
