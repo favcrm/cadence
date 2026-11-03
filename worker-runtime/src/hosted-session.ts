@@ -36,7 +36,7 @@ import { sessionEventResponse } from "./session-stream.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { authorizeTools } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
-import { threadEntries } from "./transcript.ts";
+import { projectedThreadEntries } from "./transcript.ts";
 
 /**
  * The last model the platform gateway reported serving for this conversation.
@@ -196,6 +196,28 @@ export class HostedSession<
       // Capture the watch before reading its snapshot so commits between the
       // initial read and subscription are buffered, not silently missed.
       const stream = await this.harness.session().events();
+      // Project before SSE 200, so a failing projection refuses like the master
+      // projection above rather than opening a body that errors and reconnects.
+      let snapshotEntries: ThreadEntry[];
+      try {
+        snapshotEntries = projectedThreadEntries(
+          stream.snapshot.entries,
+          thinking,
+          this.options.projectThread,
+        );
+      } catch {
+        await stream.stop();
+        return Response.json(
+          {
+            ok: false,
+            error: {
+              code: "capability_unavailable",
+              message: "The thread projection is unavailable.",
+            },
+          },
+          { status: 503 },
+        );
+      }
       function emit(entry: ThreadEntry, send: (frame: string) => void): void {
         if (entry.seq <= last) return;
         send(
@@ -212,8 +234,7 @@ export class HostedSession<
           // It reports this object's real turn state. A host projection
           // composes under those runtime fields and cannot replace them.
           send(masterFrame);
-          for (const entry of threadEntries(stream.snapshot.entries, thinking))
-            emit(entry, send);
+          for (const entry of snapshotEntries) emit(entry, send);
         },
         events: async (_events, send) => {
           for (const entry of await this.transcript(thinking))
@@ -254,9 +275,10 @@ export class HostedSession<
 
   /** Map the engine's committed records, including durable input metadata, for the board. */
   async transcript(includeThinking: boolean): Promise<ThreadEntry[]> {
-    return threadEntries(
+    return projectedThreadEntries(
       await this.harness.session().messages(),
       includeThinking,
+      this.options.projectThread,
     );
   }
 
