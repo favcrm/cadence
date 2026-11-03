@@ -11,6 +11,7 @@
 # suites are gone with them.
 cadence-agent daemon::cad811_installed_crm_qa_fixture::cad811_installed_crm_qa_fixture	# interactive installed CRM browser fixture; needs an admitted isolated runtime
 cadence-agent daemon::team_assistants_refusal::member_verbs_refuse_unbound_envelope_child	# re-exec child of the parent test that drives it
+cadence-agent daemon::tests::unit::caller::cad2059_acceptance::probe	# re-exec child of the CAD-2059 acceptance tests
 cadence-agent issue::app::bundle_grammar_tests::regenerate_bundle_grammar	# rewrites the checked-in grammar artifact
 cadence-agent protected_runtime::measure_mounts::measure_mount_metadata_acceptance_20261027::cad1085_metadata_mounts_actual_kernel	# needs root/CAP_SYS_ADMIN, an approved Docker, and the pinned policy
 cadence-agent reaper::tests::reaper_proof_isolated	# runs in its own process from reaper_keeps_owned_statuses_and_reaps_adopted_orphans

@@ -315,10 +315,12 @@ that reads `<state>/operator/secret` and passes the proof can mint a
 link. A process cadence launched (a pane, a managed endpoint, a runner,
 anything the daemon started) must evade the proof — `setsid -f` with a
 scrubbed env and stdio (`operator_secret_theft_residual_pinned` pins
-it). **A same-uid process cadence never launched needs no evasion at
-all**: an agent CLI the operator started by hand, outside every
-registered pane, passes the proof as it is (the PR #249 reviewer minted
-a link from its own Claude Code shell), and can read the file. A board
+it). **A same-uid process cadence never launched needs little or no
+evasion**: an agent CLI the operator started by hand, outside every
+registered pane, passes the proof as it is when it carries no known
+marker or runs on another store, and otherwise only has to scrub its
+environment (before CAD-2059, the PR #249 reviewer minted a link from
+its own Claude Code shell). Either way it can read the file. A board
 session is two credentials: the HttpOnly cookie and a key the signed-in
 tab keeps in its `sessionStorage` and sends as `X-Cadence-Session`.
 Phase 1 therefore refuses cadence-launched agents, relays, forged
