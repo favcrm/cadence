@@ -680,6 +680,7 @@ async function main() {
   // An ordinary failed read for an unlisted agent can still recover, so it keeps its Retry.
   detailNotServed = false;
   failDetail = true;
+  await mountServed("dev", "overview", liveRoster); // A new page, so this read is its own.
   await mountServed("nobody", "overview", liveRoster);
   const failedUnlisted = servedHost.querySelector(".ag-chat-main")?.textContent ?? "";
   assert(failedUnlisted.includes("Some details aren’t available") && failedUnlisted.includes("Retry"), "a failed read for an unlisted agent keeps its line and Retry");
