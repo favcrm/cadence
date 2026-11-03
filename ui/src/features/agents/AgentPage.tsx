@@ -1,4 +1,4 @@
-import { useContext, useEffect, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
@@ -23,6 +23,7 @@ import { dmExpectation } from "../threads/threadsView";
 import {
   agentHoldsWorkButDead,
   agentLocation,
+  agentRunningTurn,
   conversationalOnlyCloud,
   lifecycleBadge,
   lifecycleOf,
@@ -71,6 +72,7 @@ export default function AgentPage({
   groups,
   rosterLoaded,
   rosterFailed,
+  daemonDown,
   onRetryRoster,
   operator,
   onRetryAccess,
@@ -91,6 +93,9 @@ export default function AgentPage({
   /** The team list has answered, so a missing alias really is missing. */
   rosterLoaded: boolean;
   rosterFailed: boolean;
+  /** The roster answered, but only to say the daemon is down: an agent missing
+   *  from it may still exist. */
+  daemonDown: boolean;
   onRetryRoster: () => void;
   operator: boolean | null;
   onRetryAccess: () => void;
@@ -104,6 +109,7 @@ export default function AgentPage({
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [notServed, setNotServed] = useState(false);
+  const [missing, setMissing] = useState(false);
   const [retry, setRetry] = useState(0);
 
   const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
@@ -114,25 +120,41 @@ export default function AgentPage({
     // A runtime-less profile is not a registered agent: there is nothing to read.
     // Once the roster has answered, or failed, so a failed read still says so.
     if (hired || (!rosterLoaded && !rosterFailed)) return;
-    // A reload after a save keeps what is on screen; only a new alias resets.
-    if (retry === 0) setDetail(null);
-    setErr(null);
-    setNotServed(false);
+    // A re-read keeps what is on screen until it answers. A new alias is a new page.
     let live = true;
     api
       .agent(alias)
-      .then((d) => live && setDetail(d))
+      .then((d) => {
+        if (!live) return;
+        setDetail(d);
+        setErr(null);
+        setNotServed(false);
+        setMissing(false);
+      })
       .catch((e) => {
         if (!live) return;
         // The board's own "not implemented" is permanent, not a failed read to
         // retry. Another 501, such as an outdated daemon, is an ordinary failure.
-        if (e instanceof ApiError && e.status === 501 && e.code === "not_implemented") setNotServed(true);
-        else setErr(String(e.message ?? e));
+        const served = !(e instanceof ApiError && e.status === 501 && e.code === "not_implemented");
+        setNotServed(!served);
+        setErr(served ? String(e.message ?? e) : null);
+        setMissing(e instanceof ApiError && e.status === 404);
       });
     return () => {
       live = false;
     };
-  }, [alias, retry, hired, rosterLoaded, rosterFailed]);
+    // `daemonDown`: the read that failed in an outage is worth repeating after it.
+  }, [alias, retry, hired, rosterLoaded, rosterFailed, daemonDown]);
+
+  // The roster is live and the read is not: a new running turn, even at the same
+  // count, is what the page's own figures should be read again for.
+  const liveTurns = `${observed?.running ?? 0}:${(observed?.running_messages ?? []).map((m) => m.id).join()}`;
+  const readTurns = useRef(liveTurns);
+  useEffect(() => {
+    if (readTurns.current === liveTurns) return;
+    readTurns.current = liveTurns;
+    setRetry((n) => n + 1);
+  }, [liveTurns]);
 
   // Esc leaves the page, unless it is closing something inside it.
   useEffect(() => {
@@ -278,6 +300,12 @@ export default function AgentPage({
     </>
   );
 
+  const outage = daemonDown ? (
+    <div className="agents-banner tone-warn mb-3" role="status">
+      {t("Daemon unavailable. Showing the last known agent state.")}
+    </div>
+  ) : null;
+
   const notices = (
     <>
       {!detail && !err && !notServed && (
@@ -336,12 +364,39 @@ export default function AgentPage({
     const status = profile ? seatStatus(profile, t) : null;
     const mailbox = profile?.inbox === true || profile?.provider === "inbox";
     const boardIsHosted = hostedBoard || hosted;
+    // A profile has no conversation to protect, so its reason comes before access.
+    const profileGate: ChatGate | null = hired
+      ? {
+          title: t("{alias} can’t reply here yet").replace("{alias}", () => alias),
+          body: boardIsHosted
+            ? t("Chat with a profile isn’t available on hosted boards yet. It works on issues started under its profile.")
+            : t("It has no runtime connected to this board. Connect one to talk to it here."),
+          extra: <ConnectRuntime profile={hired} hosted={boardIsHosted} groups={groups} />,
+        }
+      : null;
     const gate: ChatGate | null = !rosterLoaded
       ? {
           title: rosterFailed ? t("Could not load agents") : t("Loading agents…"),
           body: "",
           extra: rosterFailed ? <Button onClick={onRetryRoster}>{t("Retry")}</Button> : undefined,
         }
+      : profileGate
+        ? profileGate
+      : daemonDown && !profile
+        ? {
+            title: t("Daemon unavailable"),
+            body: t("{alias} can’t be read right now. This doesn’t mean it was removed.").replace("{alias}", () => alias),
+            extra: (
+              <Button
+                onClick={() => {
+                  setRetry((r) => r + 1);
+                  onRetryRoster();
+                }}
+              >
+                {t("Retry")}
+              </Button>
+            ),
+          }
       : operator === null
         ? {
             title: t("We couldn’t confirm your access"),
@@ -359,48 +414,56 @@ export default function AgentPage({
               title: boardBlock ?? t("Conversations with agents are for the operator"),
               body: t("You can still see what this agent is working on."),
             }
-        : hired
+        : mailbox
           ? {
-              title: t("{alias} can’t reply here yet").replace("{alias}", () => alias),
-              body: boardIsHosted
-                ? t("Chat with a profile isn’t available on hosted boards yet. It works on issues started under its profile.")
-                : t("It has no runtime connected to this board. Connect one to talk to it here."),
-              extra: <ConnectRuntime profile={hired} hosted={boardIsHosted} groups={groups} />,
+              title: t("This is a mailbox, not an agent"),
+              body: t("Mail waits here until an agent reads it."),
             }
-          : mailbox
+          : !profile && (missing || notServed)
             ? {
-                title: t("This is a mailbox, not an agent"),
-                body: t("Mail waits here until an agent reads it."),
+                title: t("No agent named {alias}").replace("{alias}", () => alias),
+                body: t("It may have been removed. Pick another agent from the list."),
               }
-            : !profile && (err !== null || notServed)
+            : !profile && err !== null
               ? {
-                  title: t("No agent named {alias}").replace("{alias}", () => alias),
-                  body: t("It may have been removed. Pick another agent from the list."),
+                  title: t("Could not read {alias}").replace("{alias}", () => alias),
+                  body: "",
                 }
               : null;
+    const chatLook = { look: profile?.look ?? params?.look };
     const faceLook = hired ? (hired.look ?? undefined) : typeof params?.look === "string" ? params.look : undefined;
     return (
       <AgentChat
         alias={alias}
         gate={gate}
-        look={agentLook(alias, params)}
+        look={agentLook(alias, chatLook)}
         expectation={t(dmExpectation(profile))}
         attach={!boardIsHosted}
         actions={
           gate === null && !isCloud ? <Button onClick={() => onTab("work")}>{t("Assign work")}</Button> : null
         }
         block={writeBlock}
+        working={agentRunningTurn(observed?.running ?? detail?.running.length ?? 0, observed?.running_messages ?? detail?.running)}
         onBack={onBack}
         onOpenIssue={onOpenIssue}
         // With nothing known about the agent, the gate is already the one answer
-        // for an unread roster or a board that keeps no details. A known agent
-        // keeps its recovery banners, and a failed read for an unlisted agent
+        // for an unread roster, an outage or a board that keeps no details. A known
+        // agent keeps its recovery banners, and a failed read for an unlisted agent
         // keeps its Retry: a successful read is what would bring the page back.
-        notices={hired || (!profile && (!rosterLoaded || notServed)) ? null : notices}
+        notices={
+          hired ? (
+            outage
+          ) : !profile && (!rosterLoaded || notServed || daemonDown) ? null : (
+            <>
+              {outage}
+              {notices}
+            </>
+          )
+        }
         heading={
           <>
             <AgentAvatar
-              slug={hired ? "custom" : agentLook(alias, params)}
+              slug={hired ? "custom" : agentLook(alias, chatLook)}
               look={faceLook}
               still={lifecycle !== "active"}
               active={lifecycle === "active"}
@@ -504,6 +567,7 @@ export default function AgentPage({
 
       {cloudCards}
 
+      {outage}
       {notices}
 
       {!isCloud && (

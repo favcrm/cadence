@@ -44,6 +44,8 @@ const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
 const { seatStatus } = require("../src/features/agents/SeatCard") as typeof import("../src/features/agents/SeatCard");
+const { agentRunningTurn, overviewSeats } = require("../src/features/agents/agentView") as typeof import("../src/features/agents/agentView");
+const { agentThreadStore, sendToAgent } = require("../src/features/agents/agentThread") as typeof import("../src/features/agents/agentThread");
 const { profileMatchesFilter, profileMatchesSearch, profileWork } = require("../src/features/agents/agentView") as typeof import("../src/features/agents/agentView");
 const Agents = (
   require("../src/features/agents/Agents") as typeof import("../src/features/agents/Agents")
@@ -131,6 +133,8 @@ const issues: IssueCard[] = [
   },
 ] as IssueCard[];
 let failDetail = true;
+let failDetailStatus = 503;
+let detailRunning: AgentDetail["running"] = [];
 let detailNotServed = false;
 let detailNotServedCode = "not_implemented";
 let releaseDetail: (() => void) | null = null;
@@ -140,9 +144,13 @@ const threadReads: string[] = [];
 let threadExtra: Record<string, unknown> = {};
 let viewerIsOperator: boolean | null = true;
 let viewerHosted = false;
+let sendAnswer: (() => Response) | null = null;
+const extraAgents: Agent[] = [];
 globalThis.fetch = async (input, init) => {
-  if (init?.method && init.method !== "GET")
+  if (init?.method && init.method !== "GET") {
+    if (sendAnswer) return sendAnswer();
     throw new Error("Agents must not write");
+  }
   const path = new URL(String(input), "http://localhost").pathname;
   if (path.startsWith("/api/threads/")) {
     threadReads.push(path);
@@ -161,10 +169,10 @@ globalThis.fetch = async (input, init) => {
     });
   if (failDetail)
     return new Response(JSON.stringify({ error: "Detail unavailable" }), {
-      status: 503,
+      status: failDetailStatus,
     });
   const alias = decodeURIComponent(path.split("/").pop()!);
-  const a = agents.find((a) => a.alias === alias)!;
+  const a = [...agents, ...extraAgents].find((a) => a.alias === alias)!;
   const { role, tasks, ...runtime } = a;
   const detail: AgentDetail = {
     agent: {
@@ -176,7 +184,7 @@ globalThis.fetch = async (input, init) => {
     } as AgentDetail["agent"],
     queued: a.queued,
     unknown: a.unknown,
-    running: [],
+    running: detailRunning,
     events: [],
     fenced: a.fenced,
     recovery: a.recovery,
@@ -284,12 +292,15 @@ async function main() {
     aliases().join() === "blocked,owner,dev,foreign",
     "current agents list attention first, then working, in one flat grid",
   );
-  // CAD-1772: a plain Idle is grey; the master reads Ready (green) and always leads the roster.
+  // CAD-1772: a plain Idle is grey; the master reads Ready (green). CAD-2082: it leads the roster below attention.
   assert(seatStatus({ ...base, alias: "idler" }, (x: string) => x).tone === "ink", "plain Idle is the ink tone");
   assert(seatStatus({ ...base, alias: "master" }, (x: string) => x).text === "Ready", "the master at rest is Ready");
   state = loaded({ daemon: "reachable", agents: [...agents, { ...base, alias: "master" }], totals: null, ...fresh });
   await render();
-  assert(aliases()[0] === "master", "the master is always the first seat");
+  assert(
+    aliases().join() === "blocked,owner,master,dev,foreign",
+    `what needs attention sits above the master, which leads the rest (got ${aliases().join()})`,
+  );
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
   await render();
   // CAD-1772: compact seat cards, no stat tiles, no project scope.
@@ -718,6 +729,154 @@ async function main() {
     assert(!servedHost.textContent?.includes(claim), `work, roster pending: claims nothing yet: ${claim}`);
   detailNotServed = false;
   await React.act(() => servedRoot.unmount());
+  // CAD-2082: an outage is not a deleted agent, a running turn is not finished,
+  // what needs the viewer leads, and a profile keeps its reason and commands.
+  const liveHost = document.createElement("div");
+  document.body.append(liveHost);
+  const liveRoot = createRoot(liveHost);
+  let mounts = 0;
+  const mountLive = async (
+    alias: string | null,
+    roster: typeof state,
+    options: { operator?: boolean | null; hosted?: boolean; section?: typeof tab } = {},
+  ) => {
+    await React.act(() =>
+      liveRoot.render(
+        React.createElement(LocaleProvider, null, React.createElement(Agents, {
+          key: `live-${mounts++}`,
+          operator: options.operator === undefined ? true : options.operator,
+          onRetryAccess: () => {},
+          hostedBoard: options.hosted ?? false,
+          state: roster,
+          issues: issueState,
+          open: alias,
+          tab: options.section ?? "overview",
+          recruit: false,
+          ask: false,
+          onAsk: () => {},
+          onOpenAgent: () => {},
+          onTab: () => {},
+          onRecruit: () => {},
+          onOpenIssue: () => {},
+          onRetry: () => {},
+        })),
+      ),
+    );
+    await flush();
+    await flush();
+  };
+  const gateText = () => liveHost.querySelector(".ag-chat-gate")?.textContent ?? "";
+  const outageRoster = loaded({ daemon: "unreachable", agents: [], totals: null, ...fresh }) as unknown as typeof state;
+  const upRoster = loaded({ daemon: "reachable", agents, totals: null, ...fresh }) as unknown as typeof state;
+  // The daemon route answers 404 for any failed read, so an outage is told by the roster.
+  failDetail = true;
+  for (const status of [404, 503]) {
+    failDetailStatus = status;
+    await mountLive("dev", outageRoster);
+    assert(gateText().includes("Daemon unavailable"), `an outage (${status}) says the daemon is unavailable`);
+    assert(!liveHost.textContent?.includes("No agent named") && !liveHost.textContent?.includes("may have been removed"), `an outage (${status}) never says the agent was removed`);
+    assert(gateText().includes("Retry"), "an outage offers a retry");
+    await mountLive("dev", outageRoster, { section: "work" });
+    assert(liveHost.textContent?.includes("Daemon unavailable"), "a section deep link says so too");
+  }
+  failDetailStatus = 404;
+  await mountLive("nobody", upRoster);
+  assert(gateText().includes("No agent named nobody"), "a real 404 still says the agent is missing");
+  failDetailStatus = 503;
+  await mountLive("nobody", upRoster);
+  assert(gateText().includes("Could not read nobody") && !gateText().includes("No agent named"), "a failed read is not called a missing agent");
+  await mountLive("dev", upRoster);
+  assert(liveHost.querySelector("[data-composer]"), "a listed agent keeps its composer through a failed read");
+  const knownDown = loaded({ daemon: "unreachable", agents, totals: null, ...fresh }) as unknown as typeof state;
+  await mountLive("dev", knownDown);
+  assert(liveHost.querySelector(".ag-chat-main")?.textContent?.includes("Daemon unavailable. Showing the last known agent state."), "a known agent's page carries the outage banner");
+  failDetail = false;
+  failDetailStatus = 503;
+  // A working agent's first note is a live turn, however its thread reads so far.
+  const note = { seq: 2, role: "agent", kind: "assistant_text", message: null, text: "Checking the build", created: new Date().toISOString() };
+  threadExtra = { entries: [{ seq: 1, role: "operator", kind: "message", message: "m-1", text: "Ship it", created: new Date().toISOString() }, note] };
+  for (const running of [[], [{ id: "m-1" }]] as AgentDetail["running"][]) {
+    detailRunning = running;
+    await mountLive("dev", upRoster);
+    const main = liveHost.querySelector(".ag-chat-main");
+    assert(main?.querySelector('[data-kind="turn"][data-turn-state="running"]'), `a running turn paints as running (${running.length ? "named" : "unnamed"})`);
+    assert(!main?.textContent?.includes("Earlier transcript"), `a running turn is not an earlier transcript (${running.length ? "named" : "unnamed"})`);
+  }
+  // A new turn at the same count: the roster names it, whatever the last read said.
+  detailRunning = [{ id: "m-1" }];
+  threadExtra = { entries: [
+    { seq: 1, role: "operator", kind: "message", message: "m-1", text: "First", created: new Date().toISOString() },
+    { seq: 2, role: "agent", kind: "turn_result", message: "m-1", text: "First done", created: new Date().toISOString() },
+    { seq: 3, role: "operator", kind: "message", message: "m-2", text: "Second", created: new Date().toISOString() },
+  ] };
+  // Each case is its own agent: the thread store outlives a mount.
+  const busyRoster = (alias: string, over: Partial<Agent> = {}) => {
+    const busy: Agent = { ...base, alias, running: 1, state: "busy", ...over };
+    extraAgents.push(busy);
+    return loaded({ daemon: "reachable", agents: [...agents, busy], totals: null, ...fresh }) as unknown as typeof state;
+  };
+  await mountLive("next-turn", busyRoster("next-turn", { running_messages: [{ id: "m-2" }] }));
+  assert(liveHost.querySelector(".ag-chat-main [data-kind='typing']"), "the next turn at the same count shows as working");
+  // No read names the turn, as on a board that keeps no details: still no transcript label.
+  detailRunning = [];
+  failDetail = true;
+  threadExtra = { entries: [
+    { seq: 1, role: "operator", kind: "message", message: "m-3", text: "Ship it", created: new Date().toISOString() },
+    { seq: 2, role: "agent", kind: "assistant_text", message: "m-3", text: "On it", created: new Date().toISOString() },
+  ] };
+  await mountLive("unnamed-turn", busyRoster("unnamed-turn"));
+  assert(!liveHost.querySelector(".ag-chat-main")?.textContent?.includes("Earlier transcript"), "an unnamed live turn is not an earlier transcript");
+  failDetail = false;
+  // Busy on other work with nothing in this chat yet: the chat says so.
+  threadExtra = {};
+  await mountLive("empty-chat", busyRoster("empty-chat"));
+  assert(liveHost.querySelector(".chat-empty")?.textContent?.includes("empty-chat is working"), "an empty chat with a working agent says it is working");
+  assert(agentRunningTurn(1, [{ id: "m", created: 1790562108 }])?.since === 1790562108, "epoch seconds keep the turn's start");
+  assert(agentRunningTurn(1, [{ id: "m", created: "2026-01-01T00:00:00Z" }])?.since === 1767225600, "an ISO start still reads");
+  // An outage's empty roster claims nothing about the team.
+  await mountLive(null, outageRoster);
+  assert(!liveHost.textContent?.includes("No agents registered"), "an outage does not say no agents are registered");
+  // A refused retry cannot settle an attempt whose outcome was unknown.
+  const sendStore = agentThreadStore("dev");
+  sendAnswer = () => { throw new Error("connection lost"); };
+  await sendToAgent("dev", "Hello", "send-1");
+  const unconfirmedFirst = sendStore.get().data?.pending.find((p) => p.message === "send-1");
+  assert(unconfirmedFirst?.delivery === "unconfirmed", "a lost response is unconfirmed");
+  sendAnswer = () => new Response(JSON.stringify({ error: "refused" }), { status: 403 });
+  await sendToAgent("dev", "Hello", "send-1");
+  assert(sendStore.get().data?.pending.find((p) => p.message === "send-1")?.delivery === "unconfirmed", "a refused retry stays unconfirmed");
+  sendAnswer = () => new Response(JSON.stringify({ error: "refused" }), { status: 403 });
+  await sendToAgent("dev", "Hi", "send-2");
+  assert(sendStore.get().data?.pending.find((p) => p.message === "send-2")?.delivery === undefined, "a refused first send is a definite refusal");
+  sendAnswer = () => new Response(JSON.stringify({ error: "nope" }), { status: 501 });
+  await sendToAgent("dev", "Hi", "send-3");
+  assert(sendStore.get().data?.pending.find((p) => p.message === "send-3")?.delivery === undefined, "a 501 send is definite");
+  sendAnswer = null;
+  detailRunning = [];
+  const atRest = { ...upRoster, data: { ...upRoster.data!, agents: agents.map((a) => ({ ...a, running: 0, state: "idle" })) } } as typeof state;
+  await mountLive("dev", atRest);
+  assert(!liveHost.querySelector(".ag-chat-main")?.querySelector('[data-turn-state="running"]'), "an agent at rest shows no running turn");
+  threadExtra = {};
+  // One list by state: a blocked profile sits with what needs attention.
+  const hiredBlocked = { id: "ap_b", alias: "aaa-blocked", role: "worker", team_role: "worker", catalogue: null, look: null, job: "", model: "inherit", runtimes: [], latest_claim: { issue_id: "DEMO-9", state: "blocked" } };
+  const hiredIdle = { ...hiredBlocked, id: "ap_i", alias: "aaa-idle", latest_claim: null };
+  const mixed = [{ ...base, alias: "zed-idle" }, { ...base, alias: "master" }, { ...base, alias: "fenced", fenced: true }, { ...base, alias: "busy", running: 1, state: "busy" }];
+  const order = overviewSeats(mixed, [hiredIdle, hiredBlocked]).map((seat) => (seat.kind === "agent" ? seat.agent.alias : seat.profile.alias));
+  assert(order.join() === "fenced,aaa-blocked,master,busy,zed-idle,aaa-idle", `seats order by state (got ${order.join()})`);
+  await mountLive(null, loaded({ daemon: "reachable", agents: mixed, totals: null, ...fresh, profiles: [hiredIdle, hiredBlocked] }) as unknown as typeof state);
+  const seatNames = Array.from(liveHost.querySelectorAll(".rc-seats .rc-seat .t")).map((n) => n.textContent);
+  assert(seatNames.indexOf("aaa-blocked") < seatNames.indexOf("master") && seatNames.indexOf("master") < seatNames.indexOf("aaa-idle"), `a blocked profile leads the page (got ${seatNames.join()})`);
+  // A profile has no conversation to protect: its reason and commands reach anyone.
+  const rosterWithProfile = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [hiredIdle] }) as unknown as typeof state;
+  for (const [viewer, hosted] of [[false, true], [false, false], [null, true]] as [boolean | null, boolean][]) {
+    threadReads.length = 0;
+    await mountLive("aaa-idle", rosterWithProfile, { operator: viewer, hosted });
+    assert(gateText().includes("can’t reply here yet"), `profile, viewer ${viewer}: a reason about this profile`);
+    assert(gateText().includes("cadence agent context ap_i"), `profile, viewer ${viewer}: the CLI commands`);
+    assert(!gateText().includes("Your assistant is on Home") && !gateText().includes("couldn’t confirm your access"), `profile, viewer ${viewer}: no reason about a conversation it doesn't have`);
+    assert(threadReads.length === 0, `profile, viewer ${viewer}: no thread read`);
+  }
+  await React.act(() => liveRoot.unmount());
   console.log("agents view checks passed");
 }
 main().catch(async (error) => {

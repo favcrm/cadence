@@ -1,6 +1,6 @@
 import { api, ApiError } from "../../lib/api";
 import type { Resource } from "../../lib/cache";
-import { withPrivateOperation } from "../../lib/privateSession";
+import { privateSessionGeneration, withPrivateOperation } from "../../lib/privateSession";
 import { cache, threadReader } from "../../lib/resources";
 import type { ThreadRef } from "../../lib/types";
 import {
@@ -31,20 +31,26 @@ export async function sendToAgent(
   const body = text.trim();
   if (!body) return;
   const store = agentThreadStore(alias);
+  const session = privateSessionGeneration();
+  // A refused retry says nothing about the attempt whose outcome was unknown.
+  const wasUnconfirmed = store.get().data?.pending.some((p) => p.message === message && p.delivery === "unconfirmed") === true;
   store.write((s) => addPending(s, message, body, Date.now(), refs, attachments));
   try {
-    await withPrivateOperation((op) =>
-      api.threadSend(alias, body, message, refs, undefined, undefined, attachments, op),
-    );
+    await withPrivateOperation(async (op) => {
+      await api.threadSend(alias, body, message, refs, undefined, undefined, attachments, op);
+      op.assertCurrent();
+    });
     store.write((s) => settlePending(s, message, { ok: true }));
     void store.refresh();
   } catch (e) {
-    const detail = e instanceof Error ? e.message : String(e);
-    // A lost response cannot establish whether the server accepted the send.
-    const error =
-      e instanceof ApiError && e.status >= 400 && e.status < 500
-        ? detail
-        : `Delivery uncertain — check before retrying. ${detail}`;
-    store.write((s) => settlePending(s, message, { ok: false, error }));
+    // Another session's page must not inherit this send's outcome.
+    if (privateSessionGeneration() !== session) return;
+    const error = e instanceof Error ? e.message : String(e);
+    // A lost response cannot establish whether the server accepted the send;
+    // a 4xx refused it, and a 501 is a definite "this board doesn't do that".
+    const definite = e instanceof ApiError && ((e.status >= 400 && e.status < 500) || e.status === 501);
+    store.write((s) =>
+      settlePending(s, message, definite && !wasUnconfirmed ? { ok: false, error } : { ok: false, error, delivery: "unconfirmed" }),
+    );
   }
 }

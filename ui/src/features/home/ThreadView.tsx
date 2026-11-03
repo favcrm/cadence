@@ -186,7 +186,7 @@ export function ThreadItemView({
         </Bubble>
       );
     case "pending": {
-      // CAD-1485 round 3 (member surface only): a `delivery:
+      // CAD-1485 round 3 (member and agent chats): a `delivery:
       // "unconfirmed"` pending row opted into the honest unknown-
       // delivery label — never "not sent", since the daemon may have
       // committed. Absent the marker every surface keeps the Master

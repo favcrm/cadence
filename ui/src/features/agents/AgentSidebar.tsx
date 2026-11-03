@@ -32,6 +32,7 @@ export default function AgentSidebar({
   profiles,
   profileStatus,
   open,
+  overviewCurrent,
   query,
   onQuery,
   onOpen,
@@ -43,6 +44,8 @@ export default function AgentSidebar({
   /** A profile's one status line, as its card reads it. */
   profileStatus: (profile: HiredProfile) => string;
   open: string | null;
+  /** The overview itself is on screen, not Recruit or Ask Master. */
+  overviewCurrent: boolean;
   query: string;
   onQuery: (query: string) => void;
   onOpen: (alias: string) => void;
@@ -77,7 +80,7 @@ export default function AgentSidebar({
             row(
               a.alias,
               <AgentAvatar
-                slug={agentLook(a.alias, a.params as Record<string, unknown> | undefined)}
+                slug={agentLook(a.alias, { look: a.look ?? a.params?.look })}
                 size={28}
                 still
               />,
@@ -122,7 +125,7 @@ export default function AgentSidebar({
         <button
           type="button"
           className="ag-side-row plain"
-          aria-current={open === null ? "page" : undefined}
+          aria-current={overviewCurrent ? "page" : undefined}
           onClick={onOverview}
         >
           <span className="t">{t("Overview")}</span>

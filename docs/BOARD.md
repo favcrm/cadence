@@ -2480,16 +2480,16 @@ done and dropped named as exclusions. A project's Agents view binds an
 agent by dispatch (a job task on one of the project's issues) or by
 ownership (owner of a `doing`/`review` issue) — the `cadence status`
 ISSUES rule (`ui/src/lib/scope.ts`). The Agents screen shows current work,
-queue warnings and activity in compact rows/cards. Search and status filters
-operate within the selected project, with Current selected initially; stopped
-workers and mailboxes remain discoverable through explicit filters and All.
+queue warnings and activity in compact cards, with a sidebar grouping the same
+team by state. Cards list the current team; search reaches everyone, and stopped
+workers and mailboxes fold under the sidebar's groups (under the cards on a phone).
 The board accepts daemon message activity times in epoch seconds and older ISO
 text, so the Last activity column uses real timestamps when supplied. Fenced
-agents rank first, followed by agents needing input, quota recovery or
-investigation of unknown/stalled work. Mailbox queues do not count as working
-agents. A native modal drawer retains model/effort/provenance/quota evidence,
-verbatim recovery and resume
-commands, identity, params, capabilities, tasks, bound issues, running messages
+agents rank first, followed by agents and profiles needing input, quota recovery
+or investigation of unknown/stalled work, then Master, then the rest by state.
+Mailbox queues do not count as working agents. Each agent's page opens on its
+conversation, and its details and sections retain model/effort/provenance/quota
+evidence, verbatim recovery and resume commands, identity, params, capabilities, tasks, bound issues, running messages
 and the event tail. Collection observations stay available if the detail read
 fails. Missing project issue data is reported rather than guessing assignments.
 A fence banner on the board links straight to the drawer. Settings → Memory is a

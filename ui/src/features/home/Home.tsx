@@ -542,7 +542,7 @@ const discard = (message: string) => resources.masterThread.write((s) => discard
  * at mount) carry the enter animation; history paged in above it does
  * not fly in.
  */
-const ThreadList = memo(function ThreadList({
+export const ThreadList = memo(function ThreadList({
   items,
   limit,
   moreBefore,
@@ -555,6 +555,7 @@ const ThreadList = memo(function ThreadList({
   working,
   queued,
   stale,
+  onDiscard,
 }: {
   items: ThreadItem[];
   limit: number;
@@ -579,6 +580,8 @@ const ThreadList = memo(function ThreadList({
   queued: string[];
   /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
   stale: boolean;
+  /** Drops a failed send from this list's own thread. */
+  onDiscard: (message: string) => void;
 }) {
   const t = useTranslate();
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
@@ -647,10 +650,11 @@ const ThreadList = memo(function ThreadList({
         running={working?.message ?? null} /* null while a send is only submitting */
         runningUnnamed={working?.unnamed === true}
         queued={queued}
-        legacyTranscript={!items.some((item) => item.type === "answer")}
+        // A live turn is never an earlier transcript, whether or not it is named.
+        legacyTranscript={!working && !items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
         onRetry={onRetry}
-        onDiscard={discard}
+        onDiscard={onDiscard}
         activity={(item) => {
           if (flightKey !== null && !flightFlat) return null;
           if (working?.unnamed === true && unnamedTurnAnswered(shown)) return null;
@@ -1510,6 +1514,7 @@ function MasterHome({
               working={workingActivity}
               queued={(master.data?.queue ?? []).map((q) => q.message)}
               stale={streamReconnecting && activeTurn}
+              onDiscard={discard}
             />
             </ImageConversation.Provider>
             {cmds.map((c) => (
