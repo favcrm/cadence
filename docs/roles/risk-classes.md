@@ -19,7 +19,6 @@ Only these exact paths are eligible for `auto`:
 - `scripts/measurements/README.md` — isolated board measurement procedure.
 - `scripts/measurements/board-live.mjs` — isolated loopback board diagnostics. Its eligibility depends on the loopback port guard (`board-live.mjs:16-18`), which must be re-checked on every edit.
 - `scripts/test-dup-report` — read-only test duplication analysis.
-- `scripts/test-dup-report.txt` — historical duplication report, not a gate input.
 - `scripts/auto-stage.py` — candidate selector and receipt writer. It runs in the `stage` job of both automatic and manual `workflow_dispatch` runs; in a manual run its only possible effect is a failure. Its candidate check is not what promotion relies on: the `promote` job re-verifies the artifact itself (`scripts/delivery-candidate.py prepare`) and runs only on manual `workflow_dispatch` behind the `production` environment's required reviewers. Changes to `scripts/delivery-candidate.py`, to the `promote` job, or to `.github/**` stay human.
 
 Each path must satisfy ALL four criteria:

@@ -85,4 +85,4 @@ paths = ["docs/roles/**", "docs/CHARTER.md", "docs/AUDIT.md",
 # auto-eligible, never delegable.
 [scripts_allowlist]
 paths = ["scripts/measurements/README.md", "scripts/measurements/board-live.mjs",
-  "scripts/test-dup-report", "scripts/test-dup-report.txt", "scripts/auto-stage.py"]
+  "scripts/test-dup-report", "scripts/auto-stage.py"]
