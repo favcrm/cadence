@@ -344,6 +344,17 @@ pub struct AgentProfile {
     /// `inherit` or a model id.
     pub model: String,
     pub runtimes: Vec<String>,
+    /// The newest claim under this profile (CAD-1990). Hosted boards only, and
+    /// absent when it never claimed or the board could not read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_claim: Option<ProfileClaim>,
+}
+
+/// A profile's newest claim: the issue and the claim's own state.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ProfileClaim {
+    pub issue_id: String,
+    pub state: String,
 }
 
 /// `GET /api/agents`: the roster beside its snapshot's freshness.

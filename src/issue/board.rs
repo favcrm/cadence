@@ -322,16 +322,27 @@ pub fn outcomes_from_jobs(jobs: &[Value]) -> JobOutcomes {
     }
     let mut out = JobOutcomes::new();
     for (issue, mut jobs) in by_issue {
+        // Compare the whole group consistently: a pairwise fallback for
+        // malformed timestamps can violate the sort's transitivity.
+        let numeric_created = jobs.iter().all(|job| job["created"].as_f64().is_some());
         let newest = |a: &&Value, b: &&Value| {
-            // `created` is the ordering; `updated`/`id` break ties.
-            (
-                b["created"].as_str().unwrap_or_default(),
-                b["id"].as_str().unwrap_or_default(),
-            )
-                .cmp(&(
-                    a["created"].as_str().unwrap_or_default(),
-                    a["id"].as_str().unwrap_or_default(),
-                ))
+            let by_created = if numeric_created {
+                b["created"]
+                    .as_f64()
+                    .partial_cmp(&a["created"].as_f64())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                b["created"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(a["created"].as_str().unwrap_or_default())
+            };
+            by_created.then_with(|| {
+                b["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(a["id"].as_str().unwrap_or_default())
+            })
         };
         jobs.sort_by(newest);
         let chosen = jobs

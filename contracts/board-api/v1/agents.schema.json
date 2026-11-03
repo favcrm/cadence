@@ -84,6 +84,17 @@
             "null"
           ]
         },
+        "latest_claim": {
+          "description": "The newest claim under this profile (CAD-1990). Hosted boards only, and\nabsent when it never claimed or the board could not read it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileClaim"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "look": {
           "type": [
             "string",
@@ -572,6 +583,22 @@
       "enum": [
         "reachable",
         "unreachable"
+      ]
+    },
+    "ProfileClaim": {
+      "description": "A profile's newest claim: the issue and the claim's own state.",
+      "type": "object",
+      "properties": {
+        "issue_id": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issue_id",
+        "state"
       ]
     },
     "RunningMessage": {

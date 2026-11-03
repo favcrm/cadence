@@ -1234,6 +1234,180 @@ fn upload(
     Ok(0)
 }
 
+/// A version's size on a hosted org; the server refuses more.
+const ARTIFACT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// AOS-346: `cadence artifact` on a hosted org. The server decides who may see
+/// what from the credential; nothing here names an actor or a scope.
+fn artifact(
+    target: &cadence_agent::remote_cli::RemoteTarget,
+    action: &super::artifact::ArtifactAction,
+    wake_timeout: u64,
+) -> Result<i32> {
+    use super::artifact::ArtifactAction;
+    use cadence_agent::remote_cli::{call_verb, upload_artifact, ArtifactUpload, RemoteAnswer};
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(wake_timeout))
+        .ok_or_else(|| Error::usage("invalid wake timeout"))?;
+    let read = |verb: &str, args: serde_json::Map<String, Value>| -> Result<Value> {
+        match call_verb(target, verb, args, deadline, wake_timeout, |line| {
+            eprintln!("{line}")
+        })? {
+            RemoteAnswer::Ok(body) => Ok(body),
+            RemoteAnswer::Conflict(_) => Err(Error::rejected("remote read answered a conflict")),
+        }
+    };
+    match action {
+        ArtifactAction::Put {
+            kind,
+            title,
+            file,
+            id,
+            issue,
+            label,
+            customer,
+        } => {
+            if cadence_agent::master::caller_is_master() {
+                return Err(Error::rejected(
+                    "the master puts artifacts on its own board; nothing was sent",
+                ));
+            }
+            let bytes = cadence_agent::wiki::upload::read_local_file(file, ARTIFACT_MAX_BYTES)?;
+            let name = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "artifact".into());
+            let title = title.join(" ");
+            let out = upload_artifact(
+                target,
+                &ArtifactUpload {
+                    kind,
+                    title: &title,
+                    id: id.as_deref(),
+                    issue: issue.as_deref(),
+                    label: label.as_deref(),
+                    customer: customer.as_deref(),
+                    file_name: &cadence_agent::wiki::upload::part_file_name(&name),
+                    bytes: &bytes,
+                },
+                wake_timeout,
+                |line| eprintln!("{line}"),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            Ok(0)
+        }
+        ArtifactAction::Find {
+            q,
+            label,
+            customer,
+            kind,
+            limit,
+        } => {
+            let mut args = serde_json::Map::new();
+            for (key, value) in [
+                ("q", q),
+                ("label", label),
+                ("customer", customer),
+                ("kind", kind),
+            ] {
+                if let Some(value) = value {
+                    args.insert(key.into(), json!(value));
+                }
+            }
+            if let Some(limit) = limit {
+                args.insert("limit".into(), json!(limit));
+            }
+            let out = read("artifact_find", args)?;
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            Ok(0)
+        }
+        ArtifactAction::Show { id, version, out } => {
+            let Some(path) = out else {
+                if version.is_some() {
+                    return Err(Error::usage(
+                        "--version selects the bytes to write; pass --out <new file>",
+                    ));
+                }
+                let mut args = serde_json::Map::new();
+                args.insert("id".into(), json!(id));
+                let found = read("artifact_show", args)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&found).unwrap_or_default()
+                );
+                return Ok(0);
+            };
+            let mut bytes = Vec::new();
+            // Pinned from the first answer, so a new version cannot land mid-read.
+            let mut pinned = version.map(u64::from);
+            let file = loop {
+                let mut args = serde_json::Map::new();
+                args.insert("id".into(), json!(id));
+                args.insert("offset".into(), json!(bytes.len()));
+                if let Some(version) = pinned {
+                    args.insert("version".into(), json!(version));
+                }
+                let body = read("artifact_read", args)?;
+                let chunk = body["content_base64"]
+                    .as_str()
+                    .and_then(|text| {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD.decode(text).ok()
+                    })
+                    .ok_or_else(|| Error::rejected("remote answered a malformed artifact read"))?;
+                let total = body["total"]
+                    .as_u64()
+                    .filter(|total| *total <= ARTIFACT_MAX_BYTES)
+                    .ok_or_else(|| Error::rejected("remote answered a malformed artifact size"))?;
+                if chunk.is_empty() && (bytes.len() as u64) < total {
+                    return Err(Error::rejected("remote artifact read stopped early"));
+                }
+                pinned = pinned.or(body["file"]["version"].as_u64());
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() as u64 >= total {
+                    break body["file"].clone();
+                }
+            };
+            use sha2::{Digest, Sha256};
+            let digest: String = Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            if file["digest"].as_str() != Some(digest.as_str()) {
+                return Err(Error::rejected(
+                    "the artifact's bytes do not match its digest. Nothing was written",
+                ));
+            }
+            use std::io::Write;
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600); // An artifact may be private to its creator.
+            let mut target_file = options
+                .open(path)
+                .map_err(|e| Error::rejected(format!("cannot create {}: {e}", path.display())))?;
+            if let Err(error) = target_file.write_all(&bytes) {
+                let _ = std::fs::remove_file(path);
+                return Err(Error::rejected(format!(
+                    "cannot write {}: {error}",
+                    path.display()
+                )));
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "file": file,
+                    "written": path.display().to_string(),
+                }))
+                .unwrap_or_default()
+            );
+            Ok(0)
+        }
+    }
+}
+
 /// Remote blob cats stay under the default wiki upload cap. A larger
 /// pointer is refused before a range is fetched or a spool is created.
 const REMOTE_BLOB_SPOOL_BOUND: u64 = 100 * 1024 * 1024;
@@ -1567,7 +1741,8 @@ fn unavailable(command: &Commands) -> Error {
          wiki search, wiki cat, \
          wiki put (text), wiki cp, settings agents <verb>, master status, \
          team list, team invites, team invite, team revoke-invite, \
-         team set-role, team remove, delivery requirements, audit approval, \
+         team set-role, team remove, delivery requirements, artifact put, \
+         artifact find, artifact show, audit approval, \
          audit scope, audit approve (merge), audit verdicts, audit verdict, \
          audit reviewers, audit identities, issue project delivery. \
          Use `--org local` or `cadence org switch` to run locally.",
@@ -1867,6 +2042,9 @@ pub(super) fn run(
     } = &command
     {
         return upload(&target, file, path, *overwrite, wake_timeout);
+    }
+    if let Commands::Artifact { action } = &command {
+        return artifact(&target, action, wake_timeout);
     }
     if let Commands::Wiki {
         action:

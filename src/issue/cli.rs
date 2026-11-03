@@ -303,7 +303,8 @@ pub enum IssueAction {
         /// configured `base`, else the remote HEAD (`origin/HEAD`, else
         /// the remote's symbolic HEAD). A checkout with no `origin`
         /// uses its current branch. A resolved remote ref is never
-        /// replaced by the main checkout's current branch.
+        /// replaced by the main checkout's current branch. A branch
+        /// base that `origin` carries resolves to origin's current tip.
         #[arg(long)]
         base: Option<String>,
         /// Owner to record when the issue has none — default: the

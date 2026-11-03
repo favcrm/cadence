@@ -183,7 +183,7 @@ function browserLocale(): Locale {
 Object.assign(zhTW, {
   "Add {name}": "新增 {name}", "Adding…": "正在新增…", "Added {name}.": "已新增 {name}。",
   "{name} was added as {role}": "{name} 已新增為{role}", "Idle · no runtime": "閒置 · 尚無執行環境",
-  "Last: {issue}": "上次：{issue}", "Latest work": "最近工作", "Job": "職責", "Connect a runtime": "連接執行環境", "Read the profile:": "讀取設定檔：",
+  "Last: {issue}": "上次：{issue}", "Working on {issue}": "正在處理 {issue}", "Blocked on {issue}": "受阻於 {issue}", "Waiting on {issue}": "等待 {issue}", "Latest work": "最近工作", "Job": "職責", "Connect a runtime": "連接執行環境", "Read the profile:": "讀取設定檔：",
   "Start a session on an issue under this profile:": "在此設定檔下對議題開始工作階段：",
   "Register a runtime against it (provider: {providers}):": "將執行環境註冊至此設定檔（供應商：{providers}）：",
   "A runtime joins a group. Create one first:": "執行環境須加入群組，請先建立一個：",

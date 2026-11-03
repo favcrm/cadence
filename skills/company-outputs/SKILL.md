@@ -14,11 +14,13 @@ Check which tools or commands this session actually has before relying on one. `
 | Capability | What it does |
 |---|---|
 | Company facts | Read the company's details, price list and past decisions |
+| Find past work | Find and reopen what was produced earlier |
 | Find template | See the company's templates and their versions |
 | Read template | Open one exact version: its guidelines and reference files |
 | Calculate | Work out amounts in code, not in your head |
 | Render | Produce a filled output from a template and structured data, with amounts calculated in code |
 | Show | Put a result on the canvas beside the conversation |
+| Save file | Store a result in the workspace for people to find later. This does not show it on a canvas |
 | Save draft | Record a new template version as an unapproved draft |
 | Approve | The owner's act alone. You never do this |
 
