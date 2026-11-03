@@ -44,7 +44,8 @@ const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
 const { seatStatus } = require("../src/features/agents/SeatCard") as typeof import("../src/features/agents/SeatCard");
-const { overviewSeats } = require("../src/features/agents/agentView") as typeof import("../src/features/agents/agentView");
+const { agentRunningTurn, overviewSeats } = require("../src/features/agents/agentView") as typeof import("../src/features/agents/agentView");
+const { agentThreadStore, sendToAgent } = require("../src/features/agents/agentThread") as typeof import("../src/features/agents/agentThread");
 const { profileMatchesFilter, profileMatchesSearch, profileWork } = require("../src/features/agents/agentView") as typeof import("../src/features/agents/agentView");
 const Agents = (
   require("../src/features/agents/Agents") as typeof import("../src/features/agents/Agents")
@@ -143,9 +144,13 @@ const threadReads: string[] = [];
 let threadExtra: Record<string, unknown> = {};
 let viewerIsOperator: boolean | null = true;
 let viewerHosted = false;
+let sendAnswer: (() => Response) | null = null;
+const extraAgents: Agent[] = [];
 globalThis.fetch = async (input, init) => {
-  if (init?.method && init.method !== "GET")
+  if (init?.method && init.method !== "GET") {
+    if (sendAnswer) return sendAnswer();
     throw new Error("Agents must not write");
+  }
   const path = new URL(String(input), "http://localhost").pathname;
   if (path.startsWith("/api/threads/")) {
     threadReads.push(path);
@@ -167,7 +172,7 @@ globalThis.fetch = async (input, init) => {
       status: failDetailStatus,
     });
   const alias = decodeURIComponent(path.split("/").pop()!);
-  const a = agents.find((a) => a.alias === alias)!;
+  const a = [...agents, ...extraAgents].find((a) => a.alias === alias)!;
   const { role, tasks, ...runtime } = a;
   const detail: AgentDetail = {
     agent: {
@@ -797,6 +802,56 @@ async function main() {
     assert(main?.querySelector('[data-kind="turn"][data-turn-state="running"]'), `a running turn paints as running (${running.length ? "named" : "unnamed"})`);
     assert(!main?.textContent?.includes("Earlier transcript"), `a running turn is not an earlier transcript (${running.length ? "named" : "unnamed"})`);
   }
+  // A new turn at the same count: the roster names it, whatever the last read said.
+  detailRunning = [{ id: "m-1" }];
+  threadExtra = { entries: [
+    { seq: 1, role: "operator", kind: "message", message: "m-1", text: "First", created: new Date().toISOString() },
+    { seq: 2, role: "agent", kind: "turn_result", message: "m-1", text: "First done", created: new Date().toISOString() },
+    { seq: 3, role: "operator", kind: "message", message: "m-2", text: "Second", created: new Date().toISOString() },
+  ] };
+  // Each case is its own agent: the thread store outlives a mount.
+  const busyRoster = (alias: string, over: Partial<Agent> = {}) => {
+    const busy: Agent = { ...base, alias, running: 1, state: "busy", ...over };
+    extraAgents.push(busy);
+    return loaded({ daemon: "reachable", agents: [...agents, busy], totals: null, ...fresh }) as unknown as typeof state;
+  };
+  await mountLive("next-turn", busyRoster("next-turn", { running_messages: [{ id: "m-2" }] }));
+  assert(liveHost.querySelector(".ag-chat-main [data-kind='typing']"), "the next turn at the same count shows as working");
+  // No read names the turn, as on a board that keeps no details: still no transcript label.
+  detailRunning = [];
+  failDetail = true;
+  threadExtra = { entries: [
+    { seq: 1, role: "operator", kind: "message", message: "m-3", text: "Ship it", created: new Date().toISOString() },
+    { seq: 2, role: "agent", kind: "assistant_text", message: "m-3", text: "On it", created: new Date().toISOString() },
+  ] };
+  await mountLive("unnamed-turn", busyRoster("unnamed-turn"));
+  assert(!liveHost.querySelector(".ag-chat-main")?.textContent?.includes("Earlier transcript"), "an unnamed live turn is not an earlier transcript");
+  failDetail = false;
+  // Busy on other work with nothing in this chat yet: the chat says so.
+  threadExtra = {};
+  await mountLive("empty-chat", busyRoster("empty-chat"));
+  assert(liveHost.querySelector(".chat-empty")?.textContent?.includes("empty-chat is working"), "an empty chat with a working agent says it is working");
+  assert(agentRunningTurn(1, [{ id: "m", created: 1790562108 }])?.since === 1790562108, "epoch seconds keep the turn's start");
+  assert(agentRunningTurn(1, [{ id: "m", created: "2026-01-01T00:00:00Z" }])?.since === 1767225600, "an ISO start still reads");
+  // An outage's empty roster claims nothing about the team.
+  await mountLive(null, outageRoster);
+  assert(!liveHost.textContent?.includes("No agents registered"), "an outage does not say no agents are registered");
+  // A refused retry cannot settle an attempt whose outcome was unknown.
+  const sendStore = agentThreadStore("dev");
+  sendAnswer = () => { throw new Error("connection lost"); };
+  await sendToAgent("dev", "Hello", "send-1");
+  const unconfirmedFirst = sendStore.get().data?.pending.find((p) => p.message === "send-1");
+  assert(unconfirmedFirst?.delivery === "unconfirmed", "a lost response is unconfirmed");
+  sendAnswer = () => new Response(JSON.stringify({ error: "refused" }), { status: 403 });
+  await sendToAgent("dev", "Hello", "send-1");
+  assert(sendStore.get().data?.pending.find((p) => p.message === "send-1")?.delivery === "unconfirmed", "a refused retry stays unconfirmed");
+  sendAnswer = () => new Response(JSON.stringify({ error: "refused" }), { status: 403 });
+  await sendToAgent("dev", "Hi", "send-2");
+  assert(sendStore.get().data?.pending.find((p) => p.message === "send-2")?.delivery === undefined, "a refused first send is a definite refusal");
+  sendAnswer = () => new Response(JSON.stringify({ error: "nope" }), { status: 501 });
+  await sendToAgent("dev", "Hi", "send-3");
+  assert(sendStore.get().data?.pending.find((p) => p.message === "send-3")?.delivery === undefined, "a 501 send is definite");
+  sendAnswer = null;
   detailRunning = [];
   const atRest = { ...upRoster, data: { ...upRoster.data!, agents: agents.map((a) => ({ ...a, running: 0, state: "idle" })) } } as typeof state;
   await mountLive("dev", atRest);

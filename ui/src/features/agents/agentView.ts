@@ -199,16 +199,17 @@ export function overviewSeats(agents: Agent[], profiles: HiredProfile[]): Overvi
   ].sort((a, b) => rank(a) - rank(b) || alias(a).localeCompare(alias(b)));
 }
 
-/** The turn an agent is running, as Home's thread reads one. The roster's live
- *  count says whether; the last detail read names the message when it can. */
+/** The turn an agent is running, as Home's thread reads one. `running` is the
+ *  freshest list that names messages: the live roster, else the last detail read.
+ *  The daemon sends `created` as epoch seconds; older text is an ISO date. */
 export function agentRunningTurn(
   count: number,
-  running: { id: string; created?: string }[] | undefined,
+  running: { id?: string | null; created?: string | number | null }[] | null | undefined,
 ): { message: string | null; since: number | null; unnamed?: boolean } | null {
   if (count <= 0) return null;
   const turn = running?.[0];
   if (!turn?.id) return { message: null, since: null, unnamed: true };
-  const started = turn.created ? Date.parse(turn.created) : Number.NaN;
+  const started = typeof turn.created === "number" ? turn.created * 1000 : Date.parse(turn.created ?? "");
   return { message: turn.id, since: Number.isNaN(started) ? null : Math.floor(started / 1000) };
 }
 

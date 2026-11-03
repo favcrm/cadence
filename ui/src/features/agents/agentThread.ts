@@ -32,6 +32,8 @@ export async function sendToAgent(
   if (!body) return;
   const store = agentThreadStore(alias);
   const session = privateSessionGeneration();
+  // A refused retry says nothing about the attempt whose outcome was unknown.
+  const wasUnconfirmed = store.get().data?.pending.some((p) => p.message === message && p.delivery === "unconfirmed") === true;
   store.write((s) => addPending(s, message, body, Date.now(), refs, attachments));
   try {
     await withPrivateOperation(async (op) => {
@@ -48,7 +50,7 @@ export async function sendToAgent(
     // a 4xx refused it, and a 501 is a definite "this board doesn't do that".
     const definite = e instanceof ApiError && ((e.status >= 400 && e.status < 500) || e.status === 501);
     store.write((s) =>
-      settlePending(s, message, definite ? { ok: false, error } : { ok: false, error, delivery: "unconfirmed" }),
+      settlePending(s, message, definite && !wasUnconfirmed ? { ok: false, error } : { ok: false, error, delivery: "unconfirmed" }),
     );
   }
 }

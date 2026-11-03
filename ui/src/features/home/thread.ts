@@ -36,7 +36,7 @@ export interface PendingMessage {
   text: string;
   state: "sending" | "sent" | "failed";
   error?: string;
-  /** CAD-1485 round-3 (member surface only): set when the send's
+  /** CAD-1485 round-3 (member and agent chats): set when the send's
    *  delivery is genuinely unknown — a lost response, a transport/5xx
    *  failure, or a malformed/mismatching 2xx receipt. The member chat
    *  renders "Delivery unconfirmed" (opt-in label) with the same

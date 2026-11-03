@@ -263,7 +263,9 @@ function AgentConversation({
           {loaded && !failed && withheld == null && items.length === 0 && !gate && (
             <div className="chat-empty">
               <p className="text-label text-ink-400">
-                {t("No messages with {alias} yet.").replace("{alias}", () => alias)}
+                {working
+                  ? t("{alias} is working. No messages with it yet.").replace("{alias}", () => alias)
+                  : t("No messages with {alias} yet.").replace("{alias}", () => alias)}
               </p>
             </div>
           )}

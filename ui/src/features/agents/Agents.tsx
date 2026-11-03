@@ -331,7 +331,7 @@ export default function Agents({
               </div>
             </details>
           )}
-          {seats.length === 0 && (
+          {seats.length === 0 && (searching || payload.daemon !== "unreachable") && (
             <p className="text-label text-ink-500 mt-3" role="status">
               {emptyCopy}
               {searching && (

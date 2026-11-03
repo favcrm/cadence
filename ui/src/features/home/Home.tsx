@@ -555,7 +555,7 @@ export const ThreadList = memo(function ThreadList({
   working,
   queued,
   stale,
-  onDiscard = discard,
+  onDiscard,
 }: {
   items: ThreadItem[];
   limit: number;
@@ -581,7 +581,7 @@ export const ThreadList = memo(function ThreadList({
   /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
   stale: boolean;
   /** Drops a failed send from this list's own thread. */
-  onDiscard?: (message: string) => void;
+  onDiscard: (message: string) => void;
 }) {
   const t = useTranslate();
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
@@ -650,7 +650,8 @@ export const ThreadList = memo(function ThreadList({
         running={working?.message ?? null} /* null while a send is only submitting */
         runningUnnamed={working?.unnamed === true}
         queued={queued}
-        legacyTranscript={!items.some((item) => item.type === "answer")}
+        // A live turn is never an earlier transcript, whether or not it is named.
+        legacyTranscript={!working && !items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
         onRetry={onRetry}
         onDiscard={onDiscard}
@@ -1513,6 +1514,7 @@ function MasterHome({
               working={workingActivity}
               queued={(master.data?.queue ?? []).map((q) => q.message)}
               stale={streamReconnecting && activeTurn}
+              onDiscard={discard}
             />
             </ImageConversation.Provider>
             {cmds.map((c) => (

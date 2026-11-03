@@ -146,8 +146,9 @@ export default function AgentPage({
     // `daemonDown`: the read that failed in an outage is worth repeating after it.
   }, [alias, retry, hired, rosterLoaded, rosterFailed, daemonDown]);
 
-  // The roster carries the live count; a new count is a new turn for the read to name.
-  const liveTurns = observed?.running ?? 0;
+  // The roster is live and the read is not: a new running turn, even at the same
+  // count, is what the page's own figures should be read again for.
+  const liveTurns = `${observed?.running ?? 0}:${(observed?.running_messages ?? []).map((m) => m.id).join()}`;
   const readTurns = useRef(liveTurns);
   useEffect(() => {
     if (readTurns.current === liveTurns) return;
@@ -442,7 +443,7 @@ export default function AgentPage({
           gate === null && !isCloud ? <Button onClick={() => onTab("work")}>{t("Assign work")}</Button> : null
         }
         block={writeBlock}
-        working={agentRunningTurn(observed?.running ?? detail?.running.length ?? 0, detail?.running)}
+        working={agentRunningTurn(observed?.running ?? detail?.running.length ?? 0, observed?.running_messages ?? detail?.running)}
         onBack={onBack}
         onOpenIssue={onOpenIssue}
         // With nothing known about the agent, the gate is already the one answer

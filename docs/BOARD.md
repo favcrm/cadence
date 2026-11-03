@@ -2487,9 +2487,9 @@ The board accepts daemon message activity times in epoch seconds and older ISO
 text, so the Last activity column uses real timestamps when supplied. Fenced
 agents rank first, followed by agents and profiles needing input, quota recovery
 or investigation of unknown/stalled work, then Master, then the rest by state.
-Mailbox queues do not count as working agents. A native modal drawer retains model/effort/provenance/quota evidence,
-verbatim recovery and resume
-commands, identity, params, capabilities, tasks, bound issues, running messages
+Mailbox queues do not count as working agents. Each agent's page opens on its
+conversation, and its details and sections retain model/effort/provenance/quota
+evidence, verbatim recovery and resume commands, identity, params, capabilities, tasks, bound issues, running messages
 and the event tail. Collection observations stay available if the detail read
 fails. Missing project issue data is reported rather than guessing assignments.
 A fence banner on the board links straight to the drawer. Settings → Memory is a
