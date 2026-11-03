@@ -39,10 +39,10 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
     /** Abort this instance; durable state is retained when it is reconstructed. */
     reload(): string;
     /**
-     * Start a fresh context for this conversation. The durable transcript before
-     * this point stops being active; the board then has a clean thread even when
-     * a stale session is wedged and a normal reload cannot recover it. The caller
-     * is the owner-only reset route; this is deliberately not an automatic retry.
+     * Start a fresh context for this conversation. The model stops seeing what
+     * came before, while the board keeps showing it, with a marker where it
+     * happened. This also recovers a stale session a normal reload cannot. The
+     * callers are owner-only routes; this is deliberately not an automatic retry.
      */
     resetConversation(): Promise<void>;
     /** Submit without waiting: the board's send is queued, not a blocking turn. */

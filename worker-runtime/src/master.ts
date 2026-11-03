@@ -61,7 +61,7 @@ export function masterState(
           },
     // What the board host relays to this session. The composer offers these
     // and nothing else, so a verb is listed only once the host has its route.
-    commands: ["stop"],
+    commands: ["new", "stop"],
     turn: status.running
       ? {
           state: "working",

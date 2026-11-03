@@ -91,6 +91,39 @@ export function projectedThreadEntries(
   return project ? [...project(entries)] : entries;
 }
 
+/** The engine's reset record: earlier entries leave the model's context, not storage. */
+export const RESET_KIND = "pi.reset";
+
+/** Shown where a conversation started over. */
+export const FRESH_START_TEXT =
+  "Started fresh. The assistant no longer uses the messages above.";
+
+/** How many records one history read asks the engine for. */
+const HISTORY_PAGE = 500;
+
+/** One scan of a conversation's stored records, as the engine pages them. */
+export type EntryScan<C> = (
+  cursor: C | undefined,
+  limit: number,
+) => Promise<{ readonly items: readonly EntryRecord[]; readonly next?: C }>;
+
+/**
+ * Every stored record, oldest first. The board reads this, not the active
+ * context: a thread's `seq` is the position in this list, so it must not restart
+ * when a reset or a compaction narrows what the model sees. An open stream and
+ * the board's merge both rely on `seq` only ever growing.
+ */
+export async function readAllRecords<C>(scan: EntryScan<C>): Promise<EntryRecord[]> {
+  const records: EntryRecord[] = [];
+  let cursor: C | undefined;
+  do {
+    const page = await scan(cursor, HISTORY_PAGE);
+    records.push(...page.items);
+    cursor = page.next;
+  } while (cursor !== undefined);
+  return records;
+}
+
 /**
  * Map the engine's committed records, including durable input metadata, into
  * the board's entries.
@@ -107,6 +140,15 @@ export function threadEntries(
   const all = records.flatMap((record) => record.model ?? []);
   let position = -1;
   for (const record of records) {
+    // A reset with nothing before it has nothing to mark.
+    if (record.kind === RESET_KIND && entries.length > 0) {
+      entries.push({
+        seq: entries.length + 1,
+        role: "system",
+        kind: "message",
+        text: FRESH_START_TEXT,
+      });
+    }
     const data = record.data;
     const messageId =
       record.kind === BOARD_MESSAGE_KIND &&
