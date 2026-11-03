@@ -446,6 +446,8 @@ function helpText(commands: readonly SlashCommand[]): string {
   const rows = commands.filter((c) => c.name !== "help").map(
     (c) => `| \`/${c.name}${c.arg ? ` ${c.arg}` : ""}\` | ${c.blurb} |`,
   );
+  // A board that runs nothing else has no table worth showing.
+  if (rows.length === 0) return "Just type your message. `/help` is the only command in this workspace right now.";
   return `**Commands**\n\n| command | what it does |\n|---|---|\n${rows.join("\n")}`;
 }
 
@@ -1302,7 +1304,7 @@ function MasterHome({
     (name: string, arg: string) => {
       const id = ++cmdSeq.current;
       if (name === "help") {
-        setCmds((c) => [...c, { id, name, ok: true, text: helpText(offered) }]);
+        setCmds((c) => [...c, { id, name, ok: true, text: t(helpText(offered)) }]);
         return;
       }
       const known = SLASH_COMMANDS.find((c) => c.name === name);

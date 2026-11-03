@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
+import { displayUiNotice } from "../../lib/uiNotice";
 import type { ThreadRef } from "../../lib/types";
 import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
@@ -393,6 +394,8 @@ export default function MemberChat({
               density="full"
               storeKey={`member-assist:${scope}`}
               block={readOnly ? t("The board is read-only.") : null}
+              // A `/` command is not sent here, and Enter must not look dead.
+              onNotice={(notice) => setSendNote(displayUiNotice(notice, t))}
               onSend={({ body }) => {
                 void sendToAssistant(scope, body).then((receipt) => {
                   // The actual receipt decides the note: a queued-but-

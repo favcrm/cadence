@@ -106,6 +106,7 @@ async function main() {
   await enter();
   const help = host.querySelector('[data-cmd="help"]')?.textContent ?? "";
   assert(!help.includes("/compact") && !help.includes("/model"), "help lists only what this board can run");
+  assert(help.includes("Just type your message") && !help.includes("what it does"), "help with nothing to list says so, with no empty table");
 
   // A board that advertises a verb gets it in the menu and sends it.
   await React.act(async () => { root.render(null); });
