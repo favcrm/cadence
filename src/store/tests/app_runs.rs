@@ -1951,3 +1951,84 @@ fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
         "the page must not sort scoped history before LIMIT: {plan_text}"
     );
 }
+
+/// CAD-2042: the batched backfill resumes from its durable cursor after an
+/// interruption, and the version/index only commit once every row was
+/// considered. Simulates a crash after the DDL/progress step by rewinding the
+/// version and clearing what the backfill would have written.
+#[test]
+fn cad2042_interrupted_backfill_resumes_and_converges() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("resume.sqlite3");
+    drop(Store::open(&path).unwrap());
+    {
+        // A plain connection: the store's own authorizer refuses fixture DDL.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated,context_id)
+             VALUES('r-resume','install-resume',1,'sha256:bundle','{}','sha256:snap','lead','req-resume','succeeded',1.0,1.0,'ctx-resume')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema)
+             VALUES('c-resume','r-resume','s1','','','source','cr-resume','sha256:b','sha256:i','{\"kind\":\"social.source.posts\"}','sha256:d',1.0,2)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS app_capability_results_source;
+             UPDATE app_capability_results SET source_post_read=0, install_id=NULL, context_id=NULL WHERE id='c-resume';
+             INSERT OR REPLACE INTO app_schema_progress(name,cursor) VALUES('cad2042-source-scope',0);
+             UPDATE schema_version SET version=61;",
+        )
+        .unwrap();
+    }
+
+    // No rollout lease in a fixture: the schema-test constructor skips the
+    // operator gate while still running the real migration blocks.
+    let reopened = Store::open_for_schema_tests(&path).unwrap();
+    let (version, flag, install, context, progress): (
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+        i64,
+    ) = reopened
+        .conn()
+        .query_row(
+            "SELECT (SELECT version FROM schema_version),
+                    source_post_read, install_id, context_id,
+                    (SELECT COUNT(*) FROM app_schema_progress WHERE name='cad2042-source-scope')
+               FROM app_capability_results WHERE id='c-resume'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(version, 62, "the resumed upgrade finishes");
+    assert_eq!(flag, 1, "the interrupted row is backfilled");
+    assert_eq!(install.as_deref(), Some("install-resume"));
+    assert_eq!(context.as_deref(), Some("ctx-resume"));
+    assert_eq!(progress, 0, "the progress row is cleared on completion");
+    let indexes: Vec<String> = reopened
+        .conn()
+        .prepare("PRAGMA index_list(app_capability_results)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        indexes.iter().any(|name| name == "app_capability_results_source"),
+        "the page index is recreated: {indexes:?}"
+    );
+}

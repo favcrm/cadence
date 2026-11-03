@@ -1589,8 +1589,14 @@ impl Store {
                 // CAD-2042: the retained-source page must be an ordered scoped
                 // index range, not a join plus temp-B-tree sort over the whole
                 // scoped history. Denormalize the owning run's identity and the
-                // source marker onto the receipt, backfill receipts recorded
-                // before this migration, then index the exact page order.
+                // source marker onto the receipt, then index the exact page
+                // order. On a large history the backfill is O(rows), so it runs
+                // in bounded batches with a durable cursor: a reader/writer is
+                // blocked only for one batch, and an interrupted upgrade keeps
+                // its progress instead of rescanning from the start. The
+                // version bump and the index commit only once every row has
+                // been considered, so no page can see a half-built index.
+                const BATCH: i64 = 50_000;
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 for (column, definition) in [
                     ("install_id", "install_id TEXT"),
@@ -1611,23 +1617,56 @@ impl Store {
                     }
                 }
                 tx.execute_batch(
-                    "UPDATE app_capability_results
-                        SET source_post_read=1
-                      WHERE source_post_read=0
-                        AND json_extract(result,'$.kind')='social.source.posts';
-                     UPDATE app_capability_results
-                        SET install_id=(SELECT a.install_id FROM app_runs a
-                                         WHERE a.id=app_capability_results.run_id),
-                            context_id=(SELECT a.context_id FROM app_runs a
-                                         WHERE a.id=app_capability_results.run_id)
-                      WHERE source_post_read=1
-                        AND (install_id IS NULL OR context_id IS NULL);
-                     CREATE INDEX IF NOT EXISTS app_capability_results_source
-                       ON app_capability_results(install_id,context_id,created,id)
-                       WHERE source_post_read=1;
-                     UPDATE schema_version SET version=62;",
+                    "CREATE TABLE IF NOT EXISTS app_schema_progress(
+                        name TEXT PRIMARY KEY, cursor INTEGER NOT NULL);
+                     INSERT OR IGNORE INTO app_schema_progress(name,cursor)
+                       VALUES('cad2042-source-scope',0);",
                 )?;
                 tx.commit()?;
+                loop {
+                    let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                    let start: i64 = tx.query_row(
+                        "SELECT cursor FROM app_schema_progress WHERE name='cad2042-source-scope'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    let bound: i64 = tx.query_row(
+                        "SELECT COALESCE(MAX(rowid),0) FROM app_capability_results",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if start >= bound {
+                        tx.execute_batch(
+                            "CREATE INDEX IF NOT EXISTS app_capability_results_source
+                               ON app_capability_results(install_id,context_id,created,id)
+                               WHERE source_post_read=1;
+                             DELETE FROM app_schema_progress
+                               WHERE name='cad2042-source-scope';
+                             UPDATE schema_version SET version=62;",
+                        )?;
+                        tx.commit()?;
+                        break;
+                    }
+                    let end = (start + BATCH).min(bound);
+                    tx.execute(
+                        "UPDATE app_capability_results AS r
+                            SET source_post_read=1,
+                                install_id=a.install_id,
+                                context_id=a.context_id
+                           FROM app_runs a
+                          WHERE a.id=r.run_id
+                            AND r.rowid>?1 AND r.rowid<=?2
+                            AND r.source_post_read=0
+                            AND json_extract(r.result,'$.kind')='social.source.posts'",
+                        [start, end],
+                    )?;
+                    tx.execute(
+                        "UPDATE app_schema_progress SET cursor=?1
+                          WHERE name='cad2042-source-scope'",
+                        [end],
+                    )?;
+                    tx.commit()?;
+                }
             }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
