@@ -99,7 +99,7 @@ export default function MemberChat({
   const [sendNote, setSendNote] = useState<string | null>(null);
   const follow = useRef<Follow>(initialFollow());
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const liveAfter = useRef<number>(0);
+  const liveAfter = useRef<number | null>(null);
 
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   // History truth is carried in the member payload (round 3): a
@@ -110,6 +110,12 @@ export default function MemberChat({
   // genuine accepted refresh is the only thing that flips `loaded`.
   const history = memberHistory(thread);
   const loaded = history.loaded;
+  // The seq watermark for the enter animation: set before the first loaded
+  // render paints its rows, so history stays still. A later first message in
+  // an empty thread still rises in.
+  if (liveAfter.current === null && loaded) {
+    liveAfter.current = lastSeq(thread.data) ?? 0;
+  }
   const moreBefore = thread.data?.moreBefore === true;
 
   // The assistant's surface state — the bound conversation, whether
@@ -209,13 +215,6 @@ export default function MemberChat({
     const timer = setInterval(() => void store.refresh(), 6000);
     return () => clearInterval(timer);
   }, [loaded, store]);
-
-  // The seq watermark for the enter animation, captured once loaded.
-  useEffect(() => {
-    if (loaded && liveAfter.current === 0) {
-      liveAfter.current = lastSeq(thread.data) ?? 0;
-    }
-  }, [loaded, thread.data]);
 
   const [glideTick, setGlide] = useState(0);
   const scrollPanel = useCallback((kind: "glide" | "jump") => {
@@ -379,7 +378,7 @@ export default function MemberChat({
               items={shown}
               legacyTranscript={!items.some((item) => item.type === "answer")}
               readOnly={readOnly}
-              liveAfter={liveAfter.current}
+              liveAfter={liveAfter.current ?? 0}
               onOpenIssue={onOpenIssue}
               onRetry={onRetry}
               onDiscard={onDiscard}

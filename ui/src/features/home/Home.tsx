@@ -3,7 +3,6 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
-import type { SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
@@ -43,7 +42,7 @@ import Conversation from "../app-shell/chat/Conversation";
 import { TurnBar } from "../app-shell/chat/TurnBar";
 import { usePendingPermission } from "../app-shell/chat/usePendingApproval";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
-import { earlierStep, useThreadStream } from "../app-shell/chat/conversationThread";
+import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat/conversationThread";
 import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
@@ -68,6 +67,7 @@ import SinceCard from "./SinceCard";
 import {
   discardPending,
   inFlightTurnKey,
+  unnamedTurnAnswered,
   lastSeq,
   newMessageId,
   openStep,
@@ -560,7 +560,8 @@ const ThreadList = memo(function ThreadList({
   ) => void;
   /** The live turn: its own `message` id picks the row the activity
    *  belongs to; `since` drives the elapsed clock. Null otherwise. */
-  working: { message: string | null; since: number | null } | null;
+  /** `unnamed`: the host verified a turn is working but gave no id for it. */
+  working: { message: string | null; since: number | null; unnamed?: boolean } | null;
   /** Messages still queued behind the running turn: a run's send skips them. */
   queued: string[];
   /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
@@ -599,7 +600,7 @@ const ThreadList = memo(function ThreadList({
   // turn. A second empty assistant (face, "now", dots) under them is the
   // splash: hosted agent entries often carry no message id, so the anchor
   // misses them and the fallback used to append another head.
-  const flightKey = inFlightTurnKey(shown, working?.message ?? null);
+  const flightKey = inFlightTurnKey(shown, working?.message ?? null, working?.unnamed === true);
   // A hire proposal paints as flat rows, never as a ThreadTurn, so the
   // suppression below would leave that still-working turn with no
   // indicator at all. Keep the fallback activity for a flat run.
@@ -631,6 +632,7 @@ const ThreadList = memo(function ThreadList({
         readOnly={readOnly}
         liveAfter={liveAfter}
         running={working?.message ?? null} /* null while a send is only submitting */
+        runningUnnamed={working?.unnamed === true}
         queued={queued}
         legacyTranscript={!items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
@@ -638,6 +640,7 @@ const ThreadList = memo(function ThreadList({
         onDiscard={discard}
         activity={(item) => {
           if (flightKey !== null && !flightFlat) return null;
+          if (working?.unnamed === true && unnamedTurnAnswered(shown)) return null;
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
           // The anchored row shows this turn's own newest entry time. A
@@ -824,7 +827,7 @@ function MasterHome({
   // CAD-574: the rail's collapse is a layout concern — the grid column
   // narrows with it, so the state lives here and the rail renders it.
   const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
-  const [link, setLink] = useState<SseErrorState | "live" | null>("reconnecting");
+  const [link, setLink] = useState<StreamLink>("connecting");
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [cmds, setCmds] = useState<CmdResult[]>([]);
@@ -849,6 +852,13 @@ function MasterHome({
   const block = composerBlock(writeBlock, status, hosted);
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
+  // The seq watermark for the enter animation: items at or below the mount
+  // tail are history and render still; only what lands after rises in. Set
+  // here, before the first loaded render paints its rows, not in an effect
+  // that runs after they have already animated.
+  if (liveAfter.current === null && loaded) {
+    liveAfter.current = lastSeq(thread.data) ?? 0;
+  }
   const moreBefore = thread.data?.moreBefore === true;
   // The default master-state response already resolves Home before its first
   // transcript exists. Keep that server-issued binding when the empty thread
@@ -886,14 +896,18 @@ function MasterHome({
   const permissionPending = usePendingPermission(threadEntries);
   // Results older than this Home visit are history, not a live outcome.
   const liveSince = useMemo(() => Date.now(), []);
-  const streamReconnecting = link !== null && link !== "live";
+  // A first connection in progress is not an outage, so it shows no notice.
+  // Stop still waits for a live stream (`canStop`).
+  const streamReconnecting = link !== "live" && link !== "connecting";
   const turnBar = turnBarState(
     {
       master: master.data,
       entries: threadEntries,
       pendingMessages: (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message),
       awaitingApproval: permissionPending,
-      reconnecting: streamReconnecting,
+      // Actions stay off until the stream has proved the turn is current, even
+      // while a first connection shows no outage notice.
+      reconnecting: link !== "live",
       liveSince,
     },
     homeConversation ?? null,
@@ -929,7 +943,7 @@ function MasterHome({
   // turn runs. Never while the stream is down: that state is last known.
   const runningMessage =
     turnBar.kind === "working" || turnBar.kind === "writing" ? turnBar.stopMessage : null;
-  const canStop = writeBlock === null && !streamReconnecting && runningMessage !== null;
+  const canStop = writeBlock === null && loaded && link === "live" && runningMessage !== null;
   const aheadHref = useConversationDestination(
     turnBar.kind === "queued" ? turnBar.aheadConversation : null,
     master.data,
@@ -983,7 +997,12 @@ function MasterHome({
   // honest "behind a turn" line instead of claiming to type.
   const workingActivity =
     turn.kind === "working"
-      ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
+      ? {
+          message: turn.message,
+          since: typeof turn.since === "number" ? turn.since : null,
+          // Hosted boards report a running turn with `message: null`.
+          unnamed: !turn.message,
+        }
       : turn.kind === "submitting"
         ? { message: null, since: null }
         : null;
@@ -1006,15 +1025,6 @@ function MasterHome({
       || thread.data?.conversation !== undefined),
     setLink,
   );
-
-  // The seq watermark for the enter animation: items at or below the
-  // mount tail are history — they render still; only what lands after
-  // rises in.
-  useEffect(() => {
-    if (liveAfter.current === null && loaded) {
-      liveAfter.current = lastSeq(thread.data) ?? 0;
-    }
-  }, [loaded, thread.data]);
 
   // Keep master_state honest: it follows the agents resource's
   // invalidations (turn boundaries land there) and the `master` stream
