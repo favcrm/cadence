@@ -74,6 +74,17 @@ if [[ -s "$CAD1271_FETCH_LOG" ]]; then
 fi
 printf 'PASS: zero-before tag push accepted using available trusted parent; real guard exit=%s; zero fetch attempts\n' "$status"
 
+# A nightly run carries no base in its payload: the real guard must use the
+# same trusted parent rather than refuse the schedule event (CAD-2005).
+status=0
+(cd "$project/ui" && GITHUB_EVENT_NAME=schedule node scripts/build-app-fixtures.mjs) >"$root/logs/schedule-positive.log" 2>&1 || status=$?
+if [[ $status != 0 ]]; then
+  echo "FAIL: schedule event rejected by real fixture guard (exit=$status)"
+  cat "$root/logs/schedule-positive.log"
+  exit 1
+fi
+printf 'PASS: schedule event accepted using available trusted parent; real guard exit=%s\n' "$status"
+
 # Introduce a real canonical projection drift, regenerate the actual Vite
 # producer and matching golden in the private clone, then ensure the same tag
 # fallback still refuses that drift without a numeric contract bump.
