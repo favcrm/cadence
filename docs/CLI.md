@@ -150,21 +150,22 @@ per-agent filesystem confinement and provider sandboxes remain separate.
 ```
 cadence dev up [--name <n>] [--build <path>]   # create/start; writes the dev marker into the store
 eval "$(cadence dev env)"                      # point this shell at it
-cadence dev reload [--build <path>]            # restart from a local binary
+cadence dev reload [--name <n>] [--build <path>]  # restart from a local binary (clean shell, not one `dev env` exported)
 cadence dev status | down | env | ls | reset <name>
 ```
 
 `reload`, `down` and `reset` delete or restart a sandbox, so they refuse in a
 shell that `dev env` exported (the exports name the sandbox's own roots, and a
-marker is not proof). Run them from a clean shell: `env -u CADENCE_STATE_DIR
--u CADENCE_PM_DIR -u XDG_CONFIG_HOME -u CADENCE_PROFILE cadence dev down <name>`.
-The refusal prints that command.
-
-Dev commands stay local even when the saved org selects hosted production.
-They do not change that selection or access the hosted org's credentials,
-transport or container wake path. An explicitly remote `--org` or
-`CADENCE_ORG` refuses; explicit local state/tracker bindings and managed
-callers' identity restrictions remain in force.
+marker is not proof). Do not simply retry them from a clean shell. First check
+the sandbox root the refusal names: if it is a live installation (a tracker, a
+daemon database, hosted credentials), its marker is planted — stop, and run
+nothing. Only when this shell came from `cadence dev env` and that root is a
+disposable sandbox, run the verb with the sandbox exports removed: `env -u
+CADENCE_STATE_DIR -u CADENCE_PM_DIR -u XDG_CONFIG_HOME -u CADENCE_PROFILE
+cadence dev down <name>` (likewise `dev reload --name <name>`, which takes
+`--name`, and `dev reset <name>`). The refusal prints the same warning first.
+So the sequence `eval "$(cadence dev env kk)"; cadence dev reload` is not
+available in one shell: open a clean shell for the restart.
 
 `dev reload` defaults to the newest of the repo's `target/release/cadence` and
 `target/debug/cadence`. It claims no rollout lease, checks no attestation and

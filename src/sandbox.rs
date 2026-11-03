@@ -682,7 +682,39 @@ pub fn active_home() -> Result<Option<PathBuf>> {
     let Some(name) = profile() else {
         return Ok(None);
     };
-    let sb = Sandbox::open(&name)?;
+    home_of(Sandbox::open(&name)?)
+}
+
+/// The sandbox home an instance is pinned to, from the instance's own
+/// variables (a daemon's captured provider environment), for the one caller
+/// that must not fall back: a daemon binds an upload workspace to it.
+/// `Ok(None)` means no sandbox profile is set. A profile that is set but
+/// resolves to no valid root — a missing marker, a marker naming another
+/// sandbox, a base that cannot be named — is an error, never the host's
+/// own home.
+pub fn pinned_home(lookup: impl Fn(&str) -> Option<String>) -> Result<Option<PathBuf>> {
+    let Some(name) = parse_profile(lookup("CADENCE_PROFILE").as_deref()) else {
+        return Ok(None);
+    };
+    validate_name(&name)?;
+    let base = base_dir_with(&lookup)?;
+    let sb = Sandbox {
+        root: base.join(&name),
+        name: name.clone(),
+        base,
+    };
+    match home_of(sb)? {
+        Some(root) => Ok(Some(root)),
+        None => Err(Error::rejected(format!(
+            "CADENCE_PROFILE selects the sandbox '{name}', but no sandbox root with a marker \
+             naming it exists under the sandbox base — refusing to fall back to the host's \
+             own home; run `cadence dev up --name {name}` or unset CADENCE_PROFILE"
+        ))),
+    }
+}
+
+fn home_of(sb: Sandbox) -> Result<Option<PathBuf>> {
+    let name = sb.name.clone();
     // The marker must name this sandbox: a copy of another sandbox's
     // marker is not a home for this profile.
     let Some(marker) = read_marker(&sb)? else {
@@ -786,7 +818,17 @@ fn global_gate(profile: Option<&str>, allowed: Option<bool>, what: &str) -> Resu
 /// relative one follows the cwd, and a `..` would land somewhere other
 /// than the path the production guard compares.
 pub fn base_dir() -> Result<PathBuf> {
-    let var = |name| std::env::var_os(name).filter(|d| !d.is_empty());
+    base_dir_with(|name| std::env::var(name).ok())
+}
+
+/// [`base_dir`] over a caller-supplied variable source — a daemon's captured
+/// provider environment rather than the process's own.
+fn base_dir_with(lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf> {
+    let var = |name: &str| {
+        lookup(name)
+            .filter(|d| !d.is_empty())
+            .map(std::ffi::OsString::from)
+    };
     let (source, base) = if let Some(dir) = var("CADENCE_SANDBOX_ROOT") {
         ("CADENCE_SANDBOX_ROOT", PathBuf::from(dir))
     } else if let Some(dir) = var("XDG_STATE_HOME") {
@@ -1096,14 +1138,21 @@ fn refuse_overlap(sb: &Sandbox, exported: bool, own_exports_are_ours: bool) -> R
         {
             // A shell pointed at this sandbox by `dev env` exports its own
             // roots, and the deleting verbs cannot tell that from a marker
-            // planted at a live installation. Name the clean-shell remedy.
+            // planted at a live installation. The advice is conditional and
+            // leads with the check: on a live install the "clean shell"
+            // command below is exactly what deletes it.
             if label.starts_with("the exported ") && ours.iter().any(|own| own == &live) {
+                let clean = "env -u CADENCE_STATE_DIR -u CADENCE_PM_DIR -u XDG_CONFIG_HOME -u CADENCE_PROFILE";
                 return Err(Error::rejected(format!(
-                    "sandbox '{name}' at {root} overlaps {label} {dir} — refusing: this verb \
-                     deletes or restarts the sandbox and accepts no export as proof, even one \
-                     `cadence dev env` wrote. Nothing was changed. Run it from a clean shell: \
-                     `env -u CADENCE_STATE_DIR -u CADENCE_PM_DIR -u XDG_CONFIG_HOME -u \
-                     CADENCE_PROFILE cadence dev <down|reload|reset> {name}`",
+                    "sandbox '{name}' at {root} overlaps {label} {dir} — refusing; nothing was \
+                     changed. This verb deletes or restarts the sandbox and accepts no export \
+                     as proof. First check {root}: if it is a live installation (a tracker, a \
+                     daemon database, hosted credentials), STOP — its marker is planted; run \
+                     nothing below and remove the marker only by hand after you have looked. \
+                     Only if this shell came from `cadence dev env` AND {root} is a disposable \
+                     sandbox, run one of these from a clean shell: `{clean} cadence dev down \
+                     {name}`, `{clean} cadence dev reload --name {name}`, or `{clean} cadence \
+                     dev reset {name}`",
                     name = sb.name,
                     root = sb.root.display(),
                     dir = dir.display()
@@ -2556,6 +2605,45 @@ mod tests {
         assert_eq!(bound, sb.root.join("workspace"));
     }
 
+    /// The daemon's real wiring: the profile comes from the instance's own
+    /// provider environment, and a profile that resolves to no valid sandbox
+    /// root is refused instead of binding the host's workspace.
+    #[test]
+    fn cad1922_daemon_workspace_refuses_a_stale_sandbox_profile() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("host");
+        std::fs::create_dir_all(home.join(".cadence")).unwrap();
+        let _env = Cad1922SandboxEnv::isolated(&home);
+        std::env::set_var("CADENCE_SANDBOX_ROOT", fixture.path().join("sandboxes"));
+        let sb = Sandbox::open("stale").unwrap();
+        std::fs::create_dir_all(sb.state_dir()).unwrap();
+        std::fs::create_dir_all(sb.pm_dir()).unwrap();
+        // The process environment names no profile: only the instance does.
+        let provider = crate::adapter::ProviderEnv::default();
+        provider.set("CADENCE_PROFILE", sb.profile());
+        provider.set("HOME", home.to_str().unwrap());
+
+        // No marker: refused, never the host's workspace.
+        let error = crate::home::workspace_for_provider_env(&sb.pm_dir(), &provider)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing to fall back"), "{error}");
+        // A marker naming another sandbox is no root for this profile.
+        std::fs::write(sb.marker(), r#"{"name":"other"}"#).unwrap();
+        assert!(crate::home::workspace_for_provider_env(&sb.pm_dir(), &provider).is_err());
+
+        // A valid marker binds the sandbox's own workspace.
+        std::fs::write(sb.marker(), r#"{"name":"stale"}"#).unwrap();
+        let bound = crate::home::workspace_for_provider_env(&sb.pm_dir(), &provider).unwrap();
+        assert_eq!(bound, sb.root.join("workspace"));
+
+        // No profile at all is today's behaviour: the host's own workspace.
+        let plain = crate::adapter::ProviderEnv::default();
+        plain.set("HOME", home.to_str().unwrap());
+        let host = crate::home::workspace_for_provider_env(&sb.pm_dir(), &plain).unwrap();
+        assert_eq!(host, home.join(".cadence/workspace"));
+    }
+
     /// `dev env` exports the sandbox's own roots; the deleting verbs still
     /// refuse them, and the refusal names the clean-shell command.
     #[test]
@@ -2576,12 +2664,20 @@ mod tests {
         std::env::set_var("CADENCE_PROFILE", sb.profile());
         let error = refuse_production(&sb).unwrap_err().to_string();
         assert!(error.contains("overlap"), "{error}");
-        assert!(error.contains("clean shell"), "{error}");
-        assert!(error.contains("env -u CADENCE_STATE_DIR"), "{error}");
-        assert!(
-            error.contains("cadence dev <down|reload|reset> kk"),
-            "{error}"
-        );
+        // The check leads and the advice is conditional: the command that
+        // deletes a sandbox must never be offered before the live-install
+        // warning.
+        let stop = error.find("STOP").expect("a live-install warning");
+        let only_if = error.find("Only if").expect("a condition");
+        let command = error.find("env -u CADENCE_STATE_DIR").expect("a remedy");
+        assert!(stop < only_if && only_if < command, "{error}");
+        assert!(error.contains("live installation"), "{error}");
+        assert!(error.contains("planted"), "{error}");
+        // `reload` takes `--name`; a positional name is a usage error.
+        assert!(error.contains("cadence dev reload --name kk"), "{error}");
+        assert!(!error.contains("dev reload kk"), "{error}");
+        assert!(error.contains("cadence dev down kk"), "{error}");
+        assert!(error.contains("cadence dev reset kk"), "{error}");
     }
 
     #[test]

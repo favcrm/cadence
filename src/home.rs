@@ -162,18 +162,34 @@ fn layout_without_env() -> Result<Layout> {
             marker_present,
             root,
         }),
-        Installation::Ambiguous => Err(Error::rejected(format!(
-            "two Cadence installations exist: {} holds an installation (a tracker \
-             pm.yaml, the daemon database or hosted config) and the legacy paths \
-             ({} or {} or {}) exist too — refusing to pick one, and nothing was \
-             moved or deleted. Set CADENCE_HOME to name the installation to use; \
-             do not delete {}, it may also hold worktrees and other data",
-            root.display(),
-            legacy_tracker_dir()?.display(),
-            legacy_state_dir()?.display(),
-            legacy_config_dir()?.display(),
-            root.display()
-        ))),
+        Installation::Ambiguous => {
+            let list = |paths: Vec<PathBuf>| {
+                paths
+                    .iter()
+                    .filter(|path| legacy_present(path))
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            Err(Error::rejected(format!(
+                "two Cadence installations exist, so no path was chosen and nothing was moved or \
+                 deleted. Evidence in the consolidated home: {}. Legacy evidence: {}. To keep \
+                 the legacy installation, look at the consolidated files first — if you did not \
+                 create them they may be planted, and a CADENCE_HOME pointing at that tree \
+                 would adopt it — and move them out of {} yourself; cadence will not. Do not \
+                 delete {}, it may also hold worktrees and other data. `cadence doctor --host` \
+                 reports the same evidence",
+                list(consolidated_evidence(&root)),
+                list(vec![
+                    legacy_tracker_dir()?,
+                    legacy_state_dir()?,
+                    local_state_dir()?,
+                    legacy_config_dir()?
+                ]),
+                root.display(),
+                root.display()
+            )))
+        }
     }
 }
 
@@ -246,13 +262,35 @@ fn installation(root: &Path) -> Result<Installation> {
 /// live under `~/.cadence/wt`, sit beside a legacy installation without
 /// being a second one, and treating them as one would take that
 /// installation offline.
-fn consolidated_evidence(root: &Path) -> [PathBuf; 4] {
-    [
+fn consolidated_evidence(root: &Path) -> Vec<PathBuf> {
+    let mut files = vec![
         root.join("tracker/pm.yaml"),
         root.join("state/cadence.sqlite3"),
         root.join("config/orgs.json"),
         root.join("config/remote-auth/credential.json"),
-    ]
+    ];
+    // A hosted-only sign-in stores `cli-<slug>.json` beside it. A listing
+    // that cannot be answered counts as present, like any other probe.
+    let auth = root.join("config/remote-auth");
+    match std::fs::read_dir(&auth) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.starts_with("cli-") && name.ends_with(".json") {
+                            files.push(entry.path());
+                        }
+                    }
+                    Err(_) => files.push(auth.clone()),
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => files.push(auth),
+    }
+    files
 }
 
 /// The `state`, `tracker` and `config` entries under `root` that exist but
@@ -450,7 +488,9 @@ pub fn config_dir() -> Result<PathBuf> {
         // absolute `XDG_CONFIG_HOME`, the legacy config root is fully
         // spelled by the environment, exactly as it was before the
         // consolidated home. The layout cannot be probed without a home, so
-        // none is claimed; any other refusal still stands.
+        // none is claimed. This applies only when `HOME` is unnamed; with
+        // `HOME` set, or with no usable `XDG_CONFIG_HOME`, the layout's own
+        // refusal is returned unchanged.
         Err(error) => {
             if user_home().is_err() {
                 if let Ok(legacy) = legacy_config_dir() {
@@ -763,6 +803,24 @@ pub fn workspace_for_instance(
         }
     }
     Ok(workspace)
+}
+
+/// The upload workspace a daemon binds, from its captured provider
+/// environment — the one place the daemon's resolution lives, so a check
+/// can reach the real wiring. A sandbox profile in that environment pins
+/// the sandbox root; a profile that resolves to no valid root is refused
+/// rather than falling back to the host's `$HOME/.cadence/workspace`.
+pub(crate) fn workspace_for_provider_env(
+    tracker: &Path,
+    env: &crate::adapter::ProviderEnv,
+) -> Result<PathBuf> {
+    let sandbox_root = crate::sandbox::pinned_home(|name| env.var(name))?;
+    workspace_for_instance(
+        tracker,
+        sandbox_root.as_deref(),
+        env.var("CADENCE_HOME").as_deref(),
+        env.var("HOME").as_deref(),
+    )
 }
 
 /// Refuse an operational workspace that overlaps any read or write root
@@ -1388,9 +1446,33 @@ mod guard_tests {
         let error = layout().unwrap_err().to_string();
         assert!(error.contains("two Cadence installations"), "{error}");
         assert!(error.contains("nothing was moved or deleted"), "{error}");
-        assert!(error.contains("do not delete"), "{error}");
+        assert!(error.contains("Do not delete"), "{error}");
+        // The exact evidence is named; CADENCE_HOME is not offered as the way
+        // out, since a planted tree would be adopted by it.
+        assert!(
+            error.contains(&cadence.join("tracker/pm.yaml").display().to_string()),
+            "{error}"
+        );
+        assert!(
+            error.contains(&legacy_state.display().to_string()),
+            "{error}"
+        );
+        assert!(!error.contains("Set CADENCE_HOME"), "{error}");
         assert!(!error.contains("Remove the stray"), "{error}");
         assert!(cadence.join("wt/lane-1/work").exists());
+    }
+
+    #[test]
+    fn cad1922_hosted_only_cli_credential_is_consolidated_evidence() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join(".cadence");
+        std::fs::create_dir_all(root.join("config/remote-auth")).unwrap();
+        assert_eq!(stray_home_entries(&root), vec!["config"]);
+        std::fs::write(root.join("config/remote-auth/cli-acme.json"), b"{}").unwrap();
+        assert!(stray_home_entries(&root).is_empty());
+        assert!(consolidated_evidence(&root)
+            .iter()
+            .any(|path| path.ends_with("cli-acme.json")));
     }
 
     #[test]

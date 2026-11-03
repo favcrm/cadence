@@ -28,7 +28,7 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
                 json!({"error": e.to_string()}),
                 Value::Null,
                 format!("home resolution refused: {e}"),
-                "export CADENCE_HOME as an absolute path or unset it".to_string(),
+                "fix what the detail names: a non-absolute CADENCE_HOME, or two installations (the detail lists the evidence in each)".to_string(),
             );
         }
     };

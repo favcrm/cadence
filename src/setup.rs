@@ -1319,8 +1319,9 @@ impl SignInFact {
             ([], true) => (
                 None,
                 "a saved hosted login is on this machine (from `cadence auth login`), but \
-                 this run cannot name its workspace — not verified by this run, and it may \
-                 be expired; `cadence org list` names it"
+                 this run cannot name its workspace (it is recorded inside the credential \
+                 file, which is not read here) — not verified by this run, and it may be \
+                 expired"
                     .to_string(),
             ),
             (many, _) => (
