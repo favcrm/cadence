@@ -2457,6 +2457,11 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
                 "this workspace has no ticket with that id; nothing was read or changed",
             ))
         }
+        // Not what today's relay sends, which refuses at mint (see `authorize`).
+        ("issue_message_send" | "issue_messages_read", Some("insufficient_scope")) => Some((
+            "insufficient_scope",
+            "this remote login lacks the cli.write grant this needs — nothing was sent",
+        )),
         // An older relay refuses a verb it does not know the same way, so this
         // cannot say which of the two happened.
         (
