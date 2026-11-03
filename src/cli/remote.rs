@@ -874,9 +874,138 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             args.insert("payload".into(), Value::Object(payload));
             "settings_agents"
         }
+        Commands::Platform { action } => {
+            // CAD-1678: a hosted workspace owns its catalog, its accounts and
+            // its per-project default, so a flag naming any of them cannot
+            // cross faithfully — it refuses here rather than being silently
+            // ignored by the door. The tool and its input are the only caller
+            // facts that travel.
+            match action {
+                PlatformAction::Tools { project, .. } => {
+                    if project.is_some() {
+                        return Err(unsupported(
+                            "platform tools",
+                            "--project",
+                            "a hosted workspace resolves its own default account",
+                        ));
+                    }
+                    args.insert("operation".into(), json!("tools"));
+                }
+                PlatformAction::Call {
+                    tool,
+                    input,
+                    query,
+                    request,
+                    platform,
+                    account,
+                    project,
+                } => {
+                    if platform.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--platform",
+                            "a hosted workspace runs its own registered platforms",
+                        ));
+                    }
+                    if account.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--account",
+                            "a hosted workspace funds and resolves its own account",
+                        ));
+                    }
+                    if project.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--project",
+                            "a hosted workspace resolves its own project",
+                        ));
+                    }
+                    let body = match input {
+                        Some(input) => Some(super::platform::parse_platform_input(input)?),
+                        None => None,
+                    };
+                    let query = match query {
+                        Some(query) => Some(super::platform::parse_platform_input(query)?),
+                        None => None,
+                    };
+                    if body.is_none() && query.is_none() {
+                        return Err(Error::usage(
+                            "platform call needs --input or, on a hosted org, --query",
+                        ));
+                    }
+                    // The handle names the retry: an identical call replays the
+                    // door's recorded outcome instead of charging again, so a
+                    // second intentional run needs a fresh --request.
+                    let key = match request {
+                        Some(request) => {
+                            if !valid_platform_handle(request) {
+                                return Err(Error::invalid(
+                                    "platform_call",
+                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+                                ));
+                            }
+                            request.clone()
+                        }
+                        None => platform_replay_key(tool, query.as_ref(), body.as_ref()),
+                    };
+                    args.insert("operation".into(), json!("call"));
+                    args.insert("tool".into(), json!(tool));
+                    args.insert("key".into(), json!(key));
+                    if let Some(body) = body {
+                        args.insert("body".into(), body);
+                    }
+                    if let Some(query) = query {
+                        args.insert("query".into(), query);
+                    }
+                }
+                _ => return Err(unavailable(command)),
+            }
+            "platform_call"
+        }
         _ => return Err(unavailable(command)),
     };
     Ok((verb, args))
+}
+
+/// The hosted reply-token grammar (`[A-Za-z0-9_.:-]{1,128}`), checked here so
+/// a bad `--request` never reaches a paid call.
+fn valid_platform_handle(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
+/// CAD-1678: the reply key a hosted tool call replays under. The relay body
+/// has no header channel, so the token rides in the arguments; deriving it
+/// from the tool and its input means a resubmitted identical call reads the
+/// door's recorded outcome instead of charging a second time, while a
+/// different input is a different call.
+fn platform_replay_key(tool: &str, query: Option<&Value>, body: Option<&Value>) -> String {
+    use sha2::{Digest, Sha256};
+    #[derive(serde::Serialize)]
+    struct Material<'a> {
+        // The field order preserves the existing BTreeMap serialization.
+        body: Option<&'a Value>,
+        query: Option<&'a Value>,
+        tool: &'a str,
+    }
+    struct HashWriter(Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, &Material { body, query, tool })
+        .expect("JSON values serialize to the hash writer");
+    format!("pcli_{:x}", writer.0.finalize())
 }
 
 /// CAD-1568: `send`/`message send` → `message_send` arguments. Exactly
@@ -2419,6 +2548,205 @@ mod read_contract_tests {
             Ok((verb, args)) => Ok((verb, Value::Object(args))),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    fn platform(action: PlatformAction) -> Commands {
+        Commands::Platform { action }
+    }
+
+    fn call_with(
+        tool: &str,
+        input: Option<&str>,
+        query: Option<&str>,
+        request: Option<&str>,
+    ) -> Commands {
+        platform(PlatformAction::Call {
+            tool: tool.into(),
+            input: input.map(str::to_string),
+            query: query.map(str::to_string),
+            request: request.map(str::to_string),
+            platform: None,
+            account: None,
+            project: None,
+        })
+    }
+
+    #[test]
+    fn hosted_platform_replay_key_is_stable_and_input_bound() {
+        let (_, args) = outcome(&call_with(
+            "generate_image",
+            Some(r#"{"prompt": "synthetic"}"#),
+            None,
+            None,
+        ))
+        .unwrap();
+        let key = args["key"].as_str().expect("a call carries a reply key");
+        assert!(valid_platform_handle(key), "{key}");
+        // The same command replays the same key; another input is another call.
+        assert_eq!(
+            outcome(&call_with(
+                "generate_image",
+                Some(r#"{"prompt": "synthetic"}"#),
+                None,
+                None
+            ))
+            .unwrap()
+            .1["key"],
+            json!(key)
+        );
+        assert_ne!(
+            outcome(&call_with(
+                "generate_image",
+                Some(r#"{"prompt": "a different prompt"}"#),
+                None,
+                None
+            ))
+            .unwrap()
+            .1["key"],
+            json!(key)
+        );
+        let ordered = outcome(&call_with(
+            "example_tool",
+            Some(r#"{"nested":{"a":1,"b":2},"name":"x"}"#),
+            None,
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        let reordered = outcome(&call_with(
+            "example_tool",
+            Some(r#"{"name":"x","nested":{"b":2,"a":1}}"#),
+            None,
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        assert_eq!(
+            ordered, reordered,
+            "object key order must not trigger a new charge"
+        );
+        let query_key = outcome(&call_with(
+            "read_posts",
+            None,
+            Some(r#"{"handle": "first"}"#),
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        let other_query_key = outcome(&call_with(
+            "read_posts",
+            None,
+            Some(r#"{"handle": "second"}"#),
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        assert_ne!(
+            query_key, other_query_key,
+            "distinct queries cannot share a replay"
+        );
+    }
+
+    #[test]
+    fn hosted_platform_refuses_an_invalid_request_handle() {
+        let refused = outcome(&call_with(
+            "generate_image",
+            Some("{}"),
+            None,
+            Some("bad handle"),
+        ))
+        .unwrap_err();
+        assert!(refused.contains("1-128"), "{refused}");
+    }
+
+    #[test]
+    fn hosted_platform_refuses_flags_the_workspace_owns() {
+        for (label, action) in [
+            (
+                "--project",
+                PlatformAction::Tools {
+                    json: true,
+                    project: Some("cadence".into()),
+                },
+            ),
+            (
+                "--platform",
+                PlatformAction::Call {
+                    tool: "generate_image".into(),
+                    input: Some("{}".into()),
+                    query: None,
+                    request: None,
+                    platform: Some("agenticos".into()),
+                    account: None,
+                    project: None,
+                },
+            ),
+            (
+                "--account",
+                PlatformAction::Call {
+                    tool: "generate_image".into(),
+                    input: Some("{}".into()),
+                    query: None,
+                    request: None,
+                    platform: None,
+                    account: Some("work".into()),
+                    project: None,
+                },
+            ),
+        ] {
+            let refused = outcome(&platform(action)).unwrap_err();
+            assert!(refused.contains(label), "{label}: {refused}");
+        }
+    }
+
+    #[test]
+    fn hosted_platform_mixed_query_and_body_preserve_distinct_replay_keys() {
+        use clap::Parser;
+
+        let replay_key = |body: &str, query: &str| {
+            let cli = Cli::try_parse_from([
+                "cadence",
+                "--org",
+                "acme",
+                "platform",
+                "call",
+                "example_tool",
+                "--input",
+                body,
+                "--query",
+                query,
+            ])
+            .unwrap_or_else(|error| {
+                panic!("a hosted tool must accept query fields alongside its POST body: {error}")
+            });
+            let (_, args) = outcome(&cli.command).expect("mixed-input call needs a replay key");
+            args["key"]
+                .as_str()
+                .expect("a hosted call needs a replay handle")
+                .to_owned()
+        };
+
+        let original = replay_key(r#"{"prompt":"alpha"}"#, r#"{"resource":"first"}"#);
+        let repeated = replay_key(r#"{"prompt":"alpha"}"#, r#"{"resource":"first"}"#);
+        let changed_query = replay_key(r#"{"prompt":"alpha"}"#, r#"{"resource":"second"}"#);
+        let changed_body = replay_key(r#"{"prompt":"beta"}"#, r#"{"resource":"first"}"#);
+
+        assert_eq!(
+            original, repeated,
+            "repeating the same mixed-input invocation must reconcile the original call"
+        );
+        assert_ne!(
+            original, changed_query,
+            "changing only the query must not replay a call for a different resource"
+        );
+        assert_ne!(
+            original, changed_body,
+            "changing only the body must not replay a call with different content"
+        );
     }
 
     struct AgentLs {

@@ -1760,6 +1760,168 @@ fn a_bare_5xx_to_a_team_mutation_is_unknown_not_availability() {
     assert!(!text.contains("retry later"), "{text}");
 }
 
+// Independently authored from CAD-1678's lost-outcome requirement.
+#[test]
+fn hosted_platform_call_ambiguous_replies_require_same_key_reconciliation() {
+    let args = json!({
+        "operation": "call",
+        "tool": "generate_image",
+        "body": {"prompt": "synthetic acceptance input"},
+        "key": "cad1678-acceptance-run-1"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+
+    for (status, body) in [
+        // The tenant relay can return this after the capability request was
+        // dispatched and its response was lost. It proves no non-execution.
+        (
+            503,
+            json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+        ),
+        // A syntactically valid JSON null is not a usable success envelope.
+        // This distinct malformed-2xx case uses the existing JSON-only fake.
+        (200, Value::Null),
+    ] {
+        let (out, requests) = run(vec![(status, "", body)], "platform_call", args.clone(), 10);
+        let err = out.expect_err("an ambiguous paid call must not become a successful receipt");
+        assert_eq!(err.kind(), "unknown", "HTTP {status}: {err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("charg"),
+            "possible charge must be disclosed: {text}"
+        );
+        assert!(
+            text.contains("same"),
+            "reconcile the same invocation: {text}"
+        );
+        assert!(
+            text.contains("key") || text.contains("request"),
+            "reconciliation must retain the existing replay handle: {text}"
+        );
+        assert!(
+            text.contains("replay") || text.contains("retry"),
+            "the user needs same-handle reconciliation guidance: {text}"
+        );
+        assert!(
+            !text.contains("team list"),
+            "wrong operation's remedy: {text}"
+        );
+        assert!(
+            !text.contains("team invites"),
+            "wrong operation's remedy: {text}"
+        );
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "an ambiguous platform call must not be automatically replayed"
+        );
+    }
+
+    let (out, requests) = run(
+        vec![(
+            503,
+            "",
+            json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+        )],
+        "platform_call",
+        json!({"operation": "tools"}).as_object().cloned().unwrap(),
+        10,
+    );
+    let err = out.unwrap_err();
+    assert_eq!(err.kind(), "rejected", "listing cannot have charged: {err}");
+    assert!(err.to_string().contains("availability"), "{err}");
+    assert!(
+        !err.to_string().contains("charg"),
+        "listing is not a paid call: {err}"
+    );
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+// Independently authored from the capability door's explicit uncertainty contract.
+#[test]
+fn hosted_platform_explicit_uncertainty_preserves_same_key_reconciliation() {
+    let args = json!({
+        "operation": "call",
+        "tool": "generate_image",
+        "body": {"prompt": "synthetic acceptance input"},
+        "key": "test-key"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+
+    let (out, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"ok": false, "error": {"code": "uncertain"}}),
+        )],
+        "platform_call",
+        args.clone(),
+        10,
+    );
+    let err = out.expect_err("explicit provider uncertainty cannot be a successful receipt");
+    assert_eq!(err.kind(), "unknown", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("charg"),
+        "possible charge must be disclosed: {text}"
+    );
+    assert!(
+        text.contains("same"),
+        "reconcile the same invocation: {text}"
+    );
+    assert!(
+        text.contains("key") || text.contains("request"),
+        "reconciliation must retain the existing replay handle: {text}"
+    );
+    assert!(
+        text.contains("replay") || text.contains("retry"),
+        "the user needs same-handle reconciliation guidance: {text}"
+    );
+    assert!(
+        !text.contains("team list"),
+        "wrong operation's remedy: {text}"
+    );
+    assert!(
+        !text.contains("team invites"),
+        "wrong operation's remedy: {text}"
+    );
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "an uncertain platform call must not be automatically replayed"
+    );
+
+    let (out, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"ok": false, "error": {"code": "key_conflict"}}),
+        )],
+        "platform_call",
+        args,
+        10,
+    );
+    // The existing key-conflict response is a definite refusal, unlike a
+    // revision-conflict response carrying a resynchronization document.
+    let err = out.expect_err("a conflicting key must remain a definite refusal");
+    assert_eq!(err.kind(), "rejected", "{err}");
+    let text = err.to_string();
+    assert!(text.contains("key_conflict"), "{text}");
+    assert!(
+        !text.contains("charg"),
+        "a definite refusal must not claim possible execution: {text}"
+    );
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "a conflicting key must not be automatically replayed"
+    );
+}
+
 /// The board's own gate refusal is decided before the verb ran, so it
 /// stays a definite refusal — it must not be blurred into "may have
 /// committed".
@@ -2865,4 +3027,126 @@ fn transfer_ops_stay_on_write_or_job_status_and_refuse_authority() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("not allowed"), "{err}");
+}
+
+#[test]
+fn hosted_platform_in_progress_replay_preserves_same_key_reconciliation() {
+    let args = json!({
+        "operation": "call",
+        "tool": "generate_image",
+        "body": {"prompt": "synthetic in-progress acceptance input"},
+        "key": "cad1678-in-progress-acceptance-1"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    // The door can answer this while another attempt with this key still
+    // owns the funded dispatch. It does not prove the operation was rejected.
+    let body = json!({
+        "ok": false,
+        "error": {"code": "idempotency_in_progress"}
+    });
+    let (listener, requests, _server) = fake_worker(vec![(409, "", body)]);
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+
+    let out = call_verb_in(
+        &target,
+        "platform_call",
+        args.clone(),
+        10,
+        &dir,
+        |_| {},
+        |_| panic!("an in-progress replay must not be automatically retried"),
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "an in-progress replay must make exactly one forwarding attempt"
+    );
+
+    let err = out.expect_err("in-progress funding is not a completed receipt");
+    assert_eq!(
+        err.kind(),
+        "unknown",
+        "the original call can still complete and charge; it is not rejected: {err}"
+    );
+    let text = err.to_string().to_ascii_lowercase();
+    assert!(
+        text.contains("charg"),
+        "the possible charge must be disclosed: {text}"
+    );
+    assert!(
+        text.contains("same"),
+        "reconciliation must preserve the same invocation: {text}"
+    );
+    assert!(
+        text.contains("key") || text.contains("request"),
+        "reconciliation must retain the original replay handle: {text}"
+    );
+    assert!(
+        text.contains("replay") || text.contains("retry"),
+        "the user needs same-handle replay guidance: {text}"
+    );
+    assert!(
+        !text.contains("the remote refused the request"),
+        "a possible funded dispatch must not be described as definitely refused: {text}"
+    );
+    assert!(
+        !text.contains("team list") && !text.contains("team invites"),
+        "the remedy must reconcile this tool call, not an unrelated team mutation: {text}"
+    );
+}
+
+#[test]
+fn hosted_platform_catalog_in_progress_reply_remains_a_read_refusal() {
+    let args = json!({"operation": "tools"}).as_object().cloned().unwrap();
+    let body = json!({
+        "ok": false,
+        "error": {"code": "idempotency_in_progress"}
+    });
+    let (listener, requests, _server) = fake_worker(vec![(409, "", body)]);
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+
+    let out = call_verb_in(
+        &target,
+        "platform_call",
+        args.clone(),
+        10,
+        &dir,
+        |_| {},
+        |_| panic!("a catalog refusal must not be automatically retried"),
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "the refused catalog read must make exactly one forwarding attempt"
+    );
+
+    let err = out.expect_err("HTTP 409 is not a successful catalog response");
+    assert_eq!(
+        err.kind(),
+        "rejected",
+        "listing cannot dispatch a paid tool, even with the same error code: {err}"
+    );
+    let text = err.to_string().to_ascii_lowercase();
+    assert!(
+        text.contains("idempotency_in_progress"),
+        "the read refusal must preserve the safe server code: {text}"
+    );
+    assert!(
+        !text.contains("charg"),
+        "a catalog read must not claim a possible paid dispatch: {text}"
+    );
 }
