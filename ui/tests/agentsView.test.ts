@@ -296,15 +296,29 @@ async function main() {
   const card = (over: Partial<IssueCard>) => ({ ...issues[0], owner: "Developer", container: false, ...over }) as IssueCard;
   assert(profileWork(profile, []) === null, "no owned issue names no work");
   assert(
-    profileWork(profile, [card({ id: "DEMO-1", status: "done", created: "2026-01-01" }), card({ id: "DEMO-2", status: "backlog", created: "2026-01-02" }), card({ id: "DEMO-3", status: "done", created: "2026-01-03" }), card({ id: "DEMO-4", status: "doing", created: "2026-01-04", owner: "someone" })])?.issue.id === "DEMO-2",
+    profileWork(profile, [card({ id: "DEMO-1", status: "done", created: "2026-01-01" }), card({ id: "DEMO-2", status: "backlog", created: "2026-01-02" }), card({ id: "DEMO-3", status: "done", created: "2026-01-03" }), card({ id: "DEMO-4", status: "doing", created: "2026-01-04", owner: "someone" })])?.id === "DEMO-2",
     "the newest open owned issue wins over a newer finished one and another owner's",
   );
   const finished = profileWork(profile, [card({ id: "DEMO-1", status: "done", created: "2026-01-01" }), card({ id: "DEMO-3", status: "dropped", created: "2026-01-03" })]);
-  assert(finished?.issue.id === "DEMO-3" && finished.open === false, "with nothing open the newest closed issue is the last work");
+  assert(finished?.id === "DEMO-3" && finished.state === "last", "with nothing open the newest closed issue is the last work");
+  const owned = [card({ id: "DEMO-2", status: "doing", created: "2026-01-02", title: "Owned" })];
+  const claimed = (state: string, id = "DEMO-9") => ({ ...profile, latest_claim: { issue_id: id, state } });
+  assert(profileWork(claimed("running"), owned)?.state === "working", "a running claim wins over an open owned issue");
+  assert(profileWork(claimed("blocked"), owned)?.state === "blocked", "a blocked claim reads blocked");
+  assert(profileWork(claimed("queued"), owned)?.state === "waiting", "a queued claim reads waiting");
+  assert(profileWork(claimed("result"), owned)?.id === "DEMO-2", "an ended claim does not outrank open owned work");
+  const ended = profileWork(claimed("failed"), []);
+  assert(ended?.id === "DEMO-9" && ended.state === "last" && ended.title === undefined, "an ended claim outside the list is the last work, by id alone");
+  assert(profileWork(claimed("running", "DEMO-2"), owned)?.title === "Owned", "a claim takes its title from the issue list");
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [profile] });
   await render();
   const seat = () => Array.from(host.querySelectorAll(".rc-seat")).find((row) => row.textContent?.includes("Developer"))!;
   assert(seat().textContent?.includes("Idle · no runtime"), "a profile with no owned work reads Idle");
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [{ ...profile, latest_claim: { issue_id: "DEMO-9", state: "running" } }] });
+  await render();
+  assert(seat().textContent?.includes("Working on DEMO-9"), "a running claim reads on the card");
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [profile] });
+  await render();
   assert(!host.querySelector(".rc-seats .rc-connect") && !host.querySelector(".rc-seats")?.textContent?.includes("cadence "), "the card prints no commands");
   await click("Open agent Developer");
   const details = host.querySelector("dialog.rc-sheet");

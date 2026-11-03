@@ -223,22 +223,38 @@ export function profileMatchesSearch(p: HiredProfile, query: string): boolean {
   return terms.every((term) => text.includes(term));
 }
 
-/** The issue a profile's card names, and whether it is still open. */
+/** What a profile's card names: an issue and how the profile stands on it. */
 export interface ProfileWork {
-  issue: IssueCard;
-  open: boolean;
+  id: string;
+  /** Absent when this viewer's issue list does not hold it. */
+  title?: string;
+  state: "working" | "blocked" | "waiting" | "open" | "last";
 }
 
 const CLOSED_STATUSES = new Set(["done", "dropped"]);
+const LIVE_CLAIMS: Record<string, ProfileWork["state"]> = {
+  running: "working",
+  blocked: "blocked",
+  queued: "waiting",
+  waiting: "waiting",
+};
 
-/** The newest open issue a profile owns, else the newest it finished. `null`
- *  when the board records none: a hosted claim sets no owner (CAD-1990), so
- *  this is what the board knows, never an inferred job. */
+/** In order: a live claim, the newest open issue the profile owns, then the last
+ *  it finished or stopped. `null` when the board records none, never an inferred
+ *  job. A failed read of the claim ledger leaves only the owned issues. */
 export function profileWork(p: HiredProfile, issues: IssueCard[]): ProfileWork | null {
+  const titled = (id: string, state: ProfileWork["state"]): ProfileWork => {
+    const title = issues.find((issue) => issue.id === id)?.title;
+    return title === undefined ? { id, state } : { id, title, state };
+  };
+  const claim = p.latest_claim;
+  const live = claim ? LIVE_CLAIMS[claim.state] : undefined;
+  if (claim && live) return titled(claim.issue_id, live);
   const owned = issues
     .filter((issue) => issue.owner === p.alias && !issue.container)
     .sort((a, b) => b.created.localeCompare(a.created) || b.id.localeCompare(a.id, undefined, { numeric: true }));
   const open = owned.find((issue) => !CLOSED_STATUSES.has(issue.status));
-  if (open) return { issue: open, open: true };
-  return owned[0] ? { issue: owned[0], open: false } : null;
+  if (open) return titled(open.id, "open");
+  if (claim) return titled(claim.issue_id, "last");
+  return owned[0] ? titled(owned[0].id, "last") : null;
 }
