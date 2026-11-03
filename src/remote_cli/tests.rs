@@ -1291,6 +1291,31 @@ fn cli_message_refusals_map_bounded_codes_never_server_text() {
 }
 
 #[test]
+fn a_verb_a_hosted_workspace_cannot_serve_is_named_plainly() {
+    // CAD-2063: these once read as an unrecognized refusal, like a fault.
+    for verb in ["agent_show", "message_inbox"] {
+        let body = json!({"ok": false, "error": {"code": "container_required"}});
+        let (out, requests) = run(vec![(409, "", body)], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.code(), Some("container_required"), "{verb}");
+        assert!(err.to_string().contains("cannot serve"), "{verb}: {err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb} retried");
+    }
+    // These two need settings.read before a call is made, so test the mapping.
+    for verb in ["master_status", "settings_agents"] {
+        let code = Some("container_required");
+        let err = message_family_refusal(verb, 409, code, reject("generic"));
+        assert_eq!(err.code(), code, "{verb}");
+        assert!(err.to_string().contains("cannot serve"), "{verb}: {err}");
+    }
+    // Any other verb keeps the generic refusal.
+    let body = json!({"ok": false, "error": {"code": "container_required"}});
+    let (out, _) = run(vec![(409, "", body)], "issue_ls", Map::new(), 10);
+    let shown = out.unwrap_err().to_string();
+    assert!(!shown.contains("cannot serve"), "{shown}");
+}
+
+#[test]
 fn a_checked_conflict_rides_up_as_the_conflict_answer() {
     // A 409 `{conflict, current_rev, card}` is the remote's checked
     // "not written" verdict — the body must reach the caller (the
