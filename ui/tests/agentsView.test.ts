@@ -173,6 +173,7 @@ globalThis.fetch = async (input, init) => {
       tasks: tasks?.map((t) => t.task),
       enabled: true,
       session_id: `session-${alias}`,
+      instructions: "Synthetic instructions",
     } as AgentDetail["agent"],
     queued: a.queued,
     unknown: a.unknown,
@@ -401,7 +402,7 @@ async function main() {
   tab = "settings";
   await render();
   assert(host.querySelector("main.agents-page [role='tablist']"), "the profile keeps its tabs");
-  assert(!host.querySelector(".ap-stats"), "unknown stats show no tiles of dashes");
+  assert(!host.querySelector("[data-drawer]")?.textContent?.includes("Figures"), "unknown stats show no tiles of dashes");
   const text = host.querySelector("main.agents-page")!.textContent!;
   for (const evidence of [
     agents[1].recovery!,
@@ -443,7 +444,19 @@ async function main() {
   await React.act(() => host.querySelector<HTMLElement>(".ap-mrow")!.click());
   assert(host.querySelector("[data-drawer='agent-item']")?.textContent?.includes("Source"), "a row opens one drawer with its details");
   assert(!host.querySelector(".ap-rows")?.textContent?.includes("Source"), "details live in the drawer, not the row");
+  // The gear opens over the section you are on, and stays out of the URL.
   tab = "history";
+  await render();
+  await React.act(() => button("Agent settings")!.click());
+  assert(host.querySelector("[data-drawer='agent-settings']"), "the gear opens the settings drawer");
+  assert((tab as string) === "history" && host.querySelector(".ap-tab[aria-selected='true']")?.textContent === "History", "the gear keeps the current section");
+  await React.act(() =>
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    ),
+  );
+  assert((tab as string) === "history", "closing the gear keeps the current section");
+  await new Promise((resolve) => setTimeout(resolve, 400));
   await render();
   await React.act(() =>
     document.body.dispatchEvent(
@@ -520,6 +533,18 @@ async function main() {
   failDetail = false;
   issueState = loaded(issues);
   const dock = () => host.querySelector("[data-chat-dock]")?.textContent ?? "";
+  // A board that isn't answering keeps its last data on screen and takes no writes.
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
+  open = "stopped";
+  tab = "instructions";
+  await render();
+  await flush();
+  const box = () => host.querySelector<HTMLTextAreaElement>("#ap-panel textarea");
+  assert(box()?.value === "Synthetic instructions" && !box()!.readOnly, "an operator can edit instructions on a live board");
+  state = { ...state, status: "stale", error: "Refresh unavailable" };
+  await render();
+  assert(box()?.value === "Synthetic instructions" && box()!.readOnly, "a stale board keeps the text and takes no edit");
+  assert(!host.querySelector("#ap-panel button"), "a stale board offers no write action");
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
   viewerIsOperator = false;
   open = "dev";
@@ -735,15 +760,26 @@ async function main() {
   // A read still running says nothing about the agent, on a deep link.
   const unsettled = ["No events yet.", "No results yet.", "no role text"];
   holdDetail = true;
-  await mountServed("dev", "history", liveRoster);
+  const openPanel = async () => {
+    const details = Array.from(servedHost.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Details");
+    assert(details, "the details panel opens");
+    await React.act(() => details.click());
+    await flush();
+    return servedHost.querySelector(".ag-chat-panel")?.textContent ?? "";
+  };
+  await mountServed("dev", "overview", liveRoster);
+  const inFlightPanel = await openPanel();
+  assert(inFlightPanel.includes("Doing now"), "the panel shows Work while the read runs");
   for (const claim of unsettled)
-    assert(!servedHost.textContent?.includes(claim), `history, read in flight: claims nothing yet: ${claim}`);
+    assert(!inFlightPanel.includes(claim), `work, read in flight: claims nothing yet: ${claim}`);
   await React.act(async () => releaseDetail?.());
   await flush();
   holdDetail = false;
-  await mountServed("dev", "history", { ...liveRoster, data: null, status: "loading" });
+  await mountServed("dev", "overview", { ...liveRoster, data: null, status: "loading" });
+  const pendingPanel = await openPanel();
+  assert(pendingPanel.includes("Doing now"), "the panel shows Work while the roster is pending");
   for (const claim of [...unsettled, "Nothing right now", "Nothing queued", "Nothing needs attention"])
-    assert(!servedHost.textContent?.includes(claim), `roster pending: claims nothing yet: ${claim}`);
+    assert(!pendingPanel.includes(claim), `work, roster pending: claims nothing yet: ${claim}`);
   detailNotServed = false;
   await React.act(() => servedRoot.unmount());
   console.log("agents view checks passed");

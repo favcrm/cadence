@@ -59,21 +59,6 @@ const TONE: Record<string, string> = {
   ink: "var(--color-ink-500)",
 };
 
-/** Whether the browser believes it has a connection. */
-function useOnline(): boolean {
-  const [online, setOnline] = useState(navigator.onLine);
-  useEffect(() => {
-    const update = () => setOnline(navigator.onLine);
-    window.addEventListener("online", update);
-    window.addEventListener("offline", update);
-    return () => {
-      window.removeEventListener("online", update);
-      window.removeEventListener("offline", update);
-    };
-  }, []);
-  return online;
-}
-
 /** The full agent page at `agents/<alias>`: hero, stats, tabs. It replaces
  *  the old drawer and carries every banner and guard the drawer had. */
 export default function AgentPage({
@@ -89,6 +74,7 @@ export default function AgentPage({
   groups,
   rosterLoaded,
   rosterFailed,
+  rosterStale,
   onRetryRoster,
   operator,
   onRetryAccess,
@@ -110,6 +96,8 @@ export default function AgentPage({
   /** The team list has answered, so a missing alias really is missing. */
   rosterLoaded: boolean;
   rosterFailed: boolean;
+  /** The list shows its last answer because the board isn't answering now. */
+  rosterStale: boolean;
   onRetryRoster: () => void;
   operator: boolean | null;
   onRetryAccess: () => void;
@@ -126,7 +114,8 @@ export default function AgentPage({
   const [notServed, setNotServed] = useState(false);
   const [retry, setRetry] = useState(0);
 
-  const online = useOnline();
+  // The gear opens over the current section; `?tab=settings` opens over Instructions.
+  const [gear, setGear] = useState(false);
   const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
   const chat = tab === "overview";
   const leave = chat ? onBack : () => onTab("overview");
@@ -241,7 +230,7 @@ export default function AgentPage({
     onOpenIssue,
     onSaved: () => setRetry((n) => n + 1),
     hired,
-    writable: operator === true && boardBlock === null && online,
+    writable: operator === true && boardBlock === null && !rosterStale,
     toast: onToast,
     stats,
     // Without a roster row nothing is known about the agent, so this reads as
@@ -480,7 +469,6 @@ export default function AgentPage({
     : [categoryText ?? a?.role ?? observed?.role ?? t("Agent"), badge?.label, t("runs on {where}").replace("{where}", () => where)]
         .filter(Boolean)
         .join(" · ");
-  // The drawer sits over Instructions, so opening it keeps a draft there.
   const section = tab === "settings" ? "instructions" : tab;
   return (
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
@@ -503,7 +491,7 @@ export default function AgentPage({
         </div>
         {!isCloud && !mailbox && (
           <div className="ap-acts">
-            <Button variant="ghost" size="sm" aria-label={t("Agent settings")} title={t("Settings")} onClick={() => onTab("settings")}>
+            <Button variant="ghost" size="sm" aria-label={t("Agent settings")} title={t("Settings")} onClick={() => setGear(true)}>
               <IconSettings />
             </Button>
           </div>
@@ -537,7 +525,15 @@ export default function AgentPage({
           <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${section}`}>
             <AgentTabBody key={`${alias}:${section}:${detail ? "d" : "n"}`} tab={section} c={ctx} />
           </div>
-          {tab === "settings" && <SettingsDrawer c={ctx} onClose={() => onTab("instructions")} />}
+          {(gear || tab === "settings") && (
+            <SettingsDrawer
+              c={ctx}
+              onClose={() => {
+                setGear(false);
+                if (tab === "settings") onTab("instructions");
+              }}
+            />
+          )}
         </>
       )}
     </main>

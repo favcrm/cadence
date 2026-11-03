@@ -201,6 +201,7 @@ export default function Agents({
         groups={groups}
         rosterLoaded={payload != null}
         rosterFailed={payload == null && state.status === "failed"}
+        rosterStale={state.status === "stale" || (payload != null && state.status === "failed")}
         onRetryRoster={onRetry}
         operator={operator}
         onRetryAccess={onRetryAccess}
