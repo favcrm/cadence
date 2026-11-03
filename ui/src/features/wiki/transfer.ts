@@ -276,6 +276,12 @@ export async function uploadMultipart(
     const nested = record(row?.error);
     throw wikiErrorFrom(resp.status, nested ? { ...row, error: text(nested.message), code: text(row?.code) ?? text(nested.code) } : body);
   }
+  // A 2xx RPC envelope can still be a refused write: a native board answers an
+  // occupied create-only destination, or a stale update, with
+  // `{conflict:"if_rev"}` and stores nothing. Reporting those bytes as saved
+  // would claim an upload that never happened.
+  if (row?.conflict === "if_rev")
+    throw wikiErrorFrom(409, { ...row, error: "This file changed since it was chosen", code: "conflict" });
   onProgress(100);
   const rev = text(row?.rev) ?? undefined;
   const kind = text(row?.kind);
