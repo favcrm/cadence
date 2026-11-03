@@ -5,8 +5,9 @@ Use this lookup only to find the command or tool. A listed command is not proof 
 | Capability | Native workspace | Hosted workspace |
 |---|---|---|
 | Company facts | `cadence wiki search`, `cadence wiki cat` | `wiki_search`, `wiki_list`, `wiki_read` |
-| Find template | `cadence template show NAME` | Not available yet |
+| Find template | `cadence template show NAME`, which needs the name: there is no list command, so ask for it | Not available yet |
 | Read template | `cadence template show NAME --version V [--out NEW_DIR]` | Not available yet |
+| Calculate | The draft model behind `cadence document create`, or an inspected Decimal calculation where the session can run code | Not available yet |
 | Render | `cadence document create`, `show`, `export`, for an approved DOCX financial template | Not available yet |
 | Show | `cadence artifact put`, for the master's own turn | Not available yet |
 | Save draft | `cadence template create`, `revise` | Not available yet |
@@ -73,7 +74,7 @@ Reuse the `business-documents` skill's inspected `scripts/run_isolated.py` wrapp
 
 ## Consumption
 
-With a binary built from this installer revision, `cadence skill install` installs the separate cadence, company-outputs and business-documents public guidance under `~/.agents/skills/`. `cadence skill install company-outputs` installs this workflow, all four references and its business-document guidance dependency without refreshing the core protocol. `cadence skill status` reports the root and `skills[]` file, content and link state. Older binaries may install only the protocol; inspect their help and status rather than assuming availability.
+With a binary built from this installer revision, `cadence skill install` installs the separate cadence, company-outputs and business-documents public guidance under `~/.agents/skills/`. `cadence skill install company-outputs` installs this workflow, all five references and its business-document guidance dependency without refreshing the core protocol. `cadence skill status` reports the root and `skills[]` file, content and link state. Older binaries may install only the protocol; inspect their help and status rather than assuming availability.
 
 Codex uses the canonical directory; Claude, Cursor and Copilot receive symlinks. Foreign real provider entries remain untouched and are reported, so an occupied slot does not prove discovery of this version. Native Pi disables skills, confined agents may not see the operator home, and remote or hosted workers do not inherit these local files automatically. Supply approved task guidance through their normal accessible path when needed; never widen permissions or change auth to make discovery pass. Already-running contexts may need the next task or session to discover or load guidance.
 

@@ -5,7 +5,7 @@ Use this reference only when the output contains prices, options or financial to
 ## Which path
 
 - **Issuable:** the company's approved financial template, its confirmed calculation and a retained draft with export (`references/cadence.md`). Where one exists, it governs what the customer finally receives.
-- **Draft view:** an HTML view of a priced draft, shown for review. Use the Render capability when this session has it. Otherwise author the HTML and take every amount from an inspected Decimal calculation. Label it `SAMPLE` when no approved template stands behind it, or `SUGGESTED — NOT APPROVED — HUMAN REVIEW REQUIRED` when one does. It gets no document number and is not the retained or issued document. Use no scripts and no remote files: embed logos and fonts in the document itself.
+- **Draft view:** an HTML view of a priced draft, shown for review. Use the Render capability when this session has it. Otherwise author the HTML and take every amount from the Calculate capability. Label it `SAMPLE` when no approved template stands behind it, or `SUGGESTED — NOT APPROVED — HUMAN REVIEW REQUIRED` when one does. It gets no document number and is not the retained or issued document. Use no scripts and no remote files: embed logos and fonts in the document itself.
 
 An authoring pack is not a quotation: it has no line items and no calculation rules.
 
@@ -15,9 +15,9 @@ Record each selected item's quantity and unit, price, currency, dated approved s
 
 ## Calculation
 
-Use existing trusted calculation facilities (the native draft model where its contract fits, or an inspected Decimal calculation for an agreed draft). Do not do the arithmetic in your head, and do not create a calculator just to populate this skill. Record exact inputs, formulas, rounding and results. Independently reconcile the output using a different calculation representation or reviewer; repeating the same calculator result is insufficient.
+Use existing trusted calculation facilities (the native draft model where its contract fits, or an inspected Decimal calculation for an agreed draft). Never do the arithmetic yourself, even when it looks easy and even when asked for the total. Without Render or a trusted calculator, show quantities and unit prices, mark line amounts and totals `UNRESOLVED`, and say the calculation capability is missing. Do not create a calculator just to populate this skill. Record exact inputs, formulas, rounding and results. Independently reconcile the output using a different calculation representation or reviewer; repeating the same calculator result is insufficient.
 
-Exclude unselected alternatives from the selected base and label them separately. A required item without a price blocks the full total and any final-price claim; show any known-items total explicitly as partial. Never drop the mandatory item or price it at zero to pass validation. Native line items have no selection or missing-price flag: filter options explicitly and do not misrepresent a partial native calculation as a complete quotation.
+Exclude unselected alternatives from the selected base and label them separately. A required item without a price blocks the full total and any final-price or issuable claim; show any known-items total explicitly as partial. Never drop the mandatory item or price it at zero to pass validation. Native line items have no selection or missing-price flag: filter options explicitly and do not misrepresent a partial native calculation as a complete quotation.
 
 ## Check
 

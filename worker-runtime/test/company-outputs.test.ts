@@ -11,7 +11,9 @@ test("every reference the skill names is carried, and none points into a reposit
   const texts = [skill.body, ...skill.resources.map((resource) => resource.content)];
   for (const text of texts) {
     for (const [named] of text.matchAll(/references\/[\w-]+\.md/g)) expect(carried).toContain(named);
-    expect(text).not.toMatch(/\]\((?!https?:)[^)]*\)|\.\.\/|\b(?:src|ui|docs|worker-runtime)\/[\w/-]+\.\w+/);
+    expect(text).not.toContain("native detail");
+    expect(text).not.toMatch(/`cadence \w+/);
+    expect(text).not.toMatch(/\]\((?!https?:)[^)]*\)|\.\.\/|\b(?:src|ui|docs|scripts|skills|crates|tests|worker-runtime)\/[\w/-]+\.\w+|~\//);
   }
 });
 

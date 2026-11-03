@@ -16,6 +16,7 @@ Check which tools or commands this session actually has before relying on one. `
 | Company facts | Read the company's details, price list and past decisions |
 | Find template | See the company's templates and their versions |
 | Read template | Open one exact version: its guidelines and reference files |
+| Calculate | Work out amounts in code, not in your head |
 | Render | Produce a filled output from a template and structured data, with amounts calculated in code |
 | Show | Put a result on the canvas beside the conversation |
 | Save draft | Record a new template version as an unapproved draft |
@@ -25,17 +26,17 @@ When a capability is missing, say which one and what that means for this request
 
 ## Two kinds of output
 
-- **Filled** (quotation, invoice): the numbers must be exact and repeatable. Code calculates; you supply structured data. Read `references/quotation.md`.
+- **Filled** (quotation, invoice): the numbers must be exact and repeatable. Code calculates; you supply structured data. Without a way to calculate, line amounts and totals stay `UNRESOLVED`. Read `references/quotation.md`.
 - **Authored** (proposal, tender, report, letter, slide, page mockup): you write fresh content to the company's standard. For a proposal or tender read `references/proposal.md`.
 
 ## The steps
 
 1. **Understand.** Work out what is wanted, for whom, and which company it comes from. Read the company facts and price sources first, then ask only for what you could not find. Do not ask for what you can look up.
 2. **Find the standard.** One approved template fits: use that exact version. Several fit: ask which. Only a draft exists, or none: make a plain draft labelled `SAMPLE`, and never borrow another company's look.
-3. **Confirm when the stakes need it.** A simple draft with the facts in hand can go ahead, because nothing leaves the workspace. Confirm a plan first for a tender, a proposal that makes commitments, unclear pricing options or rules, or a major design direction. Until then return `awaiting-confirmation`, the plan and your questions. `references/workflow.md` covers plans and records.
+3. **Confirm when the stakes need it.** A simple draft with the facts in hand can go ahead, because nothing leaves the workspace. Confirm a plan first for a tender, anything that makes a commitment or takes a legal position, unclear pricing options or rules, or a major design direction. Until then return `awaiting-confirmation`, the plan and your questions. `references/workflow.md` covers plans and records.
 4. **Produce.** Use only company-approved facts. A missing fact is `[TBC: evidence needed]`. An unknown amount is `UNRESOLVED`, never zero. Never invent a price, tax rate, client, credential, signature or result. When the company has a visual standard, follow `references/document-design.md`.
 5. **Show and check.** Put the result on the canvas when you can, and reply in chat with one line: what it is, the total if any, what is unresolved, and that nothing was sent. Do not paste the document into chat as well. If you cannot show it, say so plainly and give it in chat only if it is still wanted. Check the actual result against the request, the facts, the calculations and the references, including long content. Repair cosmetic defects without asking again. A changed price, scope, solution or design direction goes back to step 3.
-6. **Offer to save.** After a first good draft with no template behind it, offer once to save the standard.
+6. **Offer to save.** After a first good draft with no template behind it, offer once to save the standard if this session has Save draft. Otherwise say saving is not available here yet.
 
 ## Save and reuse
 
