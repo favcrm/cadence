@@ -2112,6 +2112,16 @@ pub(super) fn run(
         return local_agent::dispatch(&target, issue, to);
     }
     if let Commands::Issue {
+        action: cadence_agent::issue::cli::IssueAction::Finish { id, worktree, .. },
+    } = &command
+    {
+        return Err(local_agent::hosted_finish(
+            &target,
+            id.as_deref(),
+            worktree.as_deref(),
+        ));
+    }
+    if let Commands::Issue {
         action:
             cadence_agent::issue::cli::IssueAction::Start {
                 id,
