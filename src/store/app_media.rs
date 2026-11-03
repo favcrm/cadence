@@ -117,8 +117,9 @@ pub(crate) struct MediaImport<'a> {
 
 /// Display material for one catalog asset, whichever provenance it has:
 /// imported workspace custody or a provider-produced original, together
-/// with the original proof when one exists. One read per attach, so the
-/// bytes and the proof cannot come from two different snapshots.
+/// with the original proof when one exists. `media_type` describes
+/// `bytes`; the proof keeps the producer-declared type separately, as the
+/// provider path always has.
 pub(crate) struct DisplayImage {
     pub asset: MediaAsset,
     pub media_type: String,
@@ -696,7 +697,7 @@ impl Store {
         let image = self.app_media_context_image(asset_id)?;
         Ok(Some(DisplayImage {
             asset: image.asset,
-            media_type: image.original.media_type.clone(),
+            media_type: image.media_type.to_string(),
             sha256: image.original.sha256.clone(),
             bytes: image.bytes,
             original: Some(image.original),

@@ -233,6 +233,10 @@ fn display_material_resolves_an_imported_asset_for_consumers() {
     );
     assert_eq!(display.media_type, "image/png");
     assert_eq!(display.asset.revision, 1);
+    assert!(
+        display.original.is_none(),
+        "imported custody has no producing run to prove"
+    );
 
     // An unknown id resolves to nothing rather than an error.
     assert!(s

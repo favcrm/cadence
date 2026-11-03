@@ -507,8 +507,16 @@ impl Shared {
             .store
             .app_media_display_image(asset_id)?
             .ok_or_else(|| Error::rejected("media asset is not in the workspace catalog"))?;
+        // The provider path always validated the PRODUCER-declared type and
+        // described the bytes with the stored one; keep both distinct, and
+        // use the custody type when there is no producing run.
+        let declared = display
+            .original
+            .as_ref()
+            .map(|original| original.media_type.clone())
+            .unwrap_or_else(|| display.media_type.clone());
         if display.asset.revision != revision
-            || !matches!(display.media_type.as_str(), "image/png" | "image/jpeg")
+            || !matches!(declared.as_str(), "image/png" | "image/jpeg")
         {
             return Err(Error::rejected(
                 "media chat attach needs a current PNG or JPEG image",
