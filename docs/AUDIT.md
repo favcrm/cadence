@@ -297,11 +297,13 @@ passes. Operator-by-positive-proof as a design decision
 (tracker issue **CAD-280**, "operator by positive proof") will replace this rule for
 board writes, `slot_reconcile` and these verbs alike.
 
-On the default store, daemon operator verbs and rollout verbs also refuse a
-caller with a known coding-agent runtime variable on its ancestry (CAD-2059).
-This is a guardrail against accidents, not a boundary: an agent that scrubs
-its environment still passes, as the residuals here describe. Other stores and
-the board's own peer proof are not covered.
+On the default store, daemon operator verbs, rollout verbs and the board's
+peer proof also refuse a caller with a known coding-agent runtime variable on
+its ancestry (CAD-2059). This is a guardrail against accidents, not a boundary:
+an agent that scrubs its environment, or starts through `systemd-run`, cron or
+`ssh localhost`, still passes. Other stores are not covered. The daemon and
+board strip these variables when they start, because a service started from an
+agent's shell is not that agent, so an agent-started board still passes.
 
 Board writes moved first (CAD-313, ADR 0004 phase 1): the board's
 operator is the holder of a session opened with a `cadence ui login`

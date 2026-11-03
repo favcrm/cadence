@@ -343,7 +343,9 @@ pub(crate) fn operator_proof(
 }
 
 /// Set in the environment of a coding agent's process and its shells.
-const AGENT_RUNTIME_MARKERS: &[&str] = &[
+/// `spawn_daemon_run` and the board's start remove them: a long-running
+/// service started from an agent's shell is not that agent.
+pub(crate) const AGENT_RUNTIME_MARKERS: &[&str] = &[
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
@@ -365,9 +367,9 @@ fn agent_runtime_marker(environ: &[u8]) -> Option<&'static str> {
 /// CAD-2059: a coding agent started by hand is no pane or managed endpoint,
 /// so [`operator_proof`] accepts it. On the production store, a known runtime
 /// marker on the caller's ancestry refuses it. This only narrows (ADR 0005 P3):
-/// it stops an agent acting as the operator by accident, and one that scrubs
-/// its environment still passes. An unreadable hop is skipped, as in
-/// [`operator_proof`].
+/// it stops an agent acting as the operator by accident. One that scrubs its
+/// environment, or starts through `systemd-run`, cron or `ssh localhost`, still
+/// passes. An unreadable hop is skipped, as in [`operator_proof`].
 pub(crate) fn refuse_agent_runtime(peer_pid: u32, state_dir: &Path) -> Result<(), String> {
     if !production_store(state_dir) {
         return Ok(());
@@ -821,6 +823,7 @@ pub(crate) fn tcp_peer_operator_proof(
     uid: u32,
     daemon_pid: u32,
     roots: &AgentRoots,
+    state_dir: &Path,
 ) -> Result<(), String> {
     let peer = canonical(peer);
     let Some((inode, _)) = client_socket_exact(server, peer)? else {
@@ -835,6 +838,7 @@ pub(crate) fn tcp_peer_operator_proof(
         ));
     }
     for pid in pids {
+        refuse_agent_runtime(pid, state_dir)?;
         roots.operator_proof(pid, uid, daemon_pid)?;
     }
     Ok(())
@@ -1240,7 +1244,9 @@ mod tests {
         let me = std::process::id();
         let start = proc_starttime(me).unwrap();
         let (_, uid) = proc_uids(me).unwrap();
-        let proof = |roots: &AgentRoots| tcp_peer_operator_proof(server, peer, uid, 0, roots);
+        let proof = |roots: &AgentRoots| {
+            tcp_peer_operator_proof(server, peer, uid, 0, roots, Path::new("/absent"))
+        };
         let unregistered = proof(&AgentRoots::default());
 
         let reused = AgentRoots {
@@ -1280,7 +1286,15 @@ mod tests {
         );
         assert!(!loopback_ownerless(server, peer));
         let (_, uid) = proc_uids(std::process::id()).unwrap();
-        assert!(tcp_peer_operator_proof(server, peer, uid, 0, &AgentRoots::default()).is_ok());
+        assert!(tcp_peer_operator_proof(
+            server,
+            peer,
+            uid,
+            0,
+            &AgentRoots::default(),
+            Path::new("/absent")
+        )
+        .is_ok());
     }
 
     /// The client socket's uid column is read, and it is ours for a
@@ -1394,11 +1408,11 @@ mod tests {
         let (board, decoy) = (board.local_addr().unwrap(), decoy.local_addr().unwrap());
         let to_board = (
             tcp_peer_agent(board, peer, &roots),
-            tcp_peer_operator_proof(board, peer, uid, 0, &roots).is_ok(),
+            tcp_peer_operator_proof(board, peer, uid, 0, &roots, Path::new("/absent")).is_ok(),
         );
         let to_decoy = (
             tcp_peer_agent(decoy, peer, &roots),
-            tcp_peer_operator_proof(decoy, peer, uid, 0, &roots).is_ok(),
+            tcp_peer_operator_proof(decoy, peer, uid, 0, &roots, Path::new("/absent")).is_ok(),
         );
         let _ = agent.kill();
         let _ = agent.wait();

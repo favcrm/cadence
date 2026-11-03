@@ -346,7 +346,8 @@ pub(super) fn prove_operator_peer(
     }
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
-    crate::peer::tcp_peer_operator_proof(server, *peer, uid, daemon_pid, &roots).map_err(refuse)
+    crate::peer::tcp_peer_operator_proof(server, *peer, uid, daemon_pid, &roots, state_dir)
+        .map_err(refuse)
 }
 
 /// Daemon error → HTTP for the relayed operator RPCs.

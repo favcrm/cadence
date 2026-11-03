@@ -306,6 +306,9 @@ fn spawn_daemon_run(state_dir: &Path, identity: Option<&str>) -> Result<std::pro
     // outbound RPCs. The child's `daemon run` re-arms from the state
     // dir's minted token instead.
     command.env_remove(crate::test_seam::AS_ENV);
+    for marker in crate::peer::AGENT_RUNTIME_MARKERS {
+        command.env_remove(marker);
+    }
     command
         .args(["--state-dir"])
         .arg(state_dir)
