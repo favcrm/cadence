@@ -67,6 +67,17 @@ skipped, never followed. Neither `approval` nor `verdicts` writes anything —
 the verdict read does not even take the registry lock — and the local read
 needs no daemon, state dir or `HOME`.
 
+The review standard is a fresh-session review (AGENTS.md "Review", operator
+decision 2026-11-03): a non-author session with no inherited context, including
+a subagent. These verbs do not enforce it. The gate counts hosted verdicts by
+attested principal and refuses the author's principal, while local notes count
+by their self-declared `From:` alias, which is not attested; it cannot tell a
+fresh session from the author under one login; until it can, merges use the temporary
+`--exception --advisory ...` path (exact-head operator approval and two
+advisory links, standards and spec-security, plus browser-qa for a `ui/`
+change; ends at `EXCEPTION_ENDS` in
+`scripts/delivery-gate`, 2026-11-10).
+
 The document says where it came from (AOS-473): `origin` is `local` for the
 note parse and `hosted` for the org's record, and the merge gate applies the
 attested rule only to `hosted`. A hosted read takes `--project` and `--repo`

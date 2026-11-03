@@ -577,7 +577,7 @@ and never work around it by pointing the gate at a repo-scoped read.
 ## Dev-to-release flow (CAD-1400)
 
 One ticket, one PR. The lane worktree passes `scripts/pre-push` locally, then
-exact-head CI and independent review on the PR; operator scope or per-head
+exact-head CI and fresh-session review on the PR; operator scope or per-head
 approval (recorded via `cadence audit approve`) precedes
 `scripts/enqueue-reviewed` into the merge queue, which retests on newest
 main. The merged head is the only release candidate: a `v*` tag matching
