@@ -1689,7 +1689,7 @@ fn artifact(
             let expected = pinned_digest.expect("a completed page has a digest");
             if !actual
                 .iter()
-                .zip(expected.chunks_exact(2))
+                .zip(expected.as_chunks::<2>().0.iter())
                 .all(|(byte, pair)| {
                     pair[0] == HEX[(byte >> 4) as usize] && pair[1] == HEX[(byte & 0xf) as usize]
                 })
