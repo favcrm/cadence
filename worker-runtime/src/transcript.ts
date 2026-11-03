@@ -6,6 +6,7 @@ import {
   type ThreadEntry,
   type ThreadProjection,
 } from "./contract.ts";
+import { appPayload, parseEntryAppScope } from "./operation-scope.ts";
 
 /** The private engine's default retry.maxRetries: attempts 1..3 retry. */
 const PI_MAX_RETRIES = 3;
@@ -176,6 +177,21 @@ export function threadEntries(
       typeof data.messageId === "string"
         ? data.messageId
         : undefined;
+    // The app scope travels with the stored entry, so a reconnect, a rebuild
+    // and a replayed retry all project the envelope the operation was admitted
+    // with, never a scope re-derived from the caller. A stored scope that does
+    // not validate fails the read: serving the entry without it would present
+    // an operation as Home, which is a silent weakening of its envelope.
+    // Only a row whose `data` is an object can claim a scope: a stored row
+    // with any other `data` is rendered as it was before scopes existed, and
+    // its execution path (`operationAppScope`) stays strict and refuses it.
+    const app =
+      data !== null && typeof data === "object" && !Array.isArray(data)
+        ? parseEntryAppScope(record.kind, data)
+        : null;
+    // The board's own operator-entry payload carries the verified binding as
+    // `{install_id, context_id?}`, which is what its retry sends back.
+    const payload = app === null ? undefined : { app: appPayload(app) };
     for (const message of record.model ?? []) {
       position += 1;
       // Tool results live in their own message, paired to the assistant tool
@@ -256,6 +272,7 @@ export function threadEntries(
           ...(operator && messageId !== undefined
             ? { message: messageId }
             : {}),
+          ...(operator && payload !== undefined ? { payload } : {}),
         });
       }
       if (message.role === "assistant" && terminalError(all, position)) {
