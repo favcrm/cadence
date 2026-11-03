@@ -55,43 +55,15 @@ function chatRightEdge(pushed: number): number | null {
   return pane ? pane.getBoundingClientRect().right + pushed : null;
 }
 
-/**
- * The running turn from the thread alone. The daemon announces no stage names
- * and no total, so: the agent's latest words, the steps so far (the live one
- * marked), "step N" with no "of M", and an indeterminate bar.
- */
-function WorkingStrip({ working, updating }: { working: Working; updating: string | null }) {
+/** The running turn: one word and an indeterminate bar. The steps stay in the thread. */
+function WorkingStrip({ updating }: { updating: string | null }) {
   const t = useTranslate();
   return (
     <div className="cv-work" role="status" aria-live="polite" data-canvas-working>
-      {working.plan ? <p className="cv-plan">{working.plan}</p> : null}
-      {working.steps.length > 0 ? (
-        <ol className="cv-stage" aria-label={t("Steps so far")}>
-          {working.steps.map((s, i) => (
-            <li key={`${i}:${s.text}`} data-s={s.done ? "done" : "now"}>
-              {s.text}
-            </li>
-          ))}
-        </ol>
-      ) : null}
       <div className="cv-live">
-        <span className="workdot live" aria-hidden />
-        <span>
-          {working.count > 0 ? `${t("step")} ${working.count}` : t("Working")}
-          {working.step ? ` · ${working.step}` : ""}
-        </span>
+        <span>{t("Working")}</span>
         {updating ? <span className="artbadge">{updating}</span> : null}
       </div>
-      {working.steps.length > 0 ? (
-        <details className="cv-details">
-          <summary>{t("details")}</summary>
-          <ul>
-            {working.steps.map((s, i) => (
-              <li key={`${i}:${s.raw}`}>{s.raw}</li>
-            ))}
-          </ul>
-        </details>
-      ) : null}
       <div className="cv-bar" aria-hidden>
         <i className="cv-bar-run" />
       </div>
@@ -248,7 +220,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
           </span>
         ) : null}
       </header>
-      {working ? <WorkingStrip working={working} updating={updating} /> : null}
+      {working ? <WorkingStrip updating={updating} /> : null}
       <div className="cv-body" data-canvas-body>
         {state.status === "loading" ? <p className="text-label text-ink-500 p-3">{t("Loading…")}</p> : null}
         {state.status === "failed" ? <p className="text-label text-fail p-3" role="alert">{state.error}</p> : null}

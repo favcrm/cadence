@@ -126,6 +126,7 @@ async function main() {
 
   await type("/help");
   await enter();
+  assert(!host.querySelector('[data-cmd="compact"]'), "the next send clears a command's answer");
   const help = host.querySelector('[data-cmd="help"]')?.textContent ?? "";
   assert(!help.includes("/compact") && !help.includes("/model"), "help lists only what this board can run");
   assert(help.includes("Just type your message") && !help.includes("what it does"), "help with nothing to list says so, with no empty table");
@@ -181,10 +182,9 @@ async function main() {
     resources.masterState.write(() => master as never);
   });
   await settle();
-  const cardsBefore = host.querySelectorAll('[data-cmd="stop"]').length;
   await type("/stop");
   await enter();
-  const typed = Array.from(host.querySelectorAll('[data-cmd="stop"]')).slice(cardsBefore).map((card) => card.textContent ?? "");
+  const typed = Array.from(host.querySelectorAll('[data-cmd="stop"]')).map((card) => card.textContent ?? "");
   assert(typed.length === 2, `a typed stop shows its answer and the notice (got ${typed.length})`);
   assert(typed.some((text) => text.includes("Stopped.")) && typed.some((text) => text.includes("A queued message was withdrawn too")), "the typed stop's notice is not overwritten by its answer");
   stopAnswer = null;

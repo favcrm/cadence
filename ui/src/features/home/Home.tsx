@@ -1092,6 +1092,8 @@ function MasterHome({
     setUnseen(0);
     setActivity(false);
     setGlideTick((n) => n + 1);
+    // A command's answer lasts until the next send; one still running stays.
+    setCmds((c) => c.filter((x) => x.running));
   }, []);
   const sendPersonalRequest = useCallback(async (text: string) => {
     if (readOnly || block || homeConversation === undefined) throw new Error("Sending is unavailable.");
