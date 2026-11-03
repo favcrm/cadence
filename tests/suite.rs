@@ -7484,6 +7484,11 @@ mod cad2088_review_workflows {
     const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const LIVE_BASE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const CTX_BASE: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    // The pinned main, a second answer main's ref could give later, and a merge base distinct from both.
+    const MAIN: &str = "dddddddddddddddddddddddddddddddddddddddd";
+    const MAIN2: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const MB: &str = "ffffffffffffffffffffffffffffffffffffffff";
+    const DIFFACC: &str = "application/vnd.github.v3.diff";
     const TOKEN1: &str = "Bearer aaa.bbb.ccc1";
     // Text no log, artifact or verdict line may carry unless it is meant to.
     const M: &str = "LEAKMARK7f3a91";
@@ -7525,7 +7530,7 @@ const reply = (r) => {
 globalThis.fetch = async (url, init = {}) => {
   url = String(url);
   const method = init.method || 'GET';
-  const idx = (sc.routes || []).findIndex((r) => url.includes(r.contains) && (!r.method || r.method === method));
+  const idx = (sc.routes || []).findIndex((r) => url.includes(r.contains) && (!r.method || r.method === method) && (!r.accept || (init.headers || {}).accept === r.accept));
   const oidc = url.startsWith('http://oidc.test/');
   const entry = { url, method, headers: init.headers || {}, body: init.body ?? null, unmatched: idx < 0 && !oidc };
   fs.appendFileSync(logf, JSON.stringify(entry) + '\n');
@@ -7918,7 +7923,7 @@ if (mode === 'keys') {
     fn world(wf: &Wf) -> Value {
         json!({
             "live": {
-                "state": "open", "merged": false, "title": "CAD-9999: a different live title", "changed_files": 2,
+                "state": "open", "merged": false, "title": "CAD-9999: a different live title", "changed_files": 7,
                 "base": { "ref": "main", "sha": LIVE_BASE },
                 "head": { "sha": HEAD, "repo": { "full_name": wf.repo() } },
             },
@@ -7929,6 +7934,9 @@ if (mode === 'keys') {
                 "ticket_body": format!("ticket body {M}"),
             },
             "diff": DIFF,
+            "stale_diff": "diff --git a/src/stale.rs b/src/stale.rs\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/src/stale.rs\n@@ -0,0 +1 @@\n+stale\n",
+            "main_seq": [{ "json": { "object": { "sha": MAIN } } }],
+            "cmp": { "status": "ahead", "merge_base": MB, "files_n": 2 },
         })
     }
 
@@ -7948,14 +7956,65 @@ if (mode === 'keys') {
         json!({ "contains": contains, "responses": responses })
     }
 
+    // The GitHub side: the PR, the context, main's ref, the paged compare JSON, the compare diff on the
+    // same URL (by Accept header), the diff against the PR's own stale base, and the two repo docs.
     fn prepare_scenario(w: &Value) -> Value {
-        json!({ "routes": [
-            route("/repos/favcrm/cadence/pulls/123", json!([{ "json": w["live"] }])),
-            route("/__platform/review-jobs/context", json!([{ "json": w["ctx"] }])),
-            route("/repos/favcrm/cadence/compare/", json!([{ "text": w["diff"] }])),
-            route("contents/AGENTS.md", json!([{ "text": "standards text" }])),
-            route("contents/docs/roles/risk-classes.md", json!([{ "text": "risk classes text" }])),
-        ] })
+        let cmp = &w["cmp"];
+        let n = cmp["files_n"].as_u64().unwrap() as usize;
+        let mut routes = vec![
+            route(
+                "/repos/favcrm/cadence/pulls/123",
+                json!([{ "json": w["live"] }]),
+            ),
+            route(
+                "/__platform/review-jobs/context",
+                json!([{ "json": w["ctx"] }]),
+            ),
+            route("git/ref/heads/main", w["main_seq"].clone()),
+        ];
+        let pages = n / 100 + 1;
+        for page in 1..=pages.max(4) {
+            let body = if let Some(pj) = cmp["pages_json"].as_array() {
+                pj.get(page - 1).cloned().unwrap_or(json!({}))
+            } else {
+                let chunk = n.saturating_sub((page - 1) * 100).min(100);
+                let files: Vec<Value> = (0..chunk).map(|i| json!({ "filename": format!("f{}.rs", (page - 1) * 100 + i), "status": "modified" })).collect();
+                json!({ "status": cmp["status"], "merge_base_commit": { "sha": cmp["merge_base"] }, "files": files })
+            };
+            routes.push(route(&format!("&page={page}"), json!([{ "json": body }])));
+        }
+        let main = w["main"].as_str().unwrap_or(MAIN);
+        // The diff the PR's own (stale) base would give: served for whatever base the PR record names.
+        let stale_bases = [
+            w["ctx"]["pull"]["base_sha"].as_str().unwrap_or(CTX_BASE),
+            w["live"]["base"]["sha"].as_str().unwrap_or(LIVE_BASE),
+        ];
+        routes.push(json!({ "contains": format!("compare/{main}...{HEAD}"), "accept": DIFFACC, "responses": [{ "text": w["diff"] }] }));
+        for base in stale_bases {
+            routes.push(json!({ "contains": format!("compare/{base}...{HEAD}"), "accept": DIFFACC, "responses": [{ "text": w["stale_diff"] }] }));
+        }
+        routes.push(route(
+            "contents/AGENTS.md",
+            json!([{ "text": "standards text" }]),
+        ));
+        routes.push(route(
+            "contents/docs/roles/risk-classes.md",
+            json!([{ "text": "risk classes text" }]),
+        ));
+        json!({ "routes": routes })
+    }
+
+    // Replace the answers of the route with this URL part (and Accept header).
+    fn set_route(sc: &mut Value, contains: &str, accept: Option<&str>, responses: Value) {
+        let r = sc["routes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|r| {
+                r["contains"].as_str().unwrap().contains(contains) && r["accept"].as_str() == accept
+            })
+            .unwrap_or_else(|| panic!("no route {contains}"));
+        r["responses"] = responses;
     }
 
     fn prepare(wf: &Wf, w: &Value, env_over: &[(&str, Option<&str>)]) -> Run {
@@ -7989,7 +8048,7 @@ if (mode === 'keys') {
     }
 
     fn file_input(w: &Value) -> Value {
-        json!({ "repo": w["ctx"]["repo"], "pr": 123, "head": HEAD, "base": CTX_BASE, "issue": "CAD-2088", "diff": w["diff"] })
+        json!({ "repo": w["ctx"]["repo"], "pr": 123, "head": HEAD, "issue": "CAD-2088", "diff": w["diff"] })
     }
 
     fn run_file(
@@ -8109,40 +8168,42 @@ if (mode === 'keys') {
         re.captures_iter(text).map(|c| c[1].to_string()).collect()
     }
 
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let mut c = Command::new("git");
+        c.current_dir(dir)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "core.quotepath=true",
+                "-c",
+                "diff.noprefix=false",
+                "-c",
+                "diff.mnemonicPrefix=false",
+            ])
+            .args(args);
+        let o = cadence_agent::reaper::output(&mut c)
+            .expect("these acceptance tests need `git` on PATH");
+        assert!(
+            o.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8(o.stdout).unwrap()
+    }
+
     // A real `git diff` of a quoted (non-ASCII) file name whose content has a
     // line that reads like a file header, then an ordinary file.
     fn quoted_name_diff() -> String {
         let dir = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| -> String {
-            let mut c = Command::new("git");
-            c.current_dir(dir.path())
-                .env_clear()
-                .env("PATH", std::env::var("PATH").unwrap_or_default())
-                .env("HOME", dir.path())
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "core.quotepath=true",
-                    "-c",
-                    "diff.noprefix=false",
-                    "-c",
-                    "diff.mnemonicPrefix=false",
-                ])
-                .args(args);
-            let o = cadence_agent::reaper::output(&mut c)
-                .expect("these acceptance tests need `git` on PATH");
-            assert!(
-                o.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            String::from_utf8(o.stdout).unwrap()
-        };
+        let git = |args: &[&str]| git_in(dir.path(), args);
         git(&["init", "-q"]);
         git(&["commit", "-q", "--allow-empty", "-m", "base"]);
         std::fs::create_dir_all(dir.path().join("a")).unwrap();
@@ -8427,8 +8488,8 @@ if (mode === 'keys') {
             };
             let cases: Vec<Edit> = vec![
                 (
-                    "truncated diff",
-                    Box::new(|w| w["live"]["changed_files"] = json!(3)),
+                    "diff and compare file list disagree",
+                    Box::new(|w| w["cmp"]["files_n"] = json!(3)),
                     "truncated",
                 ),
                 (
@@ -8512,7 +8573,7 @@ if (mode === 'keys') {
             for (name, diff, files, reason) in &cases {
                 let mut w = world(&wf);
                 w["diff"] = diff.clone();
-                w["live"]["changed_files"] = json!(files);
+                w["cmp"]["files_n"] = json!(files);
                 let r = prepare(&wf, &w, &[]);
                 assert!(
                     r.failed() && r.out.contains(reason),
@@ -8608,7 +8669,7 @@ if (mode === 'keys') {
                 let diff = format!("diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,2 @@\n fn a() {{}}\n+x{sep}diff --git a/fake b/fake\n");
                 let mut w = world(&wf);
                 w["diff"] = json!(diff);
-                w["live"]["changed_files"] = json!(2);
+                w["cmp"]["files_n"] = json!(2);
                 let r = prepare(&wf, &w, &[]);
                 assert!(
                     r.failed() && r.out.contains("truncated"),
@@ -8618,7 +8679,7 @@ if (mode === 'keys') {
                 );
                 assert!(r.files().is_empty());
                 // With the honest count the same diff is accepted: it is the count that refuses.
-                w["live"]["changed_files"] = json!(1);
+                w["cmp"]["files_n"] = json!(1);
                 assert_eq!(
                     prepare(&wf, &w, &[]).code,
                     Some(0),
@@ -8669,26 +8730,33 @@ if (mode === 'keys') {
     }
 
     #[test]
-    fn prepare_takes_the_diff_from_the_context_base_and_sends_the_context_issue() {
+    fn prepare_diffs_against_the_pinned_main_and_sends_the_context_issue() {
         for wf in all() {
+            // A stale base.sha and a stale changed_files are in the world and must change nothing.
             let w = world(&wf);
             let r = prepare(&wf, &w, &[]);
             assert_eq!(r.code, Some(0), "{}", r.out);
-            let compare = r.hits("/compare/");
-            assert_eq!(compare.len(), 1);
-            let url = compare[0]["url"].as_str().unwrap();
+            assert_eq!(r.hits("git/ref/heads/main").len(), 1, "main is read once");
+            let diff_urls: Vec<&str> = r
+                .reqs
+                .iter()
+                .filter(|q| q["headers"]["accept"] == DIFFACC)
+                .map(|q| q["url"].as_str().unwrap())
+                .collect();
+            assert_eq!(diff_urls.len(), 1);
             assert!(
-                url.contains(&format!("compare/{CTX_BASE}...{HEAD}")),
-                "diff must come from the context's base: {url}"
+                diff_urls[0].ends_with(&format!("compare/{MAIN}...{HEAD}")),
+                "the diff must be main...head: {}",
+                diff_urls[0]
             );
-            assert!(!url.contains(LIVE_BASE));
-            for c in r.hits("/contents/") {
+            assert!(!diff_urls[0].contains(CTX_BASE) && !diff_urls[0].contains(LIVE_BASE));
+            let docs = r.hits("/contents/");
+            assert_eq!(docs.len(), 2);
+            for c in docs {
                 assert!(
+                    c["url"].as_str().unwrap().ends_with(&format!("ref={MAIN}")),
+                    "repo docs must be read at the pinned main: {}",
                     c["url"]
-                        .as_str()
-                        .unwrap()
-                        .ends_with(&format!("ref={CTX_BASE}")),
-                    "repo docs must be read at the context base"
                 );
             }
             let fi = r.read("out/file-input.json").unwrap();
@@ -8697,7 +8765,14 @@ if (mode === 'keys') {
                 "issue is the context's ticket id, not the live title's"
             );
             assert_ne!(w["live"]["title"].as_str().unwrap(), "CAD-2088");
-            assert_eq!(fi["base"], CTX_BASE);
+            assert!(fi.get("base").is_none(), "file input carries no base");
+            let input = r.read("out/review-input.json").unwrap();
+            assert_eq!(
+                (input["main"].as_str(), input["merge_base"].as_str()),
+                (Some(MAIN), Some(MB))
+            );
+            assert!(input.get("base").is_none());
+            assert_eq!(input["diff"], w["diff"]);
             let sealed = sealed_model_output(&wf, &good_output(&wf));
             let f = run_file(
                 &wf,
@@ -9072,7 +9147,7 @@ if (mode === 'keys') {
                         let p = p.clone();
                         move |w| {
                             w["diff"] = json!(format!("diff --git a/x b/x\nnew file mode 100644\nBinary files /dev/null and b/{p} differ\n"));
-                            w["live"]["changed_files"] = json!(1);
+                            w["cmp"]["files_n"] = json!(1);
                         }
                     })),
                 ),
@@ -9126,7 +9201,51 @@ if (mode === 'keys') {
                     "diff http error",
                     route_edit(Box::new({
                         let p = p.clone();
-                        move |s| s["routes"][2]["responses"] = json!([{ "status": 404, "text": p }])
+                        move |s| {
+                            set_route(
+                                s,
+                                "compare/",
+                                Some(DIFFACC),
+                                json!([{ "status": 404, "text": p }]),
+                            )
+                        }
+                    })),
+                ),
+                (
+                    "ref error text",
+                    route_edit(Box::new({
+                        let p = p.clone();
+                        move |s| {
+                            set_route(
+                                s,
+                                "git/ref/heads/main",
+                                None,
+                                json!([{ "status": 500, "text": p }]),
+                            )
+                        }
+                    })),
+                ),
+                (
+                    "compare error text",
+                    route_edit(Box::new({
+                        let p = p.clone();
+                        move |s| {
+                            set_route(s, "&page=1", None, json!([{ "status": 500, "text": p }]))
+                        }
+                    })),
+                ),
+                (
+                    "compare malformed with attacker text",
+                    route_edit(Box::new({
+                        let p = p.clone();
+                        move |s| {
+                            set_route(
+                                s,
+                                "&page=1",
+                                None,
+                                json!([{ "json": { "status": p, "merge_base_commit": { "sha": p }, "files": [p] } }]),
+                            )
+                        }
                     })),
                 ),
                 (
@@ -10515,6 +10634,573 @@ if (mode === 'keys') {
                 "{}: the cited path was not neutralized: {body}",
                 wf.file
             );
+        }
+    }
+
+    // ---- the pinned main: a stale base.sha must not hide a revert -------------
+
+    struct Attack {
+        diff_main: String,
+        diff_stale: String,
+        main_sha: String,
+        base_sha: String,
+        files_main: usize,
+        files_stale: usize,
+    }
+
+    // A PR adds design-plans/x.md. Main then changes src/authz.rs (and, in variant B, src/other.rs too). The
+    // branch merges main and restores the old src/authz.rs: against its stale base the revert is invisible.
+    fn attack(variant_b: bool) -> Attack {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let git = |args: &[&str]| git_in(d, args);
+        let write = |rel: &str, text: &str| {
+            if let Some(parent) = Path::new(rel).parent() {
+                std::fs::create_dir_all(d.join(parent)).unwrap();
+            }
+            std::fs::write(d.join(rel), text).unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        write("src/authz.rs", "fn authz() { check() }\n");
+        write("src/other.rs", "fn other() { one() }\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "c1"]);
+        let base_sha = git(&["rev-parse", "HEAD"]).trim().to_string();
+        git(&["checkout", "-q", "-b", "pr"]);
+        write("design-plans/x.md", "# plan\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "pr work"]);
+        git(&["checkout", "-q", "main"]);
+        write("src/authz.rs", "fn authz() { check_v2() }\n");
+        if variant_b {
+            write("src/other.rs", "fn other() { two() }\n");
+        }
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "main moves"]);
+        let main_sha = git(&["rev-parse", "HEAD"]).trim().to_string();
+        git(&["checkout", "-q", "pr"]);
+        git(&["merge", "-q", "--no-edit", "main"]);
+        write("src/authz.rs", "fn authz() { check() }\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "restore"]);
+        let files_main = git(&["diff", "--name-only", "main...HEAD"]).lines().count();
+        let files_stale = git(&["diff", "--name-only", &base_sha, "HEAD"])
+            .lines()
+            .count();
+        Attack {
+            diff_main: git(&["diff", "main...HEAD"]),
+            diff_stale: git(&["diff", &base_sha, "HEAD"]),
+            files_main,
+            files_stale,
+            main_sha,
+            base_sha,
+        }
+    }
+
+    #[test]
+    fn a_stale_pr_base_cannot_hide_a_revert_of_main() {
+        for variant_b in [false, true] {
+            let at = attack(variant_b);
+            // The fixture is the attack: the stale-base diff lacks the revert; in B the section counts agree.
+            assert!(
+                !at.diff_stale.contains("src/authz.rs"),
+                "fixture: the stale diff must hide the revert"
+            );
+            assert!(
+                at.diff_main.contains("-fn authz() { check_v2() }")
+                    && at.diff_main.contains("+fn authz() { check() }")
+            );
+            if variant_b {
+                assert_eq!(
+                    at.files_main, at.files_stale,
+                    "fixture B: the counts must agree"
+                );
+                assert!(at.diff_stale.contains("src/other.rs"));
+            } else {
+                assert_ne!(at.files_main, at.files_stale);
+            }
+            for wf in all() {
+                let mut w = world(&wf);
+                w["main"] = json!(at.main_sha);
+                w["main_seq"] = json!([{ "json": { "object": { "sha": at.main_sha } } }]);
+                w["diff"] = json!(at.diff_main);
+                w["stale_diff"] = json!(at.diff_stale);
+                w["cmp"] = json!({ "status": "ahead", "merge_base": at.main_sha, "files_n": at.files_main });
+                // What the PR's own record says: the stale base and the stale count.
+                w["live"]["base"]["sha"] = json!(at.base_sha);
+                w["live"]["changed_files"] = json!(at.files_stale);
+                w["ctx"]["pull"]["base_sha"] = json!(at.base_sha);
+                let (input, r) = prepared_from(&wf, &w);
+                assert_eq!(
+                    input["diff"],
+                    json!(at.diff_main),
+                    "{}: the review input must carry the main-relative diff",
+                    wf.file
+                );
+                assert!(
+                    input["diff"]
+                        .as_str()
+                        .unwrap()
+                        .contains("-fn authz() { check_v2() }"),
+                    "{}: the revert is missing",
+                    wf.file
+                );
+                assert!(r.out.contains(&at.main_sha[..12]));
+                // And the revert is citable by the file job.
+                let fi = r.read("out/file-input.json").unwrap();
+                let mut o = good_output(&wf);
+                for c in o["checks"].as_array_mut().unwrap() {
+                    c["citations"] = json!([{ "file": "src/authz.rs", "line": 1 }]);
+                }
+                let f = run_file(
+                    &wf,
+                    &fi,
+                    Some(&sealed_model_output(&wf, &o)),
+                    json!([verdict_ok(false, "pass")]),
+                    &[],
+                );
+                assert_eq!(f.code, Some(0), "{}: {}", wf.file, f.out);
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_base_sha_or_changed_files_alone_refuses_nothing() {
+        for wf in all() {
+            let mut w = world(&wf);
+            w["live"]["base"]["sha"] = json!(LIVE_BASE);
+            w["live"]["changed_files"] = json!(1);
+            w["ctx"]["pull"]["base_sha"] = json!(CTX_BASE);
+            assert_eq!(prepare(&wf, &w, &[]).code, Some(0), "{}", wf.file);
+            w["live"]["changed_files"] = json!(0);
+            assert_eq!(
+                prepare(&wf, &w, &[]).code,
+                Some(0),
+                "{}: changed_files 0",
+                wf.file
+            );
+            w["live"].as_object_mut().unwrap().remove("changed_files");
+            assert_eq!(
+                prepare(&wf, &w, &[]).code,
+                Some(0),
+                "{}: no changed_files",
+                wf.file
+            );
+        }
+    }
+
+    #[test]
+    fn the_diff_and_both_docs_come_from_the_one_pinned_main() {
+        for wf in all() {
+            let mut w = world(&wf);
+            // If main were read again later in the run it would answer something else.
+            w["main_seq"] = json!([{ "json": { "object": { "sha": MAIN } } }, { "json": { "object": { "sha": MAIN2 } } }, { "json": { "object": { "sha": MAIN2 } } }]);
+            let r = prepare(&wf, &w, &[]);
+            assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+            assert_eq!(
+                r.hits("git/ref/heads/main").len(),
+                1,
+                "{}: main was read more than once",
+                wf.file
+            );
+            for q in r.reqs.iter().filter(|q| {
+                q["url"].as_str().unwrap().contains("/compare/")
+                    || q["url"].as_str().unwrap().contains("/contents/")
+            }) {
+                let u = q["url"].as_str().unwrap();
+                assert!(
+                    u.contains(MAIN) && !u.contains(MAIN2),
+                    "{}: not at the pin: {u}",
+                    wf.file
+                );
+                assert!(!u.contains(MB), "{}: read at the merge base: {u}", wf.file);
+            }
+            assert_eq!(r.hits("/contents/").len(), 2);
+            assert_eq!(r.hits("/compare/").len(), 2, "one JSON page and one diff");
+            let input = r.read("out/review-input.json").unwrap();
+            assert_eq!(input["main"], MAIN);
+        }
+    }
+
+    #[test]
+    fn prepare_refuses_an_unreadable_comparison_with_main_with_fixed_lines() {
+        let many = |n: usize| -> String {
+            (0..n).map(|i| format!("diff --git a/f{i}.rs b/f{i}.rs\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/f{i}.rs\n@@ -0,0 +1 @@\n+x\n")).collect()
+        };
+        for wf in all() {
+            let page_ok = |status: &str, mb: Value, files: Value| json!({ "status": status, "merge_base_commit": { "sha": mb }, "files": files });
+            let two = json!([{ "filename": "a" }, { "filename": "b" }]);
+            let hundred: Vec<Value> = (0..100)
+                .map(|i| json!({ "filename": format!("f{i}") }))
+                .collect();
+            let cases: Vec<(&str, Value, &str)> = vec![
+                (
+                    "identical",
+                    json!({ "cmp": { "status": "identical", "merge_base": MB, "files_n": 2 } }),
+                    "malformed or has nothing to review",
+                ),
+                (
+                    "behind",
+                    json!({ "cmp": { "status": "behind", "merge_base": MB, "files_n": 2 } }),
+                    "malformed or has nothing to review",
+                ),
+                (
+                    "unknown status",
+                    json!({ "cmp": { "status": "weird", "merge_base": MB, "files_n": 2 } }),
+                    "malformed or has nothing to review",
+                ),
+                (
+                    "no merge base",
+                    json!({ "cmp": { "pages_json": [{ "status": "ahead", "files": two }] , "files_n": 2 } }),
+                    "malformed or has nothing to review",
+                ),
+                (
+                    "short merge base",
+                    json!({ "cmp": { "pages_json": [page_ok("ahead", json!("abc123"), two.clone())], "files_n": 2 } }),
+                    "malformed or has nothing to review",
+                ),
+                (
+                    "merge base not text",
+                    json!({ "cmp": { "pages_json": [page_ok("ahead", json!(7), two.clone())], "files_n": 2 } }),
+                    "malformed or has nothing to review",
+                ),
+                (
+                    "files not a list",
+                    json!({ "cmp": { "pages_json": [page_ok("ahead", json!(MB), json!("x"))], "files_n": 2 } }),
+                    "malformed or has nothing to review",
+                ),
+                (
+                    "no files",
+                    json!({ "cmp": { "status": "ahead", "merge_base": MB, "files_n": 0 } }),
+                    "does not cover the comparison",
+                ),
+                (
+                    "no files and an empty diff",
+                    json!({ "cmp": { "status": "ahead", "merge_base": MB, "files_n": 0 }, "diff": "\n" }),
+                    "does not cover the comparison",
+                ),
+                (
+                    "merge base moves between pages",
+                    json!({ "cmp": { "pages_json": [page_ok("ahead", json!(MB), json!(hundred)), page_ok("ahead", json!(MAIN2), two.clone())], "files_n": 101 } }),
+                    "changed while it was read",
+                ),
+                (
+                    "301 files",
+                    json!({ "cmp": { "status": "ahead", "merge_base": MB, "files_n": 301 }, "diff": many(301) }),
+                    "too many files",
+                ),
+                (
+                    "1000 files",
+                    json!({ "cmp": { "status": "ahead", "merge_base": MB, "files_n": 1000 }, "diff": many(20) }),
+                    "too many files",
+                ),
+            ];
+            for (name, edit, reason) in cases {
+                let mut w = world(&wf);
+                for (k, v) in edit.as_object().unwrap() {
+                    w[k] = v.clone();
+                }
+                let r = prepare(&wf, &w, &[]);
+                assert!(
+                    r.failed() && r.out.contains(reason),
+                    "{}: {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert_eq!(
+                    r.out
+                        .lines()
+                        .filter(|l| !l.starts_with("::add-mask::"))
+                        .count(),
+                    1,
+                    "{}: {name}: one fixed line: {}",
+                    wf.file,
+                    r.out
+                );
+                // An empty file list is only noticed when the diff is judged against it; every other
+                // refusal of the comparison comes before the diff is read.
+                assert!(
+                    name.starts_with("no files")
+                        || r.reqs.iter().all(|q| q["headers"]["accept"] != DIFFACC),
+                    "{}: {name}: the diff was read after a refused comparison",
+                    wf.file
+                );
+                assert!(r.files().is_empty() && r.hits("anthropic").is_empty());
+                assert_log_clean(name, &r);
+            }
+            // Ahead and diverged (main moved after the PR merged it) are both fine.
+            for status in ["ahead", "diverged"] {
+                let mut w = world(&wf);
+                w["cmp"]["status"] = json!(status);
+                assert_eq!(prepare(&wf, &w, &[]).code, Some(0), "{}: {status}", wf.file);
+            }
+            // Main and the comparison failing outright.
+            let mut outs = std::collections::BTreeSet::new();
+            for (name, edit) in [
+                ("ref 404", json!([{ "status": 404, "text": "x" }])),
+                (
+                    "ref garbage",
+                    json!([{ "json": { "object": { "sha": "nothex" } } }]),
+                ),
+                ("ref no object", json!([{ "json": {} }])),
+            ] {
+                let mut w = world(&wf);
+                w["main_seq"] = edit;
+                let r = prepare(&wf, &w, &[]);
+                assert!(
+                    r.failed() && r.out.contains("cannot resolve main to a commit"),
+                    "{}: {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.hits("/compare/").is_empty());
+                outs.insert(r.out.clone());
+            }
+            assert_eq!(outs.len(), 1);
+            let w = world(&wf);
+            let mut sc = prepare_scenario(&w);
+            set_route(
+                &mut sc,
+                "&page=1",
+                None,
+                json!([{ "status": 404, "text": "x" }]),
+            );
+            let r = run_job(&wf, "prepare", &sc, &[], &|_| {});
+            assert!(
+                r.failed()
+                    && r.out
+                        .contains("cannot read the comparison with main: HTTP 404"),
+                "{}",
+                r.out
+            );
+        }
+    }
+
+    #[test]
+    fn a_pr_of_up_to_299_files_pages_and_is_covered() {
+        let many = |n: usize| -> String {
+            (0..n).map(|i| format!("diff --git a/f{i}.rs b/f{i}.rs\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/f{i}.rs\n@@ -0,0 +1 @@\n+x\n")).collect()
+        };
+        for wf in all() {
+            for (n, pages) in [(100, 2), (150, 2), (250, 3), (299, 3)] {
+                let mut w = world(&wf);
+                w["cmp"]["files_n"] = json!(n);
+                w["diff"] = json!(many(n));
+                let r = prepare(&wf, &w, &[]);
+                assert_eq!(r.code, Some(0), "{}: {n} files: {}", wf.file, r.out);
+                let page_reqs = r
+                    .reqs
+                    .iter()
+                    .filter(|q| q["url"].as_str().unwrap().contains("per_page=100&page="))
+                    .count();
+                assert_eq!(page_reqs, pages, "{}: {n} files", wf.file);
+                let input = r.read("out/review-input.json").unwrap();
+                assert_eq!(
+                    input["diff"]
+                        .as_str()
+                        .unwrap()
+                        .matches("diff --git ")
+                        .count(),
+                    n
+                );
+                // A diff cut to fewer sections than the listed files is refused, at every size.
+                let mut w2 = w.clone();
+                w2["diff"] = json!(many(n - 1));
+                let r = prepare(&wf, &w2, &[]);
+                assert!(
+                    r.failed() && r.out.contains("truncated or padded"),
+                    "{}: {n} files, cut: {}",
+                    wf.file,
+                    r.out
+                );
+            }
+        }
+    }
+
+    // ---- the model call: size, retries ---------------------------------------
+
+    fn chunked_events(text: &str, chunk: usize, stop: Option<&str>) -> Vec<Value> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut ev =
+            vec![json!({ "type": "message_start", "message": { "model": "claude-opus-5-5" } })];
+        for part in chars.chunks(chunk) {
+            ev.push(json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": part.iter().collect::<String>() } }));
+        }
+        if let Some(stop) = stop {
+            ev.push(json!({ "type": "message_delta", "delta": { "stop_reason": stop } }));
+        }
+        ev.push(json!({ "type": "message_stop" }));
+        ev
+    }
+
+    #[test]
+    fn a_streamed_output_over_60_kb_is_refused_not_truncated() {
+        for wf in all() {
+            let (input, _) = prepared(&wf);
+            // The call asks for room, streams, and a good output under the limit still files.
+            let ok = output_of_size(&wf, 13_000, 4).to_string();
+            assert!(ok.len() > 50_000 && ok.len() < 60_000);
+            let r = run_review(
+                &wf,
+                &input,
+                json!([{ "status": 200, "sse": chunked_events(&ok, 1_000, Some("end_turn")) }]),
+                &[],
+            );
+            assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+            let body: Value =
+                serde_json::from_str(r.hits("api.anthropic.com")[0]["body"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(
+                (body["max_tokens"].as_u64(), &body["stream"]),
+                (Some(64_000), &json!(true))
+            );
+            // Over the limit by characters, by bytes, only mid-stream, or with a broken or refused ending.
+            let long = big_text('n', 65_000);
+            let euro = big_text('\u{20ac}', 25_000);
+            let cases: Vec<(&str, Vec<Value>, bool)> = vec![
+                (
+                    "over by characters",
+                    chunked_events(&long, 1_000, Some("end_turn")),
+                    false,
+                ),
+                (
+                    "over by bytes",
+                    chunked_events(&euro, 1_000, Some("end_turn")),
+                    false,
+                ),
+                (
+                    "over then an error event",
+                    {
+                        let mut e = chunked_events(&long, 1_000, None);
+                        e.insert(e.len() - 1, json!({ "type": "error", "error": { "type": "api_error", "message": "x" } }));
+                        e
+                    },
+                    false,
+                ),
+                (
+                    "over then a refusal stop",
+                    chunked_events(&long, 1_000, Some("refusal")),
+                    false,
+                ),
+                (
+                    "over then max_tokens",
+                    chunked_events(&long, 1_000, Some("max_tokens")),
+                    false,
+                ),
+            ];
+            for (name, ev, _) in cases {
+                let r = run_review(&wf, &input, json!([{ "status": 200, "sse": ev }]), &[]);
+                assert!(
+                    r.failed()
+                        && r.out == "::error::model output is too large to file; nothing filed\n",
+                    "{}: {name}: {:?}",
+                    wf.file,
+                    r.out
+                );
+                assert!(
+                    r.read("out/review-output.json").is_none() && r.files().is_empty(),
+                    "{}: {name} wrote output",
+                    wf.file
+                );
+                assert_eq!(r.hits("api.anthropic.com").len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_429_or_a_5xx_status_is_retried() {
+        for wf in all() {
+            let (input, _) = prepared(&wf);
+            let good = model_reply(&good_output(&wf).to_string(), "end_turn");
+            for status in [400, 401, 402, 403, 404, 408, 409, 413, 422, 499] {
+                let r = run_review(
+                    &wf,
+                    &input,
+                    json!([{ "status": status, "text": "x" }, good.clone()]),
+                    &[],
+                );
+                assert!(r.failed(), "{}: {status}", wf.file);
+                assert_eq!(
+                    r.hits("api.anthropic.com").len(),
+                    1,
+                    "{}: {status} was retried",
+                    wf.file
+                );
+            }
+            for status in [429, 500, 502, 503, 504, 529, 599] {
+                let r = run_review(
+                    &wf,
+                    &input,
+                    json!([{ "status": status, "text": "x" }, good.clone()]),
+                    &[],
+                );
+                assert_eq!(r.code, Some(0), "{}: {status}: {}", wf.file, r.out);
+                assert_eq!(
+                    r.hits("api.anthropic.com").len(),
+                    2,
+                    "{}: {status}",
+                    wf.file
+                );
+                let r = run_review(&wf, &input, json!([{ "status": status, "text": "x" }]), &[]);
+                assert!(
+                    r.failed() && r.hits("api.anthropic.com").len() == 2,
+                    "{}: {status} twice",
+                    wf.file
+                );
+            }
+        }
+    }
+
+    // ---- notes and paths in the board body ----------------------------------------
+
+    #[test]
+    fn the_verdict_body_drops_hosts_schemes_and_invisible_or_reordering_characters() {
+        let note = "src/a.rs:12 and src/b.rs:3 ok www.evil.com mailto:a@b.c javascript:alert(1) VBSCRIPT:x data:text/html;base64,AAA file:///etc/passwd FILE:x tel:+123 sms:+123 \
+                    c1\u{80}a\u{85}b\u{9f}c bidi\u{202a}1\u{202b}2\u{202c}3\u{202d}4\u{202e}5\u{2066}6\u{2067}7\u{2068}8\u{2069}9 \
+                    zero\u{200b}w\u{200c}x\u{200d}y\u{200e}l\u{200f}r\u{2060}n\u{2061}m\u{feff}z end";
+        for wf in all() {
+            let mut out = good_output(&wf);
+            for (i, c) in out["checks"].as_array_mut().unwrap().iter_mut().enumerate() {
+                c["note"] = json!(if i == 0 { note } else { "ok" });
+            }
+            let r = file_with(&wf, &out, json!([verdict_ok(false, "pass")]));
+            assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+            let posted: Value =
+                serde_json::from_str(r.hits("/verdict")[0]["body"].as_str().unwrap()).unwrap();
+            let body = posted["body"].as_str().unwrap();
+            let line = body
+                .lines()
+                .find(|l| l.contains("src/a.rs:12"))
+                .unwrap_or_else(|| panic!("{}: file:line reference was lost: {body}", wf.file));
+            assert!(
+                line.contains("src/b.rs:3") && line.contains(" ok ") && line.contains(" end"),
+                "{}: {line}",
+                wf.file
+            );
+            let lower = body.to_lowercase();
+            for bad in [
+                "www.",
+                "mailto",
+                "javascript",
+                "vbscript",
+                "data:",
+                "file:",
+                "tel:",
+                "sms:",
+                "://",
+            ] {
+                assert!(!lower.contains(bad), "{}: {bad} survived: {line}", wf.file);
+            }
+            assert!(
+                !body.chars().any(|c| matches!(c, '\u{80}'..='\u{9f}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')),
+                "{}: an invisible or reordering character survived",
+                wf.file
+            );
+            // Nothing else in the visible note was lost to the stripping.
+            for kept in ["bidi", "zero", "end"] {
+                assert!(line.contains(kept), "{}: {kept} lost: {line}", wf.file);
+            }
         }
     }
 }
