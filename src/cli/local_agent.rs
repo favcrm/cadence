@@ -243,7 +243,7 @@ pub(super) fn run(
             if *state == "result" {
                 // The assignment ends here; the ticket does not move on its own.
                 // Say the next step instead of leaving the session to infer it.
-                eprint_line(
+                cadence_agent::output::eprint_line(
                     "cadence: assignment complete — close the ticket with \
                      `cadence issue set <ID> status=done` once the work is accepted",
                 );
