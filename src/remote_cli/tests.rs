@@ -4858,3 +4858,174 @@ fn hosted_platform_call_pre_forward_refusals_stay_definite() {
         );
     }
 }
+
+/// Exercise the real credential, authorize and multipart upload orchestration.
+/// Client completion ends the fixture; timeouts are loud failure bounds only.
+fn cad2009_artifact_upload_answer(status: &'static str, answer: Value) -> Result<Value> {
+    use std::os::fd::AsRawFd;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let worker = listener.try_clone().unwrap();
+    let (complete_tx, complete_rx) = std::sync::mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let mut paths = Vec::new();
+        for _ in 0..2 {
+            let mut pending = libc::pollfd {
+                fd: worker.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pending is one initialized pollfd, and the count is one.
+            let ready = unsafe { libc::poll(&mut pending, 1, 5000) };
+            assert_eq!(
+                ready, 1,
+                "expected artifact request did not arrive within 5s"
+            );
+            assert_ne!(pending.revents & libc::POLLIN, 0);
+            let (socket, _) = worker.accept().unwrap();
+            let (mut socket, path, raw) = read_raw_request(socket);
+            match path.as_str() {
+                "/__platform/cli/authorize" => {
+                    let request: Value = serde_json::from_slice(&raw).unwrap();
+                    assert_eq!(request["version"], CLI_VERSION);
+                    assert_eq!(request["requested_scopes"], json!(["cli.write"]));
+                    write_answer(
+                        &mut socket,
+                        "200 OK",
+                        "",
+                        &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                    );
+                }
+                "/__platform/artifacts/upload" => {
+                    let multipart = std::str::from_utf8(&raw).unwrap();
+                    assert!(
+                        multipart.contains("name=\"id\"\r\n\r\nart-A\r\n"),
+                        "the actual upload must explicitly request art-A: {multipart}"
+                    );
+                    assert!(multipart.contains("name=\"file\"; filename=\"acceptance.txt\""));
+                    assert!(
+                        multipart.contains("\r\n\r\nabc\r\n--"),
+                        "the receipt's known digest must describe the transmitted bytes"
+                    );
+                    write_answer(&mut socket, status, "", &answer);
+                }
+                _ => panic!("unexpected artifact upload request: {path}"),
+            }
+            paths.push(path);
+        }
+        complete_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("artifact client did not finish within 5s of the response");
+        match worker.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("artifact upload attempted an extra request after its final answer"),
+            Err(error) => panic!("checking for an artifact replay failed: {error}"),
+        }
+        paths
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let upload = ArtifactUpload {
+        kind: "md",
+        title: "Synthetic acceptance document",
+        id: Some("art-A"),
+        issue: None,
+        label: None,
+        customer: None,
+        file_name: "acceptance.txt",
+        bytes: b"abc",
+    };
+    let result = upload_artifact_in(&dir, &target, &upload, 2, |_| {
+        panic!("a final artifact receipt or refusal must never trigger a wake retry")
+    });
+    complete_tx.send(()).unwrap();
+    let paths = server.join().unwrap();
+    assert_eq!(
+        paths.as_slice(),
+        ["/__platform/cli/authorize", "/__platform/artifacts/upload"],
+        "authorize then exactly one upload, with no automatic replay"
+    );
+    result
+}
+
+#[test]
+fn cad2009_artifact_upload_wrong_requested_id_is_unknown_without_replay() {
+    // SHA-256 of the literal payload "abc", independent of the production hash.
+    let answer = json!({"file": {
+        "id": "art-B",
+        "version": 1,
+        "digest": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    }});
+    let error = cad2009_artifact_upload_answer("200 OK", answer)
+        .expect_err("a receipt for art-B cannot prove the explicitly requested art-A upload");
+    assert_eq!(
+        error.kind(),
+        "unknown",
+        "matching bytes alone cannot turn a mismatched id into success or definite refusal: {error}"
+    );
+    assert!(
+        error.to_string().contains("artifact find"),
+        "an ambiguous upload must name its reconciliation read: {error}"
+    );
+}
+
+#[test]
+fn cad2009_artifact_upload_matching_requested_id_succeeds_once() {
+    let answer = json!({"file": {
+        "id": "art-A",
+        "version": 1,
+        "digest": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    }});
+    let result = cad2009_artifact_upload_answer("200 OK", answer.clone())
+        .expect("a receipt naming art-A and its transmitted bytes must succeed");
+    assert_eq!(result, answer);
+}
+
+#[test]
+fn cad2009_artifact_upload_board_hop_503_is_definite_without_replay() {
+    let answer = json!({"ok": false, "error": {
+        "code": "capability_unavailable",
+        "hop": "board",
+        "request_id": "9cb6440e-f363-4dca-8f85-bc652696bc6a"
+    }});
+    let error = cad2009_artifact_upload_answer("503 Service Unavailable", answer)
+        .expect_err("a board gate refusal cannot produce an artifact receipt");
+    assert_eq!(
+        error.kind(),
+        "rejected",
+        "the board hop proves this upload was refused before forwarding: {error}"
+    );
+}
+
+#[test]
+fn cad2009_artifact_upload_unproven_tracker_503_is_unknown_without_replay() {
+    // Native /cli/call's tracker gate is not proof for /artifacts/upload.
+    let answer = json!({"ok": false, "error": {"code": "tracker_unavailable"}});
+    let error = cad2009_artifact_upload_answer("503 Service Unavailable", answer)
+        .expect_err("an unproven 503 cannot produce an artifact receipt");
+    assert_eq!(
+        error.kind(),
+        "unknown",
+        "this endpoint provides no proof that tracker_unavailable preceded storage: {error}"
+    );
+}
+
+#[test]
+fn cad2009_artifact_upload_unproven_worker_states_are_unknown_without_replay() {
+    for (status, state) in [
+        ("503 Service Unavailable", "wake_failed"),
+        ("503 Service Unavailable", "board_unreachable"),
+        ("503 Service Unavailable", "runtime_unavailable"),
+        ("503 Service Unavailable", "mystery"),
+        ("500 Internal Server Error", "waking"),
+    ] {
+        let answer = json!({"state": state});
+        let error = cad2009_artifact_upload_answer(status, answer)
+            .expect_err("an unproven worker state cannot establish an artifact upload outcome");
+        assert_eq!(
+            error.kind(),
+            "unknown",
+            "{status} with state {state} is not pre-forward proof for the artifact endpoint: {error}"
+        );
+    }
+}

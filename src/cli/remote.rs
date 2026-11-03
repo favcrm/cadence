@@ -1381,9 +1381,7 @@ fn artifact(
         .checked_add(std::time::Duration::from_secs(wake_timeout))
         .ok_or_else(|| Error::usage("invalid wake timeout"))?;
     let read = |verb: &str, args: serde_json::Map<String, Value>| -> Result<Value> {
-        match call_verb(target, verb, args, deadline, wake_timeout, |line| {
-            eprintln!("{line}")
-        })? {
+        match call_verb(target, verb, args, deadline, wake_timeout, eprint_line)? {
             RemoteAnswer::Ok(body) => Ok(body),
             RemoteAnswer::Conflict(_) => Err(Error::rejected("remote read answered a conflict")),
         }
@@ -1422,9 +1420,9 @@ fn artifact(
                     bytes: &bytes,
                 },
                 wake_timeout,
-                |line| eprintln!("{line}"),
+                eprint_line,
             )?;
-            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            print_json(&out);
             Ok(0)
         }
         ArtifactAction::Find {
@@ -1449,7 +1447,7 @@ fn artifact(
                 args.insert("limit".into(), json!(limit));
             }
             let out = read("artifact_find", args)?;
-            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            print_json(&out);
             Ok(0)
         }
         ArtifactAction::Show { id, version, out } => {
@@ -1462,10 +1460,7 @@ fn artifact(
                 let mut args = serde_json::Map::new();
                 args.insert("id".into(), json!(id));
                 let found = read("artifact_show", args)?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&found).unwrap_or_default()
-                );
+                print_json(&found);
                 return Ok(0);
             };
             let mut bytes = Vec::new();
@@ -1526,14 +1521,10 @@ fn artifact(
                     path.display()
                 )));
             }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "file": file,
-                    "written": path.display().to_string(),
-                }))
-                .unwrap_or_default()
-            );
+            print_json(&json!({
+                "file": file,
+                "written": path.display().to_string(),
+            }));
             Ok(0)
         }
     }

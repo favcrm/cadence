@@ -350,6 +350,9 @@ fn cli_effect(verb: &str) -> Effect {
         | "issue_history"
         | "issue_messages"
         | "issue_artifact"
+        | "artifact_find"
+        | "artifact_show"
+        | "artifact_read"
         | "message_read"
         | "message_inbox"
         | "team_list"
@@ -3295,6 +3298,17 @@ pub fn upload_artifact(
     let dir = auth_dir(None).map_err(|_| {
         reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
+    upload_artifact_in(&dir, target, upload, wake_timeout, note)
+}
+
+/// Upload with an explicit credential directory, as in `upload_file_in`.
+fn upload_artifact_in(
+    dir: &Path,
+    target: &RemoteTarget,
+    upload: &ArtifactUpload,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(wake_timeout))
         .ok_or_else(|| reject("invalid wake timeout"))?;
@@ -3312,7 +3326,7 @@ pub fn upload_artifact(
     let request_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
     loop {
         request_timeout(deadline, AUTH_TIMEOUT).map_err(|_| waking())?;
-        let cred = renewed_credential(&dir, target, deadline)?;
+        let cred = renewed_credential(dir, target, deadline)?;
         if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "cli.write") {
             return Err(reject(
                 "artifact put needs the cli.write capability, which this remote login \
@@ -3328,19 +3342,32 @@ pub fn upload_artifact(
                 "stored",
             )));
         }
-        // Past this point the store may already have committed. Only a stated
-        // wake, or the store's own refusal, is a definite answer: a new command
-        // draws a new request id, so a wrong "failed" would add a version.
-        let waking_state = body.as_ref().and_then(|b| b["state"].as_str()) == Some("waking");
-        if status >= 500 && !waking_state {
+        // A board gate or the documented waking response is pre-forward.
+        // Other 5xx replies may hide a committed upload; the native CLI
+        // tracker's refusal codes do not prove anything for this endpoint.
+        let pre_forward = board_gate_refused(body.as_ref())
+            || (status == 503 && body.as_ref().and_then(|b| b["state"].as_str()) == Some("waking"));
+        if status >= 500 && !pre_forward {
             return Err(artifact_outcome_unknown());
         }
         if !(200..300).contains(&status) && status != 503 {
             return Err(artifact_refusal(status, body.as_ref()));
         }
         match classify(status, retry_after, body) {
-            Verdict::Done(Ok(answer)) => return artifact_receipt(answer, upload.bytes),
-            Verdict::Done(Err(_)) => return Err(artifact_outcome_unknown()),
+            Verdict::Done(Ok(answer)) => {
+                // Reject a foreign receipt before hashing the uploaded bytes.
+                if upload
+                    .id
+                    .is_some_and(|id| answer["file"]["id"].as_str() != Some(id))
+                {
+                    return Err(artifact_outcome_unknown());
+                }
+                return artifact_receipt(answer, upload.bytes);
+            }
+            Verdict::Done(Err(_)) if (200..300).contains(&status) => {
+                return Err(artifact_outcome_unknown());
+            }
+            Verdict::Done(Err(error)) => return Err(error),
             Verdict::Conflict(_) => return Err(reject("remote upload conflicted")),
             Verdict::Waking(wait) => {
                 let remaining = deadline
@@ -3364,16 +3391,25 @@ fn artifact_outcome_unknown() -> Error {
     )
 }
 
-/// A success must name what was stored, and its digest must be these bytes.
+/// A success must name a usable version and the digest of the sent bytes.
 fn artifact_receipt(answer: Value, bytes: &[u8]) -> Result<Value> {
-    let local: String = Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
     let file = &answer["file"];
-    if file["id"].as_str().is_none()
-        || file["version"].as_u64().is_none()
-        || file["digest"].as_str() != Some(local.as_str())
+    if !file["id"].as_str().is_some_and(crate::store::artifact_id)
+        || !file["version"].as_u64().is_some_and(|version| version > 0)
+    {
+        return Err(artifact_outcome_unknown());
+    }
+    let digest = file["digest"]
+        .as_str()
+        .filter(|digest| digest.len() == 64)
+        .ok_or_else(artifact_outcome_unknown)?;
+    let hex = b"0123456789abcdef";
+    if !Sha256::digest(bytes)
+        .iter()
+        .zip(digest.as_bytes().chunks_exact(2))
+        .all(|(byte, pair)| {
+            pair[0] == hex[(byte >> 4) as usize] && pair[1] == hex[(byte & 0x0f) as usize]
+        })
     {
         return Err(artifact_outcome_unknown());
     }

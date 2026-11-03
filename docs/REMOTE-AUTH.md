@@ -286,6 +286,12 @@ The gateway's real refusal shapes (AOS-243):
   grant-allow receipt does not echo the request id. Their shapes alone cannot
   prove a request-to-grant correlation; inspect `settings agents grant list`
   when that correlation is needed.
+- `artifact put` confirms the uploaded bytes and a usable version; when an
+  existing artifact ID was requested, the receipt must name that same ID.
+  A lost or unproved answer is unknown: inspect `artifact find` in the same
+  workspace before repeating an upload that could add another version. The
+  native CLI route's `tracker_unavailable` proof does not apply to this
+  separate upload endpoint.
 - A `503` whose safe `error.code` is `mutation_outcome_uncertain` or
   `invite_email_uncertain` is the platform stating that a mutation may already
   have committed. It is its own category, not availability.
