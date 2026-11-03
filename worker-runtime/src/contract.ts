@@ -175,7 +175,20 @@ export interface ThreadContext {
  * `requestModel` is the only model path: the runtime never calls a provider,
  * holds provider credentials or chooses a fallback route.
  */
+/** A host's addition to the board's thread entries; see `projectThread`. */
+export type ThreadProjection = (
+  entries: readonly ThreadEntry[],
+) => readonly ThreadEntry[];
+
 export interface HostedSessionOptions {
+  /**
+   * Add host entries to what the board reads, on every thread path. It sees a
+   * copy of the projection, and changes neither stored records nor what the
+   * model receives. Must be synchronous and repeatable, and return ascending
+   * `seq` values that stay stable as the thread grows, because clients resume
+   * from them. Absent, the runtime's entries are returned unchanged.
+   */
+  readonly projectThread?: ThreadProjection;
   /** The platform default alias this deployment sends. */
   readonly modelAlias: string;
   /**

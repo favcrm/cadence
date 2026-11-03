@@ -17,6 +17,7 @@ export type {
   RuntimeTools,
   ThreadContext,
   ThreadEntry,
+  ThreadProjection,
   ToolContent,
   ToolContext,
   ToolInvocation,
