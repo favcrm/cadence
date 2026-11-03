@@ -15,7 +15,7 @@ import { ROLES } from "../settings/ModelDefaults";
 import RecruitChat from "./RecruitChat";
 import AgentPage from "./AgentPage";
 import HireSheet from "./HireSheet";
-import ProfileSeat, { ConnectRuntime } from "./ProfileSeat";
+import ProfileSeat, { ConnectRuntime, ProfileSheet } from "./ProfileSeat";
 import NewAgentDialog from "./NewAgentDialog";
 import Recruit from "./Recruit";
 import { HireGate, RoleCard } from "./RecruitCards";
@@ -35,6 +35,7 @@ import {
   agentOrder,
   profileMatchesFilter,
   profileMatchesSearch,
+  profileWork,
   type AgentFilter,
 } from "./agentView";
 import "./agents.css";
@@ -88,6 +89,7 @@ export default function Agents({
   const [creating, setCreating] = useState(false);
   const [picked, setPicked] = useState<AgentRole | null>(null);
   const [joined, setJoined] = useState<{ profile: HiredProfile; role: AgentRole } | null>(null);
+  const [openProfile, setOpenProfile] = useState<string | null>(null);
   const roles = useAgentRoles();
   const installed = useQuery(resources.apps);
   const hireBlock = useContext(HireBlock);
@@ -127,6 +129,10 @@ export default function Agents({
   const groups = allAgents.filter((a) => a.role === "pm").map((a) => a.alias);
   const taken = [...allAgents.map((a) => a.alias), ...profiles.map((p) => p.alias)];
   const askMaster = onAsk;
+  const profileTitle = (profile: HiredProfile) =>
+    roles.data?.roles.find((r) => r.id === profile.catalogue)?.title ?? profile.role;
+  const issueCards = issuesState.data ?? [];
+  const detailProfile = profiles.find((p) => p.id === openProfile);
   const hired = (profile: HiredProfile, role: AgentRole) => {
     setPicked(null);
     setJoined({ profile, role });
@@ -287,9 +293,9 @@ export default function Agents({
               <ProfileSeat
                 key={`profile-${profile.id}`}
                 profile={profile}
-                roleTitle={roles.data?.roles.find((r) => r.id === profile.catalogue)?.title ?? profile.role}
-                hosted={hosted}
-                groups={groups}
+                roleTitle={profileTitle(profile)}
+                work={profileWork(profile, issueCards)}
+                onOpen={() => setOpenProfile(profile.id)}
               />
             ))}
             {tile}
@@ -321,6 +327,18 @@ export default function Agents({
         </>
       )}
       {sheet}
+      {detailProfile && (
+        <ProfileSheet
+          key={detailProfile.id}
+          profile={detailProfile}
+          roleTitle={profileTitle(detailProfile)}
+          work={profileWork(detailProfile, issueCards)}
+          hosted={hosted}
+          groups={groups}
+          onClose={() => setOpenProfile(null)}
+          onOpenIssue={onOpenIssue}
+        />
+      )}
       {creating && <NewAgentDialog onClose={() => setCreating(false)} onCreated={() => onRetry()} />}
     </main>
   );

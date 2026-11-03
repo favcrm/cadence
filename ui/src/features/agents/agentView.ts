@@ -1,7 +1,7 @@
 import { agentOn } from "../../lib/agentOn";
 import type { Agent } from "../../lib/types";
 import { agentIssueIds, type IssueIndex } from "../../lib/scope";
-import type { HiredProfile } from "../../lib/types";
+import type { HiredProfile, IssueCard } from "../../lib/types";
 
 export const AGENT_FILTERS = [
   { value: "current", label: "Current" },
@@ -221,4 +221,24 @@ export function profileMatchesSearch(p: HiredProfile, query: string): boolean {
   const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
   const text = [p.alias, p.role, p.team_role, p.catalogue].filter(Boolean).join(" ").toLowerCase();
   return terms.every((term) => text.includes(term));
+}
+
+/** The issue a profile's card names, and whether it is still open. */
+export interface ProfileWork {
+  issue: IssueCard;
+  open: boolean;
+}
+
+const CLOSED_STATUSES = new Set(["done", "dropped"]);
+
+/** The newest open issue a profile owns, else the newest it finished. `null`
+ *  when the board records none: a hosted claim sets no owner (CAD-1990), so
+ *  this is what the board knows, never an inferred job. */
+export function profileWork(p: HiredProfile, issues: IssueCard[]): ProfileWork | null {
+  const owned = issues
+    .filter((issue) => issue.owner === p.alias && !issue.container)
+    .sort((a, b) => b.created.localeCompare(a.created) || b.id.localeCompare(a.id, undefined, { numeric: true }));
+  const open = owned.find((issue) => !CLOSED_STATUSES.has(issue.status));
+  if (open) return { issue: open, open: true };
+  return owned[0] ? { issue: owned[0], open: false } : null;
 }
