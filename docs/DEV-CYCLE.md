@@ -22,8 +22,9 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    emergency path). For a bug fix, show the failing case once, then fixed.
    Add checks only under AGENTS.md's behavior-first and gates/security rules;
    do not restore retired tests or routinely repeat suites. `--tests` is a
-   focused diagnostic, not a blanket pre-review prerequisite; required CI and
-   full merge-group regression remain unchanged.
+   focused diagnostic, not a blanket pre-review prerequisite; required CI
+   (fmt, clippy, build, ui, cross-build) is unchanged, and the suite runs in
+   `tests.yml` on a schedule and on demand (CAD-1970).
 4. Under strict requirements, one independent reviewer; two for auth, identity,
    secrets, the daemon trees and UI paths (`docs/roles/one-review-paths.toml`
    lists what gets one).
@@ -38,7 +39,7 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    sensitive cases retain strict legacy floors. Explicitly approved custom
    policies remain in force and strict; malformed or unapproved policy changes
    fail closed. Approved version-one profiles remain readable for compatibility.
-   Mandatory protection checks, full merge-group regression, credential
+   Mandatory protection checks, required CI (the suite runs in `tests.yml`, CAD-1970), credential
    isolation and operator-owned deployment remain unchanged. No fabricated
    verdict/readiness counts as review or outcome evidence; dry-run is read-only
    and requirements must be freshly bound before queueing.
@@ -363,13 +364,13 @@ merge approval on the **literal full SHA** just reviewed. Example syntax
 (the example SHA must be replaced with the actual reviewed head before use):
 
 ```sh
-cadence audit approve --repo favcrm/cadence --pr <PR> --head <FULL_REVIEWED_SHA> --source "Operator in chat: approves the reviewed green PR head."
+cadence audit approve --project <key> --issue <ID> --pr <PR> --head <FULL_REVIEWED_SHA> --source "Operator in chat: approves the reviewed green PR head."
 ```
 
 On a hosted org the approval is project-scoped and names the ticket it
-authorizes, so the paste-ready form adds `--project <key> --issue <ID>`
-(CAD-2001); a hosted approval without them is refused rather than inferred
-from the repo. A local approval stays repo-scoped.
+authorizes, hence `--project <key> --issue <ID>` (CAD-2001); a hosted approval
+without them is refused rather than inferred from the repo. A local approval
+stays repo-scoped and may use `--repo favcrm/cadence` instead.
 
 Provide the operator a concrete paste-ready version with no placeholders,
 `read`, guessed SHA, or source over 200 characters. The agent never executes
@@ -379,6 +380,14 @@ the approval itself. Record the returned approval id on the ticket, then:
 scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA> --dry-run
 scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA>
 ```
+
+Temporary path (CAD-1946; remove this note when it ends): while the hosted
+reviewer attestation cannot be produced, add `--exception --advisory
+standards=<url> --advisory spec-security=<url>` (plus `--advisory
+browser-qa=<url>` for a `ui/` change) to the enqueue. It waives only the
+missing reviewer attestation. The advisory reviews are PR comments posted by
+separately assigned sessions, and the operator approves each exact head. The
+path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10).
 
 The helper enforces exact-head checks, verdicts, evidence and approval. Queue
 position is not merge evidence: watch the merge-group run and verify the

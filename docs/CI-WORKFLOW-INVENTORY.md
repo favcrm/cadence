@@ -1,15 +1,18 @@
 # Workflow inventory after #738 (CAD-1088)
 
 This inventory was taken during the reduced-gate window; CAD-1102 ended that
-window and made the current gate permanent. Required branch checks observed at the start of CAD-1088 are **fmt,
-clippy, test, build, ui**; neither `test-shard` nor `test-once` is required.
+window and made the current gate permanent. Required branch checks observed at the start of CAD-1088 were **fmt,
+clippy, test, build, ui**; neither `test-shard` nor `test-once` was required.
+Since CAD-1970 `ci.yml` has no `test` job: the required gates are **fmt,
+clippy, build, ui and cross-build (required)**, and the suite runs in
+`tests.yml` on a schedule and on demand.
 No branch/ruleset settings are changed by this cleanup. The last three rows
 were added when those workflows landed (CAD-1455, CAD-1506, CAD-1475); the
 rest of the table records the CAD-1088 snapshot.
 
 | Workflow | Triggers | Current role |
 | --- | --- | --- |
-| `ci.yml` | PR, merge group, main push, v tags, dispatch (`native_fixture`) | Five required gates; exact-SHA queue reuse; isolated cache writer; guarded release chain; the C1 proof is opt-in per dispatch (CAD-1970) |
+| `ci.yml` | PR, merge group, main push, v tags, dispatch (`native_fixture`) | Five required gates (fmt, clippy, build, ui, cross-build); exact-SHA queue reuse; isolated cache writer; guarded release chain; the C1 proof is opt-in per dispatch (CAD-1970) |
 | `staging.yml` | Filtered PR, dispatch, 15-minute schedule, main CI completion | PR migration rehearsal active; select/stage/promote refuse reduced source trees |
 | `e2e.yml` | Nightly, v tags, dispatch | MVP journey retired; cargo-only seam-exclusion probe, not E2E coverage |
 | `clean-install.yml` | Filtered PR, dispatch | Installer fixtures retired; native installation dispatch scaffolding remains |

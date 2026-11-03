@@ -2,20 +2,21 @@
 
 ## Current state: the permanent gate (CAD-1102; window history below)
 
-CAD-1073 / PR #738 retired the legacy integration suite. The required `test`
-check compiles and runs four `safety_floor` tests; green means that floor
-passed, **not** full behavior coverage. `fmt`, `clippy`, `build` and `ui`
-remain required on PRs and merge groups. CAD-1088 selects PR feedback from a
-classifier loaded from the base commit: isolated docs use no compilation;
-isolated UI code runs UI validation but not unrelated default Rust gates;
-edits confined to pre-existing independent top-level `tests/<name>.rs`
-targets run the rust gates with only those integration targets (lib and
-bins suites unchanged).
+CAD-1073 / PR #738 retired the legacy integration suite, and CAD-1970 took the
+suite off the pull-request path: `ci.yml` has no `test` job and no
+`safety_floor` gate. The required checks are `fmt`, `clippy`, `build`, `ui` and
+`cross-build (required)`, on PRs and merge groups. They prove the code
+compiles, lints and builds the release seam, **not** behavior coverage; the
+suite runs in `tests.yml` on a schedule and on demand, and is not a required
+check. CAD-1088 selects PR feedback from a classifier loaded from the base
+commit: isolated docs use no compilation; isolated UI code runs UI validation
+but not unrelated default Rust gates; edits confined to pre-existing
+independent top-level `tests/<name>.rs` targets run the rust gates.
 Required contexts explicitly report not-applicable commands rather than
 claiming to build. Governance, workflow, scripts, dependency manifests, mixed
 or unknown changes run all gates. Merge groups always run the full current
-validation (including the reduced floor); the narrowed `tests` scope is
-pull_request feedback only and the runner refuses it on any other event.
+validation; the narrowed `tests` scope is pull_request feedback only and the
+runner refuses it on any other event.
 Fast PR feedback is not evidence for skipping integration validation. `scripts/require-full-gates` refuses
 release artifacts, candidate staging and promotion from any source SHA that
 commits `.github/reduced-gates`. CAD-1102 ended the CAD-1073 window by
