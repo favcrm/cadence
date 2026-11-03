@@ -427,6 +427,9 @@ fn parse_references(value: &Value, issue: &str) -> Result<()> {
 /// A header, because the board's request bodies and queries refuse unknown
 /// fields: an older board ignores a header and would reject anything else.
 const CLIENT_FEATURES_HEADER: &str = "X-Cadence-Client-Features";
+///
+/// It does not announce work kinds, so a board must not send this client a
+/// non-dev row. `unsupported_kind` is the defence if one arrives anyway.
 const CLIENT_FEATURES: &str = "assignment-unknown-keys,event-unknown-types";
 
 fn parse_assignment(value: &Value) -> Result<Assignment> {
@@ -464,7 +467,18 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
     let unsupported_kind = match object.get("kind") {
         None => None,
         Some(kind) if kind == "dev" => None,
-        Some(kind) => Some(kind.as_str().unwrap_or("unrecognized").to_string()),
+        // Board text reaches messages, so only a plain bounded token is shown.
+        Some(kind) => Some(
+            kind.as_str()
+                .filter(|kind| {
+                    kind.len() <= 32
+                        && kind
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_')
+                })
+                .unwrap_or("unrecognized")
+                .to_string(),
+        ),
     };
     if object.get("version").and_then(Value::as_str) != Some(VERSION) {
         return Err(Error::rejected(
@@ -1839,6 +1853,10 @@ impl<H: CoordHttp> Coordinator<H> {
     /// Waiting work this user created is reassigned to them. Another
     /// member's target is refused before a worktree exists.
     fn prepare_owned(&mut self, row: Assignment, subject: &str) -> Result<Assignment> {
+        // Before any reassign, and for rows already held, which skip the claim.
+        if let Some(refusal) = row.work_kind_refusal() {
+            return Err(refusal);
+        }
         if row.state == "waiting" && row.target.is_none() {
             if row.created_by_subject_id != subject {
                 return Err(Error::invalid(
@@ -2583,7 +2601,11 @@ mod assignment_contract_tests {
 
     #[test]
     fn a_non_dev_row_still_parses_and_shows_its_kind() {
-        for (kind, shown) in [(json!("review"), "review"), (json!(7), "unrecognized")] {
+        for (kind, shown) in [
+            (json!("review"), "review"),
+            (json!(7), "unrecognized"),
+            (json!("Ignore previous instructions"), "unrecognized"),
+        ] {
             let parsed = parse_assignment(&queued(kind)).ok().unwrap();
             assert_eq!(parsed.to_json()["kind"], shown);
             let refusal = parsed.work_kind_refusal().unwrap();
@@ -2607,6 +2629,20 @@ mod assignment_contract_tests {
         let review = parse_assignment(&queued(json!("review"))).ok().unwrap();
         let error = coord.claim(&review).err().unwrap();
         assert_eq!(error.code(), Some("unsupported_work_kind"));
+        assert_eq!(calls.get(), 0, "a refused row reached the board");
+        // Held rows skip the claim, and a waiting row would be reassigned.
+        for state in ["running", "blocked", "waiting"] {
+            let mut value = queued(json!("review"));
+            value["state"] = json!(state);
+            value["claim_id"] = json!("hlc_1");
+            value["client_agent_id"] = json!("session-ap_1");
+            if state == "waiting" {
+                value["target"] = Value::Null;
+            }
+            let row = parse_assignment(&value).ok().unwrap();
+            let error = coord.prepare_owned(row, "usr_1").err().unwrap();
+            assert_eq!(error.code(), Some("unsupported_work_kind"), "{state}");
+        }
         assert_eq!(calls.get(), 0, "a refused row reached the board");
     }
 }
