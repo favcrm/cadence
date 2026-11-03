@@ -57,7 +57,9 @@ export function masterState(
             streaming: status.running,
             compacting: false,
           },
-    commands: [],
+    // What the board host relays to this session. The composer offers these
+    // and nothing else, so a verb is listed only once the host has its route.
+    commands: ["new", "stop"],
     turn: status.running
       ? {
           state: "working",

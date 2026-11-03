@@ -56075,7 +56075,7 @@ function masterState(model, status, conversationId, metadata) {
       streaming: status.running,
       compacting: false
     },
-    commands: [],
+    commands: ["new", "stop"],
     turn: status.running ? {
       state: "working",
       message: status.message ?? null,
