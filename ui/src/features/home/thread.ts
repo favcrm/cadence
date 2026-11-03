@@ -505,9 +505,12 @@ export function sendBefore(items: ThreadItem[], runItems: ThreadItem[], queued: 
  *  queued or interleaved turn must not be marked busy, and must not have
  *  the placeholder of the send actually running suppressed. A queued user
  *  row can sit between the running send and its first assistant rows, so
- *  an empty matching run falls through to the tail run. */
-export function inFlightTurnKey(items: ThreadItem[], message: string | null): string | null {
-  if (message === null || message === "") return null;
+ *  an empty matching run falls through to the tail run.
+ *
+ *  `unnamed` says a turn is verified working with no id. Without it a null
+ *  id is a send still in flight, which must not claim an older run. */
+export function inFlightTurnKey(items: ThreadItem[], message: string | null, unnamed = false): string | null {
+  if ((message === null || message === "") && !unnamed) return null;
   // A failed pending row stays visible for Retry/Discard but is not a live
   // send: it neither bounds nor names the running turn.
   const isUser = (item: ThreadItem) =>
@@ -534,6 +537,16 @@ export function inFlightTurnKey(items: ThreadItem[], message: string | null): st
     }
     return { key: first, present };
   };
+  // A turn the host reports as working without naming it (hosted boards send
+  // `message: null`) is the newest stored send's. A pending row has no stored
+  // entry yet, so it has not started and cannot be what is running.
+  if (message === null || message === "") {
+    let lastOperator = -1;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type === "operator") lastOperator = i;
+    }
+    return runAfter(lastOperator + 1).key;
+  }
   const idx = items.findIndex((item) => isUser(item) && itemMessage(item) === message);
   if (idx >= 0) {
     const run = runAfter(idx + 1);

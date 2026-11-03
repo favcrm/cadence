@@ -392,6 +392,41 @@ async function main() {
   await settle();
   assert(host.querySelectorAll('[data-kind="typing"]').length === 0, "the typing bubble clears once the send settles out of submitting");
 
+  // CAD-2011: a hosted board reports its running turn with no message id and
+  // its agent rows carry none either. That is still one live turn: no second
+  // head, no finished look, and no interim note promoted to an answer.
+  const hostedState = (turn: unknown) => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "cadence", endpoint_kind: "durable_object", live: true, turn, queue: [] }) as never;
+  const hostedTurn = { state: "working", message: null, conversation: "home-thread", app_origin: null, summary: null, since: null };
+  await React.act(async () => {
+    resources.masterState.write(() => hostedState(hostedTurn));
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [],
+      entries: [
+        { seq: 70, role: "operator", kind: "message", message: "ui-hosted", text: "Hosted ask" },
+        { seq: 71, role: "agent", kind: "tool_call", text: "catalog_search: website" },
+        { seq: 72, role: "agent", kind: "tool_result", text: "ok" },
+        { seq: 73, role: "agent", kind: "assistant_text", text: "Checking drafts as well" },
+      ],
+    }));
+  });
+  await settle();
+  assert(host.querySelectorAll(".turn-head").length === 1, `a hosted working turn paints one head (got ${host.querySelectorAll(".turn-head").length})`);
+  const hostedHead = host.querySelector(".turn-head");
+  assert(host.querySelector('[data-kind="turn"]')?.getAttribute("data-turn-state") === "running", "the hosted run paints as running, not finished");
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "the hosted run has one typing row");
+  assert(host.querySelector('[data-kind="answer"]') === null && !host.textContent?.includes("Earlier transcript"), "an interim note stays in the trace while the hosted turn runs");
+  await React.act(async () => {
+    resources.masterState.write(() => hostedState(null));
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [...state!.entries, { seq: 74, role: "agent", kind: "turn_result", text: "Hosted answer" }],
+    }));
+  });
+  await settle();
+  assert(host.querySelectorAll(".turn-head").length === 1 && host.querySelectorAll('[data-kind="answer"]').length === 1, "the answer lands under the one head");
+  assert(host.querySelector(".turn-head") === hostedHead, "the answer lands under the same head, not a remounted one");
+
 
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();

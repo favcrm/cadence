@@ -796,6 +796,31 @@ assert(coldRuns[1].querySelector(".turn-head") !== null, "the new send paints it
 assert(coldRuns[1].querySelector('[data-kind="typing"]') !== null, "the new send's run owns the typing bubble");
 assert(coldRuns[0].querySelector('[data-kind="typing"]') === null, "the historical run is not typing for the new send");
 equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows cold history");
+// CAD-2011: a hosted board reports its working turn with no message id. The
+// open run is that turn: it types, and no second assistant head follows it.
+{
+  const before = turn;
+  convs["install-crm"].push(conv("c-hosted", { title: "Hosted turn" }));
+  threads["c-hosted"] = [
+    ent(1, "operator", "message", "hosted ask", "m-hosted"),
+    ent(2, "agent", "tool_call", "catalog_search: website", null),
+    ent(3, "agent", "tool_result", "ok", null),
+  ];
+  turn = { state: "working", message: null, conversation: "c-hosted" } as never;
+  await React.act(async () => { await conversationList("install-crm").refresh(); });
+  await settle();
+  await pick("Hosted turn");
+  await React.act(async () => {
+    await conversationThread("c-hosted").refresh();
+    await resources.masterConversation("c-hosted").refresh();
+  });
+  await settle();
+  equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "the open run types for an unnamed turn");
+  equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows an unnamed turn's run");
+  turn = before;
+  await React.act(async () => { await resources.masterConversation("c-hosted").refresh(); });
+  await settle();
+}
 // A differing daemon id whose rows are untagged must keep the adopted send
 // when the queue changes; otherwise the queued send steals the identity.
 convs["install-crm"].push(conv("c-split2", { title: "Split turn two" }));
