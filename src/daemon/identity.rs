@@ -380,6 +380,7 @@ impl Shared {
                 )),
             };
         }
+        crate::peer::refuse_agent_runtime(peer_pid, &self.state_dir)?;
         let panes = crate::peer::AgentPids::classify(self.store.pty_pane_pids().map_err(|e| {
             format!("the registered panes cannot be read to prove this connection is not one ({e})")
         })?)

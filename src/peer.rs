@@ -56,6 +56,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::Path;
 
 use crate::adapter::pty::caller_chain;
 use crate::error::Error;
@@ -339,6 +340,61 @@ pub(crate) fn operator_proof(
         ));
     }
     Ok(())
+}
+
+/// Set in the environment of a coding agent's process and its shells.
+const AGENT_RUNTIME_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "PI_CODING_AGENT",
+    "PI_SESSION_ID",
+];
+
+fn agent_runtime_marker(environ: &[u8]) -> Option<&'static str> {
+    environ.split(|b| *b == 0).find_map(|kv| {
+        let key = kv.split(|b| *b == b'=').next()?;
+        AGENT_RUNTIME_MARKERS
+            .iter()
+            .find(|marker| marker.as_bytes() == key)
+            .copied()
+    })
+}
+
+/// CAD-2059: a coding agent started by hand is no pane or managed endpoint,
+/// so [`operator_proof`] accepts it. On the production store, a known runtime
+/// marker on the caller's ancestry refuses it. This only narrows (ADR 0005 P3):
+/// it stops an agent acting as the operator by accident, and one that scrubs
+/// its environment still passes. An unreadable hop is skipped, as in
+/// [`operator_proof`].
+pub(crate) fn refuse_agent_runtime(peer_pid: u32, state_dir: &Path) -> Result<(), String> {
+    if !production_store(state_dir) {
+        return Ok(());
+    }
+    let chain = caller_chain(peer_pid)
+        .ok_or_else(|| format!("pid {peer_pid}: /proc ancestry unreadable"))?;
+    for hop in chain {
+        let Ok(environ) = std::fs::read(format!("/proc/{hop}/environ")) else {
+            continue;
+        };
+        if let Some(marker) = agent_runtime_marker(&environ) {
+            return Err(format!(
+                "pid {hop} on its ancestry carries {marker} — a coding agent's session, \
+                 including its `!` commands; use a plain terminal"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A store other than the default is disposable and holds nothing of the
+/// operator's, and agents run such stores for isolated checks. If the default
+/// cannot be resolved, the store counts as production.
+fn production_store(state_dir: &Path) -> bool {
+    let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    crate::client::default_state_dir()
+        .map_or(true, |default| resolved(&default) == resolved(state_dir))
 }
 
 /// Who is asking to change or delete an agent row — derived from the
@@ -927,6 +983,64 @@ mod tests {
     /// start time read from `/proc` now.
     fn recorded(alias: &str, pid: u32) -> AgentPids {
         AgentPids::classify([(alias.to_string(), pid, proc_starttime(pid))])
+    }
+
+    #[test]
+    fn agent_runtime_markers_match_whole_keys_only() {
+        for marker in AGENT_RUNTIME_MARKERS {
+            let environ = format!("PATH=/bin\0{marker}=1\0HOME=/h\0");
+            assert_eq!(agent_runtime_marker(environ.as_bytes()), Some(*marker));
+        }
+        // An empty value is still the marker: only the key is read.
+        assert_eq!(agent_runtime_marker(b"CLAUDECODE=\0"), Some("CLAUDECODE"));
+        for clean in [
+            &b""[..],
+            b"PATH=/bin\0HOME=/h\0",
+            b"NOT_CLAUDECODE=1\0",
+            b"CLAUDECODE_X=1\0",
+            b"NOTE=CLAUDECODE=1\0",
+            b"DBUS_SESSION_BUS_ADDRESS=x\0XDG_SESSION_ID=1\0",
+        ] {
+            assert_eq!(agent_runtime_marker(clean), None);
+        }
+    }
+
+    #[test]
+    fn a_store_other_than_the_default_is_not_guarded() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!production_store(dir.path()));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .env("CLAUDECODE", "1")
+            .spawn()
+            .unwrap();
+        let result = refuse_agent_runtime(child.id(), dir.path());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn the_default_store_refuses_a_marker_on_the_ancestry() {
+        let default = crate::client::default_state_dir().unwrap();
+        assert!(production_store(&default));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .env("PI_CODING_AGENT", "true")
+            .spawn()
+            .unwrap();
+        // /proc/<pid>/environ reflects the exec only once it has happened.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut result = refuse_agent_runtime(child.id(), &default);
+        while result.is_ok() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            result = refuse_agent_runtime(child.id(), &default);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let why = result.unwrap_err();
+        assert!(why.contains("PI_CODING_AGENT"), "{why}");
+        assert!(why.contains("plain terminal"), "{why}");
     }
 
     #[test]
