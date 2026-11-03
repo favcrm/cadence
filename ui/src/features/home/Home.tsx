@@ -13,6 +13,7 @@ import {
   kvRows,
   MASTER,
   masterStatus,
+  restingStatus,
   SLASH_COMMANDS,
   START_COMMAND,
   RESUME_COMMAND,
@@ -921,6 +922,23 @@ function MasterHome({
     turnBar.kind === "approval" ||
     turnBar.kind === "sending" ||
     turnBar.kind === "queued";
+  // The header's plain-word status. A state this list does not know is shown
+  // as it is, never rounded up to "Available".
+  const headerChip = (() => {
+    const warn = "bg-warn/10 text-warn";
+    const ok = "bg-ok/15 text-ok";
+    if (status.kind === "unknown") return { label: status.kind, tone: "bg-ink-800 text-ink-400" };
+    if (status.kind !== "running") return { label: status.kind === "absent" ? t("not started") : status.kind, tone: warn };
+    if (streamReconnecting && activeTurn) {
+      return { label: link === "stopped" ? t("stream stopped") : t("reconnecting…"), tone: warn };
+    }
+    if (turnBar.kind === "approval") return { label: t("Needs you"), tone: warn };
+    if (turnBar.kind === "queued") return { label: t("Queued"), tone: ok };
+    // A turn in another conversation still occupies this assistant.
+    if (activeTurn || master.data?.turn?.state === "working") return { label: t("Working"), tone: ok };
+    const word = restingStatus(status.state);
+    return word === null ? { label: status.state, tone: warn } : { label: t(word), tone: ok };
+  })();
   // CAD-1880: Stop sits in the composer's send slot while this pane's own
   // turn runs. Never while the stream is down: that state is last known.
   const runningMessage =
@@ -1403,22 +1421,11 @@ function MasterHome({
             <div className="assistant-heading-text">
               <div className="assistant-heading-name">
                 <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(actor.read, actor.scope, t)}</h1>
-                <span
-                  className={`chip ${
-                    status.kind === "running"
-                      ? "bg-ok/15 text-ok"
-                      : status.kind === "unknown"
-                        ? "bg-ink-800 text-ink-400"
-                        : "bg-warn/10 text-warn"
-                  }`}
-                >
-                  {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
+                <span className={`chip chip-sans ${headerChip.tone}`} data-assistant-status>
+                  {headerChip.label}
                 </span>
                 <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
                 <HeaderMenu master={master.data} row={masterRow} readOnly={readOnly} scope={scopeDescriptor(actor.scope, t)} />
-                {streamReconnecting && activeTurn && status.kind === "running" && (
-                  <span className="text-micro text-ink-500" data-stale>{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
-                )}
               </div>
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>

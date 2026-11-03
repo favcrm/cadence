@@ -1,4 +1,4 @@
-import { masterModelsOptions, pickLanded } from "../src/features/home/master";
+import { masterModelsOptions, pickLanded, restingStatus } from "../src/features/home/master";
 import type { MasterModels } from "../src/lib/types";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
@@ -66,5 +66,11 @@ function equal(actual: unknown, expected: unknown, what: string): void {
   equal(pickLanded("effort", "high", "high"), true, "effort exact");
   equal(pickLanded("effort", "xhigh/high", "high"), false, "effort has no provider/id form");
 }
+
+// CAD-2013: the header's word for an agent with no turn on this surface.
+equal(restingStatus("idle"), "Available", "idle is available");
+equal(restingStatus("running"), "Available", "a live session between turns is available");
+equal(restingStatus("busy"), "Working", "busy is real work, never available");
+equal(restingStatus("waiting_input"), null, "an unlisted state is not rounded up to healthy");
 
 console.log("master models checks passed");
