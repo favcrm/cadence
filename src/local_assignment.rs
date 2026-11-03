@@ -403,6 +403,12 @@ fn parse_references(value: &Value, issue: &str) -> Result<()> {
     }
 }
 
+/// What this client tolerates, announced on every board request (CAD-2060).
+/// A header, because the board's request bodies and queries refuse unknown
+/// fields: an older board ignores a header and would reject anything else.
+const CLIENT_FEATURES_HEADER: &str = "X-Cadence-Client-Features";
+const CLIENT_FEATURES: &str = "assignment-unknown-keys,event-unknown-types";
+
 fn parse_assignment(value: &Value) -> Result<Assignment> {
     if forbidden_path_key(value) {
         return Err(Error::rejected(
@@ -426,15 +432,20 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
         "reported_head_sha",
         "text",
     ];
+    // An unknown key is ignored so a newer board can add one. Required keys,
+    // their values and the forbidden path check above stay strict.
     let object = value
         .as_object()
-        .filter(|object| {
-            required.iter().all(|key| object.contains_key(*key))
-                && object.keys().all(|key| {
-                    required.contains(&key.as_str()) || key == "references" || key == "profile_id"
-                })
-        })
+        .filter(|object| required.iter().all(|key| object.contains_key(*key)))
         .ok_or_else(|| Error::rejected("coordination response is not the assignment contract"))?;
+    // Ignoring a work kind would run review or research as dev work, so this
+    // one key is refused until this client implements it.
+    if object.get("kind").is_some_and(|kind| kind != "dev") {
+        return Err(Error::invalid(
+            "unsupported_work_kind",
+            "the board returned a work kind this client cannot run; nothing local was started",
+        ));
+    }
     if object.get("version").and_then(Value::as_str) != Some(VERSION) {
         return Err(Error::rejected(
             "coordination response is not the assignment contract",
@@ -2452,5 +2463,74 @@ fn ensure_lane(root: &Path, lane: &str, base_ref: Option<&str>) -> Result<PathBu
             }
             Err(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod assignment_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row() -> Value {
+        json!({
+            "version": VERSION,
+            "assignment_id": "hla_00000000-0000-4000-8000-000000000001",
+            "organization_id": "ws_1",
+            "issue_id": "CAD-1",
+            "action": "start",
+            "execution": "local",
+            "state": "waiting",
+            "generation": 1,
+            "claim_id": null,
+            "target": null,
+            "created_by_subject_id": "usr_1",
+            "client_agent_id": null,
+            "guidance": null,
+            "reported_head_sha": null,
+            "text": null,
+        })
+    }
+
+    #[test]
+    fn the_baseline_row_parses() {
+        assert!(parse_assignment(&row()).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_key_is_ignored() {
+        let mut value = row();
+        value["added_by_a_newer_board"] = json!({"any": "shape"});
+        assert!(parse_assignment(&value).is_ok());
+    }
+
+    #[test]
+    fn a_missing_required_key_is_still_refused() {
+        let mut value = row();
+        value.as_object_mut().unwrap().remove("claim_id");
+        assert!(parse_assignment(&value).is_err());
+    }
+
+    #[test]
+    fn a_forbidden_path_key_is_still_refused() {
+        let mut value = row();
+        value["nested"] = json!({"worktree": "/somewhere"});
+        assert!(parse_assignment(&value).is_err());
+    }
+
+    #[test]
+    fn an_invalid_known_value_is_still_refused() {
+        let mut value = row();
+        value["state"] = json!("invented");
+        assert!(parse_assignment(&value).is_err());
+    }
+
+    #[test]
+    fn a_non_dev_work_kind_is_refused_and_dev_is_not() {
+        let mut value = row();
+        value["kind"] = json!("dev");
+        assert!(parse_assignment(&value).is_ok());
+        value["kind"] = json!("review");
+        let error = parse_assignment(&value).err().unwrap().to_string();
+        assert!(error.contains("work kind"), "{error}");
     }
 }

@@ -912,7 +912,7 @@ fn session(
         if event["version"] != VERSION {
             return Err(Error::rejected("hosted event version is invalid"));
         }
-        match event["type"].as_str() {
+        let retain = match event["type"].as_str() {
             Some("ready") => continue,
             Some("error") => {
                 if matches!(
@@ -950,6 +950,7 @@ fn session(
                 {
                     return Err(Error::rejected("assignment event is invalid"));
                 }
+                true
             }
             Some("agent_notified") => {
                 if event["kind"] != "fyi"
@@ -962,9 +963,14 @@ fn session(
                 {
                     return Err(Error::rejected("agent notice event is invalid"));
                 }
+                true
             }
-            _ => return Err(Error::rejected("hosted event type is invalid")),
-        }
+            // A newer board's event: acknowledged so the stream keeps moving,
+            // never kept or acted on. Events only invalidate; HTTPS stays the
+            // authority, so skipping one loses no work.
+            Some(_) => false,
+            None => return Err(Error::rejected("hosted event type is invalid")),
+        };
         let seq = event["seq"]
             .as_u64()
             .filter(|seq| *seq > 0)
@@ -972,14 +978,7 @@ fn session(
         {
             let _lock = inbox_lock(state)?;
             inbox = load_inbox(state, binding)?;
-            if seq > inbox.cursor {
-                if inbox.entries.len() >= INBOX_LIMIT {
-                    return Err(Error::rejected(
-                        "hosted event inbox is full; observe and clear FYI notices",
-                    ));
-                }
-                inbox.entries.push(event);
-                inbox.cursor = seq; // Recipient sequences are sparse, not contiguous.
+            if record_event(&mut inbox, event, seq, retain)? {
                 atomic(&binding.inbox_path(state), &inbox)?;
             }
         }
@@ -995,6 +994,24 @@ fn session(
     }
     let _ = socket.close(None);
     Ok(())
+}
+
+/// Apply one validated frame to the inbox. A skipped event still moves the
+/// cursor and needs no inbox room. True when the inbox changed and must be saved.
+fn record_event(inbox: &mut Inbox, event: Value, seq: u64, retain: bool) -> Result<bool> {
+    if seq <= inbox.cursor {
+        return Ok(false);
+    }
+    if retain {
+        if inbox.entries.len() >= INBOX_LIMIT {
+            return Err(Error::rejected(
+                "hosted event inbox is full; observe and clear FYI notices",
+            ));
+        }
+        inbox.entries.push(event);
+    }
+    inbox.cursor = seq; // Recipient sequences are sparse, not contiguous.
+    Ok(true)
 }
 
 fn process<F: FnMut(&Kickoff) -> Result<Value>>(
@@ -1113,4 +1130,61 @@ fn process<F: FnMut(&Kickoff) -> Result<Value>>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod record_event_tests {
+    use super::*;
+
+    fn inbox(cursor: u64) -> Inbox {
+        Inbox {
+            version: 1,
+            organization_id: "ws_1".into(),
+            endpoint: "https://example.test".into(),
+            subject_id: "usr_1".into(),
+            issuer: "https://issuer.test".into(),
+            cursor,
+            initialized: true,
+            resumed_operation: None,
+            selected_operation: None,
+            recovery_watermark: None,
+            recovery_notice_after: None,
+            entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_skipped_event_moves_the_cursor_and_keeps_nothing() {
+        let mut inbox = inbox(4);
+        assert!(record_event(&mut inbox, json!({"type": "new"}), 9, false).unwrap());
+        assert_eq!(inbox.cursor, 9);
+        assert!(inbox.entries.is_empty());
+    }
+
+    #[test]
+    fn a_skipped_event_needs_no_inbox_room() {
+        let mut inbox = inbox(4);
+        inbox.entries = vec![json!({}); INBOX_LIMIT];
+        assert!(record_event(&mut inbox, json!({"type": "new"}), 5, false).unwrap());
+        assert_eq!(inbox.cursor, 5);
+        assert_eq!(inbox.entries.len(), INBOX_LIMIT);
+    }
+
+    #[test]
+    fn a_retained_event_is_kept_and_still_refused_when_full() {
+        let mut roomy = inbox(4);
+        assert!(record_event(&mut roomy, json!({"type": "x"}), 5, true).unwrap());
+        assert_eq!(roomy.entries.len(), 1);
+        let mut full = inbox(4);
+        full.entries = vec![json!({}); INBOX_LIMIT];
+        assert!(record_event(&mut full, json!({"type": "x"}), 5, true).is_err());
+        assert_eq!(full.cursor, 4);
+    }
+
+    #[test]
+    fn a_replayed_event_changes_nothing() {
+        let mut inbox = inbox(9);
+        assert!(!record_event(&mut inbox, json!({"type": "x"}), 9, true).unwrap());
+        assert!(inbox.entries.is_empty());
+    }
 }
