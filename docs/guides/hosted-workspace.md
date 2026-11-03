@@ -260,20 +260,65 @@ execution or a result happened; inspect assignment/report state.
 An existing terminal or coding session can work on the named issue instead.
 Check the owning repository's worktree and integration-branch rules first;
 if the supported placement cannot meet them, report the conflict before
-starting. Load the profile, then use the project's actual integration ref:
+starting. Name the profile on the start and use the project's actual
+integration ref; the start returns the profile's context, and `agent context`
+prints it again on its own:
 
 ```sh
-cadence --org acme agent context ap_<profile-id>
 cadence --org acme issue start <issue-id> --repo /absolute/path/to/checkout --profile ap_<profile-id> --base <integration-ref>
+cadence --org acme agent context ap_<profile-id>
 cadence --org acme agent report <assignment-id> --state blocked --text "waiting for the owner"
 ```
 
 `--profile` claims under `session-<profile-id>` without a daemon and targets
 only the named issue. Inspect the receipt for the claim, lane and reporting
 instructions. The board checks claim and generation on reports, but the
-profile-derived client ID is not proof of a distinct session identity.
-`--profile` does not read profile content; load it with `context`. Hiring creates only such a profile (CAD-1989): no runtime, provider, sandbox or model is chosen, nothing launches, and `model` stays `inherit` until a runtime resolves it or one is set explicitly. A native board reads a profile the same way with `cadence agent context <alias>`. The
+profile-derived client ID is not proof of a distinct session identity, and a
+resume under the same profile does not prove a previous worker has stopped:
+the client ID is derived from the profile, so two live sessions on one profile
+are indistinguishable here. Hiring creates only such a profile (CAD-1989): no
+runtime, provider, sandbox or model is chosen, nothing launches, and `model`
+stays `inherit` until a runtime resolves it or one is set explicitly. A native
+board reads a profile the same way with `cadence agent context <alias>`. The
 authenticated caller, not the profile, carries authority.
+
+The start reads that profile's context once, after the claim and lane exist,
+and puts it in the receipt as `context`:
+
+- `status` is `loaded`, `unavailable` or `mismatch`; `profile` is the id asked
+  for; `revision` is the profile's own revision; `unavailable` relays the areas
+  the board could not read and why; `bundle` is the board's `context` object
+  verbatim.
+- `absent` lists contract fields the board did not send, so nothing is
+  defaulted on its behalf. A board older than `profile.model` reports
+  `["profile.model"]`; nothing is cached and nothing is written to the local
+  assignment ledger, so a resume reads the context again.
+- The bundle is checked before it is relayed. A profile without its name, role,
+  responsibilities, skills, status or revision; an identity that is not
+  `attribution: external` with `agent_authenticated: false`; an area that does
+  not say whether it is available; or an unavailable area whose reason the
+  board's `unavailable` list omits all refuse as `malformed_context`, with the
+  field named in `reason`. Unknown extra fields are allowed and ride along, so
+  a newer board is not refused for adding one.
+- A failed or refused read is reported as `unavailable` with one of a fixed set
+  of codes and diagnostics — `capability_unavailable`, `unbound_identity` for a
+  session with no saved-login member and issuer pin, or plain `unavailable` —
+  never the board's or the error's own text, which can carry a credential. A
+  bundle for a different profile is `mismatch`. In every case the claim, lane
+  and worktree in the same receipt are real: nothing is replayed, and no local
+  state stands in for the board's answer.
+- The read is bound to the member and issuer that obtained the claim. The
+  client is opened once for the start, its captured identity is pinned into
+  the read's target, and a saved login replaced mid-run is refused rather
+  than answering with another member's context.
+
+This read is the `cli.read` profile context: the profile's role,
+responsibilities, skills, model and revision, plus the knowledge and memory
+page paths, sizes and revisions with the board's own reasons for any area it
+withheld. It does **not** carry the text of those pages — the bounded content
+path is a wiki-scoped `profile_context` read that this client does not send —
+so treat `bundle` as the profile's identity and an index of its knowledge, and
+read a page through `wiki cat` when its text is needed.
 
 Profile claims depend on the deployed board and client versions. An older
 board may still require the member's registered default alias; report that

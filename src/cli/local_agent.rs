@@ -282,7 +282,69 @@ pub(super) fn start(
         // CAD-1964: the caller is the actor, so this claims under the
         // profile's session id and opens the lane without a local alias,
         // a daemon handoff or any other waiting assignment.
-        return finish(&coordinator(target)?.start_session(id, repo, name, profile, base)?);
+        //
+        // The profile's context is read through `agent_profile_context` —
+        // the caller's own authorized view of that profile — once the claim
+        // and lane exist. A read that fails must not look like a failed
+        // start, replay the claim or strand the lane: the receipt keeps the
+        // claim, lane and worktree and reports the context as unavailable.
+        //
+        // The read is bound to the member and issuer that obtained the claim,
+        // not to whatever login is saved when it runs: the client is opened
+        // once, its captured identity is pinned into the read's target, and a
+        // replaced login is then refused instead of answering with another
+        // member's context. Without a pin the read is refused as unbound.
+        let http = BoardHttp::open(target)?;
+        let pinned = http.pinned_target();
+        let mut coord = http.into_coordinator()?;
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(wake_timeout))
+            .ok_or_else(|| Error::usage("invalid wake timeout"))?;
+        let mut load = |id: &str| -> Result<Value> {
+            let Ok(pinned) = pinned.as_ref() else {
+                let reason = pinned
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "no saved-login member and issuer pin".to_string());
+                return Err(Error::invalid("unbound_identity", reason));
+            };
+            let mut arguments = serde_json::Map::new();
+            arguments.insert("id".to_string(), json!(id));
+            match cadence_agent::remote_cli::call_verb(
+                pinned,
+                "agent_profile_context",
+                arguments,
+                deadline,
+                wake_timeout,
+                |_| {},
+            )? {
+                cadence_agent::remote_cli::RemoteAnswer::Ok(body) => Ok(body),
+                cadence_agent::remote_cli::RemoteAnswer::Conflict(_) => Err(Error::rejected(
+                    "the board answered a conflict instead of a context bundle; nothing was loaded",
+                )),
+            }
+        };
+        let value = coord.start_session(id, repo, name, profile, base, &mut load)?;
+        let context = value.get("context");
+        let status = context
+            .and_then(|context| context.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("unavailable");
+        if status != "loaded" {
+            let code = context
+                .and_then(|context| context.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or(status);
+            let reason = context
+                .and_then(|context| context.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("no reason given");
+            eprintln!(
+                "warning: the profile context was not loaded ({code}): {reason} — the claim and lane above are real; run `cadence agent context {profile}` once the board answers"
+            );
+        }
+        return finish(&value);
     }
     if base.is_some() {
         return Err(Error::usage(
