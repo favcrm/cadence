@@ -246,6 +246,192 @@ fn safe_code(body: &Value) -> String {
     }
 }
 
+/// The parts of the board's context contract this receipt relies on.
+///
+/// A bundle that cannot show them is not relayed as loaded: an absent identity
+/// attestation, or an area that does not say whether it is available, is not
+/// the same as "nothing is missing". Unknown keys are allowed, so a newer
+/// board's extra fields ride along untouched.
+fn context_shape(bundle: &Value) -> std::result::Result<(), &'static str> {
+    let profile = bundle
+        .get("profile")
+        .filter(|profile| profile.is_object())
+        .ok_or("the board's context does not carry a profile object")?;
+    if !profile.get("name").is_some_and(Value::is_string)
+        || !profile.get("role").is_some_and(Value::is_string)
+        || !profile
+            .get("responsibilities")
+            .is_some_and(Value::is_string)
+        || !profile.get("status").is_some_and(Value::is_string)
+        || !profile.get("revision").is_some_and(Value::is_u64)
+        || !profile
+            .get("skills")
+            .and_then(Value::as_array)
+            .is_some_and(|skills| skills.iter().all(Value::is_string))
+    {
+        return Err("the board's context does not carry the profile's name, role, responsibilities, skills, status and revision");
+    }
+    // `model` arrived after the first board that answered this verb, so it is
+    // optional; a present one must still be a string.
+    match profile.get("model") {
+        None | Some(Value::String(_)) => {}
+        Some(_) => return Err("the board's context carries a profile model that is not a string"),
+    }
+    let identity = bundle
+        .get("identity")
+        .filter(|identity| identity.is_object())
+        .ok_or("the board's context does not carry its identity attribution")?;
+    if identity.get("attribution").and_then(Value::as_str) != Some("external")
+        || identity.get("agent_authenticated") != Some(&Value::Bool(false))
+    {
+        return Err("the board's context does not state that it is external context and not an authenticated agent");
+    }
+    let knowledge = bundle
+        .get("knowledge")
+        .filter(|knowledge| knowledge.is_object())
+        .ok_or("the board's context does not carry its knowledge areas")?;
+    let mut missing_reasons = Vec::new();
+    for area in ["profile", "knowledge", "memory"] {
+        let entry = knowledge
+            .get(area)
+            .and_then(Value::as_object)
+            .ok_or("the board's context does not carry all three knowledge areas")?;
+        match entry.get("available") {
+            Some(Value::Bool(true)) => {
+                let pages = entry
+                    .get("pages")
+                    .and_then(Value::as_array)
+                    .ok_or("a knowledge area the board reports as available has no pages list")?;
+                if !pages.iter().all(|page| {
+                    page.get("path").is_some_and(Value::is_string)
+                        && page.get("rev").is_none_or(Value::is_string)
+                }) {
+                    return Err("a knowledge page in the board's context has no path");
+                }
+            }
+            Some(Value::Bool(false)) => {
+                let reason = entry
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .ok_or("a knowledge area the board reports as unavailable has no reason")?;
+                missing_reasons.push(format!("{area}: {reason}"));
+            }
+            _ => {
+                return Err(
+                    "a knowledge area in the board's context does not say whether it is available",
+                )
+            }
+        }
+    }
+    let reported = bundle
+        .get("unavailable")
+        .and_then(Value::as_array)
+        .ok_or("the board's context does not carry its unavailable list")?;
+    if !reported.iter().all(Value::is_string) {
+        return Err("the board's context unavailable list is not a list of reasons");
+    }
+    // Every area the board reports as unavailable must have its own reason in
+    // that list. Extra entries are allowed: a newer board may name more.
+    if missing_reasons.iter().any(|reason| {
+        !reported
+            .iter()
+            .any(|entry| entry.as_str() == Some(reason.as_str()))
+    }) {
+        return Err(
+            "the board's context does not list a reason for an area it reports as unavailable",
+        );
+    }
+    Ok(())
+}
+
+/// A refused context read, in the receipt's own words.
+///
+/// The error's message and its code are never relayed: a wake failure carries
+/// a server-supplied code that can be a whole credential, and this receipt is
+/// printed and read back. Only these fixed pairs leave the process.
+fn context_refusal(code: Option<&str>) -> (&'static str, &'static str) {
+    match code {
+        Some("unbound_identity") => (
+            "unbound_identity",
+            "this session has no saved-login member and issuer pin; the profile context was not read",
+        ),
+        Some("capability_unavailable") => (
+            "capability_unavailable",
+            "the board could not supply the profile context; it was not read",
+        ),
+        _ => (
+            "unavailable",
+            "the profile context could not be read; the claim and lane are unaffected",
+        ),
+    }
+}
+
+/// CAD-1964: read one profile's context for a started session and report
+/// exactly what came back.
+///
+/// The profile is configuration, never a credential, so this grants nothing:
+/// it relays what the board already lets this caller read. A board that cannot
+/// answer, answers a different profile, or answers a bundle that does not carry
+/// the contract is reported as such and its body is not used. Nothing is
+/// cached or persisted: the context is read again on every start and resume.
+fn load_profile_context<C>(profile: &str, load: &mut C) -> Value
+where
+    C: FnMut(&str) -> Result<Value>,
+{
+    let body = match load(profile) {
+        Ok(body) => body,
+        Err(error) => {
+            let (code, reason) = context_refusal(error.code());
+            return json!({
+                "status": "unavailable",
+                "profile": profile,
+                "code": code,
+                "reason": reason,
+            });
+        }
+    };
+    let Some(bundle) = body.get("context").filter(|bundle| bundle.is_object()) else {
+        return json!({
+            "status": "unavailable",
+            "profile": profile,
+            "code": "malformed_context",
+            "reason": "the board answered without a context bundle; nothing was loaded",
+        });
+    };
+    if bundle.pointer("/profile/id").and_then(Value::as_str) != Some(profile) {
+        return json!({
+            "status": "mismatch",
+            "profile": profile,
+            "code": "profile_mismatch",
+            "reason": "the board answered a different profile; its context was not used",
+        });
+    }
+    if let Err(reason) = context_shape(bundle) {
+        return json!({
+            "status": "unavailable",
+            "profile": profile,
+            "code": "malformed_context",
+            "reason": reason,
+        });
+    }
+    // A board older than `profile.model` is valid. Say the field is absent
+    // rather than invent a default; it is the only contract field a board may
+    // omit, and a present one is already checked to be a string.
+    let absent = if bundle.pointer("/profile/model").is_some() {
+        json!([])
+    } else {
+        json!(["profile.model"])
+    };
+    json!({
+        "status": "loaded",
+        "profile": profile,
+        "revision": bundle["profile"]["revision"],
+        "absent": absent,
+        "unavailable": bundle["unavailable"],
+        "bundle": bundle,
+    })
+}
+
 fn forbidden_path_key(value: &Value) -> bool {
     match value {
         Value::Object(object) => object.iter().any(|(key, child)| {
@@ -1881,14 +2067,23 @@ impl<H: CoordHttp> Coordinator<H> {
     /// claim is bound to a client id derived from the profile, which the
     /// board re-checks on every report. A profile is configuration, not a
     /// credential — the authenticated login still carries the authority.
-    pub fn start_session(
+    ///
+    /// `load_context` reads the profile's own context from the caller's
+    /// authorized view. It runs after the claim and lane exist, so a context
+    /// read that fails leaves the started receipt and its lane intact and
+    /// says so, rather than reporting a failed start or replaying the claim.
+    pub fn start_session<C>(
         &mut self,
         issue: &str,
         repo: &Path,
         name: Option<&str>,
         profile: &str,
         base_ref: Option<&str>,
-    ) -> Result<Value> {
+        load_context: &mut C,
+    ) -> Result<Value>
+    where
+        C: FnMut(&str) -> Result<Value>,
+    {
         self.ensure_active()?;
         if !prefixed_id(profile, "ap_") {
             return Err(Error::rejected(
@@ -1957,6 +2152,7 @@ impl<H: CoordHttp> Coordinator<H> {
             }
             Ok(())
         })?;
+        let context = load_profile_context(profile, load_context);
         let mut receipt = json!({
             "version": VERSION,
             "assignment_id": claimed.assignment_id,
@@ -1981,6 +2177,7 @@ impl<H: CoordHttp> Coordinator<H> {
         if let Some(base) = base_ref {
             receipt["base"] = json!(base);
         }
+        receipt["context"] = context;
         Ok(receipt)
     }
 
@@ -2451,6 +2648,376 @@ fn ensure_lane(root: &Path, lane: &str, base_ref: Option<&str>) -> Result<PathBu
                 }
             }
             Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod profile_context {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+
+    const ORG: &str = "ws_cad1964";
+    const ISSUE: &str = "CAD1964";
+    const ME: &str = "usr_me";
+    const PROFILE: &str = "ap_00000000-0000-4000-8000-000000000001";
+    const CLAIM: &str = "hlc_00000000-0000-4000-8000-000000000001";
+    const ASSIGNMENT: &str = "hla_00000000-0000-4000-8000-000000000001";
+
+    /// The board's two calls for a session start, kept as state rather than an
+    /// echo: it creates the assignment itself and the claim moves that row to
+    /// running under the client id the request named.
+    struct Board {
+        calls: Arc<Mutex<Vec<(String, String)>>>,
+        row: Arc<Mutex<Option<Value>>>,
+    }
+
+    impl Board {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                row: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    impl CoordHttp for Board {
+        fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push((method.to_string(), path.to_string()));
+            let mut guard = self.row.lock().expect("row");
+            if method == "GET" {
+                let wanted = path.rsplit("state=").next().unwrap_or("");
+                let assignments = match guard.as_ref() {
+                    Some(row) if row["state"].as_str() == Some(wanted) => json!([row.clone()]),
+                    _ => json!([]),
+                };
+                return Ok(Reply {
+                    status: 200,
+                    body: json!({"version": VERSION, "assignments": assignments}),
+                });
+            }
+            let request = body.cloned().unwrap_or(Value::Null);
+            if path.ends_with("/claim") {
+                let Some(row) = guard.as_mut() else {
+                    return Err(Error::rejected(
+                        "a claim for an assignment this board does not hold",
+                    ));
+                };
+                row["state"] = json!("running");
+                row["claim_id"] = json!(CLAIM);
+                row["client_agent_id"] = request["client_agent_id"].clone();
+                row["profile_id"] = request["profile_id"].clone();
+            } else {
+                *guard = Some(json!({
+                    "version": VERSION,
+                    "assignment_id": ASSIGNMENT,
+                    "organization_id": ORG,
+                    "issue_id": request["issue_id"].clone(),
+                    "action": "start",
+                    "execution": "local",
+                    "state": "queued",
+                    "generation": 1,
+                    "claim_id": Value::Null,
+                    "target": request["target"].clone(),
+                    "created_by_subject_id": ME,
+                    "client_agent_id": Value::Null,
+                    "guidance": Value::Null,
+                    "reported_head_sha": Value::Null,
+                    "text": Value::Null,
+                }));
+            }
+            let row = guard.as_ref().expect("row").clone();
+            Ok(Reply {
+                status: 200,
+                body: row,
+            })
+        }
+    }
+
+    fn repo() -> TempDir {
+        let dir = TempDir::new().expect("repo");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(dir.path().join("f"), "x").expect("file");
+        fs::write(dir.path().join(".gitignore"), "/target\n").expect("ignore");
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("cargo");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        dir
+    }
+
+    /// The coordinator's ledger must be a private directory. A bare TempDir is
+    /// world-readable under the default umask and the production check refuses
+    /// it, so the fixture sets the mode instead of relaxing that check.
+    fn ledger_dir() -> TempDir {
+        let dir = TempDir::new().expect("ledger");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("ledger mode");
+        dir
+    }
+
+    fn coordinator(board: Board, ledger: &TempDir) -> Coordinator<Board> {
+        Coordinator::open(
+            board,
+            ORG.to_string(),
+            ledger.path().to_path_buf(),
+            Some(ME.to_string()),
+            Some("https://platform.test".to_string()),
+            "https://board.test".to_string(),
+        )
+        .expect("coordinator")
+    }
+
+    /// One valid contract bundle: an unavailable profile area, an available
+    /// knowledge area with a page, an unavailable memory area, and the reasons
+    /// the board derives for them.
+    fn bundle(profile: &str) -> Value {
+        json!({
+            "profile": {
+                "id": profile,
+                "name": "Developer",
+                "role": "developer",
+                "responsibilities": "Implement assigned software work.",
+                "skills": ["cadence"],
+                "status": "active",
+                "revision": 3,
+                "model": "inherit",
+            },
+            "identity": {
+                "attribution": "external",
+                "agent_authenticated": false,
+                "note": "context for an external session",
+            },
+            "knowledge": {
+                "profile": {"available": false, "reason": "no such wiki folder"},
+                "knowledge": {
+                    "available": true,
+                    "pages": [{"path": "agents/x/knowledge/a.md", "rev": "wrev_a"}],
+                },
+                "memory": {"available": false, "reason": "no such wiki folder"},
+            },
+            "unavailable": [
+                "profile: no such wiki folder",
+                "memory: no such wiki folder",
+            ],
+        })
+    }
+
+    #[test]
+    fn a_refused_context_read_keeps_the_started_receipt() {
+        for code in ["capability_unavailable", "unbound_identity"] {
+            let ledger = ledger_dir();
+            let repo = repo();
+            let board = Board::new();
+            let calls = board.calls.clone();
+            let mut coord = coordinator(board, &ledger);
+            let mut load = |_: &str| -> Result<Value> {
+                Err(Error::invalid(code, "the context read was refused"))
+            };
+            let receipt = coord
+                .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None, &mut load)
+                .expect("start");
+
+            // The claim, the lane and its checkout are real, and the receipt says so.
+            assert_eq!(receipt["claim_id"], json!(CLAIM));
+            assert_eq!(receipt["state"], json!("running"));
+            assert_eq!(receipt["profile"], json!(PROFILE));
+            assert_eq!(
+                receipt["client_agent_id"],
+                json!(format!("session-{PROFILE}"))
+            );
+            assert!(Path::new(receipt["worktree"].as_str().expect("worktree")).is_dir());
+            // The refused read is reported as missing context, not a failed start.
+            assert_eq!(receipt["context"]["status"], json!("unavailable"));
+            assert_eq!(receipt["context"]["code"], json!(code));
+            assert!(receipt["context"].get("bundle").is_none());
+            // Nothing was replayed after the read was refused: one create, one claim.
+            let calls = calls.lock().expect("calls");
+            let posts = |suffix: &str| {
+                calls
+                    .iter()
+                    .filter(|(method, path)| method.as_str() == "POST" && path.ends_with(suffix))
+                    .count()
+            };
+            assert_eq!((posts("local-assignments"), posts("/claim")), (1, 1));
+        }
+    }
+
+    #[test]
+    fn a_refused_read_never_relays_the_credential_it_was_given() {
+        // A wake failure can carry a server-supplied code that is a whole
+        // credential, and the loader's message can repeat it. Neither may
+        // reach the receipt the caller prints.
+        const CREDENTIAL: &str = "hct_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let ledger = ledger_dir();
+        let repo = repo();
+        let mut coord = coordinator(Board::new(), &ledger);
+        let mut load = |_: &str| -> Result<Value> {
+            Err(Error::invalid(
+                CREDENTIAL,
+                format!("wake_failed: remote org is not running ({CREDENTIAL})"),
+            ))
+        };
+        let receipt = coord
+            .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None, &mut load)
+            .expect("start");
+
+        let printed = receipt.to_string();
+        assert!(!printed.contains(CREDENTIAL));
+        assert!(!printed.contains("hct_"));
+        // The started receipt is still true, with a fixed refusal.
+        assert_eq!(receipt["claim_id"], json!(CLAIM));
+        assert_eq!(receipt["state"], json!("running"));
+        assert!(receipt["lane"]
+            .as_str()
+            .is_some_and(|lane| !lane.is_empty()));
+        assert_eq!(receipt["context"]["status"], json!("unavailable"));
+        assert_eq!(receipt["context"]["code"], json!("unavailable"));
+        assert!(receipt["context"]["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()));
+    }
+
+    #[test]
+    fn the_context_read_reports_the_requested_profile_and_its_revision() {
+        let ledger = ledger_dir();
+        let repo = repo();
+        let mut coord = coordinator(Board::new(), &ledger);
+        let mut load = |id: &str| -> Result<Value> { Ok(json!({"context": bundle(id)})) };
+        let receipt = coord
+            .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None, &mut load)
+            .expect("start");
+
+        assert_eq!(receipt["context"]["status"], json!("loaded"));
+        assert_eq!(receipt["context"]["profile"], json!(PROFILE));
+        assert_eq!(receipt["context"]["revision"], json!(3));
+        assert_eq!(
+            receipt["context"]["bundle"]["profile"]["id"],
+            json!(PROFILE)
+        );
+        assert_eq!(receipt["context"]["absent"], json!([]));
+        assert_eq!(
+            receipt["context"]["unavailable"],
+            json!([
+                "profile: no such wiki folder",
+                "memory: no such wiki folder"
+            ])
+        );
+        assert!(receipt["context"].get("digest").is_none());
+        assert!(receipt["context"].get("unchanged").is_none());
+    }
+
+    #[test]
+    fn an_old_board_bundle_without_model_is_loaded_and_says_so() {
+        let ledger = ledger_dir();
+        let repo = repo();
+        let mut coord = coordinator(Board::new(), &ledger);
+        let mut load = |id: &str| -> Result<Value> {
+            let mut value = bundle(id);
+            value
+                .get_mut("profile")
+                .and_then(Value::as_object_mut)
+                .expect("profile")
+                .remove("model");
+            Ok(json!({"context": value}))
+        };
+        let receipt = coord
+            .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None, &mut load)
+            .expect("start");
+
+        assert_eq!(receipt["context"]["status"], json!("loaded"));
+        assert_eq!(receipt["context"]["absent"], json!(["profile.model"]));
+        assert!(receipt["context"]["bundle"]["profile"]
+            .get("model")
+            .is_none());
+        assert_eq!(receipt["context"]["revision"], json!(3));
+    }
+
+    #[test]
+    fn a_bundle_for_another_profile_is_not_used() {
+        let ledger = ledger_dir();
+        let repo = repo();
+        let mut coord = coordinator(Board::new(), &ledger);
+        let mut load = |_: &str| -> Result<Value> {
+            Ok(json!({"context": bundle("ap_ffffffff-ffff-4fff-8fff-ffffffffffff")}))
+        };
+        let receipt = coord
+            .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None, &mut load)
+            .expect("start");
+
+        assert_eq!(receipt["claim_id"], json!(CLAIM));
+        assert_eq!(receipt["context"]["status"], json!("mismatch"));
+        assert!(receipt["context"].get("bundle").is_none());
+    }
+
+    #[test]
+    fn a_forged_or_incomplete_bundle_is_refused() {
+        let ledger = ledger_dir();
+        let repo = repo();
+        let mut coord = coordinator(Board::new(), &ledger);
+        let mut step = 0;
+        let mut load = |id: &str| -> Result<Value> {
+            let mut value = bundle(id);
+            match step {
+                0 => {}
+                1 => value["identity"]["agent_authenticated"] = json!(true),
+                2 => {
+                    value.as_object_mut().expect("bundle").remove("identity");
+                }
+                3 => value["profile"]["skills"] = json!("cadence"),
+                4 => {
+                    value
+                        .get_mut("knowledge")
+                        .and_then(Value::as_object_mut)
+                        .expect("areas")
+                        .remove("memory");
+                }
+                _ => value["unavailable"] = json!(["profile: no such wiki folder"]),
+            }
+            step += 1;
+            Ok(json!({"context": value}))
+        };
+        let started = coord
+            .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None, &mut load)
+            .expect("start");
+        assert_eq!(started["context"]["status"], json!("loaded"));
+
+        let lane = started["lane"].clone();
+        for _ in 0..5 {
+            let receipt = coord
+                .start_session(ISSUE, repo.path(), Some("work"), PROFILE, None, &mut load)
+                .expect("resume");
+            // The claim and its lane survive a bundle that cannot be trusted.
+            assert_eq!(receipt["claim_id"], json!(CLAIM));
+            assert_eq!(receipt["lane"], lane);
+            assert_eq!(receipt["context"]["status"], json!("unavailable"));
+            assert_eq!(receipt["context"]["code"], json!("malformed_context"));
+            assert!(receipt["context"].get("bundle").is_none());
+            assert!(receipt["context"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()));
         }
     }
 }
