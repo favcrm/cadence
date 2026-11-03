@@ -683,12 +683,17 @@ mod cad2081_workflow_verdicts {
             put(d, SPEC_FILE, "spec workflow v1\n");
             put(d, "README", "base\n");
             for file in [
-                "docs/guides/a.md",
-                "docs/guides/b.md",
                 "design-plans/p/a.md",
+                "design-plans/p/b.md",
+                "design-plans/p/run.md",
             ] {
                 put(d, file, "base\n");
             }
+            std::fs::set_permissions(
+                d.join("design-plans/p/run.md"),
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .unwrap();
             let base = commit(d, "base");
             // A superseded workflow, and one without the file, off the base.
             git(d, &["checkout", "-q", "-b", "old", &base]);
@@ -718,7 +723,7 @@ mod cad2081_workflow_verdicts {
             git(d, &["checkout", "-q", "-b", "tip2", &tip]);
             let tip_same = commit(d, "an unrelated change after the tip");
             git(d, &["checkout", "-q", "main"]);
-            put(d, "docs/guides/x.md", "x\n");
+            put(d, "design-plans/x.md", "x\n");
             let head = commit(d, "an allowlisted change");
             Fixture {
                 dir,
@@ -756,7 +761,7 @@ mod cad2081_workflow_verdicts {
         }
 
         /// A head whose only change adds `entries` (raw tree lines, e.g. a file named
-        /// `..`) under docs/guides, built with plumbing because git refuses them otherwise.
+        /// `..`) under design-plans/p, built with plumbing because git refuses them otherwise.
         fn odd_head(&self, entries: &str) -> String {
             let d = self.work();
             let tree = |input: &str| {
@@ -783,7 +788,7 @@ mod cad2081_workflow_verdicts {
             let blob = git(&d, &["rev-parse", &format!("{}:README", self.base)]);
             let inner = tree(&format!("100644 blob {blob}\tx.md\n"));
             let entries = entries.replace("BLOB", &blob).replace("TREE", &inner);
-            // Rebuild root -> docs -> guides from the base's own entries, plus the odd ones.
+            // Rebuild root -> design-plans -> p from the base's own entries, plus the odd ones.
             let keep = |rev: &str, name: &str| {
                 git(&d, &["ls-tree", rev])
                     .lines()
@@ -791,12 +796,12 @@ mod cad2081_workflow_verdicts {
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            let base_guides = git(&d, &["ls-tree", &format!("{}:docs/guides", self.base)]);
-            let guides = tree(&format!("{base_guides}\n{entries}"));
-            let docs = keep(&format!("{}:docs", self.base), "guides");
-            let docs = tree(&format!("{docs}\n040000 tree {guides}\tguides\n"));
-            let root = keep(&self.base, "docs");
-            let root = tree(&format!("{root}\n040000 tree {docs}\tdocs\n"));
+            let base_p = git(&d, &["ls-tree", &format!("{}:design-plans/p", self.base)]);
+            let p = tree(&format!("{base_p}\n{entries}"));
+            let plans = keep(&format!("{}:design-plans", self.base), "p");
+            let plans = tree(&format!("{plans}\n040000 tree {p}\tp\n"));
+            let root = keep(&self.base, "design-plans");
+            let root = tree(&format!("{root}\n040000 tree {plans}\tdesign-plans\n"));
             git(
                 &d,
                 &["commit-tree", &root, "-p", &self.base, "-m", "an odd path"],
@@ -1277,11 +1282,11 @@ mod cad2081_workflow_verdicts {
     #[test]
     fn only_the_allowlisted_paths_pass_on_workflow_reviews_alone() {
         let f = Fixture::new();
-        passes(&f, f.touch("docs/guides/new.md"));
+        passes(&f, f.touch("design-plans/p/new.md"));
         passes(&f, f.touch("design-plans/y/z/plan.md"));
         passes(
             &f,
-            f.make_head("rewrite", |d| put(d, "docs/guides/a.md", "changed\n")),
+            f.make_head("rewrite", |d| put(d, "design-plans/p/a.md", "changed\n")),
         );
         // Everything else needs the operator, including paths no list ever named.
         for path in [
@@ -1298,6 +1303,7 @@ mod cad2081_workflow_verdicts {
             "agents/x.md",
             "src/remote_cli.rs",
             "src/secret/x.rs",
+            "docs/guides/x.md",
             "design-plans/x.html",
             "design-plans/x.json",
             "docs/other.md",
@@ -1312,32 +1318,36 @@ mod cad2081_workflow_verdicts {
         let f = Fixture::new();
         let heads = [
             f.make_head("delete", |d| {
-                std::fs::remove_file(d.join("docs/guides/a.md")).unwrap()
+                std::fs::remove_file(d.join("design-plans/p/a.md")).unwrap()
             }),
             f.make_head("rename", |d| {
-                std::fs::rename(d.join("docs/guides/b.md"), d.join("docs/guides/c.md")).unwrap()
+                std::fs::rename(d.join("design-plans/p/b.md"), d.join("design-plans/p/c.md"))
+                    .unwrap()
             }),
             f.make_head("symlink", |d| {
-                std::os::unix::fs::symlink("a.md", d.join("docs/guides/link.md")).unwrap()
+                std::os::unix::fs::symlink("a.md", d.join("design-plans/p/link.md")).unwrap()
             }),
             f.make_head("exec", |d| {
-                put(d, "docs/guides/run.md", "x\n");
+                put(d, "design-plans/p/run2.md", "x\n");
                 std::fs::set_permissions(
-                    d.join("docs/guides/run.md"),
+                    d.join("design-plans/p/run2.md"),
                     std::os::unix::fs::PermissionsExt::from_mode(0o755),
                 )
                 .unwrap();
             }),
+            f.make_head("exec-modify", |d| {
+                put(d, "design-plans/p/run.md", "changed\n")
+            }),
             f.make_head("chmod", |d| {
                 std::fs::set_permissions(
-                    d.join("docs/guides/a.md"),
+                    d.join("design-plans/p/a.md"),
                     std::os::unix::fs::PermissionsExt::from_mode(0o755),
                 )
                 .unwrap();
             }),
             f.make_head("typechange", |d| {
-                std::fs::remove_file(d.join("docs/guides/a.md")).unwrap();
-                std::os::unix::fs::symlink("b.md", d.join("docs/guides/a.md")).unwrap();
+                std::fs::remove_file(d.join("design-plans/p/a.md")).unwrap();
+                std::os::unix::fs::symlink("b.md", d.join("design-plans/p/a.md")).unwrap();
             }),
         ];
         for head in heads {
@@ -1349,7 +1359,7 @@ mod cad2081_workflow_verdicts {
     fn an_unlisted_path_beside_an_allowlisted_one_needs_the_operator() {
         let f = Fixture::new();
         let head = f.make_head("beside", |d| {
-            put(d, "docs/guides/n.md", "x\n");
+            put(d, "design-plans/p/n.md", "x\n");
             put(d, "src/wiki/x.rs", "// x\n");
         });
         needs_operator(&f, head, OPERATOR);
@@ -1368,14 +1378,14 @@ mod cad2081_workflow_verdicts {
         ] {
             needs_operator(&f, f.odd_head(entries), OPERATOR);
         }
-        needs_operator(&f, f.touch("docs/guides/a\\b.md"), OPERATOR);
-        needs_operator(&f, f.touch("docs/guides/a..b.md"), OPERATOR);
+        needs_operator(&f, f.touch("design-plans/p/a\\b.md"), OPERATOR);
+        needs_operator(&f, f.touch("design-plans/p/a..b.md"), OPERATOR);
     }
 
     #[test]
     fn a_missing_or_unreadable_allowlist_file_at_the_tip_needs_the_operator() {
         let f = Fixture::new();
-        let head = f.touch("docs/guides/new.md");
+        let head = f.touch("design-plans/p/new.md");
         let mut gone = f.base_files();
         gone.as_object_mut().unwrap().remove(AUTO_PATHS);
         let broken = |text: &str| {
@@ -1413,7 +1423,7 @@ mod cad2081_workflow_verdicts {
         let f = Fixture::new();
         let widened = |f: &Fixture| {
             let mut files = f.base_files();
-            files[AUTO_PATHS] = json!("[auto]\npaths = [\"src/**\", \"docs/guides/**\"]\n");
+            files[AUTO_PATHS] = json!("[auto]\npaths = [\"src/**\", \"design-plans/**/*.md\"]\n");
             files
         };
         // The list changed only in the PR's own head.
@@ -1429,16 +1439,15 @@ mod cad2081_workflow_verdicts {
         refused(&f, case, OPERATOR);
         // A path removed at the tip stops being eligible for a PR based before the removal.
         let mut narrowed = f.base_files();
-        narrowed[AUTO_PATHS] = json!("[auto]\npaths = [\"design-plans/**/*.md\"]\n");
+        narrowed[AUTO_PATHS] = json!("[auto]\npaths = [\"design-plans/other/**/*.md\"]\n");
         let mut case = scenario(vec![f.std(), f.spec()]);
-        case.head = Some(f.touch("docs/guides/new.md"));
+        case.head = Some(f.touch("design-plans/p/new.md"));
         case.tip_files = Some(narrowed);
         refused(&f, case, OPERATOR);
         // The reverse is allowed: a path added at the tip is eligible for an older base.
         let mut wider_tip = f.base_files();
-        wider_tip[AUTO_PATHS] = json!(
-            "[auto]\npaths = [\"docs/guides/**\", \"design-plans/**/*.md\", \"docs/extra/**\"]\n"
-        );
+        wider_tip[AUTO_PATHS] =
+            json!("[auto]\npaths = [\"design-plans/**/*.md\", \"docs/extra/**\"]\n");
         let mut case = scenario(vec![f.std(), f.spec()]);
         case.head = Some(f.touch("docs/extra/y.md"));
         case.tip_files = Some(wider_tip);
@@ -1680,5 +1689,74 @@ mod cad2081_workflow_verdicts {
         case.base_files = Some(files);
         let (code, stdout, stderr) = f.gate(&case);
         assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    }
+
+    #[test]
+    fn instruction_files_and_dot_paths_are_never_eligible_whatever_the_list_says() {
+        let f = Fixture::new();
+        for list in ["design-plans/**", "**"] {
+            let mut files = f.base_files();
+            files[AUTO_PATHS] = json!(format!("[auto]\npaths = [\"{list}\"]\n"));
+            let case = |head: String| {
+                let mut case = scenario(vec![f.std(), f.spec()]);
+                case.head = Some(head);
+                case.tip_files = Some(files.clone());
+                case
+            };
+            // A control: the same list makes an ordinary file eligible.
+            let (code, stdout, stderr) = f.gate(&case(f.touch("design-plans/p/ok.txt")));
+            assert_eq!(code, 0, "{list}\nstdout: {stdout}\nstderr: {stderr}");
+            for path in [
+                "design-plans/CLAUDE.md",
+                "design-plans/x/agents.md",
+                "design-plans/x/Agents.MD",
+                "design-plans/GEMINI.md",
+                "design-plans/AGENTS.md",
+                "design-plans/.hid/a.md",
+                "design-plans/.gitattributes",
+            ] {
+                refused_all(&f, case(f.touch(path)), &[OPERATOR, NO_APPROVAL]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_path_refuses_cleanly() {
+        let f = Fixture::new();
+        let head = f.make_head("non-utf8", |d| {
+            let name = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"\xff.md");
+            std::fs::write(d.join("design-plans").join(name), "x\n").unwrap();
+        });
+        let mut case = scenario(vec![f.std(), f.spec()]);
+        case.head = Some(head);
+        let (code, stdout, stderr) = f.gate(&case);
+        assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stderr.contains("cannot list the changed files"), "{stderr}");
+        assert!(!stderr.contains("Traceback"), "{stderr}");
+        assert!(!stdout.contains("every rule holds"), "{stdout}");
+    }
+
+    #[test]
+    fn one_workflow_row_beside_an_owner_row_does_not_satisfy_the_consequential_class() {
+        let f = Fixture::new();
+        let bob = f.owner(
+            "20261103-000200-b.md",
+            "20261103-000200",
+            "usr_bob",
+            "bob",
+            "spec-security",
+        );
+        let alice = f.owner(
+            "20261103-000100-a.md",
+            "20261103-000100",
+            "usr_alice",
+            "alice",
+            "standards",
+        );
+        for rows in [vec![f.std(), bob], vec![alice, f.spec()]] {
+            let mut case = scenario(rows);
+            case.class = "consequential";
+            refused(&f, case, "requires exactly one independent combined review");
+        }
     }
 }
