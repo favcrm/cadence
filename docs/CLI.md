@@ -73,6 +73,12 @@ session has reloaded the guidance — start a fresh session or reread it at
 a task boundary. Client-only update does not install guidance or start a
 daemon. A sandbox profile still does not write the shared home.
 
+In an unmanaged native session, `cadence skill status` and `cadence skill show`
+inspect this machine even when a hosted org is the saved default. An explicit
+remote `--org` or `CADENCE_ORG` is refused rather than ignored. Managed and
+grant-bound sessions retain their existing routing and permission checks.
+This does not change skill installation authority or client-only policy.
+
 `--to` runs the same checks as `upgrade --sha`: the sha is on main, CI's
 `test` job passed on that exact sha, the sha256 and manifest match, and the
 build-provenance attestation verifies for the repository. A sha that is not

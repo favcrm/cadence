@@ -911,12 +911,13 @@ fn local_resolved(org: &str, state_dir: PathBuf, tracker_dir: PathBuf) -> Result
 }
 
 /// Which local-maintenance command is resolving, so a remote selector can
-/// name that command. Not a mode framework: only `update` and `dev`.
+/// name that command.
 #[derive(Clone, Copy)]
 enum LocalMaintenance {
     Update,
     Dev,
     Setup,
+    SkillRead,
 }
 
 impl LocalMaintenance {
@@ -938,15 +939,18 @@ impl LocalMaintenance {
                  remote. Its hosted routes are its own `--hosted`/`--register` flags; \
                  omit the remote `--org`/`CADENCE_ORG`, or choose local."
             )),
+            Self::SkillRead => Error::rejected(format!(
+                "`cadence skill status` and `cadence skill show` inspect this machine's \
+                 guidance, not remote org '{name}'. Omit the remote `--org`/`CADENCE_ORG`."
+            )),
         }
     }
 
     /// `update` keeps its pin arm: an explicit root wins and `CADENCE_ORG`
-    /// is not consulted. `dev` still keeps that root, but a remote
-    /// `CADENCE_ORG` beside it is a deliberate selection and must refuse
-    /// instead of being dropped on the floor.
+    /// is not consulted. For `dev`, `setup`, and skill reads, a remote
+    /// `CADENCE_ORG` beside that root is deliberate and must not be discarded.
     fn refuse_remote_env_beside_pins(self) -> bool {
-        matches!(self, Self::Dev | Self::Setup)
+        matches!(self, Self::Dev | Self::Setup | Self::SkillRead)
     }
 }
 
@@ -1008,12 +1012,6 @@ pub(super) fn resolve_update(
     resolve_local_maintenance(LocalMaintenance::Update, org, state, tracker)
 }
 
-/// `cadence dev` (`sandbox` alias) is local maintenance of a disposable
-/// Cadence. Same selector rules as [`resolve_update`], plus: a remote
-/// `CADENCE_ORG` is refused even when a local pin or managed inherited
-/// root is present, so that env is not silently discarded. `--org` on a
-/// pin still conflicts exactly as [`resolve`]; `--org` on a managed caller
-/// is still the managed-caller refusal, before any assignment lookup.
 /// `cadence setup` installs on this machine. It shares the local-maintenance
 /// selector, so a saved *local* connection keeps its state and tracker, a
 /// saved remote default never routes it over the allowlist, and a remote
@@ -1026,12 +1024,29 @@ pub(super) fn resolve_setup(
     resolve_local_maintenance(LocalMaintenance::Setup, org, state, tracker)
 }
 
+/// `cadence dev` (`sandbox` alias) is local maintenance of a disposable
+/// Cadence. Same selector rules as [`resolve_update`], plus: a remote
+/// `CADENCE_ORG` is refused even when a local pin or managed inherited
+/// root is present, so that env is not silently discarded. `--org` on a
+/// pin still conflicts exactly as [`resolve`]; `--org` on a managed caller
+/// is still the managed-caller refusal, before any assignment lookup.
 pub(super) fn resolve_dev(
     org: Option<&str>,
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
 ) -> Result<Resolved> {
     resolve_local_maintenance(LocalMaintenance::Dev, org, state, tracker)
+}
+
+/// Read-only skill discovery is local to the installation. Like `dev`, a
+/// saved remote default does not select it, but a deliberate remote
+/// selector is refused rather than silently discarded.
+pub(super) fn resolve_skill_read(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    resolve_local_maintenance(LocalMaintenance::SkillRead, org, state, tracker)
 }
 
 fn resolve_local_maintenance(
