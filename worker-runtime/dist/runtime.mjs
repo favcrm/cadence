@@ -56679,6 +56679,10 @@ function toolCallText(name, args) {
   const json = JSON.stringify(args);
   return json === undefined || json === "{}" ? name : `${name} ${json}`;
 }
+function projectedThreadEntries(records, includeThinking, project) {
+  const entries = threadEntries(records, includeThinking);
+  return project ? [...project(entries)] : entries;
+}
 function threadEntries(records, includeThinking) {
   const entries = [];
   const all = records.flatMap((record) => record.model ?? []);
@@ -56846,7 +56850,7 @@ data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, master?
 
 `);
           send(masterFrame);
-          for (const entry of threadEntries(stream.snapshot.entries, thinking))
+          for (const entry of projectedThreadEntries(stream.snapshot.entries, thinking, this.options.projectThread))
             emit(entry, send);
         },
         events: async (_events, send) => {
@@ -56886,7 +56890,7 @@ data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, master?
     };
   }
   async transcript(includeThinking) {
-    return threadEntries(await this.harness.session().messages(), includeThinking);
+    return projectedThreadEntries(await this.harness.session().messages(), includeThinking, this.options.projectThread);
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;

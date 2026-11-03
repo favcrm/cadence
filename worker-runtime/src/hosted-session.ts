@@ -36,7 +36,7 @@ import { sessionEventResponse } from "./session-stream.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { authorizeTools } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
-import { threadEntries } from "./transcript.ts";
+import { projectedThreadEntries } from "./transcript.ts";
 
 /**
  * The last model the platform gateway reported serving for this conversation.
@@ -213,7 +213,11 @@ export class HostedSession<
           // native turn, so the honest snapshot is idle. A host projection
           // composes under those runtime fields and cannot replace them.
           send(masterFrame);
-          for (const entry of threadEntries(stream.snapshot.entries, thinking))
+          for (const entry of projectedThreadEntries(
+            stream.snapshot.entries,
+            thinking,
+            this.options.projectThread,
+          ))
             emit(entry, send);
         },
         events: async (_events, send) => {
@@ -255,9 +259,10 @@ export class HostedSession<
 
   /** Map the engine's committed records, including durable input metadata, for the board. */
   async transcript(includeThinking: boolean): Promise<ThreadEntry[]> {
-    return threadEntries(
+    return projectedThreadEntries(
       await this.harness.session().messages(),
       includeThinking,
+      this.options.projectThread,
     );
   }
 

@@ -1,7 +1,11 @@
 import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import type { EntryRecord } from "@earendil-works/pi-durable";
-import { BOARD_MESSAGE_KIND, type ThreadEntry } from "./contract.ts";
+import {
+  BOARD_MESSAGE_KIND,
+  type ThreadEntry,
+  type ThreadProjection,
+} from "./contract.ts";
 
 /** The private engine's default retry.maxRetries: attempts 1..3 retry. */
 const PI_MAX_RETRIES = 3;
@@ -65,6 +69,19 @@ function toolCallText(name: string, args: Record<string, unknown>): string {
   }
   const json = JSON.stringify(args);
   return json === undefined || json === "{}" ? name : `${name} ${json}`;
+}
+
+/**
+ * The entries every thread read reports: the engine's mapping, then the host's
+ * projection when it has one, so a paged read and both stream paths agree.
+ */
+export function projectedThreadEntries(
+  records: readonly EntryRecord[],
+  includeThinking: boolean,
+  project?: ThreadProjection,
+): ThreadEntry[] {
+  const entries = threadEntries(records, includeThinking);
+  return project ? [...project(entries)] : entries;
 }
 
 /**

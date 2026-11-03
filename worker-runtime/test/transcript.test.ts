@@ -2,7 +2,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "bun:test";
 import { BOARD_MESSAGE_KIND } from "../src/contract.ts";
-import { threadEntries } from "../src/transcript.ts";
+import { projectedThreadEntries, threadEntries } from "../src/transcript.ts";
 
 const input = (
   id: string,
@@ -450,5 +450,26 @@ describe("board transcript identity", () => {
     it("does not surface an aborted turn", () => {
       expect(threadEntries([assistant("2", [], "aborted")], false)).toEqual([]);
     });
+  });
+});
+
+describe("projectedThreadEntries", () => {
+  const records = [input("1", "hello")];
+
+  it("returns the runtime's entries unchanged without a projection", () => {
+    expect(projectedThreadEntries(records, false)).toEqual(
+      threadEntries(records, false),
+    );
+  });
+
+  it("applies the host's projection without changing the stored records", () => {
+    const before = JSON.stringify(records);
+    const seen = projectedThreadEntries(records, false, (entries) => [
+      ...entries,
+      { seq: entries.length + 1, role: "agent", kind: "artifact", text: "" },
+    ]);
+    expect(seen.map((entry) => entry.kind).at(-1)).toBe("artifact");
+    expect(seen).toHaveLength(threadEntries(records, false).length + 1);
+    expect(JSON.stringify(records)).toBe(before);
   });
 });
