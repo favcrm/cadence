@@ -209,7 +209,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const { route, view, project, openId, filters } = loc;
   const screen = route.screen;
   useHomeUnread(screen === "home");
-  const fullHeight = screen === "home" || screen === "wiki" || screen === "workspaceApp" || screen === "workspaceAppKey" || screen === "threads" ||
+  const fullHeight = screen === "home" || screen === "agents" || screen === "wiki" || screen === "workspaceApp" || screen === "workspaceAppKey" || screen === "threads" ||
     (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   /** The href of a route, carrying the scope and drawer like `goTo`. */
@@ -1371,6 +1371,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
         {route.screen === "agents" && (
           <Agents
+            key={meta.session?.id ?? ""}
+            operator={access.operator}
+            onRetryAccess={retryAccess}
+            hostedBoard={meta.hosted === true}
             state={agentsState}
             issues={issuesState}
             open={route.alias}
