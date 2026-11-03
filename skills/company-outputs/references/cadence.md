@@ -1,6 +1,20 @@
-# Supported Cadence path and limits
+# Where each capability exists
 
-Native template commands live in `src/cli/business_templates.rs`. The daemon validates the spec, stores the version and enforces company scope from the connection. Recheck current help for another binary; this is not proof of hosted access or successful rendering.
+Use this lookup only to find the command or tool. A listed command is not proof that this session may run it or that rendering will succeed; recheck the session's own tools and help.
+
+| Capability | Native workspace | Hosted workspace |
+|---|---|---|
+| Company facts | `cadence wiki search`, `cadence wiki cat` | `wiki_search`, `wiki_list`, `wiki_read` |
+| Find template | `cadence template show NAME` | Not available yet |
+| Read template | `cadence template show NAME --version V [--out NEW_DIR]` | Not available yet |
+| Render | `cadence document create`, `show`, `export`, for an approved DOCX financial template | Not available yet |
+| Show | `cadence artifact put`, for the master's own turn | Not available yet |
+| Save draft | `cadence template create`, `revise` | Not available yet |
+| Approve | The operator's `cadence template approve` | Not available yet |
+
+"Not available yet" means no such tool unless this session lists one. Say so plainly rather than asking for credentials or inventing a route.
+
+The rest of this file is the native detail. The daemon validates the spec, stores the version and enforces company scope from the connection.
 
 ## Two template bodies, one registry
 
@@ -29,7 +43,7 @@ Reserved basenames are `guidelines.md` and `template.json` (any case). Open the 
 
 Accepted reference media types are `image/png`, `image/jpeg`, `application/pdf`, `text/plain` and `text/markdown`. Office files are not reference assets. Each name is a flat basename of at most 120 characters: letters, digits, `.`, `_` or `-`, with no leading dot. The extension must match `media_type`, ASCII case-insensitive: `.png`, `.jpg` or `.jpeg`, `.pdf`, `.txt`, or `.md`. `notes.sh` or `script.html` with `text/plain` is refused; `layout.txt` with `text/plain` is valid. PNG, JPEG and PDF bytes must start with their format signature (`\x89PNG`, `\xFF\xD8\xFF`, `%PDF-`). That PDF check is a signature only, not malware sanitization. Text and markdown must be UTF-8; the only control bytes allowed are tab, LF and CR. Words such as `<script` or `javascript:` are not stripped and are not executed. At most 12 references. Purpose is 8..=2000 bytes. Each description is 8..=2000 bytes. Guidelines are 16..=65536 bytes. Each decoded asset is non-empty and at most 2 MiB; the total is at most 8 MiB. `content_base64` is standard base64. Unknown JSON fields are refused. `show --out` applies the same checks before it creates the directory.
 
-For a complete fictional authoring-pack JSON and registration/retrieval example, see [the operator guide](../../business-documents/OPERATOR.md#authoring-packs-and-financial-templates). That example is a text-only letter standard, not a visual slide reference. A visual template must contain real authorised reference images/pages and useful descriptions; a one-pixel image or a prose claim is not visual evidence.
+For a complete fictional authoring-pack JSON and registration/retrieval example, see "Authoring packs and financial templates" in the `business-documents` skill's `OPERATOR.md`, where installed. That example is a text-only letter standard, not a visual slide reference. A visual template must contain real authorised reference images/pages and useful descriptions; a one-pixel image or a prose claim is not visual evidence.
 
 The generic workflow installation includes that supporting operator guide. Use one maintained example rather than a second copy of the pack specification.
 
@@ -55,7 +69,7 @@ Amounts have two decimal minor digits; positive quantities have up to three deci
 
 ## Existing local tools
 
-Reuse the inspected `skills/business-documents/scripts/run_isolated.py` wrapper only when its operator guide and permissions fit. It requires Docker access and the exact offline image `cadence-business-files:cad-1393-dev1`, ID `sha256:06ea75fdd2b41762d37dcf68a101703be3962976e6be1aebd2247503431cee64`, with its required workflow label. Output must be an existing separate directory owned and writable by the caller; root UID/GID is refused. Never call internal parsers or renderers outside the wrapper, weaken its pin, rebuild or relabel an image to bypass it, or add script hooks. The general render path also generates PDF; its financial XLSX is a fixed Suggested quotation, not arbitrary company-form filling. Missing prerequisites are reported limitations, not reasons to substitute another renderer silently.
+Reuse the `business-documents` skill's inspected `scripts/run_isolated.py` wrapper only when its operator guide and permissions fit. It requires Docker access and the exact offline image `cadence-business-files:cad-1393-dev1`, ID `sha256:06ea75fdd2b41762d37dcf68a101703be3962976e6be1aebd2247503431cee64`, with its required workflow label. Output must be an existing separate directory owned and writable by the caller; root UID/GID is refused. Never call internal parsers or renderers outside the wrapper, weaken its pin, rebuild or relabel an image to bypass it, or add script hooks. The general render path also generates PDF; its financial XLSX is a fixed Suggested quotation, not arbitrary company-form filling. Missing prerequisites are reported limitations, not reasons to substitute another renderer silently.
 
 ## Consumption
 

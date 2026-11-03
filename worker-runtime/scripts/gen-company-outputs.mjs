@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+/**
+ * Generate the hosted copy of the `company-outputs` skill from its one source,
+ * `skills/company-outputs/`. Hosted has no filesystem to install guidance into,
+ * so the same text travels in the runtime bundle: `SKILL.md` is the body and
+ * the references load on demand. test/company-outputs.test.ts fails on drift.
+ *
+ *   bun scripts/gen-company-outputs.mjs
+ */
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const source = join(here, "..", "..", "skills", "company-outputs");
+export const target = join(here, "..", "src", "company-outputs.generated.ts");
+
+export function renderCompanyOutputs() {
+  const text = readFileSync(join(source, "SKILL.md"), "utf8");
+  const parsed = /^---\nname: (.+)\ndescription: (.+)\n---\n\n([\s\S]*)$/.exec(text);
+  if (!parsed) throw new Error("company-outputs SKILL.md: unexpected frontmatter");
+  const [, name, description, body] = parsed;
+  const resources = readdirSync(join(source, "references"))
+    .sort()
+    .map((file) => ({
+      kind: "reference",
+      path: `references/${file}`,
+      content: readFileSync(join(source, "references", file), "utf8"),
+    }));
+  const digest = createHash("sha256")
+    .update(JSON.stringify({ description, body, resources }))
+    .digest("hex")
+    .slice(0, 16);
+  const skill = { name, version: digest, description, body, resources };
+  return `// Generated from skills/company-outputs by scripts/gen-company-outputs.mjs. Do not edit.
+import type { SkillManifest } from "agents/skills";
+
+export const COMPANY_OUTPUTS_FINGERPRINT = ${JSON.stringify(`tenant-company-outputs-${digest}`)};
+
+export const COMPANY_OUTPUTS_SKILL = ${JSON.stringify(skill, null, 2)} as unknown as SkillManifest["skills"][number];
+`;
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  writeFileSync(target, renderCompanyOutputs());
+}
