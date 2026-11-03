@@ -5610,3 +5610,55 @@ fn cad2009_team_invite_nel_input_keeps_definite_predispatch_refusal() {
     assert_eq!(crate::error::exit_code_for_kind(error.kind()), 3);
     assert!(!error.to_string().contains("outcome is unknown"), "{error}");
 }
+
+// CAD-2009: a sync can update one export before another fails. Only a
+// documented pre-effect refusal proves that the dispatched sync did not apply.
+#[test]
+fn cad2009_profile_sync_postdispatch_503_is_unknown_but_invalid_request_is_definite() {
+    for (status, code, expected_kind) in [
+        (503, "capability_unavailable", "unknown"),
+        // cli_route::rpc maps a native rejected error to this pre-effect
+        // refusal (for example, selecting a profile that does not exist).
+        (400, "invalid_request", "rejected"),
+    ] {
+        let arguments = settings_args("profile.sync", json!({"profile": "p1"}));
+        let (result, requests) = run(
+            vec![(status, "", json!({"ok": false, "error": {"code": code}}))],
+            "settings_agents",
+            arguments.clone(),
+            10,
+        );
+        let error = result.expect_err("the failed sync must not return success");
+        assert_eq!(error.kind(), expected_kind, "HTTP {status}: {error}");
+        assert_eq!(
+            crate::error::exit_code_for_kind(error.kind()),
+            if status == 503 { 1 } else { 3 },
+            "HTTP {status}"
+        );
+        let guidance = error.to_string();
+        if status == 503 {
+            for read in ["settings agents show", "settings agents history", "--org"] {
+                assert!(guidance.contains(read), "HTTP {status}: {guidance}");
+            }
+            assert!(!guidance.contains("retry later"), "{guidance}");
+        } else {
+            assert!(!guidance.contains("settings agents show"), "{guidance}");
+            assert!(!guidance.contains("settings agents history"), "{guidance}");
+        }
+        assert_eq!(
+            hits(&requests, "/__platform/cli/authorize"),
+            1,
+            "HTTP {status}: must not reauthorize: {requests:?}"
+        );
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "HTTP {status}: must not replay the sync: {requests:?}"
+        );
+        assert_eq!(requests.len(), 2, "HTTP {status}: {requests:?}");
+        assert_eq!(requests[0]["path"], "/__platform/cli/authorize");
+        assert_eq!(requests[1]["path"], "/__platform/cli/call");
+        assert_eq!(requests[1]["body"]["verb"], "settings_agents");
+        assert_eq!(requests[1]["body"]["arguments"], json!(arguments));
+    }
+}

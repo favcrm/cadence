@@ -344,6 +344,7 @@ pub fn sync(
         }
     }
     let mut files = Vec::new();
+    let mut wrote_export = false;
     for profile in selected {
         for harness in ["pi", "claude"] {
             let path = export_path(&pm.dir, harness, &profile.id);
@@ -357,7 +358,14 @@ pub fn sync(
                 }));
                 continue;
             }
-            write_export(&pm.dir, harness, &profile.id, profile)?;
+            write_export(&pm.dir, harness, &profile.id, profile).map_err(|error| {
+                if wrote_export {
+                    export_sync_unknown(error)
+                } else {
+                    error
+                }
+            })?;
+            wrote_export = true;
             files.push(json!({
                 "profile": profile.id,
                 "harness": harness,
@@ -366,15 +374,21 @@ pub fn sync(
             }));
         }
     }
-    let profiles = profiles_from(&current.doc.profiles)?;
     let token = revision_token(
         current.revision,
         &current.doc.model_defaults.agent_settings,
         &profiles,
         policy.as_ref(),
     );
+    let history = store.settings_history(8).map_err(|error| {
+        if wrote_export {
+            export_sync_unknown(error)
+        } else {
+            error
+        }
+    })?;
     Ok(json!({
-        "snapshot": build_snapshot(token, &present_overlay(&current.doc.model_defaults, policy.as_ref()), &profiles, policy.as_ref(), agents, &pm.dir, &store.settings_history(8)?),
+        "snapshot": build_snapshot(token, &present_overlay(&current.doc.model_defaults, policy.as_ref()), &profiles, policy.as_ref(), agents, &pm.dir, &history),
         "files": files,
     }))
 }
@@ -2262,6 +2276,16 @@ fn read_export(pm_dir: &Path, harness: &str, id: &str) -> ExportRead {
     }
 }
 
+fn export_sync_unknown(error: Error) -> Error {
+    if error.kind() == "unknown" {
+        return error;
+    }
+    Error::unknown(format!(
+        "profile sync may have changed agent exports; inspect `cadence settings agents show` \
+         in the same workspace before repeating: {error}"
+    ))
+}
+
 fn write_export_at(dir: &OwnedFd, name: &str, text: &str) -> Result<()> {
     let cname = export_component(name)?;
     let fd = unsafe {
@@ -2290,24 +2314,27 @@ fn write_export_at(dir: &OwnedFd, name: &str, text: &str) -> Result<()> {
         // Write the validated inode, never a replacement at `name`. Preserve
         // the ownership header through partial writes; truncate only afterward.
         file.seek(SeekFrom::Start(0))?;
-        file.write_all(text.as_bytes())?;
-        file.set_len(text.len() as u64)?;
-        file.sync_all()?;
-        let current_fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                cname.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        };
-        if current_fd < 0 {
-            return Err(Error::rejected("export destination changed during sync"));
-        }
-        let current = unsafe { File::from_raw_fd(current_fd) }.metadata()?;
-        if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
-            return Err(Error::rejected("export destination changed during sync"));
-        }
-        return Ok(());
+        return (|| -> Result<()> {
+            file.write_all(text.as_bytes())?;
+            file.set_len(text.len() as u64)?;
+            file.sync_all()?;
+            let current_fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    cname.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                )
+            };
+            if current_fd < 0 {
+                return Err(Error::rejected("export destination changed during sync"));
+            }
+            let current = unsafe { File::from_raw_fd(current_fd) }.metadata()?;
+            if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
+                return Err(Error::rejected("export destination changed during sync"));
+            }
+            Ok(())
+        })()
+        .map_err(export_sync_unknown);
     }
     if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
         return Err(Error::rejected("export is a symlink or cannot be opened"));
@@ -2356,7 +2383,9 @@ fn write_export_at(dir: &OwnedFd, name: &str, text: &str) -> Result<()> {
         return Err(Error::rejected("export destination appeared during sync"));
     }
     if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
-        return Err(Error::rejected("export directory sync failed"));
+        return Err(export_sync_unknown(Error::rejected(
+            "export directory sync failed",
+        )));
     }
     Ok(())
 }
@@ -3028,3 +3057,7 @@ mod inherit_tests {
         assert!(listed[0]["job"].is_null());
     }
 }
+
+#[cfg(test)]
+#[path = "cad2009_profile_sync_acceptance.rs"]
+mod cad2009_profile_sync_acceptance;

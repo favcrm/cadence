@@ -837,6 +837,9 @@ pub(crate) fn require_model_defaults(state_dir: &Path) -> std::result::Result<()
 }
 
 pub(crate) fn settings_rpc_error(err: Error) -> HttpResp {
+    if err.kind() == "unknown" {
+        return coded_response(409, "outcome_unknown", &err.to_string(), None);
+    }
     if daemon_unavailable(&err) {
         return coded_response(503, "daemon_unavailable", &err.to_string(), None);
     }
@@ -3028,5 +3031,34 @@ mod cad2009_status_authority_acceptance {
         exercise(JobReply::Malformed);
         exercise(JobReply::KnownEmpty);
         println!("{COMPLETE}");
+    }
+}
+
+#[cfg(test)]
+mod cad2009_settings_rpc_error_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn cad2009_settings_rpc_error_preserves_unknown_sync_and_definite_refusal() {
+        let partial_sync = "profile sync may have updated the Pi export before the Claude export failed; read settings agents show and settings agents history with the same explicit --org before repeating it";
+        let rejected = "unknown profile 'missing'";
+        for (error, expected_status, expected_code, expected_message) in [
+            (
+                Error::unknown(partial_sync),
+                409,
+                "outcome_unknown",
+                partial_sync,
+            ),
+            (Error::rejected(rejected), 400, "invalid_request", rejected),
+        ] {
+            let response = settings_rpc_error(error);
+            assert_eq!(response.status_code().0, expected_status, "{expected_code}");
+            let mut body = String::new();
+            response.into_reader().read_to_string(&mut body).unwrap();
+            let body: Value = serde_json::from_str(&body).expect("settings error must be JSON");
+            assert_eq!(body["code"], expected_code);
+            assert_eq!(body["error"], expected_message);
+        }
     }
 }
