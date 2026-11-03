@@ -31,10 +31,9 @@ fn cad1922_accept_daemon_refuses_a_stale_sandbox_profile_and_binds_nothing() {
     }
     let restore = scopeguard(saved);
 
-    let dir = tempfile::Builder::new()
-        .prefix("c22d")
-        .tempdir_in("/tmp")
-        .unwrap();
+    // The test seam confines state to `std::env::temp_dir()`, so the fixture
+    // lives there too: a hard-coded /tmp only agrees with it when TMPDIR is /tmp.
+    let dir = tempfile::Builder::new().prefix("c22d").tempdir().unwrap();
     let home = dir.path().join("home");
     let base = dir.path().join("box");
     let pm = dir.path().join("pm");
