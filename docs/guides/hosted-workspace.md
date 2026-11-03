@@ -175,8 +175,8 @@ checks run, in install order.
 
 Each tool call receives `ToolInvocation.app`, the same resolved scope, after
 the refusal and live-authorization checks, so structured admission stays the
-authority. A tool that runs outside an operation, such as one in another
-conversation's run, gets none. A malformed stored scope or a mixed run
+authority. A tool call with no active run to attribute it to is refused,
+never run as Home. A malformed stored scope or a mixed run
 therefore refuses the request or the execution rather than acting outside the
 envelope.
 

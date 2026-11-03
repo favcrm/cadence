@@ -24,8 +24,8 @@ type ToolExecute = ToolRegistration["execute"];
 
 /**
  * The app scope of the operation that owns one call, resolved by the session
- * from the engine's own run and placed entry. `null` means Home or a call that
- * runs outside an operation.
+ * from the engine's own run and placed entry. `null` means Home. A call that
+ * cannot be attributed to an operation throws and is refused.
  */
 export type AppScopeResolver = (
   api: Parameters<ToolExecute>[1],

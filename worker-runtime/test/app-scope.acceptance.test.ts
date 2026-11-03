@@ -34,7 +34,8 @@ import {
   type RuntimeTool,
 } from "../src/contract.ts";
 import { runtimeExtension, type AppScopeResolver } from "../src/engine.ts";
-import { readSubmissionEntry } from "../src/identity.ts";
+import { readSubmissionEntry, type TaskSql } from "../src/identity.ts";
+import { threadEntries } from "../src/transcript.ts";
 import {
   guardOperationRequests,
   operationContextExtension,
@@ -2131,6 +2132,163 @@ describe("session wiring", () => {
       }),
     ).toThrow(/attestation/);
     expect(scripted.observations).toHaveLength(0);
+    database.close();
+  });
+
+  it("carries the original scope on a provider retry", async () => {
+    const { database } = sessionDatabase();
+    const session = await constructedSession(database, { tools: [] });
+    let attempts = 0;
+    const scripted = scriptedModels(
+      () =>
+        (attempts += 1) === 1
+          ? {
+              ...assistantReply(""),
+              content: [],
+              stopReason: "error",
+              errorMessage: "503 service unavailable",
+            }
+          : assistantReply("done"),
+      { gate: false },
+    );
+    session.models.setProvider(scripted.provider);
+    const storage = await SqliteStorage.open(sqliteFacade(database), {
+      prefix: "pi_",
+    });
+    const harness = await Harness.open(
+      storage,
+      { models: session.models, registry: session.registry },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const conversation = await harness.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      const turn = await conversation.submit(
+        {
+          type: "input",
+          requestId: "op-ledger",
+          content: "ledger question",
+          entry: operationEntry("op-ledger", LEDGER_CAMPAIGN),
+        },
+        BACKGROUND_CONTEXT,
+      );
+      expect((await turn.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      expect(scripted.observations).toHaveLength(2);
+      for (const observation of scripted.observations)
+        expect(observation.system).toContain(
+          "install_id install_ledger, context_id campaign",
+        );
+    } finally {
+      await harness.close(BACKGROUND_CONTEXT);
+      database.close();
+    }
+  }, 30_000);
+
+  it("keeps the original scope for the model and the tool after the request is abandoned and the store reopened", async () => {
+    const { database, path } = sessionDatabase();
+    const seen: Array<AppScope | undefined> = [];
+    const probe: RuntimeTool = {
+      name: "scope_probe",
+      description: "Report the app scope of the turn.",
+      parameters: { type: "object", properties: {} },
+      async execute(_input, invocation) {
+        seen.push(invocation.app);
+        return { output: [{ type: "text", text: "noted" }] };
+      },
+    };
+    const open = async (db: Database, scripted: ReturnType<typeof scriptedModels>) => {
+      const session = await constructedSession(db, { tools: [probe] });
+      session.models.setProvider(scripted.provider);
+      return Harness.open(
+        await SqliteStorage.open(sqliteFacade(db), { prefix: "pi_" }),
+        { models: session.models, registry: session.registry },
+        BACKGROUND_CONTEXT,
+      );
+    };
+    // The first process never answers its request: it is abandoned mid-turn.
+    const first = scriptedModels("never", { gate: true });
+    const abandoned = await open(database, first);
+    const conversation = await abandoned.root(BACKGROUND_CONTEXT, {
+      agent: { model: { provider: "scripted", modelId: "scripted" } },
+    });
+    await conversation.submit(
+      {
+        type: "input",
+        requestId: "op-ledger",
+        content: "ledger question",
+        entry: operationEntry("op-ledger", LEDGER_CAMPAIGN),
+      },
+      BACKGROUND_CONTEXT,
+    );
+    await first.started;
+
+    const reopened = new Database(path);
+    const second = scriptedModels(
+      ({ hasToolResult }) =>
+        hasToolResult
+          ? assistantReply("done")
+          : toolCallReply("recovered-call", "scope_probe"),
+      { gate: false },
+    );
+    const harness = await open(reopened, second);
+    try {
+      await harness.waitForIdle(BACKGROUND_CONTEXT);
+      expect(second.observations.length).toBeGreaterThan(0);
+      for (const observation of second.observations)
+        expect(observation.system).toContain(
+          "install_id install_ledger, context_id campaign",
+        );
+      expect(seen).toEqual([LEDGER_CAMPAIGN]);
+    } finally {
+      await harness.close(BACKGROUND_CONTEXT);
+      reopened.close();
+      database.close();
+    }
+  }, 30_000);
+
+  it("propagates a failed SQL read instead of reading it as an absent entry", () => {
+    const failing: TaskSql = {
+      exec() {
+        throw new Error("disk I/O error");
+      },
+    };
+    expect(() => readSubmissionEntry(failing, "1")).toThrow("disk I/O error");
+  });
+
+  it("leaves the rest of a thread readable when one stored row is malformed, while its execution is refused", async () => {
+    const { database } = sessionDatabase();
+    database.exec(
+      "CREATE TABLE pi_submissions (id INTEGER PRIMARY KEY, record TEXT); CREATE TABLE pi_entries (id INTEGER PRIMARY KEY, record TEXT)",
+    );
+    database
+      .prepare("INSERT INTO pi_submissions (id, record) VALUES (1, ?)")
+      .run(JSON.stringify({ type: "input", entry: 1 }));
+    database
+      .prepare("INSERT INTO pi_entries (id, record) VALUES (1, ?)")
+      .run(JSON.stringify({ kind: BOARD_MESSAGE_KIND, data: "not-an-object" }));
+    const row = (id: number, data: unknown, text: string) =>
+      ({
+        id,
+        conversationId: 1,
+        kind: BOARD_MESSAGE_KIND,
+        data,
+        model: [{ role: "user", content: text, timestamp: 1000 }],
+      }) as never;
+    const entries = threadEntries(
+      [
+        row(1, "not-an-object", "bad row"),
+        row(2, { messageId: "op-2", app: LEDGER }, "good row"),
+      ],
+      false,
+    );
+    expect(entries.map((entry) => entry.text)).toEqual(["bad row", "good row"]);
+    expect(entries[0]).not.toHaveProperty("message");
+    expect(entries[0]).not.toHaveProperty("payload");
+    expect(entries[1]?.payload?.app).toEqual({ install_id: "install_ledger" });
+
+    const session = await constructedSession(database, { tools: [] });
+    expect(() => session.operationAppScope("1")).toThrow();
     database.close();
   });
 

@@ -87,8 +87,8 @@ export interface ToolInvocation {
     /**
      * The app scope of the turn this call belongs to: the common scope of every
      * input of the run, as those operations were admitted. Absent for a Home
-     * operation and for a call that runs outside one (for example a tool of
-     * another conversation's run).
+     * operation. A call with no active run to attribute it to is refused, never
+     * run as Home.
      */
     readonly app?: AppScope;
 }

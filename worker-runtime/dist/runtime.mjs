@@ -57036,7 +57036,7 @@ function threadEntries(records, includeThinking) {
   for (const record of records) {
     const data = record.data;
     const messageId = record.kind === BOARD_MESSAGE_KIND && data !== null && typeof data === "object" && !Array.isArray(data) && typeof data.messageId === "string" ? data.messageId : undefined;
-    const app = parseEntryAppScope(record.kind, data);
+    const app = data !== null && typeof data === "object" && !Array.isArray(data) ? parseEntryAppScope(record.kind, data) : null;
     const payload = app === null ? undefined : { app: appPayload(app) };
     for (const message of record.model ?? []) {
       position += 1;

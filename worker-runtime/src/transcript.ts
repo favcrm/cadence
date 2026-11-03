@@ -122,7 +122,13 @@ export function threadEntries(
     // with, never a scope re-derived from the caller. A stored scope that does
     // not validate fails the read: serving the entry without it would present
     // an operation as Home, which is a silent weakening of its envelope.
-    const app = parseEntryAppScope(record.kind, data);
+    // Only a row whose `data` is an object can claim a scope: a stored row
+    // with any other `data` is rendered as it was before scopes existed, and
+    // its execution path (`operationAppScope`) stays strict and refuses it.
+    const app =
+      data !== null && typeof data === "object" && !Array.isArray(data)
+        ? parseEntryAppScope(record.kind, data)
+        : null;
     // The board's own operator-entry payload carries the verified binding as
     // `{install_id, context_id?}`, which is what its retry sends back.
     const payload = app === null ? undefined : { app: appPayload(app) };
