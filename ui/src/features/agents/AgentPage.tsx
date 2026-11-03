@@ -392,7 +392,8 @@ export default function AgentPage({
         block={writeBlock}
         onBack={onBack}
         onOpenIssue={onOpenIssue}
-        notices={hired ? null : notices}
+        // A missing agent or unread roster already has its one answer in the gate.
+        notices={hired || !profile ? null : notices}
         heading={
           <>
             <AgentAvatar

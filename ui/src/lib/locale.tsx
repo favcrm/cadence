@@ -9,7 +9,7 @@ type Scope = "user" | "organization";
 type Preferences = { organization_locale: Locale | null; user_locale: Locale | null };
 
 const zhTW: Record<string, string> = {
-  "Provider not reported": "未回報提供者", "This board has no job text for this agent.": "此看板沒有此代理程式的工作說明。", "This board doesn’t report runtime details.": "此看板不會回報執行環境詳細資料。",
+  "Provider not reported": "未回報供應商", "This board doesn’t show job text for this agent.": "此看板不會顯示此代理程式的工作說明。", "This board doesn’t report runtime details.": "此看板不會回報執行環境詳細資料。",
   "This board doesn’t record agent history.": "此看板不會記錄代理程式的歷史。", "This agent was hired as {role}.": "此代理程式的受聘角色為 {role}。",
   "Could not load agents": "無法載入代理程式", "We couldn’t confirm your access": "無法確認你的存取權限", "This doesn’t mean you’ve been signed out. The connection may be interrupted.": "這不代表你已登出。連線可能已中斷。",
   "Your assistant is on Home": "你的助理在首頁", "Conversations with agents here are for the workspace operator.": "此處與代理程式的對話僅供工作區操作員使用。", "Open Home": "開啟首頁", "Conversations with agents are for the operator": "與代理程式的對話僅供操作員使用", "You can still see what this agent is working on.": "你仍可查看此代理程式正在處理的工作。", "Chat with a profile isn’t available on hosted boards yet. It works on issues started under its profile.": "託管看板尚未支援與此設定檔對話。它會處理以此設定檔啟動的議題。",

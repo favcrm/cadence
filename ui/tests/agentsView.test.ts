@@ -598,7 +598,7 @@ async function main() {
   await flush();
   const failedPanel = freshHost.querySelector(".ag-chat-panel")?.textContent ?? "";
   assert(failedPanel.includes("Agent details are unavailable."), "the panel says its details could not be read");
-  for (const empty of ["Nothing queued.", "No results yet.", "No events yet."])
+  for (const empty of ["Nothing queued.", "No results yet.", "No events yet.", "no role text"])
     assert(!failedPanel.includes(empty), `the panel claims nothing about unread details: ${empty}`);
   await React.act(() => freshRoot.unmount());
   // A board that answers 501 keeps no details: permanent, so nothing to retry.
@@ -669,6 +669,14 @@ async function main() {
       assert(page.includes("Some details aren’t available"), `${label}, ${section}, 501: reports that details are missing`);
     }
   }
+  // The panel on an unknown agent claims no role text it could not read.
+  await mountServed("nobody", "overview", liveRoster);
+  const unknownDetails = Array.from(servedHost.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Details");
+  assert(unknownDetails, "the panel opens for an unknown agent");
+  await React.act(() => unknownDetails.click());
+  await flush();
+  assert(!servedHost.querySelector(".ag-chat-panel")?.textContent?.includes("no role text"), "an unread read claims no role text");
+  assert(!servedHost.querySelector(".ag-chat-main")?.textContent?.includes("Some details"), "a missing agent has one answer, the gate");
   await mountServed("dev", "history", liveRoster);
   assert(servedHost.textContent?.includes(NOT_RECORDED), "a known agent's history says it isn't recorded");
   assert(!servedHost.querySelector(".rc-cats"), "no filters over a history the board doesn't keep");
@@ -682,6 +690,20 @@ async function main() {
   detailNotServedCode = "not_implemented";
   await mountServed("nobody", "overview", liveRoster);
   assert(servedHost.querySelector(".ag-chat-gate")?.textContent?.includes("No agent named nobody"), "an unknown agent on a 501 board is still reported as missing");
+  // A read still running says nothing about the agent, on a deep link.
+  const unsettled = ["No events yet.", "No results yet.", "no role text"];
+  holdDetail = true;
+  for (const section of ["history", "work"] as const) {
+    await mountServed("dev", section, liveRoster);
+    for (const claim of unsettled)
+      assert(!servedHost.textContent?.includes(claim), `${section}, read in flight: claims nothing yet: ${claim}`);
+    await React.act(async () => releaseDetail?.());
+    await flush();
+  }
+  holdDetail = false;
+  await mountServed("dev", "work", { ...liveRoster, data: null, status: "loading" });
+  for (const claim of [...unsettled, "Nothing right now", "Nothing queued", "Nothing needs attention"])
+    assert(!servedHost.textContent?.includes(claim), `work, roster pending: claims nothing yet: ${claim}`);
   detailNotServed = false;
   await React.act(() => servedRoot.unmount());
   console.log("agents view checks passed");
