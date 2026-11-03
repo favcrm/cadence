@@ -1,4 +1,14 @@
-import type { WikiHistoryResponse, WikiKind, WikiListing, WikiPage, WikiSearchResponse } from "./api";
+import type {
+  TrashEntry,
+  TrashItems,
+  TrashLanding,
+  TrashLandings,
+  WikiHistoryResponse,
+  WikiKind,
+  WikiListing,
+  WikiPage,
+  WikiSearchResponse,
+} from "./api";
 import { baseName } from "./paths";
 import type { SearchHit } from "./search";
 
@@ -96,4 +106,112 @@ export function normalizeHistory(value: WikiHistoryResponse & {
       ...(commit.can_open !== undefined ? { can_open: commit.can_open } : {}),
     })),
   } : value;
+}
+
+/* ------------------------------------------------- CAD-2018: trash wire */
+
+type WireTrashLanding = Omit<TrashLanding, "kind"> & { kind: string | null };
+type WireTrashEntry = Omit<TrashEntry, "kind"> & { kind: string };
+
+/** A non-negative finite number, or null when the board did not prove one. */
+function provenNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function provenTimestamp(value: unknown): number | null {
+  const ms = provenNumber(value);
+  return ms !== null && Number.isSafeInteger(ms) && ms <= 8_640_000_000_000_000 ? ms : null;
+}
+
+function provenString(value: unknown): string | null {
+  return typeof value === "string" && value ? value : null;
+}
+
+function trashCursor(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" && value) return value;
+  throw new Error("the board returned an invalid trash cursor");
+}
+
+/**
+ * The landing selector is the only restore source the board accepts, so it
+ * is checked before it is ever sent back: `.trash/`, a landing segment and
+ * an original path, with no empty or traversal segment. The board still
+ * rejects anything foreign; this only keeps a malformed row off the screen.
+ */
+export function safeTrashFrom(from: string): boolean {
+  if (!from.startsWith(".trash/")) return false;
+  const parts = from.split("/");
+  if (parts.length < 3) return false;
+  return parts.every((part) => part !== "" && part !== "." && part !== "..");
+}
+
+/**
+ * `GET /api/wiki/trash`. Fail closed on a malformed row: a landing with no
+ * identity, a selector outside `.trash/` or no restorability answer is not
+ * shown at all, rather than rendered with invented values. A null `from`
+ * is a real answer — the board cannot prove the origin — so it stays null
+ * and is never made restorable here.
+ */
+export function normalizeTrashLandings(value: {
+  landings?: WireTrashLanding[];
+  next_cursor?: string | null;
+}): TrashLandings {
+  if (!Array.isArray(value.landings)) throw new Error("the trash listing had no landings");
+  return {
+    landings: value.landings.map((landing) => {
+      const landingId = typeof landing.landing_id === "string" ? landing.landing_id : "";
+      if (!landingId) throw new Error("the trash listing returned a landing without an id");
+      const from = typeof landing.from === "string" && landing.from ? landing.from : null;
+      if (from !== null && (!safeTrashFrom(from) || from.split("/")[1] !== landingId)) {
+        throw new Error("the trash listing returned a foreign landing selector");
+      }
+      if (landing.kind === null && from !== null) {
+        throw new Error("the trash listing returned a selector without a known kind");
+      }
+      if (typeof landing.restorable !== "boolean") {
+        throw new Error("the trash listing did not say whether a landing is restorable");
+      }
+      const reason = provenString(landing.reason);
+      const reasonKnown = landing.reason === null || reason !== null;
+      return {
+        landing_id: landingId,
+        from,
+        path: provenString(landing.path),
+        kind: landing.kind === null ? null : wikiKind(landing.kind),
+        deleted_at: provenTimestamp(landing.deleted_at),
+        actor: provenString(landing.actor),
+        item_count: provenNumber(landing.item_count),
+        size: provenNumber(landing.size),
+        // A landing with no provable origin cannot be a restore source, no
+        // matter what the row claims.
+        restorable: landing.restorable && from !== null && reasonKnown && reason === null,
+        reason,
+      };
+    }),
+    next_cursor: trashCursor(value.next_cursor),
+  };
+}
+
+/**
+ * `GET /api/wiki/trash/items`. The answer must name the landing that was
+ * asked for — a different `from` is a foreign answer, not a page to append.
+ */
+export function normalizeTrashItems(value: {
+  from?: string;
+  entries?: WireTrashEntry[];
+  next_cursor?: string | null;
+}, requested: string): TrashItems {
+  if (value.from !== requested) throw new Error("the board answered a different trash landing");
+  if (!Array.isArray(value.entries)) throw new Error("the trash landing had no entries");
+  return {
+    from: requested,
+    entries: value.entries.map((entry) => {
+      if (typeof entry.path !== "string" || !entry.path) {
+        throw new Error("the trash landing returned an entry without a path");
+      }
+      return { path: entry.path, kind: wikiKind(entry.kind), size: provenNumber(entry.size) };
+    }),
+    next_cursor: trashCursor(value.next_cursor),
+  };
 }

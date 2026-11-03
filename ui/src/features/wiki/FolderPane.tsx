@@ -1,14 +1,15 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import Link from "../../ui/Link";
-import { IconFolder, IconGrid, IconList, IconMore } from "../../ui/icons";
-import { wiki, wikiBlob, type WikiEntry } from "./api";
+import { IconFolder, IconGrid, IconList, IconMore, IconTrash } from "../../ui/icons";
+import { wiki, WikiError, wikiBlob, type WikiEntry } from "./api";
 import { baseName, joinPath, parentPath } from "./paths";
 import { withinScope } from "./scope";
 import { kindLabel, previewKind } from "./preview";
 import { entryOrder } from "./tree";
+import { confirmedDeleteLanding } from "./trash";
 import Button from "../../ui/Button";
-import { KindIcon, Loading, WikiImage, useWikiScope } from "./shared";
+import { KindIcon, Loading, Note, WikiImage, useWikiScope } from "./shared";
 import { useTranslate } from "../../lib/locale";
 import { onPrivateReadsPaused, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { sessionKey } from "../../lib/sessionKey";
@@ -18,10 +19,15 @@ import { sessionKey } from "../../lib/sessionKey";
  * menu (rename, move, download, delete-to-trash) and the empty state.
  */
 
+export type DeleteReceipt = { name: string; trash: string };
+
 export default function FolderPane({
   entries,
+  receipt,
+  onReceipt,
   navHref,
   readOnly,
+  trashHref,
   onRefresh,
   onToast,
   onFail,
@@ -29,6 +35,11 @@ export default function FolderPane({
   entries: WikiEntry[];
   navHref: (route: Route) => string;
   readOnly: boolean;
+  /** The operator's Trash screen; absent for a non-operator, who gets no
+   *  discovery. The landing receipt itself is shown either way. */
+  trashHref?: string | null;
+  receipt: DeleteReceipt | null;
+  onReceipt: (receipt: DeleteReceipt) => void;
   onRefresh: () => void;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onFail: (error: unknown, verb: string) => void;
@@ -71,6 +82,7 @@ export default function FolderPane({
     return () => window.removeEventListener("keydown", dismiss);
   }, [menu]);
 
+
   const rows = [...entries].sort(entryOrder);
   const openHref = (entry: WikiEntry) =>
     navHref({ screen: "wiki", mode: "browse", path: entry.path, query: null });
@@ -110,17 +122,27 @@ export default function FolderPane({
   const remove = async (entry: WikiEntry) => {
     setBusy(true);
     try {
-      // Neither host lists trash here. Name the returned landing as an
-      // operator recovery path, not as a place this screen can browse.
+      // Both hosts answer the landing this delete created. Name it as the
+      // receipt, and (for the operator) offer the Trash screen as the way
+      // to find it again; the landing itself is never browsed from here.
       const result = await wiki.rm(entry.path);
-      onToast("ok", result.trash
-        ? `${entry.name} moved to ${result.trash} — restoring it is an operator recovery step`
-        : `${entry.name} was removed`);
+      const landing = confirmedDeleteLanding(result, entry.path);
+      if (landing) {
+        onReceipt({ name: entry.name, trash: landing });
+        onToast("ok", `${entry.name} moved to ${landing}`);
+      } else {
+        onToast("warn", `Delete of ${entry.name} was not confirmed. Refresh and check the folder and Trash.`);
+      }
       setConfirm(null);
       setMenu(null);
       onRefresh();
     } catch (error) {
-      onFail(error, "delete");
+      if (error instanceof WikiError && [403, 404, 409].includes(error.status)) {
+        onFail(error, "delete");
+      } else {
+        onToast("warn", `Delete of ${entry.name} was not confirmed. Refresh and check the folder and Trash.`);
+        onRefresh();
+      }
     } finally {
       setBusy(false);
     }
@@ -156,15 +178,30 @@ export default function FolderPane({
     }
   };
 
+  // The receipt outlives the row it names, including when the delete
+  // emptied the folder: the landing is the operator's way back.
+  const receiptNote = receipt && (
+    <Note>
+      <IconTrash size={13} />
+      <span>
+        {receipt.name} {t("moved to")} <span className="num">{receipt.trash}</span>.
+        {trashHref && <> <Link className="lnk" href={trashHref}>{t("Open Trash")}</Link></>}
+      </span>
+    </Note>
+  );
+
   if (rows.length === 0) {
     return (
-      <div className="wk-empty card">
-        <IconFolder size={34} />
-        <div className="wk-etitle">{t("This folder is empty")}</div>
-        <div className="wk-ebody">
-          {readOnly ? t("nothing here yet — you can read this folder, but not add to it.") : t("start with New page, or drop files to upload.")}
+      <>
+        {receiptNote}
+        <div className="wk-empty card">
+          <IconFolder size={34} />
+          <div className="wk-etitle">{t("This folder is empty")}</div>
+          <div className="wk-ebody">
+            {readOnly ? t("nothing here yet — you can read this folder, but not add to it.") : t("start with New page, or drop files to upload.")}
+          </div>
         </div>
-      </div>
+      </>
     );
   }
 
@@ -210,6 +247,7 @@ export default function FolderPane({
 
   return (
     <>
+      {receiptNote}
       <div className="wk-viewrow">
         <span className="text-label text-ink-500">{rows.length} {rows.length === 1 ? "item" : "items"}</span>
         <span className="wk-vt" role="group" aria-label={t("Folder view")}>
@@ -280,7 +318,7 @@ export default function FolderPane({
         <div className="wk-dialog card">
           <h2 className="wk-dialog-title">{t("Delete")} {baseName(confirm)}?</h2>
           <div className="text-secondary text-ink-300">
-            {t("This item moves to .trash/. Restoring it is an operator recovery step — this board has no trash browser.")}
+            {t("This item moves to .trash/ with its stored bytes. Restoring it is the operator’s step.")}
           </div>
           <div className="wk-tools">
             <Button

@@ -58,11 +58,23 @@ the available file type, and a hosted result that matched only some search
 terms says so. An upload's extraction status is a receipt, not a live progress
 feed; an unconfirmed result does not establish that extraction has finished.
 
-Removing an item returns its exact `.trash/...` landing. There is no board
-trash browser; retain that landing and ask an operator to restore it with
-`cadence wiki mv <landing> <destination>` when the target host supports the
-restore. The destination must be available. An older revision whose original
-text was not retained cannot be reconstructed from its history entry.
+Removing an item returns its exact `.trash/...` landing. An operator can open
+Trash in the board, inspect the recorded entries, and restore to the original
+path or another available destination. Trash is not visible to members or
+agents. The browser does not guess a restore source when a native landing's
+original path cannot be proved from its tracker history; it reports when its
+bounded history search stops before finding proof. Keep the original receipt:
+an operator can restore that exact source with
+`cadence wiki mv <landing> <destination>` after the server's safety checks.
+Older servers may not support the trash browser.
+
+Hosted restores with more than 200 distinct stored attachments are refused
+until an enforceable storage-custody policy exists. Smaller hosted restores
+check that the referenced objects exist immediately before the move; an
+independent, privileged deletion after that check can still race the restore.
+The check is not a backup or proof of a tenant bucket lock. An older revision
+whose original text was not retained cannot be reconstructed from its history
+entry.
 
 ## Upload and update
 

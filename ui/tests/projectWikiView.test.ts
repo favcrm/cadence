@@ -276,7 +276,7 @@ async function run() {
   transferModule.importFile = originalImport;
 
   const folderErrors: string[] = [];
-  const folderProps = { entries: [{ name: "README.md", path: pagePath, kind: "page" as const }], navHref: () => "/", readOnly: false, onRefresh: () => {}, onToast: () => {}, onFail: (error: unknown) => folderErrors.push(String(error)) };
+  const folderProps = { receipt: null, onReceipt: () => {}, entries: [{ name: "README.md", path: pagePath, kind: "page" as const }], navHref: () => "/", readOnly: false, onRefresh: () => {}, onToast: () => {}, onFail: (error: unknown) => folderErrors.push(String(error)) };
   const renderFolder = async (readOnly = false) => {
     await React.act(() => renderWithNavigation(React.createElement(WikiScopeContext, { value: { root: "projects/cadence", label: "Cadence" } }, React.createElement(FolderPane, { ...folderProps, readOnly }))));
   };

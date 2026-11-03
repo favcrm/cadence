@@ -16,6 +16,8 @@ import {
   ConnectIcon,
   CubeIcon,
   DashboardSquare01Icon,
+  Delete02Icon,
+  DeletePutBackIcon,
   File01Icon,
   Folder01Icon,
   Home01Icon,
@@ -111,6 +113,14 @@ export const IconWiki = ({ size = 15, ...rest }: IconProps = {}) => (
 /** A folder in the wiki tree and its empty state. */
 export const IconFolder = ({ size = 14, ...rest }: IconProps = {}) => (
   <Glyph icon={Folder01Icon} size={size} {...rest} />
+);
+/** The wiki's Trash: deleted landings an operator can restore. */
+export const IconTrash = ({ size = 14, ...rest }: IconProps = {}) => (
+  <Glyph icon={Delete02Icon} size={size} {...rest} />
+);
+/** Restore one landing out of Trash. */
+export const IconRestore = ({ size = 14, ...rest }: IconProps = {}) => (
+  <Glyph icon={DeletePutBackIcon} size={size} {...rest} />
 );
 /** The disclosure chevron; rotate it for open rows. */
 export const IconChevron = ({ size = 10, ...rest }: IconProps = {}) => (

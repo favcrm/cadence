@@ -3,9 +3,10 @@ import { fmtBytes } from "../../lib/fmt";
 import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
 import { useTranslate } from "../../lib/locale";
+import { onPrivateReadsPaused } from "../../lib/privateSession";
 import Button from "../../ui/Button";
 import PageState from "../../ui/PageState";
-import { IconWarning } from "../../ui/icons";
+import { IconTrash, IconWarning } from "../../ui/icons";
 import {
   blobPage,
   isMissingWikiFolder,
@@ -37,10 +38,11 @@ import FileExplorer from "./FileExplorer";
 import PagePane from "./PagePane";
 import { statusText, whoLabel } from "./hosted";
 import EditorPane from "./EditorPane";
-import FolderPane from "./FolderPane";
+import FolderPane, { type DeleteReceipt } from "./FolderPane";
 import UploadPane from "./UploadPane";
 import SearchPane from "./SearchPane";
 import HistoryPane from "./HistoryPane";
+import TrashPane from "./TrashPane";
 import "./wiki.css";
 
 /**
@@ -69,6 +71,10 @@ export interface WikiProps {
   hosted?: boolean;
   /** The signed-in member's subject id, so hosted "edited by" can say "you". */
   viewerSub?: string | null;
+  /** The proven operator (`true`), a proven non-operator (`false`) or
+   *  unknown (`null`/absent). Trash discovery is operator-only; `false`
+   *  never probes it and never guesses a host capability. */
+  operator?: boolean | null;
 }
 
 type Open =
@@ -86,11 +92,17 @@ function unavailableRevision(error: unknown): boolean {
   );
 }
 
-export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, onToast, scope, hosted, viewerSub }: WikiProps) {
+export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, onToast, scope, hosted, viewerSub, operator }: WikiProps) {
   const t = useTranslate();
   const root = scope?.root ?? "";
   const current = route.path ?? root;
   const validPath = withinScope(current, root);
+  const trashMode = route.mode === "trash";
+  // Trash is the workspace's, not a project context's, and only a proven
+  // operator gets the entry. A proven non-operator gets no discovery at all.
+  const trashHref = operator === true && !scope
+    ? navHref({ screen: "wiki", mode: "trash", path: null, query: null })
+    : null;
   const [children, setChildren] = useState<Record<string, WikiEntry[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set([""]));
   const [dirError, setDirError] = useState<Record<string, string>>({});
@@ -295,10 +307,20 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
           emptyText={dirError[root] ? t("Files unavailable") : missingRoot || open?.kind === "dir" ? t("No pages yet") : t("Loading…")}
           hrefFor={hrefFor}
           onToggle={toggle}
+          trash={trashHref ? { href: trashHref, active: trashMode } : undefined}
         />
 
         <div className="wk-pane" data-mode={route.mode}>
-          {route.mode === "search" ? (
+          {route.mode === "trash" ? (
+            <TrashPane
+              operator={operator}
+              navHref={navHref}
+              readOnly={readOnly}
+              readOnlyReason={readOnlyReason}
+              onToast={onToast}
+              onRefresh={refresh}
+            />
+          ) : route.mode === "search" ? (
             <SearchPane route={route} navHref={navHref} />
           ) : route.mode === "history" && route.path ? (
             <HistoryPane
@@ -341,6 +363,7 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
               readOnlyReason={readOnlyReason}
               hosted={hosted}
               viewerSub={viewerSub}
+              trashHref={trashHref}
               section={route.section}
               page={route.page}
               onToast={onToast}
@@ -367,6 +390,7 @@ function BrowsePane({
   readOnlyReason,
   hosted,
   viewerSub,
+  trashHref,
   section,
   page: citedPage,
   onToast,
@@ -384,6 +408,8 @@ function BrowsePane({
   readOnlyReason?: string | null;
   hosted?: boolean;
   viewerSub?: string | null;
+  /** The operator's Trash screen, absent for a non-operator or a context. */
+  trashHref: string | null;
   section?: string;
   page?: number;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
@@ -393,6 +419,9 @@ function BrowsePane({
   const t = useTranslate();
   const [creating, setCreating] = useState<{ kind: "page" | "dir"; value: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [receipt, setReceipt] = useState<(DeleteReceipt & { folder: string }) | null>(null);
+  useEffect(() => { setReceipt(null); }, [path]);
+  useEffect(() => onPrivateReadsPaused(() => setReceipt(null)), []);
   const createContext = async () => {
     if (!scope || readOnly) return;
     setBusy(true);
@@ -526,6 +555,7 @@ function BrowsePane({
               {t("Upload")}
             </Button>
             <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
+            {trashHref && <Button href={trashHref} icon={<IconTrash />}>{t("Trash")}</Button>}
         </>} />
         {missingRoot && scope && (
           <EmptyCard title={t("No project context yet")} action={
@@ -551,8 +581,11 @@ function BrowsePane({
         {!missingRoot && isCollectionRoot(path) && <CollectionPane path={path} navHref={navHref} readOnly={readOnly} />}
         {!missingRoot && <FolderPane
           entries={open.listing.entries ?? []}
+          receipt={receipt?.folder === path ? receipt : null}
+          onReceipt={(next) => setReceipt({ ...next, folder: path })}
           navHref={navHref}
           readOnly={writeBlocked}
+          trashHref={trashHref}
           onRefresh={onRefresh}
           onToast={onToast}
           onFail={onFail}

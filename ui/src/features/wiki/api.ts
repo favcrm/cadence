@@ -2,7 +2,7 @@ import { sessionHeaders } from "../../lib/sessionKey";
 import { privateFetch, privateReadsAllowed, privateSessionGeneration, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import type { WikiVersion } from "./history";
 import type { SearchHit } from "./search";
-import { normalizeListing, normalizePage, normalizeSearch, normalizeHistory } from "./wire";
+import { normalizeListing, normalizePage, normalizeSearch, normalizeHistory, normalizeTrashLandings, normalizeTrashItems } from "./wire";
 
 /**
  * The wiki store's HTTP surface (CAD-580) as this screen reads it. One
@@ -94,6 +94,53 @@ export interface WikiHistoryResponse {
   /** CAD-1915: false when the server cannot read a non-current revision (hosted Worker log). */
   canOpen?: boolean;
 }
+
+/**
+ * One deleted landing, as the operator-only listing answers it (CAD-2018).
+ *
+ * `landing_id` is the board's row identity and is always present. `from` is
+ * the exact opaque `.trash/…` value the board accepts as a restore source;
+ * it is null when the board cannot prove the landing's exact origin — a
+ * native landing whose root predates the fixed layout. `path` is the
+ * original logical wiki path, null for the same reason. A null `from` is
+ * never turned into a `.trash/…` string and never asked for items.
+ *
+ * `kind`, `item_count`, `size`, `deleted_at`, `actor` and `reason` are null only
+ * when the board cannot prove them — the screen never fills a gap in.
+ */
+export interface TrashLanding {
+  landing_id: string;
+  from: string | null;
+  path: string | null;
+  kind: WikiKind | null;
+  deleted_at: number | null;
+  actor: string | null;
+  item_count: number | null;
+  size: number | null;
+  restorable: boolean;
+  reason: string | null;
+}
+
+export interface TrashLandings {
+  landings: TrashLanding[];
+  next_cursor: string | null;
+}
+
+/** One path inside a landing: original logical path, no contents. */
+export interface TrashEntry {
+  path: string;
+  kind: WikiKind;
+  size: number | null;
+}
+
+export interface TrashItems {
+  from: string;
+  entries: TrashEntry[];
+  next_cursor: string | null;
+}
+
+/** Both trash routes default to 50 rows and refuse more than 100. */
+export const TRASH_PAGE = 50;
 
 /** A wiki route's refusal, with the conflict fields the editor reads. */
 export class WikiError extends Error {
@@ -251,6 +298,23 @@ export function historyQuery(path: string, from?: string, to?: string): string {
   return `/api/wiki/history?${params.toString()}`;
 }
 
+/** `GET /api/wiki/trash` — operator-only landings in the board's stable
+ *  order. `cursor` is the board's opaque token, never rebuilt here. */
+export function trashQuery(cursor?: string | null, limit = TRASH_PAGE): string {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+  return `/api/wiki/trash?${params.toString()}`;
+}
+
+/** `GET /api/wiki/trash/items` — one landing's original paths, no contents. */
+export function trashItemsQuery(from: string, cursor?: string | null, limit = TRASH_PAGE): string {
+  const params = new URLSearchParams({ from, limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+  // Native query parsing percent-decodes, but does not interpret '+' as a
+  // space. Preserve literal pluses (%2B) and spell spaces as %20 for both hosts.
+  return `/api/wiki/trash/items?${params.toString().replaceAll("+", "%20")}`;
+}
+
 export const mkdirBody = (path: string) => ({ path });
 export const mvBody = (from: string, to: string) => ({ from, to });
 export const rmBody = (path: string) => ({ path });
@@ -266,4 +330,11 @@ export const wiki = {
   search: (query: string, type?: string, path?: string) => get<Parameters<typeof normalizeSearch>[0]>(searchQuery(query, type, path)).then(normalizeSearch),
   history: (path: string, from?: string, to?: string) =>
     get<Parameters<typeof normalizeHistory>[0]>(historyQuery(path, from, to)).then(normalizeHistory),
+  /** CAD-2018: the operator's deleted landings. A board without the route
+   *  answers 404, which the screen reports as "not available here". */
+  trash: (cursor?: string | null) =>
+    get<Parameters<typeof normalizeTrashLandings>[0]>(trashQuery(cursor)).then(normalizeTrashLandings),
+  trashItems: (from: string, cursor?: string | null) =>
+    get<Parameters<typeof normalizeTrashItems>[0]>(trashItemsQuery(from, cursor))
+      .then((value) => normalizeTrashItems(value, from)),
 };

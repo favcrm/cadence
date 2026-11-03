@@ -1647,3 +1647,114 @@ Object.assign(zhTW, {
   "Agent details are unavailable.": "無法取得代理程式詳細資料。",
   "Needs attention could not be read.": "無法讀取需要處理的項目。",
 });
+
+/** CAD-2018: the operator's wiki Trash — list, one landing, one restore. */
+Object.assign(zhTW, {
+  "Trash": "垃圾桶",
+  "Trash is operator-only": "垃圾桶僅限操作員",
+  "Back to Wiki": "返回知識庫",
+  "Restoring from .trash/ is the workspace owner’s. Ask an operator to inspect a deletion and restore it when its stored files are available.":
+    "從 .trash/ 還原是工作區擁有者的權限。請操作員檢查刪除項目，並在已儲存的檔案可用時還原。",
+  "Trash landings loaded.": "已載入垃圾桶存放區。",
+  "Landing": "存放區",
+  "Operator-only · landings under .trash/": "僅限操作員 · 存放區位於 .trash/ 之下",
+  "Deleting moves a page or folder into one landing, which references any stored attachments. Restoring moves the landing back; the board checks attachment storage before the move.":
+    "刪除會把頁面或資料夾移入一個存放區，並保留對已儲存附件的參照。還原會移回該存放區；看板會在移動前檢查附件儲存狀態。",
+  "reading the trash…": "正在讀取垃圾桶…",
+  "The board refused this listing before any write.": "看板在任何寫入之前就拒絕了此清單。",
+  "Trash browsing isn’t available on this board": "此看板不提供垃圾桶瀏覽",
+  "This board does not serve the trash listing route, so this screen cannot list deletions or offer a restore. Keep any delete receipt and ask an operator about recovery.":
+    "此看板未提供垃圾桶清單路由，因此此畫面無法列出刪除項目或提供還原。請保留任何刪除收據，並向操作員查詢如何恢復。",
+  "could not read the trash": "無法讀取垃圾桶",
+  "Trash is empty": "垃圾桶是空的",
+  "Nothing has been deleted, or an operator already restored everything.": "尚未刪除任何內容，或操作員已還原所有項目。",
+  "More landings could not be read.": "無法讀取更多存放區。",
+  "Load more landings": "載入更多存放區",
+  "Deleted landings": "已刪除的存放區",
+  "Original path": "原始路徑",
+  "Deleted": "刪除時間",
+  "By": "刪除者",
+  "Items": "項目數",
+  "Stored": "已儲存",
+  "Original path unknown": "原始路徑未知",
+  "origin unknown": "來源未知",
+  "restorable": "可還原",
+  "not restorable": "無法還原",
+  "Restored": "已還原",
+  "The landing moved back. The board did not report how many entries it held.": "存放區已移回。看板未回報其中包含多少項目。",
+  "moved back from the landing.": "已從存放區移回。",
+  "The board checked the stored bytes before moving them. A stored object deleted between that check and the move cannot be prevented, so open the restored files to confirm them.":
+    "看板在移動前檢查了已儲存的位元組。若某個已儲存物件在檢查與移動之間被刪除，無法避免，請開啟還原後的檔案確認。",
+  "Open the restored path": "開啟還原後的路徑",
+  "Back to Trash": "返回垃圾桶",
+  "Reading the landing’s paths…": "正在讀取存放區的路徑…",
+  "path listed": "個路徑已列出",
+  "paths listed": "個路徑已列出",
+  "The board cannot prove this landing’s original path.": "看板無法證明此存放區的原始路徑。",
+  "Landing contents": "存放區內容",
+  "This landing has no provable restore source, so its paths are not requested.": "此存放區沒有可證明的還原來源，因此不會請求其路徑。",
+  "The board stopped searching older changes before it could prove this landing’s original path. It did not guess a restore source.":
+    "看板在確認此存放區的原始路徑前已停止搜尋較舊的變更，並未猜測還原來源。",
+  "reading the landing’s paths…": "正在讀取存放區的路徑…",
+  "could not read this landing’s paths": "無法讀取此存放區的路徑",
+  "The board cannot name this landing’s restore source.": "看板無法指出此存放區的還原來源。",
+  "The board listed no paths in this landing.": "看板未列出此存放區中的任何路徑。",
+  "Load more paths": "載入更多路徑",
+  "Restore source": "還原來源",
+  "Restores to": "還原至",
+  "The board checks the destination and every grant before the first write. Nothing is copied.": "看板會在第一次寫入前檢查目的地與每一項授權。不會複製任何內容。",
+  "Restore is operator-only": "還原僅限操作員",
+  "The board refused the restore before any write.": "看板在任何寫入之前就拒絕了還原。",
+  "Restore blocked — custody not verified": "還原已封鎖 — 保管未經驗證",
+  "The board cannot prove custody of this landing’s stored bytes, so it refuses to restore them. A digest checkpoint from an older board is not custody, and this screen does not offer one as a workaround.":
+    "看板無法證明此存放區已儲存位元組的保管狀態，因此拒絕還原。舊版看板的摘要檢查點並非保管證明，此畫面不會將其視為替代方案。",
+  "This board wants a digest checkpoint before a large restore. A checkpoint counts files once; it does not prove their bytes are still there, so this screen does not use one as permission to restore.":
+    "此看板要求大型還原前先完成摘要檢查點。檢查點只計數一次檔案，並不證明其位元組仍在，因此此畫面不會將其視為還原許可。",
+  "Restore blocked — a checkpoint is not custody": "還原已封鎖 — 檢查點並非保管證明",
+  "That destination already exists": "該目的地已存在",
+  "The board refused the restore": "看板拒絕了還原",
+  "Nothing was written. Choose another destination and restore again.": "未寫入任何內容。請選擇另一個目的地後再次還原。",
+  "The board refused this request. Reload Trash before retrying if the result is uncertain.":
+    "看板拒絕了此請求。若結果不明，請在重試前重新載入垃圾桶。",
+  "The landing or stored bytes are unavailable": "存放區或已儲存的位元組無法使用",
+  "The board refused the restore. Reload Trash to check whether the landing is still available.":
+    "看板拒絕了還原。請重新載入垃圾桶，確認存放區是否仍然可用。",
+  "The stored bytes could not be checked": "無法檢查已儲存的位元組",
+  "The board could not verify the landing, so nothing was restored. Retry when storage answers.": "看板無法驗證此存放區，因此未還原任何內容。請在儲存服務恢復回應後重試。",
+  "That destination was refused": "該目的地遭拒",
+  "The restore was not confirmed": "還原未獲確認",
+  "The board did not confirm whether the landing moved. Reload Trash and check the list before trying again.":
+    "看板未確認存放區是否已移動。請重新載入垃圾桶並確認清單後再試。",
+  "Retry restore": "重試還原",
+  "Reload Trash": "重新載入垃圾桶",
+  "Restore from Trash?": "要從垃圾桶還原嗎？",
+  "The landing’s entries move back to the path below. Nothing is copied, and the landing is consumed.":
+    "存放區的項目會移回下方路徑。不會複製任何內容，且存放區會被消耗。",
+  "move back to the path below. Nothing is copied, and the landing is consumed.":
+    "個項目會移回下方路徑。不會複製任何內容，且存放區會被消耗。",
+  "folder": "資料夾",
+  "page": "頁面",
+  "file": "檔案",
+  "moved to": "已移至",
+  "was removed.": "已移除。",
+  "Open Trash": "開啟垃圾桶",
+  "This item moves to .trash/ with its stored bytes. Restoring it is the operator’s step.":
+    "此項目會連同已儲存的位元組移至 .trash/。還原是操作員的步驟。",
+  "Enter a destination path.": "請輸入目的地路徑。",
+  "A wiki path cannot start with a slash.": "知識庫路徑不能以斜線開頭。",
+  "A wiki path cannot end with a slash.": "知識庫路徑不能以斜線結尾。",
+  "A wiki path cannot contain a backslash, a percent sign or a control character.":
+    "知識庫路徑不能包含反斜線、百分比符號或控制字元。",
+  "The board cannot prove this landing’s exact original root, so it cannot say where a restore would put it. This screen does not guess a path and cannot restore it.":
+    "看板無法證明此存放區的確切原始根目錄，因此無法說明還原後的位置。此畫面不會猜測路徑，也無法還原。",
+  "The board cannot prove this landing’s exact original root, so it cannot say where a restore would put it.":
+    "看板無法證明此存放區的確切原始根目錄，因此無法說明還原後的位置。",
+  "The board cannot read this landing’s stored rows, so it will not restore it.": "看板無法讀取此存放區已儲存的資料列，因此不會還原它。",
+  "This landing holds a symlink or another entry the board will not move.": "此存放區包含符號連結或看板不願移動的其他項目。",
+  "This landing’s original root is outside the fixed wiki roots, so the board will not restore it.":
+    "此存放區的原始根目錄不在固定的知識庫根目錄內，因此看板不會還原它。",
+  "More than one stored landing could be this delete, so the board will not pick one.":
+    "有多個存放區可能對應這次刪除，因此看板不會任意選擇。",
+  "This landing has no entries left to restore.": "此存放區已沒有可還原的項目。",
+  "The board marked this landing as not restorable.": "看板已將此存放區標記為無法還原。",
+});
