@@ -177,15 +177,33 @@ impl Shared {
         })
     }
 
-    /// The imported-custody counterpart of `with_media_mount_current`:
-    /// the same live mount proof — session, pinned context and lifetime,
-    /// install digest and approval, declared `media.read`, active owned
-    /// context — without a producing-run binding, which imported bytes
-    /// never have. One shared door, so a later hardening of the provider
-    /// path is a decision about this one too.
+    fn with_media_mount_current<T>(
+        &self,
+        params: &Value,
+        original: &crate::store::app_media::MediaOriginalProof,
+        read: impl FnOnce(&ToolContext) -> Result<T>,
+    ) -> Result<T> {
+        self.with_media_authority(params, OriginalAuthority::Provider(original), read)
+    }
+
+    /// The imported-custody counterpart: no producing-run binding, which
+    /// imported bytes never have, but every other proof is the same one.
     fn with_imported_media_current<T>(
         &self,
         params: &Value,
+        read: impl FnOnce(&ToolContext) -> Result<T>,
+    ) -> Result<T> {
+        self.with_media_authority(params, OriginalAuthority::Imported, read)
+    }
+
+    /// One media-image door for both provenances: the session, the pinned
+    /// tool context and its lifetime, the install digest and approval, the
+    /// declared `media.read`, the active owned context and the per-send
+    /// mount proof all live here, so a hardening lands on both paths.
+    fn with_media_authority<T>(
+        &self,
+        params: &Value,
+        authority: OriginalAuthority<'_>,
         read: impl FnOnce(&ToolContext) -> Result<T>,
     ) -> Result<T> {
         let token = required_str(params, "token")?;
@@ -221,53 +239,7 @@ impl Shared {
             token,
             key,
             origin,
-            authority: OriginalAuthority::Imported,
-            account_source: None,
-            expected,
-        };
-        delivery.with_current(|| read(&delivery.expected))?
-    }
-
-    fn with_media_mount_current<T>(
-        &self,
-        params: &Value,
-        original: &crate::store::app_media::MediaOriginalProof,
-        read: impl FnOnce(&ToolContext) -> Result<T>,
-    ) -> Result<T> {
-        let token = required_str(params, "token")?;
-        let action_token = required_str(params, "action_token")?;
-        let key = match params.get("key") {
-            None => "",
-            Some(Value::String(key)) => key.as_str(),
-            _ => {
-                return Err(Error::rejected(
-                    "media image key must be a session key string",
-                ))
-            }
-        };
-        let origin = match params["origin"].as_str() {
-            Some("loopback") => Origin::Loopback,
-            Some("tailnet") => Origin::Tailnet,
-            Some("public") => Origin::Public,
-            _ => {
-                return Err(Error::rejected(
-                    "media image needs a classified session origin",
-                ))
-            }
-        };
-        let (session, _) = self
-            .tool_session(token, key, origin)
-            .ok_or_else(|| Error::rejected("media image needs a live operator session"))?;
-        let expected = self.tool_context_proven(action_token, &session)?;
-        let pm = self.pm_at(&self.pm_dir()?)?;
-        let delivery = OriginalDelivery {
-            shared: self,
-            pm: &pm,
-            action_token,
-            token,
-            key,
-            origin,
-            authority: OriginalAuthority::Provider(original),
+            authority,
             account_source: None,
             expected,
         };
