@@ -223,7 +223,7 @@ summary.ag-side-group .num { margin-left: auto; }
 .ag-folded summary { margin-bottom: 0.5rem; cursor: pointer; color: var(--color-ink-400); font-size: var(--text-label); }
 
 /* An agent's page: Home's chat with the agent's own panel */
-.ag-chat { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; flex: 1; min-height: 0; padding: 0.875rem 1.125rem; }
+.ag-chat { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); gap: 1rem; flex: 1; min-height: 0; padding: 0.875rem 1.125rem; }
 .ag-chat-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .ag-chat-head { display: flex; align-items: center; gap: 0.625rem; padding-bottom: 0.625rem; border-bottom: 1px solid var(--color-ink-700); }
 .ag-chat-title { flex: 1; }
