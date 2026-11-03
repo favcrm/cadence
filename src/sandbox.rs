@@ -3098,6 +3098,10 @@ mod tests {
 }
 
 #[cfg(test)]
+#[path = "sandbox/cad1922_acceptance_20261103.rs"]
+mod cad1922_acceptance_20261103;
+
+#[cfg(test)]
 mod agenticos_approve_tests {
     use super::*;
 
