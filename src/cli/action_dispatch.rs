@@ -269,6 +269,10 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             json,
             auth_dir,
         } => {
+            if *use_ {
+                org::refuse_managed_default_change()
+                    .inspect_err(|error| report_register_error(error, *json))?;
+            }
             let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
             let issuer = issuer
                 .as_deref()
@@ -353,6 +357,9 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             cloud_agent,
             audit_approve,
         } => {
+            if *use_ && !*token_stdin {
+                org::refuse_managed_default_change()?;
+            }
             // `--token-stdin` is the legacy AgenticOS token path, not org login.
             let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
             if *token_stdin {

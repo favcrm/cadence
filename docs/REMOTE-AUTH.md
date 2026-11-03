@@ -145,6 +145,14 @@ remove an org binding; a verified re-login replaces it. Use
 `--use`, the current default is unchanged. `--no-open` prints the approval
 URL and code without opening a browser.
 
+In a session inheriting `CADENCE_ALIAS` or `CADENCE_GRANT_TOKEN`, hosted portal
+login and registration refuse `--use` before starting consent, and `org switch` refuses
+before changing the registry. The operator can choose a default in their own
+shell; agents should target their assigned workspace explicitly. This is an
+accidental-change guard, not caller authentication: environment variables can
+be removed or changed, and filesystem permissions govern shared credentials
+and preferences.
+
 An owner or current member can approve ordinary collaboration. Both the portal
 and explicit org login request `cli.read`, `cli.write`, `wiki.read` and
 `wiki.write`; saved renewal retains the consented set. `--web` requests its
