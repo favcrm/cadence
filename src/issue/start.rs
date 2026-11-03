@@ -248,36 +248,44 @@ fn verify_explicit_base(root: &Path, base: &str) -> Result<String> {
     if is_sha || !origin_configured(root) {
         return verify_base(root, base);
     }
-    let branch = base
+    let remote_form = base
         .strip_prefix("refs/remotes/origin/")
+        .or_else(|| base.strip_prefix("origin/"));
+    let spelled = remote_form
         .or_else(|| base.strip_prefix("refs/heads/"))
-        .or_else(|| base.strip_prefix("origin/"))
         .unwrap_or(base);
-    if !valid_branch(branch) {
+    let branch = if remote_form == Some("HEAD") {
+        remote_head_branch(root)?
+    } else {
+        spelled.to_string()
+    };
+    if !valid_branch(&branch) {
         return verify_base(root, base);
     }
-    let listed = git(
-        root,
-        &[
-            "ls-remote",
-            "--heads",
-            "origin",
-            &format!("refs/heads/{branch}"),
-        ],
-    )
-    .map_err(|e| {
+    let want = format!("refs/heads/{branch}");
+    let listed = git(root, &["ls-remote", "--heads", "origin", &want]).map_err(|e| {
         Error::rejected(format!(
             "Could not reach origin to resolve base '{base}' in {} ({e}) — retry when origin is \
              reachable; no stale local ref was used",
             root.display()
         ))
     })?;
-    if listed.trim().is_empty() {
+    let on_origin = listed
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(want.as_str()));
+    if !on_origin {
+        if remote_form.is_some() {
+            return Err(Error::rejected(format!(
+                "Base '{base}' names a branch origin no longer carries — pass --base <ref> \
+                 that exists on origin; the stale tracking ref was not used"
+            )));
+        }
         return verify_base(root, base);
     }
-    let remote_ref = format!("origin/{branch}");
-    fetch_integration(root, &remote_ref)?;
-    verify_base(root, &remote_ref)
+    fetch_integration(root, &format!("origin/{branch}"))?;
+    // The full ref: a local tag or branch named `origin/<branch>` would win
+    // the short spelling.
+    verify_base(root, &format!("refs/remotes/origin/{branch}"))
 }
 
 fn verify_base(root: &Path, base: &str) -> Result<String> {
@@ -1743,6 +1751,46 @@ mod resolve_base_tests {
         // A full SHA is used as given.
         let pinned = resolve_base(&fix.checkout, Some(&fix.main_sha), None).expect("sha");
         assert_eq!(pinned.sha, fix.main_sha);
+    }
+
+    #[test]
+    fn explicit_base_ignores_a_local_ref_shadowing_origin_main() {
+        let fix = fixture();
+        // A local tag named `origin/main` outranks the short remote-tracking name.
+        run_git(&fix.checkout, &["tag", "origin/main", &fix.side_sha]);
+        let resolved = resolve_base(&fix.checkout, Some("main"), None).expect("main");
+        assert_eq!(resolved.sha, fix.main_sha);
+        let resolved = resolve_base(&fix.checkout, Some("origin/main"), None).expect("origin/main");
+        assert_eq!(resolved.sha, fix.main_sha);
+    }
+
+    #[test]
+    fn explicit_remote_base_refuses_a_branch_origin_dropped() {
+        let fix = fixture();
+        run_git(
+            &fix.checkout,
+            &["push", "--quiet", "origin", "--delete", "staging"],
+        );
+        // The push pruned the tracking ref; restore it as a stale leftover.
+        run_git(
+            &fix.checkout,
+            &[
+                "update-ref",
+                "refs/remotes/origin/staging",
+                &fix.staging_sha,
+            ],
+        );
+        for base in ["origin/staging", "refs/remotes/origin/staging"] {
+            let error = resolve_base(&fix.checkout, Some(base), None).expect_err(base);
+            assert!(error.to_string().contains("no longer carries"), "{error}");
+        }
+    }
+
+    #[test]
+    fn explicit_origin_head_resolves_the_remote_head_branch() {
+        let fix = fixture();
+        let resolved = resolve_base(&fix.checkout, Some("origin/HEAD"), None).expect("head");
+        assert_eq!(resolved.sha, fix.main_sha);
     }
 
     #[test]

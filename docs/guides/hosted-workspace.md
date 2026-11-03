@@ -316,7 +316,9 @@ board may still require the member's registered default alias; report that
 refusal rather than borrowing an alias or assuming another board has the
 same behavior.
 
-`--base <ref>` cuts the lane from that ref and echoes it in the receipt; without
+`--base <ref>` cuts the lane from that ref and echoes it in the receipt; a branch
+base that origin carries resolves to origin's current tip, and an unreachable
+origin refuses; without
 it the lane follows the checkout's own resolution. The alias path refuses
 `--base` rather than ignoring it. A board that predates profile claims refuses
 the field: the claim then proceeds without it, under the same client id and
