@@ -77,7 +77,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "levels", blurb: "Thinking levels the provider offers", kind: "read" },
   { name: "effort", arg: "level", blurb: "Set the thinking level (bare: levels + current)", kind: "set" },
   { name: "compact", blurb: "Compact the session context now", kind: "act" },
-  { name: "new", blurb: "Restart the provider session — fresh context", kind: "act" },
+  { name: "new", blurb: "Start fresh — the assistant stops using the messages so far", kind: "act" },
   { name: "stop", blurb: "Interrupt the running turn", kind: "act" },
 ];
 
