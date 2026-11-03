@@ -1979,6 +1979,27 @@ pub(super) fn run(
     local_state: Option<std::path::PathBuf>,
     command_path: Option<String>,
 ) -> Result<i32> {
+    run_with_finish(
+        target,
+        command,
+        wake_timeout,
+        local_state,
+        command_path,
+        local_agent::hosted_finish,
+    )
+}
+
+fn run_with_finish<F>(
+    target: cadence_agent::remote_cli::RemoteTarget,
+    command: Commands,
+    wake_timeout: u64,
+    local_state: Option<std::path::PathBuf>,
+    command_path: Option<String>,
+    finish: F,
+) -> Result<i32>
+where
+    F: FnOnce(&RemoteTarget, Option<&str>, Option<&std::path::Path>) -> Error,
+{
     if let Commands::Org { action } = command {
         return org::run(action);
     }
@@ -2115,11 +2136,7 @@ pub(super) fn run(
         action: cadence_agent::issue::cli::IssueAction::Finish { id, worktree, .. },
     } = &command
     {
-        return Err(local_agent::hosted_finish(
-            &target,
-            id.as_deref(),
-            worktree.as_deref(),
-        ));
+        return Err(finish(&target, id.as_deref(), worktree.as_deref()));
     }
     if let Commands::Issue {
         action:
@@ -2832,6 +2849,69 @@ pub(super) fn remote_failure(error: Error) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hosted_finish_refuses_through_remote_dispatch_without_tracker_access() {
+        use cadence_agent::issue::cli::IssueAction;
+        use cadence_agent::local_assignment::{CoordHttp, Coordinator, Reply};
+        use std::{cell::Cell, os::unix::fs::PermissionsExt, rc::Rc};
+
+        struct FakeRemote(Rc<Cell<usize>>);
+        impl CoordHttp for FakeRemote {
+            fn send(&mut self, _: &str, _: &str, _: Option<&Value>) -> Result<Reply> {
+                self.0.set(self.0.get() + 1);
+                Err(Error::rejected("unexpected remote call"))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let coordinator = Coordinator::new(
+            FakeRemote(calls.clone()),
+            "ws_synthetic".into(),
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        let tracker = dir.path().join("local-tracker");
+        let command = Commands::Issue {
+            action: IssueAction::Finish {
+                id: Some("CAD-42".into()),
+                worktree: None,
+                force: true,
+                keep_branch: false,
+                remote: true,
+                merged: false,
+                project: None,
+                dry_run: false,
+                json: false,
+            },
+        };
+        let target = RemoteTarget {
+            org: "synthetic".into(),
+            endpoint: "https://synthetic.cadencecloud.app".into(),
+            org_id: "ws_synthetic".into(),
+            identity: None,
+        };
+        let error = run_with_finish(
+            target,
+            command,
+            1,
+            Some(tracker.clone()),
+            Some("issue finish".into()),
+            |_, issue, worktree| {
+                cadence_agent::local_assignment::finish_guidance::refusal(
+                    &coordinator,
+                    issue,
+                    worktree,
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), "rejected");
+        assert!(error.to_string().contains("reconcile sweep"), "{error}");
+        assert!(error.to_string().contains("cannot be confirmed"), "{error}");
+        assert_eq!(calls.get(), 0, "no remote tracker call");
+        assert!(!tracker.exists(), "no local tracker operation");
+    }
 
     #[test]
     fn remote_wiki_cat_refuses_a_directory_like_local_cat() {

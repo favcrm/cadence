@@ -94,7 +94,15 @@ fn observe<H: CoordHttp>(
         &root,
         &["rev-parse", "--verify", &format!("{into}^{{commit}}")],
     )?;
-    Ok(Some(if merge_rule(&root, &branch, &tip, &into).is_some() {
+    let evidence = merge_rule(&root, &branch, &tip, &into);
+    // `git cherry` ignores merge commits, which can contain unique resolution
+    // work even when every non-merge commit is patch-equivalent upstream.
+    if evidence == Some("cherry")
+        && !git(&root, &["rev-list", "--merges", &format!("{into}..{tip}")])?.is_empty()
+    {
+        return Ok(Some(LaneState::CleanUnverified));
+    }
+    Ok(Some(if evidence.is_some() {
         LaneState::CleanMerged
     } else {
         LaneState::CleanUnverified
@@ -118,7 +126,7 @@ mod tests {
         }
     }
 
-    fn git(dir: &Path, args: &[&str]) {
+    fn git(dir: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -130,6 +138,7 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     #[test]
@@ -217,6 +226,21 @@ mod tests {
             missing.contains("reconcile sweep") && missing.contains("cannot"),
             "{missing}"
         );
+        fs::write(repo.join("main-only"), "main\n").unwrap();
+        git(&repo, &["add", "main-only"]);
+        git(&repo, &["commit", "-m", "main"]);
+        fs::write(lane.join("lane-only"), "lane\n").unwrap();
+        git(&lane, &["add", "lane-only"]);
+        git(&lane, &["commit", "-m", "lane"]);
+        let lane_commit = git(&lane, &["rev-parse", "HEAD"]);
+        git(&lane, &["merge", "--no-ff", "--no-commit", "main"]);
+        fs::write(lane.join("merge-only"), "unmerged resolution\n").unwrap();
+        git(&lane, &["add", "merge-only"]);
+        git(&lane, &["commit", "-m", "merge with resolution"]);
+        git(&repo, &["cherry-pick", &lane_commit]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let merge_only = refusal(&coord, Some("CAD-1"), None).to_string();
+        assert!(merge_only.contains("cannot be confirmed"), "{merge_only}");
         ledger.attempts.get_mut("test").unwrap().fenced = true;
         ledger.save(&coord.ledger, "ws_test").unwrap();
         let fenced = refusal(&coord, Some("CAD-1"), None).to_string();
