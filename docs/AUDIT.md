@@ -82,7 +82,9 @@ CAD-2081: the gate also counts a hosted row with `identity_source:
 "workflow-oidc"` (run fields `run_id`, `run_attempt`, `workflow_sha`, `jti`; no
 `github_login`). Such a row counts only when its `reviewer_id` is listed in
 `docs/roles/review-workflow-principals.toml` at the PR's base with the row's
-kind, and a workflow row that is not a pass always refuses. `identity_source`
+kind, the principal's workflow file at the row's `workflow_sha` is byte-identical
+to the PR's base (a re-run of a since-fixed workflow counts for nothing), a
+present `base_ref` is main, and a workflow row that is not a pass always refuses. `identity_source`
 alone is never enough. This proves a fresh runner executed trusted workflow code
 and filed for a live head; it does not prove the quality of the review, and a
 session holding admin can still tamper until agents lose admin. Browser QA has no

@@ -136,8 +136,12 @@ the code you just wrote.
 - **Workflow-issued reviews (CAD-2081).** The gate also counts a hosted row whose
   `identity_source` is `workflow-oidc`, but only when its principal is in
   `docs/roles/review-workflow-principals.toml` read from the PR's base and the
-  row's kind is the one kind that principal may fill; an unlisted principal, a
-  wrong kind or a non-pass row refuses and counts for nothing. Such a row has no
+  row's kind is the one kind that principal may fill, and the principal's workflow
+  file at the row's `workflow_sha` is byte-identical to the one on the PR's base
+  (a re-run keeps the original commit's workflow for up to 30 days, so a
+  since-fixed workflow cannot still file a pass; an unreachable commit refuses).
+  An unlisted principal, a wrong kind, a base that is not main or a non-pass row
+  refuses and counts for nothing. Such a row has no
   login, so the author-login checks do not apply to it. Standards plus
   Spec/security from the two workflow principals satisfy the two-review
   requirement. This proves a fresh GitHub-hosted job ran workflow code that was

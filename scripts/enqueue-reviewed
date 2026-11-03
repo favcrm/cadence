@@ -102,6 +102,9 @@ ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 # kind each may fill. Read at the PR's base, like the lists above.
 WORKFLOW_PRINCIPALS_FILE = "docs/roles/review-workflow-principals.toml"
 WORKFLOW_KINDS = ("standards", "spec-security")
+# The writer's name for the base a workflow row reviewed against (CAD-2081); the
+# one place to change it if the tenant renames it. Rust passes it through.
+WORKFLOW_ROW_BASE_FIELD = "base_ref"
 # The review standard is a fresh-session review (AGENTS.md "Review", CAD-1946), which
 # this gate cannot yet enforce. Refusals for a missing or shared reviewer point at
 # the temporary exception and the standard.
@@ -652,9 +655,10 @@ def read_identities():
 
 
 def workflow_principals(toml_text):
-    """`principal -> kind` from the allowlist text, or None when it is missing or
-    malformed. An entry for any kind but a Standards or Spec/security review is
-    malformed, so one bad line fails the whole list closed."""
+    """`principal -> {"kind", "workflow"}` from the allowlist text, or None when it
+    is missing or malformed. An entry for any kind but a Standards or Spec/security
+    review, or without a workflow file path, is malformed, so one bad entry fails
+    the whole list closed."""
     if toml_text is None:
         return None
     try:
@@ -662,9 +666,37 @@ def workflow_principals(toml_text):
     except (tomllib.TOMLDecodeError, KeyError, TypeError):
         return None
     if not isinstance(table, dict) or not all(
-            isinstance(k, str) and k and v in WORKFLOW_KINDS for k, v in table.items()):
+            isinstance(k, str) and k and isinstance(v, dict)
+            and v.get("kind") in WORKFLOW_KINDS
+            and isinstance(v.get("workflow"), str)
+            and re.fullmatch(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml", v["workflow"])
+            for k, v in table.items()):
         return None
-    return dict(table)
+    return {k: {"kind": v["kind"], "workflow": v["workflow"]} for k, v in table.items()}
+
+
+def workflow_file_reason(base_oid, sha, path):
+    """"" when `path` at `sha` is byte-identical to `path` at the PR's base commit.
+
+    A GitHub re-run keeps the original commit's workflow for up to 30 days, so a
+    since-fixed workflow can still file a pass. A blob id equals byte equality.
+    An unreachable commit or a missing file refuses; it is never skipped."""
+    def blob(rev):
+        rc, out, _ = run(["git", "rev-parse", "--verify", "--quiet", f"{rev}:{path}"])
+        return out.strip() if rc == 0 else ""
+    if not FULL_SHA.match(sha or ""):
+        return f"its workflow_sha {sha!r} is not a full commit SHA"
+    if run(["git", "cat-file", "-e", f"{sha}^{{commit}}"])[0] != 0:
+        run(["git", "fetch", "--quiet", "--no-tags", "origin", sha])
+    if run(["git", "cat-file", "-e", f"{sha}^{{commit}}"])[0] != 0:
+        return f"workflow commit {sha} is not in this checkout, so {path} there cannot be compared"
+    then, now = blob(sha), blob(base_oid)
+    if not then or not now:
+        return f"{path} cannot be read at workflow commit {sha[:12]} or at the PR's base"
+    if then != now:
+        return (f"{path} at workflow commit {sha[:12]} differs from the PR's base: "
+                "a run of a superseded workflow does not count")
+    return ""
 
 
 def is_workflow_row(n):
@@ -688,9 +720,19 @@ def workflow_reason(n, hosted):
     if principal not in allowed:
         return (f"workflow verdict {n['name']} cannot count: principal {principal or '(none)'} is "
                 f"not in {WORKFLOW_PRINCIPALS_FILE} at the base")
-    if n["kind"] != allowed[principal]:
+    entry = allowed[principal]
+    if n["kind"] != entry["kind"]:
         return (f"workflow verdict {n['name']} cannot count: principal {principal} may file only "
-                f"{allowed[principal]}, not {n['kind']}")
+                f"{entry['kind']}, not {n['kind']}")
+    # The writer may add the base ref the review ran against; when it is
+    # present it must be main. Absent counts as before.
+    base_ref = n.get(WORKFLOW_ROW_BASE_FIELD)
+    if base_ref is not None and base_ref not in ("main", "refs/heads/main"):
+        return (f"workflow verdict {n['name']} cannot count: it reviewed a base of "
+                f"{base_ref!r}, not main")
+    why = hosted["workflow_file"](n.get("workflow_sha"), entry["workflow"])
+    if why:
+        return f"workflow verdict {n['name']} cannot count: {why}"
     return ""
 
 
@@ -1461,7 +1503,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             hosted = {"repo": repo, "project": hosted_project,
                       "author_login": author_login,
                       "author_principal": identities.get(author_login.lower(), ""),
-                      "workflow_principals": wf_principals}
+                      "workflow_principals": wf_principals,
+                      "workflow_file": lambda sha, path: workflow_file_reason(base_oid, sha, path)}
             report.append(f"verdict origin: hosted ({repo}, project {hosted_project}); "
                           "counting attested principals")
             if any(not is_workflow_row(v) for v in verdicts):
@@ -1720,12 +1763,18 @@ def self_test():
                   "run_attempt": "1", "workflow_sha": "a" * 40, "jti": "j" * 12})
         return r
 
-    wf = {"svc_std": "standards", "svc_spec": "spec-security"}
+    wf = {"svc_std": {"kind": "standards", "workflow": ".github/workflows/review-standards.yml"},
+          "svc_spec": {"kind": "spec-security", "workflow": ".github/workflows/review-spec.yml"}}
 
-    def hosted_wf(**kw):
+    def hosted_wf(allow=wf, same=lambda sha, path: ""):
         h = hosted("author", "usr_author")
-        h["workflow_principals"] = kw.get("allow", wf)
+        h["workflow_principals"] = allow
+        h["workflow_file"] = same
         return h
+
+    def drifted(sha, path):
+        return ("" if sha != "b" * 40 else f"{path} at workflow commit {sha[:12]} differs from "
+                "the PR's base: a run of a superseded workflow does not count")
 
     # Workflow cases carry no login and need no author principal.
     wf_cases = [
@@ -1760,6 +1809,25 @@ def self_test():
          [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_spec", "spec-security")],
          False, "Browser QA", 2, True),
     ]
+    old_sha = "b" * 40
+    wf_cases += [
+        ("a workflow run whose workflow differs from the base counts for nothing",
+         [dict(wrow("s.md", "svc_std", "standards"), workflow_sha=old_sha),
+          wrow("p.md", "svc_spec", "spec-security")],
+         False, "differs from the PR's base", 1, False, drifted),
+        ("a workflow commit that cannot be read refuses, not skips",
+         [wrow("s.md", "svc_std", "standards"), wrow("p.md", "svc_spec", "spec-security")],
+         False, "cannot be compared", 0, False,
+         lambda sha, path: f"workflow commit {sha} is not in this checkout, so {path} there cannot be compared"),
+        ("a workflow row reviewing a base other than main refuses",
+         [dict(wrow("s.md", "svc_std", "standards"), base_ref="staging"),
+          wrow("p.md", "svc_spec", "spec-security")],
+         False, "not main", 1),
+        ("a workflow row reviewing main still counts",
+         [dict(wrow("s.md", "svc_std", "standards"), base_ref="main"),
+          wrow("p.md", "svc_spec", "spec-security")],
+         False, None, 2),
+    ]
     owner_row = row("o.md", "usr_other", "reviewer")
 
     cases = [
@@ -1786,9 +1854,11 @@ def self_test():
             detail = "; ".join(reasons) or "no refusal"
         print(f"{'ok  ' if ok else 'FAIL'} {label}: {detail}")
         failures += 0 if ok else 1
-    for label, rows, one, expected, n_counted, *qa in wf_cases:
-        h = hosted_wf(allow=None if "unreadable" in label else wf)
-        reasons, counted = check_reviews(rows, one, bool(qa), {"author"}, "CAD-1", h)
+    for label, rows, one, expected, n_counted, *extra in wf_cases:
+        qa = extra[0] if extra else False
+        h = hosted_wf(allow=None if "unreadable" in label else wf,
+                      **({"same": extra[1]} if len(extra) > 1 else {}))
+        reasons, counted = check_reviews(rows, one, qa, {"author"}, "CAD-1", h)
         if expected is None:
             ok = not reasons and len(counted) == n_counted
             detail = "; ".join(reasons) or f"counted {len(counted)}"

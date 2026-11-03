@@ -906,6 +906,13 @@ fn verdict_entry(row: &Value, repo: &str, verb: &str) -> Result<Value> {
             entry[field] = json!(row_text(row, field, verb)?);
         }
     }
+    // CAD-2081: the base the review ran against, when the writer records one.
+    // The gate refuses a workflow row whose base is not main; absent is as before.
+    if workflow {
+        if row.get("base_ref").is_some_and(|v| !v.is_null()) {
+            entry["base_ref"] = json!(row_text(row, "base_ref", verb)?);
+        }
+    }
     Ok(entry)
 }
 
