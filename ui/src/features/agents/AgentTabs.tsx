@@ -38,6 +38,16 @@ export interface TabContext {
   onSaved: () => void;
   /** The detail read failed. Roster tasks, when present, stay visible. */
   detailFailed: boolean;
+  /** This board answers the read with 501: it keeps no such details. That is
+   *  permanent, so it reads as neither a failure to retry nor an empty record. */
+  detailNotServed: boolean;
+}
+
+const NOT_RECORDED = "This board doesn’t record agent history.";
+
+/** No answer yet: a read still running says nothing about what the agent has. */
+function reading(c: TabContext): boolean {
+  return !c.detail && !c.detailFailed && !c.detailNotServed;
 }
 
 function Panel({
@@ -140,6 +150,7 @@ function NowCard({ c, onlyDoing = false }: { c: TabContext; onlyDoing?: boolean 
       </div>
     );
   }
+  if (reading(c) && !c.observed) return <Note>{t("Loading…")}</Note>;
   const working = Boolean(
     c.observed &&
       (c.observed.running > 0 ||
@@ -226,11 +237,10 @@ function JobSummary({ text }: { text: string }) {
 function JobExcerpt({ c }: { c: TabContext }) {
   const t = useTranslate();
   const text = c.detail?.agent.instructions ?? c.role?.instructions ?? null;
-  return text ? (
-    <JobSummary text={text} />
-  ) : (
-    <p className="rc-note">{t("This agent has no role text on this board.")}</p>
-  );
+  if (text) return <JobSummary text={text} />;
+  if (reading(c)) return <Note>{t("Loading…")}</Note>;
+  if (c.detailFailed) return <Note>{t("Agent details are unavailable.")}</Note>;
+  return <p className="rc-note">{t("This agent has no role text on this board.")}</p>;
 }
 
 function Overview({ c }: { c: TabContext }) {
@@ -247,39 +257,47 @@ function Overview({ c }: { c: TabContext }) {
           <NowCard c={c} />
         </Panel>
         <Panel title="Up next" link="work" onTab={c.onTab}>
-          {c.observed ? <AgentQueue agent={c.observed} /> : c.detailFailed ? unavailable : <Note>{t("Nothing queued.")}</Note>}
+          {c.observed ? <AgentQueue agent={c.observed} /> : c.detailFailed ? unavailable : <Note>{t(reading(c) ? "Loading…" : "Nothing queued.")}</Note>}
         </Panel>
-        <Panel title="Recent results" link="work" onTab={c.onTab}>
-          {c.detailFailed ? (
-            unavailable
-          ) : results.length ? (
-            <Rows>
-              {results.slice(0, 3).map((e) => (
-                <EventRow key={e.seq} e={e} />
-              ))}
-            </Rows>
-          ) : (
-            <Note>{t("No results yet.")}</Note>
-          )}
-        </Panel>
-        <Panel title="History" link="history" onTab={c.onTab}>
-          {c.detailFailed ? (
-            unavailable
-          ) : events.length ? (
-            <Rows>
-              {events.slice(-3).reverse().map((e) => (
-                <EventRow key={e.seq} e={e} />
-              ))}
-            </Rows>
-          ) : (
-            <Note>{t("No events yet.")}</Note>
-          )}
-        </Panel>
+        {c.detailNotServed ? (
+          <Note>{t(NOT_RECORDED)}</Note>
+        ) : (
+          <>
+            <Panel title="Recent results" link="work" onTab={c.onTab}>
+              {c.detailFailed ? (
+                unavailable
+              ) : results.length ? (
+                <Rows>
+                  {results.slice(0, 3).map((e) => (
+                    <EventRow key={e.seq} e={e} />
+                  ))}
+                </Rows>
+              ) : (
+                <Note>{t(reading(c) ? "Loading…" : "No results yet.")}</Note>
+              )}
+            </Panel>
+            <Panel title="History" link="history" onTab={c.onTab}>
+              {c.detailFailed ? (
+                unavailable
+              ) : events.length ? (
+                <Rows>
+                  {events.slice(-3).reverse().map((e) => (
+                    <EventRow key={e.seq} e={e} />
+                  ))}
+                </Rows>
+              ) : (
+                <Note>{t(reading(c) ? "Loading…" : "No events yet.")}</Note>
+              )}
+            </Panel>
+          </>
+        )}
       </div>
       <aside className="ap-side">
-        <Panel title="Job" link="job" onTab={c.onTab}>
-          <JobExcerpt c={c} />
-        </Panel>
+        {(!c.detailNotServed || c.detail?.agent.instructions || c.role?.instructions) && (
+          <Panel title="Job" link="job" onTab={c.onTab}>
+            <JobExcerpt c={c} />
+          </Panel>
+        )}
         <Panel title="Knowledge" link="knowledge" onTab={c.onTab}>
           <Chips
             items={[t("Workspace wiki"), ...(project ? [`${t("Project notes")}: ${project}`] : [t("Ticket's project notes")])]}
@@ -293,7 +311,7 @@ function Overview({ c }: { c: TabContext }) {
           <Chips items={["cadence"]} planned={["Per-agent MCP"]} />
         </Panel>
         <Panel title="Model & usage" link="settings" onTab={c.onTab}>
-          {c.profile ? <ProfileBlock agent={c.profile} /> : <Note>{t("Loading agent details…")}</Note>}
+          {c.profile ? <ProfileBlock agent={c.profile} /> : <Note>{t(c.detailFailed ? "Agent details are unavailable." : "Loading agent details…")}</Note>}
         </Panel>
       </aside>
     </div>
@@ -339,7 +357,7 @@ function Work({ c }: { c: TabContext }) {
         )}
       </Panel>
       <Panel title="Queue" mark="queue" onTab={c.onTab}>
-        {c.observed ? <AgentQueue agent={c.observed} /> : <Note>{t(unavailable ? "Agent details are unavailable." : "Nothing queued.")}</Note>}
+        {c.observed ? <AgentQueue agent={c.observed} /> : <Note>{t(unavailable ? "Agent details are unavailable." : reading(c) ? "Loading…" : "Nothing queued.")}</Note>}
         {parts && <AssignedTaskList alias={c.alias} tasks={parts.queue} />}
         {detailOnly.length > 0 && (
           <div className="mt-3">
@@ -377,11 +395,13 @@ function Work({ c }: { c: TabContext }) {
         ))}
         {parts && <AssignedTaskList alias={c.alias} tasks={parts.attention} />}
         {attentionCount === 0 && (
-          <Note>{t(unavailable ? "Needs attention could not be read." : "Nothing needs attention.")}</Note>
+          <Note>{t(unavailable ? "Needs attention could not be read." : reading(c) && !c.observed ? "Loading…" : "Nothing needs attention.")}</Note>
         )}
       </Panel>
       <Panel title="Results" mark="results" onTab={c.onTab}>
-        {c.detailFailed && !detail ? (
+        {c.detailNotServed ? (
+          <Note>{t(NOT_RECORDED)}</Note>
+        ) : c.detailFailed && !detail ? (
           <Note>{t("Agent details are unavailable.")}</Note>
         ) : detail?.events_error && results.length === 0 ? (
           <p role="alert" className="text-label text-fail">
@@ -394,7 +414,7 @@ function Work({ c }: { c: TabContext }) {
             ))}
           </Rows>
         ) : (
-          <Note>{t("No results yet.")}</Note>
+          <Note>{t(reading(c) ? "Loading…" : "No results yet.")}</Note>
         )}
       </Panel>
       <Note>
@@ -427,19 +447,21 @@ function History({ c }: { c: TabContext }) {
   const rows = [...inbox, ...events].filter((r) => filter === "all" || r.group === filter);
   return (
     <div className="ap-body">
-      <div className="rc-cats" role="group" aria-label={t("Filter history")}>
-        {HISTORY_FILTERS.map((f) => (
-          <button
-            key={f.id}
-            type="button"
-            className="rc-cat"
-            aria-pressed={filter === f.id}
-            onClick={() => setFilter(f.id)}
-          >
-            {t(f.label)}
-          </button>
-        ))}
-      </div>
+      {!c.detailNotServed && (
+        <div className="rc-cats" role="group" aria-label={t("Filter history")}>
+          {HISTORY_FILTERS.map((f) => (
+            <button
+              key={f.id}
+              type="button"
+              className="rc-cat"
+              aria-pressed={filter === f.id}
+              onClick={() => setFilter(f.id)}
+            >
+              {t(f.label)}
+            </button>
+          ))}
+        </div>
+      )}
       {detail && (
         <p className="text-micro text-ink-500">
           {t("{running} running · {queued} queued · {unknown} unknown")
@@ -455,7 +477,11 @@ function History({ c }: { c: TabContext }) {
           {t("The event history could not be read:")} {detail.events_error}
         </p>
       )}
-      {rows.length ? (
+      {c.detailNotServed ? (
+        <Note>{t(NOT_RECORDED)}</Note>
+      ) : c.detailFailed && !detail ? (
+        <Note>{t("Agent details are unavailable.")}</Note>
+      ) : rows.length ? (
         <Rows>
           {rows.map((r) => (
             <Row
@@ -470,7 +496,7 @@ function History({ c }: { c: TabContext }) {
           ))}
         </Rows>
       ) : (
-        <Note>{t("No events yet.")}</Note>
+        <Note>{t(reading(c) ? "Loading…" : "No events yet.")}</Note>
       )}
     </div>
   );
@@ -504,6 +530,11 @@ function Job({ c }: { c: TabContext }) {
       setSaving(false);
     }
   };
+  if (c.detailNotServed) {
+    if (c.role?.instructions) return <JobSummary text={c.role.instructions} />;
+    return <Note>{c.role ? t("This agent was hired as {role}.").replace("{role}", () => c.role!.title) : t("This board doesn’t show job text for this agent.")}</Note>;
+  }
+  if (c.detailFailed && !c.detail) return <Note>{t("Agent details are unavailable.")}</Note>;
   if (!c.detail) return <Note>{t("Loading agent details…")}</Note>;
   if (served === null) {
     return (
@@ -713,7 +744,7 @@ function Settings({ c }: { c: TabContext }) {
   return (
     <div className="ap-body">
       <Panel title="Model, effort & usage" onTab={c.onTab}>
-        {profile ? <ProfileBlock agent={profile} /> : <Note>{t("Loading agent details…")}</Note>}
+        {profile ? <ProfileBlock agent={profile} /> : <Note>{t(c.detailFailed ? "Agent details are unavailable." : "Loading agent details…")}</Note>}
       </Panel>
       <Panel title="Runtime" onTab={c.onTab}>
         {a ? (
@@ -752,6 +783,10 @@ function Settings({ c }: { c: TabContext }) {
               </div>
             ))}
           </dl>
+        ) : c.detailNotServed ? (
+          <Note>{t("This board doesn’t report runtime details.")}</Note>
+        ) : c.detailFailed ? (
+          <Note>{t("Agent details are unavailable.")}</Note>
         ) : (
           <Note>{t("Loading agent details…")}</Note>
         )}
