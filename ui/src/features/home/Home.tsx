@@ -14,6 +14,7 @@ import {
   kvRows,
   MASTER,
   masterStatus,
+  restingStatus,
   SLASH_COMMANDS,
   START_COMMAND,
   RESUME_COMMAND,
@@ -919,10 +920,10 @@ function MasterHome({
     }
     if (turnBar.kind === "approval") return { label: t("Needs you"), tone: warn };
     if (turnBar.kind === "queued") return { label: t("Queued"), tone: ok };
-    if (activeTurn) return { label: t("Working"), tone: ok };
-    return ["idle", "running", "busy"].includes(status.state)
-      ? { label: t("Available"), tone: ok }
-      : { label: status.state, tone: warn };
+    // A turn in another conversation still occupies this assistant.
+    if (activeTurn || master.data?.turn?.state === "working") return { label: t("Working"), tone: ok };
+    const word = restingStatus(status.state);
+    return word === null ? { label: status.state, tone: warn } : { label: t(word), tone: ok };
   })();
   // CAD-1880: Stop sits in the composer's send slot while this pane's own
   // turn runs. Never while the stream is down: that state is last known.

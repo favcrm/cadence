@@ -362,10 +362,44 @@ for (const density of ["full", "compact"] as const) {
     const summaryAt = noteAfterTool.indexOf("turntrace-summary");
     const listAt = noteAfterTool.indexOf("turntrace-list");
     ok(summaryAt >= 0 && listAt > summaryAt, "newest note: summary sits in the trace head");
-    ok(noteAfterTool.slice(summaryAt, listAt).includes("Checking the ledger next."), "newest note: the summary names the newer reasoning, not the older tool");
-    ok(!noteAfterTool.slice(summaryAt, listAt).includes("cadence board read"), "newest note: an older tool name does not win the summary");
+    ok(!noteAfterTool.slice(summaryAt, listAt).includes("Checking the ledger next."), "newest note: note text stays out of the closed summary");
+    ok(noteAfterTool.slice(summaryAt, listAt).includes("Bash"), "newest note: the summary still names the tool");
+    ok(!noteAfterTool.slice(summaryAt, listAt).includes("cadence board read"), "newest note: no tool argument in the closed summary");
     const list = noteAfterTool.slice(listAt);
     ok(list.indexOf("Checking the ledger next.") < list.indexOf("cadence board read"), "newest note: the open trace leads with it");
+  }
+
+  // CAD-2013: the chip shows a friendly label, and the raw id stays in its tooltip.
+  {
+    const MasterChips = require("../src/features/home/MasterChips").default;
+    const chip = renderToStaticMarkup(
+      createElement(MasterChips, { master: { model: "live/model-2", model_label: "Live Model 2", live: true }, readOnly: false }),
+    );
+    ok(chip.includes(">Live Model 2") || chip.includes("Live Model 2<"), "chip: the label is what it shows");
+    ok(chip.includes('title="live/model-2 '), "chip: the raw id stays in the tooltip when the session sends a label");
+  }
+
+  // CAD-2013: what the closed summary may never show, and which title a turn earns.
+  {
+    const closed = (html: string) => html.slice(html.indexOf("turntrace-summary"), html.indexOf("turntrace-list"));
+    const ended = (...rows: ThreadEntry[]) => threadItems(state([...rows, agent(90, "turn_result", "Done.")]));
+    const noted = closed(renderTurn(ended(agent(1, "tool_call", "Bash: ls"), agent(2, "assistant_text", "The password in the file is hunter2"))));
+    ok(!noted.includes("hunter2"), "summary: a note's text never reaches it");
+    const paged = renderTurn(ended(agent(1, "tool_result", "Found API KEY in /home/u/.env line 3")));
+    ok(!paged.slice(paged.indexOf("turntrace-title"), paged.indexOf("turntrace-list")).includes("API KEY"), "summary: a result whose call was paged out never reaches it");
+    const pagedRunning = renderTurn(threadItems(state([agent(1, "tool_result", "Found API KEY in /home/u/.env")])), true);
+    ok(!pagedRunning.includes("Running found"), "typing row: tool output is not a tool name");
+    const noSeparator = closed(renderTurn(ended(agent(1, "tool_call", "cat /home/u/.ssh/id_rsa --token=abc123"))));
+    ok(noSeparator.includes("Cat") && !noSeparator.includes("id_rsa") && !noSeparator.includes("abc123"), "summary: only the tool's own word, with no separator to cut at");
+    const several = closed(renderTurn(ended(
+      agent(1, "tool_call", "a_one: x"), agent(2, "assistant_text", "note"), agent(3, "tool_call", "b_two: y"), agent(4, "tool_call", "c_three: z"), agent(5, "tool_call", "d_four: w"), agent(6, "tool_call", "d_four: v"),
+    )));
+    ok(several.includes("D four, C three, B two") && !several.includes("A one"), "summary: three distinct tools across the whole turn, newest first");
+    const notesOnly = renderTurn(threadItems(state([agent(1, "assistant_text", "Only a note"), agent(90, "turn_result", "Done.")])));
+    ok(!notesOnly.includes("turntrace-summary"), "summary: a trace of notes alone has none");
+    ok(renderTurn(threadItems(state([agent(1, "tool_call", "Bash: ls"), agent(90, "turn_result", "Done.")]))).includes(">Finished<"), "title: an untimed turn with an answer finished");
+    ok(!renderTurn(threadItems(state([agent(1, "tool_call", "Bash: ls")]))).includes(">Finished<"), "title: a segment with no answer never claims to have finished");
+    ok(renderTurn(threadItems(state([agent(1, "tool_call", "Bash: ls"), { ...agent(90, "turn_result", ""), payload: { status: "failed", error: "x" } }]))).includes(">Stopped<"), "title: a failed turn stopped");
   }
 
   // A transcript from before `turn_result`: the last worker note reads as the

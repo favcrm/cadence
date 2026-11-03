@@ -545,52 +545,42 @@ function traceElapsed(from: string | null | undefined, to: string | null | undef
   return `${Math.floor(secs / 60)}m ${secs % 60}s`;
 }
 
-/** Tool name without its JSON arguments: `board_list_issues {"limit":50}`
- *  reads as `board_list_issues` on the trace head. */
-function stepLabel(summary: string): string {
-  const cut = summary.indexOf(" {");
-  const name = (cut > 0 ? summary.slice(0, cut) : summary).trim();
-  return name.length > 48 ? `${name.slice(0, 45)}…` : name;
-}
-
 /** A tool call's plain name for the closed trace: `catalog_search: website`
- *  reads as `Catalog search`. Formats a known-shape string for reading; raw
- *  calls and their arguments stay in the open trace. */
+ *  reads as `Catalog search`. Only the first word is kept, so an argument
+ *  cannot follow it in. Formats a known-shape string for reading; raw calls
+ *  and their arguments stay in the open trace. */
 function toolName(summary: string): string {
-  const name = stepLabel(summary).split(":", 1)[0].replaceAll("_", " ").replace(/\s+/g, " ").trim();
+  if (carriesSecret(summary)) return "";
+  const name = summary.trim().split(/[\s:]/, 1)[0].replaceAll("_", " ").replace(/\s+/g, " ").trim();
   return name.charAt(0).toUpperCase() + name.slice(1);
 }
 
-/** The line after the trace title: the newest step the open trace leads with,
- *  and never the call that opened the turn or a raw argument blob. The
- *  newest item decides: a tool run names its last calls, a reasoning or
- *  commentary note reads as its own line. Older tool names appear only
- *  when the newest row has nothing to say. */
+/** Plain names of a tool run's calls, newest first. A result whose call has
+ *  been paged out is not named: its summary is the tool's output. */
+function toolNames(entries: ThreadEntry[]): string[] {
+  const names: string[] = [];
+  for (const step of toolSteps(entries)) {
+    if (step.call.kind !== "tool_call") continue;
+    const name = toolName(step.summary);
+    if (name !== "") names.unshift(name);
+  }
+  return names;
+}
+
+/** The line after the trace title: up to three distinct tools the turn used,
+ *  newest first. Never note text and never arguments: both stay in the open
+ *  trace, because a closed summary is on screen for anyone to read. */
 function traceDigest(trace: ThreadItem[]): { summary: string; errors: number } {
   let errors = 0;
+  const names: string[] = [];
   for (const item of trace) {
     if (item.type !== "tools") continue;
     for (const step of toolSteps(item.entries)) {
       if (step.error) errors += 1;
     }
+    names.unshift(...toolNames(item.entries));
   }
-  for (let i = trace.length - 1; i >= 0; i--) {
-    const item = trace[i];
-    if (item.type === "tools") {
-      const names: string[] = [];
-      for (const step of toolSteps(item.entries)) {
-        const name = toolName(step.summary);
-        if (name !== "" && !carriesSecret(name)) names.unshift(name);
-      }
-      if (names.length > 0) return { summary: [...new Set(names)].slice(0, 3).join(", "), errors };
-      continue;
-    }
-    if (item.type !== "thinking" && item.type !== "commentary") continue;
-    if (carriesSecret(item.entry.text)) continue;
-    const line = stepSummary(item.entry.text);
-    if (line !== "") return { summary: line, errors };
-  }
-  return { summary: "", errors };
+  return { summary: [...new Set(names)].slice(0, 3).join(", "), errors };
 }
 
 /** The tool the turn is on right now, when the newest trace row is a tool.
@@ -600,11 +590,8 @@ function runningTool(trace: ThreadItem[]): string {
   for (let i = trace.length - 1; i >= 0; i--) {
     const item = trace[i];
     if (item.type === "tools") {
-      const steps = toolSteps(item.entries);
-      for (let s = steps.length - 1; s >= 0; s--) {
-        const name = toolName(steps[s].summary);
-        if (name !== "" && !carriesSecret(name)) return name;
-      }
+      const [newest] = toolNames(item.entries);
+      if (newest !== undefined) return newest;
       continue;
     }
     if (item.type === "thinking" || item.type === "commentary") return "";
@@ -658,6 +645,7 @@ function TurnTrace({
   errors,
   elapsed,
   failed,
+  answered,
 }: {
   items: ThreadItem[];
   steps: number;
@@ -667,6 +655,9 @@ function TurnTrace({
   elapsed: string | null;
   /** The turn ended on a failure rather than an answer. */
   failed: boolean;
+  /** This segment holds the answer. An earlier segment of a split turn does
+   *  not, and may still be live, so it never claims to have finished. */
+  answered: boolean;
 }) {
   const t = useTranslate();
   const [open, setOpen] = useState(false);
@@ -677,7 +668,9 @@ function TurnTrace({
       ? t("Stopped")
       : elapsed
         ? `${t("Thought for")} ${elapsed}`
-        : t("Finished");
+        : answered
+          ? t("Finished")
+          : t("Reasoning");
   return (
     <div className="steps turntrace min-w-0" data-kind="turn-trace" data-open={open || undefined}>
       <button
@@ -924,6 +917,7 @@ export function ThreadTurn({
           errors={digest.errors}
           elapsed={elapsed}
           failed={shown != null && turnFailure(shown.entry, t) !== null}
+          answered={shown != null}
         />
       )}
       {/* Dots, then the current step. Under the trace once steps exist,

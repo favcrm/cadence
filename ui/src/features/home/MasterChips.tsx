@@ -75,8 +75,9 @@ export default function MasterChips({
   readOnly: boolean;
 }) {
   const t = useTranslate();
-  const model =
-    master?.model_label ?? master?.model ?? row?.model ?? row?.model_reported ?? row?.model_configured;
+  // The id, for the tooltip and the catalogue; a hosted board's label is the id too.
+  const modelId = master?.model ?? row?.model ?? row?.model_reported ?? row?.model_configured;
+  const model = master?.model_label ?? modelId;
   const effort = master?.effort ?? row?.effort ?? row?.effort_reported;
   const pct = master?.context?.percent;
   const live = master?.live === true;
@@ -97,7 +98,7 @@ export default function MasterChips({
     api.masterModels().then((m) => { if (current) setCatalogue(masterModelsOptions(m)); }).catch(() => undefined);
     return () => { current = false; };
   }, [model]);
-  const modelLabel = (view ?? catalogue)?.models.find((m) => m.id === model)?.label ?? model;
+  const modelLabel = (view ?? catalogue)?.models.find((m) => m.id === modelId)?.label ?? model;
 
   // The picker's read: fetched on each open so the list never serves a
   // stale session; the last good payload stays rendered while it loads.
@@ -162,7 +163,7 @@ export default function MasterChips({
             type="button"
             key={`m:${model}`}
             className="chip chip-sans chip-in bg-ink-800 text-ink-300 chip-btn"
-            title={`${model} — ${
+            title={`${modelId ?? model} — ${
               live ? t("Reported by the live provider session — pick a model") : t("Configured model — pick a model")
             }`}
             aria-expanded={open === "model"}
