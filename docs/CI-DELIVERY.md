@@ -4,8 +4,9 @@
 
 CAD-1073 / PR #738 retired the legacy integration suite, and CAD-1970 took the
 suite off the pull-request path: `ci.yml` has no `test` job and no
-`safety_floor` gate. The required checks are `fmt`, `clippy`, `build`, `ui` and
-`cross-build (required)`, on PRs and merge groups. They prove the code
+`safety_floor` gate. Live branch protection requires `fmt`, `clippy`, `build`,
+`ui` and `delivery-gate`; `enqueue-reviewed` reads the live set. `cross-build (required)` always runs
+on PRs and merge groups but is not yet a required context (an operator step, ci.yml CAD-1540). The CI jobs prove the code
 compiles, lints and builds the release seam, **not** behavior coverage; the
 suite runs in `tests.yml` on a schedule and on demand, and is not a required
 check. CAD-1088 selects PR feedback from a classifier loaded from the base
@@ -325,7 +326,7 @@ GitHub/merge-queue acceptance.
 Each `test-shard` job selects the scope from the base policy, proves
 Cargo/nextest inventory parity, compiles on a rust-cache hit, builds its
 SPA, executes its assigned tests and uploads assignment/cost artifacts.
-The required `test` aggregate verifies complete, disjoint coverage from the
+The `test` aggregate (historical: removed from `ci.yml` by CAD-1970) verified complete, disjoint coverage from the
 assignment receipts (eight automatically; four or eight on a manual
 benchmark). Default-feature refusal proofs and doctests
 remain in `test-once`. Exact-SHA main queue-evidence reuse is unchanged.

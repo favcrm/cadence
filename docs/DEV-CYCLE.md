@@ -23,7 +23,8 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    Add checks only under AGENTS.md's behavior-first and gates/security rules;
    do not restore retired tests or routinely repeat suites. `--tests` is a
    focused diagnostic, not a blanket pre-review prerequisite; required CI
-   (fmt, clippy, build, ui, cross-build) is unchanged, and the suite runs in
+   (fmt, clippy, build, ui, delivery-gate required; cross-build runs but is
+   not yet required) is unchanged, and the suite runs in
    `tests.yml` on a schedule and on demand (CAD-1970).
 4. Under strict requirements, one independent reviewer; two for auth, identity,
    secrets, the daemon trees and UI paths (`docs/roles/one-review-paths.toml`
@@ -370,7 +371,8 @@ cadence audit approve --project <key> --issue <ID> --pr <PR> --head <FULL_REVIEW
 On a hosted org the approval is project-scoped and names the ticket it
 authorizes, hence `--project <key> --issue <ID>` (CAD-2001); a hosted approval
 without them is refused rather than inferred from the repo. A local approval
-stays repo-scoped and may use `--repo favcrm/cadence` instead.
+stays repo-scoped: a local operator drops `--project` and `--issue`, and
+`--repo favcrm/cadence` is optional (docs/AUDIT.md).
 
 Provide the operator a concrete paste-ready version with no placeholders,
 `read`, guessed SHA, or source over 200 characters. The agent never executes
@@ -385,7 +387,8 @@ Temporary path (CAD-1946; remove this note when it ends): while the hosted
 reviewer attestation cannot be produced, add `--exception --advisory
 standards=<url> --advisory spec-security=<url>` (plus `--advisory
 browser-qa=<url>` for a `ui/` change) to the enqueue. It waives only the
-missing reviewer attestation. The advisory reviews are PR comments posted by
+missing reviewer attestation and, on a hosted routine PR, the readiness proof
+hosted cannot yet produce; the evidence names both. The advisory reviews are PR comments posted by
 separately assigned sessions, and the operator approves each exact head. The
 path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10).
 

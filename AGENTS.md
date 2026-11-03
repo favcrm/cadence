@@ -353,7 +353,8 @@ limitation; only an authorized operator can decide an exception.
   reviewer attestation cannot be produced, `scripts/enqueue-reviewed <pr>
   --head <sha> --exception --advisory standards=<url> --advisory
   spec-security=<url>` (plus `--advisory browser-qa=<url>` for a `ui/` change)
-  waives only the missing reviewer attestation. The advisory reviews are PR
+  waives only the missing reviewer attestation and, on a hosted routine PR, the
+  readiness proof hosted cannot yet produce; the evidence names both. The advisory reviews are PR
   comments posted by separately assigned sessions, and the operator approves
   each exact head. The path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`
   (2026-11-10).
@@ -381,7 +382,7 @@ limitation; only an authorized operator can decide an exception.
   back to a local build. `CADENCE_PRE_PUSH_LOCAL=1` is the explicit
   emergency path and runs the same plan on this host. `scripts/pre-push
   --tests` is a focused diagnostic, not a prerequisite before review;
-  required CI (fmt, clippy, build, ui, cross-build) is unchanged, and the
+  required CI (fmt, clippy, build, ui, delivery-gate required; cross-build runs but is not yet required) is unchanged, and the
   suite runs in `tests.yml` on a schedule and on demand (CAD-1970). Review
   and operator approval stay authoritative. Neither a remote run nor a
   green suite proves the ticket's outcome. The split
