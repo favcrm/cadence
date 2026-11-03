@@ -1585,6 +1585,50 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=61", [])?;
                 tx.commit()?;
             }
+            if version < 62 {
+                // CAD-2042: the retained-source page must be an ordered scoped
+                // index range, not a join plus temp-B-tree sort over the whole
+                // scoped history. Denormalize the owning run's identity and the
+                // source marker onto the receipt, backfill receipts recorded
+                // before this migration, then index the exact page order.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                for (column, definition) in [
+                    ("install_id", "install_id TEXT"),
+                    ("context_id", "context_id TEXT"),
+                    (
+                        "source_post_read",
+                        "source_post_read INTEGER NOT NULL DEFAULT 0",
+                    ),
+                ] {
+                    let columns = tx
+                        .prepare("PRAGMA table_info(app_capability_results)")?
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    if !columns.iter().any(|name| name == column) {
+                        tx.execute_batch(&format!(
+                            "ALTER TABLE app_capability_results ADD COLUMN {definition};"
+                        ))?;
+                    }
+                }
+                tx.execute_batch(
+                    "UPDATE app_capability_results
+                        SET source_post_read=1
+                      WHERE source_post_read=0
+                        AND json_extract(result,'$.kind')='social.source.posts';
+                     UPDATE app_capability_results
+                        SET install_id=(SELECT a.install_id FROM app_runs a
+                                         WHERE a.id=app_capability_results.run_id),
+                            context_id=(SELECT a.context_id FROM app_runs a
+                                         WHERE a.id=app_capability_results.run_id)
+                      WHERE source_post_read=1
+                        AND (install_id IS NULL OR context_id IS NULL);
+                     CREATE INDEX IF NOT EXISTS app_capability_results_source
+                       ON app_capability_results(install_id,context_id,created,id)
+                       WHERE source_post_read=1;
+                     UPDATE schema_version SET version=62;",
+                )?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

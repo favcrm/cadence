@@ -1816,3 +1816,138 @@ fn cad1887_human_receipt_keeps_the_caller_request_id() {
         assert_eq!(payload["human"]["sub"], "operator-1", "{kind}");
     }
 }
+
+/// CAD-2042: the retained-source page is an ordered scoped index range, not a
+/// join plus temp-B-tree sort over the whole scoped history. Recording a
+/// source read denormalizes its owning run's installation/context and the
+/// source marker in the same transaction, and the page query reads the page
+/// from `app_capability_results_source`.
+#[test]
+fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
+    let (_dir, s, _run) = runtime_fixture();
+    let install = "install-1";
+    let config = crate::store::app_contexts::ContextConfig::new(
+        "Synthetic source context",
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let context = s
+        .app_context_create(install, &config, "cad2042-context")
+        .unwrap();
+    let context_id = context["context"]["id"].as_str().unwrap().to_string();
+    let (_config, proof) = s.app_context_proof(install, &context_id).unwrap();
+
+    let text = "---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
+    let inputs = std::collections::BTreeMap::new();
+    let workflow = crate::store::app_runs::LocalWorkflow::parse(text, &inputs).unwrap();
+    let run = s
+        .app_run_create_with_context(
+            crate::store::app_runs::LocalRunRequest {
+                install_id: install,
+                bundle_digest: "sha256:bundle",
+                workflow: &workflow,
+                inputs: &inputs,
+                request_id: "cad2042-run",
+                owner_pm: Some("lead"),
+                project_link: None,
+            },
+            Some(&proof),
+        )
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_string();
+    s.app_run_decide(
+        &run_id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    let dispatched = s.app_run_dispatch(&run_id, "sha256:bundle").unwrap();
+    let writer = start_local_step(&s, &dispatched, 0, "writer");
+    let turn = writer.turn_id.as_deref().unwrap();
+    let input_digest = crate::store::app_runs::material_digest(&json!({"handle":"client_a"}));
+    s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
+        run: &run_id,
+        step: "s1",
+        message: &writer.id,
+        turn,
+        slot: "source",
+        request: "cad2042-request",
+        binding_digest: "binding-a",
+        input_digest: &input_digest,
+        call_id: "cad2042-receipt",
+    })
+    .unwrap();
+    let result = json!({
+        "schema": 1,
+        "kind": "social.source.posts",
+        "handle": "client_a",
+        "posts": [{"id": "p1", "permalink": "https://www.instagram.com/p/AbC/", "published_at_unix": 1}],
+    });
+    s.app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
+        id: "cad2042-receipt",
+        run: &run_id,
+        step: "s1",
+        message: &writer.id,
+        turn,
+        slot: "source",
+        request: "cad2042-request",
+        binding_digest: "binding-a",
+        input_digest: &input_digest,
+        result: &result,
+        asset: None,
+    })
+    .unwrap();
+
+    let (flag, receipt_install, receipt_context): (i64, Option<String>, Option<String>) = s
+        .conn()
+        .query_row(
+            "SELECT source_post_read,install_id,context_id FROM app_capability_results WHERE id=?",
+            ["cad2042-receipt"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        flag, 1,
+        "a source read is marked in the recording transaction"
+    );
+    assert_eq!(receipt_install.as_deref(), Some(install));
+    assert_eq!(receipt_context.as_deref(), Some(context_id.as_str()));
+
+    let fence = s.app_source_run_watermark().unwrap();
+    let page = s
+        .app_source_run_candidates(install, &context_id, None, fence, 5)
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+        vec!["cad2042-receipt"],
+        "the recorded source read is pageable in its own scope"
+    );
+
+    let plan: Vec<String> = s
+        .conn()
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT id,created,run_id FROM app_capability_results
+              WHERE install_id=? AND context_id=? AND source_post_read=1
+                AND rowid<=? AND (created<? OR (created=? AND id<?))
+              ORDER BY created DESC,id DESC LIMIT ?",
+        )
+        .unwrap()
+        .query_map(
+            params![install, &context_id, fence, 0.0f64, 0.0f64, "zzzz", 5i64],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let plan_text = plan.join("\n");
+    assert!(
+        plan_text.contains("app_capability_results_source"),
+        "the page must use its scoped ordered index: {plan_text}"
+    );
+    assert!(
+        !plan_text.contains("TEMP B-TREE"),
+        "the page must not sort scoped history before LIMIT: {plan_text}"
+    );
+}

@@ -131,7 +131,11 @@ pub use migration::{
 ///
 /// v61 (CAD-1962) adds workspace custody for an image an installation
 /// imported into the shared media library, plus its accepted-intent ledger.
-pub const SCHEMA_VERSION: i64 = 61;
+///
+/// v62 (CAD-2042) denormalizes an owning run's installation/context and the
+/// source-read marker onto capability receipts, with a partial scoped index,
+/// so the retained-source page is an ordered range instead of a join+sort.
+pub const SCHEMA_VERSION: i64 = 62;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
