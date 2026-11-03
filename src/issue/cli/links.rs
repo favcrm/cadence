@@ -172,6 +172,13 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
         IssueAction::Review { .. } => Err(Error::rejected(
             "reviewing a task artifact needs a hosted org — nothing was written",
         )),
+        // The tenant store holds them; a local tracker has no equivalent yet.
+        IssueAction::Say { .. }
+        | IssueAction::Messages { .. }
+        | IssueAction::MessagesRead { .. } => Err(Error::rejected(
+            "ticket messages need a hosted org for now — pass `--org <org>`; nothing was \
+                 read or written",
+        )),
         _ => unreachable!("links"),
     }
 }

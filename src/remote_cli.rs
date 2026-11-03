@@ -126,6 +126,7 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_ls",
     "issue_show",
     "issue_history",
+    "issue_messages",
     "issue_artifact",
     // AOS-346: artifacts a worker or the assistant produced. The upload is its
     // own multipart path, `upload_artifact`.
@@ -145,6 +146,8 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_comment",
     "issue_attach",
     "issue_review",
+    "issue_message_send",
+    "issue_messages_read",
     "issue_set",
     "team_invite",
     "team_revoke_invite",
@@ -234,6 +237,11 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_identities_set"
         | "delivery_policy_set" => &["cli.write", "audit.approve"],
         "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
+        // Asking for one scope makes a login without it a refusal at mint, which
+        // can be named. Asking for both would mint a narrower envelope, and the
+        // call would then get a bare 401 that reads like an expired login.
+        "issue_message_send" | "issue_messages_read" => &["cli.write"],
+        "issue_messages" => &["cli.read"],
         _ => &["cli.read", "cli.write"],
     }
 }
@@ -265,6 +273,8 @@ fn mutating_cli_verb(verb: &str) -> bool {
         "message_send"
             | "issue_attach"
             | "issue_review"
+            | "issue_message_send"
+            | "issue_messages_read"
             | "audit_verdict"
             | "audit_reviewers_set"
             | "audit_verdict_project"
@@ -284,6 +294,13 @@ fn mutating_cli_verb(verb: &str) -> bool {
 fn lost_mutation_note(verb: &str) -> &'static str {
     if verb == "message_send" {
         "the send may or may not have been recorded"
+    } else if verb == "issue_message_send" {
+        "the message may or may not have been stored — repeat `issue say` with the same \
+         --message, --to, --from and text: an identical retry reports `duplicate` and stores \
+         nothing new, and any difference is refused as a conflict"
+    } else if verb == "issue_messages_read" {
+        "the read point may or may not have moved — repeating the same call is safe, because \
+         it only moves forward"
     } else if verb == "issue_attach" {
         "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it"
     } else if verb == "audit_reviewers_set" {
@@ -1528,6 +1545,7 @@ fn authorize(
     target: &RemoteTarget,
     cred: &Credential,
     surface: Surface,
+    verb: &str,
     scopes: &[&str],
     timeout: Duration,
 ) -> Result<String> {
@@ -1560,6 +1578,19 @@ fn authorize(
             Ok(envelope.to_string())
         }
         s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
+        403 if matches!(verb, "issue_message_send" | "issue_messages_read")
+            && body
+                .as_ref()
+                .and_then(|b| b.pointer("/error/code"))
+                .and_then(Value::as_str)
+                == Some("forbidden") =>
+        {
+            Err(Error::invalid(
+                "insufficient_scope",
+                "this login cannot write to this workspace (it lacks cli.write), and a new login \
+                 only helps if your role allows it. Nothing was sent (insufficient_scope, HTTP 403)",
+            ))
+        }
         _ => Err(refusal_error(status, body.as_ref())),
     }
 }
@@ -1597,6 +1628,7 @@ fn call_once(
         target,
         cred,
         surface,
+        verb,
         scopes,
         request_timeout(deadline, AUTH_TIMEOUT)?,
     )?;
@@ -1657,6 +1689,7 @@ fn upload_once(
         target,
         cred,
         Surface::Wiki,
+        "",
         &["wiki.write"],
         request_timeout(deadline, AUTH_TIMEOUT)?,
     )?;
@@ -1730,6 +1763,7 @@ fn artifact_upload_once(
         target,
         cred,
         Surface::Cli,
+        "",
         &["cli.write"],
         request_timeout(deadline, AUTH_TIMEOUT)?,
     )?;
@@ -2412,6 +2446,32 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
                  passive inbox inspection requires a human workspace owner",
             ))
         }
+        ("issue_message_send", Some("message_id_conflict")) => Some((
+            "message_id_conflict",
+            "that --message id was already used with different content, on another ticket, \
+             or by another member — pick a new id; nothing was stored",
+        )),
+        ("issue_message_send" | "issue_messages" | "issue_messages_read", Some("not_found")) => {
+            Some((
+                "not_found",
+                "this workspace has no ticket with that id; nothing was read or changed",
+            ))
+        }
+        // Not what today's relay sends, which refuses at mint (see `authorize`).
+        ("issue_message_send" | "issue_messages_read", Some("insufficient_scope")) => Some((
+            "insufficient_scope",
+            "this remote login lacks the cli.write grant this needs — nothing was sent",
+        )),
+        // An older relay refuses a verb it does not know the same way, so this
+        // cannot say which of the two happened.
+        (
+            "issue_message_send" | "issue_messages" | "issue_messages_read",
+            Some("invalid_request"),
+        ) => Some((
+            "invalid_request",
+            "the call was refused at the request boundary: a value was invalid, or this \
+             workspace's hosted service predates ticket messages. Nothing was read or changed",
+        )),
         ("message_read", Some("not_found")) => Some((
             "not_found",
             "no CLI message with that id is visible to this human identity; \
@@ -3181,6 +3241,27 @@ pub(crate) fn call_bounded(
     )
 }
 
+/// Whether a ticket message write's 2xx names the write that was asked for.
+/// The ticket id can come back in its stored case.
+fn ticket_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String, Value>) -> bool {
+    let sent = |key: &str| arguments.get(key).and_then(Value::as_str);
+    let got = |key: &str| receipt.get(key).and_then(Value::as_str);
+    let same_ticket = sent("id")
+        .zip(got("id"))
+        .is_some_and(|(sent, got)| sent.eq_ignore_ascii_case(got));
+    same_ticket
+        && if verb == "issue_message_send" {
+            sent("message").is_some()
+                && got("message") == sent("message")
+                && got("to") == sent("to")
+                && got("state") == Some("stored")
+        } else {
+            sent("role").is_some()
+                && got("role") == sent("role")
+                && receipt.get("read_through").is_some_and(Value::is_u64)
+        }
+}
+
 /// CAD-1568 revision: a `message_send` 2xx is a usable receipt only when it
 /// carries the complete correlated enqueue binding:
 ///
@@ -3435,6 +3516,20 @@ fn call_verb_until_retry(
                 "remote send returned no usable correlated receipt — enqueue outcome is unknown",
             ));
         }
+        // A 2xx that does not echo this write is not evidence it landed. Reading
+        // it as a refusal invites a new --message and a second stored copy, and
+        // reading it as success claims something nobody saw.
+        if matches!(verb, "issue_message_send" | "issue_messages_read")
+            && (200..300).contains(&status)
+            && !body
+                .as_ref()
+                .is_some_and(|receipt| ticket_receipt_correlates(verb, receipt, &arguments))
+        {
+            return Err(Error::unknown(format!(
+                "the remote answered without a matching receipt — {}",
+                lost_mutation_note(verb)
+            )));
+        }
         if verb == "issue_attach" && (200..300).contains(&status) {
             let expected_id = arguments.get("id").and_then(Value::as_str);
             let expected_name = arguments
@@ -3537,8 +3632,10 @@ fn call_verb_until_retry(
                 refusal_code.as_deref(),
                 Some("mutation_outcome_uncertain" | "invite_email_uncertain")
             );
-        let artifact_outcome_unknown = matches!(verb, "issue_attach" | "issue_review")
-            && status >= 500
+        let artifact_outcome_unknown = matches!(
+            verb,
+            "issue_attach" | "issue_review" | "issue_message_send" | "issue_messages_read"
+        ) && status >= 500
             && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
             && !board_gate_refused(body.as_ref());
         // CAD-1999: a project create is answered by the tenant Worker from
@@ -3569,6 +3666,27 @@ fn call_verb_until_retry(
         // evidence". Report it before the generic decoder can call it
         // retryable. A checked write conflict keeps its own verdict: the call
         // ran and proved nothing was written.
+        if status == 501
+            && matches!(
+                verb,
+                "issue_message_send" | "issue_messages" | "issue_messages_read"
+            )
+        {
+            let nothing = if verb == "issue_messages" {
+                "read"
+            } else {
+                "changed"
+            };
+            let command = match verb {
+                "issue_message_send" => "issue say",
+                "issue_messages_read" => "issue messages-read",
+                _ => "issue messages",
+            };
+            return Err(Error::invalid(
+                "not_implemented",
+                artifact_tenant_too_old(command, status, nothing),
+            ));
+        }
         if status == 501 && matches!(verb, "artifact_find" | "artifact_show" | "artifact_read") {
             let verb = verb.replacen('_', " ", 1);
             return Err(reject(artifact_tenant_too_old(&verb, status, "read")));
