@@ -65,6 +65,10 @@ pub struct ToolDecl {
     pub effect: Option<String>,
     pub scopes: Vec<String>,
     pub label: Option<String>,
+    /// CAD-1974: the call must name the connection it reads and the charge it
+    /// accepts before the platform is asked anything. Declared on the table,
+    /// never inferred from a tool's name.
+    pub connected_read: bool,
 }
 
 /// An adapter's declared tool table (§5.2) — `{tool, effect, scopes,
@@ -119,6 +123,10 @@ impl ToolTable {
                         })
                         .unwrap_or_default(),
                     label: t.get("label").and_then(Value::as_str).map(str::to_string),
+                    connected_read: t
+                        .get("connected_read")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 })
             })
             .collect::<Result<Vec<_>>>()?;

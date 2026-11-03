@@ -225,6 +225,17 @@ impl From<ImageFailure> for AppCapabilityError {
     }
 }
 
+/// One connected read, as the gate admitted it: the reviewed tool, the
+/// caller's arguments, the connection it reads and the charge the caller
+/// already accepted.
+pub struct ConnectedRead<'a> {
+    pub tool: &'a str,
+    pub input: &'a Value,
+    pub connection: &'a str,
+    pub max_charge_minor: u64,
+    pub idempotency_key: &'a str,
+}
+
 /// One platform's adapter — the proxy's outward leg.
 pub trait PlatformAdapter: Send + Sync {
     /// The adapter's declared tool table, reviewed like code and pinned
@@ -258,6 +269,20 @@ pub trait PlatformAdapter: Send + Sync {
         expected_hash: Option<&str>,
     ) -> std::result::Result<Value, String> {
         self.execute(credential, tool, input, idempotency_key, expected_hash)
+    }
+
+    /// CAD-1974: a read the caller scoped to one connection and priced with a
+    /// ceiling they accepted before anything ran. Only an adapter whose table
+    /// declares `connected_read` receives this, and only for a `read` effect;
+    /// everyone else refuses, so a connected read can never fall back to the
+    /// unattended path.
+    fn execute_connected_read(
+        &self,
+        _account: &str,
+        _credential: &[u8],
+        _call: &ConnectedRead<'_>,
+    ) -> std::result::Result<Value, String> {
+        Err("this platform has no connected-read door".into())
     }
 
     /// Reviewed discovery metadata. Legacy adapters default unavailable.

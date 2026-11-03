@@ -11,6 +11,7 @@ pub mod account_media;
 pub mod adapter;
 pub mod agenticos;
 pub mod agenticos_external;
+pub mod agenticos_provider;
 pub mod agenticos_web;
 pub mod connections;
 pub mod custody;
@@ -29,7 +30,8 @@ pub mod smtp;
 pub mod smtp_internal;
 
 pub use adapter::{
-    AppArtifactError, AppCapabilityError, ImageFailure, ImageReason, ImageSettle, PlatformAdapter,
+    AppArtifactError, AppCapabilityError, ConnectedRead, ImageFailure, ImageReason, ImageSettle,
+    PlatformAdapter,
 };
 
 /// One reviewed adapter tool, as registered at daemon startup.
