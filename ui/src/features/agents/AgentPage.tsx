@@ -6,7 +6,7 @@ import { WriteGate } from "../auth/WriteGate";
 import type { Agent, AgentDetail, HiredProfile } from "../../lib/types";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import AgentChat, { type ChatGate } from "./AgentChat";
-import { ConnectRuntime, ProfileDetails } from "./ProfileSeat";
+import { ConnectRuntime, ProfileDetails, workText } from "./ProfileSeat";
 import { seatStatus } from "./SeatCard";
 import { RecoveryBlock } from "./AgentProfile";
 import AgentTabBody, { type TabContext } from "./AgentTabs";
@@ -25,6 +25,7 @@ import {
   conversationalOnlyCloud,
   lifecycleBadge,
   lifecycleOf,
+  type ProfileWork,
 } from "./agentView";
 import "./agents.css";
 
@@ -68,6 +69,7 @@ export default function AgentPage({
   hosted,
   groups,
   rosterLoaded,
+  hiredWork,
 }: {
   alias: string;
   observed?: Agent;
@@ -82,6 +84,8 @@ export default function AgentPage({
   groups: string[];
   /** The team list has answered, so a missing alias really is missing. */
   rosterLoaded: boolean;
+  /** What a runtime-less profile's card names, if anything. */
+  hiredWork: ProfileWork | null;
 }) {
   const writeBlock = useContext(WriteGate);
   const t = useTranslate();
@@ -247,8 +251,8 @@ export default function AgentPage({
     const mailbox = profile?.inbox === true || profile?.provider === "inbox";
     const gate: ChatGate | null = hired
       ? {
-          title: t("{alias} isn’t running, so it can’t reply yet").replace("{alias}", () => alias),
-          body: t("Connect a runtime to talk to it here."),
+          title: t("{alias} can’t reply here yet").replace("{alias}", () => alias),
+          body: t("It has no runtime connected to this board. Connect one to talk to it here."),
           extra: <ConnectRuntime profile={hired} hosted={hosted} groups={groups} />,
         }
       : mailbox
@@ -286,7 +290,7 @@ export default function AgentPage({
                 {hired ? (
                   <>
                     <span className="rc-dot" style={{ "--c": "var(--color-ink-500)" } as React.CSSProperties} />{" "}
-                    {t("Idle · no runtime")}
+                    {hiredWork ? workText(hiredWork, t) : t("Idle · no runtime")}
                   </>
                 ) : (
                   <>
@@ -307,7 +311,7 @@ export default function AgentPage({
           hired ? (
             <ProfileDetails
               profile={hired}
-              work={null}
+              work={hiredWork}
               onOpenIssue={onOpenIssue}
             />
           ) : (

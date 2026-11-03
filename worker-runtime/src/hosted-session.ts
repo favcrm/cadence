@@ -1,6 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import {
+  type Cursor,
+  createRegistry,
+  Harness,
+} from "@earendil-works/pi-durable";
 import { PiHarness, skills } from "agents/harness/pi";
 import { Lifecycle } from "agents/lifecycle";
 import { createAI } from "agents/models/pi-ai";
@@ -36,7 +41,7 @@ import { sessionEventResponse } from "./session-stream.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { authorizeTools } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
-import { projectedThreadEntries } from "./transcript.ts";
+import { projectedThreadEntries, readAllRecords } from "./transcript.ts";
 
 /**
  * The last model the platform gateway reported serving for this conversation.
@@ -196,15 +201,13 @@ export class HostedSession<
       // Capture the watch before reading its snapshot so commits between the
       // initial read and subscription are buffered, not silently missed.
       const stream = await this.harness.session().events();
-      // Project before SSE 200, so a failing projection refuses like the master
+      // Read and project before SSE 200, so a failure refuses like the master
       // projection above rather than opening a body that errors and reconnects.
+      // The engine's own snapshot is the active context, which numbers from 1
+      // again after a reset: a reconnect must see the same `seq` as a page read.
       let snapshotEntries: ThreadEntry[];
       try {
-        snapshotEntries = projectedThreadEntries(
-          stream.snapshot.entries,
-          thinking,
-          this.options.projectThread,
-        );
+        snapshotEntries = await this.transcript(thinking);
       } catch {
         await stream.stop();
         return Response.json(
@@ -275,8 +278,18 @@ export class HostedSession<
 
   /** Map the engine's committed records, including durable input metadata, for the board. */
   async transcript(includeThinking: boolean): Promise<ThreadEntry[]> {
+    const conversation = await this.harness.conversation(
+      this.harness.session().id,
+    );
     return projectedThreadEntries(
-      await this.harness.session().messages(),
+      await readAllRecords<Cursor>((cursor, limit) =>
+        conversation.entries(
+          { order: "ascending" },
+          limit,
+          cursor,
+          BACKGROUND_CONTEXT,
+        ),
+      ),
       includeThinking,
       this.options.projectThread,
     );
@@ -294,10 +307,10 @@ export class HostedSession<
   }
 
   /**
-   * Start a fresh context for this conversation. The durable transcript before
-   * this point stops being active; the board then has a clean thread even when
-   * a stale session is wedged and a normal reload cannot recover it. The caller
-   * is the owner-only reset route; this is deliberately not an automatic retry.
+   * Start a fresh context for this conversation. The model stops seeing what
+   * came before, while the board keeps showing it, with a marker where it
+   * happened. This also recovers a stale session a normal reload cannot. The
+   * callers are owner-only routes; this is deliberately not an automatic retry.
    */
   async resetConversation(): Promise<void> {
     await this.harness.session().reset();

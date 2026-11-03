@@ -4,7 +4,7 @@ import type { Agent, HiredProfile } from "../../lib/types";
 import { IconSearch } from "../../ui/icons";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import { seatStatus } from "./SeatCard";
-import { agentCategory, agentOrder } from "./agentView";
+import { agentCategory, agentOrder, liveClaimState } from "./agentView";
 
 /** The list's groups, in the order they read. Stopped and Mailboxes fold. */
 const GROUPS: { id: string; label: string; folded?: boolean }[] = [
@@ -16,6 +16,12 @@ const GROUPS: { id: string; label: string; folded?: boolean }[] = [
   { id: "inbox", label: "Mailboxes", folded: true },
 ];
 
+/** A profile sits with the agents its live claim matches; its card says the same. */
+function profileGroup(p: HiredProfile): string {
+  const live = liveClaimState(p);
+  return live === "working" ? "working" : live === "blocked" ? "attention" : "profile";
+}
+
 function groupOf(a: Agent): string {
   const category = agentCategory(a);
   return category === "other" ? "idle" : category;
@@ -24,6 +30,7 @@ function groupOf(a: Agent): string {
 export default function AgentSidebar({
   agents,
   profiles,
+  profileStatus,
   open,
   query,
   onQuery,
@@ -33,6 +40,8 @@ export default function AgentSidebar({
 }: {
   agents: Agent[];
   profiles: HiredProfile[];
+  /** A profile's one status line, as its card reads it. */
+  profileStatus: (profile: HiredProfile) => string;
   open: string | null;
   query: string;
   onQuery: (query: string) => void;
@@ -60,24 +69,27 @@ export default function AgentSidebar({
   );
   const groups = GROUPS.map((group) => {
     const rows =
-      group.id === "profile"
-        ? profiles.map((p) =>
-            row(p.alias, <AgentAvatar slug="custom" look={p.look ?? undefined} size={28} still />, t("Idle · no runtime")),
-          )
-        : agents
-            .filter((a) => groupOf(a) === group.id)
-            .sort((a, b) => agentOrder(a) - agentOrder(b) || a.alias.localeCompare(b.alias))
-            .map((a) =>
-              row(
-                a.alias,
-                <AgentAvatar
-                  slug={agentLook(a.alias, a.params as Record<string, unknown> | undefined)}
-                  size={28}
-                  still
-                />,
-                seatStatus(a, t).text,
-              ),
-            );
+      [
+        ...agents
+          .filter((a) => groupOf(a) === group.id)
+          .sort((a, b) => agentOrder(a) - agentOrder(b) || a.alias.localeCompare(b.alias))
+          .map((a) =>
+            row(
+              a.alias,
+              <AgentAvatar
+                slug={agentLook(a.alias, a.params as Record<string, unknown> | undefined)}
+                size={28}
+                still
+              />,
+              seatStatus(a, t).text,
+            ),
+          ),
+        ...profiles
+          .filter((p) => profileGroup(p) === group.id)
+          .map((p) =>
+            row(p.alias, <AgentAvatar slug="custom" look={p.look ?? undefined} size={28} still />, profileStatus(p)),
+          ),
+      ];
     return { ...group, rows };
   }).filter((group) => group.rows.length > 0);
 

@@ -46,9 +46,25 @@ export function ConnectRuntime({
   );
 }
 
-function workText(work: ProfileWork, t: (english: string) => string): string {
-  const line = `${work.issue.id} · ${work.issue.title}`;
-  return work.open ? line : t("Last: {issue}").replace("{issue}", () => line);
+const WORK_TONE: Record<ProfileWork["state"], string> = {
+  working: "var(--color-ok)",
+  blocked: "var(--color-warn)",
+  waiting: "var(--color-info)",
+  open: "var(--color-ink-500)",
+  last: "var(--color-ink-500)",
+};
+
+export function workText(work: ProfileWork, t: (english: string) => string): string {
+  const line = work.title ? `${work.id} · ${work.title}` : work.id;
+  const form: Record<ProfileWork["state"], string | null> = {
+    working: "Working on {issue}",
+    blocked: "Blocked on {issue}",
+    waiting: "Waiting on {issue}",
+    open: null,
+    last: "Last: {issue}",
+  };
+  const template = form[work.state];
+  return template ? t(template).replace("{issue}", () => line) : line;
 }
 
 /** A profile with no runtime, in a seat card's shape: avatar, name, role, then
@@ -80,7 +96,10 @@ export default function ProfileSeat({
         <span className="s">{roleTitle}</span>
       </span>
       <span className="st">
-        <span className="rc-dot" style={{ "--c": "var(--color-ink-500)" } as React.CSSProperties} />
+        <span
+          className="rc-dot"
+          style={{ "--c": work ? WORK_TONE[work.state] : "var(--color-ink-500)" } as React.CSSProperties}
+        />
         <span className="min-w-0 truncate" title={status}>
           {status}
         </span>
@@ -104,12 +123,12 @@ export function ProfileDetails({
     <div className="rc-sheet-b">
       <div className="rc-blk">
         <h4>{t("Status")}</h4>
-        <p className="rc-profile-line">{t("Idle · no runtime")}</p>
+        <p className="rc-profile-line">{work && work.state !== "open" && work.state !== "last" ? workText(work, t) : t("Idle · no runtime")}</p>
       </div>
       {work && (
         <div className="rc-blk">
           <h4>{t("Latest work")}</h4>
-          <button type="button" className="rc-profile-work" onClick={() => onOpenIssue(work.issue.id)}>
+          <button type="button" className="rc-profile-work" onClick={() => onOpenIssue(work.id)}>
             {workText(work, t)}
           </button>
         </div>

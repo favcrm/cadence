@@ -29,9 +29,10 @@
 //!   install. A revoke or upgrade between mount and read fails closed.
 //!
 //! `input` is the closed union `{kind:"catalog", limit?:1..20,
-//! cursor?:opaque}` — `{kind:"asset", asset_id}` is recognized by the
-//! contract but NOT admitted until its custody check lands, and refuses
-//! explicitly. Catalog output is `{assets, next_cursor, current_actor}`.
+//! cursor?:opaque}` plus `{kind:"asset", asset_id}` — one catalog row's
+//! metadata projection, never a byte or a locator (CAD-1962). Catalog
+//! output is `{assets, next_cursor, current_actor}`; detail output is
+//! `{asset, current_actor}`.
 //! `current_actor` and each asset's `creator` carry the tagged app-port
 //! `Creator` union — `{kind:"user", id:<verified native
 //! BoardUser.sub>, label?}`, `{kind:"operator"}` or `{kind:"unknown"}`
@@ -103,9 +104,11 @@ impl Shared {
             },
             |view, input, _ctx| {
                 // The workspace is this daemon's own store — the mount
-                // proved it; no request field selects one. The catalog
-                // is store-wide: same-workspace collaborators read the
-                // same rows regardless of which install produced them.
+                // proved it; no request field selects one. The catalog is
+                // store-wide: same-workspace collaborators read the same
+                // rows regardless of which install produced them, and
+                // draft/published is curation, not visibility (CAD-1365's
+                // cross-install read acceptance pins this).
                 self.media_read_input(view, &input)
             },
         )
@@ -120,10 +123,38 @@ impl Shared {
             .as_i64()
             .filter(|revision| *revision > 0)
             .ok_or_else(|| Error::rejected("media preview needs a positive revision"))?;
-        let image = self.store.app_media_context_image(asset_id)?;
-        if image.asset.revision != revision || image.asset.kind != "image" {
-            return Err(Error::rejected("media preview reference is stale"));
+        if let Some(asset) = self.store.app_media_asset(asset_id)? {
+            if asset.revision != revision || asset.kind != "image" {
+                return Err(Error::rejected("media preview reference is stale"));
+            }
         }
+        if let Some(imported) = self.store.app_media_imported_image(asset_id)? {
+            // Workspace custody: the bytes are this store's own, so the
+            // only authority is the live mount proved above. The digest
+            // and size were re-verified on read.
+            let preview = crate::platform::agenticos_external::image::preview_jpeg(
+                &imported.bytes,
+                &imported.media_type,
+            )
+            .map_err(|(_, reason)| Error::rejected(reason))?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(preview);
+            // Re-prove the mount AND the asset revision after preparing
+            // the bytes and before the reply: an expiry, revoke or a
+            // revision change that landed meanwhile refuses, exactly as
+            // the provider branch re-checks `app_media_revision`.
+            self.media_mount_reprove(params)?;
+            if self.store.app_media_revision(asset_id)? != revision {
+                return Err(Error::rejected(
+                    "media preview reference changed during preparation",
+                ));
+            }
+            return Ok(json!({
+                "asset_id": asset_id, "revision": revision,
+                "sha256": imported.sha256,
+                "media_type": "image/jpeg", "base64": encoded,
+            }));
+        }
+        let image = self.store.app_media_context_image(asset_id)?;
         let preview = crate::platform::agenticos_external::image::preview_jpeg(
             &image.bytes,
             image.media_type,
@@ -142,6 +173,52 @@ impl Shared {
                 "media_type": "image/jpeg", "base64": encoded,
             }))
         })
+    }
+
+    /// Re-prove the live mount behind this media request. Used where a
+    /// preparation step ran outside the runtime snapshot (imported
+    /// custody preview) and the reply must not ride an earlier proof.
+    fn media_mount_reprove(&self, params: &Value) -> Result<()> {
+        let token = required_str(params, "token")?;
+        let action_token = required_str(params, "action_token")?;
+        let key = match params.get("key") {
+            None => "",
+            Some(Value::String(key)) => key.as_str(),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "media image key must be a session key string",
+                ))
+            }
+        };
+        let origin = match params["origin"].as_str() {
+            Some("loopback") => Origin::Loopback,
+            Some("tailnet") => Origin::Tailnet,
+            Some("public") => Origin::Public,
+            _ => {
+                return Err(Error::rejected(
+                    "media image needs a classified session origin",
+                ))
+            }
+        };
+        let (session, _) = self
+            .tool_session(token, key, origin)
+            .ok_or_else(|| Error::rejected("media image needs a live operator session"))?;
+        let ctx = self.tool_context_proven(action_token, &session)?;
+        let context_id = ctx
+            .context_id
+            .as_deref()
+            .ok_or_else(|| Error::rejected("media image needs a mounted active context"))?;
+        // Presence is not liveness: the context must still be the active
+        // one this installation owns. `tool_context_proven` proves the
+        // token and session, not `app_contexts.state`, so an archive that
+        // landed while the preview was being prepared refuses here.
+        let (_, proof) = self.store.app_context_proof(&ctx.install_id, context_id)?;
+        if proof.install_id != ctx.install_id {
+            return Err(Error::rejected(
+                "media image context belongs to another installation",
+            ));
+        }
+        Ok(())
     }
 
     fn with_media_mount_current<T>(
@@ -183,7 +260,7 @@ impl Shared {
             token,
             key,
             origin,
-            proven: original,
+            authority: OriginalAuthority::Provider(original),
             account_source: None,
             expected,
         };
@@ -562,6 +639,96 @@ impl Shared {
         )
     }
 
+    /// `app_media_import {action_token, token, key, origin, receipt_id,
+    /// request_id}` — copy ONE retained image this installation holds
+    /// into workspace custody and the shared catalog, as a draft.
+    /// Identical fresh authority chain to `app_media_publish` — operator
+    /// connection, closed fields, real session + public-operator floor,
+    /// the SAME session's consumed mount, live install digest, approved
+    /// status, re-extracted package, active owned context — then the
+    /// declared permission is `media.import`, never implied by
+    /// `media.read` or `media.publish`.
+    ///
+    /// The bytes come from THIS installation's own tool custody: the
+    /// receipt is looked up under the mount's install, never a request
+    /// field, and the stored MIME is re-sniffed against the bytes before
+    /// anything is written. The store copies them into workspace
+    /// custody, so the asset outlives this installation and another app
+    /// in the same workspace can read it.
+    pub(super) fn rpc_app_media_import(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.media_request_proven(
+            "media import",
+            params,
+            peer_pid,
+            (
+                &[
+                    "action_token",
+                    "token",
+                    "key",
+                    "origin",
+                    "receipt_id",
+                    "request_id",
+                ],
+                app_screen_decl::MAY_MEDIA_IMPORT,
+            ),
+            |params| {
+                let receipt_id = required_str(params, "receipt_id")?;
+                if receipt_id.is_empty()
+                    || receipt_id.len() > 128
+                    || !receipt_id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                {
+                    return Err(Error::rejected(
+                        "media import receipt_id must be nonempty ASCII \
+                         letters/digits/hyphen/underscore within 128 bytes",
+                    ));
+                }
+                let request_id = required_str(params, "request_id")?;
+                if request_id.is_empty()
+                    || request_id.len() > 128
+                    || !request_id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                {
+                    return Err(Error::rejected(
+                        "media import request_id must be nonempty ASCII \
+                         letters/digits/hyphen/underscore within 128 bytes",
+                    ));
+                }
+                Ok((receipt_id.to_string(), request_id.to_string()))
+            },
+            |view, (receipt_id, request_id), ctx| {
+                let context = ctx.context_id.as_deref().ok_or_else(|| {
+                    Error::rejected("media import needs a mounted active context")
+                })?;
+                let (declared_mime, _digest, bytes) = self
+                    .store
+                    .app_tool_asset_bytes(&ctx.install_id, &receipt_id)
+                    .map_err(|_| {
+                        Error::rejected(
+                            "media import needs a retained image this installation owns",
+                        )
+                    })?;
+                let media_type = crate::platform::agenticos_external::image::uploaded_image_mime(
+                    &bytes,
+                    &declared_mime,
+                )
+                .map_err(|(_, reason)| Error::rejected(reason))?;
+                self.store
+                    .app_media_import(crate::store::app_media::MediaImport {
+                        install: &ctx.install_id,
+                        context,
+                        creator: &media_actor(view).to_string(),
+                        media_type,
+                        bytes: &bytes,
+                        source_receipt_id: &receipt_id,
+                        request_id: &request_id,
+                    })
+            },
+        )
+    }
+
     /// `app_media_original {action_token, token, key, origin, asset_id}`
     /// — the CLOSED original transfer for one live `screen-media.v1`
     /// mount declaring `media.read`. Identical fresh authority chain to
@@ -645,6 +812,23 @@ impl Shared {
             return Err(Error::rejected(format!(
                 "{verb} needs a mounted active context"
             )));
+        }
+        // CAD-1962: imported bytes live in THIS workspace's custody, so
+        // there is no producing run to re-prove. They are served under the
+        // caller's own mount authority plus the stored digest, and they
+        // outlive the installation that imported them.
+        if let Some(imported) = self.store.app_media_imported_image(asset_id)? {
+            return self.imported_original_stream(
+                &ctx,
+                &imported,
+                OriginalRequest {
+                    token,
+                    key,
+                    origin,
+                    action_token,
+                },
+                deliver,
+            );
         }
         // The asset's private provenance — a pure store read, resolved
         // before the runtime snapshot so the producing install is known.
@@ -786,7 +970,7 @@ impl Shared {
             token,
             key,
             origin,
-            proven: &proven,
+            authority: OriginalAuthority::Provider(&proven),
             account_source,
             expected: ctx,
         };
@@ -800,21 +984,88 @@ impl Shared {
     /// mounting and producing installs, the re-extracted media package and
     /// the active context. Runs before the provider GET and again before
     /// every socket send.
+    /// CAD-1962: the imported-custody retrieval door. The bytes are this
+    /// store's own, already digest- and size-verified on read; the
+    /// authority is the caller's live mount — approved digest, media.read,
+    /// active owned context — re-proven under the runtime snapshot before
+    /// the header and again before every send by `OriginalDelivery`. No
+    /// producing run exists, so no run binding is invented.
+    fn imported_original_stream(
+        &self,
+        ctx: &ToolContext,
+        imported: &crate::store::app_media::ImportedImage,
+        request: OriginalRequest<'_>,
+        deliver: impl FnOnce(&Value, &[u8], &OriginalDelivery<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let OriginalRequest {
+            token,
+            key,
+            origin,
+            action_token,
+        } = request;
+        let verb = "media original";
+        // Native public membership is refreshed OUTSIDE the runtime and
+        // release guards, exactly as the provider path does, and the
+        // pinned proof is then re-checked inside them.
+        let proof = self.original_public_proof(token, origin, action_token, ctx)?;
+        let pm_dir = self.pm_dir()?;
+        let pm = self.pm_at(&pm_dir)?;
+        workspace::with_runtime_snapshot(&pm, &ctx.install_id, |bundle, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.caller_runtime_current(ctx, verb, (bundle, files))?;
+            // The session and mount proven above are re-proven AFTER the
+            // bytes were read and BEFORE any success header: an expiry or
+            // revoke that landed during the read refuses the delivery.
+            self.original_authority_under_guards(
+                token,
+                key,
+                origin,
+                action_token,
+                ctx,
+                proof.as_ref(),
+            )?;
+            Ok(())
+        })?;
+        let header = json!({
+            "transfer": "app-media-original/1",
+            "asset_id": imported.asset.id,
+            "media_type": imported.media_type,
+            "bytes": imported.bytes.len() as u64,
+            // `artifact_digest` already yields `sha256:<hex>`.
+            "sha256": imported.sha256.clone(),
+        });
+        let delivery = OriginalDelivery {
+            shared: self,
+            pm: &pm,
+            action_token,
+            token,
+            key,
+            origin,
+            authority: OriginalAuthority::Imported,
+            account_source: None,
+            expected: ctx.clone(),
+        };
+        deliver(&header, &imported.bytes, &delivery)
+    }
+
     fn original_runtime_current(
         &self,
         ctx: &ToolContext,
         proven: &crate::store::app_media::MediaOriginalProof,
-        (bundle, files): (&Value, &BTreeMap<String, String>),
-        (pbundle, pfiles): (&Value, &BTreeMap<String, String>),
+        caller: (&Value, &BTreeMap<String, String>),
+        producer: (&Value, &BTreeMap<String, String>),
     ) -> Result<()> {
-        let verb = "media original";
-        let context_id = ctx
-            .context_id
-            .as_deref()
-            .ok_or_else(|| Error::rejected(format!("{verb} needs a mounted active context")))?;
         // The CURRENT binding/connection/revision at the PRODUCING install
         // must still match the run-frozen proof — drift, replacement,
         // rotation or revocation refuses before any provider access.
+        let (pbundle, pfiles) = producer;
         self.app_binding_receipt_current(
             &proven.install_id,
             proven.context_id.as_deref(),
@@ -823,6 +1074,38 @@ impl Shared {
             pbundle,
             pfiles,
         )?;
+        self.caller_runtime_current(ctx, "media original", caller)?;
+        // The producing run's approval must still be current: a revoked or
+        // expired install approval at the producing install refuses the
+        // original read, exactly as a mount's own approval proof does.
+        if self
+            .store
+            .app_capability_status(&proven.install_id, required_str(pbundle, "digest")?)?["state"]
+            .as_str()
+            != Some("approved")
+        {
+            return Err(Error::rejected(
+                "producing installation is not approved at its current digest",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The caller side of the media authority, shared by the provider
+    /// original and the imported-custody retrieval door: the mount's live
+    /// digest, approval at that digest, the re-extracted media package and
+    /// the active owned context. Runs under the held runtime snapshot and
+    /// release lock, before any byte is read and again before every send.
+    fn caller_runtime_current(
+        &self,
+        ctx: &ToolContext,
+        verb: &str,
+        (bundle, files): (&Value, &BTreeMap<String, String>),
+    ) -> Result<()> {
+        let context_id = ctx
+            .context_id
+            .as_deref()
+            .ok_or_else(|| Error::rejected(format!("{verb} needs a mounted active context")))?;
         let live_digest = required_str(bundle, "digest")?;
         if live_digest != ctx.digest {
             return Err(Error::rejected(format!(
@@ -848,19 +1131,6 @@ impl Shared {
             return Err(Error::rejected(format!(
                 "{verb} requires the screen-media.v1 host contract",
             )));
-        }
-        // The producing run's approval must still be current: a revoked or
-        // expired install approval at the producing install refuses the
-        // original read, exactly as a mount's own approval proof does.
-        if self
-            .store
-            .app_capability_status(&proven.install_id, required_str(pbundle, "digest")?)?["state"]
-            .as_str()
-            != Some("approved")
-        {
-            return Err(Error::rejected(
-                "producing installation is not approved at its current digest",
-            ));
         }
         let (_, proof) = self.store.app_context_proof(&ctx.install_id, context_id)?;
         if proof.install_id != ctx.install_id {
@@ -1391,9 +1661,12 @@ impl Shared {
         }
     }
 
-    /// The closed media-read input union and the bounded catalog page.
-    /// `kind:"asset"` is a recognized contract member but NOT admitted —
-    /// detail needs its own custody check and refuses explicitly here.
+    /// The closed media-read input union: the bounded catalog page and
+    /// one asset's metadata projection. The store is the workspace, so
+    /// permitted collaborators read the same rows regardless of which
+    /// installation produced them (CAD-1365's cross-install acceptance);
+    /// `lifecycle` is curation, not visibility. Neither input returns
+    /// bytes or a locator — the original transfer is its own door.
     fn media_read_input(
         &self,
         view: &crate::operator_auth::SessionView,
@@ -1443,9 +1716,29 @@ impl Shared {
                     "current_actor": media_actor(view),
                 }))
             }
-            "asset" => Err(Error::rejected(
-                "media asset detail is not admitted — no asset read exists yet",
-            )),
+            "asset" => {
+                // CAD-1962: one catalog row by id — the same metadata
+                // projection the page emits, never bytes or a locator.
+                // Store-wide like the page: another installation's row
+                // resolves here too.
+                if input
+                    .as_object()
+                    .is_some_and(|o| o.keys().any(|k| !matches!(k.as_str(), "kind" | "asset_id")))
+                {
+                    return Err(Error::rejected("media asset input has unsupported fields"));
+                }
+                let asset_id = input
+                    .get("asset_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::rejected("media asset input needs an asset_id"))?;
+                let asset = self.store.app_media_asset(asset_id)?.ok_or_else(|| {
+                    Error::rejected("media asset is not in the workspace catalog")
+                })?;
+                Ok(json!({
+                    "asset": asset.projection(),
+                    "current_actor": media_actor(view),
+                }))
+            }
             _ => Err(Error::rejected(
                 "media read input kind is not a recognized media read",
             )),
@@ -1521,6 +1814,25 @@ struct OriginalPublicProof {
 /// refreshed before those guards and pinned locally inside them. The write
 /// itself is one nonblocking send inside the guards. No guard is held
 /// across a `WouldBlock` wait, so a revoke serializes with a single send.
+/// What backs the bytes one original delivery is sending: a provider
+/// original with its run-frozen proof, or imported workspace custody with
+/// no producing run.
+/// The relayed session material one original request carries. Grouped so
+/// the delivery paths stay readable and inside the argument bound.
+pub(super) struct OriginalRequest<'a> {
+    pub token: &'a str,
+    pub key: &'a str,
+    pub origin: Origin,
+    pub action_token: &'a str,
+}
+
+pub(super) enum OriginalAuthority<'a> {
+    Provider(&'a crate::store::app_media::MediaOriginalProof),
+    /// Workspace custody: no producing run and no install binding, so
+    /// nothing beyond the caller's own mount authority is re-proved.
+    Imported,
+}
+
 pub(super) struct OriginalDelivery<'a> {
     shared: &'a Shared,
     pm: &'a crate::issue::Pm,
@@ -1528,82 +1840,121 @@ pub(super) struct OriginalDelivery<'a> {
     token: &'a str,
     key: &'a str,
     origin: Origin,
-    proven: &'a crate::store::app_media::MediaOriginalProof,
+    authority: OriginalAuthority<'a>,
     account_source: Option<crate::remote_cli::AccountImageIdentity>,
     expected: ToolContext,
 }
 
 impl OriginalDelivery<'_> {
     pub(super) fn with_current<T>(&self, send: impl FnOnce() -> T) -> Result<T> {
-        let refused = || Error::rejected("media original authority ended — delivery refused");
         let proof = self.shared.original_public_proof(
             self.token,
             self.origin,
             self.action_token,
             &self.expected,
         )?;
-        workspace::with_runtime_snapshot_pair(
-            self.pm,
-            &self.expected.install_id,
-            &self.proven.install_id,
-            |caller, producer| {
-                let _custody = self
-                    .shared
-                    .platform_custody_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let _release = self
-                    .shared
-                    .app_release_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                self.shared.original_runtime_current(
-                    &self.expected,
-                    self.proven,
-                    caller,
-                    producer,
-                )?;
-                self.shared.original_authority_under_guards(
-                    self.token,
-                    self.key,
-                    self.origin,
-                    self.action_token,
-                    &self.expected,
-                    proof.as_ref(),
-                )?;
-                if let Some(expected) = &self.account_source {
-                    let current =
-                        crate::platform::account_media::current_identity(&self.proven.proof.config)
-                            .map_err(Error::rejected)?;
-                    if &current != expected {
-                        return Err(refused());
-                    }
-                }
-                let mut auth = self.shared.operator_auth();
-                if !auth.live_hash(&self.expected.session, self.shared.operator_now())? {
-                    return Err(refused());
-                }
-                let map = self
-                    .shared
-                    .tool_contexts
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let ctx = map.get(self.action_token).ok_or_else(refused)?;
-                let e = &self.expected;
-                let same_mount = ctx.session == e.session
-                    && ctx.install_id == e.install_id
-                    && ctx.context_id == e.context_id
-                    && ctx.digest == e.digest
-                    && ctx.tag == e.tag
-                    && ctx.generation == e.generation
-                    && ctx.mount.is_some()
-                    && ctx.mount == e.mount;
-                if !same_mount || Instant::now().duration_since(ctx.issued) >= TOOL_CTX_TTL {
-                    return Err(refused());
-                }
-                Ok(send())
-            },
-        )
+        match self.authority {
+            OriginalAuthority::Provider(proven) => workspace::with_runtime_snapshot_pair(
+                self.pm,
+                &self.expected.install_id,
+                &proven.install_id,
+                |caller, producer| {
+                    let _custody = self
+                        .shared
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .shared
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    self.shared.original_runtime_current(
+                        &self.expected,
+                        proven,
+                        caller,
+                        producer,
+                    )?;
+                    self.finish(proof.as_ref(), Some(proven), send)
+                },
+            ),
+            // Imported bytes: no producing run to re-prove, and the
+            // importing installation's removal must not revoke workspace
+            // custody — the caller's own mount is the whole authority.
+            OriginalAuthority::Imported { .. } => workspace::with_runtime_snapshot(
+                self.pm,
+                &self.expected.install_id,
+                |bundle, files| {
+                    let _custody = self
+                        .shared
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .shared
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    self.shared.caller_runtime_current(
+                        &self.expected,
+                        "media original",
+                        (bundle, files),
+                    )?;
+                    self.finish(proof.as_ref(), None, send)
+                },
+            ),
+        }
+    }
+
+    /// The checks both doors share once the runtime snapshot and the
+    /// release/custody guards are held: the relayed mount proof, the live
+    /// operator session, the pinned tool context and its lifetime.
+    fn finish<T>(
+        &self,
+        proof: Option<&OriginalPublicProof>,
+        proven: Option<&crate::store::app_media::MediaOriginalProof>,
+        send: impl FnOnce() -> T,
+    ) -> Result<T> {
+        let refused = || Error::rejected("media original authority ended — delivery refused");
+        self.shared.original_authority_under_guards(
+            self.token,
+            self.key,
+            self.origin,
+            self.action_token,
+            &self.expected,
+            proof,
+        )?;
+        if let Some(expected) = &self.account_source {
+            let proven = proven.ok_or_else(refused)?;
+            let current = crate::platform::account_media::current_identity(&proven.proof.config)
+                .map_err(Error::rejected)?;
+            if &current != expected {
+                return Err(refused());
+            }
+        }
+        let mut auth = self.shared.operator_auth();
+        if !auth.live_hash(&self.expected.session, self.shared.operator_now())? {
+            return Err(refused());
+        }
+        let map = self
+            .shared
+            .tool_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = map.get(self.action_token).ok_or_else(refused)?;
+        let e = &self.expected;
+        let same_mount = ctx.session == e.session
+            && ctx.install_id == e.install_id
+            && ctx.context_id == e.context_id
+            && ctx.digest == e.digest
+            && ctx.tag == e.tag
+            && ctx.generation == e.generation
+            && ctx.mount.is_some()
+            && ctx.mount == e.mount;
+        if !same_mount || Instant::now().duration_since(ctx.issued) >= TOOL_CTX_TTL {
+            return Err(refused());
+        }
+        Ok(send())
     }
 }
 

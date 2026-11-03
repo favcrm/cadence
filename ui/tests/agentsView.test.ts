@@ -44,7 +44,7 @@ const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
 const { seatStatus } = require("../src/features/agents/SeatCard") as typeof import("../src/features/agents/SeatCard");
-const { profileWork } = require("../src/features/agents/agentView") as typeof import("../src/features/agents/agentView");
+const { profileMatchesFilter, profileMatchesSearch, profileWork } = require("../src/features/agents/agentView") as typeof import("../src/features/agents/agentView");
 const Agents = (
   require("../src/features/agents/Agents") as typeof import("../src/features/agents/Agents")
 ).default;
@@ -297,22 +297,54 @@ async function main() {
   const card = (over: Partial<IssueCard>) => ({ ...issues[0], owner: "Developer", container: false, ...over }) as IssueCard;
   assert(profileWork(profile, []) === null, "no owned issue names no work");
   assert(
-    profileWork(profile, [card({ id: "DEMO-1", status: "done", created: "2026-01-01" }), card({ id: "DEMO-2", status: "backlog", created: "2026-01-02" }), card({ id: "DEMO-3", status: "done", created: "2026-01-03" }), card({ id: "DEMO-4", status: "doing", created: "2026-01-04", owner: "someone" })])?.issue.id === "DEMO-2",
+    profileWork(profile, [card({ id: "DEMO-1", status: "done", created: "2026-01-01" }), card({ id: "DEMO-2", status: "backlog", created: "2026-01-02" }), card({ id: "DEMO-3", status: "done", created: "2026-01-03" }), card({ id: "DEMO-4", status: "doing", created: "2026-01-04", owner: "someone" })])?.id === "DEMO-2",
     "the newest open owned issue wins over a newer finished one and another owner's",
   );
   const finished = profileWork(profile, [card({ id: "DEMO-1", status: "done", created: "2026-01-01" }), card({ id: "DEMO-3", status: "dropped", created: "2026-01-03" })]);
-  assert(finished?.issue.id === "DEMO-3" && finished.open === false, "with nothing open the newest closed issue is the last work");
+  assert(finished?.id === "DEMO-3" && finished.state === "last", "with nothing open the newest closed issue is the last work");
+  const owned = [card({ id: "DEMO-2", status: "doing", created: "2026-01-02", title: "Owned" })];
+  const claimed = (state: string, id = "DEMO-9") => ({ ...profile, latest_claim: { issue_id: id, state } });
+  assert(profileWork(claimed("running"), owned)?.state === "working", "a running claim wins over an open owned issue");
+  assert(profileWork(claimed("blocked"), owned)?.state === "blocked", "a blocked claim reads blocked");
+  assert(profileWork(claimed("queued"), owned)?.state === "waiting", "a queued claim reads waiting");
+  assert(profileWork(claimed("result"), owned)?.id === "DEMO-2", "an ended claim does not outrank open owned work");
+  const ended = profileWork(claimed("failed"), []);
+  assert(ended?.id === "DEMO-9" && ended.state === "last" && ended.title === undefined, "an ended claim outside the list is the last work, by id alone");
+  for (const bad of [{ state: "running" }, { issue_id: 7, state: "running" }, { issue_id: "", state: "running" }, "x", 7, [], {}, { issue_id: "DEMO-9", state: "paused" }, { issue_id: "DEMO-9", state: "constructor" }]) {
+    const malformed = { ...profile, latest_claim: bad } as unknown as typeof profile;
+    assert(profileWork(malformed, []) === null, `a malformed or unknown claim names no work: ${JSON.stringify(bad)}`);
+    assert(profileWork(malformed, owned)?.state === "open", `owned work still shows beside a bad claim: ${JSON.stringify(bad)}`);
+    assert(profileMatchesFilter(malformed, "idle"), `a bad claim doesn't move the filter: ${JSON.stringify(bad)}`);
+  }
+  const inFilter = (state: string, filter: Parameters<typeof profileMatchesFilter>[1]) => profileMatchesFilter(claimed(state), filter);
+  assert(inFilter("running", "working") && !inFilter("running", "idle"), "a running claim files under Working, not Idle");
+  assert(inFilter("blocked", "attention") && !inFilter("blocked", "idle"), "a blocked claim files under Needs attention");
+  assert(!inFilter("queued", "idle") && inFilter("queued", "current"), "a waiting claim is not idle and stays in Current");
+  assert(inFilter("result", "idle") && !inFilter("result", "working"), "an ended claim reads idle");
+  assert(profileMatchesSearch(claimed("running", "DEMO-9"), "demo-9"), "search finds the claimed issue id printed on the card");
+  assert(profileWork(claimed("running", "DEMO-2"), owned)?.title === "Owned", "a claim takes its title from the issue list");
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [profile] });
   await render();
   const seat = () => Array.from(host.querySelectorAll(".rc-seat")).find((row) => row.textContent?.includes("Developer"))!;
   assert(seat().textContent?.includes("Idle · no runtime"), "a profile with no owned work reads Idle");
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [{ ...profile, latest_claim: { issue_id: "DEMO-9", state: "running" } }] });
+  await render();
+  assert(seat().textContent?.includes("Working on DEMO-9"), "a running claim reads on the card");
+  const sideProfile = Array.from(host.querySelectorAll(".ag-side-row")).find((row) => row.textContent?.includes("Developer"));
+  assert(sideProfile?.textContent?.includes("Working on DEMO-9"), "the sidebar reads a live claim as the card does");
+  assert(
+    sideProfile?.parentElement?.querySelector(".ag-side-group")?.textContent?.startsWith("Working"),
+    "a working profile sits under Working, not Not running",
+  );
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [profile] });
+  await render();
   assert(!host.querySelector(".rc-seats .rc-connect") && !host.querySelector(".rc-seats")?.textContent?.includes("cadence "), "the card prints no commands");
   await click("Open agent Developer");
   await render();
   assert(open === "Developer", "a profile opens on the same agent route as any agent");
   assert(!host.querySelector("dialog.rc-sheet"), "the drawer is gone");
   const gate = host.querySelector(".ag-chat-gate");
-  assert(gate?.textContent?.includes("isn’t running"), "the page says why nothing can answer");
+  assert(gate?.textContent?.includes("can’t reply here yet"), "the page says why nothing can answer");
   assert(gate?.textContent?.includes("cadence agent context ap_1"), "the reason sits with the connect commands");
   assert(!host.querySelector("[data-composer]"), "no composer pretends to send");
   assert(!reads.includes("/api/agents/Developer"), "a profile is not read as a registered agent");

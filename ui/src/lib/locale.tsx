@@ -9,7 +9,7 @@ type Scope = "user" | "organization";
 type Preferences = { organization_locale: Locale | null; user_locale: Locale | null };
 
 const zhTW: Record<string, string> = {
-  "Conversation with {alias}": "與 {alias} 的對話", "Back to Agents": "返回代理", "{alias} details": "{alias} 詳情", "Close details": "關閉詳情", "No messages with {alias} yet.": "尚未與 {alias} 對話。", "Recruit an agent": "招募代理", "No agents match “{query}”.": "沒有符合「{query}」的代理。", "Clear search": "清除搜尋", "Not running": "未執行", "Stopped and mailboxes": "已停止與收件匣", "No current agents. Search to find stopped agents and mailboxes.": "目前沒有代理。搜尋即可找到已停止的代理與收件匣。", "Some details aren’t available on this board.": "此看板無法提供部分詳情。", "{alias} isn’t running, so it can’t reply yet": "{alias} 尚未執行，暫時無法回覆", "Connect a runtime to talk to it here.": "連接執行環境後即可在此對話。", "This is a mailbox, not an agent": "這是收件匣，不是代理", "Mail waits here until an agent reads it.": "郵件會在此等候代理讀取。", "No agent named {alias}": "沒有名為 {alias} 的代理", "It may have been removed. Pick another agent from the list.": "它可能已被移除。請從清單選擇其他代理。", "Manage profile": "管理資料",
+  "Conversation with {alias}": "與 {alias} 的對話", "Back to Agents": "返回代理", "{alias} details": "{alias} 詳情", "Close details": "關閉詳情", "No messages with {alias} yet.": "尚未與 {alias} 對話。", "Recruit an agent": "招募代理", "No agents match “{query}”.": "沒有符合「{query}」的代理。", "Clear search": "清除搜尋", "Not running": "未執行", "Stopped and mailboxes": "已停止與收件匣", "No current agents. Search to find stopped agents and mailboxes.": "目前沒有代理。搜尋即可找到已停止的代理與收件匣。", "Some details aren’t available on this board.": "此看板無法提供部分詳情。", "{alias} can’t reply here yet": "{alias} 暫時無法在此回覆", "It has no runtime connected to this board. Connect one to talk to it here.": "此看板尚未連接它的執行環境。連接後即可在此對話。", "This is a mailbox, not an agent": "這是收件匣，不是代理", "Mail waits here until an agent reads it.": "郵件會在此等候代理讀取。", "No agent named {alias}": "沒有名為 {alias} 的代理", "It may have been removed. Pick another agent from the list.": "它可能已被移除。請從清單選擇其他代理。", "Manage profile": "管理資料",
   "Collapse sidebar": "收合側邊欄", "Expand sidebar": "展開側邊欄", "Close navigation": "關閉導覽",
   "Type an issue ID, title word, owner or tag. Issue search covers card fields only, not descriptions or comments.": "輸入議題編號、標題字詞、負責人或標籤。議題搜尋僅涵蓋卡片欄位，不包括描述或留言。",
   "Search issues…": "搜尋議題…", "Search issues by ID, title, owner or tag…": "依編號、標題、負責人或標籤搜尋議題…",
@@ -184,7 +184,7 @@ function browserLocale(): Locale {
 Object.assign(zhTW, {
   "Add {name}": "新增 {name}", "Adding…": "正在新增…", "Added {name}.": "已新增 {name}。",
   "{name} was added as {role}": "{name} 已新增為{role}", "Idle · no runtime": "閒置 · 尚無執行環境",
-  "Last: {issue}": "上次：{issue}", "Latest work": "最近工作", "Job": "職責", "Connect a runtime": "連接執行環境", "Read the profile:": "讀取設定檔：",
+  "Last: {issue}": "上次：{issue}", "Working on {issue}": "正在處理 {issue}", "Blocked on {issue}": "受阻於 {issue}", "Waiting on {issue}": "等待 {issue}", "Latest work": "最近工作", "Job": "職責", "Connect a runtime": "連接執行環境", "Read the profile:": "讀取設定檔：",
   "Start a session on an issue under this profile:": "在此設定檔下對議題開始工作階段：",
   "Register a runtime against it (provider: {providers}):": "將執行環境註冊至此設定檔（供應商：{providers}）：",
   "A runtime joins a group. Create one first:": "執行環境須加入群組，請先建立一個：",

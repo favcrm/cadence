@@ -308,7 +308,10 @@ Do not substitute a comment or another identity for the required proof.
 - The operator records a `human` approval from an operator connection (not
   an agent pane or endpoint): `cadence audit approve --pr <n> --head
   <full-sha> --source "<who decided, where>"`. A note or ticket comment is
-  not approval evidence (`docs/AUDIT.md`).
+  not approval evidence (`docs/AUDIT.md`). On a hosted org that form is
+  refused; the hosted form names the project and ticket: `cadence audit
+  approve --project <key> --issue <ID> --pr <n> --head <full-sha> --source
+  "<who>"` (see `docs/AUDIT.md`, CAD-2001).
 - Approve once per ticket: the operator may run `cadence audit approve
   --issue <ID> --action scope` once, and `scripts/enqueue-reviewed` then
   accepts it for every in-scope PR of that ticket. Traps: the ticket body
@@ -346,6 +349,15 @@ limitation; only an authorized operator can decide an exception.
   favcrm/cadence --disable-auto`; re-enable it, pinned to the new head, only
   after that head passes review.
 - `--admin` only in a declared emergency, never as routine.
+- Temporary path (CAD-1946, remove this note when it ends): while the hosted
+  reviewer attestation cannot be produced, `scripts/enqueue-reviewed <pr>
+  --head <sha> --exception --advisory standards=<url> --advisory
+  spec-security=<url>` (plus `--advisory browser-qa=<url>` for a `ui/` change)
+  waives only the missing reviewer attestation and, on a hosted routine PR, the
+  readiness proof hosted cannot yet produce; the evidence names both. The advisory reviews are PR
+  comments posted by separately assigned sessions, and the operator approves
+  each exact head. The path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`
+  (2026-11-10).
 
 ### Checks: trust exit codes, not filtered text
 
@@ -370,7 +382,8 @@ limitation; only an authorized operator can decide an exception.
   back to a local build. `CADENCE_PRE_PUSH_LOCAL=1` is the explicit
   emergency path and runs the same plan on this host. `scripts/pre-push
   --tests` is a focused diagnostic, not a prerequisite before review;
-  required CI and the merge-group regression floor are unchanged. Review
+  required CI (fmt, clippy, build, ui, delivery-gate required; cross-build runs but is not yet required) is unchanged, and the
+  suite runs in `tests.yml` on a schedule and on demand (CAD-1970). Review
   and operator approval stay authoritative. Neither a remote run nor a
   green suite proves the ticket's outcome. The split
   manifests are retired; do not run `split-map-sync` until a reviewed

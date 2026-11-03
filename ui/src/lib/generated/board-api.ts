@@ -42,6 +42,9 @@ export interface AgentProfile {
   id: string;
   /** The operator's to read: absent from the board's shared payload. */
   job?: string | null;
+  /** The newest claim under this profile (CAD-1990). Hosted boards only, and
+   * absent when it never claimed or the board could not read it. */
+  latest_claim?: ProfileClaim | null;
   look?: string | null;
   /** `inherit` or a model id. */
   model: string;
@@ -556,6 +559,12 @@ export interface PersonalAssistantIdentity {
   name?: string | null;
   revision: number;
   tone?: string | null;
+}
+
+/** A profile's newest claim: the issue and the claim's own state. */
+export interface ProfileClaim {
+  issue_id: string;
+  state: string;
 }
 
 /** Work-item counts by status bucket. */

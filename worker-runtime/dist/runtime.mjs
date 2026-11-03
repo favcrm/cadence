@@ -14971,10 +14971,7 @@ __export(exports_x509_transport_state_browser, {
 // src/hosted-session.ts
 init_models();
 import { DurableObject } from "cloudflare:workers";
-// node_modules/@earendil-works/pi-durable/dist/harness/define.js
-function hook(task, handlers) {
-  return { task: task.definition.name, handlers };
-}
+
 // node_modules/@earendil-works/chord/dist/context/index.js
 init_dist();
 var ABORT_SIGNAL_CONTEXT_KEY = Object.freeze({
@@ -15064,7 +15061,10 @@ function abortError(signal) {
   const reason = signal.reason;
   return reason instanceof Error ? reason : new DOMException("The operation was aborted", "AbortError");
 }
-
+// node_modules/@earendil-works/pi-durable/dist/harness/define.js
+function hook(task, handlers) {
+  return { task: task.definition.name, handlers };
+}
 // node_modules/@earendil-works/pi-durable/dist/errors.js
 function errorMessage(error) {
   if (error instanceof Error)
@@ -56077,7 +56077,7 @@ function masterState(model, status, conversationId, metadata) {
       streaming: status.running,
       compacting: false
     },
-    commands: ["stop"],
+    commands: ["new", "stop"],
     turn: status.running ? {
       state: "working",
       message: status.message ?? null,
@@ -56700,11 +56700,39 @@ function projectedThreadEntries(records, includeThinking, project) {
   const entries = threadEntries(records, includeThinking);
   return project ? [...project(entries)] : entries;
 }
+var RESET_KIND = "pi.reset";
+var COMPACTION_KIND = "pi.compaction";
+var RESET_BOUNDARY = { role: "user", content: "", timestamp: 0 };
+var FRESH_START_TEXT = "Started fresh. The assistant no longer uses the messages above.";
+var HISTORY_PAGE = 500;
+async function readAllRecords(scan) {
+  const records = [];
+  let cursor;
+  do {
+    const page = await scan(cursor, HISTORY_PAGE);
+    records.push(...page.items);
+    cursor = page.next;
+  } while (cursor !== undefined);
+  return records;
+}
 function threadEntries(records, includeThinking) {
   const entries = [];
-  const all = records.flatMap((record) => record.model ?? []);
+  const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
+  const all = visible.flatMap((record) => record.kind === RESET_KIND ? [RESET_BOUNDARY, ...record.model ?? []] : record.model ?? []);
   let position = -1;
-  for (const record of records) {
+  for (const record of visible) {
+    if (record.kind === RESET_KIND) {
+      position += 1;
+      const previous = entries.at(-1);
+      if (previous !== undefined && !(previous.role === "system" && previous.text === FRESH_START_TEXT)) {
+        entries.push({
+          seq: entries.length + 1,
+          role: "system",
+          kind: "message",
+          text: FRESH_START_TEXT
+        });
+      }
+    }
     const data = record.data;
     const messageId = record.kind === BOARD_MESSAGE_KIND && data !== null && typeof data === "object" && !Array.isArray(data) && typeof data.messageId === "string" ? data.messageId : undefined;
     for (const message of record.model ?? []) {
@@ -56868,7 +56896,7 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
       const stream = await this.harness.session().events();
       let snapshotEntries;
       try {
-        snapshotEntries = projectedThreadEntries(stream.snapshot.entries, thinking, this.options.projectThread);
+        snapshotEntries = await this.transcript(thinking);
       } catch {
         await stream.stop();
         return Response.json({
@@ -56925,7 +56953,8 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
     };
   }
   async transcript(includeThinking) {
-    return projectedThreadEntries(await this.harness.session().messages(), includeThinking, this.options.projectThread);
+    const conversation = await this.harness.conversation(this.harness.session().id);
+    return projectedThreadEntries(await readAllRecords((cursor, limit) => conversation.entries({ order: "ascending" }, limit, cursor, BACKGROUND_CONTEXT)), includeThinking, this.options.projectThread);
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;

@@ -481,7 +481,7 @@ install. Ask which they need:
 
 Never ask for a password, one-time code, cookie, device code or token in chat,
 and never copy another person's credential or browser cookie. A workspace
-invitation, credential consent and local-agent registration are three separate
+invitation, credential consent and `agent connect` registration are three separate
 actions; completing one does not perform the others. Do not offer `cadence
 setup` to a hosted user who only needs the board.
 

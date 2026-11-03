@@ -15,7 +15,7 @@ import { ROLES } from "../settings/ModelDefaults";
 import RecruitChat from "./RecruitChat";
 import AgentPage from "./AgentPage";
 import HireSheet from "./HireSheet";
-import ProfileSeat, { ConnectRuntime } from "./ProfileSeat";
+import ProfileSeat, { ConnectRuntime, workText } from "./ProfileSeat";
 import AgentSidebar from "./AgentSidebar";
 import NewAgentDialog from "./NewAgentDialog";
 import Recruit from "./Recruit";
@@ -153,11 +153,16 @@ export default function Agents({
     />
   );
 
+  const openHired = profiles.find((p) => p.alias === open);
   const shell = (content: ReactNode) => (
     <div className="ag-shell">
       <AgentSidebar
         agents={sidebarAgents}
         profiles={sidebarProfiles}
+        profileStatus={(p) => {
+          const work = profileWork(p, issueCards);
+          return work ? workText(work, t) : t("Idle · no runtime");
+        }}
         open={open}
         query={query}
         onQuery={setQuery}
@@ -184,6 +189,7 @@ export default function Agents({
         hosted={hosted}
         groups={groups}
         rosterLoaded={payload != null}
+        hiredWork={openHired ? profileWork(openHired, issueCards) : null}
       />
     );
   }
