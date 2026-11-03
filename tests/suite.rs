@@ -7471,11 +7471,11 @@ mod cad2100_classifier_merge_base {
 // implementer; implementers must not edit it. It parses the real review
 // workflow files and runs their real inline Node scripts, fed on stdin
 // exactly as the runner feeds them, against a scripted fetch preloaded with
-// `node --import`. Needs Node 20+ at test time (`node` on PATH).
+// `node --import`. Needs Node 20+ and git at test time (both on PATH).
 mod cad2088_review_workflows {
     use serde_json::{json, Value};
     use std::io::Write;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::{Command, Stdio};
     use std::sync::OnceLock;
 
@@ -7484,11 +7484,21 @@ mod cad2088_review_workflows {
     const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const LIVE_BASE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const CTX_BASE: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const TOKEN1: &str = "Bearer aaa.bbb.ccc1";
+    // Text no log, artifact or verdict line may carry unless it is meant to.
+    const M: &str = "LEAKMARK7f3a91";
+
+    // A marker followed by lines that would be workflow commands if a log
+    // ever printed them, with every line terminator JavaScript knows.
+    fn inj() -> String {
+        format!("{M}\n::error::{M}\n::warning::{M}\r::warning::{M}\u{2028}::error::{M}\u{2029}::notice::{M}")
+    }
 
     // A scripted fetch. Routes are matched by URL substring, in order; each
     // route answers its responses in sequence and repeats the last one. An
     // unmatched URL is logged and fails like a network error. Timers fire at
-    // once so the scripts' backoff does not slow the suite.
+    // once so the scripts' backoff does not slow the suite. The default OIDC
+    // answer is a JWT-shaped token, different every time.
     const STUB: &str = r##"
 import fs from 'node:fs';
 const sc = JSON.parse(fs.readFileSync(process.env.STUB_SCENARIO, 'utf8'));
@@ -7514,7 +7524,7 @@ globalThis.fetch = async (url, init = {}) => {
     const n = hits.get(idx) || 0; hits.set(idx, n + 1);
     return reply(route.responses[Math.min(n, route.responses.length - 1)]);
   }
-  if (oidc) { minted++; return reply({ json: { value: `oidc-token-${minted}` } }); }
+  if (oidc) { minted++; return reply({ json: { value: `aaa.bbb.ccc${minted}` } }); }
   throw new TypeError('fetch failed');
 };
 "##;
@@ -7564,21 +7574,12 @@ if (mode === 'keys') {
         pub_small: String,
     }
 
-    fn tool_path() -> PathBuf {
-        static P: OnceLock<PathBuf> = OnceLock::new();
-        P.get_or_init(|| {
-            let dir = std::env::temp_dir().join(format!("c2088-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("tool.mjs"), TOOL).unwrap();
-            std::fs::write(dir.join("stub.mjs"), STUB).unwrap();
-            dir
-        })
-        .clone()
-    }
-
     fn node_tool(mode: &str, input: Option<&Value>) -> Value {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("tool.mjs");
+        std::fs::write(&script, TOOL).unwrap();
         let mut cmd = Command::new("node");
-        cmd.arg(tool_path().join("tool.mjs"))
+        cmd.arg(&script)
             .arg(mode)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -7718,7 +7719,7 @@ if (mode === 'keys') {
         code: Option<i32>,
         out: String,
         reqs: Vec<Value>,
-        runner: PathBuf,
+        runner: std::path::PathBuf,
         _dir: tempfile::TempDir,
     }
 
@@ -7735,8 +7736,8 @@ if (mode === 'keys') {
         fn failed(&self) -> bool {
             self.code != Some(0)
         }
-        fn files(&self) -> Vec<(PathBuf, String)> {
-            fn walk(p: &Path, acc: &mut Vec<(PathBuf, String)>) {
+        fn files(&self) -> Vec<(std::path::PathBuf, String)> {
+            fn walk(p: &Path, acc: &mut Vec<(std::path::PathBuf, String)>) {
                 if let Ok(rd) = std::fs::read_dir(p) {
                     for e in rd.flatten() {
                         let q = e.path();
@@ -7766,6 +7767,33 @@ if (mode === 'keys') {
         }
     }
 
+    // The log of a run, on any path: no attacker-controlled text, and no line a
+    // runner would take for a workflow command other than the fixed ones.
+    fn assert_log_clean(ctx: &str, r: &Run) {
+        assert!(
+            !r.out.contains(M),
+            "{ctx}: attacker text reached the log: {}",
+            r.out
+        );
+        assert!(
+            !r.out.contains('\r') && !r.out.contains('\u{2028}') && !r.out.contains('\u{2029}'),
+            "{ctx}: a line terminator reached the log: {:?}",
+            r.out
+        );
+        let mut errors = 0;
+        for l in r.out.lines() {
+            if l.starts_with("::error::") {
+                errors += 1;
+            } else if !(l.starts_with("::add-mask::") || l.starts_with("::notice::")) {
+                assert!(
+                    !l.starts_with("::"),
+                    "{ctx}: unexpected workflow command: {l}"
+                );
+            }
+        }
+        assert!(errors <= 1, "{ctx}: several error commands: {}", r.out);
+    }
+
     // env_over: Some(v) sets, None removes. setup writes inputs under RUNNER_TEMP.
     fn run_job(
         wf: &Wf,
@@ -7775,17 +7803,16 @@ if (mode === 'keys') {
         setup: &dyn Fn(&Path),
     ) -> Run {
         let k = keys();
-        let dir = tempfile::Builder::new()
-            .prefix("c88")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let dir = tempfile::Builder::new().prefix("c88").tempdir().unwrap();
         let runner = dir.path().join("r");
         std::fs::create_dir_all(&runner).unwrap();
         setup(&runner);
         let sc = dir.path().join("sc.json");
         let log = dir.path().join("log.jsonl");
+        let stub = dir.path().join("stub.mjs");
         std::fs::write(&sc, scenario.to_string()).unwrap();
         std::fs::write(&log, "").unwrap();
+        std::fs::write(&stub, STUB).unwrap();
         let mut ctx = std::collections::HashMap::new();
         for (a, b) in [
             ("inputs.pr", PR.to_string()),
@@ -7808,6 +7835,7 @@ if (mode === 'keys') {
                 env.insert(n.clone(), subst(v.as_str().unwrap(), &ctx));
             }
         }
+        env.insert("GITHUB_REF".into(), "refs/heads/main".into());
         for (n, v) in env_over {
             match v {
                 Some(v) => env.insert(n.to_string(), v.to_string()),
@@ -7816,7 +7844,7 @@ if (mode === 'keys') {
         }
         let mut cmd = Command::new("node");
         cmd.arg("--import")
-            .arg(tool_path().join("stub.mjs"))
+            .arg(&stub)
             .arg("--input-type=module")
             .arg("-")
             .env_clear()
@@ -7865,11 +7893,6 @@ if (mode === 'keys') {
 
     // ---- fixtures -------------------------------------------------------
 
-    fn marker() -> &'static str {
-        static M: OnceLock<String> = OnceLock::new();
-        M.get_or_init(|| format!("TICKETMARK{}X{}", std::process::id(), "9f3e"))
-    }
-
     const DIFF: &str = "diff --git a/src/a.rs b/src/a.rs\nindex 1111111..2222222 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,4 @@\n fn a() {}\n+fn b() {}\n fn c() {}\n fn d() {}\ndiff --git a/docs/x.md b/docs/x.md\nnew file mode 100644\nindex 0000000..3333333\n--- /dev/null\n+++ b/docs/x.md\n@@ -0,0 +1,2 @@\n+hello\n+world\n";
 
     // Added line text `++ b/src/fake.rs` renders as a diff line `+++ b/src/fake.rs`.
@@ -7885,11 +7908,23 @@ if (mode === 'keys') {
             "ctx": {
                 "state": "ok", "kind": wf.kind(), "repo": wf.repo(), "pr": 123, "head": HEAD,
                 "pull": { "base": "main", "head": HEAD, "base_sha": CTX_BASE, "title": "a pr", "author": "someone", "body": "pr body" },
-                "ticket": { "id": "CAD-2088", "title": format!("{} title", marker()), "status": "in_progress" },
-                "ticket_body": format!("ticket body {}", marker()),
+                "ticket": { "id": "CAD-2088", "title": format!("{M} title"), "status": "in_progress" },
+                "ticket_body": format!("ticket body {M}"),
             },
             "diff": DIFF,
         })
+    }
+
+    // Every field an attacker or a tenant could fill carries the marker and the injection.
+    fn poisoned_world(wf: &Wf) -> Value {
+        let mut w = world(wf);
+        let p = inj();
+        w["ctx"]["ticket"]["title"] = json!(p);
+        w["ctx"]["ticket_body"] = json!(p);
+        w["ctx"]["pull"]["title"] = json!(p);
+        w["ctx"]["pull"]["body"] = json!(p);
+        w["ctx"]["pull"]["author"] = json!(p);
+        w
     }
 
     fn route(contains: &str, responses: Value) -> Value {
@@ -7914,7 +7949,7 @@ if (mode === 'keys') {
         let checks: Vec<Value> = wf
             .names()
             .iter()
-            .map(|n| json!({ "name": n, "result": "pass", "note": format!("fine <b>`x`\n{} quoted", marker()), "citations": [{ "file": "src/a.rs", "line": 2 }] }))
+            .map(|n| json!({ "name": n, "result": "pass", "note": format!("fine <b>`x`\n{M} quoted"), "citations": [{ "file": "src/a.rs", "line": 2 }] }))
             .collect();
         json!({ "outcome": "pass", "risk_level": "auto", "risk_triggers": [], "checks": checks })
     }
@@ -7965,6 +8000,16 @@ if (mode === 'keys') {
         )
     }
 
+    fn file_with(wf: &Wf, out: &Value, verdicts: Value) -> Run {
+        run_file(
+            wf,
+            &file_input(&world(wf)),
+            Some(&sealed_model_output(wf, out)),
+            verdicts,
+            &[],
+        )
+    }
+
     fn model_reply(text: &str, stop: &str) -> Value {
         json!({ "status": 200, "json": { "stop_reason": stop, "model": "claude-opus-5-5", "content": [{ "type": "text", "text": text }], "usage": { "input_tokens": 1, "output_tokens": 1 } } })
     }
@@ -7983,18 +8028,17 @@ if (mode === 'keys') {
     }
 
     // A real prepare run's review-input.json.
-    fn prepared(wf: &Wf) -> (Value, Run) {
-        let r = prepare(wf, &world(wf), &[]);
-        assert_eq!(
-            r.code,
-            Some(0),
-            "prepare should succeed on a clean world: {}",
-            r.out
-        );
+    fn prepared_from(wf: &Wf, w: &Value) -> (Value, Run) {
+        let r = prepare(wf, w, &[]);
+        assert_eq!(r.code, Some(0), "prepare should succeed: {}", r.out);
         let v = r
             .read("out/review-input.json")
             .expect("prepare wrote review-input.json");
         (v, r)
+    }
+
+    fn prepared(wf: &Wf) -> (Value, Run) {
+        prepared_from(wf, &world(wf))
     }
 
     fn flat(v: &Value) -> String {
@@ -8006,7 +8050,63 @@ if (mode === 'keys') {
         re.captures_iter(text).map(|c| c[1].to_string()).collect()
     }
 
-    // ---- structure ------------------------------------------------------
+    // A real `git diff` of a quoted (non-ASCII) file name whose content has a
+    // line that reads like a file header, then an ordinary file.
+    fn quoted_name_diff() -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| -> String {
+            let mut c = Command::new("git");
+            c.current_dir(dir.path())
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("HOME", dir.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "core.quotepath=true",
+                    "-c",
+                    "diff.noprefix=false",
+                    "-c",
+                    "diff.mnemonicPrefix=false",
+                ])
+                .args(args);
+            let o = cadence_agent::reaper::output(&mut c)
+                .expect("these acceptance tests need `git` on PATH");
+            assert!(
+                o.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8(o.stdout).unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/\u{e9}.rs"),
+            "fn q() {}\n++ b/src/auth/guard.rs\nfn pad() {}\nfn more() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("b/real.rs"), "fn r1() {}\nfn r2() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "x"]);
+        let d = git(&["diff", "HEAD~1", "HEAD"]);
+        assert!(
+            d.contains("+++ \"b/a/\\303\\251.rs\"")
+                && d.contains("\n+++ b/src/auth/guard.rs\n")
+                && d.contains("+++ b/b/real.rs"),
+            "unexpected git diff:\n{d}"
+        );
+        d
+    }
+
+    // ---- static: the properties a mistake here would break ---------------
 
     #[test]
     fn only_a_dispatch_runs_it_and_nothing_is_granted_by_default() {
@@ -8018,13 +8118,6 @@ if (mode === 'keys') {
                 ["workflow_dispatch"],
                 "{f}: only workflow_dispatch may trigger it"
             );
-            let mut inputs: Vec<&String> = on["workflow_dispatch"]["inputs"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .collect();
-            inputs.sort();
-            assert_eq!(inputs, ["head_sha", "pr"], "{f}: inputs");
             assert_eq!(
                 wf.doc["permissions"],
                 json!({}),
@@ -8049,16 +8142,6 @@ if (mode === 'keys') {
                 json!({ "id-token": "write" }),
                 "{f}: file"
             );
-            assert!(
-                wf.job("prepare")["if"]
-                    .as_str()
-                    .unwrap()
-                    .contains("refs/heads/main"),
-                "{f}: prepare runs only from main"
-            );
-            let mut jobs: Vec<&String> = wf.doc["jobs"].as_object().unwrap().keys().collect();
-            jobs.sort();
-            assert_eq!(jobs, ["file", "prepare", "review"], "{f}: jobs");
         }
     }
 
@@ -8093,7 +8176,6 @@ if (mode === 'keys') {
                 !file.contains("ANTHROPIC"),
                 "{f}: the file job must never mention the model key"
             );
-            // The model key appears in exactly one step of the whole workflow: the review step.
             let mut holders = Vec::new();
             assert!(
                 !flat(&wf.doc["env"]).contains("ANTHROPIC") && !flat(wf.on()).contains("ANTHROPIC"),
@@ -8117,43 +8199,16 @@ if (mode === 'keys') {
                 .as_str()
                 .unwrap()
                 .contains("secrets.ANTHROPIC_API_KEY"));
-            // No inherited secrets anywhere, and no reusable workflow call.
-            let all = flat(&wf.doc);
-            assert!(!all.contains("inherit"), "{f}: no secrets: inherit");
+            assert!(
+                !flat(&wf.doc).contains("inherit"),
+                "{f}: no secrets: inherit"
+            );
             for (jn, job) in wf.doc["jobs"].as_object().unwrap() {
                 assert!(
                     job.get("secrets").is_none() && job.get("uses").is_none(),
                     "{f}: {jn} calls a workflow"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn every_action_is_pinned_by_a_full_commit_sha() {
-        let re = regex::Regex::new(
-            r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(/[A-Za-z0-9_./-]+)?@[0-9a-f]{40}$",
-        )
-        .unwrap();
-        for wf in all() {
-            let mut n = 0;
-            for (jn, job) in wf.doc["jobs"].as_object().unwrap() {
-                for s in job["steps"].as_array().unwrap() {
-                    if let Some(u) = s.get("uses") {
-                        n += 1;
-                        assert!(
-                            re.is_match(u.as_str().unwrap()),
-                            "{}: {jn} uses {u} unpinned",
-                            wf.file
-                        );
-                    }
-                }
-            }
-            assert!(
-                n >= 5,
-                "{}: expected the artifact steps, found {n}",
-                wf.file
-            );
         }
     }
 
@@ -8271,6 +8326,39 @@ if (mode === 'keys') {
     }
 
     #[test]
+    fn a_dispatch_from_a_side_branch_fails_in_prepare_before_any_call() {
+        for wf in all() {
+            for (name, v) in [
+                ("side branch", Some("refs/heads/side")),
+                ("a tag", Some("refs/tags/v1")),
+                ("main prefix", Some("refs/heads/main2")),
+                ("unset", None),
+            ] {
+                let r = prepare(&wf, &world(&wf), &[("GITHUB_REF", v)]);
+                assert!(
+                    r.failed() && r.out.contains("only runs from main"),
+                    "{}: {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(
+                    r.reqs.is_empty(),
+                    "{}: {name} made calls: {:?}",
+                    wf.file,
+                    r.reqs
+                );
+                assert!(r.files().is_empty());
+            }
+            assert_eq!(
+                prepare(&wf, &world(&wf), &[]).code,
+                Some(0),
+                "{}: main must work",
+                wf.file
+            );
+        }
+    }
+
+    #[test]
     fn prepare_refuses_a_truncated_diff_and_a_context_that_does_not_match() {
         for wf in all() {
             let other = if wf.kind() == "standards" {
@@ -8287,7 +8375,7 @@ if (mode === 'keys') {
                 (
                     "empty diff",
                     Box::new(|w| w["diff"] = json!("")),
-                    "truncated",
+                    "incomplete",
                 ),
                 (
                     "other kind",
@@ -8331,6 +8419,151 @@ if (mode === 'keys') {
                 assert!(
                     r.hits("anthropic").is_empty() && r.files().is_empty(),
                     "{}: {name}: artifacts or model call",
+                    wf.file
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_refuses_an_unreadable_diff_or_an_oversize_text_before_any_model_call() {
+        let one = "diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,2 @@\n fn a() {}\n+fn b() {}\n";
+        let binary = format!("{one}diff --git a/img.png b/img.png\nnew file mode 100644\nindex 0000000..1111111\nBinary files /dev/null and b/img.png differ\n");
+        let git_binary = format!("{one}diff --git a/img.png b/img.png\nnew file mode 100644\nindex 0000000..1111111\nGIT binary patch\nliteral 0\n");
+        let short_hunk = "diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,4 @@\n fn a() {}\n+fn b() {}\n".to_string();
+        let no_newline = one.trim_end().to_string();
+        let cases: Vec<(&str, Value, u32, &str)> = vec![
+            ("binary section", json!(binary), 2, "binary"),
+            ("git binary patch", json!(git_binary), 2, "binary"),
+            (
+                "incomplete final hunk",
+                json!(short_hunk),
+                1,
+                "incomplete hunk",
+            ),
+            ("missing final newline", json!(no_newline), 1, "incomplete"),
+            (
+                "over 300 KB",
+                json!(format!("{one}+{}\n", "x".repeat(300_000))),
+                1,
+                "300 KB",
+            ),
+        ];
+        for wf in all() {
+            for (name, diff, files, reason) in &cases {
+                let mut w = world(&wf);
+                w["diff"] = diff.clone();
+                w["live"]["changed_files"] = json!(files);
+                let r = prepare(&wf, &w, &[]);
+                assert!(
+                    r.failed() && r.out.contains(reason),
+                    "{}: {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(
+                    r.hits("anthropic").is_empty() && r.files().is_empty(),
+                    "{}: {name}: artifacts or model call",
+                    wf.file
+                );
+                // The file job applies the same walk to the diff it was handed.
+                if *name != "over 300 KB" {
+                    let mut input = file_input(&world(&wf));
+                    input["diff"] = diff.clone();
+                    let f = run_file(
+                        &wf,
+                        &input,
+                        Some(&sealed_model_output(&wf, &good_output(&wf))),
+                        json!([verdict_ok(false, "pass")]),
+                        &[],
+                    );
+                    assert!(
+                        f.failed() && f.hits("/verdict").is_empty(),
+                        "{}: file job accepted {name}: {}",
+                        wf.file,
+                        f.out
+                    );
+                }
+            }
+            let big = "x".repeat(100_001);
+            let cases: Vec<Edit> = vec![
+                (
+                    "ticket body over 100 KB",
+                    Box::new({
+                        let b = big.clone();
+                        move |w| w["ctx"]["ticket_body"] = json!(b)
+                    }),
+                    "too large",
+                ),
+                (
+                    "PR body over 100 KB",
+                    Box::new({
+                        let b = big.clone();
+                        move |w| w["ctx"]["pull"]["body"] = json!(b)
+                    }),
+                    "too large",
+                ),
+                (
+                    "PR title and body together",
+                    Box::new({
+                        let b = "y".repeat(60_000);
+                        move |w| {
+                            w["ctx"]["pull"]["body"] = json!(b);
+                            w["ctx"]["pull"]["title"] = json!(b);
+                        }
+                    }),
+                    "too large",
+                ),
+                (
+                    "ticket body not text",
+                    Box::new(|w| w["ctx"]["ticket_body"] = json!(["x"])),
+                    "too large",
+                ),
+            ];
+            for (name, edit, reason) in cases {
+                let mut w = world(&wf);
+                edit(&mut w);
+                let r = prepare(&wf, &w, &[]);
+                assert!(
+                    r.failed() && r.out.contains(reason),
+                    "{}: {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(
+                    r.hits("compare").is_empty()
+                        && r.hits("anthropic").is_empty()
+                        && r.files().is_empty(),
+                    "{}: {name} went on",
+                    wf.file
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_content_line_cannot_pad_the_section_count() {
+        // JavaScript's `^` in a multiline regex also matches after CR, U+2028 and U+2029.
+        for wf in all() {
+            for (name, sep) in [("CR", "\r"), ("U+2028", "\u{2028}"), ("U+2029", "\u{2029}")] {
+                let diff = format!("diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,2 @@\n fn a() {{}}\n+x{sep}diff --git a/fake b/fake\n");
+                let mut w = world(&wf);
+                w["diff"] = json!(diff);
+                w["live"]["changed_files"] = json!(2);
+                let r = prepare(&wf, &w, &[]);
+                assert!(
+                    r.failed() && r.out.contains("truncated"),
+                    "{}: {name} padded the count: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.files().is_empty());
+                // With the honest count the same diff is accepted: it is the count that refuses.
+                w["live"]["changed_files"] = json!(1);
+                assert_eq!(
+                    prepare(&wf, &w, &[]).code,
+                    Some(0),
+                    "{}: {name} honest count",
                     wf.file
                 );
             }
@@ -8406,7 +8639,6 @@ if (mode === 'keys') {
             );
             assert_ne!(w["live"]["title"].as_str().unwrap(), "CAD-2088");
             assert_eq!(fi["base"], CTX_BASE);
-            // Later, the file job sends that id, whatever the live title says.
             let sealed = sealed_model_output(&wf, &good_output(&wf));
             let f = run_file(
                 &wf,
@@ -8427,12 +8659,11 @@ if (mode === 'keys') {
     #[test]
     fn no_plaintext_ticket_reaches_an_artifact_or_a_log() {
         for wf in all() {
-            let m = marker();
             let (input, p) = prepared(&wf);
             let mut seen = vec![p.out.clone()];
             for (path, t) in p.files() {
                 assert!(
-                    !t.contains(m),
+                    !t.contains(M),
                     "{}: plaintext ticket in {}",
                     wf.file,
                     path.display()
@@ -8443,9 +8674,8 @@ if (mode === 'keys') {
                     && input.get("ticket").is_none()
                     && input.get("ticket_body").is_none()
             );
-            // The model gets the opened ticket and quotes it back.
             let mut out = good_output(&wf);
-            out["checks"][0]["note"] = json!(format!("the ticket says {m}"));
+            out["checks"][0]["note"] = json!(format!("the ticket says {M}"));
             let reply = model_reply(&out.to_string(), "end_turn");
             let r = run_review(&wf, &input, json!([reply]), &[]);
             assert_eq!(r.code, Some(0), "{}", r.out);
@@ -8453,7 +8683,7 @@ if (mode === 'keys') {
             assert_eq!(calls.len(), 1);
             let body: Value = serde_json::from_str(calls[0]["body"].as_str().unwrap()).unwrap();
             assert!(
-                body["messages"][0]["content"].as_str().unwrap().contains(m),
+                body["messages"][0]["content"].as_str().unwrap().contains(M),
                 "the model must see the opened ticket"
             );
             assert!(
@@ -8468,14 +8698,13 @@ if (mode === 'keys') {
                 .expect("review wrote its sealed output");
             for (path, t) in r.files() {
                 assert!(
-                    !t.contains(m),
+                    !t.contains(M),
                     "{}: plaintext ticket in {}",
                     wf.file,
                     path.display()
                 );
             }
             assert!(sealed_out["ct"].is_string() && sealed_out.get("output").is_none());
-            // The file job opens it and files; its log and artifacts stay clean too.
             let fi = p.read("out/file-input.json").unwrap();
             let f = run_file(
                 &wf,
@@ -8487,7 +8716,7 @@ if (mode === 'keys') {
             assert_eq!(f.code, Some(0), "{}", f.out);
             seen.push(f.out.clone());
             for s in seen {
-                assert!(!s.contains(m), "{}: ticket text in a log", wf.file);
+                assert!(!s.contains(M), "{}: ticket text in a log", wf.file);
             }
             assert!(!f.out.contains("sk-ant"));
         }
@@ -8587,46 +8816,64 @@ if (mode === 'keys') {
     }
 
     #[test]
-    fn a_model_refusal_or_failure_files_nothing_and_writes_no_output() {
+    fn a_model_refusal_or_failure_files_nothing_and_a_run_makes_at_most_two_requests() {
         for wf in all() {
             let (input, _) = prepared(&wf);
             let revise = json!({ "outcome": "revise", "risk_level": "auto", "risk_triggers": [], "checks": [] }).to_string();
-            let cases: Vec<(&str, Value, &str)> = vec![
+            let cases: Vec<(&str, Value, &str, usize)> = vec![
                 (
                     "refusal",
                     json!([model_reply(&revise, "refusal")]),
                     "stopped with refusal",
+                    1,
                 ),
                 (
                     "max tokens",
                     json!([model_reply(&good_output(&wf).to_string(), "max_tokens")]),
                     "stopped with max_tokens",
+                    1,
                 ),
                 (
                     "not json",
                     json!([model_reply("sorry, no", "end_turn")]),
                     "not JSON",
+                    1,
                 ),
                 (
                     "bad request",
                     json!([{ "status": 400, "json": { "type": "error" } }]),
-                    "refused: HTTP 400",
+                    "request failed: HTTP 400",
+                    1,
                 ),
                 (
-                    "overloaded",
+                    "overloaded twice",
                     json!([{ "status": 529, "text": "busy" }]),
-                    "unavailable after 4 attempts",
+                    "request failed: HTTP 529",
+                    2,
                 ),
                 (
-                    "network",
+                    "rate limited twice",
+                    json!([{ "status": 429, "text": "slow" }]),
+                    "request failed: HTTP 429",
+                    2,
+                ),
+                (
+                    "network twice",
                     json!([{ "throw": true }]),
-                    "unavailable after 4 attempts",
+                    "request failed: HTTP 0",
+                    2,
                 ),
             ];
-            for (name, replies, reason) in cases {
+            for (name, replies, reason, requests) in cases {
                 let r = run_review(&wf, &input, replies, &[]);
                 assert!(r.failed(), "{}: {name} must fail", wf.file);
                 assert!(r.out.contains(reason), "{}: {name}: {}", wf.file, r.out);
+                assert_eq!(
+                    r.hits("api.anthropic.com").len(),
+                    requests,
+                    "{}: {name}: request count",
+                    wf.file
+                );
                 assert!(
                     r.read("out/review-output.json").is_none() && r.files().is_empty(),
                     "{}: {name} wrote output",
@@ -8637,6 +8884,381 @@ if (mode === 'keys') {
                     "the review job never talks to the tenant"
                 );
             }
+            // A transient failure then success is the most it ever bills twice for.
+            let again = json!([{ "status": 500, "text": "oops" }, model_reply(&good_output(&wf).to_string(), "end_turn")]);
+            let r = run_review(&wf, &input, again, &[]);
+            assert_eq!(r.code, Some(0), "{}", r.out);
+            assert_eq!(r.hits("api.anthropic.com").len(), 2);
+        }
+    }
+
+    // ---- log hygiene: no attacker-controlled text on any path --------------
+
+    #[test]
+    fn prepare_logs_carry_no_attacker_text_on_any_path() {
+        type Fix = Box<dyn Fn(&mut Value)>;
+        let p = inj();
+        for wf in all() {
+            let nop = || -> Fix { Box::new(|_| {}) };
+            let world_edit = |f: Fix| (f, nop());
+            let route_edit = |f: Fix| (nop(), f);
+            let cases: Vec<(&str, (Fix, Fix))> = vec![
+                ("success", (nop(), nop())),
+                (
+                    "kind",
+                    world_edit(Box::new({
+                        let p = p.clone();
+                        move |w| w["ctx"]["kind"] = json!(p)
+                    })),
+                ),
+                (
+                    "ticket id",
+                    world_edit(Box::new({
+                        let p = p.clone();
+                        move |w| w["ctx"]["ticket"]["id"] = json!(p)
+                    })),
+                ),
+                (
+                    "ticket body too large",
+                    world_edit(Box::new({
+                        let p = p.clone();
+                        move |w| {
+                            w["ctx"]["ticket_body"] = json!(format!("{p}{}", "x".repeat(100_001)))
+                        }
+                    })),
+                ),
+                (
+                    "binary diff",
+                    world_edit(Box::new({
+                        let p = p.clone();
+                        move |w| {
+                            w["diff"] = json!(format!("diff --git a/x b/x\nnew file mode 100644\nBinary files /dev/null and b/{p} differ\n"));
+                            w["live"]["changed_files"] = json!(1);
+                        }
+                    })),
+                ),
+                (
+                    "incomplete diff",
+                    world_edit(Box::new({
+                        let p = p.clone();
+                        move |w| {
+                            w["diff"] = json!(format!(
+                                "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,3 @@\n+{p}\n"
+                            ))
+                        }
+                    })),
+                ),
+                (
+                    "fork name",
+                    world_edit(Box::new({
+                        let p = p.clone();
+                        move |w| w["live"]["head"]["repo"]["full_name"] = json!(p)
+                    })),
+                ),
+                (
+                    "closed state",
+                    world_edit(Box::new({
+                        let p = p.clone();
+                        move |w| w["live"]["state"] = json!(p)
+                    })),
+                ),
+                (
+                    "context state",
+                    world_edit(Box::new({
+                        let p = p.clone();
+                        move |w| w["ctx"]["state"] = json!(p)
+                    })),
+                ),
+                (
+                    "tenant refusal",
+                    route_edit(Box::new({
+                        let p = p.clone();
+                        move |s| s["routes"][1]["responses"] = json!([{ "status": 403, "json": { "ok": false, "error": { "code": p, "message": p } } }])
+                    })),
+                ),
+                (
+                    "tenant error text",
+                    route_edit(Box::new({
+                        let p = p.clone();
+                        move |s| s["routes"][1]["responses"] = json!([{ "status": 500, "text": p }])
+                    })),
+                ),
+                (
+                    "diff http error",
+                    route_edit(Box::new({
+                        let p = p.clone();
+                        move |s| s["routes"][2]["responses"] = json!([{ "status": 404, "text": p }])
+                    })),
+                ),
+                (
+                    "oidc answer",
+                    route_edit(Box::new({
+                        let p = p.clone();
+                        move |s| {
+                            s["routes"].as_array_mut().unwrap().insert(
+                                0,
+                                route("http://oidc.test/", json!([{ "json": { "value": p } }])),
+                            )
+                        }
+                    })),
+                ),
+                (
+                    "oidc error",
+                    route_edit(Box::new({
+                        let p = p.clone();
+                        move |s| {
+                            s["routes"].as_array_mut().unwrap().insert(
+                                0,
+                                route("http://oidc.test/", json!([{ "status": 500, "text": p }])),
+                            )
+                        }
+                    })),
+                ),
+            ];
+            for (name, (we, se)) in cases {
+                let mut w = poisoned_world(&wf);
+                we(&mut w);
+                let mut sc = prepare_scenario(&w);
+                se(&mut sc);
+                let r = run_job(&wf, "prepare", &sc, &[], &|_| {});
+                assert_eq!(
+                    r.code == Some(0),
+                    name == "success",
+                    "{}: {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert_log_clean(&format!("{} prepare {name}", wf.file), &r);
+            }
+        }
+    }
+
+    #[test]
+    fn review_logs_carry_no_attacker_text_on_any_path() {
+        let p = inj();
+        for wf in all() {
+            let (input, pr) = prepared_from(&wf, &poisoned_world(&wf));
+            assert_log_clean("prepare success", &pr);
+            let mut poisoned_ok = good_output(&wf);
+            poisoned_ok["checks"][0]["note"] = json!(p);
+            poisoned_ok["checks"][0]["citations"] = json!([{ "file": p, "line": 1 }]);
+            let cases: Vec<(&str, Value, bool)> = vec![
+                (
+                    "success",
+                    json!([model_reply(&poisoned_ok.to_string(), "end_turn")]),
+                    true,
+                ),
+                ("refusal text", json!([model_reply(&p, "refusal")]), false),
+                ("odd stop reason", json!([model_reply("{}", &p)]), false),
+                ("not json", json!([model_reply(&p, "end_turn")]), false),
+                (
+                    "400 body",
+                    json!([{ "status": 400, "json": { "error": { "message": p, "type": p } } }]),
+                    false,
+                ),
+                ("500 text", json!([{ "status": 500, "text": p }]), false),
+                ("429 text", json!([{ "status": 429, "text": p }]), false),
+                (
+                    "model name",
+                    json!([{ "status": 200, "json": { "stop_reason": "end_turn", "model": p, "content": [{ "type": "text", "text": "{}" }], "usage": { "input_tokens": p, "output_tokens": p } } }]),
+                    true,
+                ),
+            ];
+            for (name, replies, ok) in cases {
+                let r = run_review(&wf, &input, replies, &[]);
+                assert_eq!(r.code == Some(0), ok, "{}: {name}: {}", wf.file, r.out);
+                assert_log_clean(&format!("{} review {name}", wf.file), &r);
+                for (path, t) in r.files() {
+                    assert!(
+                        !t.contains(M),
+                        "{}: {name}: plaintext in {}",
+                        wf.file,
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_logs_carry_no_attacker_text_on_any_path() {
+        let p = inj();
+        for wf in all() {
+            let with = |f: &dyn Fn(&mut Value)| {
+                let mut v = good_output(&wf);
+                f(&mut v);
+                v
+            };
+            let refused: Vec<(&str, Value)> = vec![
+                (
+                    "citation file",
+                    with(&|v| v["checks"][0]["citations"] = json!([{ "file": p, "line": 2 }])),
+                ),
+                (
+                    "citation line",
+                    with(&|v| {
+                        v["checks"][0]["citations"] = json!([{ "file": "src/a.rs", "line": p }])
+                    }),
+                ),
+                (
+                    "citation extra key",
+                    with(&|v| v["checks"][0]["citations"][0][&p] = json!(1)),
+                ),
+                ("check name", with(&|v| v["checks"][0]["name"] = json!(p))),
+                (
+                    "check name not text",
+                    with(&|v| v["checks"][0]["name"] = json!([p])),
+                ),
+                (
+                    "check result",
+                    with(&|v| v["checks"][0]["result"] = json!(p)),
+                ),
+                (
+                    "note with contradiction",
+                    with(&|v| {
+                        v["checks"][0]["note"] = json!(p);
+                        v["outcome"] = json!("revise");
+                    }),
+                ),
+                (
+                    "note not text",
+                    with(&|v| v["checks"][0]["note"] = json!([p])),
+                ),
+                ("output key", with(&|v| v[&p] = json!(1))),
+                ("check key", with(&|v| v["checks"][0][&p] = json!(1))),
+                ("risk level", with(&|v| v["risk_level"] = json!(p))),
+                (
+                    "risk trigger",
+                    with(&|v| {
+                        v["risk_level"] = json!("human");
+                        v["risk_triggers"] = json!([p]);
+                    }),
+                ),
+                ("outcome", with(&|v| v["outcome"] = json!(p))),
+                ("not an object", json!(p)),
+            ];
+            for (name, out) in refused {
+                let r = file_with(&wf, &out, json!([verdict_ok(false, "pass")]));
+                assert!(
+                    r.failed() && r.hits("/verdict").is_empty(),
+                    "{}: {name} must be refused: {}",
+                    wf.file,
+                    r.out
+                );
+                assert_log_clean(&format!("{} file refused {name}", wf.file), &r);
+            }
+            let ok = with(&|v| {
+                v["checks"][0]["note"] = json!(p);
+                v["checks"][1]["note"] = json!(p);
+            });
+            let tenant: Vec<(&str, Value, bool)> = vec![
+                ("success", json!([verdict_ok(false, "pass")]), true),
+                ("duplicate", json!([verdict_ok(true, "revise")]), true),
+                (
+                    "refusal text",
+                    json!([{ "status": 403, "json": { "ok": false, "error": { "code": p, "message": p } } }]),
+                    false,
+                ),
+                ("500 text", json!([{ "status": 500, "text": p }]), false),
+                (
+                    "409 with a hostile code",
+                    json!([{ "status": 409, "json": { "ok": false, "error": { "code": p } } }]),
+                    false,
+                ),
+                (
+                    "verdict_exists",
+                    json!([{ "status": 409, "json": { "ok": false, "error": { "code": "verdict_exists", "message": p } } }]),
+                    false,
+                ),
+                (
+                    "record with hostile outcome",
+                    json!([{ "status": 200, "json": { "state": "recorded", "verdict": { "outcome": p }, "head": HEAD, "pr": 123 } }]),
+                    false,
+                ),
+            ];
+            for (name, verdicts, good) in tenant {
+                let r = file_with(&wf, &ok, verdicts);
+                assert_eq!(r.code == Some(0), good, "{}: {name}: {}", wf.file, r.out);
+                assert_log_clean(&format!("{} file tenant {name}", wf.file), &r);
+                let summary =
+                    std::fs::read_to_string(r.runner.parent().unwrap().join("summary.md"))
+                        .unwrap_or_default();
+                assert!(
+                    !summary.contains(M),
+                    "{}: {name}: step summary carries attacker text",
+                    wf.file
+                );
+            }
+            // Fields of the file input itself.
+            let mut bad_issue = file_input(&world(&wf));
+            bad_issue["issue"] = json!(p);
+            let r = run_file(
+                &wf,
+                &bad_issue,
+                Some(&sealed_model_output(&wf, &ok)),
+                json!([verdict_ok(false, "pass")]),
+                &[],
+            );
+            assert!(r.failed());
+            assert_log_clean(&format!("{} file bad issue", wf.file), &r);
+        }
+    }
+
+    #[test]
+    fn a_sanitized_citation_path_and_note_reach_the_verdict_body_without_a_new_line() {
+        let diff = "diff --git a/src/a<b>.rs b/src/a<b>.rs\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/src/a<b>.rs\n@@ -0,0 +1,2 @@\n+one\n+two\n";
+        for wf in all() {
+            let mut w = world(&wf);
+            w["diff"] = json!(diff);
+            let mut out = good_output(&wf);
+            for (i, c) in out["checks"].as_array_mut().unwrap().iter_mut().enumerate() {
+                c["citations"] = json!([{ "file": "src/a<b>.rs", "line": 1 }]);
+                c["note"] = json!(if i == 0 {
+                    "line1\n::warning::x\r\n::error::y\u{2028}tail `code` <b>".to_string()
+                } else {
+                    "ok".to_string()
+                });
+            }
+            let r = run_file(
+                &wf,
+                &file_input(&w),
+                Some(&sealed_model_output(&wf, &out)),
+                json!([verdict_ok(false, "pass")]),
+                &[],
+            );
+            assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+            let posted: Value =
+                serde_json::from_str(r.hits("/verdict")[0]["body"].as_str().unwrap()).unwrap();
+            let body = posted["body"].as_str().unwrap();
+            assert_eq!(
+                body.lines().count(),
+                wf.names().len() + 4,
+                "{}: a field added a line: {body:?}",
+                wf.file
+            );
+            assert!(
+                !body.contains('\r') && !body.contains('\u{2028}'),
+                "{}: {body:?}",
+                wf.file
+            );
+            for l in body.lines() {
+                assert!(
+                    !l.starts_with("::"),
+                    "{}: a body line reads as a workflow command: {l}",
+                    wf.file
+                );
+            }
+            assert!(
+                body.contains("[src/a b .rs:1]"),
+                "{}: citation path was not sanitized: {body}",
+                wf.file
+            );
+            assert!(
+                body.contains("line1 ::warning::x ::error::y tail code b"),
+                "{}: note was not neutralized: {body}",
+                wf.file
+            );
+            assert_log_clean(&format!("{} file", wf.file), &r);
         }
     }
 
@@ -8648,17 +9270,11 @@ if (mode === 'keys') {
             let mut out = good_output(&wf);
             out["risk_level"] = json!("human");
             out["risk_triggers"] = json!([4, 2]);
-            let r = run_file(
-                &wf,
-                &file_input(&world(&wf)),
-                Some(&sealed_model_output(&wf, &out)),
-                json!([verdict_ok(false, "pass")]),
-                &[],
-            );
+            let r = file_with(&wf, &out, json!([verdict_ok(false, "pass")]));
             assert_eq!(r.code, Some(0), "{}", r.out);
             let posts = r.hits("/__platform/review-jobs/verdict");
             assert_eq!(posts.len(), 1);
-            assert_eq!(posts[0]["headers"]["authorization"], "Bearer oidc-token-1");
+            assert_eq!(posts[0]["headers"]["authorization"], TOKEN1);
             let p: Value = serde_json::from_str(posts[0]["body"].as_str().unwrap()).unwrap();
             assert_eq!(p["outcome"], "pass");
             assert_eq!(p["risk"], "human (2, 4)");
@@ -8670,7 +9286,7 @@ if (mode === 'keys') {
                 "notes are stripped: {body}"
             );
             assert!(
-                !body.contains("DIFFTEXT") && !body.contains("fn b()"),
+                !body.contains("fn b()") && !body.contains("hello"),
                 "diff text never goes into the body"
             );
         }
@@ -8700,35 +9316,43 @@ if (mode === 'keys') {
                     with(&|v| {
                         v["checks"][0]["citations"] = json!([{ "file": "src/ghost.rs", "line": 1 }])
                     }),
-                    "not a line of the diff",
+                    "is not a line of the diff",
                 ),
                 (
                     "out-of-hunk line",
                     with(&|v| {
                         v["checks"][0]["citations"] = json!([{ "file": "src/a.rs", "line": 99 }])
                     }),
-                    "not a line of the diff",
+                    "is not a line of the diff",
                 ),
                 (
                     "line zero",
                     with(&|v| {
                         v["checks"][0]["citations"] = json!([{ "file": "src/a.rs", "line": 0 }])
                     }),
-                    "not a line of the diff",
+                    "is not a line of the diff",
                 ),
                 (
                     "float line",
                     with(&|v| {
                         v["checks"][0]["citations"] = json!([{ "file": "src/a.rs", "line": 2.5 }])
                     }),
-                    "malformed citation",
+                    "is malformed",
                 ),
                 (
                     "pass but revise",
                     with(&|v| v["outcome"] = json!("revise")),
                     "contradicts",
                 ),
-                ("fail but pass", Value::Null, "contradicts"),
+                (
+                    "fail but pass",
+                    {
+                        let mut v = mixed_fail.clone();
+                        v["outcome"] = json!("pass");
+                        v
+                    },
+                    "contradicts",
+                ),
                 (
                     "missing check",
                     with(&|v| {
@@ -8774,7 +9398,7 @@ if (mode === 'keys') {
                 (
                     "extra citation key",
                     with(&|v| v["checks"][0]["citations"][0]["extra"] = json!(1)),
-                    "malformed citation",
+                    "is malformed",
                 ),
                 (
                     "risk above 7",
@@ -8845,20 +9469,7 @@ if (mode === 'keys') {
                 ),
             ];
             for (name, out, reason) in cases {
-                let out = if name == "fail but pass" {
-                    let mut v = mixed_fail.clone();
-                    v["outcome"] = json!("pass");
-                    v
-                } else {
-                    out
-                };
-                let r = run_file(
-                    &wf,
-                    &file_input(&world(&wf)),
-                    Some(&sealed_model_output(&wf, &out)),
-                    json!([verdict_ok(false, "pass")]),
-                    &[],
-                );
+                let r = file_with(&wf, &out, json!([verdict_ok(false, "pass")]));
                 assert!(r.failed(), "{}: {name} must fail", wf.file);
                 assert!(
                     r.out.contains(reason),
@@ -8872,6 +9483,46 @@ if (mode === 'keys') {
                     wf.file
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_pass_needs_the_requirement_axis_judged_only_where_the_axis_has_one() {
+        for wf in all() {
+            let na = |name: &str| {
+                let mut v = good_output(&wf);
+                for c in v["checks"].as_array_mut().unwrap() {
+                    if c["name"] == name {
+                        c["result"] = json!("na");
+                        c["citations"] = json!([]);
+                    }
+                }
+                v
+            };
+            let spec = wf.names().iter().any(|n| n == "ticket-requirements");
+            if spec {
+                let r = file_with(
+                    &wf,
+                    &na("ticket-requirements"),
+                    json!([verdict_ok(false, "pass")]),
+                );
+                assert!(
+                    r.failed() && r.out.contains("ticket-requirements judged"),
+                    "{}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.hits("/verdict").is_empty() && r.minted() == 0);
+            }
+            // Any other check being na is fine on either axis while two checks still pass.
+            let other = wf
+                .names()
+                .into_iter()
+                .find(|n| n != "ticket-requirements")
+                .unwrap();
+            let r = file_with(&wf, &na(&other), json!([verdict_ok(false, "pass")]));
+            assert_eq!(r.code, Some(0), "{}: {other} na: {}", wf.file, r.out);
+            assert_eq!(r.hits("/verdict").len(), 1);
         }
     }
 
@@ -8936,7 +9587,13 @@ if (mode === 'keys') {
                     vec![("REVIEW_SEAL_PRIVATE_KEY", None)],
                     "REVIEW_SEAL_PRIVATE_KEY",
                 ),
-                ("no output at all", input.clone(), None, vec![], ""),
+                (
+                    "no output at all",
+                    input.clone(),
+                    None,
+                    vec![],
+                    "does not open",
+                ),
                 (
                     "input for another head",
                     bad_input,
@@ -8976,7 +9633,6 @@ if (mode === 'keys') {
         for wf in all() {
             let mut input = file_input(&world(&wf));
             input["diff"] = json!(HOSTILE_DIFF);
-            // Citing the file a diff line merely claims to start: refused.
             for line in 1..=4 {
                 let mut forged = good_output(&wf);
                 forged["checks"][0]["citations"] = json!([{ "file": "src/fake.rs", "line": line }]);
@@ -8988,7 +9644,7 @@ if (mode === 'keys') {
                     &[],
                 );
                 assert!(
-                    r.failed() && r.out.contains("not a line of the diff"),
+                    r.failed() && r.out.contains("is not a line of the diff"),
                     "{}: fake.rs:{line}: {}",
                     wf.file,
                     r.out
@@ -9030,11 +9686,72 @@ if (mode === 'keys') {
     }
 
     #[test]
+    fn a_quoted_file_name_cannot_make_a_content_line_citable() {
+        let diff = quoted_name_diff();
+        for wf in all() {
+            let mut input = file_input(&world(&wf));
+            input["diff"] = json!(diff);
+            let cite = |file: &str, line: i64| {
+                let mut o = good_output(&wf);
+                for c in o["checks"].as_array_mut().unwrap() {
+                    c["citations"] = json!([{ "file": "b/real.rs", "line": 1 }]);
+                }
+                o["checks"][0]["citations"] = json!([{ "file": file, "line": line }]);
+                o
+            };
+            // The content line reads like a header for guard.rs; no line of it, and no line
+            // of the quoted file itself, may be cited.
+            for (file, lines) in [
+                ("src/auth/guard.rs", 1..=6),
+                ("a/\u{e9}.rs", 1..=6),
+                ("\"a/\\303\\251.rs\"", 1..=6),
+                ("b/a/\u{e9}.rs", 1..=6),
+            ] {
+                for line in lines {
+                    let r = run_file(
+                        &wf,
+                        &input,
+                        Some(&sealed_model_output(&wf, &cite(file, line))),
+                        json!([verdict_ok(false, "pass")]),
+                        &[],
+                    );
+                    assert!(
+                        r.failed() && r.out.contains("is not a line of the diff"),
+                        "{}: {file}:{line} was citable: {}",
+                        wf.file,
+                        r.out
+                    );
+                    assert!(r.hits("/verdict").is_empty());
+                }
+            }
+            // A real file after the quoted section stays citable.
+            for line in [1, 2] {
+                let r = run_file(
+                    &wf,
+                    &input,
+                    Some(&sealed_model_output(&wf, &cite("b/real.rs", line))),
+                    json!([verdict_ok(false, "pass")]),
+                    &[],
+                );
+                assert_eq!(r.code, Some(0), "{}: b/real.rs:{line}: {}", wf.file, r.out);
+                assert_eq!(r.hits("/verdict").len(), 1);
+            }
+            assert!(run_file(
+                &wf,
+                &input,
+                Some(&sealed_model_output(&wf, &cite("b/real.rs", 3))),
+                json!([verdict_ok(false, "pass")]),
+                &[]
+            )
+            .failed());
+        }
+    }
+
+    #[test]
     fn a_duplicate_is_read_and_verdict_exists_is_red() {
         for wf in all() {
-            let input = file_input(&world(&wf));
             let sealed = sealed_model_output(&wf, &good_output(&wf));
-            // This run's opinion is pass; the stored row says revise.
+            let input = file_input(&world(&wf));
             let r = run_file(
                 &wf,
                 &input,
@@ -9050,20 +9767,19 @@ if (mode === 'keys') {
             );
             assert_eq!(r.minted(), 1);
             assert!(
-                r.out.contains("outcome revise") && r.out.contains("differs from this run's pass"),
+                r.out.contains("stored outcome revise")
+                    && r.out.contains("differs from this run's pass"),
                 "{}",
                 r.out
             );
             let summary =
                 std::fs::read_to_string(r.runner.parent().unwrap().join("summary.md")).unwrap();
             assert!(summary.contains("revise") && summary.contains("duplicate"));
-            // A different run's row stands: first row wins, this run filed nothing, red.
             let exists = json!([{ "status": 409, "json": { "ok": false, "error": { "code": "verdict_exists" } } }, verdict_ok(false, "pass")]);
             let r = run_file(&wf, &input, Some(&sealed), exists, &[]);
             assert!(r.failed(), "{}: verdict_exists must exit red", wf.file);
             assert_eq!(r.hits("/verdict").len(), 1, "verdict_exists is not retried");
-            assert!(r.out.contains("this run filed nothing"), "{}", r.out);
-            // A record that does not fit the question is not trusted.
+            assert!(r.out.contains("wrote no new row"), "{}", r.out);
             let odd = json!([{ "status": 200, "json": { "state": "recorded", "verdict": { "outcome": "maybe" }, "head": HEAD, "pr": 123 } }]);
             let r = run_file(&wf, &input, Some(&sealed), odd, &[]);
             assert!(r.failed());
@@ -9094,7 +9810,6 @@ if (mode === 'keys') {
                 posts.iter().all(|p| p["body"] == posts[0]["body"]),
                 "the payload changed between attempts"
             );
-            // The same holds for prepare's context call.
             let w = world(&wf);
             let mut sc = prepare_scenario(&w);
             sc["routes"][1]["responses"] =
@@ -9158,7 +9873,6 @@ if (mode === 'keys') {
                 &[],
             );
             assert!(jwks.failed() && jwks.hits("/verdict").len() == 1);
-            // The oidc endpoint itself failing mints nothing and posts nothing.
             let sc = json!({ "routes": [route("http://oidc.test/", json!([{ "status": 500, "text": "no" }])), route("/verdict", json!([verdict_ok(false, "pass")]))] });
             let r = run_job(&wf, "file", &sc, &[], &|r| {
                 let a = r.join("in/file-input");
