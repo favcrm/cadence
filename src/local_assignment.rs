@@ -1102,6 +1102,11 @@ impl<H: CoordHttp> Coordinator<H> {
                 "claim response named a different assignment",
             ));
         }
+        // The board's answer is the row this client would run, so its work kind
+        // is authoritative here — not only the observation that was claimed.
+        if let Some(refusal) = claimed.work_kind_refusal() {
+            return Err(refusal);
+        }
         self.with_ledger(|ledger| {
             let mut found = false;
             for attempt in ledger.attempts.values_mut() {
@@ -1758,6 +1763,11 @@ impl<H: CoordHttp> Coordinator<H> {
                         "report response named a different assignment",
                     ));
                 }
+                // A resume report replaces the row this client will run, so a
+                // kind it cannot serve must stop it before any worktree.
+                if let Some(refusal) = reported.work_kind_refusal() {
+                    return Err(refusal);
+                }
                 self.with_ledger(|ledger| {
                     for attempt in ledger.attempts.values_mut() {
                         if attempt.assignment_id.as_deref() != Some(reported.assignment_id.as_str())
@@ -2335,6 +2345,10 @@ impl<H: CoordHttp> Coordinator<H> {
                 "reassign response named a different assignment",
             ));
         }
+        // Reassignment hands this client the row it will start.
+        if let Some(refusal) = updated.work_kind_refusal() {
+            return Err(refusal);
+        }
         self.with_ledger(|ledger| {
             for attempt in ledger.attempts.values_mut() {
                 if attempt.assignment_id.as_deref() != Some(assignment) {
@@ -2644,5 +2658,109 @@ mod assignment_contract_tests {
             assert_eq!(error.code(), Some("unsupported_work_kind"), "{state}");
         }
         assert_eq!(calls.get(), 0, "a refused row reached the board");
+    }
+
+    /// Answers one call with a fixed body and counts calls.
+    struct Respond {
+        body: Value,
+        calls: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl CoordHttp for Respond {
+        fn send(&mut self, method: &str, path: &str, _: Option<&Value>) -> Result<Reply> {
+            self.calls.set(self.calls.get() + 1);
+            assert_eq!(method, "POST");
+            assert!(
+                path.ends_with("/claim")
+                    || path.ends_with("/report")
+                    || path.ends_with("/reassign"),
+                "{path}"
+            );
+            Ok(Reply {
+                status: 200,
+                body: self.body.clone(),
+            })
+        }
+    }
+
+    fn running(kind: Value) -> Value {
+        let mut value = row();
+        value["state"] = json!("running");
+        value["target"] = json!("usr_1");
+        value["client_agent_id"] = json!("worker");
+        value["claim_id"] = json!("hlc_00000000-0000-4000-8000-000000000001");
+        value["kind"] = kind;
+        value
+    }
+
+    fn coord_with(
+        body: Value,
+    ) -> (
+        Coordinator<Respond>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let http = Respond {
+            body,
+            calls: calls.clone(),
+        };
+        let coord = Coordinator::new(http, "ws_1".into(), dir.path().into())
+            .ok()
+            .unwrap();
+        (coord, calls, dir)
+    }
+
+    #[test]
+    fn a_non_dev_claim_response_is_refused() {
+        let (mut coord, calls, _state) = coord_with(running(json!("review")));
+        let input = parse_assignment(&queued(json!("dev"))).ok().unwrap();
+        let error = coord
+            .claim_with_profile(&input, "worker", None)
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"));
+        assert_eq!(calls.get(), 1, "the claim was sent before the refusal");
+    }
+
+    #[test]
+    fn a_non_dev_report_response_is_refused() {
+        let (mut coord, calls, _state) = coord_with(running(json!("research")));
+        let error = coord
+            .report_claimed(
+                "hla_00000000-0000-4000-8000-000000000001",
+                "hlc_00000000-0000-4000-8000-000000000001",
+                1,
+                "running",
+                None,
+                None,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"));
+        assert_eq!(calls.get(), 1, "the report was sent before the refusal");
+    }
+
+    #[test]
+    fn a_non_dev_reassign_response_is_refused() {
+        let (mut coord, calls, _state) = coord_with(running(json!("review")));
+        let input = parse_assignment(&queued(json!("dev"))).ok().unwrap();
+        coord.remember_discovered(&input).unwrap();
+        let error = coord
+            .reassign_owned(
+                "hla_00000000-0000-4000-8000-000000000001",
+                Some("usr_1"),
+                false,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"));
+        assert_eq!(calls.get(), 1, "the reassign was sent before the refusal");
     }
 }
