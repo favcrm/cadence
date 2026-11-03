@@ -32,7 +32,7 @@ import {
   agentLocation,
   agentMatchesFilter,
   agentMatchesSearch,
-  agentOrder,
+  overviewSeats,
   profileMatchesFilter,
   profileMatchesSearch,
   profileWork,
@@ -111,14 +111,8 @@ export default function Agents({
   const shownProfiles = idleProfiles.filter(
     (p) => profileMatchesFilter(p, filter) && profileMatchesSearch(p, query),
   );
-  const agents = allAgents
-    .filter((a) => agentMatchesFilter(a, filter) && agentMatchesSearch(a, query, issueIndexed))
-    .sort(
-      (a, b) =>
-        Number(b.alias === MASTER) - Number(a.alias === MASTER) ||
-        agentOrder(a) - agentOrder(b) ||
-        a.alias.localeCompare(b.alias),
-    );
+  const agents = allAgents.filter((a) => agentMatchesFilter(a, filter) && agentMatchesSearch(a, query, issueIndexed));
+  const seats = overviewSeats(agents, shownProfiles);
   const emptyCopy =
     allAgents.length + idleProfiles.length === 0
       ? t("No agents registered.")
@@ -175,6 +169,7 @@ export default function Agents({
         query={query}
         onQuery={setQuery}
         onOpen={setOpen}
+        overviewCurrent={!open && !recruit && !ask}
         onOverview={() => setOpen(null)}
         onRecruit={() => onRecruit(true)}
       />
@@ -198,6 +193,7 @@ export default function Agents({
         groups={groups}
         rosterLoaded={payload != null}
         rosterFailed={payload == null && state.status === "failed"}
+        daemonDown={payload?.daemon === "unreachable"}
         onRetryRoster={onRetry}
         operator={operator}
         onRetryAccess={onRetryAccess}
@@ -298,23 +294,24 @@ export default function Agents({
             </label>
           </div>
           <div className="rc-seats">
-            {agents.map((a) => (
-              <SeatCard
-                key={a.alias}
-                agent={a}
-                roleLine={roleLine(a, roleOf(a, roles.data, profiles)?.title, hosted, t)}
-                onOpen={() => setOpen(a.alias)}
-              />
-            ))}
-            {shownProfiles.map((profile) => (
-              <ProfileSeat
-                key={`profile-${profile.id}`}
-                profile={profile}
-                roleTitle={profileTitle(profile)}
-                work={profileWork(profile, issueCards)}
-                onOpen={() => setOpen(profile.alias)}
-              />
-            ))}
+            {seats.map((seat) =>
+              seat.kind === "agent" ? (
+                <SeatCard
+                  key={seat.agent.alias}
+                  agent={seat.agent}
+                  roleLine={roleLine(seat.agent, roleOf(seat.agent, roles.data, profiles)?.title, hosted, t)}
+                  onOpen={() => setOpen(seat.agent.alias)}
+                />
+              ) : (
+                <ProfileSeat
+                  key={`profile-${seat.profile.id}`}
+                  profile={seat.profile}
+                  roleTitle={profileTitle(seat.profile)}
+                  work={profileWork(seat.profile, issueCards)}
+                  onOpen={() => setOpen(seat.profile.alias)}
+                />
+              ),
+            )}
             {!searching && tile}
           </div>
           {folded.length > 0 && (
@@ -334,9 +331,17 @@ export default function Agents({
               </div>
             </details>
           )}
-          {agents.length + shownProfiles.length === 0 && (
+          {seats.length === 0 && (
             <p className="text-label text-ink-500 mt-3" role="status">
               {emptyCopy}
+              {searching && (
+                <>
+                  {" "}
+                  <button type="button" className="lnk" onClick={() => setQuery("")}>
+                    {t("Clear search")}
+                  </button>
+                </>
+              )}
             </p>
           )}
           {roles.data && suggestion.roles.length > 0 && (

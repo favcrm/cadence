@@ -1,4 +1,5 @@
 import { agentOn } from "../../lib/agentOn";
+import { MASTER } from "../home/master";
 import type { Agent } from "../../lib/types";
 import { agentIssueIds, type IssueIndex } from "../../lib/scope";
 import type { HiredProfile, IssueCard } from "../../lib/types";
@@ -171,6 +172,44 @@ export function agentOrder(a: Agent): number {
     inbox: 6,
   };
   return order[agentCategory(a)];
+}
+
+/** A profile's place among the agents: a live claim ranks as that state does,
+ *  and anything else follows the idle agents, as in the sidebar. */
+function profileOrder(p: HiredProfile): number {
+  const live = liveClaimState(p);
+  return live === "blocked" ? 1 : live === "working" ? 2 : 3.5;
+}
+
+export type OverviewSeat = { kind: "agent"; agent: Agent } | { kind: "profile"; profile: HiredProfile };
+
+/** The overview's one list, by state: what needs the viewer comes first, so an
+ *  attention-needing agent or a blocked profile sits above an unblocked Master,
+ *  which leads everything else. */
+export function overviewSeats(agents: Agent[], profiles: HiredProfile[]): OverviewSeat[] {
+  const rank = (seat: OverviewSeat) => {
+    if (seat.kind === "profile") return profileOrder(seat.profile);
+    const order = agentOrder(seat.agent);
+    return seat.agent.alias === MASTER && order > 1 ? 1.5 : order;
+  };
+  const alias = (seat: OverviewSeat) => (seat.kind === "agent" ? seat.agent.alias : seat.profile.alias);
+  return [
+    ...agents.map((agent): OverviewSeat => ({ kind: "agent", agent })),
+    ...profiles.map((profile): OverviewSeat => ({ kind: "profile", profile })),
+  ].sort((a, b) => rank(a) - rank(b) || alias(a).localeCompare(alias(b)));
+}
+
+/** The turn an agent is running, as Home's thread reads one. The roster's live
+ *  count says whether; the last detail read names the message when it can. */
+export function agentRunningTurn(
+  count: number,
+  running: { id: string; created?: string }[] | undefined,
+): { message: string | null; since: number | null; unnamed?: boolean } | null {
+  if (count <= 0) return null;
+  const turn = running?.[0];
+  if (!turn?.id) return { message: null, since: null, unnamed: true };
+  const started = turn.created ? Date.parse(turn.created) : Number.NaN;
+  return { message: turn.id, since: Number.isNaN(started) ? null : Math.floor(started / 1000) };
 }
 
 /** Search only observation and exact issue bindings; never infer projects

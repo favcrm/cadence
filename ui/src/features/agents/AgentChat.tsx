@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
+import { useDocumentVisible } from "../app-shell/chat/chatVisibility";
 import { displayUiNotice } from "../../lib/uiNotice";
 import { useResource } from "../../lib/useResource";
 import type { ThreadRef } from "../../lib/types";
 import Button from "../../ui/Button";
 import SharedComposer from "../app-shell/chat/Composer";
-import Conversation from "../app-shell/chat/Conversation";
 import { AssistantActorProvider, type AssistantActorValue } from "../assistant/AssistantIdentity";
 import type { AvatarLook } from "../assistant/identity";
 import { atTail, tailTop } from "../home/dock";
+import { ThreadList } from "../home/Home";
 import { CloudContentNotice } from "../home/ThreadView";
 import {
   applyEarlier,
@@ -16,13 +17,14 @@ import {
   fetchEarlier,
   lastSeq,
   threadItems,
-  visibleWindow,
   WINDOW,
 } from "../home/thread";
 import { useDockHeight } from "../home/useDockHeight";
 import { threadReader } from "../../lib/resources";
 import { subscribeThreadsChanged } from "../threads/threadsClient";
 import { agentThreadStore, sendToAgent } from "./agentThread";
+
+type AgentTurn = { message: string | null; since: number | null; unnamed?: boolean } | null;
 
 /** How a chat page leaves the composer out: a plain reason in its place. */
 export type ChatGate = { title: string; body: string; extra?: ReactNode };
@@ -39,6 +41,7 @@ export default function AgentChat({
   notices,
   panel,
   block,
+  working,
   onBack,
   onOpenIssue,
 }: {
@@ -56,6 +59,8 @@ export default function AgentChat({
   notices?: ReactNode;
   panel: ReactNode;
   block: string | null;
+  /** The turn the agent is running now, if any. */
+  working: AgentTurn;
   onBack: () => void;
   onOpenIssue: (id: string) => void;
 }) {
@@ -99,7 +104,7 @@ export default function AgentChat({
           </button>
         </header>
         {notices}
-        <AgentConversation alias={alias} gate={gate} look={look} expectation={expectation} attach={attach} block={block} onOpenIssue={onOpenIssue} />
+        <AgentConversation alias={alias} gate={gate} look={look} expectation={expectation} attach={attach} block={block} working={working} onOpenIssue={onOpenIssue} />
       </section>
       {panelOpen && (
         <aside className="ag-chat-panel" aria-label={t("{alias} details").replace("{alias}", () => alias)}>
@@ -130,6 +135,7 @@ function AgentConversation({
   expectation,
   attach,
   block,
+  working,
   onOpenIssue,
 }: {
   alias: string;
@@ -138,9 +144,11 @@ function AgentConversation({
   expectation: string;
   attach: boolean;
   block: string | null;
+  working: AgentTurn;
   onOpenIssue: (id: string) => void;
 }) {
   const t = useTranslate();
+  const visible = useDocumentVisible();
   const [sendNote, setSendNote] = useState<string | null>(null);
   const store = agentThreadStore(alias);
   const thread = useResource(store);
@@ -162,9 +170,10 @@ function AgentConversation({
   }, [gate === null]);
 
   // No stream names this thread's rows, so a gentle poll carries a live reply;
-  // a Threads frame refreshes it sooner. A gated page has nothing to wait for.
+  // a Threads frame refreshes it sooner. A gated page has nothing to wait for,
+  // and a hidden tab catches up when it is shown again.
   useEffect(() => {
-    if (gate) return;
+    if (gate || !visible) return;
     const refresh = () => void store.refresh();
     refresh();
     const timer = setInterval(refresh, 6000);
@@ -173,7 +182,7 @@ function AgentConversation({
       clearInterval(timer);
       unsubscribe();
     };
-  }, [store, gate]);
+  }, [store, gate, visible]);
 
   const toTail = useCallback(() => {
     const el = scrollRef.current;
@@ -222,7 +231,7 @@ function AgentConversation({
     }),
     [alias, look],
   );
-  const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
+  const noQueue = useMemo<string[]>(() => [], []);
   const failed = gate === null && thread.error !== null && thread.error !== undefined;
   const withheld = thread.data?.cloudWithheld;
 
@@ -258,18 +267,13 @@ function AgentConversation({
               </p>
             </div>
           )}
-          {!gate && (hidden > 0 || thread.data?.moreBefore === true) ? (
-            <div className="flex justify-center">
-              <button className="lnk text-label disabled:opacity-50" disabled={loadingEarlier} onClick={onEarlier}>
-                {loadingEarlier ? t("Loading…") : t("Load earlier messages")}
-              </button>
-            </div>
-          ) : null}
           {!gate && (
-            <Conversation
-              mode={{ kind: "home" }}
-              items={shown}
-              legacyTranscript={!items.some((item) => item.type === "answer")}
+            <ThreadList
+              items={items}
+              limit={limit}
+              moreBefore={thread.data?.moreBefore === true}
+              loadingEarlier={loadingEarlier}
+              onEarlier={onEarlier}
               readOnly={block !== null}
               liveAfter={liveAfter.current ?? 0}
               onOpenIssue={onOpenIssue}
@@ -277,6 +281,9 @@ function AgentConversation({
                 void sendToAgent(alias, text, message, refs, attachments);
               }}
               onDiscard={(message: string) => store.write((s) => discardPending(s, message))}
+              working={working}
+              queued={noQueue}
+              stale={false}
             />
           )}
         </div>

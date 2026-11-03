@@ -295,7 +295,7 @@ export function addPending(
 export function settlePending(
   state: ThreadState | null,
   message: string,
-  outcome: { ok: true } | { ok: false; error: string },
+  outcome: { ok: true } | { ok: false; error: string; delivery?: "unconfirmed" },
 ): ThreadState {
   const base = state ?? EMPTY_THREAD;
   if (!base.pending.some((p) => p.message === message)) return base;
@@ -307,7 +307,7 @@ export function settlePending(
         ? p
         : error === undefined
           ? { ...p, state: "sent", error: undefined }
-          : { ...p, state: "failed", error },
+          : { ...p, state: "failed", error, delivery: "delivery" in outcome ? outcome.delivery : undefined },
     ),
   };
 }
