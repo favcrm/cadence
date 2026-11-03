@@ -1563,6 +1563,16 @@ fn soc55_source_pages_and_exact_reads_are_scoped_and_attributable() {
     let newer = fetch("fetch-55-b");
     assert_ne!(older, newer, "each fetch retains its own receipt");
 
+    for cursor in [json!(null), json!(7), json!({}), json!([])] {
+        let invalid = rpc(
+            &action,
+            "app_social_sources_page",
+            json!({"tool_alias":"drafts","cursor":cursor}),
+        )
+        .expect_err("a present non-string cursor must be refused");
+        assert_eq!(invalid.code(), Some("invalid_cursor"), "{invalid}");
+    }
+
     let page = rpc(
         &action,
         "app_social_sources_page",

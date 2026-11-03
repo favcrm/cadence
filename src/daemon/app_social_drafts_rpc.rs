@@ -672,7 +672,7 @@ impl Shared {
         let fence = records.app_social_source_revision(context)?;
         let run_fence = self.store.app_source_run_watermark()?;
         let cursor = match params.get("cursor") {
-            None | Some(Value::Null) => None,
+            None => None,
             Some(Value::String(raw)) => {
                 Some(crate::store::app_social_drafts::source_cursor_decode(
                     &ctx.install_id,

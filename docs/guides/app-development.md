@@ -129,8 +129,9 @@ the install's retained source library through its verified mount:
   `{items, next_cursor, availability}`. An item is `{handle, post}`, where
   `post` is `{id, caption, published_at, permalink, media_kind, thumb_url?,
   receipt_id}` (`published_at` is epoch seconds) and a run-bound item also
-  carries `run_id`. Pages are count- and byte-bounded; `next_cursor` is opaque
-  and null at the end of the retained scan, not the end of provider history.
+  carries `run_id`. Pages are count- and byte-bounded. Omit `cursor` for the
+  first page; a present cursor must be a string. `next_cursor` is opaque and
+  null at the end of the retained scan, not the end of provider history.
   `availability` is `partial` only when retained material is known but cannot
   be verified or delivered — another page does not make it partial.
 - `social.sources.get` — request `{alias, receipt_id, post_id}`, response
