@@ -416,13 +416,16 @@ async function main() {
   assert(host.querySelector('[data-kind="turn"]')?.getAttribute("data-turn-state") === "running", "the hosted run paints as running, not finished");
   assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "the hosted run has one typing row");
   assert(host.querySelector('[data-kind="answer"]') === null && !host.textContent?.includes("Earlier transcript"), "an interim note stays in the trace while the hosted turn runs");
+  // The answer usually arrives a read before the working flag clears.
   await React.act(async () => {
-    resources.masterState.write(() => hostedState(null));
     resources.masterThread.write((state) => ({
       ...state!,
       entries: [...state!.entries, { seq: 74, role: "agent", kind: "turn_result", text: "Hosted answer" }],
     }));
   });
+  await settle();
+  assert(host.querySelectorAll(".turn-head").length === 1, `no second head while the flag catches up (got ${host.querySelectorAll(".turn-head").length})`);
+  await React.act(async () => { resources.masterState.write(() => hostedState(null)); });
   await settle();
   assert(host.querySelectorAll(".turn-head").length === 1 && host.querySelectorAll('[data-kind="answer"]').length === 1, "the answer lands under the one head");
   assert(host.querySelector(".turn-head") === hostedHead, "the answer lands under the same head, not a remounted one");

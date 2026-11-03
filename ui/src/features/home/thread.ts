@@ -493,6 +493,17 @@ export function sendBefore(items: ThreadItem[], runItems: ThreadItem[], queued: 
   return null;
 }
 
+/** An unnamed turn whose answer has landed: the thread ends on an answer, so
+ *  no send is waiting on it. The host's working flag is just about to clear,
+ *  and a placeholder now would paint a second head under the answer. */
+export function unnamedTurnAnswered(items: ThreadItem[]): boolean {
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i].type === "artifact") continue;
+    return items[i].type === "answer";
+  }
+  return false;
+}
+
 /** The assistant item that opens the run still in flight for `message`.
  *  Null when that send has no assistant rows yet, or the run already has
  *  an answer. Hosted transcripts often omit the message id on agent rows,

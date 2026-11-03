@@ -44,6 +44,7 @@ import {
   discardPending,
   sendBefore,
   inFlightTurnKey,
+  unnamedTurnAnswered,
   itemMessage,
   newMessageId,
   rowPaintKey,
@@ -2194,7 +2195,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           // keeps a separate tail and must not reuse the turn's key.
           const reserveTyping =
             turnState.kind === "sending" ||
-            ((turnState.kind === "working" || turnState.kind === "writing") && !typingOwned);
+            ((turnState.kind === "working" || turnState.kind === "writing") && !typingOwned
+              && !(runningUnnamed && unnamedTurnAnswered(shown)));
           // The send this turn belongs to, stable from the optimistic row
           // through the stored operator row: the placeholder keeps that id
           // while the turn is in flight, including the working state before

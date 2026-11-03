@@ -67,6 +67,7 @@ import SinceCard from "./SinceCard";
 import {
   discardPending,
   inFlightTurnKey,
+  unnamedTurnAnswered,
   lastSeq,
   newMessageId,
   openStep,
@@ -639,6 +640,7 @@ const ThreadList = memo(function ThreadList({
         onDiscard={discard}
         activity={(item) => {
           if (flightKey !== null && !flightFlat) return null;
+          if (working?.unnamed === true && unnamedTurnAnswered(shown)) return null;
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
           // The anchored row shows this turn's own newest entry time. A

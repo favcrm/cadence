@@ -21,6 +21,7 @@ import {
   threadItems,
   threadRuns,
   inFlightTurnKey,
+  unnamedTurnAnswered,
   itemMessage,
   sendBefore,
   rowPaintKey,
@@ -596,6 +597,13 @@ main().catch((e) => {
   );
   equal(inFlightTurnKey(answered, "ui-1"), null, "a landed answer is not still in flight");
   equal(inFlightTurnKey(answered, null, true), null, "a landed answer is not in flight for an unnamed turn either");
+  equal(unnamedTurnAnswered(answered), true, "a thread ending on an answer has no send waiting");
+  equal(unnamedTurnAnswered(open), false, "an open run is still waiting");
+  equal(
+    unnamedTurnAnswered([...answered, { type: "pending", key: "pnext", pending: { message: "ui-2", text: "next", state: "sent", at: 1 } }]),
+    false,
+    "a later send keeps its placeholder",
+  );
   equal(inFlightTurnKey([], null, true), null, "an unnamed turn with no rows has nothing to own");
   const tagged = threadItems(
     mergePage(null, {
