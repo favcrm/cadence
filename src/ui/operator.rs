@@ -361,6 +361,16 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     ),
     route(
         "POST",
+        "/api/app-social-drafts/sources/page",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/sources/get",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
         "/api/app-social-drafts/sources/save",
         RouteClass::OperatorOnly,
     ),

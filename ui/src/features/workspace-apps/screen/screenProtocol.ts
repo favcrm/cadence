@@ -80,30 +80,91 @@ export type ScreenSurface = { v: 1; op: "surface"; role: ScreenSurfaceRole; moda
  *  drawer callback, and the frame has an action host. */
 export const SCREEN_DRAWER_OPEN = "screen.drawer.open" as const;
 export const SCREEN_DRAWER_CLOSE = "screen.drawer.close" as const;
+/** SOC-55 — the drawer child's host-local read of the bounded context the
+ *  primary passed to its open. It is never a backend/capability verb. */
+export const SCREEN_DRAWER_CONTEXT = "screen.drawer.context" as const;
 export const SCREEN_DRAWER_VERBS = [SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE] as const;
-export type ScreenDrawerVerb = (typeof SCREEN_DRAWER_VERBS)[number];
+/** A drawer child may close itself and read its own open context, never
+ *  open another drawer. */
+export const SCREEN_DRAWER_CHILD_VERBS = [SCREEN_DRAWER_CLOSE, SCREEN_DRAWER_CONTEXT] as const;
+export type ScreenDrawerVerb = (typeof SCREEN_DRAWER_OPEN) | (typeof SCREEN_DRAWER_CLOSE) | (typeof SCREEN_DRAWER_CONTEXT);
 export const isScreenDrawerVerb = (verb: string): verb is ScreenDrawerVerb =>
-  (SCREEN_DRAWER_VERBS as readonly string[]).includes(verb);
+  verb === SCREEN_DRAWER_OPEN || verb === SCREEN_DRAWER_CLOSE || verb === SCREEN_DRAWER_CONTEXT;
 /** The closed surface idiom a drawer request may name. */
 export const DRAWER_SURFACE = /^[a-z0-9_-]{1,64}$/;
+/** SOC-55 — the bounded, non-authoritative context a primary may hand to its
+ *  own host-created drawer child. It is plain JSON and never a capability. */
+export const DRAWER_CONTEXT_BYTES = 1024;
+export function drawerContextBytes(value: unknown): number | null {
+  // MessagePort accepts structured-clone values that JSON.stringify silently
+  // drops or converts. Reject them before measuring or retaining the context.
+  const ancestors = new Set<object>();
+  let remaining = DRAWER_CONTEXT_BYTES;
+  const plainJson = (item: unknown): boolean => {
+    if (--remaining < 0) return false;
+    if (item === null || typeof item === "boolean") return true;
+    if (typeof item === "string") return item.length <= DRAWER_CONTEXT_BYTES;
+    if (typeof item === "number") return Number.isFinite(item);
+    if (typeof item !== "object" || ancestors.has(item)) return false;
+    const array = Array.isArray(item);
+    const prototype = Object.getPrototypeOf(item);
+    if (!array && prototype !== Object.prototype && prototype !== null) return false;
+    if (array && item.length > DRAWER_CONTEXT_BYTES) return false;
+    ancestors.add(item);
+    let valid = true;
+    if (array) {
+      for (const child of item) if (!plainJson(child)) { valid = false; break; }
+    } else {
+      for (const key in item) {
+        if (Object.hasOwn(item, key) && (key.length > DRAWER_CONTEXT_BYTES || !plainJson((item as Record<string, unknown>)[key]))) {
+          valid = false;
+          break;
+        }
+      }
+    }
+    ancestors.delete(item);
+    return valid;
+  };
+  try {
+    if (!plainJson(value)) return null;
+    const text = JSON.stringify(value);
+    return typeof text === "string" ? new TextEncoder().encode(text).byteLength : null;
+  } catch { return null; }
+}
 /** CAD-1932 — the closed panel widths an open may ask for. `narrow` is the
  *  default; `wide` fits a draft editor. The shell owns the pixels. */
 export type ScreenDrawerSize = "narrow" | "wide";
 /** What a validated drawer request asks the shell to do. */
-export type ScreenDrawerRequest = { mode: "drawer"; surface: string; size?: ScreenDrawerSize } | { mode: "outlet" };
+export type ScreenDrawerRequest =
+  | { mode: "drawer"; surface: string; size?: ScreenDrawerSize; context?: unknown }
+  | { mode: "context" }
+  | { mode: "outlet" };
 /** Parse one drawer request's EXACT arguments, or `null` when they are not
- *  the closed shape (`{surface, size?}` for open, `{}` for close). The host's
- *  argument guard and the records dispatch share this one parser, so a
- *  malformed request — an unknown size included — can never change
- *  geometry on either path. */
+ *  the closed shape (`{surface, size?, context?}` for open, `{}` for close or
+ *  the child's context read). The host's argument guard and the records
+ *  dispatch share this one parser, so a malformed request — an unknown size
+ *  or an unbounded context included — can never change geometry. */
 export function parseScreenDrawerCall(verb: ScreenDrawerVerb, args: ActionArgs): ScreenDrawerRequest | null {
   if (verb === SCREEN_DRAWER_OPEN) {
     const keys = Object.keys(args).sort().join();
-    if (keys !== "surface" && keys !== "size,surface" || typeof args.surface !== "string" || !DRAWER_SURFACE.test(args.surface)) return null;
-    if (keys === "surface") return { mode: "drawer", surface: args.surface };
+    if (!["surface", "size,surface", "context,surface", "context,size,surface"].includes(keys) ||
+        typeof args.surface !== "string" || !DRAWER_SURFACE.test(args.surface)) return null;
+    let context: unknown;
+    if ("context" in args) {
+      const bytes = drawerContextBytes(args.context);
+      if (bytes === null || bytes > DRAWER_CONTEXT_BYTES) return null;
+      // Retain only the measured JSON, detached from the incoming message.
+      try { context = JSON.parse(JSON.stringify(args.context)); } catch { return null; }
+    }
+    if (!("size" in args)) return context === undefined
+      ? { mode: "drawer", surface: args.surface }
+      : { mode: "drawer", surface: args.surface, context };
     if (args.size !== "narrow" && args.size !== "wide") return null;
-    return { mode: "drawer", surface: args.surface, size: args.size };
+    return context === undefined
+      ? { mode: "drawer", surface: args.surface, size: args.size }
+      : { mode: "drawer", surface: args.surface, size: args.size, context };
   }
+  if (verb === SCREEN_DRAWER_CONTEXT) return Object.keys(args).length === 0 ? { mode: "context" } : null;
   return Object.keys(args).length === 0 ? { mode: "outlet" } : null;
 }
 
@@ -116,7 +177,7 @@ export function parseScreenDrawerCall(verb: ScreenDrawerVerb, args: ActionArgs):
  *  start, the original download and the image picker. Confirm and schedule
  *  also stay slot verbs until every installed app sends them as calls
  *  (Social Content 0.12.10 still sends slots). */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "publish.destination.use", "publish.destination.remove", "publish.settings.save", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.chat.attach"] as const;
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "screen.drawer.context", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.page", "social.sources.get", "social.sources.save", "social.destinations.list", "publish.destination.use", "publish.destination.remove", "publish.settings.save", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.chat.attach"] as const;
 export const SLOT_VERBS = ["run.start", "publish.draft.confirm", "publish.draft.schedule", "media.original.download", "social.image.pick"] as const;
 /** CAD-1365 — the protected original download slot. Qualified per mount
  *  (screen-media.v1 + media.read + live token); never a generic action verb. */
@@ -132,7 +193,7 @@ export const isMediaVerb = (verb: string): verb is MediaVerb =>
 /** The verbs a screen.v2 PUSH advertises in `actions` — media verbs are
  *  deliberately absent; the channel appends a mount's declared media
  *  rights itself. */
-export const ACTION_VERBS: string[] = [...new Set([...CALL_VERBS.filter(v => !(MEDIA_VERBS as readonly string[]).includes(v)), ...SLOT_VERBS.filter(v => v !== ORIGINAL_DOWNLOAD_VERB)])];
+export const ACTION_VERBS: string[] = [...new Set([...CALL_VERBS.filter(v => !(MEDIA_VERBS as readonly string[]).includes(v) && v !== SCREEN_DRAWER_CONTEXT), ...SLOT_VERBS.filter(v => v !== ORIGINAL_DOWNLOAD_VERB)])];
 export const RECORD_CALL_VERBS = ["records.list", "records.show", "records.create", "records.update", "records.csv.preview", "segments.list", "segments.show", "segments.save", "exclusions.list", "exclusions.show", "exclusions.save", "suppressions.list", "suppressions.add", "audience.preview", "audience.prepare", "audience.show", "content.list", "content.show", "content.save", "content.clone", "content.render", "proposals.list", "proposals.show", "proposals.render", "proposals.apply", "proposals.discard", "sender-bindings.list", "sender-bindings.show", "sender-bindings.save", "content.test-prepare", "content.send-prepare", "sends.prepare", "sends.show", "sends.list", "sends.cancel", "smtp.show", "origin.show", "campaign-work.show", "campaign-work.save", "screen.preview.show", "screen.preview.clear", "screen.route.patch", "whatsapp.status", "whatsapp.connect_session", "whatsapp.conversations.list", "whatsapp.conversations.show", "whatsapp.messages", "whatsapp.reply.prepare", "whatsapp.reply.status", "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.prepare", "whatsapp.template.status", "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate", "whatsapp.broadcast.results", "whatsapp.broadcast.draft", "whatsapp.broadcast.test.prepare", "whatsapp.broadcast.prepare", "whatsapp.handoff.set", "chat.whatsapp.open", "whatsapp.draft.show", "whatsapp.draft.discard", "works.query", "works.get", "works.create", "works.patch", "works.trash", "works.restore", "works.request_review"] as const;
 export const RECORD_SLOT_VERBS = ["records.csv.import", "records.csv.confirm", "content.approve", "smtp.manage", "smtp.bind", "smtp.rebind", "smtp.revoke", "smtp.test-send", "sends.approve", "sends.resolve", "origin.manage", "chat.campaign.open", "chat.campaign.brief", "whatsapp.reply.send", "whatsapp.template.send", "whatsapp.broadcast.test.send", "whatsapp.broadcast.send", "whatsapp.broadcast.stop", "whatsapp.handoff.release", "chat.whatsapp.brief", "works.review", "works.export"] as const;
 export const RECORD_OPERATIONS: readonly string[] = [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];

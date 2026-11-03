@@ -41,7 +41,7 @@ function mountRefusalCode(body: unknown): string | null {
  *  its host-private action token to that child's mount request. Role is
  *  host-derived: `surfaceRole` is set by the host's own mount, never by the
  *  frame. */
-export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, surfaceRole = "primary", drawerSurface, drawerTarget, parentActionToken }: {
+export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, surfaceRole = "primary", drawerSurface, drawerTarget, parentActionToken, drawerContext }: {
   projection: ScreenPush; fallback: ReactNode;
   /** Render the specific pane for a mount failure; absent keeps `fallback`. */
   renderFailure?: ScreenFailurePane;
@@ -59,7 +59,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
    *  `screen-surfaces.v1` capability: an independent open mounts a separate
    *  drawer frame in the shell's fixed overlay instead of promoting this
    *  one. */
-  onScreenDrawer?: (mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize) => void;
+  onScreenDrawer?: (mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize, context?: unknown) => void;
   /** CAD-1615 — which surface this frame is presented in (legacy). */
   presentation?: ScreenPresentationMode;
   /** CAD-1777 — the host-derived role of THIS outlet. */
@@ -72,6 +72,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   /** CAD-1777 — the primary's host-private action token, used ONLY for the
    *  child's private mount POST. It never reaches the child port or DOM. */
   parentActionToken?: string;
+  /** SOC-55 — the bounded, non-authoritative context this host-created
+   *  drawer child was opened with; readable only through the drawer child's
+   *  own `screen.drawer.context` call. */
+  drawerContext?: unknown;
 }) {
   const { t, locale } = useLocale();
   const presentationLocale = useRef(locale);
@@ -114,6 +118,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // the shell to open, and the shell-private action token for the child's
   // mount POST (never rendered, never sent over a port).
   const [overlay, setOverlay] = useState<string | null>(null);
+  const [overlayContext, setOverlayContext] = useState<unknown>(null);
   const overlayRef = useRef<string | null>(null);
   overlayRef.current = overlay;
   const actionTokenRef = useRef<string | null>(null);
@@ -123,19 +128,21 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // The one place the two overlay verbs act. Kept in a ref so the mount
   // effect (scoped to the frame identity) always calls the current
   // callbacks without restarting the frame.
-  const drawerApi = useRef<{ open: (surface: string, size?: ScreenDrawerSize) => void; close: () => void }>({ open: () => {}, close: () => {} });
+  const drawerApi = useRef<{ open: (surface: string, size?: ScreenDrawerSize, context?: unknown) => void; close: () => void }>({ open: () => {}, close: () => {} });
   drawerApi.current = {
-    open: (surface: string, size?: ScreenDrawerSize) => {
+    open: (surface: string, size?: ScreenDrawerSize, context?: unknown) => {
       if (!primary) return;
       const shell = navigationCallbacks.current.onScreenDrawer;
       // No live shell drawer target: never leave a local "open" state with
       // nothing to show. The frame keeps its normal list.
       if (!shell) return;
       setOverlay(surface);
+      setOverlayContext(context ?? null);
       shell("drawer", surface, true, size);
     },
     close: () => {
       setOverlay(null);
+      setOverlayContext(null);
       navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true);
     },
   };
@@ -151,12 +158,18 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   useEffect(() => {
     channel.current?.surface(surfaceRole, primary && overlay !== null, primary ? undefined : drawerSurface);
   }, [surfaceRole, primary, overlay, state]);
+  // SOC-55 — the drawer child's own open context. It is host-local data,
+  // never authority; a closed/reopened drawer gets a new mount and a fresh
+  // value.
+  useEffect(() => {
+    channel.current?.setDrawerContext(drawerContext ?? null);
+  }, [drawerContext, state]);
   // The shell closed the overlay (scrim, Escape, route loss): drop the
   // child. Only a target that was really attached and then removed counts,
   // so the first open does not clear itself while the shell renders it.
   useEffect(() => {
     if (drawerTarget) { hadDrawerTarget.current = true; return; }
-    if (hadDrawerTarget.current) { hadDrawerTarget.current = false; setOverlay(null); }
+    if (hadDrawerTarget.current) { hadDrawerTarget.current = false; setOverlay(null); setOverlayContext(null); }
   }, [drawerTarget]);
   const scope = JSON.stringify([projection.install_id, projection.digest, projection.tag, projection.context_id]);
   useLayoutEffect(() => {
@@ -317,7 +330,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
             onSlot: view => { if (isCurrent()) setSlot(view); },
             onLink: url => { if (isCurrent()) setLink(url); },
             onScreenDrawer: onScreenDrawer
-              ? (mode, surface, independent, size) => {
+              ? (mode, surface, independent, size, context) => {
                   if (!isCurrent()) return;
                   // A drawer frame may only close itself; it never opens
                   // another drawer. The native parent proof refuses it too.
@@ -325,7 +338,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
                   // Independent opens mount a separate child frame in the
                   // shell's fixed overlay; this primary never moves.
                   if (independent) {
-                    if (mode === "drawer") drawerApi.current.open(surface ?? "", size);
+                    if (mode === "drawer") drawerApi.current.open(surface ?? "", size, context);
                     else drawerApi.current.close();
                     return;
                   }
@@ -350,6 +363,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         // state is stored before the handshake, so `send()` can post it
         // before the first projection.
         owned.surfaceRole = surfaceRole;
+        owned.setDrawerContext(drawerContext);
         owned.surface(surfaceRole, primary && overlayRef.current !== null, primary ? undefined : drawerSurface);
         channel.current = owned;
         frame.addEventListener("load", () => owned?.load());
@@ -453,6 +467,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         onToolInvoked={onToolInvoked}
         surfaceRole="drawer"
         drawerSurface={overlay ?? undefined}
+        drawerContext={overlayContext}
         parentActionToken={drawerToken}
         onRoute={navigationCallbacks.current.onRoute}
         onCommand={navigationCallbacks.current.onCommand}

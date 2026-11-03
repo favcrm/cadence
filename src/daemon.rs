@@ -3948,6 +3948,8 @@ impl Shared {
             | "app_social_draft_discard"
             | "app_social_draft_asset"
             | "app_social_sources_show"
+            | "app_social_sources_page"
+            | "app_social_sources_get"
             | "app_social_sources_save" => self.rpc_app_social_draft(method, params, peer_pid),
             "business_template_create"
             | "business_template_revise"

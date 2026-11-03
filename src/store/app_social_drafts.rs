@@ -62,7 +62,9 @@ CREATE TABLE IF NOT EXISTS app_social_effects(\
  draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE,\
  digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL \
  CHECK(state IN ('waiting','approved','scheduled','cancelled','declined','sending','posted','refused')) ,\
- approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, due_epoch INTEGER, timezone TEXT, created REAL NOT NULL, updated REAL NOT NULL);";
+ approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, due_epoch INTEGER, timezone TEXT, created REAL NOT NULL, updated REAL NOT NULL);\
+CREATE TABLE IF NOT EXISTS app_social_source_revision(\
+ context_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);";
 
 pub const CAPTION_MAX_SCALARS: usize =
     crate::platform::agenticos_external::publish::DEVICE_PUBLISH_MAX_CAPTION_SCALARS;
@@ -149,6 +151,167 @@ pub struct SocialDraft {
     pub asset_id: Option<String>,
     pub created_at: f64,
     pub updated_at: f64,
+}
+
+/// SOC-55: one retained receipt the paged source library may read. The caller
+/// re-proves the receipt itself, so a legacy row is either a real source read
+/// or honestly unverifiable — never guessed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceCandidate {
+    pub receipt_id: String,
+    pub completed_at: f64,
+}
+
+/// SOC-55: the keyset position of the next retained source item. `post` is
+/// the index of the next post to emit from `receipt_id` (0 when the receipt
+/// itself is the next thing to examine). The encoded cursor carries the
+/// host's verified install and context, so a cursor minted for another scope
+/// can never silently skip this one's retained material.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceCursor {
+    /// The context's candidate-set revision when the scan started. A page
+    /// whose cursor names a different revision is refused, so a concurrent
+    /// insert (equal timestamp, backdated or head) can never join a scan that
+    /// already began.
+    pub revision: u64,
+    pub completed_at: f64,
+    pub receipt_id: String,
+    pub post: usize,
+    /// The `app_capability_results` rowid upper bound when the scan started.
+    /// Run receipts are immutable and never deleted, so this insertion
+    /// watermark fixes the run-bound snapshot even when a later row carries an
+    /// equal or backdated `created` or a lexically smaller id.
+    pub run_fence: Option<i64>,
+}
+
+/// A cursor is a bounded opaque string; the encoded scope digest plus a
+/// receipt id and a post index fit well inside this.
+const SOURCE_CURSOR_MAX: usize = 560;
+/// A retained source read holds at most the provider's page of posts; the
+/// index is bounded so a forged cursor cannot name an unbounded position.
+const SOURCE_POST_INDEX_MAX: usize = 256;
+
+fn source_scope(install: &str, context: &str) -> String {
+    let material = json!(["social.sources.page", install, context]);
+    let digest = crate::store::app_runs::material_digest(&material);
+    digest
+        .strip_prefix("sha256:")
+        .unwrap_or(digest.as_str())
+        .to_owned()
+}
+
+pub fn source_receipt_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// SOC-55: every mutation of this context's source-candidate set bumps one
+/// counter in the same transaction. A paged scan carries the counter it began
+/// with, so any concurrent insert or replacement — including an equal
+/// timestamp with a lexicographically earlier or later id, or a backdated
+/// receipt — makes the next page refuse instead of silently joining the scan.
+fn bump_source_revision(tx: &rusqlite::Connection, context: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO app_social_source_revision(context_id,revision) VALUES(?,1)
+         ON CONFLICT(context_id) DO UPDATE SET revision=revision+1",
+        [context],
+    )?;
+    Ok(())
+}
+
+/// Encode the next-item position as the opaque cursor the app echoes back.
+/// It is not a credential: the daemon re-validates it and the scope digest
+/// makes a cross-scope cursor a refusal rather than a silent skip.
+pub fn source_cursor_encode(install: &str, context: &str, cursor: &SourceCursor) -> String {
+    use base64::Engine;
+    let run_at = match cursor.run_fence {
+        Some(rowid) => rowid.to_string(),
+        None => "-".to_owned(),
+    };
+    let payload = format!(
+        "v1:{}:{}:{:016x}:{}:{}:{}",
+        source_scope(install, context),
+        cursor.revision,
+        cursor.completed_at.to_bits(),
+        cursor.receipt_id,
+        cursor.post,
+        run_at
+    );
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes())
+}
+
+/// Decode a cursor for exactly this verified scope. Anything malformed, out
+/// of bounds or minted for another install/context is refused: a cursor that
+/// cannot be proven to belong to this scan must not advance it.
+pub fn source_cursor_decode(install: &str, context: &str, raw: &str) -> Result<SourceCursor> {
+    use base64::Engine;
+    let invalid = || {
+        Error::invalid(
+            "invalid_cursor",
+            "social source cursor is not valid for this scan",
+        )
+    };
+    if raw.is_empty() || raw.len() > SOURCE_CURSOR_MAX {
+        return Err(invalid());
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw.as_bytes())
+        .map_err(|_| invalid())?;
+    let text = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let mut parts = text.split(':');
+    let (
+        Some("v1"),
+        Some(scope),
+        Some(revision),
+        Some(bits),
+        Some(receipt_id),
+        Some(post),
+        Some(run_fence),
+        None,
+    ) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    )
+    else {
+        return Err(invalid());
+    };
+    let expected_scope = source_scope(install, context);
+    if scope != expected_scope.as_str() || !source_receipt_id_valid(receipt_id) {
+        return Err(invalid());
+    }
+    let revision: u64 = revision.parse().map_err(|_| invalid())?;
+    let bits = u64::from_str_radix(bits, 16).map_err(|_| invalid())?;
+    let completed_at = f64::from_bits(bits);
+    if !completed_at.is_finite() || completed_at < 0.0 {
+        return Err(invalid());
+    }
+    let post: usize = post.parse().map_err(|_| invalid())?;
+    if post > SOURCE_POST_INDEX_MAX {
+        return Err(invalid());
+    }
+    let run_fence = match run_fence {
+        "-" => None,
+        rowid => Some(rowid.parse::<i64>().map_err(|_| invalid())?),
+    };
+    if run_fence.is_some_and(|rowid| rowid < 0) {
+        return Err(invalid());
+    }
+    Ok(SourceCursor {
+        revision,
+        completed_at,
+        receipt_id: receipt_id.to_owned(),
+        post,
+        run_fence,
+    })
 }
 
 fn valid_caption(caption: &str) -> Result<()> {
@@ -372,7 +535,11 @@ pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS app_social_tool_receipts_source_order
           ON app_social_tool_receipts(install_id,context_id,kind,completed_at DESC,receipt_id DESC);
          CREATE INDEX IF NOT EXISTS app_social_freshness_source_order
-          ON app_social_freshness(install_id,context_id,completed_at DESC,handle);",
+          ON app_social_freshness(install_id,context_id,completed_at DESC,handle);
+         -- SOC-55: the paged library resolves each freshness candidate's
+         -- receipt against this context, so that membership probe is a lookup.
+         CREATE INDEX IF NOT EXISTS app_social_freshness_receipt
+          ON app_social_freshness(install_id,context_id,receipt_id);",
     )?;
     // CAD-1303: soft discard marker. Additive; the file schema version stays.
     let draft_columns = conn
@@ -605,7 +772,11 @@ impl RecordStore {
             ));
         }
         self.write_tx(|tx| {
-            tx.execute("INSERT INTO app_social_freshness(install_id,context_id,handle,receipt_id,completed_at) VALUES(?,?,?,?,?) ON CONFLICT(context_id,handle) DO UPDATE SET receipt_id=excluded.receipt_id,completed_at=excluded.completed_at WHERE excluded.completed_at>app_social_freshness.completed_at OR (excluded.completed_at=app_social_freshness.completed_at AND excluded.receipt_id>app_social_freshness.receipt_id)", params![self.install(), context, handle, receipt, completed])?;
+            let changed = tx.execute("INSERT INTO app_social_freshness(install_id,context_id,handle,receipt_id,completed_at) VALUES(?,?,?,?,?) ON CONFLICT(context_id,handle) DO UPDATE SET receipt_id=excluded.receipt_id,completed_at=excluded.completed_at WHERE excluded.completed_at>app_social_freshness.completed_at OR (excluded.completed_at=app_social_freshness.completed_at AND excluded.receipt_id>app_social_freshness.receipt_id)", params![self.install(), context, handle, receipt, completed])?;
+            // A replaced or new freshness read is a new candidate row.
+            if changed == 1 {
+                bump_source_revision(tx, context)?;
+            }
             Ok(())
         })
     }
@@ -846,10 +1017,42 @@ impl RecordStore {
         completed: f64,
         kind: &str,
     ) -> Result<()> {
-        self.write_tx(|tx|{tx.execute("INSERT OR IGNORE INTO app_social_tool_receipts(install_id,context_id,receipt_id,completed_at,kind) VALUES(?,?,?,?,?)",params![self.install(),context,receipt,completed,kind])?;Ok(())})
+        self.write_tx(|tx|{
+            let changed=tx.execute("INSERT OR IGNORE INTO app_social_tool_receipts(install_id,context_id,receipt_id,completed_at,kind) VALUES(?,?,?,?,?)",params![self.install(),context,receipt,completed,kind])?;
+            // Only a source-eligible row can join the library page; an upload
+            // or caption never invalidates a scan in progress.
+            if changed == 1 && matches!(kind, "social.source.posts" | "") {
+                bump_source_revision(tx, context)?;
+            }
+            Ok(())
+        })
     }
     pub fn app_social_tool_receipt_contains(&self, context: &str, receipt: &str) -> Result<bool> {
         Ok(self.conn().query_row("SELECT EXISTS(SELECT 1 FROM app_social_tool_receipts WHERE install_id=? AND context_id=? AND receipt_id=?)",params![self.install(),context,receipt],|r|r.get(0))?)
+    }
+
+    /// SOC-55: the context's source-candidate revision. The paged scan reads
+    /// it before its first query and carries it in every cursor; a page whose
+    /// cursor names another revision is refused, so the scan is a snapshot.
+    pub fn app_social_source_revision(&self, context: &str) -> Result<u64> {
+        let revision: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT revision FROM app_social_source_revision WHERE context_id=?",
+                [context],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(revision.unwrap_or(0).max(0) as u64)
+    }
+
+    /// SOC-55: a legacy retained source read that never reached the attachment
+    /// table is still this context's own receipt — the freshness row was
+    /// written when this context fetched the handle. The page and the exact
+    /// lookup treat that as the context link the attachment would have been;
+    /// a source-backed draft does not (it keeps the attachment requirement).
+    pub fn app_social_freshness_contains(&self, context: &str, receipt: &str) -> Result<bool> {
+        Ok(self.conn().query_row("SELECT EXISTS(SELECT 1 FROM app_social_freshness WHERE install_id=? AND context_id=? AND receipt_id=?)",params![self.install(),context,receipt],|r|r.get(0))?)
     }
 
     /// SOC-54: the candidate source receipts of this context, bounded. Typed
@@ -1340,5 +1543,134 @@ impl RecordStore {
             tx.execute("INSERT INTO app_social_source_requests(request_id,install_id,context_id,intent_digest,at) VALUES(?,?,?,?,?)",params![request,self.install(),context,intent,at])?;
             Ok(json!({"revision":next,"handles":normalized,"updated_at":at}))
         })
+    }
+
+    /// SOC-55: the next retained attachment candidates of this context, in
+    /// the page's `(completed_at DESC, receipt_id DESC)` order after `after`.
+    /// Only the two source-eligible kinds are read — a typed source read or a
+    /// row retained before the kind column existed — so uploads and captions
+    /// can never consume the scan at any threshold. Each kind arm is an
+    /// ordered walk of `app_social_tool_receipts_source_order`; the merged
+    /// result is the union's exact head because both arms are sorted.
+    pub fn app_social_source_candidates(
+        &self,
+        context: &str,
+        after: Option<(f64, &str)>,
+        limit: usize,
+    ) -> Result<Vec<SourceCandidate>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut rows =
+            self.source_candidates_of_kind(context, "social.source.posts", after, limit)?;
+        rows.extend(self.source_candidates_of_kind(context, "", after, limit)?);
+        rows.sort_by(|a, b| {
+            b.completed_at
+                .total_cmp(&a.completed_at)
+                .then_with(|| b.receipt_id.cmp(&a.receipt_id))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    fn source_candidates_of_kind(
+        &self,
+        context: &str,
+        kind: &str,
+        after: Option<(f64, &str)>,
+        limit: usize,
+    ) -> Result<Vec<SourceCandidate>> {
+        let conn = self.conn();
+        let sql = match after {
+            Some(_) => {
+                "SELECT receipt_id,completed_at FROM app_social_tool_receipts
+                  WHERE install_id=? AND context_id=? AND kind=?
+                    AND (completed_at<? OR (completed_at=? AND receipt_id<?))
+                  ORDER BY completed_at DESC, receipt_id DESC LIMIT ?"
+            }
+            None => {
+                "SELECT receipt_id,completed_at FROM app_social_tool_receipts
+                  WHERE install_id=? AND context_id=? AND kind=?
+                  ORDER BY completed_at DESC, receipt_id DESC LIMIT ?"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let row = |r: &rusqlite::Row<'_>| {
+            Ok(SourceCandidate {
+                receipt_id: r.get::<_, String>(0)?,
+                completed_at: r.get::<_, f64>(1)?,
+            })
+        };
+        let rows = match after {
+            Some((at, id)) => stmt
+                .query_map(
+                    params![self.install(), context, kind, at, at, id, limit as i64],
+                    row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map(params![self.install(), context, kind, limit as i64], row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// SOC-55: retained `sources_freshness` reads that never reached the
+    /// attachment table — the pre-kind upgrade path. They are still this
+    /// context's attributable source reads, so paging must include them; a
+    /// receipt that is attached already is left to the attachment arm so it
+    /// appears once. Ordered newest-first with the same keyset. The table
+    /// holds one row per handle ever saved in the context, so ordering it is
+    /// bounded by handle churn, not by receipt history.
+    pub fn app_social_freshness_candidates(
+        &self,
+        context: &str,
+        after: Option<(f64, &str)>,
+        limit: usize,
+    ) -> Result<Vec<SourceCandidate>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn();
+        let sql = match after {
+            Some(_) => {
+                "SELECT f.receipt_id,f.completed_at FROM app_social_freshness f
+                  WHERE f.install_id=? AND f.context_id=?
+                    AND NOT EXISTS (SELECT 1 FROM app_social_tool_receipts a
+                                     WHERE a.install_id=f.install_id
+                                       AND a.context_id=f.context_id
+                                       AND a.receipt_id=f.receipt_id)
+                    AND (f.completed_at<? OR (f.completed_at=? AND f.receipt_id<?))
+                  ORDER BY f.completed_at DESC, f.receipt_id DESC LIMIT ?"
+            }
+            None => {
+                "SELECT f.receipt_id,f.completed_at FROM app_social_freshness f
+                  WHERE f.install_id=? AND f.context_id=?
+                    AND NOT EXISTS (SELECT 1 FROM app_social_tool_receipts a
+                                     WHERE a.install_id=f.install_id
+                                       AND a.context_id=f.context_id
+                                       AND a.receipt_id=f.receipt_id)
+                  ORDER BY f.completed_at DESC, f.receipt_id DESC LIMIT ?"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let row = |r: &rusqlite::Row<'_>| {
+            Ok(SourceCandidate {
+                receipt_id: r.get::<_, String>(0)?,
+                completed_at: r.get::<_, f64>(1)?,
+            })
+        };
+        let rows = match after {
+            Some((at, id)) => stmt
+                .query_map(
+                    params![self.install(), context, at, at, id, limit as i64],
+                    row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map(params![self.install(), context, limit as i64], row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        Ok(rows)
     }
 }

@@ -89,6 +89,40 @@ async function main() {
   assert(sent.length === 1, "refused discards never reach the host");
   equal(plainRefusal(new ApiError("x", 400, { code: "draft_in_use" })).code, "draft_in_use", "draft_in_use code");
   equal(plainRefusal(new ApiError("revision is stale", 409, { code: "stale_revision" })).code, "stale_revision", "stale_revision code");
+  // SOC-55: the retained library page and the exact source read go through
+  // the mounted draft alias; a caller-supplied scope field never leaves the
+  // frame, and the opaque cursor is relayed only when it is a bounded string.
+  const sourceCalls: { url: string; body: Record<string, unknown> }[] = [];
+  globalThis.fetch = async (input, init) => {
+    sourceCalls.push({ url: String(input), body: JSON.parse(String(init?.body ?? "{}")) });
+    return new Response(JSON.stringify({ items: [], next_cursor: null, availability: "available" }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  const firstPage = await runCall(ctx, "social.sources.page", { alias: "social.draft" }, withToken);
+  assert(firstPage.ok && sourceCalls.length === 1 && sourceCalls[0].url.endsWith("/api/app-social-drafts/sources/page"), "page uses its own route");
+  equal(Object.keys(sourceCalls[0].body).sort(), ["action_token", "tool_alias"], "page without a cursor sends only the alias");
+  const longCursor = "a".repeat(607);
+  await runCall(ctx, "social.sources.page", { alias: "social.draft", cursor: longCursor }, withToken);
+  equal(Object.keys(sourceCalls[1].body).sort(), ["action_token", "cursor", "tool_alias"], "page relays the opaque cursor");
+  equal(sourceCalls[1].body.cursor, longCursor, "a valid hosted cursor is relayed without truncation");
+  for (const bad of [{ alias: "social.draft", cursor: "" }, { alias: "social.draft", cursor: 1 },
+    { alias: "social.draft", cursor: "a".repeat(2049) }, { alias: "social.draft", cursor: "x", extra: 1 }]) {
+    const refused = await runCall(ctx, "social.sources.page", bad as Record<string, unknown>, withToken);
+    assert(!refused.ok && refused.refusal.code === "bad_args", `page refuses ${JSON.stringify(bad)}`);
+  }
+  equal(sourceCalls.length, 2, "refused pages never reach the host");
+  const exact = await runCall(ctx, "social.sources.get",
+    { alias: "social.draft", receipt_id: "app-tool-1", post_id: "post-1" }, withToken);
+  assert(exact.ok && sourceCalls[2].url.endsWith("/api/app-social-drafts/sources/get"), "get uses its own route");
+  equal(Object.keys(sourceCalls[2].body).sort(), ["action_token", "post_id", "receipt_id", "tool_alias"], "get body fields");
+  for (const bad of [{ alias: "social.draft", receipt_id: "r" }, { alias: "social.draft", receipt_id: "", post_id: "p" },
+    { alias: "social.draft", receipt_id: "r", post_id: "" },
+    { alias: "social.draft", receipt_id: "r", post_id: "p", cursor: "x" }]) {
+    const refused = await runCall(ctx, "social.sources.get", bad, withToken);
+    assert(!refused.ok && refused.refusal.code === "bad_args", `get refuses ${JSON.stringify(bad)}`);
+  }
+  equal(sourceCalls.length, 3, "refused lookups never reach the host");
+  equal(plainRefusal(new ApiError("x", 400, { code: "stale_cursor" })).code, "stale_cursor", "a stale cursor keeps its code so the app can restart");
+  equal(plainRefusal(new ApiError("x", 400, { code: "invalid_cursor" })).code, "invalid_cursor", "an invalid cursor keeps its code");
   console.log("screenActionsCad1288 ok");
 }
 main().catch(error => { console.error(error); { throw error; }; });

@@ -505,6 +505,99 @@ impl Store {
         )
     }
 
+    /// SOC-55: the `app_capability_results` rowid upper bound at scan start.
+    /// Rowid is the insertion order, not the host clock: a later receipt with
+    /// an equal or backdated `created` and any id is excluded from a scan that
+    /// began earlier. Receipts are immutable and never deleted, so the bound
+    /// is a stable snapshot of the run-bound rows.
+    pub(crate) fn app_source_run_watermark(&self) -> Result<i64> {
+        Ok(self.conn().query_row(
+            "SELECT COALESCE(MAX(rowid),0) FROM app_capability_results",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub(crate) fn app_source_run_candidates(
+        &self,
+        install: &str,
+        context: &str,
+        after: Option<(f64, &str)>,
+        fence: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, f64, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn();
+        let sql = match after {
+            Some(_) => {
+                "SELECT r.id,r.created,r.run_id FROM app_capability_results r
+                  JOIN app_runs a ON a.id=r.run_id
+                  WHERE a.install_id=? AND a.context_id=? AND r.rowid<=?
+                    AND json_extract(r.result,'$.kind')='social.source.posts'
+                    AND (r.created<? OR (r.created=? AND r.id<?))
+                  ORDER BY r.created DESC,r.id DESC LIMIT ?"
+            }
+            None => {
+                "SELECT r.id,r.created,r.run_id FROM app_capability_results r
+                  JOIN app_runs a ON a.id=r.run_id
+                  WHERE a.install_id=? AND a.context_id=? AND r.rowid<=?
+                    AND json_extract(r.result,'$.kind')='social.source.posts'
+                  ORDER BY r.created DESC,r.id DESC LIMIT ?"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = match after {
+            Some((at, id)) => stmt
+                .query_map(
+                    params![install, context, fence, at, at, id, limit as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map(params![install, context, fence, limit as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// SOC-55: a run-bound source read of this install/context. Broker turns
+    /// use the existing draft proof; native host executions use their approved
+    /// step and exact claim. This read does not widen draft authorization.
+    /// `None` means the receipt is not provable; nothing is guessed.
+    pub(crate) fn app_source_run_receipt(
+        &self,
+        install: &str,
+        context: &str,
+        receipt_id: &str,
+    ) -> Option<(Value, String)> {
+        let receipt = self.app_capability_result(receipt_id).ok()?;
+        if receipt["result"]["kind"].as_str() != Some("social.source.posts") {
+            return None;
+        }
+        let run_id = receipt["run_id"].as_str()?.to_owned();
+        let run = self.app_run_show(&run_id).ok()?;
+        if run["install_id"].as_str() != Some(install)
+            || run["context_id"].as_str() != Some(context)
+        {
+            return None;
+        }
+        // Two supported producers: a broker-turn agent step (message/turn
+        // present) and the native host executor, which records with an empty
+        // message/turn and proves the approved dispatched step plus its exact
+        // immutable claim. Read authorization only; draft authorization is
+        // unchanged.
+        if receipt["message_id"].as_str() == Some("") {
+            source_host_receipt_recoverable_in(&self.conn(), &run, &receipt).ok()?;
+        } else {
+            source_receipt_recoverable_in(&self.conn(), &run, &receipt).ok()?;
+        }
+        Some((receipt, run_id))
+    }
+
     pub(crate) fn app_capability_asset(&self, id: &str) -> Result<Value> {
         let (receipt, bytes) = asset_material_in(&self.conn(), id)?;
         use base64::Engine;
@@ -513,6 +606,44 @@ impl Store {
             "size":bytes.len(),"base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
         )
     }
+}
+
+/// A host-executed run records its capability receipt with an empty message
+/// and turn (`execute_host_run`); the proof is the approved dispatched step and
+/// the exact immutable claim that reserved the call. This is the read-side
+/// counterpart of the broker-turn proof above; it grants no draft authority.
+pub(super) fn source_host_receipt_recoverable_in(
+    conn: &impl super::StoreConn,
+    run: &Value,
+    receipt: &Value,
+) -> Result<()> {
+    if !matches!(run["state"].as_str(), Some("succeeded" | "failed"))
+        || run["approved_digest"] != run["snapshot_digest"]
+        || receipt["run_id"] != run["id"]
+        || receipt["message_id"].as_str() != Some("")
+    {
+        return Err(Error::rejected(
+            "source run has no recoverable approved host receipt",
+        ));
+    }
+    let belongs_to_host_step: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM app_capability_results r
+         JOIN app_capability_claims c ON c.run_id=r.run_id AND c.slot=r.slot
+         JOIN app_run_steps s ON s.run_id=r.run_id AND s.step_id=r.step_id
+         WHERE r.id=?1 AND r.run_id=?2 AND r.message_id=''
+         AND s.state IN ('dispatched','succeeded','failed')
+         AND c.step_id=r.step_id AND c.request_id=r.request_id
+         AND c.binding_digest=r.binding_digest AND c.input_digest=r.input_digest
+         AND c.call_id=r.id)",
+        params![receipt["id"].as_str(), run["id"].as_str()],
+        |r| r.get(0),
+    )?;
+    if !belongs_to_host_step {
+        return Err(Error::rejected(
+            "source receipt lacks its approved host step and claim",
+        ));
+    }
+    Ok(())
 }
 
 /// A later failed step does not erase a broker-recorded read. Recovery is

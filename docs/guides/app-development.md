@@ -111,8 +111,40 @@ Rules:
   intended path for a host that does not present.
 - The host owns the drawer geometry, scrim and close affordance. The app owns
   its surface and forwards close/Escape only when it has its own fallback.
+- An independent drawer open may carry a bounded, non-authoritative `context`
+  (plain JSON, at most 1024 UTF-8 bytes) for the host-created child. Only that
+  child may read it with `screen.drawer.context {}`; it is never backend or
+  capability authority, never crosses to a sibling mount, and a reopen starts
+  empty. An older host refuses the unknown open argument in place, so the app
+  keeps its local fallback.
 - The app still validates its own PUSH payload and its own verb arguments; the
   kit is transport and lifecycle only.
+
+### Retained source reads
+
+A `screen-actions.v1` screen whose manifest declares the draft alias may read
+the install's retained source library through its verified mount:
+
+- `social.sources.page` — request `{alias, cursor?}`, response
+  `{items, next_cursor, availability}`. An item is `{handle, post}`, where
+  `post` is `{id, caption, published_at, permalink, media_kind, thumb_url?,
+  receipt_id}` (`published_at` is epoch seconds) and a run-bound item also
+  carries `run_id`. Pages are count- and byte-bounded; `next_cursor` is opaque
+  and null at the end of the retained scan, not the end of provider history.
+  `availability` is `partial` only when retained material is known but cannot
+  be verified or delivered — another page does not make it partial.
+- `social.sources.get` — request `{alias, receipt_id, post_id}`, response
+  `{item}` or `{item: null}`. It resolves an older draft's exact receipt/post
+  pair (including its `run_id`) without paging; a missing, foreign or
+  mismatched pair never reveals another receipt.
+
+Scope is the host's verified mount and context, never a request field. A scan
+is a snapshot: its cursor is bound to the scope and to the scan's fence, and
+if the retained library moves mid-scan the host refuses with `stale_cursor`
+(or `invalid_cursor` for a malformed cursor) so the client restarts without
+discarding cards it already showed. A source-backed draft still requires the
+receipt to be attached to the context, and its handle to remain a saved
+source.
 
 ## 4. Local loop
 
