@@ -138,6 +138,10 @@ globalThis.fetch = async (input, init) => {
   if (init?.method && init.method !== "GET")
     throw new Error("Agents must not write");
   const path = new URL(String(input), "http://localhost").pathname;
+  if (path.startsWith("/api/threads/"))
+    return new Response(JSON.stringify({ entries: [], cursor: 0, more_before: false }), {
+      headers: { "Content-Type": "application/json" },
+    });
   reads.push(path);
   if (holdDetail)
     await new Promise<void>((resolve) => {
@@ -241,9 +245,9 @@ async function click(label: string) {
   await flush();
 }
 function aliases() {
-  return Array.from(host.querySelectorAll(".rc-seats .rc-seat .t")).map(
-    (b) => b.textContent,
-  );
+  return Array.from(host.querySelectorAll(".rc-seats .rc-seat .t"))
+    .filter((b) => !b.closest(".ag-folded"))
+    .map((b) => b.textContent);
 }
 async function search(value: string) {
   const input = host.querySelector<HTMLInputElement>("#agents-search");
@@ -259,10 +263,7 @@ async function search(value: string) {
 }
 async function main() {
   await render();
-  assert(
-    button("Current4").getAttribute("aria-pressed") === "true",
-    "Current is the default when the roster contains stopped agents and mailboxes",
-  );
+  assert(!host.querySelector(".ag-seg"), "the sidebar's groups replace the status filters");
   assert(
     aliases().join() === "blocked,owner,dev,foreign",
     "current agents list attention first, then working, in one flat grid",
@@ -277,7 +278,7 @@ async function main() {
   await render();
   // CAD-1772: compact seat cards, no stat tiles, no project scope.
   assert(host.querySelectorAll(".agents-triage-cell").length === 0, "the five stat tiles are gone");
-  assert(host.querySelector(".ag-toolbar .ag-seg") && host.querySelector(".ag-toolbar .ag-search"), "one compact toolbar row");
+  assert(host.querySelector(".ag-toolbar .ag-search"), "narrow widths keep a search above the cards");
   assert(!Array.from(host.querySelectorAll("button")).some((b) => b.textContent?.trim() === "Message"), "seat cards carry no inline Message button");
   assert(
     Array.from(host.querySelectorAll(".rc-seat")).find((row) => row.textContent?.includes("owner"))?.textContent?.includes("1 queued"),
@@ -307,55 +308,51 @@ async function main() {
   assert(seat().textContent?.includes("Idle · no runtime"), "a profile with no owned work reads Idle");
   assert(!host.querySelector(".rc-seats .rc-connect") && !host.querySelector(".rc-seats")?.textContent?.includes("cadence "), "the card prints no commands");
   await click("Open agent Developer");
-  const details = host.querySelector("dialog.rc-sheet");
-  assert(details?.textContent?.includes("cadence agent context ap_1"), "details hold the connect commands");
-  assert(details?.textContent?.includes("Ship it") && details?.textContent?.includes("Model"), "details hold the job and model");
-  await click("Close");
-  assert(!host.querySelector("dialog.rc-sheet"), "Close leaves the roster");
+  await render();
+  assert(open === "Developer", "a profile opens on the same agent route as any agent");
+  assert(!host.querySelector("dialog.rc-sheet"), "the drawer is gone");
+  const gate = host.querySelector(".ag-chat-gate");
+  assert(gate?.textContent?.includes("isn’t running"), "the page says why nothing can answer");
+  assert(gate?.textContent?.includes("cadence agent context ap_1"), "the reason sits with the connect commands");
+  assert(!host.querySelector("[data-composer]"), "no composer pretends to send");
+  assert(!reads.includes("/api/agents/Developer"), "a profile is not read as a registered agent");
+  await click("Details");
+  const panel = host.querySelector(".ag-chat-panel");
+  assert(panel?.textContent?.includes("Ship it") && panel?.textContent?.includes("Model"), "details hold the job and model");
+  open = null;
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
   await render();
-  await click("All6");
-  assert(aliases().length === 6, "All keeps stopped workers and mailboxes discoverable");
-  await click("Stopped1");
-  assert(aliases().join() === "stopped", "stopped agents have an explicit view");
-  await click("Needs attention2");
-  assert(
-    aliases().join() === "blocked,owner",
-    "waiting and fenced agents filter accurately",
-  );
-  await click("Mailboxes1");
-  assert(
-    aliases().join() === "inbox",
-    "840 inbox messages do not count as working",
-  );
-  await click("Current4");
+  const sideRows = () => Array.from(host.querySelectorAll(".ag-side-row .t")).map((t) => t.textContent);
+  assert(sideRows().length === 7, "the sidebar keeps stopped workers and mailboxes discoverable, under Overview");
+  const foldedGroups = Array.from(host.querySelectorAll(".ag-side details summary")).map((g) => g.textContent);
+  assert(foldedGroups.join().includes("Stopped") && foldedGroups.join().includes("Mailboxes"), "stopped agents and mailboxes fold");
+  assert(!Array.from(host.querySelectorAll(".ag-side-group")).some((g) => g.textContent?.startsWith("Idle")), "an empty group does not appear");
   await search("SETTINGS");
   assert(aliases().join() === "dev", "task search is case insensitive");
   await search("does not exist");
   assert(
-    host.textContent?.includes("No agents match these filters."),
+    host.textContent?.includes("No agents match “does not exist”."),
     "no match copy is explicit",
   );
   await search("");
   // Agents are the team's, not a project's: a project in the URL state does not filter them.
   await render();
   assert(aliases().length === 4, "the roster lists the team regardless of project");
-  await click("All6");
   await click("Open agent blocked");
   await render();
   assert(
-    host.querySelector("main.agents-page h1")?.textContent === "blocked" &&
-      host.querySelector("[role='tablist']"),
-    "the agent page opens at its alias with its tabs",
+    host.querySelector("main.ag-chat h1")?.textContent === "blocked" && host.querySelector("[data-composer]"),
+    "an agent opens on its conversation with a composer",
   );
   assert(
-    host
-      .querySelector("[role='alert']")
-      ?.textContent?.includes("Detail unavailable"),
-    "detail failure is explicit",
+    host.querySelector("main.ag-chat")?.textContent?.includes("Some details aren’t available") &&
+      !host.querySelector("main.ag-chat [role='alert']"),
+    "a detail failure is a quiet line, not an alert",
   );
   tab = "settings";
   await render();
+  assert(host.querySelector("main.agents-page [role='tablist']"), "the profile keeps its tabs");
+  assert(!host.querySelector(".ap-stats"), "unknown stats show no tiles of dashes");
   const text = host.querySelector("main.agents-page")!.textContent!;
   for (const evidence of [
     agents[1].recovery!,
@@ -377,7 +374,7 @@ async function main() {
     "detail reads exact alias route",
   );
   failDetail = false;
-  await click("Retry details");
+  await click("Retry");
   assert(
     host.querySelector("main.agents-page")?.textContent?.includes("session-blocked") &&
       !host.querySelector("[role='alert']"),
@@ -388,7 +385,14 @@ async function main() {
       new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
     ),
   );
-  assert(open === null, "Escape leaves the agent page");
+  assert((tab as string) === "overview", "Escape on a profile section returns to the conversation");
+  await render();
+  await React.act(() =>
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    ),
+  );
+  assert(open === null, "Escape on the conversation leaves the agent page");
   await render();
   assert(
     button("Open agent blocked") && host.querySelector(".rc-seats"),
@@ -421,7 +425,6 @@ async function main() {
   open = null;
   state = { ...state, status: "stale", error: "Refresh unavailable" };
   await render();
-  await click("Current4");
   assert(
     host.textContent?.includes("stale") && aliases().length === 4,
     "stale payload stays visible",

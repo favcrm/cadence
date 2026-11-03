@@ -174,8 +174,12 @@ function NowCard({ c, onlyDoing = false }: { c: TabContext; onlyDoing?: boolean 
   return (
     <div className="ap-now">
       <b>{t("Nothing right now")}</b>
-      <small>{t("Give it a job:")}</small>
-      {c.role && <FirstJobs alias={c.alias} tasks={c.role.first_tasks} />}
+      {c.role && c.role.first_tasks.length > 0 && (
+        <>
+          <small>{t("Give it a job:")}</small>
+          <FirstJobs alias={c.alias} tasks={c.role.first_tasks} />
+        </>
+      )}
     </div>
   );
 }

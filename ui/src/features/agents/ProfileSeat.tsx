@@ -1,7 +1,5 @@
-import { useEffect, useRef } from "react";
 import { useTranslate } from "../../lib/locale";
 import type { HiredProfile } from "../../lib/types";
-import Button from "../../ui/Button";
 import AgentAvatar from "./AgentAvatar";
 import type { ProfileWork } from "./agentView";
 
@@ -91,91 +89,41 @@ export default function ProfileSeat({
   );
 }
 
-/** A profile's details: a right drawer on desktop, a bottom sheet on phones,
- *  like the hire sheet it follows. Focus returns and Esc closes. */
-export function ProfileSheet({
+/** A runtime-less profile's details, for its agent page's panel. */
+export function ProfileDetails({
   profile,
-  roleTitle,
   work,
-  hosted,
-  groups,
-  onClose,
   onOpenIssue,
 }: {
   profile: HiredProfile;
-  roleTitle: string;
   work: ProfileWork | null;
-  hosted: boolean;
-  groups: string[];
-  onClose: () => void;
   onOpenIssue: (id: string) => void;
 }) {
   const t = useTranslate();
-  const dialogRef = useRef<HTMLDialogElement>(null);
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    const trigger = document.activeElement;
-    const overflow = document.body.style.overflow;
-    dialog?.showModal();
-    document.body.style.overflow = "hidden";
-    return () => {
-      dialog?.close();
-      document.body.style.overflow = overflow;
-      if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus();
-    };
-  }, []);
-
   return (
-    <dialog
-      ref={dialogRef}
-      className="rc-sheet bg-ink-875 border-l border-ink-700 text-ink-200"
-      aria-labelledby="profile-title"
-      onCancel={(event) => {
-        event.preventDefault();
-        onClose();
-      }}
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
-      <div className="rc-sheet-h">
-        <AgentAvatar slug="custom" look={profile.look ?? undefined} size={52} still />
-        <div className="min-w-0">
-          <div className="t" id="profile-title">
-            {profile.alias}
-          </div>
-          <div className="s">{roleTitle}</div>
-        </div>
-        <Button variant="ghost" size="sm" className="x" aria-label={t("Close")} onClick={onClose}>
-          ✕
-        </Button>
+    <div className="rc-sheet-b">
+      <div className="rc-blk">
+        <h4>{t("Status")}</h4>
+        <p className="rc-profile-line">{t("Idle · no runtime")}</p>
       </div>
-      <div className="rc-sheet-b">
+      {work && (
         <div className="rc-blk">
-          <h4>{t("Status")}</h4>
-          <p className="rc-profile-line">{t("Idle · no runtime")}</p>
+          <h4>{t("Latest work")}</h4>
+          <button type="button" className="rc-profile-work" onClick={() => onOpenIssue(work.issue.id)}>
+            {workText(work, t)}
+          </button>
         </div>
-        {work && (
-          <div className="rc-blk">
-            <h4>{t("Latest work")}</h4>
-            <button type="button" className="rc-profile-work" onClick={() => onOpenIssue(work.issue.id)}>
-              {workText(work, t)}
-            </button>
-          </div>
-        )}
-        {profile.job && (
-          <div className="rc-blk">
-            <h4>{t("Job")}</h4>
-            <p className="rc-profile-job">{profile.job}</p>
-          </div>
-        )}
+      )}
+      {profile.job && (
         <div className="rc-blk">
-          <h4>{t("Model")}</h4>
-          <p className="rc-profile-line">{profile.model === "inherit" ? t("Inherit from the runtime") : profile.model}</p>
+          <h4>{t("Job")}</h4>
+          <p className="rc-profile-job">{profile.job}</p>
         </div>
-        <ConnectRuntime profile={profile} hosted={hosted} groups={groups} />
+      )}
+      <div className="rc-blk">
+        <h4>{t("Model")}</h4>
+        <p className="rc-profile-line">{profile.model === "inherit" ? t("Inherit from the runtime") : profile.model}</p>
       </div>
-    </dialog>
+    </div>
   );
 }

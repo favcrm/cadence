@@ -5,6 +5,9 @@ import Button from "../../ui/Button";
 import { WriteGate } from "../auth/WriteGate";
 import type { Agent, AgentDetail, HiredProfile } from "../../lib/types";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
+import AgentChat, { type ChatGate } from "./AgentChat";
+import { ConnectRuntime, ProfileDetails } from "./ProfileSeat";
+import { seatStatus } from "./SeatCard";
 import { RecoveryBlock } from "./AgentProfile";
 import AgentTabBody, { type TabContext } from "./AgentTabs";
 import {
@@ -62,6 +65,9 @@ export default function AgentPage({
   onTab,
   onBack,
   onOpenIssue,
+  hosted,
+  groups,
+  rosterLoaded,
 }: {
   alias: string;
   observed?: Agent;
@@ -71,6 +77,11 @@ export default function AgentPage({
   onTab: (tab: AgentTab) => void;
   onBack: () => void;
   onOpenIssue: (id: string) => void;
+  hosted: boolean;
+  /** PM aliases a runtime can join on a native board. */
+  groups: string[];
+  /** The team list has answered, so a missing alias really is missing. */
+  rosterLoaded: boolean;
 }) {
   const writeBlock = useContext(WriteGate);
   const t = useTranslate();
@@ -78,7 +89,12 @@ export default function AgentPage({
   const [err, setErr] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
 
+  const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
+  const chat = tab === "overview";
+  const leave = chat ? onBack : () => onTab("overview");
   useEffect(() => {
+    // A runtime-less profile is not a registered agent: there is nothing to read.
+    if (hired) return;
     // A reload after a save keeps what is on screen; only a new alias resets.
     if (retry === 0) setDetail(null);
     setErr(null);
@@ -90,7 +106,7 @@ export default function AgentPage({
     return () => {
       live = false;
     };
-  }, [alias, retry]);
+  }, [alias, retry, hired]);
 
   // Esc leaves the page, unless it is closing something inside it.
   useEffect(() => {
@@ -102,11 +118,11 @@ export default function AgentPage({
         (target.closest("input, textarea, select, dialog, [contenteditable]") !== null)
       )
         return;
-      onBack();
+      leave();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onBack]);
+  }, [leave]);
 
   const a = detail?.agent;
   // A collection observation keeps evidence available during loading/failure.
@@ -136,7 +152,6 @@ export default function AgentPage({
   const role = profile
     ? roleOf({ alias }, roles.data, profiles)
     : null;
-  const hosted = roles.data?.install.hosted ?? false;
   const badge = profile ? lifecycleBadge(profile, t) : null;
   const where = isCloud
     ? t("a cloud runtime")
@@ -180,10 +195,136 @@ export default function AgentPage({
     detailFailed: err !== null,
   };
 
+  const notices = (
+    <>
+      {!detail && !err && (
+        <p role="status" className="text-label text-ink-500 mb-3">
+          {t("Loading agent details…")}
+        </p>
+      )}
+      {err && (
+        <p role="status" className="text-label text-ink-500 mb-3">
+          {t("Some details aren’t available on this board.")}{" "}
+          <button type="button" className="lnk" onClick={() => setRetry((r) => r + 1)}>
+            {t("Retry")}
+          </button>
+        </p>
+      )}
+      {deadHolding && (
+        <div className="agents-banner tone-fail mb-3" role="status">
+          {t("Agent is dead but still holds work — release the claim or reassign before it stalls the ticket.")}
+        </div>
+      )}
+      {lifecycle === "stale-inbox" && profile && (
+        <div className="agents-banner tone-info mb-3" role="status">
+          {t("Mailbox only — {count} unread, no live endpoint. Drain or archive.").replace("{count}", String(profile.queued))}
+        </div>
+      )}
+      {lifecycle === "idle-holding" && (
+        <div className="agents-banner tone-warn mb-3" role="status">
+          {t("Not running but still holds a claim — resume it or release the work.")}
+        </div>
+      )}
+      {fenced && (
+        <section className="mb-3">
+          <h3 className="text-cardtitle font-semibold text-fail">{t("Recovery required")}</h3>
+          <p className="text-label text-ink-400 mt-1">
+            {t("An operator must inspect the outcome before reconciling.")}
+          </p>
+          <RecoveryBlock
+            text={
+              recovery ??
+              t("Recovery guidance unavailable. Refresh agent details before taking action.")
+            }
+          />
+        </section>
+      )}
+    </>
+  );
+
+  if (chat) {
+    const status = profile ? seatStatus(profile, t) : null;
+    const mailbox = profile?.inbox === true || profile?.provider === "inbox";
+    const gate: ChatGate | null = hired
+      ? {
+          title: t("{alias} isn’t running, so it can’t reply yet").replace("{alias}", () => alias),
+          body: t("Connect a runtime to talk to it here."),
+          extra: <ConnectRuntime profile={hired} hosted={hosted} groups={groups} />,
+        }
+      : mailbox
+        ? {
+            title: t("This is a mailbox, not an agent"),
+            body: t("Mail waits here until an agent reads it."),
+          }
+        : rosterLoaded && !profile && err !== null
+          ? {
+              title: t("No agent named {alias}").replace("{alias}", () => alias),
+              body: t("It may have been removed. Pick another agent from the list."),
+            }
+          : null;
+    const faceLook = hired ? (hired.look ?? undefined) : typeof params?.look === "string" ? params.look : undefined;
+    return (
+      <AgentChat
+        alias={alias}
+        gate={gate}
+        block={writeBlock}
+        onBack={onBack}
+        onOpenIssue={onOpenIssue}
+        notices={hired ? null : notices}
+        heading={
+          <>
+            <AgentAvatar
+              slug={hired ? "custom" : agentLook(alias, params)}
+              look={faceLook}
+              still={lifecycle !== "active"}
+              active={lifecycle === "active"}
+              size={34}
+            />
+            <div className="ag-chat-title min-w-0">
+              <h1 tabIndex={-1}>{alias}</h1>
+              <p>
+                {hired ? (
+                  <>
+                    <span className="rc-dot" style={{ "--c": "var(--color-ink-500)" } as React.CSSProperties} />{" "}
+                    {t("Idle · no runtime")}
+                  </>
+                ) : (
+                  <>
+                    {status && (
+                      <>
+                        <span className="rc-dot" style={{ "--c": TONE[status.tone] } as React.CSSProperties} /> {status.text}
+                        {" · "}
+                      </>
+                    )}
+                    {categoryText ?? profile?.role ?? t("Agent")}
+                  </>
+                )}
+              </p>
+            </div>
+          </>
+        }
+        panel={
+          hired ? (
+            <ProfileDetails
+              profile={hired}
+              work={null}
+              onOpenIssue={onOpenIssue}
+            />
+          ) : (
+            <div className="ag-chat-panel-body">
+              <AgentTabBody key={`${alias}:panel:${detail ? "d" : "n"}`} tab="overview" c={ctx} />
+              <Button onClick={() => onTab("job")}>{t("Manage profile")}</Button>
+            </div>
+          )
+        }
+      />
+    );
+  }
+
   return (
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
-      <button type="button" className="rc-back" onClick={onBack}>
-        ← {t("Agents")}
+      <button type="button" className="rc-back" onClick={leave}>
+        ← {alias}
       </button>
       <header className="ap-hero">
         <AgentAvatar
@@ -219,15 +360,7 @@ export default function AgentPage({
           {role && <p className="ap-job">{role.job}</p>}
         </div>
         <div className="ap-acts">
-          {/* Threads resolves the alias: the existing You ↔ agent conversation
-              opens; otherwise `?dm=` starts a local draft — nothing is sent
-              and no server row is created until the operator writes. */}
-          <Button
-            variant="primary"
-            href={`/threads?dm=${encodeURIComponent(alias)}`}
-            disabled={writeBlock !== null}
-            title={writeBlock ?? t("Open the direct conversation with this agent")}
-          >
+          <Button variant="primary" onClick={() => onTab("overview")}>
             {t("Message")}
           </Button>
           {!isCloud && (
@@ -290,51 +423,11 @@ export default function AgentPage({
         </section>
       )}
 
-      {!detail && !err && (
-        <p role="status" className="text-label text-ink-500 mb-3">
-          {t("Loading agent details…")}
-        </p>
-      )}
-      {err && (
-        <div className="space-y-2 mb-3">
-          <p role="alert" className="text-label text-fail">
-            {t("Could not load agent details:")} {err}
-          </p>
-          <Button onClick={() => setRetry((r) => r + 1)}>{t("Retry details")}</Button>
-        </div>
-      )}
-      {deadHolding && (
-        <div className="agents-banner tone-fail mb-3" role="status">
-          {t("Agent is dead but still holds work — release the claim or reassign before it stalls the ticket.")}
-        </div>
-      )}
-      {lifecycle === "stale-inbox" && profile && (
-        <div className="agents-banner tone-info mb-3" role="status">
-          {t("Mailbox only — {count} unread, no live endpoint. Drain or archive.").replace("{count}", String(profile.queued))}
-        </div>
-      )}
-      {lifecycle === "idle-holding" && (
-        <div className="agents-banner tone-warn mb-3" role="status">
-          {t("Not running but still holds a claim — resume it or release the work.")}
-        </div>
-      )}
-      {fenced && (
-        <section className="mb-3">
-          <h3 className="text-cardtitle font-semibold text-fail">{t("Recovery required")}</h3>
-          <p className="text-label text-ink-400 mt-1">
-            {t("An operator must inspect the outcome before reconciling.")}
-          </p>
-          <RecoveryBlock
-            text={
-              recovery ??
-              t("Recovery guidance unavailable. Refresh agent details before taking action.")
-            }
-          />
-        </section>
-      )}
+      {notices}
 
       {!isCloud && (
         <>
+          {stats.some(([, value]) => value !== "—") && (
           <div className="ap-stats">
             {stats.map(([label, value]) => (
               <div
@@ -347,8 +440,9 @@ export default function AgentPage({
               </div>
             ))}
           </div>
+          )}
           <nav className="ap-tabs" role="tablist" aria-label={t("Agent sections")}>
-            {AGENT_TABS.map((entry) => (
+            {AGENT_TABS.filter((entry) => entry.id !== "overview").map((entry) => (
               <button
                 key={entry.id}
                 type="button"
