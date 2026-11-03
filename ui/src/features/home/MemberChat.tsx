@@ -19,6 +19,7 @@ import {
   WINDOW,
 } from "./thread";
 import { memberThreadReader } from "./memberThread";
+import { ImageConversation } from "../canvas/imageConversation";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
@@ -386,6 +387,7 @@ export default function MemberChat({
                 </button>
               </div>
             ) : null}
+            <ImageConversation.Provider value={surface?.conversation ?? null}>
             <Conversation
               mode={{ kind: "home" }}
               items={shown}
@@ -396,6 +398,7 @@ export default function MemberChat({
               onRetry={onRetry}
               onDiscard={onDiscard}
             />
+            </ImageConversation.Provider>
           </div>
 
           <div className="chatdock" ref={dockRef} data-chat-dock>

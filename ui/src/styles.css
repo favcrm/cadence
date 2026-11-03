@@ -936,6 +936,16 @@ pre {
 .answer .issue-reader tbody tr + tr td {
   border-top: 1px solid color-mix(in srgb, var(--color-ink-800) 60%, transparent);
 }
+/* With `anywhere` a long unbreakable value in a later column squeezed the
+   first to a few pixels and split its words ("Artifa/ct"). A floor on the
+   first column keeps its words whole, while `anywhere` still lets any long
+   value wrap, so the table never outgrows the column. */
+.answer .issue-reader th:first-child,
+.answer .issue-reader td:first-child,
+.chat-bubble.issue-reader th:first-child,
+.chat-bubble.issue-reader td:first-child {
+  min-width: 9rem;
+}
 .answer .issue-reader blockquote {
   padding: .65rem .85rem;
   border-inline-start: 0;
