@@ -133,6 +133,19 @@ From a client-only installation, local daemon and state commands refuse with
 exit 3. Remote org verbs route to their org, and bounded
 login, auth, org and offline management stays available.
 
+An unmanaged client-only installation can read its bundled guidance offline:
+
+```sh
+cadence-client skill show cadence --file SKILL.md
+```
+
+This reads the copy embedded in the installed executable, not a workspace or
+an installed provider skill; it makes no request and does not change the
+workspace default. Omit `--file` for the bundled file manifest. Managed
+callers keep their existing routing and permission checks; installation and
+status commands remain unchanged. Reading it does not mean an already-running
+agent session has reloaded it.
+
 This mode needs a published release whose `cadence update --help` carries the
 client-only marker (`Upgrade a client-only installation`). The published
 v0.1.1 predates the unified command and still has only `client-update`; it
