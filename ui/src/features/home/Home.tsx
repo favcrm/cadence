@@ -66,6 +66,7 @@ import SinceCard from "./SinceCard";
 import {
   discardPending,
   inFlightTurnKey,
+  unnamedTurnAnswered,
   lastSeq,
   newMessageId,
   openStep,
@@ -558,7 +559,8 @@ const ThreadList = memo(function ThreadList({
   ) => void;
   /** The live turn: its own `message` id picks the row the activity
    *  belongs to; `since` drives the elapsed clock. Null otherwise. */
-  working: { message: string | null; since: number | null } | null;
+  /** `unnamed`: the host verified a turn is working but gave no id for it. */
+  working: { message: string | null; since: number | null; unnamed?: boolean } | null;
   /** Messages still queued behind the running turn: a run's send skips them. */
   queued: string[];
   /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
@@ -597,7 +599,7 @@ const ThreadList = memo(function ThreadList({
   // turn. A second empty assistant (face, "now", dots) under them is the
   // splash: hosted agent entries often carry no message id, so the anchor
   // misses them and the fallback used to append another head.
-  const flightKey = inFlightTurnKey(shown, working?.message ?? null);
+  const flightKey = inFlightTurnKey(shown, working?.message ?? null, working?.unnamed === true);
   // A hire proposal paints as flat rows, never as a ThreadTurn, so the
   // suppression below would leave that still-working turn with no
   // indicator at all. Keep the fallback activity for a flat run.
@@ -629,6 +631,7 @@ const ThreadList = memo(function ThreadList({
         readOnly={readOnly}
         liveAfter={liveAfter}
         running={working?.message ?? null} /* null while a send is only submitting */
+        runningUnnamed={working?.unnamed === true}
         queued={queued}
         legacyTranscript={!items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
@@ -636,6 +639,7 @@ const ThreadList = memo(function ThreadList({
         onDiscard={discard}
         activity={(item) => {
           if (flightKey !== null && !flightFlat) return null;
+          if (working?.unnamed === true && unnamedTurnAnswered(shown)) return null;
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
           // The anchored row shows this turn's own newest entry time. A
@@ -975,7 +979,12 @@ function MasterHome({
   // honest "behind a turn" line instead of claiming to type.
   const workingActivity =
     turn.kind === "working"
-      ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
+      ? {
+          message: turn.message,
+          since: typeof turn.since === "number" ? turn.since : null,
+          // Hosted boards report a running turn with `message: null`.
+          unnamed: !turn.message,
+        }
       : turn.kind === "submitting"
         ? { message: null, since: null }
         : null;

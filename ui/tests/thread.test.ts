@@ -21,6 +21,7 @@ import {
   threadItems,
   threadRuns,
   inFlightTurnKey,
+  unnamedTurnAnswered,
   itemMessage,
   sendBefore,
   rowPaintKey,
@@ -578,6 +579,12 @@ main().catch((e) => {
   equal(inFlightTurnKey(open, "ui-1"), "e2", "an untagged tool run after the send is that turn");
   equal(inFlightTurnKey(open, "server-id"), "e2", "a working id that matches no row still adopts the untagged run");
   equal(inFlightTurnKey(open, null), null, "a submit with no id does not claim an older run");
+  equal(inFlightTurnKey(open, null, true), "e2", "a working turn with no id owns the open run after the newest send");
+  equal(
+    inFlightTurnKey([...open, { type: "pending", key: "pnext", pending: { message: "ui-2", text: "next", state: "sent", at: 1 } }], null, true),
+    "e2",
+    "a send not yet stored is not what is running; the open run before it still is",
+  );
   const answered = threadItems(
     mergePage(null, {
       thread: { id: "t-flight" },
@@ -589,6 +596,15 @@ main().catch((e) => {
     }),
   );
   equal(inFlightTurnKey(answered, "ui-1"), null, "a landed answer is not still in flight");
+  equal(inFlightTurnKey(answered, null, true), null, "a landed answer is not in flight for an unnamed turn either");
+  equal(unnamedTurnAnswered(answered), true, "a thread ending on an answer has no send waiting");
+  equal(unnamedTurnAnswered(open), false, "an open run is still waiting");
+  equal(
+    unnamedTurnAnswered([...answered, { type: "pending", key: "pnext", pending: { message: "ui-2", text: "next", state: "sent", at: 1 } }]),
+    false,
+    "a later send keeps its placeholder",
+  );
+  equal(inFlightTurnKey([], null, true), null, "an unnamed turn with no rows has nothing to own");
   const tagged = threadItems(
     mergePage(null, {
       thread: { id: "t-flight" },
