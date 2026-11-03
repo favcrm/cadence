@@ -18,11 +18,19 @@ payload is rebuilt from the arguments, never read from the comment. `queue-pr`
 prints the PR number of a gh-readonly-queue/main/pr-N-<sha> ref.
 Exit: 0 ok / 1 refused / 2 usage.
 
+CAD-1946 temporary exception: `sign --exception` signs a distinct payload under a
+distinct marker. `verify` accepts one only before EXCEPTION_ENDS, read from the
+merge group's base, and says it is an exception. It waives the missing
+authenticated reviewer attestation only: enqueue-reviewed still requires every
+other rule and the operator's approval of this exact head. Delete it when the
+trusted reviewer workflow ships.
+
 Known limit: the key sits on a host where every session runs as one uid, so
 a session that reads it can sign (CAD-280 separates the operator uid).
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -32,6 +40,8 @@ import tempfile
 
 ME = "delivery-gate"
 MARKER = "<!-- cadence-delivery-gate v1 -->"
+EXCEPTION_MARKER = "<!-- cadence-delivery-gate exception v1 -->"
+EXCEPTION_ENDS = "2026-11-10T00:00:00Z"
 NAMESPACE = "cadence-delivery-gate"
 PRINCIPAL = "cadence-delivery-gate"
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -42,6 +52,17 @@ ARMOR = re.compile(r"-----BEGIN SSH SIGNATURE-----\n[A-Za-z0-9+/=\n]+?-----END S
 
 def payload(repo, pr, head):
     return f"cadence-delivery-gate v1\nrepo {repo}\npr {pr}\nhead {head}\n".encode()
+
+
+def exception_payload(repo, pr, head):
+    return (f"cadence-delivery-gate exception v1\nrepo {repo}\npr {pr}\nhead {head}\n"
+            f"ends {EXCEPTION_ENDS}\n").encode()
+
+
+def exception_open():
+    ends = datetime.datetime.strptime(EXCEPTION_ENDS, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc)
+    return datetime.datetime.now(datetime.timezone.utc) < ends
 
 
 def usage(args):
@@ -59,12 +80,22 @@ def sign(args):
     if not (os.path.isfile(args.key) and os.access(args.key, os.R_OK)):
         print(f"{ME}: refused: no readable signing key at {args.key}", file=sys.stderr)
         return 1
+    exception = getattr(args, "exception", False)
+    if exception and not exception_open():
+        print(f"{ME}: refused: the review exception ended at {EXCEPTION_ENDS}", file=sys.stderr)
+        return 1
+    data = (exception_payload if exception else payload)(args.repo, args.pr, args.head)
     p = subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-n", NAMESPACE, "-f", args.key],
-                       input=payload(args.repo, args.pr, args.head), capture_output=True)
+                       input=data, capture_output=True)
     sig = p.stdout.decode(errors="replace").strip()
     if p.returncode != 0 or not ARMOR.fullmatch(sig):
         print(f"{ME}: refused: signing failed: {p.stderr.decode(errors='replace').strip()}", file=sys.stderr)
         return 1
+    if exception:
+        print(f"{EXCEPTION_MARKER}\nDelivery gate EXCEPTION, not a pass: {args.repo}#{args.pr} at "
+              f"{args.head}\nReviewer attestation waived by the operator's approval of this head, "
+              f"until {EXCEPTION_ENDS}.\n\n```\n{sig}\n```")
+        return 0
     print(f"{MARKER}\nDelivery gate passed: {args.repo}#{args.pr} at {args.head}\n\n```\n{sig}\n```")
     return 0
 
@@ -88,21 +119,27 @@ def verify(args):
         comments = []
     if reasons:
         return refuse(reasons)
-    blocks = [(c.get("id"), m.group(0)) for c in comments if MARKER in c["body"]
+    # The marker picks the payload, so one kind of signature can't stand in for the other.
+    blocks = [(c.get("id"), m.group(0), EXCEPTION_MARKER in c["body"]) for c in comments
+              if MARKER in c["body"] or EXCEPTION_MARKER in c["body"]
               for m in ARMOR.finditer(c["body"].replace("\r\n", "\n"))]
     if not blocks:
         return refuse([f"no signed delivery-gate comment on PR #{args.pr}: "
                        "enqueue with scripts/enqueue-reviewed"])
-    data = payload(args.repo, args.pr, args.head)
+    opened = exception_open()
     with tempfile.TemporaryDirectory(prefix="delivery-gate.") as tmp:
-        for cid, block in blocks:
+        for cid, block, exception in blocks:
+            if exception and not opened:
+                continue
+            data = (exception_payload if exception else payload)(args.repo, args.pr, args.head)
             sig = os.path.join(tmp, "sig")
             with open(sig, "w", encoding="utf-8") as f:
                 f.write(block + "\n")
             p = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", args.signers, "-I", PRINCIPAL,
                                 "-n", NAMESPACE, "-s", sig], input=data, capture_output=True)
             if p.returncode == 0:
-                print(f"{ME}: accepted: comment {cid} signs {args.repo}#{args.pr} at {args.head}")
+                kind = "as an EXCEPTION, not a pass" if exception else "as a pass"
+                print(f"{ME}: accepted {kind}: comment {cid} signs {args.repo}#{args.pr} at {args.head}")
                 return 0
     return refuse([f"no delivery-gate signature on PR #{args.pr} verifies for head {args.head} "
                    f"({len(blocks)} tried)"])
@@ -124,12 +161,19 @@ def main(argv):
         p.add_argument("--head", required=True)
         if name == "sign":
             p.add_argument("--key", required=True)
+            p.add_argument("--exception", action="store_true")
         else:
             p.add_argument("--signers", required=True)
             p.add_argument("--comments", required=True)
     q = sub.add_parser("queue-pr")
     q.add_argument("ref")
+    sub.add_parser("exception-open")
     args = ap.parse_args(argv)
+    if args.cmd == "exception-open":
+        if exception_open():
+            print(EXCEPTION_ENDS)
+            return 0
+        return refuse([f"the review exception ended at {EXCEPTION_ENDS}"])
     if args.cmd == "queue-pr":
         m = QUEUE_REF.fullmatch(args.ref)
         if not m:
