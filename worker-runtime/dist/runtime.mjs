@@ -56686,7 +56686,7 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
     return { ...operationStatus(pending), model };
   }
   async stopOperation(operationId) {
-    if (operationId === "")
+    if (!operationId)
       return false;
     return this.harness.session().abort(operationId);
   }

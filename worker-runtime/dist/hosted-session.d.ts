@@ -88,9 +88,11 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      */
     state(): Promise<HostedState>;
     /**
-     * Stop one running or queued operation by its id. The id is required: the
-     * engine reads a missing id as "abort the whole session", which is not what
-     * a board asking to stop one turn means. False when nothing matched.
+     * Stop the turn with this id. The id is required: the engine reads a missing
+     * one as "abort this session" even when nothing has been asked to stop.
+     * Stopping a running turn aborts its conversation, and the engine withdraws
+     * the conversation's queued inputs with it, so a caller that can see a queue
+     * must say so. False when nothing matched.
      */
     stopOperation(operationId: string): Promise<boolean>;
     private recordResolvedModel;
