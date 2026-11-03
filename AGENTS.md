@@ -127,8 +127,8 @@ the code you just wrote.
   both act under one login. Until it can, merge through the
   temporary exception (`--exception --advisory standards=<url> --advisory
   spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
-  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10). The exception
-  only checks that the advisory links are separate https URLs; it proves
+  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10). Of the advisory
+  links, it checks only that they are separate https URLs; it proves
   neither head binding nor that Browser QA ran. A verdict filed under the
   author's identity still refuses under the exception, so a same-login
   session posts its findings as a PR comment and files no verdict. A second

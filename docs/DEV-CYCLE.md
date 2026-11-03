@@ -32,7 +32,8 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    fresh-session review is a non-author session with no inherited context,
    including a subagent (AGENTS.md "Review standard"). The merge gate does not
    enforce that yet; merges use the temporary `--exception` (exact-head operator approval and two
-   advisory links, standards and spec-security) until `EXCEPTION_ENDS`
+   advisory links, standards and spec-security, plus browser-qa for a `ui/`
+   change) until `EXCEPTION_ENDS`
    (2026-11-10).
 5. The version-one delivery tiers apply to clean default-equivalent policies
    by default after the reviewed implementation is installed; the introducing

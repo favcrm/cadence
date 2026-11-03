@@ -101,9 +101,10 @@ ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 # The review standard is a fresh-session review (AGENTS.md "Review", CAD-1946), which
 # this gate cannot yet enforce. Refusals for a missing or shared reviewer point at
 # the temporary exception and the standard.
-# A filed row by the author is refused even under --exception; the review goes in as a link.
-AUTHOR_ROW_HINT = (" (a filed row under the author's identity is not waived by --exception; "
-                   "post the review as a PR comment and pass it as an --advisory URL)")
+# A filed row by the author is refused even under --exception, and an advisory link does not clear it.
+AUTHOR_ROW_HINT = (" (a filed row under the author's identity still refuses under --exception, and an "
+                   "advisory link does not clear it. The author's own review can never be an advisory; "
+                   "only a fresh non-author session's review can)")
 REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a non-author session, "
                         "and this gate cannot yet tell one from the author under one login: use "
                         "--exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate. "

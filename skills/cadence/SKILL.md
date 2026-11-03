@@ -688,11 +688,12 @@ During implementation and handoff:
   your conclusions, and call it a fresh-session review, never independent
   parties. In the Cadence repository the merge gate does not enforce this yet: hosted
   verdicts count by attested principal (the author's is refused) and local notes by
-  their self-declared `From:` alias, so a same-login session cannot file a
-  gate-counted verdict. Post its findings as a PR comment. In the Cadence
+  their self-declared `From:` alias, so a same-login session must not file
+  one: hosted refuses it, and a local note's alias proves nothing. Post its
+  findings as a PR comment. In the Cadence
   repository itself, merges use the temporary `--exception --advisory ...`
-  path (exact-head operator approval and two advisory links) until
-  `EXCEPTION_ENDS` (2026-11-10); it checks only that the links are https URLs.
+  path (exact-head operator approval and two advisory links, plus browser-qa for a `ui/` change) until
+  `EXCEPTION_ENDS` (2026-11-10); it checks only that the links are separate https URLs.
   A second attested human is not required.
 - Make review converge. First inspect the complete change against acceptance;
   verify each blocking finding with a concrete failure scenario and source
