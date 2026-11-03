@@ -38,7 +38,9 @@ def gh():
     path = next(a for a in ARGS[1:] if a.startswith("repos/"))
     repo = S["repo"]
     if path == f"repos/{repo}/git/ref/heads/main":
-        print(S["tip"])
+        if S.get("tip_fails"):
+            fail("Not Found (HTTP 404)")
+        print(S.get("tip_sha") or S["tip"])
         sys.exit(0)
     if path.startswith(f"repos/{repo}/rules/branches/"):
         out([{"type": "required_status_checks", "parameters": {"required_status_checks": [
@@ -71,6 +73,11 @@ def cadence():
     if ARGS[:3] == ["issue", "show", "CAD-1"]:
         names = " ".join(v["name"] for v in S["verdicts"])
         body = f"{S['head']}\nBase branch: {S['base']}\nGreen CI run: {RUN_URL}\n{names}\n"
+        if S.get("approved"):
+            body += "Operator approval id: ap-1\n"
+        if S.get("class") == "routine":
+            body += ("Delivery class: routine\nPolicy digest: sha256:" + "0" * 64
+                     + "\nOutcome report: CAD-1/reports/x\nNative CI run: 101 " + RUN_URL + "\n")
         if S.get("class") == "consequential":
             body += "Delivery class: consequential\nPolicy digest: sha256:" + "0" * 64 + "\n"
         out({"id": "CAD-1", "project": "cadence", "owner": None, "claim": None,
@@ -78,7 +85,11 @@ def cadence():
     if ARGS[:2] == ["delivery", "requirements"]:
         digest = "sha256:" + "0" * 64
         kind = S.get("class", "strict")
-        if kind == "consequential":
+        if kind == "routine":
+            req = {"class": "routine", "activation": "active", "reviews": 0,
+                   "review_kind": "none", "security_capable": False,
+                   "operator_approval": False, "browser_qa": False, "full_checks": False}
+        elif kind == "consequential":
             req = {"class": "consequential", "activation": "active", "reviews": 1,
                    "review_kind": "combined", "security_capable": False,
                    "operator_approval": False, "browser_qa": False, "full_checks": True}
@@ -91,17 +102,28 @@ def cadence():
                    "review_kind": "standards_and_spec", "security_capable": False,
                    "operator_approval": False, "browser_qa": False, "full_checks": True}
         req.update({"policy_digest": digest, "reasons": []})
+        readiness = None
+        if kind == "routine":
+            readiness = {"repo": S["repo"].lower(), "pr": S["pr"], "head": S["head"],
+                         "base": S["base_oid"], "base_ref": S["base"], "policy_digest": digest,
+                         "ci_run_id": 101, "ci_run_url": RUN_URL,
+                         "outcome_report": "CAD-1/reports/x"}
         out({"issue": "CAD-1", "project": "cadence", "repo": S["repo"].lower(), "pr": S["pr"],
              "head": S["head"], "base": S["base_oid"], "base_ref": S["base"],
              "merge_base": S["base_oid"], "policy_digest": digest, "origin": "hosted",
-             "requirements": req, "readiness": None})
+             "requirements": req, "readiness": readiness})
     if ARGS[:2] == ["audit", "verdicts"]:
         if ARGS[ARGS.index("--project") + 1] != "cadence":
             fail("stub cadence: verdicts read without the ticket's project", 3)
         out({"origin": "hosted", "project": "cadence", "verdicts": S["verdicts"], "skipped": []})
     if ARGS[:2] == ["audit", "identities"]:
+        if S["identities"] is None:
+            fail("the workspace identity map is not readable by this caller")
         out({"identities": S["identities"]})
     if ARGS[:2] == ["audit", "approval"]:
+        if S.get("approved"):
+            out({"state": "in-force", "approval_id": "ap-1", "recorded_via": "operator-connection",
+                 "source": "operator", "action": "merge"})
         print(json.dumps({"state": "missing", "reason": "no approval recorded"}))
         sys.exit(1)
     fail(f"stub cadence: unexpected {ARGS}", 3)

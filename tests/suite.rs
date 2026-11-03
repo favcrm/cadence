@@ -694,6 +694,11 @@ mod cad2081_workflow_verdicts {
                 std::os::unix::fs::PermissionsExt::from_mode(0o755),
             )
             .unwrap();
+            // Files main later fixes: the stale-base attack restores their old copies.
+            for file in ["src/review.rs", "src/peer.rs", "src/authz.rs"] {
+                put(d, file, "old\n");
+            }
+            put(d, "src/big.rs", &"a\n".repeat(2000));
             let base = commit(d, "base");
             // A superseded workflow, and one without the file, off the base.
             git(d, &["checkout", "-q", "-b", "old", &base]);
@@ -714,6 +719,10 @@ mod cad2081_workflow_verdicts {
             if !symlinked {
                 put(d, STD_FILE, "standards workflow v3, live on main\n");
             }
+            for file in ["src/review.rs", "src/peer.rs", "src/authz.rs"] {
+                put(d, file, "fixed\n");
+            }
+            put(d, "src/big.rs", &"b\n".repeat(2000));
             let tip = commit(d, "main moves the standards workflow");
             let origin = dir.path().join("origin.git");
             git(d, &["init", "-q", "--bare", origin.to_str().unwrap()]);
@@ -758,6 +767,29 @@ mod cad2081_workflow_verdicts {
                 .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
                 .collect();
             self.make_head(&format!("touch-{name}"), |d| put(d, path, "// x\n"))
+        }
+
+        /// A branch that merged main's tip and then put `restore` back to its old copy,
+        /// adding `extra`, while GitHub's baseRefOid still says the old base.
+        fn stale_head(&self, restore: Option<&str>, extra: &str) -> String {
+            let d = self.work();
+            let name = format!("stale-{}", restore.unwrap_or("clean").replace('/', "-"));
+            git(&d, &["checkout", "-q", "-B", &name, &self.base]);
+            git(&d, &["merge", "-q", "--no-edit", &self.tip]);
+            if let Some(path) = restore {
+                git(&d, &["checkout", &self.base, "--", path]);
+            }
+            put(&d, extra, "x\n");
+            let head = commit(&d, &name);
+            git(&d, &["checkout", "-q", "main"]);
+            head
+        }
+
+        /// The served files with the workflow auto list set to one entry.
+        fn listed(&self, glob: &str) -> Value {
+            let mut files = self.base_files();
+            files[AUTO_PATHS] = json!(format!("[auto]\npaths = [\"{glob}\"]\n"));
+            files
         }
 
         /// A head whose only change adds `entries` (raw tree lines, e.g. a file named
@@ -891,8 +923,10 @@ mod cad2081_workflow_verdicts {
             let scenario = json!({
                 "repo": REPO, "pr": 7, "title": "CAD-1: add the thing", "head": head,
                 "base": case.base_ref, "base_oid": self.base, "tip": self.tip, "author": "authorlogin",
-                "files_by_ref": by_ref, "verdicts": case.rows, "class": case.class,
-                "identities": case.identities.clone().unwrap_or_else(Self::identities),
+                "files_by_ref": by_ref, "verdicts": case.rows, "class": case.class, "approved": case.approved,
+                "tip_fails": case.tip_fails, "tip_sha": case.tip_sha,
+                "identities": if case.no_identity_map { Value::Null } else {
+                    case.identities.clone().unwrap_or_else(Self::identities) },
             });
             let scenario_path = self.dir.path().join(".scenario.json");
             std::fs::write(&scenario_path, serde_json::to_vec(&scenario).unwrap()).unwrap();
@@ -939,6 +973,10 @@ mod cad2081_workflow_verdicts {
         identities: Option<Value>,
         extra_args: Vec<String>,
         class: &'static str,
+        approved: bool,
+        tip_fails: bool,
+        tip_sha: Option<String>,
+        no_identity_map: bool,
     }
 
     fn scenario(rows: Vec<Value>) -> Scenario {
@@ -952,6 +990,10 @@ mod cad2081_workflow_verdicts {
             identities: None,
             extra_args: vec![],
             class: "strict",
+            approved: true,
+            tip_fails: false,
+            tip_sha: None,
+            no_identity_map: false,
         }
     }
 
@@ -1261,20 +1303,24 @@ mod cad2081_workflow_verdicts {
         );
     }
 
-    const OPERATOR: &str =
-        "cannot stand in for the operator on paths outside docs/roles/workflow-auto-paths.toml";
+    const OPERATOR: &str = "a workflow review cannot stand in for the operator";
     const NO_APPROVAL: &str = "no operator approval recorded";
 
-    fn needs_operator(f: &Fixture, head: String, why: &str) {
+    /// Workflow rows, no approval recorded, and a one-entry list at main's tip.
+    fn unapproved(f: &Fixture, head: String) -> Scenario {
         let mut case = scenario(vec![f.std(), f.spec()]);
         case.head = Some(head);
-        refused_all(f, case, &[why, NO_APPROVAL]);
+        case.approved = false;
+        case.tip_files = Some(f.listed("design-plans/**/*.md"));
+        case
+    }
+
+    fn needs_operator(f: &Fixture, head: String, why: &str) {
+        refused_all(f, unapproved(f, head), &[why, NO_APPROVAL]);
     }
 
     fn passes(f: &Fixture, head: String) {
-        let mut case = scenario(vec![f.std(), f.spec()]);
-        case.head = Some(head);
-        let (code, stdout, stderr) = f.gate(&case);
+        let (code, stdout, stderr) = f.gate(&unapproved(f, head));
         assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
         assert!(stdout.contains("class: auto"), "{stdout}");
     }
@@ -1398,16 +1444,20 @@ mod cad2081_workflow_verdicts {
             broken("[auto\npaths = "),
             broken("title = \"no auto table\"\n"),
             broken("[auto]\npaths = [1, 2]\n"),
-            broken("[auto]\npaths = []\n"),
         ] {
-            let mut case = scenario(vec![f.std(), f.spec()]);
-            case.head = Some(head.clone());
+            let mut case = unapproved(&f, head.clone());
             case.tip_files = Some(tip);
-            refused_all(&f, case, &[NO_APPROVAL]);
+            refused_all(
+                &f,
+                case,
+                &[
+                    NO_APPROVAL,
+                    "cannot read docs/roles/workflow-auto-paths.toml",
+                ],
+            );
         }
         // A missing file is named as unreadable, not read as "nothing to restrict".
-        let mut case = scenario(vec![f.std(), f.spec()]);
-        case.head = Some(head);
+        let mut case = unapproved(&f, head);
         let mut tip = f.base_files();
         tip.as_object_mut().unwrap().remove(AUTO_PATHS);
         case.tip_files = Some(tip);
@@ -1421,36 +1471,21 @@ mod cad2081_workflow_verdicts {
     #[test]
     fn a_pr_cannot_widen_the_list_and_a_removal_at_the_tip_reaches_it() {
         let f = Fixture::new();
-        let widened = |f: &Fixture| {
-            let mut files = f.base_files();
-            files[AUTO_PATHS] = json!("[auto]\npaths = [\"src/**\", \"design-plans/**/*.md\"]\n");
-            files
-        };
         // The list changed only in the PR's own head.
-        let mut case = scenario(vec![f.std(), f.spec()]);
-        case.head = Some(f.touch("src/wiki/x.rs"));
-        case.head_files = Some(widened(&f));
+        let mut case = unapproved(&f, f.touch("src/wiki/x.rs"));
+        case.head_files = Some(f.listed("**"));
         refused(&f, case, OPERATOR);
         // The list is wider only at a stale base; main's tip is what counts.
-        let mut case = scenario(vec![f.std(), f.spec()]);
-        case.head = Some(f.touch("src/wiki/x.rs"));
-        case.base_files = Some(widened(&f));
-        case.tip_files = Some(f.base_files());
+        let mut case = unapproved(&f, f.touch("src/wiki/x.rs"));
+        case.base_files = Some(f.listed("**"));
         refused(&f, case, OPERATOR);
         // A path removed at the tip stops being eligible for a PR based before the removal.
-        let mut narrowed = f.base_files();
-        narrowed[AUTO_PATHS] = json!("[auto]\npaths = [\"design-plans/other/**/*.md\"]\n");
-        let mut case = scenario(vec![f.std(), f.spec()]);
-        case.head = Some(f.touch("design-plans/p/new.md"));
-        case.tip_files = Some(narrowed);
+        let mut case = unapproved(&f, f.touch("design-plans/p/new.md"));
+        case.tip_files = Some(f.listed("design-plans/other/**/*.md"));
         refused(&f, case, OPERATOR);
         // The reverse is allowed: a path added at the tip is eligible for an older base.
-        let mut wider_tip = f.base_files();
-        wider_tip[AUTO_PATHS] =
-            json!("[auto]\npaths = [\"design-plans/**/*.md\", \"docs/extra/**\"]\n");
-        let mut case = scenario(vec![f.std(), f.spec()]);
-        case.head = Some(f.touch("docs/extra/y.md"));
-        case.tip_files = Some(wider_tip);
+        let mut case = unapproved(&f, f.touch("docs/extra/y.md"));
+        case.tip_files = Some(f.listed("docs/extra/**"));
         let (code, stdout, stderr) = f.gate(&case);
         assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     }
@@ -1534,6 +1569,7 @@ mod cad2081_workflow_verdicts {
         let mut case = scenario(rows);
         case.head = Some(f.touch("src/delivery/hosted_gate.rs"));
         case.base_files = Some(files);
+        case.approved = false;
         refused(&f, case, NO_APPROVAL);
     }
 
@@ -1695,12 +1731,9 @@ mod cad2081_workflow_verdicts {
     fn instruction_files_and_dot_paths_are_never_eligible_whatever_the_list_says() {
         let f = Fixture::new();
         for list in ["design-plans/**", "**"] {
-            let mut files = f.base_files();
-            files[AUTO_PATHS] = json!(format!("[auto]\npaths = [\"{list}\"]\n"));
             let case = |head: String| {
-                let mut case = scenario(vec![f.std(), f.spec()]);
-                case.head = Some(head);
-                case.tip_files = Some(files.clone());
+                let mut case = unapproved(&f, head);
+                case.tip_files = Some(f.listed(list));
                 case
             };
             // A control: the same list makes an ordinary file eligible.
@@ -1708,14 +1741,26 @@ mod cad2081_workflow_verdicts {
             assert_eq!(code, 0, "{list}\nstdout: {stdout}\nstderr: {stderr}");
             for path in [
                 "design-plans/CLAUDE.md",
+                "design-plans/CLAUDE.local.md",
                 "design-plans/x/agents.md",
                 "design-plans/x/Agents.MD",
+                "design-plans/AGENTS.override.md",
                 "design-plans/GEMINI.md",
+                "design-plans/GEMINI.x",
+                "design-plans/Claude.anything",
                 "design-plans/AGENTS.md",
                 "design-plans/.hid/a.md",
                 "design-plans/.gitattributes",
             ] {
-                refused_all(&f, case(f.touch(path)), &[OPERATOR, NO_APPROVAL]);
+                refused_all(
+                    &f,
+                    case(f.touch(path)),
+                    &[
+                        OPERATOR,
+                        NO_APPROVAL,
+                        "hidden or agent-instruction file name",
+                    ],
+                );
             }
         }
     }
@@ -1758,5 +1803,191 @@ mod cad2081_workflow_verdicts {
             case.class = "consequential";
             refused(&f, case, "requires exactly one independent combined review");
         }
+    }
+
+    fn owner_pair(f: &Fixture) -> Vec<Value> {
+        vec![
+            f.owner(
+                "20261103-000100-a.md",
+                "20261103-000100",
+                "usr_alice",
+                "alice",
+                "standards",
+            ),
+            f.owner(
+                "20261103-000200-b.md",
+                "20261103-000200",
+                "usr_bob",
+                "bob",
+                "spec-security",
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_branch_that_merged_main_and_restored_an_old_file_is_judged_on_its_real_changes() {
+        let f = Fixture::new();
+        // The human class and its reason reflect the restored file, for owner rows...
+        let mut case = scenario(owner_pair(&f));
+        case.head = Some(f.stale_head(Some("src/review.rs"), "docs/y.md"));
+        case.approved = false;
+        refused_all(&f, case, &["class: human (src/review.rs", NO_APPROVAL]);
+        // ...and for workflow rows, whose reason names the path.
+        let mut case = unapproved(&f, f.stale_head(Some("src/review.rs"), "design-plans/y.md"));
+        case.approved = false;
+        refused_all(
+            &f,
+            case,
+            &[OPERATOR, "src/review.rs (not on the list", NO_APPROVAL],
+        );
+        // It flips the review count from one to two...
+        let combined = || {
+            f.owner(
+                "20261103-000100-c.md",
+                "20261103-000100",
+                "usr_alice",
+                "alice",
+                "combined",
+            )
+        };
+        let mut case = scenario(vec![combined()]);
+        case.class = "strict1";
+        case.head = Some(f.stale_head(Some("src/peer.rs"), "docs/y.md"));
+        case.approved = false;
+        refused_all(
+            &f,
+            case,
+            &["reviews required: two", "no pass Standards verdict"],
+        );
+        // ...and the human class.
+        let mut case = scenario(vec![combined()]);
+        case.class = "strict1";
+        case.head = Some(f.stale_head(Some("src/review.rs"), "docs/y.md"));
+        case.approved = false;
+        refused(&f, case, NO_APPROVAL);
+        // The size trigger counts the same diff: restoring a big file is thousands of lines.
+        let mut case = scenario(owner_pair(&f));
+        case.head = Some(f.stale_head(Some("src/big.rs"), "docs/y.md"));
+        case.approved = false;
+        refused_all(&f, case, &["changed lines", NO_APPROVAL]);
+    }
+
+    #[test]
+    fn a_clean_branch_behind_a_stale_base_is_not_refused() {
+        let f = Fixture::new();
+        // It merged main and changed only a doc; GitHub still reports the old base.
+        let mut case = scenario(owner_pair(&f));
+        case.head = Some(f.stale_head(None, "docs/y.md"));
+        case.approved = false;
+        let (code, stdout, stderr) = f.gate(&case);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("class: auto"), "{stdout}");
+        // A base other than main keeps the PR's own base and never needs main's tip.
+        let mut case = scenario(owner_pair(&f));
+        case.base_ref = "staging".into();
+        case.tip_fails = true;
+        case.head = Some(f.touch("docs/y.md"));
+        case.approved = false;
+        let (code, stdout, stderr) = f.gate(&case);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        // ...so what main brought in counts as the branch's own change there.
+        let mut case = scenario(owner_pair(&f));
+        case.base_ref = "staging".into();
+        case.head = Some(f.stale_head(None, "docs/y.md"));
+        case.approved = false;
+        refused_all(&f, case, &["class: human", NO_APPROVAL]);
+    }
+
+    #[test]
+    fn an_unreadable_or_unfetchable_tip_refuses_a_pr_based_on_main() {
+        let f = Fixture::new();
+        let mut case = scenario(owner_pair(&f));
+        case.tip_fails = true;
+        refused(&f, case, "cannot list the changed files");
+        let mut case = scenario(owner_pair(&f));
+        case.tip_sha = Some("d".repeat(40));
+        refused(&f, case, "cannot list the changed files");
+    }
+
+    #[test]
+    fn the_real_empty_list_sends_every_path_to_the_operator_and_is_not_unreadable() {
+        let f = Fixture::new();
+        let mut case = scenario(vec![f.std(), f.spec()]);
+        case.head = Some(f.touch("design-plans/p/new.md"));
+        case.approved = false;
+        let (code, stdout, stderr) = f.gate(&case);
+        assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stdout.contains("design-plans/p/new.md (not on the list"),
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("cannot read docs/roles/workflow-auto-paths.toml"),
+            "{stdout}"
+        );
+        assert!(stderr.contains(NO_APPROVAL), "{stderr}");
+        // With the operator's approval recorded, the workflow rows still satisfy the reviews.
+        let mut case = scenario(vec![f.std(), f.spec()]);
+        case.head = Some(f.touch("design-plans/p/new.md"));
+        let (code, stdout, stderr) = f.gate(&case);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("approval in force"), "{stdout}");
+    }
+
+    #[test]
+    fn a_workflow_row_that_is_not_a_pass_refuses_under_active_routine() {
+        let f = Fixture::new();
+        let mut revise = f.std();
+        revise["outcome"] = json!("revise");
+        revise["section_outcome"] = json!("revise");
+        let mut case = scenario(vec![revise, f.spec()]);
+        case.class = "routine";
+        refused(
+            &f,
+            case,
+            "a workflow review that is not a pass always refuses",
+        );
+        // Passing workflow rows under routine are fine with the approval the empty list needs.
+        let mut case = scenario(vec![f.std(), f.spec()]);
+        case.class = "routine";
+        let (code, stdout, stderr) = f.gate(&case);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        // An owner row that is not a pass behaves as it does on main: routine reads no reviews.
+        let mut owner = f.owner(
+            "20261103-000100-a.md",
+            "20261103-000100",
+            "usr_alice",
+            "alice",
+            "standards",
+        );
+        owner["outcome"] = json!("revise");
+        owner["section_outcome"] = json!("revise");
+        let mut case = scenario(vec![owner]);
+        case.class = "routine";
+        let (code, stdout, stderr) = f.gate(&case);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    }
+
+    #[test]
+    fn a_workflow_row_with_a_risk_that_is_not_auto_needs_the_operator_on_an_eligible_path() {
+        let f = Fixture::new();
+        let mut risky = f.std();
+        risky["risk"] = json!("human");
+        let mut case = unapproved(&f, f.touch("design-plans/p/ok.md"));
+        case.rows = vec![risky, f.spec()];
+        refused_all(&f, case, &["Risk 'human'", NO_APPROVAL]);
+    }
+
+    #[test]
+    fn a_document_of_workflow_rows_alone_needs_no_read_of_the_owner_map() {
+        let f = Fixture::new();
+        let mut case = scenario(vec![f.std(), f.spec()]);
+        case.no_identity_map = true;
+        let (code, stdout, stderr) = f.gate(&case);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        // An owner row beside them does need it, and refuses without it.
+        let mut case = scenario(vec![f.std(), owner_pair(&f).remove(1)]);
+        case.no_identity_map = true;
+        refused(&f, case, "cannot read the workspace identity map");
     }
 }
