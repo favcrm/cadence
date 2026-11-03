@@ -387,8 +387,10 @@ impl Shared {
 
     /// Imported custody has no producing run to re-prove and must outlive
     /// the installation that imported it, so the receiver's own admission
-    /// is the whole currentness check here. One helper, so a change to the
-    /// receiver's admission or guard order lands for imported bytes too.
+    /// is the whole currentness check here. A post-admission rule belongs
+    /// in `receiver_install_admitted`, which every arm — this one, the
+    /// producer pairing, and the pre-byte gate — calls; the wrapper differs
+    /// only where the provider needs a two-install snapshot.
     fn with_receiver_only_current<T>(
         &self,
         caller: &str,
@@ -1605,7 +1607,8 @@ impl Shared {
             .ok_or_else(|| Error::rejected("media inspect reference is stale"))?;
         let image = self
             .store
-            .app_media_pinned_display(asset_id, pinned_revision, pinned_sha)?;
+            .app_media_pinned_display(asset_id, pinned_revision, pinned_sha)?
+            .ok_or_else(|| Error::rejected("media inspect reference is stale"))?;
         let delivery = MediaInspectionDelivery {
             shared: self,
             params,

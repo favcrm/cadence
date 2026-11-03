@@ -721,22 +721,21 @@ impl Store {
     /// names the revision and the digest of the bytes themselves, so the
     /// check is provenance-neutral: an imported workspace asset and a
     /// provider-produced one pass or refuse on the same terms, and
-    /// anything that is not a verified workspace asset refuses.
+    /// anything that is not a verified workspace asset answers `None`, and
+    /// each caller words its own refusal.
     pub(crate) fn app_media_pinned_display(
         &self,
         asset_id: &str,
         revision: i64,
         sha256: &str,
-    ) -> Result<DisplayImage> {
-        let image = self
-            .app_media_display_image(asset_id)?
-            .ok_or_else(|| Error::rejected("media asset is not in the workspace catalog"))?;
+    ) -> Result<Option<DisplayImage>> {
+        let Some(image) = self.app_media_display_image(asset_id)? else {
+            return Ok(None);
+        };
         if image.asset.revision != revision || image.sha256 != sha256 {
-            return Err(Error::rejected(
-                "attached library image no longer matches the retained bytes",
-            ));
+            return Ok(None);
         }
-        Ok(image)
+        Ok(Some(image))
     }
 
     /// CAD-1962: the verified custody bytes behind one imported asset.

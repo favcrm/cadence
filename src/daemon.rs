@@ -1704,7 +1704,10 @@ impl Shared {
             .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
         let image = self
             .store
-            .app_media_pinned_display(asset_id, pinned_revision, pinned_sha)?;
+            .app_media_pinned_display(asset_id, pinned_revision, pinned_sha)?
+            .ok_or_else(|| {
+                Error::rejected("attached library image no longer matches the retained bytes")
+            })?;
         let revision = image.asset.revision;
         let authority = match &image.original {
             Some(original) => app_media_rpc::OriginalAuthority::Provider(original),

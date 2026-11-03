@@ -257,6 +257,7 @@ fn a_pinned_library_image_resolves_by_its_own_bytes_for_either_provenance() {
     // asset resolves exactly as a provider-produced one would.
     let image = s
         .app_media_pinned_display(asset_id, 1, &digest)
+        .expect("the resolver reads")
         .expect("an imported asset satisfies the same pin");
     assert_eq!(image.bytes, IMPORT_BYTES);
     assert_eq!(image.sha256, digest);
