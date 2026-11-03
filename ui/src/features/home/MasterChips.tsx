@@ -88,6 +88,17 @@ export default function MasterChips({
   /** The pick still being applied — `kind`+`id`; clears when state agrees. */
   const [pending, setPending] = useState<{ kind: "model" | "effort"; id: string } | null>(null);
 
+  // The chip's friendly name comes from the catalogue. A failed read keeps
+  // the raw id rather than raising an error nobody asked to see.
+  const [catalogue, setCatalogue] = useState<MasterModelsView | null>(null);
+  useEffect(() => {
+    if (!model) return;
+    let current = true;
+    api.masterModels().then((m) => { if (current) setCatalogue(masterModelsOptions(m)); }).catch(() => undefined);
+    return () => { current = false; };
+  }, [model]);
+  const modelLabel = (view ?? catalogue)?.models.find((m) => m.id === model)?.label ?? model;
+
   // The picker's read: fetched on each open so the list never serves a
   // stale session; the last good payload stays rendered while it loads.
   const load = () => {
@@ -150,16 +161,16 @@ export default function MasterChips({
           <button
             type="button"
             key={`m:${model}`}
-            className="chip chip-in bg-ink-800 text-ink-300 chip-btn"
-            title={
+            className="chip chip-sans chip-in bg-ink-800 text-ink-300 chip-btn"
+            title={`${model} — ${
               live ? t("Reported by the live provider session — pick a model") : t("Configured model — pick a model")
-            }
+            }`}
             aria-expanded={open === "model"}
             disabled={disabled}
             onClick={() => toggle("model")}
           >
             {live && <span className="livedot" aria-hidden />}
-            {pending?.kind === "model" ? `${pending.id}…` : model}
+            {pending?.kind === "model" ? `${pending.id}…` : modelLabel}
             <span aria-hidden> ▾</span>
           </button>
           {open === "model" && (

@@ -305,6 +305,7 @@ for (const density of ["full", "compact"] as const) {
     ok(answerAt >= 0 && complete.indexOf("turn-copy") < answerAt, "turn: Copy is in the head, not on the answer");
     ok(!complete.slice(answerAt).includes("turn-copy"), "turn: the answer bubble has no Copy control");
   }
+  ok(complete.includes(">Thought for 4s<") && !renderTurn(completeItems).includes(">Finished<"), "turn: a timed finish keeps its elapsed title");
   ok(count(complete, "answer-copy") === 0, "turn: no Answer kicker copy");
   ok(complete.includes("<table>") && complete.includes(">PILOT-1<"), "turn: answer Markdown table");
   ok(!complete.includes("| id | title |"), "turn: no literal Markdown pipes");
@@ -319,12 +320,14 @@ for (const density of ["full", "compact"] as const) {
   );
   const running = renderTurn(runningItems, true);
   ok(running.includes('data-turn-state="running"'), "streaming: running state");
-  ok(running.includes("Thinking…"), "streaming: the trace says it is thinking");
+  ok(running.includes(">Working<"), "streaming: the trace title says it is working");
+  ok(running.split("Thinking…").length <= 2, "streaming: Thinking… never appears twice");
   {
     const summaryAt = running.indexOf("turntrace-summary");
     const listAt = running.indexOf("turntrace-list");
     ok(summaryAt >= 0 && listAt > summaryAt, "streaming: the summary sits in the trace head");
-    ok(running.slice(summaryAt, listAt).includes("Bash: cadence board read"), "streaming: the summary is the latest step");
+    ok(running.slice(summaryAt, listAt).includes("Bash"), "streaming: the summary is the latest step");
+    ok(!running.slice(summaryAt, listAt).includes("cadence board read"), "streaming: a tool's arguments stay out of the closed summary");
     ok(!running.slice(summaryAt, listAt).includes("Reading the board"), "streaming: the summary is not the first note");
     const list = running.slice(listAt);
     ok(list.indexOf("Bash: cadence board read") < list.indexOf("Reading the board"), "streaming: the open trace leads with the latest step");
@@ -336,11 +339,11 @@ for (const density of ["full", "compact"] as const) {
   }
   ok(count(running, 'data-kind="typing"') === 1, "streaming: one typing row");
   ok(running.indexOf('data-kind="turn-trace"') < running.indexOf('data-kind="typing"'), "streaming: the typing bubble follows the trace");
-  ok(running.includes("Running Bash: cadence board read"), "streaming: the typing bubble names the latest step");
+  ok(running.includes("Running bash"), "streaming: the typing bubble names the latest step");
   ok(count(running, "<i></i>") === 3, "streaming: exactly three dots");
   ok(!running.includes('data-kind="answer"'), "streaming: no answer body");
   ok(!running.toLowerCase().includes("skeleton"), "streaming: no skeleton");
-  ok(!running.includes("data-assistant-activity") && !running.includes("Working"), "streaming: no status chip");
+  ok(!running.includes("data-assistant-activity") && !running.includes('class="chip'), "streaming: no status chip");
   const initialTyping = renderTurn([], true);
   ok(initialTyping.includes('data-turn-state="running"') && count(initialTyping, 'data-kind="typing"') === 1, "streaming: initial 0-step turn shows typing bubble immediately");
   ok(!initialTyping.includes('data-kind="no-answer"') && !initialTyping.includes('data-kind="turn-trace"'), "streaming: initial 0-step turn has no trace or no-answer line");

@@ -553,7 +553,15 @@ function stepLabel(summary: string): string {
   return name.length > 48 ? `${name.slice(0, 45)}…` : name;
 }
 
-/** The line after "Reasoning": the newest step the open trace leads with,
+/** A tool call's plain name for the closed trace: `catalog_search: website`
+ *  reads as `Catalog search`. Formats a known-shape string for reading; raw
+ *  calls and their arguments stay in the open trace. */
+function toolName(summary: string): string {
+  const name = stepLabel(summary).split(":", 1)[0].replaceAll("_", " ").replace(/\s+/g, " ").trim();
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+/** The line after the trace title: the newest step the open trace leads with,
  *  and never the call that opened the turn or a raw argument blob. The
  *  newest item decides: a tool run names its last calls, a reasoning or
  *  commentary note reads as its own line. Older tool names appear only
@@ -571,10 +579,10 @@ function traceDigest(trace: ThreadItem[]): { summary: string; errors: number } {
     if (item.type === "tools") {
       const names: string[] = [];
       for (const step of toolSteps(item.entries)) {
-        const name = stepLabel(step.summary);
-        if (name !== "" && !carriesSecret(name)) names.push(name);
+        const name = toolName(step.summary);
+        if (name !== "" && !carriesSecret(name)) names.unshift(name);
       }
-      if (names.length > 0) return { summary: names.slice(-3).join(", "), errors };
+      if (names.length > 0) return { summary: [...new Set(names)].slice(0, 3).join(", "), errors };
       continue;
     }
     if (item.type !== "thinking" && item.type !== "commentary") continue;
@@ -594,7 +602,7 @@ function runningTool(trace: ThreadItem[]): string {
     if (item.type === "tools") {
       const steps = toolSteps(item.entries);
       for (let s = steps.length - 1; s >= 0; s--) {
-        const name = stepLabel(steps[s].summary);
+        const name = toolName(steps[s].summary);
         if (name !== "" && !carriesSecret(name)) return name;
       }
       continue;
@@ -649,6 +657,7 @@ function TurnTrace({
   summary,
   errors,
   elapsed,
+  failed,
 }: {
   items: ThreadItem[];
   steps: number;
@@ -656,11 +665,19 @@ function TurnTrace({
   summary: string;
   errors: number;
   elapsed: string | null;
+  /** The turn ended on a failure rather than an answer. */
+  failed: boolean;
 }) {
   const t = useTranslate();
   const [open, setOpen] = useState(false);
   const id = useId();
-  const title = running ? t("Thinking…") : elapsed ? `${t("Thought for")} ${elapsed}` : t("Reasoning");
+  const title = running
+    ? t("Working")
+    : failed
+      ? t("Stopped")
+      : elapsed
+        ? `${t("Thought for")} ${elapsed}`
+        : t("Finished");
   return (
     <div className="steps turntrace min-w-0" data-kind="turn-trace" data-open={open || undefined}>
       <button
@@ -675,7 +692,7 @@ function TurnTrace({
         </span>
         <span className="turntrace-title shrink-0">{title}</span>
         {summary !== "" && (
-          <span className="turntrace-summary num truncate min-w-0" title={summary}>
+          <span className="turntrace-summary truncate min-w-0" title={summary}>
             · {summary}
           </span>
         )}
@@ -887,7 +904,7 @@ export function ThreadTurn({
   const elapsed = streaming ? null : traceElapsed(introEntry?.created, shown?.entry.created);
   const headAt = shown?.entry.created ?? lastCreated(items);
   const tool = runningTool(trace);
-  const typingLabel = tool !== "" ? `${t("Running")} ${tool}` : t("Thinking…");
+  const typingLabel = tool !== "" ? `${t("Running")} ${tool.charAt(0).toLowerCase()}${tool.slice(1)}` : t("Thinking…");
   return (
     <div className="turn min-w-0" data-kind="turn" data-turn-state={streaming ? "running" : "complete"} data-turn-continued={continued || undefined}>
       {head && (
@@ -906,6 +923,7 @@ export function ThreadTurn({
           summary={digest.summary}
           errors={digest.errors}
           elapsed={elapsed}
+          failed={shown != null && turnFailure(shown.entry, t) !== null}
         />
       )}
       {/* Dots, then the current step. Under the trace once steps exist,

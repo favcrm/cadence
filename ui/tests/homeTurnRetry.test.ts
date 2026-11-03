@@ -231,7 +231,7 @@ async function main() {
   await settle();
   assert(face.isConnected, "the assistant face stays mounted when the tool call lands");
   const bubble = host.querySelector('[data-kind="typing"]');
-  assert(bubble !== null && bubble.textContent?.includes("Running Bash: cadence board read") === true, "the typing bubble names the tool now running");
+  assert(bubble !== null && bubble.textContent?.includes("Running bash") === true, "the typing bubble names the tool now running");
   const trace = host.querySelector('[data-kind="turn-trace"]');
   assert(
     trace !== null && (bubble.compareDocumentPosition(trace) & Node.DOCUMENT_POSITION_PRECEDING) !== 0,

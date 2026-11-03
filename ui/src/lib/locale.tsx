@@ -1500,6 +1500,7 @@ Object.assign(zhTW, {
   "The release could not be read.": "未能讀取所選版本。",
   // The worker-transcript turn: one head, one folded trace, the answer surface.
   "Reasoning": "思考",
+  "Finished": "已完成",
   "Thought for": "思考了",
   "Thinking…": "思考中…",
   "Worker note": "工作紀錄",
