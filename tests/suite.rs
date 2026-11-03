@@ -7509,6 +7509,16 @@ const realSet = globalThis.setTimeout;
 globalThis.setTimeout = (f, _ms, ...a) => realSet(f, 0, ...a);
 const reply = (r) => {
   if (r.throw) throw new TypeError('fetch failed');
+  if (r.sse) {
+    const enc = new TextEncoder();
+    const body = new ReadableStream({
+      start(controller) {
+        for (const ev of r.sse) controller.enqueue(enc.encode(`event: ${ev.type}\ndata: ${typeof ev.raw === 'string' ? ev.raw : JSON.stringify(ev)}\n\n`));
+        if (r.drop) controller.error(new TypeError('terminated')); else controller.close();
+      },
+    });
+    return new Response(body, { status: r.status ?? 200, headers: { 'content-type': 'text/event-stream' } });
+  }
   const body = r.json !== undefined ? JSON.stringify(r.json) : (r.text ?? '');
   return new Response(body, { status: r.status ?? 200 });
 };
@@ -7546,10 +7556,17 @@ if (mode === 'keys') {
   process.stdout.write(JSON.stringify({ pub_a: a.pub, priv_a: a.priv, pub_b: b.pub, priv_b: b.priv, pub_small: c.pub }));
 } else if (mode === 'seal') {
   const { pub, label, obj, repo, pr, head } = input;
+  // Padded framing: 4-byte length, data, zero padding to a fixed size per label, all inside the AEAD.
+  const SIZES = { ticket: 131072, 'review-output': 65536, selftest: 1024 };
+  const data = Buffer.from(JSON.stringify(obj), 'utf8');
+  const size = input.size ?? SIZES[label];
+  const framed = Buffer.alloc(size);
+  framed.writeUInt32BE(input.len ?? data.length, 0);
+  data.copy(framed, 4);
   const k = crypto.randomBytes(32), iv = crypto.randomBytes(12);
   const c = crypto.createCipheriv('aes-256-gcm', k, iv);
   c.setAAD(Buffer.from(`cadence-review-seal:v1:${repo}:${pr}:${head}:${label}`));
-  const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
+  const ct = Buffer.concat([c.update(framed), c.final()]);
   const wrapped = crypto.publicEncrypt({ key: pub, oaepHash: 'sha256', padding: crypto.constants.RSA_PKCS1_OAEP_PADDING }, k);
   process.stdout.write(JSON.stringify({ v: 1, k: wrapped.toString('base64'), iv: iv.toString('base64'), tag: c.getAuthTag().toString('base64'), ct: ct.toString('base64') }));
 }
@@ -7955,12 +7972,16 @@ if (mode === 'keys') {
     }
 
     fn seal(wf: &Wf, pubkey: &str, label: &str, obj: &Value) -> Value {
-        node_tool(
-            "seal",
-            Some(
-                &json!({ "pub": pubkey, "label": label, "obj": obj, "repo": wf.repo(), "pr": PR, "head": HEAD }),
-            ),
-        )
+        seal_with(wf, pubkey, label, obj, json!({}))
+    }
+
+    // extra may carry `size` or `len` to build a wrongly framed seal.
+    fn seal_with(wf: &Wf, pubkey: &str, label: &str, obj: &Value, extra: Value) -> Value {
+        let mut req = json!({ "pub": pubkey, "label": label, "obj": obj, "repo": wf.repo(), "pr": PR, "head": HEAD });
+        for (k, v) in extra.as_object().unwrap() {
+            req[k] = v.clone();
+        }
+        node_tool("seal", Some(&req))
     }
 
     fn verdict_ok(dup: bool, outcome: &str) -> Value {
@@ -8010,8 +8031,34 @@ if (mode === 'keys') {
         )
     }
 
+    // A streamed reply: message_start, a thinking block, the text in two deltas, the stop reason
+    // in message_delta, message_stop (event shapes of the Messages streaming API).
+    fn model_events(text: &str, stop: Option<&str>) -> Vec<Value> {
+        let mid = text
+            .char_indices()
+            .nth(text.chars().count() / 2)
+            .map_or(0, |(i, _)| i);
+        let mut ev = vec![
+            json!({ "type": "message_start", "message": { "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [], "stop_reason": null, "usage": { "input_tokens": 1, "output_tokens": 1 } } }),
+            json!({ "type": "ping" }),
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "" } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "hmm" } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": "sig" } }),
+            json!({ "type": "content_block_stop", "index": 0 }),
+            json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "text", "text": "" } }),
+            json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "text_delta", "text": &text[..mid] } }),
+            json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "text_delta", "text": &text[mid..] } }),
+            json!({ "type": "content_block_stop", "index": 1 }),
+        ];
+        if let Some(stop) = stop {
+            ev.push(json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": { "output_tokens": 15 } }));
+        }
+        ev.push(json!({ "type": "message_stop" }));
+        ev
+    }
+
     fn model_reply(text: &str, stop: &str) -> Value {
-        json!({ "status": 200, "json": { "stop_reason": stop, "model": "claude-opus-5-5", "content": [{ "type": "text", "text": text }], "usage": { "input_tokens": 1, "output_tokens": 1 } } })
+        json!({ "status": 200, "sse": model_events(text, Some(stop)) })
     }
 
     fn run_review(
@@ -8039,6 +8086,18 @@ if (mode === 'keys') {
 
     fn prepared(wf: &Wf) -> (Value, Run) {
         prepared_from(wf, &world(wf))
+    }
+
+    // The one line a refused model output prints, whatever made it invalid.
+    const FILE_REFUSAL: &str = "::error::model output failed validation; nothing filed\n";
+
+    fn assert_refused(ctx: &str, r: &Run) {
+        assert!(r.failed(), "{ctx}: must fail: {}", r.out);
+        assert_eq!(r.out, FILE_REFUSAL, "{ctx}: the refusal line differs");
+        assert!(
+            r.hits("/verdict").is_empty() && r.minted() == 0,
+            "{ctx}: reached the tenant"
+        );
     }
 
     fn flat(v: &Value) -> String {
@@ -8816,10 +8875,19 @@ if (mode === 'keys') {
     }
 
     #[test]
-    fn a_model_refusal_or_failure_files_nothing_and_a_run_makes_at_most_two_requests() {
+    fn a_model_refusal_or_failure_files_nothing_and_a_run_makes_one_generation() {
         for wf in all() {
             let (input, _) = prepared(&wf);
+            let good = good_output(&wf).to_string();
             let revise = json!({ "outcome": "revise", "risk_level": "auto", "risk_triggers": [], "checks": [] }).to_string();
+            let mut no_stop = model_events(&good, None);
+            let mut mid_error = model_events(&good, None);
+            mid_error.truncate(8);
+            mid_error.push(json!({ "type": "error", "error": { "type": "overloaded_error", "message": "Overloaded" } }));
+            no_stop.retain(|e| e["type"] != "message_stop");
+            let mut bad_event = model_events(&good, Some("end_turn"));
+            bad_event.insert(8, json!({ "type": "x", "raw": "{not json" }));
+            let truncated = model_events(&good, None)[..8].to_vec();
             let cases: Vec<(&str, Value, &str, usize)> = vec![
                 (
                     "refusal",
@@ -8829,8 +8897,50 @@ if (mode === 'keys') {
                 ),
                 (
                     "max tokens",
-                    json!([model_reply(&good_output(&wf).to_string(), "max_tokens")]),
+                    json!([model_reply(&good, "max_tokens")]),
                     "stopped with max_tokens",
+                    1,
+                ),
+                (
+                    "pause turn",
+                    json!([model_reply(&good, "pause_turn")]),
+                    "stopped with pause_turn",
+                    1,
+                ),
+                (
+                    "tool use stop",
+                    json!([model_reply(&good, "tool_use")]),
+                    "model stopped early",
+                    1,
+                ),
+                (
+                    "stream with no stop reason",
+                    json!([{ "status": 200, "sse": model_events(&good, None) }]),
+                    "model stopped early",
+                    1,
+                ),
+                (
+                    "stream cut before the stop reason",
+                    json!([{ "status": 200, "sse": no_stop }]),
+                    "model stopped early",
+                    1,
+                ),
+                (
+                    "stream dropped mid-way",
+                    json!([{ "status": 200, "sse": truncated, "drop": true }]),
+                    "call failed or timed out",
+                    1,
+                ),
+                (
+                    "error event mid-stream",
+                    json!([{ "status": 200, "sse": mid_error }]),
+                    "stream failed",
+                    1,
+                ),
+                (
+                    "unparseable event",
+                    json!([{ "status": 200, "sse": bad_event }]),
+                    "stream failed",
                     1,
                 ),
                 (
@@ -8840,9 +8950,21 @@ if (mode === 'keys') {
                     1,
                 ),
                 (
+                    "empty text",
+                    json!([model_reply("", "end_turn")]),
+                    "not JSON",
+                    1,
+                ),
+                (
                     "bad request",
                     json!([{ "status": 400, "json": { "type": "error" } }]),
                     "request failed: HTTP 400",
+                    1,
+                ),
+                (
+                    "thrown fetch",
+                    json!([{ "throw": true }, model_reply(&good, "end_turn")]),
+                    "call failed or timed out",
                     1,
                 ),
                 (
@@ -8858,9 +8980,15 @@ if (mode === 'keys') {
                     2,
                 ),
                 (
-                    "network twice",
-                    json!([{ "throw": true }]),
-                    "request failed: HTTP 0",
+                    "5xx then a dropped stream",
+                    json!([{ "status": 503, "text": "x" }, { "status": 200, "sse": model_events(&good, None)[..8].to_vec(), "drop": true }, model_reply(&good, "end_turn")]),
+                    "call failed or timed out",
+                    2,
+                ),
+                (
+                    "5xx then a stream error",
+                    json!([{ "status": 500, "text": "x" }, { "status": 200, "sse": [{ "type": "error", "error": { "type": "api_error", "message": "x" } }] }, model_reply(&good, "end_turn")]),
+                    "stream failed",
                     2,
                 ),
             ];
@@ -8884,11 +9012,22 @@ if (mode === 'keys') {
                     "the review job never talks to the tenant"
                 );
             }
-            // A transient failure then success is the most it ever bills twice for.
-            let again = json!([{ "status": 500, "text": "oops" }, model_reply(&good_output(&wf).to_string(), "end_turn")]);
-            let r = run_review(&wf, &input, again, &[]);
+            // A transient status then a good stream is the most it ever bills twice for (nothing was generated).
+            for status in [500, 429, 503] {
+                let again =
+                    json!([{ "status": status, "text": "oops" }, model_reply(&good, "end_turn")]);
+                let r = run_review(&wf, &input, again, &[]);
+                assert_eq!(r.code, Some(0), "{}: {status}: {}", wf.file, r.out);
+                assert_eq!(r.hits("api.anthropic.com").len(), 2);
+            }
+            // A good stream is read once, however the text is split across events.
+            let r = run_review(&wf, &input, json!([model_reply(&good, "end_turn")]), &[]);
             assert_eq!(r.code, Some(0), "{}", r.out);
-            assert_eq!(r.hits("api.anthropic.com").len(), 2);
+            assert_eq!(r.hits("api.anthropic.com").len(), 1);
+            let body: Value =
+                serde_json::from_str(r.hits("api.anthropic.com")[0]["body"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(body["stream"], true, "the call must stream");
         }
     }
 
@@ -9059,9 +9198,28 @@ if (mode === 'keys') {
                 ("500 text", json!([{ "status": 500, "text": p }]), false),
                 ("429 text", json!([{ "status": 429, "text": p }]), false),
                 (
-                    "model name",
-                    json!([{ "status": 200, "json": { "stop_reason": "end_turn", "model": p, "content": [{ "type": "text", "text": "{}" }], "usage": { "input_tokens": p, "output_tokens": p } } }]),
+                    "model name and usage",
+                    json!([{ "status": 200, "sse": [
+                        { "type": "message_start", "message": { "model": p, "usage": { "input_tokens": p, "output_tokens": p } } },
+                        { "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "{}" } },
+                        { "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": p } },
+                        { "type": "message_stop" }] }]),
                     true,
+                ),
+                (
+                    "stream error event",
+                    json!([{ "status": 200, "sse": [{ "type": "error", "error": { "type": p, "message": p } }] }]),
+                    false,
+                ),
+                (
+                    "garbage event",
+                    json!([{ "status": 200, "sse": [{ "type": "x", "raw": p }] }]),
+                    false,
+                ),
+                (
+                    "dropped stream",
+                    json!([{ "status": 200, "sse": model_events(&p, None)[..8].to_vec(), "drop": true }]),
+                    false,
                 ),
             ];
             for (name, replies, ok) in cases {
@@ -9468,20 +9626,9 @@ if (mode === 'keys') {
                     "bad fields",
                 ),
             ];
-            for (name, out, reason) in cases {
+            for (name, out, _) in cases {
                 let r = file_with(&wf, &out, json!([verdict_ok(false, "pass")]));
-                assert!(r.failed(), "{}: {name} must fail", wf.file);
-                assert!(
-                    r.out.contains(reason),
-                    "{}: {name}: wrong reason: {}",
-                    wf.file,
-                    r.out
-                );
-                assert!(
-                    r.hits("/verdict").is_empty() && r.minted() == 0,
-                    "{}: {name} reached the tenant",
-                    wf.file
-                );
+                assert_refused(&format!("{}: {name}", wf.file), &r);
             }
         }
     }
@@ -9507,7 +9654,7 @@ if (mode === 'keys') {
                     json!([verdict_ok(false, "pass")]),
                 );
                 assert!(
-                    r.failed() && r.out.contains("ticket-requirements judged"),
+                    r.failed() && r.out == FILE_REFUSAL,
                     "{}: {}",
                     wf.file,
                     r.out
@@ -9644,7 +9791,7 @@ if (mode === 'keys') {
                     &[],
                 );
                 assert!(
-                    r.failed() && r.out.contains("is not a line of the diff"),
+                    r.failed() && r.out == FILE_REFUSAL,
                     "{}: fake.rs:{line}: {}",
                     wf.file,
                     r.out
@@ -9716,7 +9863,7 @@ if (mode === 'keys') {
                         &[],
                     );
                     assert!(
-                        r.failed() && r.out.contains("is not a line of the diff"),
+                        r.failed() && r.out == FILE_REFUSAL,
                         "{}: {file}:{line} was citable: {}",
                         wf.file,
                         r.out
@@ -9883,6 +10030,491 @@ if (mode === 'keys') {
                 std::fs::write(b.join("review-output.json"), sealed.to_string()).unwrap();
             });
             assert!(r.failed() && r.hits("/verdict").is_empty());
+        }
+    }
+
+    // ---- side channels: nothing model-chosen, ticket-sized or sealed-sized is observable ----
+
+    // Log lines may carry run identifiers and an HTTP status or attempt number, nothing else numeric.
+    fn assert_no_derived_numbers(ctx: &str, r: &Run) {
+        let known = regex::Regex::new(
+            r"CAD-2088|PR 123|HTTP [0-9]{3}|attempt [0-9]|after [0-9] attempts|\([0-9]{3}\)",
+        )
+        .unwrap();
+        for l in r.out.lines().filter(|l| !l.starts_with("::add-mask::")) {
+            let rest = known.replace_all(l, "");
+            assert!(
+                !rest.chars().any(|c| c.is_ascii_digit()),
+                "{ctx}: a number on a log line: {l}"
+            );
+        }
+    }
+
+    fn big_text(c: char, n: usize) -> String {
+        std::iter::repeat_n(c, n).collect()
+    }
+
+    // A world whose ticket and PR text have the given sizes.
+    fn sized_world(wf: &Wf, title: usize, body: usize, pr_body: usize) -> Value {
+        let mut w = world(wf);
+        w["ctx"]["ticket"]["title"] = json!(big_text('T', title));
+        w["ctx"]["ticket_body"] = json!(big_text('x', body));
+        w["ctx"]["pull"]["body"] = json!(big_text('y', pr_body));
+        w
+    }
+
+    fn output_of_size(wf: &Wf, note: usize, citations: usize) -> Value {
+        let mut o = good_output(wf);
+        for c in o["checks"].as_array_mut().unwrap() {
+            c["note"] = json!(big_text('n', note));
+            c["citations"] = json!((0..citations)
+                .map(|_| json!({ "file": "src/a.rs", "line": 2 }))
+                .collect::<Vec<_>>());
+        }
+        o["risk_level"] = json!(if citations > 1 { "human" } else { "auto" });
+        o["risk_triggers"] = json!(if citations > 1 {
+            vec![1, 2, 3, 4, 5]
+        } else {
+            vec![]
+        });
+        o
+    }
+
+    #[test]
+    fn every_validation_refusal_prints_the_same_single_line() {
+        for wf in all() {
+            let good = good_output(&wf);
+            let with = |f: &dyn Fn(&mut Value)| {
+                let mut v = good.clone();
+                f(&mut v);
+                v
+            };
+            // Kinds that differ in index, check name, count, position and nature.
+            let kinds: Vec<(&str, Value)> = vec![
+                (
+                    "first citation",
+                    with(&|v| v["checks"][0]["citations"] = json!([{ "file": "nope", "line": 1 }])),
+                ),
+                (
+                    "last citation",
+                    with(&|v| {
+                        v["checks"][3]["citations"] = json!([{ "file": "src/a.rs", "line": 2 }, { "file": "nope", "line": 1 }])
+                    }),
+                ),
+                (
+                    "second check name",
+                    with(&|v| v["checks"][1]["name"] = json!("zzz")),
+                ),
+                (
+                    "missing check",
+                    with(&|v| {
+                        v["checks"].as_array_mut().unwrap().pop();
+                    }),
+                ),
+                (
+                    "two missing checks",
+                    with(&|v| {
+                        v["checks"].as_array_mut().unwrap().truncate(2);
+                    }),
+                ),
+                (
+                    "extra checks",
+                    with(&|v| {
+                        let c = v["checks"][0].clone();
+                        v["checks"].as_array_mut().unwrap().extend([c.clone(), c]);
+                    }),
+                ),
+                ("contradiction", with(&|v| v["outcome"] = json!("revise"))),
+                ("risk", with(&|v| v["risk_triggers"] = json!([9]))),
+                ("shape", json!(["x"])),
+                (
+                    "one pass",
+                    with(&|v| {
+                        for i in 1..4 {
+                            v["checks"][i]["result"] = json!("na");
+                            v["checks"][i]["citations"] = json!([]);
+                        }
+                    }),
+                ),
+            ];
+            let mut outs = std::collections::BTreeSet::new();
+            for (name, out) in kinds {
+                let r = file_with(&wf, &out, json!([verdict_ok(false, "pass")]));
+                assert_refused(&format!("{}: {name}", wf.file), &r);
+                outs.insert(r.out.clone());
+            }
+            // A bad diff handed to the file job prints the same line.
+            let mut input = file_input(&world(&wf));
+            input["diff"] = json!("diff --git a/x b/x\nBinary files /dev/null and b/x differ\n");
+            let r = run_file(
+                &wf,
+                &input,
+                Some(&sealed_model_output(&wf, &good)),
+                json!([verdict_ok(false, "pass")]),
+                &[],
+            );
+            assert_refused(&format!("{}: binary diff", wf.file), &r);
+            outs.insert(r.out.clone());
+            assert_eq!(outs.len(), 1, "{}: refusal lines differ: {outs:?}", wf.file);
+        }
+    }
+
+    #[test]
+    fn logs_are_identical_whatever_the_ticket_the_output_or_the_sealed_sizes() {
+        for wf in all() {
+            let small = sized_world(&wf, 3, 5, 5);
+            let large = sized_world(&wf, 1500, 99_000, 90_000);
+            let (p_small, p_large) = (prepare(&wf, &small, &[]), prepare(&wf, &large, &[]));
+            assert_eq!(
+                (p_small.code, p_large.code),
+                (Some(0), Some(0)),
+                "{}: {} {}",
+                wf.file,
+                p_small.out,
+                p_large.out
+            );
+            assert_eq!(
+                p_small.out, p_large.out,
+                "{}: prepare logs differ with the ticket size",
+                wf.file
+            );
+            assert_no_derived_numbers("prepare", &p_small);
+            let (in_small, in_large) = (
+                p_small.read("out/review-input.json").unwrap(),
+                p_large.read("out/review-input.json").unwrap(),
+            );
+
+            // Review: ticket sizes, output sizes and the usage numbers the stream reports.
+            let mut runs = Vec::new();
+            for (input, note, cites, tokens) in
+                [(&in_small, 3, 1, 1), (&in_large, 2000, 4, 987_654)]
+            {
+                let text = output_of_size(&wf, note, cites).to_string();
+                let mut ev = model_events(&text, Some("end_turn"));
+                ev[0]["message"]["usage"] =
+                    json!({ "input_tokens": tokens, "output_tokens": tokens });
+                let last = ev.len() - 2;
+                ev[last]["usage"] = json!({ "output_tokens": tokens });
+                runs.push(run_review(
+                    &wf,
+                    input,
+                    json!([{ "status": 200, "sse": ev }]),
+                    &[],
+                ));
+            }
+            assert!(
+                runs.iter().all(|r| r.code == Some(0)),
+                "{}: {} {}",
+                wf.file,
+                runs[0].out,
+                runs[1].out
+            );
+            assert_eq!(runs[0].out, runs[1].out, "{}: review logs differ", wf.file);
+            assert_no_derived_numbers("review", &runs[0]);
+            // The same on a failing stream, whatever it carried.
+            let (r1, r2) = (
+                run_review(
+                    &wf,
+                    &in_small,
+                    json!([model_reply(&big_text('a', 5), "refusal")]),
+                    &[],
+                ),
+                run_review(
+                    &wf,
+                    &in_large,
+                    json!([model_reply(&big_text('a', 50_000), "refusal")]),
+                    &[],
+                ),
+            );
+            assert!(
+                r1.failed() && r1.out == r2.out,
+                "{}: {:?} vs {:?}",
+                wf.file,
+                r1.out,
+                r2.out
+            );
+            assert_no_derived_numbers("review failure", &r1);
+
+            // File: output sizes, citation counts, risk lists, note lengths.
+            let sealed: Vec<Value> = [(3, 1), (250, 4)]
+                .iter()
+                .map(|(n, c)| sealed_model_output(&wf, &output_of_size(&wf, *n, *c)))
+                .collect();
+            let f: Vec<Run> = sealed
+                .iter()
+                .map(|s| {
+                    run_file(
+                        &wf,
+                        &file_input(&world(&wf)),
+                        Some(s),
+                        json!([verdict_ok(false, "pass")]),
+                        &[],
+                    )
+                })
+                .collect();
+            assert!(
+                f.iter().all(|r| r.code == Some(0)),
+                "{}: {} {}",
+                wf.file,
+                f[0].out,
+                f[1].out
+            );
+            assert_eq!(f[0].out, f[1].out, "{}: file logs differ", wf.file);
+            assert_no_derived_numbers("file", &f[0]);
+            // And the retry lines carry only the attempt number.
+            let down = run_file(
+                &wf,
+                &file_input(&world(&wf)),
+                Some(&sealed[1]),
+                json!([{ "status": 503, "text": "x" }]),
+                &[],
+            );
+            assert_no_derived_numbers("file retries", &down);
+        }
+    }
+
+    #[test]
+    fn sealed_artifacts_have_one_size_and_oversize_input_is_refused_with_a_fixed_line() {
+        // Plaintext 131072 and 65536 bytes under AES-GCM: the ciphertext base64 is fixed too.
+        let b64 = |n: usize| 4 * n.div_ceil(3);
+        for wf in all() {
+            let sizes: Vec<usize> = [sized_world(&wf, 1, 1, 1), sized_world(&wf, 1500, 99_000, 1)]
+                .iter()
+                .map(|w| {
+                    let r = prepare(&wf, w, &[]);
+                    assert_eq!(r.code, Some(0), "{}", r.out);
+                    let t = &r.read("out/review-input.json").unwrap()["sealed_ticket"];
+                    assert_eq!(
+                        t["ct"].as_str().unwrap().len(),
+                        b64(131_072),
+                        "{}: ticket ciphertext size",
+                        wf.file
+                    );
+                    t.to_string().len()
+                })
+                .collect();
+            assert_eq!(
+                sizes[0], sizes[1],
+                "{}: sealed ticket size depends on the ticket",
+                wf.file
+            );
+            let (input, _) = prepared(&wf);
+            let out_sizes: Vec<usize> = [output_of_size(&wf, 1, 1), output_of_size(&wf, 5_000, 4)]
+                .iter()
+                .map(|o| {
+                    let r = run_review(
+                        &wf,
+                        &input,
+                        json!([model_reply(&o.to_string(), "end_turn")]),
+                        &[],
+                    );
+                    assert_eq!(r.code, Some(0), "{}", r.out);
+                    let path = r.runner.join("out/review-output.json");
+                    let v: Value =
+                        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                    assert_eq!(
+                        v["ct"].as_str().unwrap().len(),
+                        b64(65_536),
+                        "{}: output ciphertext size",
+                        wf.file
+                    );
+                    std::fs::metadata(path).unwrap().len() as usize
+                })
+                .collect();
+            assert_eq!(
+                out_sizes[0], out_sizes[1],
+                "{}: artifact size depends on the output",
+                wf.file
+            );
+
+            // Too large, including a ticket that fits raw and overflows only once JSON escapes it.
+            let mut outs = std::collections::BTreeSet::new();
+            for (name, body) in [
+                ("raw", big_text('x', 100_001)),
+                ("quotes", big_text('"', 99_000)),
+                ("controls", big_text('\u{1}', 30_000)),
+                ("backslashes", big_text('\\', 70_000)),
+            ] {
+                let mut w = world(&wf);
+                w["ctx"]["ticket_body"] = json!(body);
+                let r = prepare(&wf, &w, &[]);
+                assert!(
+                    r.failed() && r.files().is_empty(),
+                    "{}: {name} was accepted: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(
+                    r.out.contains("too large (or malformed) to review"),
+                    "{}: {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert_log_clean(name, &r);
+                outs.insert(r.out.clone());
+            }
+            assert_eq!(outs.len(), 1, "{}: refusal lines differ: {outs:?}", wf.file);
+            // A model output over 64 KiB, also only after escaping, is refused and writes nothing.
+            let mut outs = std::collections::BTreeSet::new();
+            for (name, note) in [
+                ("long", big_text('n', 70_000)),
+                ("quotes", big_text('"', 40_000)),
+            ] {
+                let mut o = good_output(&wf);
+                o["checks"][0]["note"] = json!(note);
+                let r = run_review(
+                    &wf,
+                    &input,
+                    json!([model_reply(&o.to_string(), "end_turn")]),
+                    &[],
+                );
+                assert!(
+                    r.failed() && r.files().is_empty(),
+                    "{}: {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(
+                    r.out.contains("too large to file"),
+                    "{}: {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                outs.insert(r.out.clone());
+            }
+            assert_eq!(outs.len(), 1, "{}: refusal lines differ: {outs:?}", wf.file);
+        }
+    }
+
+    #[test]
+    fn a_seal_with_the_wrong_framing_does_not_open() {
+        let k = keys();
+        for wf in all() {
+            let (input, _) = prepared(&wf);
+            let ticket =
+                json!({ "ticket": { "id": "CAD-1", "title": "t", "status": "s" }, "body": "b" });
+            for (name, extra) in [
+                ("unpadded", json!({ "size": 4096 })),
+                ("padded to the other label", json!({ "size": 65_536 })),
+                ("length beyond the data", json!({ "len": 131_072 })),
+                (
+                    "length beyond the frame",
+                    json!({ "len": 4_000_000_000_u64 }),
+                ),
+            ] {
+                let mut inp = input.clone();
+                inp["sealed_ticket"] = seal_with(&wf, &k.pub_a, "ticket", &ticket, extra.clone());
+                let r = run_review(
+                    &wf,
+                    &inp,
+                    json!([model_reply(&good_output(&wf).to_string(), "end_turn")]),
+                    &[],
+                );
+                assert!(
+                    r.failed() && r.out.contains("sealed ticket does not open"),
+                    "{}: ticket {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(
+                    r.hits("anthropic").is_empty(),
+                    "{}: ticket {name}: the model was called",
+                    wf.file
+                );
+                let extra = if name == "padded to the other label" {
+                    json!({ "size": 131_072 })
+                } else {
+                    extra
+                };
+                let sealed = seal_with(
+                    &wf,
+                    &k.pub_a,
+                    "review-output",
+                    &json!({ "model": "m", "output": good_output(&wf) }),
+                    extra,
+                );
+                let r = run_file(
+                    &wf,
+                    &file_input(&world(&wf)),
+                    Some(&sealed),
+                    json!([verdict_ok(false, "pass")]),
+                    &[],
+                );
+                assert!(
+                    r.failed() && r.out.contains("does not open"),
+                    "{}: output {name}: {}",
+                    wf.file,
+                    r.out
+                );
+                assert!(r.hits("/verdict").is_empty() && r.minted() == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn the_review_output_upload_is_not_compressed() {
+        for wf in all() {
+            let steps = wf.job("review")["steps"].as_array().unwrap();
+            let up: Vec<&Value> = steps
+                .iter()
+                .filter(|s| s["with"]["name"] == "review-output")
+                .collect();
+            assert_eq!(up.len(), 1, "{}: one review-output upload", wf.file);
+            assert_eq!(
+                up[0]["with"]["compression-level"], 0,
+                "{}: compression would leak the output's size",
+                wf.file
+            );
+        }
+    }
+
+    #[test]
+    fn link_image_html_and_url_syntax_never_reaches_the_verdict_body() {
+        let diff = "diff --git a/docs/[click](evil).md b/docs/[click](evil).md\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/docs/[click](evil).md\n@@ -0,0 +1,2 @@\n+one\n+two\n";
+        let note = "see https://evil.example/x?a=b and [click](http://x.y) ![img](ftp://a.b/c.png) <a href=\"u\">t</a> <img src=x> HTTP://UP.CASE/x s3+x://h/p";
+        for wf in all() {
+            let mut w = world(&wf);
+            w["diff"] = json!(diff);
+            let mut out = good_output(&wf);
+            for (i, c) in out["checks"].as_array_mut().unwrap().iter_mut().enumerate() {
+                c["citations"] = json!([{ "file": "docs/[click](evil).md", "line": 1 }]);
+                c["note"] = json!(if i == 0 { note } else { "ok" });
+            }
+            let r = run_file(
+                &wf,
+                &file_input(&w),
+                Some(&sealed_model_output(&wf, &out)),
+                json!([verdict_ok(false, "pass")]),
+                &[],
+            );
+            assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+            let posted: Value =
+                serde_json::from_str(r.hits("/verdict")[0]["body"].as_str().unwrap()).unwrap();
+            let body = posted["body"].as_str().unwrap();
+            for l in body.lines().filter(|l| l.starts_with("- ")) {
+                assert!(
+                    !l.contains("://")
+                        && !l.contains("![")
+                        && !l.contains("](")
+                        && !l.contains('<')
+                        && !l.contains('>'),
+                    "{}: link syntax survived: {l}",
+                    wf.file
+                );
+                // The only square brackets are the wrapper around the cited path.
+                assert_eq!(
+                    (l.matches('[').count(), l.matches(']').count()),
+                    (1, 1),
+                    "{}: {l}",
+                    wf.file
+                );
+            }
+            assert!(body.contains("(url)"), "{}: {body}", wf.file);
+            assert!(
+                body.contains("[docs/(click)(evil).md:1]"),
+                "{}: the cited path was not neutralized: {body}",
+                wf.file
+            );
         }
     }
 }
