@@ -142,12 +142,14 @@ impl Shared {
             // the bytes and before the reply: an expiry, revoke or a
             // revision change that landed meanwhile refuses, exactly as
             // the provider branch re-checks `app_media_revision`.
-            self.media_mount_reprove(params)?;
-            if self.store.app_media_revision(asset_id)? != revision {
-                return Err(Error::rejected(
-                    "media preview reference changed during preparation",
-                ));
-            }
+            self.with_imported_media_current(params, |_| {
+                if self.store.app_media_revision(asset_id)? != revision {
+                    return Err(Error::rejected(
+                        "media preview reference changed during preparation",
+                    ));
+                }
+                Ok(())
+            })?;
             return Ok(json!({
                 "asset_id": asset_id, "revision": revision,
                 "sha256": imported.sha256,
@@ -175,11 +177,17 @@ impl Shared {
         })
     }
 
-    /// Re-prove the live mount behind this media request. Used where a
-    /// preparation step ran outside the runtime snapshot (imported
-    /// custody preview and chat attach) and the reply must not ride an
-    /// earlier proof. Returns the context it proved.
-    fn media_mount_reprove(&self, params: &Value) -> Result<ToolContext> {
+    /// The imported-custody counterpart of `with_media_mount_current`:
+    /// the same live mount proof — session, pinned context and lifetime,
+    /// install digest and approval, declared `media.read`, active owned
+    /// context — without a producing-run binding, which imported bytes
+    /// never have. One shared door, so a later hardening of the provider
+    /// path is a decision about this one too.
+    fn with_imported_media_current<T>(
+        &self,
+        params: &Value,
+        read: impl FnOnce(&ToolContext) -> Result<T>,
+    ) -> Result<T> {
         let token = required_str(params, "token")?;
         let action_token = required_str(params, "action_token")?;
         let key = match params.get("key") {
@@ -204,22 +212,20 @@ impl Shared {
         let (session, _) = self
             .tool_session(token, key, origin)
             .ok_or_else(|| Error::rejected("media image needs a live operator session"))?;
-        let ctx = self.tool_context_proven(action_token, &session)?;
-        let context_id = ctx
-            .context_id
-            .as_deref()
-            .ok_or_else(|| Error::rejected("media image needs a mounted active context"))?;
-        // Presence is not liveness: the context must still be the active
-        // one this installation owns. `tool_context_proven` proves the
-        // token and session, not `app_contexts.state`, so an archive that
-        // landed while the preview was being prepared refuses here.
-        let (_, proof) = self.store.app_context_proof(&ctx.install_id, context_id)?;
-        if proof.install_id != ctx.install_id {
-            return Err(Error::rejected(
-                "media image context belongs to another installation",
-            ));
-        }
-        Ok(ctx)
+        let expected = self.tool_context_proven(action_token, &session)?;
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let delivery = OriginalDelivery {
+            shared: self,
+            pm: &pm,
+            action_token,
+            token,
+            key,
+            origin,
+            authority: OriginalAuthority::Imported,
+            account_source: None,
+            expected,
+        };
+        delivery.with_current(|| read(&delivery.expected))?
     }
 
     fn with_media_mount_current<T>(
@@ -574,10 +580,7 @@ impl Shared {
         };
         match proof {
             Some(original) => self.with_media_mount_current(params, &original, emit),
-            None => {
-                let ctx = self.media_mount_reprove(params)?;
-                emit(&ctx)
-            }
+            None => self.with_imported_media_current(params, emit),
         }
     }
 
