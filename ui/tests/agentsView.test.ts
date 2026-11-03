@@ -44,6 +44,7 @@ const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
 const { seatStatus } = require("../src/features/agents/SeatCard") as typeof import("../src/features/agents/SeatCard");
+const { profileWork } = require("../src/features/agents/agentView") as typeof import("../src/features/agents/agentView");
 const Agents = (
   require("../src/features/agents/Agents") as typeof import("../src/features/agents/Agents")
 ).default;
@@ -290,6 +291,29 @@ async function main() {
     Array.from(host.querySelectorAll(".rc-seat")).find((row) => row.textContent?.includes("blocked"))?.textContent?.includes("Attention"),
     "a fenced seat reads Attention in its status line",
   );
+  // CAD-2010: a profile card is one status line; its commands live in details.
+  const profile = { id: "ap_1", alias: "Developer", role: "worker", team_role: "worker", catalogue: null, look: null, job: "Ship it", model: "inherit", runtimes: [] };
+  const card = (over: Partial<IssueCard>) => ({ ...issues[0], owner: "Developer", container: false, ...over }) as IssueCard;
+  assert(profileWork(profile, []) === null, "no owned issue names no work");
+  assert(
+    profileWork(profile, [card({ id: "DEMO-1", status: "done", created: "2026-01-01" }), card({ id: "DEMO-2", status: "backlog", created: "2026-01-02" }), card({ id: "DEMO-3", status: "done", created: "2026-01-03" }), card({ id: "DEMO-4", status: "doing", created: "2026-01-04", owner: "someone" })])?.issue.id === "DEMO-2",
+    "the newest open owned issue wins over a newer finished one and another owner's",
+  );
+  const finished = profileWork(profile, [card({ id: "DEMO-1", status: "done", created: "2026-01-01" }), card({ id: "DEMO-3", status: "dropped", created: "2026-01-03" })]);
+  assert(finished?.issue.id === "DEMO-3" && finished.open === false, "with nothing open the newest closed issue is the last work");
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [profile] });
+  await render();
+  const seat = () => Array.from(host.querySelectorAll(".rc-seat")).find((row) => row.textContent?.includes("Developer"))!;
+  assert(seat().textContent?.includes("Idle · no runtime"), "a profile with no owned work reads Idle");
+  assert(!host.querySelector(".rc-seats .rc-connect") && !host.querySelector(".rc-seats")?.textContent?.includes("cadence "), "the card prints no commands");
+  await click("Open agent Developer");
+  const details = host.querySelector("dialog.rc-sheet");
+  assert(details?.textContent?.includes("cadence agent context ap_1"), "details hold the connect commands");
+  assert(details?.textContent?.includes("Ship it") && details?.textContent?.includes("Model"), "details hold the job and model");
+  await click("Close");
+  assert(!host.querySelector("dialog.rc-sheet"), "Close leaves the roster");
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
+  await render();
   await click("All6");
   assert(aliases().length === 6, "All keeps stopped workers and mailboxes discoverable");
   await click("Stopped1");
