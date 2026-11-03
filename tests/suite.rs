@@ -13890,4 +13890,14 @@ mod cad2064_artifact_acceptance {
         assert_eq!(receipt["file"]["version"], VERSION);
         assert_eq!(receipt["written"], destination.to_str().unwrap());
     }
+
+    #[test]
+    fn consistent_but_incorrect_digest_is_refused_before_creating_destination() {
+        let mut pages = valid_pages();
+        for page in &mut pages {
+            page["file"]["digest"] = json!("0".repeat(64));
+        }
+        let board = Board::new(pages);
+        assert_refused(&board, false, 2);
+    }
 }
