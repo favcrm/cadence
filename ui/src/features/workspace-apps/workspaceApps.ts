@@ -382,7 +382,7 @@ export const workspaceApps = {
    *  bytes into workspace custody and answers with the new draft asset. */
   mediaImport: (body: { action_token: string; receipt_id: string; request_id: string }) =>
     request<Record<string, unknown>>("/api/app-media/import", undefined, body),
-  socialDraftAction: (operation: "create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage"|"confirm"|"schedule"|"reschedule"|"cancel", body: Record<string, unknown> & { alias: string }) =>
+  socialDraftAction: (operation: "create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/page"|"sources/get"|"sources/save"|"effect-stage"|"confirm"|"schedule"|"reschedule"|"cancel", body: Record<string, unknown> & { alias: string }) =>
     request<Record<string, unknown>>(`/api/app-social-drafts/${operation}`, undefined, toolActionBody(body)),
   /** SOC-32: the host-owned image upload door. `file` goes as multipart; the
    *  daemon re-proves the live mount/context/slot, normalises the image and

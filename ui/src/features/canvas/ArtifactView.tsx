@@ -4,6 +4,7 @@ import Md, { CodeSurface } from "../../ui/Md";
 import { artifactBytes } from "./artifactClient";
 import { CSV_MAX_COLS, CSV_MAX_ROWS, parseCsv } from "./csv";
 import type { ArtifactKind } from "./canvasStore";
+import ImageOverlay from "./ImageOverlay";
 
 export interface Loaded {
   bytes: ArrayBuffer;
@@ -30,6 +31,18 @@ export function downloadName(title: string, kind: ArtifactKind, mime: string): s
   return `${base}.${ext}`;
 }
 
+/** Hand bytes to the browser as a file. */
+export function saveBytes(bytes: ArrayBuffer, mime: string, filename: string): void {
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime.split(";")[0] }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 /** Fetch one version's bytes through the board (operator session), aborting
  *  when the version in view changes. */
 export function useArtifactBytes(conversation: string, id: string, version: number) {
@@ -53,7 +66,7 @@ export function useArtifactBytes(conversation: string, id: string, version: numb
 
 /** A `data:` URL for an image: the board CSP allows `data:` images and not
  *  `blob:` ones. SVG only ever shows as an `<img>` source, never as a URL. */
-function imageDataUrl(data: Loaded): string {
+export function imageDataUrl(data: Loaded): string {
   let bin = "";
   const bytes = new Uint8Array(data.bytes);
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
@@ -125,12 +138,15 @@ export default function ArtifactView({
   data,
   contentRef,
   htmlView = "rendered",
+  aspect,
 }: {
   kind: ArtifactKind;
   title: string;
   data: Loaded;
   contentRef: React.RefObject<HTMLDivElement | null>;
   htmlView?: HtmlView;
+  /** A generated image's shape, for its overlay. */
+  aspect?: string;
 }) {
   const t = useTranslate();
   switch (kind) {
@@ -168,7 +184,16 @@ export default function ArtifactView({
     case "image":
       return (
         <div className="canvas-doc" data-artifact-view="image">
-          <img className="canvas-image" src={imageDataUrl(data)} alt={title} />
+          <div className="imgshot" data-canvas-image>
+            <img className="canvas-image" src={imageDataUrl(data)} alt={title} />
+            <ImageOverlay
+              title={title}
+              aspect={aspect}
+              mime={data.mime}
+              bytes={data.bytes.byteLength}
+              onDownload={() => saveBytes(data.bytes, data.mime, downloadName(title, kind, data.mime))}
+            />
+          </div>
         </div>
       );
     case "pdf":

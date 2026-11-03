@@ -142,12 +142,14 @@ impl Shared {
             // the bytes and before the reply: an expiry, revoke or a
             // revision change that landed meanwhile refuses, exactly as
             // the provider branch re-checks `app_media_revision`.
-            self.media_mount_reprove(params)?;
-            if self.store.app_media_revision(asset_id)? != revision {
-                return Err(Error::rejected(
-                    "media preview reference changed during preparation",
-                ));
-            }
+            self.with_imported_media_current(params, |_| {
+                if self.store.app_media_revision(asset_id)? != revision {
+                    return Err(Error::rejected(
+                        "media preview reference changed during preparation",
+                    ));
+                }
+                Ok(())
+            })?;
             return Ok(json!({
                 "asset_id": asset_id, "revision": revision,
                 "sha256": imported.sha256,
@@ -175,57 +177,33 @@ impl Shared {
         })
     }
 
-    /// Re-prove the live mount behind this media request. Used where a
-    /// preparation step ran outside the runtime snapshot (imported
-    /// custody preview and chat attach) and the reply must not ride an
-    /// earlier proof. Returns the context it proved.
-    fn media_mount_reprove(&self, params: &Value) -> Result<ToolContext> {
-        let token = required_str(params, "token")?;
-        let action_token = required_str(params, "action_token")?;
-        let key = match params.get("key") {
-            None => "",
-            Some(Value::String(key)) => key.as_str(),
-            Some(_) => {
-                return Err(Error::rejected(
-                    "media image key must be a session key string",
-                ))
-            }
-        };
-        let origin = match params["origin"].as_str() {
-            Some("loopback") => Origin::Loopback,
-            Some("tailnet") => Origin::Tailnet,
-            Some("public") => Origin::Public,
-            _ => {
-                return Err(Error::rejected(
-                    "media image needs a classified session origin",
-                ))
-            }
-        };
-        let (session, _) = self
-            .tool_session(token, key, origin)
-            .ok_or_else(|| Error::rejected("media image needs a live operator session"))?;
-        let ctx = self.tool_context_proven(action_token, &session)?;
-        let context_id = ctx
-            .context_id
-            .as_deref()
-            .ok_or_else(|| Error::rejected("media image needs a mounted active context"))?;
-        // Presence is not liveness: the context must still be the active
-        // one this installation owns. `tool_context_proven` proves the
-        // token and session, not `app_contexts.state`, so an archive that
-        // landed while the preview was being prepared refuses here.
-        let (_, proof) = self.store.app_context_proof(&ctx.install_id, context_id)?;
-        if proof.install_id != ctx.install_id {
-            return Err(Error::rejected(
-                "media image context belongs to another installation",
-            ));
-        }
-        Ok(ctx)
-    }
-
     fn with_media_mount_current<T>(
         &self,
         params: &Value,
         original: &crate::store::app_media::MediaOriginalProof,
+        read: impl FnOnce(&ToolContext) -> Result<T>,
+    ) -> Result<T> {
+        self.with_media_authority(params, OriginalAuthority::Provider(original), read)
+    }
+
+    /// The imported-custody counterpart: no producing-run binding, which
+    /// imported bytes never have, but every other proof is the same one.
+    fn with_imported_media_current<T>(
+        &self,
+        params: &Value,
+        read: impl FnOnce(&ToolContext) -> Result<T>,
+    ) -> Result<T> {
+        self.with_media_authority(params, OriginalAuthority::Imported, read)
+    }
+
+    /// One media-image door for both provenances: the session, the pinned
+    /// tool context and its lifetime, the install digest and approval, the
+    /// declared `media.read`, the active owned context and the per-send
+    /// mount proof all live here, so a hardening lands on both paths.
+    fn with_media_authority<T>(
+        &self,
+        params: &Value,
+        authority: OriginalAuthority<'_>,
         read: impl FnOnce(&ToolContext) -> Result<T>,
     ) -> Result<T> {
         let token = required_str(params, "token")?;
@@ -233,7 +211,7 @@ impl Shared {
         let key = match params.get("key") {
             None => "",
             Some(Value::String(key)) => key.as_str(),
-            _ => {
+            Some(_) => {
                 return Err(Error::rejected(
                     "media image key must be a session key string",
                 ))
@@ -261,7 +239,7 @@ impl Shared {
             token,
             key,
             origin,
-            authority: OriginalAuthority::Provider(original),
+            authority,
             account_source: None,
             expected,
         };
@@ -574,10 +552,7 @@ impl Shared {
         };
         match proof {
             Some(original) => self.with_media_mount_current(params, &original, emit),
-            None => {
-                let ctx = self.media_mount_reprove(params)?;
-                emit(&ctx)
-            }
+            None => self.with_imported_media_current(params, emit),
         }
     }
 

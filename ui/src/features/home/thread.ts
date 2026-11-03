@@ -16,7 +16,7 @@ import type { SseEvent } from "../../lib/sse";
  */
 
 export type ThreadRole = "operator" | "agent" | "system";
-export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "hire_proposal";
+export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "hire_proposal";
 
 /** One stored entry (`thread_read` / the stream's `entry` frame). */
 export interface ThreadEntry {
@@ -327,6 +327,7 @@ export type ThreadItem =
   | { type: "tools"; key: string; entries: ThreadEntry[] }
   | { type: "answer"; key: string; entry: ThreadEntry }
   | { type: "artifact"; key: string; entry: ThreadEntry }
+  | { type: "image"; key: string; entry: ThreadEntry }
   | { type: "hire"; key: string; entry: ThreadEntry; reason: string | null }
   | { type: "pending"; key: string; pending: PendingMessage };
 
@@ -350,8 +351,8 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
   };
   for (const entry of state?.entries ?? []) {
     const key = `e${entry.seq}`;
-    if (entry.kind === "artifact" && items[items.length - 1]?.type === "tools") {
-      held.push({ type: "artifact", key, entry });
+    if ((entry.kind === "artifact" || entry.kind === "image_job") && items[items.length - 1]?.type === "tools") {
+      held.push({ type: entry.kind === "artifact" ? "artifact" : "image", key, entry });
       continue;
     }
     if (!TOOL_KINDS.has(entry.kind)) flush();
@@ -377,6 +378,9 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
     } else if (entry.kind === "artifact") {
       // CAD-1726: a card for a canvas artifact — metadata, never content.
       items.push({ type: "artifact", key, entry });
+    } else if (entry.kind === "image_job") {
+      // A generated image's block: a job id and a shape, never the picture.
+      items.push({ type: "image", key, entry });
     } else if (entry.role === "operator") {
       items.push({ type: "operator", key, entry });
     } else {
@@ -391,7 +395,10 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
 }
 
 /** Item types that belong to an assistant turn. */
-const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "hire"]);
+const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "image", "hire"]);
+
+/** A card that follows its turn's answer without ending or starting a turn. */
+export const isCardItem = (item: { type: string }): boolean => item.type === "artifact" || item.type === "image";
 
 /** One render run: an assistant turn (its flat items), or one item that is
  *  not part of a turn. The items themselves stay flat — `threadItems` is
@@ -414,7 +421,7 @@ export function threadRuns(items: ThreadItem[]): ThreadRun[] {
   let runMessage: string | null = null;
   const flush = () => {
     if (run.length === 0) return;
-    if (run.some((item) => item.type !== "artifact")) {
+    if (run.some((item) => !isCardItem(item))) {
       runs.push({ turn: true, key: run[0].key, items: run, message: runMessage });
     } else {
       for (const item of run) runs.push({ turn: false, key: item.key, item });
@@ -435,7 +442,7 @@ export function threadRuns(items: ThreadItem[]): ThreadRun[] {
     if (run.length > 0 && message !== null && runMessage !== null && message !== runMessage) {
       flush();
     }
-    if (item.type !== "artifact" && run.some((i) => i.type === "answer")) flush();
+    if (!isCardItem(item) && run.some((i) => i.type === "answer")) flush();
     run.push(item);
     if (message !== null) runMessage = message;
   }
@@ -498,7 +505,7 @@ export function sendBefore(items: ThreadItem[], runItems: ThreadItem[], queued: 
  *  and a placeholder now would paint a second head under the answer. */
 export function unnamedTurnAnswered(items: ThreadItem[]): boolean {
   for (let i = items.length - 1; i >= 0; i--) {
-    if (items[i].type === "artifact") continue;
+    if (isCardItem(items[i])) continue;
     return items[i].type === "answer";
   }
   return false;
@@ -550,7 +557,7 @@ export function inFlightTurnKey(items: ThreadItem[], message: string | null, unn
   // `present` distinguishes "no assistant rows yet" (fall through) from a
   // run that answered or names another send (refuse, never fall through).
   const isTurn = (item: ThreadItem) =>
-    OPEN_TURN.has(item.type) || item.type === "answer" || item.type === "artifact";
+    OPEN_TURN.has(item.type) || item.type === "answer" || isCardItem(item);
   const runAfter = (start: number): { key: string | null; present: boolean } => {
     let first: string | null = null;
     let present = false;

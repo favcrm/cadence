@@ -56,6 +56,21 @@ export function kickoffBlock(meta: Meta | null): string | null {
 /** The reason a non-operator session is refused hiring and job edits. */
 export const OPERATOR_HIRE_REASON = "Only the operator can hire.";
 
+/** Why a project's access settings are disabled, or null when this session
+ *  may change them. The policy write is an operator-only route, so a
+ *  signed-in member passes [`writeBlock`] and is still refused. */
+export function policyBlock(meta: Meta | null): string | null {
+  const writes = writeBlock(meta);
+  if (writes) return writes;
+  if (meta?.operator === null) {
+    return "Only the operator can change who can see a project — the board could not confirm whether this session is the operator's. It is re-checking; retry in a moment.";
+  }
+  if (meta?.operator !== true) {
+    return "Only the operator can change who can see a project — this session is not the operator's.";
+  }
+  return null;
+}
+
 /** Why hiring (and editing an agent's job) is disabled, or null when this
  *  session may. Both go over operator-only routes, so a signed-in member
  *  (`operator: false`) passes [`writeBlock`] but is still refused. */

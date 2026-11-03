@@ -1,5 +1,6 @@
 import { chatContext } from "../chatScreen";
 import { useCanvasFeed } from "../../canvas/feed";
+import { ImageConversation } from "../../canvas/imageConversation";
 import {
   Fragment,
   cloneElement,
@@ -1906,6 +1907,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
 
   return (
     <AssistantActorProvider actor={actor}>
+    <ImageConversation.Provider value={convId}>
     <div className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
       <button
         type="button"
@@ -2411,6 +2413,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         className="app-chat-form"
       />
     </div>
+    </ImageConversation.Provider>
     </AssistantActorProvider>
   );
 }

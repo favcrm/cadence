@@ -1412,6 +1412,32 @@ impl Shared {
             Some(Value::String(repo)) => Some(std::path::PathBuf::from(repo)),
             Some(_) => return Err(Error::rejected("'repo' must be a path string or null")),
         };
+        // CAD-1950: the create-time access policy. An unknown spelling is a
+        // refusal, never a default — a typo must not silently create a
+        // workspace-visible project.
+        let visibility = match params.get("visibility") {
+            None | Some(Value::Null) => crate::issue::project::Visibility::WorkspaceVisible,
+            Some(Value::String(raw)) => crate::issue::cli::PolicyVisibility::from_wire(raw)
+                .map(crate::issue::cli::PolicyVisibility::recorded)
+                .ok_or_else(|| {
+                    Error::rejected(format!(
+                        "'visibility' must be workspace-visible or private (got {raw:?})"
+                    ))
+                })?,
+            Some(_) => return Err(Error::rejected("'visibility' must be a string")),
+        };
+        let grants = match params.get("grants") {
+            None | Some(Value::Null) => vec![],
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|v| {
+                    v.as_str().map(str::to_string).ok_or_else(|| {
+                        Error::rejected("'grants' must be a list of caller spellings")
+                    })
+                })
+                .collect::<Result<_>>()?,
+            Some(_) => return Err(Error::rejected("'grants' must be a list of strings")),
+        };
         let req = crate::issue::project_new::Request {
             key: required_str(params, "key")?.to_string(),
             repo,
@@ -1419,6 +1445,8 @@ impl Shared {
             goal: text("goal"),
             agents,
             issue: text("issue"),
+            visibility,
+            grants,
         };
         let pm = self.pm()?;
         let out = crate::issue::project_new::run(

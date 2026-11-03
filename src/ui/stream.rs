@@ -87,6 +87,9 @@ pub(crate) fn event_resources(name: &str) -> &'static [&'static str] {
             "app_runs",
             "outbox",
             "app_outputs",
+            // CAD-1950: a project's recorded policy is a separate read, not a
+            // collection the entity frame patches, so it survives the filter.
+            "projectPolicy",
         ],
         "jobs" => &[
             "issues",

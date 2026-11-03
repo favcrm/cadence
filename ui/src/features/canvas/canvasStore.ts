@@ -24,6 +24,8 @@ export interface ArtifactRef {
   title: string;
   bytes: number;
   digest?: string;
+  /** A generated image's shape (`16:9`), shown on its overlay; absent otherwise. */
+  aspect?: string;
 }
 
 /** What the board knows of one stored version (from its thread card). */
@@ -37,6 +39,7 @@ export interface CanvasTab {
   kind: ArtifactKind;
   title: string;
   bytes: number;
+  aspect?: string;
   /** The newest version the thread has announced. */
   latest: number;
   /** The version in view. */
@@ -168,6 +171,7 @@ function newTab(ref: ArtifactRef, turn: string | null): CanvasTab {
     kind: ref.kind,
     title: ref.title,
     bytes: ref.bytes,
+    ...(ref.aspect ? { aspect: ref.aspect } : {}),
     latest: ref.version,
     selected: ref.version,
     follow: true,
@@ -181,6 +185,7 @@ function withVersion(t: CanvasTab, ref: ArtifactRef, turn: string | null): Canva
   return {
     ...t,
     versions: { ...t.versions, [ref.version]: { bytes: ref.bytes, digest: ref.digest } },
+    ...(ref.aspect && !t.aspect ? { aspect: ref.aspect } : {}),
     ...(newer
       ? { title: ref.title, bytes: ref.bytes, latest: ref.version, selected: t.follow ? ref.version : t.selected, turn }
       : {}),

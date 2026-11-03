@@ -8,8 +8,9 @@ import { attachMeta } from "../app-shell/chat/attach";
 import { askLabel } from "../canvas/askRefs";
 import HireProposalCard from "../agents/HireProposalCard";
 import ArtifactCard from "../canvas/ArtifactCard";
+import ImageBlock from "../canvas/ImageBlock";
 import { ThreadPermission } from "./PermissionCard";
-import { isArtifactPutCall, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
+import { isArtifactPutCall, isCardItem, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
 import { carriesSecret } from "../app-shell/chat/directive";
 
 /**
@@ -254,6 +255,8 @@ export function ThreadItemView({
       return <StepsGroup entries={item.entries} density={density} />;
     case "artifact":
       return <ArtifactCard entry={item.entry} />;
+    case "image":
+      return <ImageBlock entry={item.entry} />;
     case "hire":
       return <HireProposalCard entry={item.entry} reason={item.reason} />;
     case "answer": {
@@ -873,12 +876,12 @@ export function ThreadTurn({
     (item) => item.type === "thinking" || item.type === "commentary" || item.type === "tools",
   );
   const answer = items.find((item) => item.type === "answer");
-  const artifacts = items.filter((item) => item.type === "artifact");
+  const artifacts = items.filter(isCardItem);
   // A transcript from before `turn_result` has no answer item: its last
   // worker note IS what the operator read as the reply. Only the LAST
   // non-artifact item can be that note — a note followed by tools is a
   // tool-turn step, not a reply, and must stay in the trace.
-  const lastNote = [...items].reverse().find((item) => item.type !== "artifact");
+  const lastNote = [...items].reverse().find((item) => !isCardItem(item));
   const legacy =
     allowLegacy && !answer && !running && lastNote?.type === "commentary" ? lastNote : null;
   const trace = legacy ? traceItems.filter((item) => item.key !== legacy.key) : traceItems;
@@ -932,9 +935,9 @@ export function ThreadTurn({
       {artifacts.length > 0 && (
         <div className="turn-artifacts">
           {artifacts.map((item) =>
-            item.type === "artifact" ? (
-              <div key={item.key} data-item-key={item.key}>
-                <ArtifactCard entry={item.entry} />
+            item.type === "artifact" || item.type === "image" ? (
+              <div key={item.key} data-item-key={item.key} className={item.type === "image" ? "turn-image" : undefined}>
+                {item.type === "image" ? <ImageBlock entry={item.entry} /> : <ArtifactCard entry={item.entry} />}
               </div>
             ) : null,
           )}

@@ -121,3 +121,74 @@
 .cv-details { color: var(--color-ink-500); font: var(--text-micro) var(--font-mono); }
 .cv-details summary { cursor: pointer; width: max-content; font-family: var(--font-sans); }
 .cv-details ul { margin: 4px 0 0; padding: 0; list-style: none; display: grid; gap: 2px; overflow-wrap: anywhere; }
+
+/* A generated image in the thread (CAD-2069). One box at the final shape from
+   first paint, so the picture replaces the placeholder with nothing moving. */
+.turn-image { flex: 1 1 100%; min-width: 0; }
+.imgblock { width: 100%; max-width: 22.5rem; margin: 0.25rem 0; }
+.imgblock[data-shape="16:9"] { max-width: 30rem; }
+.imgblock[data-shape="3:2"] { max-width: 27rem; }
+.imgblock[data-shape="9:16"], .imgblock[data-shape="2:3"] { max-width: 15rem; }
+.imgbox { position: relative; display: block; width: 100%; overflow: hidden; border: 1px solid var(--color-edge, var(--color-ink-700)); border-radius: 12px; background: var(--color-ink-850); aspect-ratio: 1 / 1; }
+.imgblock[data-shape="16:9"] .imgbox { aspect-ratio: 16 / 9; }
+.imgblock[data-shape="3:2"] .imgbox { aspect-ratio: 3 / 2; }
+.imgblock[data-shape="9:16"] .imgbox { aspect-ratio: 9 / 16; }
+.imgblock[data-shape="2:3"] .imgbox { aspect-ratio: 2 / 3; }
+/* Failed and unclear are short cards, not a picture's worth of empty box. */
+.imgblock .imgbox[data-compact] { aspect-ratio: auto; }
+.imgopen { position: absolute; inset: 0; display: block; width: 100%; height: 100%; padding: 0; border: 0; background: none; cursor: zoom-in; }
+.imgopen:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.imgopen img { display: block; width: 100%; height: 100%; object-fit: contain; animation: img-in 0.22s ease-out; }
+@keyframes img-in { from { opacity: 0; } }
+.imgwait { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 16px; text-align: center; background: linear-gradient(100deg, transparent 30%, color-mix(in srgb, var(--color-ink-700) 45%, transparent) 50%, transparent 70%) 0 0 / 250% 100%; animation: img-sweep 2.4s linear infinite; }
+@keyframes img-sweep { from { background-position: 125% 0; } to { background-position: -125% 0; } }
+.imgwait b { color: var(--color-ink-100); font-size: var(--text-label); font-weight: 500; }
+.imgwait small { max-width: 16rem; color: var(--color-ink-500); font-size: var(--text-micro); }
+.imgclock { color: var(--color-ink-400); font-size: var(--text-micro); line-height: 1; }
+.imgdots { display: inline-flex; gap: 5px; }
+.imgdots i { width: 6px; height: 6px; border-radius: 9999px; background: var(--color-accent); animation: img-dot 1.2s ease-in-out infinite; }
+.imgdots i:nth-child(2) { animation-delay: 0.16s; }
+.imgdots i:nth-child(3) { animation-delay: 0.32s; }
+@keyframes img-dot { 0%, 60%, 100% { opacity: 0.35; } 30% { opacity: 1; } }
+.imgstate { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 12px 14px; }
+.imgstate > div { flex: 1 1 12rem; min-width: 0; }
+.imgstate b { display: block; color: var(--color-ink-100); font-size: var(--text-label); font-weight: 500; }
+.imgstate small { display: block; color: var(--color-ink-400); font-size: var(--text-secondary); }
+.imgstate[data-tone="fail"] b { color: var(--color-fail); }
+.imgstate[data-tone="warn"] b { color: var(--color-warn); }
+.imgact { min-height: 1.75rem; padding: 3px 10px; border: 1px solid var(--color-edge, var(--color-ink-700)); border-radius: 8px; background: var(--color-ink-850); color: var(--color-ink-200); font-size: var(--text-micro); cursor: pointer; }
+.imgact:hover { background: var(--color-ink-800); }
+.imgact:disabled { opacity: 0.5; cursor: default; }
+.imgact:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.imgquiet { position: absolute; inset: 0; display: grid; place-items: center; margin: 0; padding: 16px; color: var(--color-ink-500); font-size: var(--text-micro); text-align: center; }
+
+/* The overlay sits on a picture, not on the theme: its colours are fixed. It
+   shows on hover and on keyboard focus anywhere inside the picture. Touch has
+   no hover, so the thread skips it (a tap opens the canvas) and the canvas
+   always shows it. */
+.imgover { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: flex-end; gap: 8px; padding: 32px 10px 8px; background: linear-gradient(to top, rgb(0 0 0 / 0.68), rgb(0 0 0 / 0.4) 55%, transparent); color: #fff; opacity: 0; pointer-events: none; transition: opacity 0.12s; }
+.imgbox:hover .imgover, .imgbox:focus-within .imgover, .imgshot:hover .imgover, .imgshot:focus-within .imgover { opacity: 1; }
+.imgover .imgtool { pointer-events: auto; }
+.imgcap { flex: 1; min-width: 0; color: rgb(255 255 255 / 0.78); font-size: var(--text-micro); }
+.imgcap b { display: block; overflow: hidden; color: #fff; font-size: var(--text-label); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.imgcap span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.imgtool { display: grid; flex: none; place-items: center; width: 1.875rem; height: 1.875rem; padding: 0; border: 0; border-radius: 8px; background: none; color: #fff; cursor: pointer; }
+.imgtool:hover { background: rgb(255 255 255 / 0.18); }
+.imgtool:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }
+@media (hover: none) {
+  .imgbox .imgover { display: none; }
+  .imgshot .imgover { opacity: 1; }
+  .imgshot .imgtool { pointer-events: auto; }
+}
+
+/* The same picture in the canvas: contained, never cropped. */
+.canvas-doc[data-artifact-view="image"] { display: flex; flex: 1; align-items: center; justify-content: center; min-height: 0; }
+.imgshot { position: relative; display: block; max-width: 100%; overflow: hidden; border-radius: 8px; }
+.imgshot .canvas-image { display: block; max-width: 100%; max-height: calc(100dvh - 9rem); width: auto; height: auto; object-fit: contain; }
+
+@media (prefers-reduced-motion: reduce) {
+  .imgwait, .imgdots i, .imgopen img { animation: none; }
+  .imgwait { background: none; }
+  .imgdots i { opacity: 0.7; }
+  .imgover { transition: none; }
+}
