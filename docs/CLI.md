@@ -124,6 +124,11 @@ candidate only after its build-provenance attestation verifies and its
 manifest matches this platform and version. It does not downgrade, delete old
 releases or touch the daemon.
 
+Older client updaters can reject newer release manifests after the CI check
+list or macOS runner changes. If an installed updater reports a manifest
+mismatch, use the signed release's `install.sh --client-only` to reinstall;
+the old updater cannot repair its own manifest validation.
+
 From a client-only installation, local daemon and state commands refuse with
 exit 3. Remote org verbs route to their org, and bounded
 login, auth, org and offline management stays available.

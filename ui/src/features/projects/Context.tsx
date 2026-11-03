@@ -9,6 +9,8 @@ import { useTranslate } from "../../lib/locale";
 interface ContextProps {
   project: string;
   readOnly: boolean;
+  /** Why writes are blocked, when the board knows it (App's `writeBlock`). */
+  readOnlyReason?: string | null;
   actor: string;
   onToast: WikiProps["onToast"];
   navHref: (route: Route) => string;
@@ -22,6 +24,7 @@ interface ContextProps {
 export default function Context({
   project,
   readOnly,
+  readOnlyReason,
   actor,
   onToast,
   navHref,
@@ -46,7 +49,7 @@ export default function Context({
   return (
     <main className="context-workspace" aria-label={`${project} context`}>
       {project === "all" ? <div className="p-5 text-secondary text-ink-400">{t("Choose a project to open its context.")}</div> : route ? (
-        <Wiki key={project} hosted={hosted} viewerSub={viewerSub} scope={scope} route={route} navHref={wikiHref} readOnly={readOnly} actor={actor} onToast={onToast} />
+        <Wiki key={project} hosted={hosted} viewerSub={viewerSub} scope={scope} route={route} navHref={wikiHref} readOnly={readOnly} readOnlyReason={readOnlyReason} actor={actor} onToast={onToast} />
       ) : <div className="p-5" role="alert">{t("This page is outside the project’s context.")} <Link className="lnk" href={`/projects/${encodeURIComponent(project)}/context`}>{t("Open project context")}</Link></div>}
     </main>
   );

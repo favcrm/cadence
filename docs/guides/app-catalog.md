@@ -93,10 +93,11 @@ Native install/run/business records remain native-owned; this is not their migra
 daemon, no store and no PM read or write — usable in an app repo's CI before
 anything talks to a host. The `builtin:<catalog-id>` source form is retired
 (CAD-1422) and refused at the source stage (`app_check_source`). It runs the same bundle snapshot and content
-validation `install-check` runs (entry grammar, per-file caps — 384 KiB for a
-screen JS/CSS asset, 16 KiB for a skill member, 4 KiB for a `skill.json`, and
-256 KiB elsewhere — the 2 MiB aggregate, the manifest
-including `summary`, descriptor forbidden keys, workflow checks, the full
+validation `install-check` runs (entry grammar, per-file caps — screen JS, CSS,
+SVG and JSON assets share the 2 MiB aggregate app budget; `screens.json` is
+limited to 32 KiB; skill members to 16 KiB and `skill.json` to 4 KiB; other
+files to 256 KiB — the 2 MiB aggregate, the manifest including `summary`,
+descriptor forbidden keys, workflow checks, the full
 `app-screens/v1|v2` declaration integrity for every `screens/<tag>/` package
 (`screens.json` body, declared↔supplied asset set, sha256+size matches — the
 same `app_screen_pkg::extract` the mount RPC re-runs), every `skills/<tag>/`
@@ -111,9 +112,15 @@ the same lowercase ASCII/digit/hyphen grammar as other app tags (1–32 bytes,
 no leading hyphen); links, nested storage directories and alternate extensions
 are refused. Storage members require exactly
 `needs.requires.contracts: {app-storage: [1]}`, and that requirement needs its
-root declaration. The generated document is
-`contracts/bundle-grammar/v3/grammar.json`; versions 1 and 2 remain historical
+root declaration. The current generated document is
+`contracts/bundle-grammar/v4/grammar.json`; versions 1–3 remain historical
 artifacts, not a second current admission path.
+
+Version 4 preserves the version-3 path grammar and publishes the screen asset,
+declaration, count and aggregate bounds. Individual screen assets no longer
+have smaller JS, CSS, SVG or JSON quotas; every file still counts toward the
+whole app's 2 MiB budget. Frame documents may exceed the old 768 KiB limit
+when their approved package fits that budget.
 
 The version-3 grammar adds one directory, `skills/<tag>/`: an installed skill
 package. It holds a required `skill.json` manifest, flat root text leaves
@@ -555,6 +562,21 @@ the host version. Envelope `ok` means evaluation succeeded, not compatibility;
 read `value.compatible`. A legacy manifest declares no requirements, so it
 returns `declared: false` and no checks, not proof that a target can run it.
 Package inspection, tenant state and authorization are separate decisions.
+
+The `app.screen.integrity` command runs the same screen declaration/integrity
+guard natively (`src/issue/app_screen_decl.rs` is now a re-export of
+`crates/cadence-core/src/app_screen_decl.rs`) for a host that will not hand the
+rules core its asset bodies. It takes the exact `screens.json` text plus
+host-computed `size`/`sha256` facts for every installed asset leaf, and the
+number of `screens/<tag>/` packages the app declares — bounded by the one
+`MAX_SCREENS` the native bundle scan enforces, and checked before any
+declaration work. It returns the declared app tag only when the declaration and
+those facts agree. The facts and the count are the caller's report — the caller
+must hash the exact bytes it installed — and `invalid_manifest` refuses a wrong
+digest or size, an undeclared or missing leaf, a repeated object key, an
+over-count app, or any grammar/bound violation. The command accepts no asset
+bodies, so a multi-megabyte leaf cannot ride the ABI, and it grants no install,
+mount, execution or effect authority.
 
 ## Offline screen-frame previews and projection fixtures
 

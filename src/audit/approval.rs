@@ -143,7 +143,7 @@ pub(super) fn bind_approval_for(
 /// CAD-959: the first whitespace token of a note's `From:`, lower-cased,
 /// minus backticks and trailing punctuation. `From:` is free text
 /// (`cc13-pm standards reviewer`); this is the ONE identity used for both
-/// the author exclusion and the distinct-reviewer count.
+/// the author exclusion and the reviewer-identity count.
 pub(crate) fn reviewer_identity(from: &str) -> String {
     from.split_whitespace()
         .next()

@@ -256,7 +256,7 @@ function usableClaim(p: HiredProfile): { issue_id: string; state: string } | nul
   return LIVE_CLAIMS.has(claim.state) || ENDED_CLAIMS.has(claim.state) ? claim : null;
 }
 
-function liveClaimState(p: HiredProfile): ProfileWork["state"] | undefined {
+export function liveClaimState(p: HiredProfile): ProfileWork["state"] | undefined {
   const claim = usableClaim(p);
   return claim ? LIVE_CLAIMS.get(claim.state) : undefined;
 }

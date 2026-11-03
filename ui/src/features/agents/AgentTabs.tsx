@@ -174,8 +174,12 @@ function NowCard({ c, onlyDoing = false }: { c: TabContext; onlyDoing?: boolean 
   return (
     <div className="ap-now">
       <b>{t("Nothing right now")}</b>
-      <small>{t("Give it a job:")}</small>
-      {c.role && <FirstJobs alias={c.alias} tasks={c.role.first_tasks} />}
+      {c.role && c.role.first_tasks.length > 0 && (
+        <>
+          <small>{t("Give it a job:")}</small>
+          <FirstJobs alias={c.alias} tasks={c.role.first_tasks} />
+        </>
+      )}
     </div>
   );
 }
@@ -234,6 +238,8 @@ function Overview({ c }: { c: TabContext }) {
   const events = c.detail?.events ?? [];
   const results = resultRows(c.detail);
   const project = c.detail?.agent.turn_project ?? null;
+  // A failed read is not an empty one: these sections come from the details.
+  const unavailable = <Note>{t("Agent details are unavailable.")}</Note>;
   return (
     <div className="ap-grid">
       <div className="ap-main">
@@ -241,10 +247,12 @@ function Overview({ c }: { c: TabContext }) {
           <NowCard c={c} />
         </Panel>
         <Panel title="Up next" link="work" onTab={c.onTab}>
-          {c.observed ? <AgentQueue agent={c.observed} /> : <Note>{t("Nothing queued.")}</Note>}
+          {c.observed ? <AgentQueue agent={c.observed} /> : c.detailFailed ? unavailable : <Note>{t("Nothing queued.")}</Note>}
         </Panel>
         <Panel title="Recent results" link="work" onTab={c.onTab}>
-          {results.length ? (
+          {c.detailFailed ? (
+            unavailable
+          ) : results.length ? (
             <Rows>
               {results.slice(0, 3).map((e) => (
                 <EventRow key={e.seq} e={e} />
@@ -255,7 +263,9 @@ function Overview({ c }: { c: TabContext }) {
           )}
         </Panel>
         <Panel title="History" link="history" onTab={c.onTab}>
-          {events.length ? (
+          {c.detailFailed ? (
+            unavailable
+          ) : events.length ? (
             <Rows>
               {events.slice(-3).reverse().map((e) => (
                 <EventRow key={e.seq} e={e} />

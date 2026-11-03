@@ -350,14 +350,25 @@ impl Shared {
 
     pub(super) fn rpc_wiki_mv(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         Self::reject_wiki_fields(params)?;
-        let caller = self.wiki_caller(params, peer_pid, "wiki mv")?;
+        let mut caller = self.wiki_caller(params, peer_pid, "wiki mv")?;
         let from = required_str(params, "from")?;
         let to = required_str(params, "to")?;
-        let human = self
-            .wiki_human(params, &caller, "wiki mv")?
-            .map(|h| h.receipt());
-        // A `.trash/` source is an operator-only restore that `wiki::mv`
-        // gates itself; only a real source path needs the ACL check here.
+        let human = self.wiki_human(params, &caller, "wiki mv")?;
+        // A `.trash/` restore is operator authority, and the board relays a
+        // public-board owner as `user:<handle>`. The VERIFIED session's
+        // effective role is what promotes that caller — the same owner proof
+        // `knowledge_actor` uses — and it is checked against the caller
+        // above, never read from a request field. A member session, an agent
+        // and an unproven caller keep their own caller, so `wiki::mv` still
+        // refuses them; the human receipt below keeps the attribution.
+        if from.starts_with(".trash/")
+            && human.as_ref().is_some_and(|human| human.role.is_operator())
+        {
+            caller = Caller::Operator;
+        }
+        let human = human.map(|h| h.receipt());
+        // A `.trash/` source is a restore that `wiki::mv` gates itself; only
+        // a real source path needs the ACL check here.
         let sources: Vec<(&str, wiki::Op)> = if from.starts_with(".trash/") {
             vec![(to, wiki::Op::Write)]
         } else {
@@ -657,6 +668,31 @@ impl Shared {
         self.wiki_index.refresh()
     }
 
+    /// CAD-2018: the operator's native trash browser. `operator_connection`
+    /// is the whole gate — the listing is operator-managed state and nothing
+    /// is attributed, so no `wiki_as`/`public_session` claim is accepted:
+    /// the field allowlist admits only the pagination, and a forged identity
+    /// is a refusal rather than an ignored key.
+    pub(super) fn rpc_wiki_trash_list(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        Self::allow_wiki_fields(params, &["limit", "cursor"], "wiki trash")?;
+        self.operator_connection("wiki trash", params, peer_pid)?;
+        let limit = trash_limit(params)?;
+        let cursor = trash_cursor(params)?;
+        wiki::trash::list(&self.pm()?, &Caller::Operator, limit, cursor)
+    }
+
+    /// CAD-2018: one landing's contents, as original logical paths. Same
+    /// connection-bound gate; `from` is the landing selector `wiki mv`
+    /// restores from, never a free path.
+    pub(super) fn rpc_wiki_trash_items(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        Self::allow_wiki_fields(params, &["from", "limit", "cursor"], "wiki trash")?;
+        self.operator_connection("wiki trash", params, peer_pid)?;
+        let from = required_str(params, "from")?;
+        let limit = trash_limit(params)?;
+        let cursor = trash_cursor(params)?;
+        wiki::trash::items(&self.pm()?, &Caller::Operator, from, limit, cursor)
+    }
+
     /// CAD-914: resumable wiki transfer. Caller identity is the connection.
     /// `_transfer_binding` is the operator board's verified envelope tuple
     /// `{issuer,organization_id,audience,subject}`. An agent connection that
@@ -916,6 +952,34 @@ impl Shared {
         };
         let at = export_at(params)?;
         wiki::transfer::export(&self.pm()?, caller, path, offset, bytes, rev, at)
+    }
+}
+
+/// The `limit` of a trash page: absent/null is the store's default; a
+/// present value must be a non-negative integer, never a silently
+/// ignored string.
+fn trash_limit(params: &Value) -> Result<Option<u64>> {
+    match params.get("limit") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n.as_u64().map(Some).ok_or_else(|| {
+            Error::rejected("wiki trash refused: 'limit' must be a non-negative integer")
+        }),
+        Some(_) => Err(Error::rejected(
+            "wiki trash refused: 'limit' must be a non-negative integer",
+        )),
+    }
+}
+
+/// The opaque page cursor: absent/null is the first page; a present
+/// value must be a non-empty string (the store decides whether it
+/// decodes, and refuses it if not).
+fn trash_cursor(params: &Value) -> Result<Option<&str>> {
+    match params.get("cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(cursor)) if !cursor.is_empty() => Ok(Some(cursor.as_str())),
+        Some(_) => Err(Error::rejected(
+            "wiki trash refused: 'cursor' must be a non-empty string",
+        )),
     }
 }
 

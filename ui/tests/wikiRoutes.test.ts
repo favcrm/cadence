@@ -66,6 +66,8 @@ const routes: Route[] = [
   { screen: "wiki", mode: "search", path: null, query: null },
   { screen: "wiki", mode: "search", path: null, query: "board shell" },
   { screen: "wiki", mode: "search", path: null, query: "a/b c" },
+  // CAD-2018: one Trash screen; a landing is the board's row, not a URL.
+  { screen: "wiki", mode: "trash", path: null, query: null },
 ];
 for (const route of routes) {
   equal(matchRoute(routePath(route)), route, `round trip ${routePath(route)}`);

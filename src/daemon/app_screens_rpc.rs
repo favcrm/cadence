@@ -807,7 +807,7 @@ pub const SCREEN_KIT_VERSION: &str = "cadence-kit/1";
 /// Rendered-frame HTML: the static wrapper document carrying the CSP
 /// nonce, the bootstrap JSON block, the approved CSS and the approved
 /// IIFE — every byte host-verified so the package's own text can never
-/// break out of its script/style context. Capped post-escape (768 KiB).
+/// break out of its script/style context. Assets share the app package bound.
 ///
 /// `csp_nonce` admits the two stamped blocks only; `bridge_nonce` is the
 /// non-authorizing init token the child echoes (distinct from the
@@ -889,6 +889,26 @@ fn render_frame_document(
     parent_origin: &str,
 ) -> Result<String> {
     let (styles, scripts) = assets;
+    let asset_bytes = styles
+        .iter()
+        .chain(scripts.iter())
+        .try_fold(0usize, |total, text| total.checked_add(text.len()))
+        .ok_or_else(|| Error::rejected("screen frame assets exceed the app package byte limit"))?;
+    if asset_bytes > crate::issue::app::MAX_APP_BYTES as usize {
+        return Err(Error::rejected(
+            "screen frame assets exceed the app package byte limit",
+        ));
+    }
+    let bootstrap_bytes = csp_nonce
+        .len()
+        .saturating_add(tag.len())
+        .saturating_add(bridge_nonce.len())
+        .saturating_add(parent_origin.len());
+    if bootstrap_bytes > 4 * 1024 {
+        return Err(Error::rejected(
+            "screen frame bootstrap exceeds its byte limit",
+        ));
+    }
     let boot = json!({
         "tag": tag,
         "bridge_nonce": bridge_nonce,
@@ -905,40 +925,41 @@ fn render_frame_document(
         .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
-    let mut style_blocks = String::new();
+    let capacity = asset_bytes
+        + SCREEN_KIT_CSS.len()
+        + boot.len()
+        + kit_boot.len()
+        + csp_nonce.len() * (2 + scripts.len())
+        + (styles.len() + scripts.len()) * 32
+        + 512;
+    let mut html = String::with_capacity(capacity);
+    html.push_str("<!doctype html><html data-cadence-kit=\"");
+    html.push_str(SCREEN_KIT_VERSION);
+    html.push_str("\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><script nonce=\"");
+    html.push_str(&csp_nonce);
+    html.push_str("\" type=\"application/json\" id=\"cadence-screen-boot\">");
+    html.push_str(&boot);
+    html.push_str("</script><script nonce=\"");
+    html.push_str(&csp_nonce);
+    html.push_str("\" type=\"application/json\" id=\"cadence-screen-kit\">");
+    html.push_str(&kit_boot);
+    html.push_str("</script><style id=\"cadence-kit\">");
+    html.push_str(SCREEN_KIT_CSS);
+    html.push_str("</style>");
     for css in styles {
-        style_blocks.push_str(&format!("<style>{}</style>", check_style_text(css)?));
+        html.push_str("<style>");
+        html.push_str(check_style_text(css)?);
+        html.push_str("</style>");
     }
-    let mut script_blocks = String::new();
+    html.push_str("</head><body><div id=\"root\"></div>");
     for js in scripts {
-        script_blocks.push_str(&format!(
-            "<script nonce=\"{csp_nonce}\">{}</script>",
-            check_script_text(js)?
-        ));
+        html.push_str("<script nonce=\"");
+        html.push_str(&csp_nonce);
+        html.push_str("\">");
+        html.push_str(check_script_text(js)?);
+        html.push_str("</script>");
     }
-    let html = format!(
-        "<!doctype html><html data-cadence-kit=\"{kit}\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<script nonce=\"{csp}\" type=\"application/json\" id=\"cadence-screen-boot\">{boot}</script>\
-<script nonce=\"{csp}\" type=\"application/json\" id=\"cadence-screen-kit\">{kit_boot}</script>\
-<style id=\"cadence-kit\">{kit_css}</style>\
-{style_blocks}\
-</head><body><div id=\"root\"></div>\
-{script_blocks}\
-</body></html>",
-        csp = csp_nonce,
-        boot = boot,
-        kit = SCREEN_KIT_VERSION,
-        kit_boot = kit_boot,
-        kit_css = SCREEN_KIT_CSS,
-        style_blocks = style_blocks,
-        script_blocks = script_blocks,
-    );
-    if html.len() > 768 * 1024 {
-        return Err(Error::rejected(
-            "rendered screen document exceeds its bound",
-        ));
-    }
+    html.push_str("</body></html>");
     Ok(html)
 }
 
@@ -972,8 +993,12 @@ fn escape_json_script(text: &str) -> String {
 /// Preserving the exact approved source is what makes the approved
 /// bytes' sha256 the executed bytes.
 fn check_script_text(text: &str) -> Result<&str> {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("</script") || lower.contains("<!--") || lower.contains("-->") {
+    let script_end = text.match_indices('<').any(|(index, _)| {
+        text.as_bytes()
+            .get(index..index + 8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"</script"))
+    });
+    if script_end || text.contains("<!--") || text.contains("-->") {
         return Err(Error::rejected(
             "screen entry contains a forbidden HTML-script end token",
         ));
@@ -985,7 +1010,12 @@ fn check_script_text(text: &str) -> Result<&str> {
 /// contain a case-insensitive `</style` end token; fail closed instead
 /// of rewriting (a rewritten stylesheet is not the approved bytes).
 fn check_style_text(text: &str) -> Result<&str> {
-    if text.to_ascii_lowercase().contains("</style") {
+    let style_end = text.match_indices('<').any(|(index, _)| {
+        text.as_bytes()
+            .get(index..index + 7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"</style"))
+    });
+    if style_end {
         return Err(Error::rejected(
             "screen stylesheet contains a forbidden </style end token",
         ));

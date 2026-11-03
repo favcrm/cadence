@@ -115,6 +115,21 @@ pub(crate) struct MediaImport<'a> {
     pub request_id: &'a str,
 }
 
+/// Display material for one catalog asset, whichever provenance it has:
+/// imported workspace custody or a provider-produced original, together
+/// with the original proof when one exists. `media_type` describes
+/// `bytes`; the proof keeps the producer-declared type separately, as the
+/// provider path always has.
+pub(crate) struct DisplayImage {
+    pub asset: MediaAsset,
+    pub media_type: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+    /// The provider-produced original, when the bytes are provider bytes.
+    /// Imported custody carries no producing run, so this is `None` there.
+    pub original: Option<crate::store::app_media::MediaOriginalProof>,
+}
+
 /// One imported workspace image: the catalog row plus the verified
 /// custody bytes. Only the store's own readers see this shape; the
 /// frame still receives metadata only.
@@ -661,6 +676,32 @@ impl Store {
             )?;
             Ok(result)
         })
+    }
+
+    /// CAD-2051: display material for one catalog asset, imported or
+    /// provider-produced. An absent id is `None`; a stored row that fails
+    /// its own checks refuses rather than projecting.
+    pub(crate) fn app_media_display_image(&self, asset_id: &str) -> Result<Option<DisplayImage>> {
+        if let Some(imported) = self.app_media_imported_image(asset_id)? {
+            return Ok(Some(DisplayImage {
+                asset: imported.asset,
+                media_type: imported.media_type,
+                sha256: imported.sha256,
+                bytes: imported.bytes,
+                original: None,
+            }));
+        }
+        if self.app_media_asset(asset_id)?.is_none() {
+            return Ok(None);
+        }
+        let image = self.app_media_context_image(asset_id)?;
+        Ok(Some(DisplayImage {
+            asset: image.asset,
+            media_type: image.media_type.to_string(),
+            sha256: image.original.sha256.clone(),
+            bytes: image.bytes,
+            original: Some(image.original),
+        }))
     }
 
     /// CAD-1962: the verified custody bytes behind one imported asset.

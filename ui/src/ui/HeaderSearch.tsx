@@ -206,7 +206,7 @@ export default function HeaderSearch({
         ? contextHref(project, { screen: "wiki", mode: "browse", path: hit.path, query: null })
         : navHref({ screen: "wiki", mode: "browse", path: hit.path, query: null }),
       title: hit.name,
-      meta: `${project ?? t("wiki")} · ${t(hitKind(hit))} · ${hit.path}`,
+      meta: `${project ?? t("wiki")} · ${t(hitKind(hit) ?? "file")} · ${hit.path}`,
       snippet: hit.snippet,
     };
   });

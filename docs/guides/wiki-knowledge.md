@@ -45,6 +45,40 @@ contradictions and open questions. Periodically check broken source links,
 orphan pages, and claims whose source has changed. Do not automatically turn
 an uploaded document into accepted operational guidance.
 
+### Board navigation and recovery
+
+The Wiki root lists the fixed namespaces; it is not itself a place to create
+pages. Open a writable folder such as `global/`, a project folder, or your
+personal folder. Native boards identify that folder by handle; hosted boards
+use the verified member subject. A read-only message on one folder does not
+mean every folder is read-only.
+
+An empty project Context offers to create its wiki folder. Search filters use
+the available file type, and a hosted result that matched only some search
+terms says so. Hosted attachment filenames remain searchable even when their
+text cannot be extracted. An upload's extraction status is a receipt, not a
+live progress feed; an unconfirmed result does not establish that extraction
+has finished. Hosted history identifies your edits as yours and uses a neutral
+contributor label for other, unresolved subjects.
+
+Removing an item returns its exact `.trash/...` landing. An operator can open
+Trash in the board, inspect the recorded entries, and restore to the original
+path or another available destination. Trash is not visible to members or
+agents. The browser does not guess a restore source when a native landing's
+original path cannot be proved from its tracker history; it reports when its
+bounded history search stops before finding proof. Keep the original receipt:
+an operator can restore that exact source with
+`cadence wiki mv <landing> <destination>` after the server's safety checks.
+Older servers may not support the trash browser.
+
+Hosted restores with more than 200 distinct stored attachments are refused
+until an enforceable storage-custody policy exists. Smaller hosted restores
+check that the referenced objects exist immediately before the move; an
+independent, privileged deletion after that check can still race the restore.
+The check is not a backup or proof of a tenant bucket lock. An older revision
+whose original text was not retained cannot be reconstructed from its history
+entry.
+
 ## Upload and update
 
 The board Wiki Upload pane sends a complete destination path for every file.
@@ -52,6 +86,9 @@ Markdown and TXT uploads create or update a text page. Other uploads use the
 blob store; PDF text extraction runs after the blob commits and the response
 includes an `extraction` status. The board warns when a PDF was saved but its
 text could not be indexed.
+
+On hosted boards, editable Markdown and TXT uploads are limited to 256 KiB;
+larger text uploads are refused before storage rather than becoming attachments.
 
 An operator can use the CLI:
 

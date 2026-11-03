@@ -49,3 +49,21 @@ fn golden_cases() {
     }
     assert!(count >= 10, "golden corpus went missing");
 }
+
+#[test]
+fn unknown_operation_is_refused_as_an_invalid_command() {
+    let request = serde_json::json!({"v": 1, "op": "app.screen.unknown", "input": {}});
+    let response: Value =
+        serde_json::from_slice(&crate::evaluate(&serde_json::to_vec(&request).unwrap())).unwrap();
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["code"], "invalid_command", "{response}");
+
+    let known = serde_json::json!({
+        "v": 1,
+        "op": "app.manifest.preflight",
+        "input": {"manifest": "---\nname: demo\n---\nbody\n"},
+    });
+    let response: Value =
+        serde_json::from_slice(&crate::evaluate(&serde_json::to_vec(&known).unwrap())).unwrap();
+    assert_eq!(response["ok"], true, "{response}");
+}

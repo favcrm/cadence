@@ -30,7 +30,8 @@ const ARCHIVE_MEMBERS: [&str; 3] = [BINARY, SHA_FILE, MANIFEST];
 const LISTING_MAX: usize = 16 * 1024;
 const BINARY_MAX: usize = 512 * 1024 * 1024;
 const SMALL_MEMBER_MAX: usize = 64 * 1024;
-const CHECKS: [&str; 5] = ["fmt", "clippy", "test", "build", "ui"];
+const CHECKS: [&str; 4] = ["fmt", "clippy", "build", "ui"];
+const LEGACY_CHECKS: [&str; 5] = ["fmt", "clippy", "test", "build", "ui"];
 const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The unified `update --help` marker `install.sh --client-only` also requires.
@@ -401,10 +402,12 @@ fn check_manifest(
     let source = manifest["source_sha"].as_str().filter(|s| is_full_sha(s));
     let matches = manifest["version"] == tag
         && manifest["target"] == target
-        && manifest["runner"] == runner
+        && (manifest["runner"] == runner
+            || (target == "aarch64-macos" && manifest["runner"] == "macos-15"))
         && manifest["sha256"] == digest
         && manifest["features"] == serde_json::json!(["ui"])
-        && manifest["checks"] == serde_json::json!(CHECKS)
+        && (manifest["checks"] == serde_json::json!(CHECKS)
+            || manifest["checks"] == serde_json::json!(LEGACY_CHECKS))
         && manifest["run_id"].is_u64()
         && manifest["run_attempt"].is_u64()
         && ["rustc", "cargo", "built_at"]

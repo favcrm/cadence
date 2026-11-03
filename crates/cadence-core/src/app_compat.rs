@@ -590,8 +590,9 @@ pub const SUPPORTED_CONTRACTS: &[(&str, &[u64], ContractStage)] = &[
     // contracts/app-chat/v1 — src/issue/app_chat.rs validator plus the
     // board's rendered chat surface.
     ("app-chat", &[1], ContractStage::Sandboxed),
-    // src/issue/app_screen_decl.rs — the screens/<tag>/ package runs in
-    // the board's sandbox; legacy declarations retain their read-only bridge.
+    // crates/cadence-core/src/app_screen_decl.rs — the screens/<tag>/ package
+    // runs in the board's sandbox; legacy declarations retain their read-only
+    // bridge.
     ("app-screens", &[1], ContractStage::Sandboxed),
     // Closed screen service operations with current native scope proof and
     // host-owned confirmation, route and inert-preview consumers.
