@@ -2410,6 +2410,16 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "no CLI message with that id is visible to this human identity; \
              reconcile the original workspace and login before retrying the same id",
         )),
+        // CAD-2063: the tenant has no runtime to serve these, so a retry or a
+        // new login cannot help.
+        (
+            "agent_show" | "message_inbox" | "master_status" | "settings_agents",
+            Some("container_required"),
+        ) => Some((
+            "container_required",
+            "a hosted workspace cannot serve this command. Retrying will not help, and \
+             nothing was changed",
+        )),
         // CAD-1999: the hosted project registry's own typed refusals. A key
         // that already exists as a ticket-only project conflicts exactly like
         // a registered one; only the identical key+name+prefix is a reuse.

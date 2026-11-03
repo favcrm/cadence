@@ -1734,12 +1734,12 @@ fn unavailable(command: &Commands) -> Error {
     // allowlisted alternatives are the only remote surface.
     Error::rejected(format!(
         "`cadence {}` is not available on a remote org in this build - \
-         remote verbs are: status, agent list, agent show, issue ls, \
+         remote verbs are: status, agent list, issue ls, \
          issue show, issue log, issue new, issue comment, issue set, \
-         send/message send (--message required), message read, inbox (peek), \
+         send/message send (--message required), message read, \
          issue project policy, project new, issue project ls, wiki ls, \
          wiki search, wiki cat, \
-         wiki put (text), wiki cp, settings agents <verb>, master status, \
+         wiki put (text), wiki cp, \
          team list, team invites, team invite, team revoke-invite, \
          team set-role, team remove, delivery requirements, artifact put, \
          artifact find, artifact show, audit approval, \
