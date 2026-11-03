@@ -154,6 +154,12 @@ cadence dev reload [--name <n>] [--build <path>]  # restart from a local binary 
 cadence dev status | down | env | ls | reset <name>
 ```
 
+Dev commands stay local even when the saved org selects hosted production.
+They do not change that selection or access the hosted org's credentials,
+transport or container wake path. An explicitly remote `--org` or
+`CADENCE_ORG` refuses; explicit local state/tracker bindings and managed
+callers' identity restrictions remain in force.
+
 `reload`, `down` and `reset` delete or restart a sandbox, so they refuse in a
 shell that `dev env` exported (the exports name the sandbox's own roots, and a
 marker is not proof). Do not simply retry them from a clean shell. First check
