@@ -1,7 +1,19 @@
-import type { MasterStatus } from "./contract.ts";
+import type { HostedState, MasterStatus, PendingOperation } from "./contract.ts";
 
 /** Application-owned business identity for the thread header. */
 export type MasterMetadata = Readonly<Record<string, unknown>>;
+
+/** The header's turn facts, from what the engine has not settled. */
+export function operationStatus(
+  pending: readonly PendingOperation[],
+): Pick<HostedState, "running" | "message" | "queued"> {
+  const running = pending.find((operation) => operation.status === "running");
+  return {
+    running: running !== undefined,
+    message: running?.operationId ?? null,
+    queued: pending.filter((operation) => operation.status === "queued").length,
+  };
+}
 
 /**
  * The board's master payload, in one place.
@@ -49,7 +61,7 @@ export function masterState(
     turn: status.running
       ? {
           state: "working",
-          message: null,
+          message: status.message ?? null,
           conversation: conversationId,
           app_origin: null,
           summary: null,

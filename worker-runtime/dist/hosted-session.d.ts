@@ -87,6 +87,12 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      * call resolves the platform default.
      */
     state(): Promise<HostedState>;
+    /**
+     * Stop one running or queued operation by its id. The id is required: the
+     * engine reads a missing id as "abort the whole session", which is not what
+     * a board asking to stop one turn means. False when nothing matched.
+     */
+    stopOperation(operationId: string): Promise<boolean>;
     private recordResolvedModel;
     private modelLabel;
 }

@@ -24,7 +24,7 @@ import {
   IdentitySnapshots,
   type IdentitySnapshotSql,
 } from "./identity-snapshots.ts";
-import { masterState } from "./master.ts";
+import { masterState, operationStatus } from "./master.ts";
 import { defaultModel, meteredBinding, withDefaultModel } from "./model.ts";
 import {
   operationalSkills,
@@ -168,14 +168,14 @@ export class HostedSession<
         const master = this.options.threadContext
           ? this.validatedThreadContext(await this.options.threadContext())
           : null;
-        const model = await this.modelLabel();
+        const status = await this.state();
         // Serialize the actual composed payload once, before opening a watch
         // or returning SSE 200. Metadata may contain non-JSON values, while
         // reserved fields it cannot override must retain runtime precedence.
         masterFrame = `event: master\ndata: ${JSON.stringify(
           masterState(
-            model,
-            { running: false, queued: 0 },
+            status.model,
+            status,
             master?.conversationId ?? null,
             master?.metadata,
           ),
@@ -368,12 +368,17 @@ export class HostedSession<
       this.pendingOperations(),
       this.modelLabel(),
     ]);
-    return {
-      running: pending.some((operation) => operation.status === "running"),
-      queued: pending.filter((operation) => operation.status === "queued")
-        .length,
-      model,
-    };
+    return { ...operationStatus(pending), model };
+  }
+
+  /**
+   * Stop one running or queued operation by its id. The id is required: the
+   * engine reads a missing id as "abort the whole session", which is not what
+   * a board asking to stop one turn means. False when nothing matched.
+   */
+  async stopOperation(operationId: string): Promise<boolean> {
+    if (operationId === "") return false;
+    return this.harness.session().abort(operationId);
   }
 
   private recordResolvedModel(served: string): void {
