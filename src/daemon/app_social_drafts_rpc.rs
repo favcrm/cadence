@@ -171,11 +171,15 @@ fn source_post_item(
     post: &Value,
 ) -> Option<Value> {
     let id = post["id"].as_str().filter(|id| source_post_id_valid(id))?;
-    let published = post["published_at_unix"].as_i64().or_else(|| {
-        post["published_at"]
-            .as_str()
-            .and_then(crate::issue::time::parse_iso)
-    })?;
+    let published = post["published_at_unix"]
+        .as_i64()
+        .filter(|time| *time >= 0)
+        .or_else(|| {
+            post["published_at"]
+                .as_str()
+                .and_then(crate::issue::time::parse_iso)
+                .filter(|time| *time >= 0)
+        })?;
     let permalink = source_permalink(post["permalink"].as_str()?)?;
     let media_kind = match post.get("media_kind") {
         None => "unknown",
@@ -257,6 +261,20 @@ enum Emit {
     Full(usize),
 }
 
+#[derive(Default)]
+struct JsonByteCount(usize);
+
+impl std::io::Write for JsonByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_source_posts(
     items: &mut Vec<Value>,
@@ -274,9 +292,9 @@ fn emit_source_posts(
             *partial = true;
             continue;
         };
-        let size = serde_json::to_vec(&item)
-            .map_err(|e| Error::internal(e.to_string()))?
-            .len();
+        let mut encoded = JsonByteCount::default();
+        serde_json::to_writer(&mut encoded, &item).map_err(|e| Error::internal(e.to_string()))?;
+        let size = encoded.0;
         if size + 3 > SOURCE_PAGE_BYTES {
             // Larger than a whole page: it cannot be delivered under the
             // bound, so it is reported partial rather than shipped unbounded
@@ -1443,5 +1461,8 @@ mod source_post_id_tests {
             .expect("the page emits the same identity");
         assert_eq!(item["post"]["id"], json!(id));
         assert_eq!(item["post"]["receipt_id"], "app-tool-1");
+        let mut negative_time = post.clone();
+        negative_time["published_at_unix"] = json!(-1);
+        assert!(source_post_item("brandhk", "app-tool-1", None, &negative_time).is_none());
     }
 }

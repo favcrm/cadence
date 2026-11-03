@@ -139,12 +139,13 @@ the install's retained source library through its verified mount:
   mismatched pair never reveals another receipt.
 
 Scope is the host's verified mount and context, never a request field. A scan
-is a snapshot: its cursor is bound to the scope and to the scan's fence, and
-if the retained library moves mid-scan the host refuses with `stale_cursor`
-(or `invalid_cursor` for a malformed cursor) so the client restarts without
-discarding cards it already showed. A source-backed draft still requires the
-receipt to be attached to the context, and its handle to remain a saved
-source.
+is a snapshot: its cursor is bound to the scope and the scan's fence. Later
+inserts are excluded or the host refuses with `stale_cursor` when it cannot
+continue that snapshot; malformed cursors return `invalid_cursor`. In either
+case the client can restart without discarding cards it already showed.
+For a standalone source-backed draft, the receipt must still be attached to
+the context and the handle must remain a saved source. A run-backed draft
+instead proves the selected receipt and post against its own scoped run.
 
 ## 4. Local loop
 
