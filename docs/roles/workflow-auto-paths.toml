@@ -12,14 +12,18 @@
 # a prompt-injected model can write that, so the safe default for a path nobody has
 # classified is the operator. Add a path only after reading what it holds.
 #
-# Left out on purpose (each held identity, approval, secret, gate, execution or
-# install logic): src/wiki/** (caller access rules, approvals, the secret guard),
-# src/overview/** (spawns git and gh, approval-menu commands), src/doctor/** (host,
-# agent-uid, pane-identity and tailnet probes, redaction util), src/issue/**
-# (claim, finish guard, delivery policy and requirements, app guard), research/**
-# (executable acceptance drivers), tests/, .github/, .claude/, infra/, crates/,
-# scripts/, docs/roles/, src/protected_runtime/ and every other src/ path.
+# Whatever `paths` says, the script never treats as eligible a path with a segment
+# starting with `.` (.github, .claude, .gitattributes) or a file named AGENTS.md,
+# CLAUDE.md or GEMINI.md in any directory (they can load as agent instructions),
+# and a modify must keep mode 100644.
+#
+# Left out on purpose: docs/guides/** (it holds rule text AGENTS.md defers to, and a
+# subdirectory CLAUDE.md or AGENTS.md can load as project instructions),
+# src/wiki/**, src/overview/**, src/doctor/**, src/issue/** (identity, approval,
+# secret, gate and execution logic), research/** (executable drivers), tests/,
+# .github/, .claude/, infra/, crates/, scripts/, docs/roles/, src/protected_runtime/
+# and every other path. Widening this list is a later, deliberate, reviewed change.
 # Changing this file is class `human` (risk-classes.md trigger 7).
 
 [auto]
-paths = ["docs/guides/**", "design-plans/**/*.md"]
+paths = ["design-plans/**/*.md"]

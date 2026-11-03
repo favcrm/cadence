@@ -137,6 +137,7 @@ RISK_HUMAN_TABLES = ("schema", "trigger4", "trigger6", "trigger7")
 # write `risk: auto` (a prompt-injected model can), so no path is eligible by
 # default.
 WORKFLOW_AUTO_FILE = "docs/roles/workflow-auto-paths.toml"
+WORKFLOW_NEVER_BASENAMES = ("agents.md", "claude.md", "gemini.md")  # compared lower-case
 HUMAN_LINES = 1500  # risk-classes trigger 5
 HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml",
                    "package-lock.json", ".npmrc", "yarn.lock", "bun.lockb",
@@ -186,6 +187,9 @@ def run(argv, input_text=None):
         r = subprocess.run(argv, input=input_text, capture_output=True, text=True)
     except OSError as e:
         return 127, "", str(e)
+    except UnicodeDecodeError:
+        # A path name that is not UTF-8 cannot be judged: fail closed with a reason.
+        return 1, "", f"{argv[0]} printed output that is not valid UTF-8 (a non-UTF-8 path name?)"
     return r.returncode, r.stdout, r.stderr
 
 
@@ -310,14 +314,13 @@ def pr_changes(pr, head, base, base_oid):
     return parse_raw_diff(out), lines
 
 
-def risk_globs(toml_text, tables=RISK_HUMAN_TABLES):
-    """The globs of the given risk-paths.toml tables (default: the human-class
-    ones), or None if unreadable."""
+def risk_globs(toml_text):
+    """The human-class globs of risk-paths.toml, or None if unreadable."""
     if toml_text is None:
         return None
     try:
         doc = tomllib.loads(toml_text)
-        globs = [g for t in tables for g in doc[t]["paths"]]
+        globs = [g for t in RISK_HUMAN_TABLES for g in doc[t]["paths"]]
     except (tomllib.TOMLDecodeError, KeyError, TypeError):
         return None
     return globs if all(isinstance(g, str) for g in globs) else None
@@ -327,10 +330,13 @@ def workflow_auto_reasons(changes, toml_text):
     """Why a PR with a workflow-issued review needs the operator's approval (CAD-2081).
 
     A positive allowlist: every change must be a plain add or modify of a regular
-    file (100644, or an unchanged mode on a modify) on a path matching
+    file with new mode 100644 (a modify keeps its mode) on a path matching
     WORKFLOW_AUTO_FILE's `[auto] paths`. A delete, rename (seen as a delete plus an
-    add), symlink, submodule or mode change, a path outside the list, an empty list
-    and a missing or unreadable file all need the operator."""
+    add), symlink, submodule, executable or mode change, a path outside the list, an
+    empty list and a missing or unreadable file all need the operator. Whatever the
+    list says, a path with a segment starting with `.` (.github, .claude,
+    .gitattributes) or a basename of AGENTS.md, CLAUDE.md or GEMINI.md (any case,
+    any directory: they can load as agent instructions) is never eligible."""
     globs = glob_list(toml_text, ("auto", "paths"))
     if globs is None:
         return [f"cannot read {WORKFLOW_AUTO_FILE} at main's live tip, so a workflow review "
@@ -340,8 +346,11 @@ def workflow_auto_reasons(changes, toml_text):
         odd = (not path or path.startswith("/") or "\\" in path or ".." in path
                or any(seg in ("", ".") for seg in path.split("/")))
         plain = ((status == "A" and old_mode == "000000" and new_mode == "100644")
-                 or (status == "M" and old_mode == new_mode and new_mode in REGULAR_MODES))
-        if odd or not plain or not any(glob_match(g, path) for g in globs):
+                 or (status == "M" and old_mode == "100644" and new_mode == "100644"))
+        segs = path.split("/")
+        reserved = (any(seg.startswith(".") for seg in segs)
+                    or segs[-1].lower() in WORKFLOW_NEVER_BASENAMES)
+        if odd or reserved or not plain or not any(glob_match(g, path) for g in globs):
             out.append(path)
     return ([f"a workflow review cannot stand in for the operator on paths outside "
              f"{WORKFLOW_AUTO_FILE}: {', '.join(out[:5])}"] if out else [])
@@ -1636,7 +1645,10 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                 reasons.append(f"active {klass} delivery requires exactly one independent combined review")
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
 
-    # Human class: paths, size, or any head-pinned note whose Risk is not exactly `auto`.
+    # Human class: paths, size, any head-pinned note whose Risk is not exactly `auto`,
+    # or (CAD-2081) a workflow-issued review on any change outside the workflow
+    # auto-paths allowlist. `cadence delivery requirements` does not report that last
+    # rule; this script adds it.
     rc, risk_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
                             f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={base_oid}"])
     risk_text = risk_text if rc == 0 and base_oid else None

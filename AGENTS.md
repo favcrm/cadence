@@ -169,14 +169,20 @@ the code you just wrote.
   is a plain add or modify of a regular file (a delete, rename, symlink, executable
   or mode change needs the operator). Nothing outside that list is eligible, so a
   path no list names fails closed, and a missing or unreadable file means the
-  operator. It starts small (`docs/guides/**` and `design-plans/**/*.md`); a path is
-  added only after reading what it holds. Rule-7 paths, the size trigger and a
-  non-`auto` `Risk:` still force the operator as before. The tenant stops re-filing, not re-rolling: a run can be cancelled and
-  re-dispatched, or an empty commit pushed, for a new head and a new verdict.
-  A session holding admin can still rewrite the workflow or sign directly until
+  operator. It starts as `design-plans/**/*.md` only, so nearly every PR still
+  needs one operator approval after two workflow reviews; widening it is a later,
+  deliberate decision, made only after reading what a path holds. Whatever the list
+  says, a path with a segment starting with `.` or a file named AGENTS.md, CLAUDE.md
+  or GEMINI.md is never eligible, and a modify must keep mode 100644. `cadence
+  delivery requirements` does not report this rule; the script adds it. Rule-7
+  paths, the size trigger and a non-`auto` `Risk:` still force the operator as
+  before. The tenant stops re-filing, not re-rolling: a run can be cancelled and
+  re-dispatched, or an empty commit pushed, for a new head and a new verdict. A
+  session holding admin can still rewrite the workflow or sign directly until
   agents lose admin. There is no Browser QA workflow: a `ui/` PR still needs a
   Browser QA verdict from a session, and refuses without it. `--exception` is
-  otherwise unchanged, but a workflow row that does not hold refuses under it too.
+  otherwise unchanged, but a workflow row that does not hold refuses under it
+  too.
 - One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
