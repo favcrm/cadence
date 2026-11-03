@@ -5,17 +5,19 @@ Use this lookup only to find the command or tool. A listed command is not proof 
 | Capability | Native workspace | Hosted workspace |
 |---|---|---|
 | Company facts | `cadence wiki search`, `cadence wiki cat` | `wiki_search`, `wiki_list`, `wiki_read` |
-| Find past work | `cadence --org <name> artifact find`, `artifact show`, on a hosted workspace | Not available yet |
+| Find past work | `cadence --org <name> artifact find`, `artifact show`, on a hosted workspace | `artifact_find`, `artifact_read` |
 | Find template | `cadence template show NAME`, which needs the name: there is no list command, so ask for it | Not available yet |
 | Read template | `cadence template show NAME --version V [--out NEW_DIR]` | Not available yet |
 | Calculate | The draft model behind `cadence document create`, or an inspected Decimal calculation where the session can run code | Not available yet |
 | Render | `cadence document create`, `show`, `export`, for an approved DOCX financial template | Not available yet |
-| Show | `cadence artifact put`, for the master's own turn | Not available yet |
-| Save file | `cadence --org <name> artifact put --issue <id>`, for a worker on a hosted workspace; without `--issue` it stays private to you | Not available yet |
+| Show | `cadence artifact put`, for the master's own turn | `artifact_put` for a new file or version, `artifact_show` for one already saved |
+| Save file | `cadence --org <name> artifact put --issue <id>`, for a worker on a hosted workspace; without `--issue` it stays private to you | `artifact_put`, which also shows it |
 | Save draft | `cadence template create`, `revise` | Not available yet |
 | Approve | The operator's `cadence template approve` | Not available yet |
 
 "Not available yet" means no such tool unless this session lists one. Say so plainly rather than asking for credentials or inventing a route.
+
+When saving, set the label to the document type, such as `quotation`, and name the customer when you know it. Draft status such as `SAMPLE` belongs in the title and the document, not the label.
 
 The rest of this file is the native detail. The daemon validates the spec, stores the version and enforces company scope from the connection.
 

@@ -56551,10 +56551,10 @@ function operationContextExtension(load, authored) {
 }
 
 // src/company-outputs.generated.ts
-var COMPANY_OUTPUTS_FINGERPRINT = "tenant-company-outputs-3d08fa107575a2ee";
+var COMPANY_OUTPUTS_FINGERPRINT = "tenant-company-outputs-709000f9e3e2411a";
 var COMPANY_OUTPUTS_SKILL = {
   name: "company-outputs",
-  version: "3d08fa107575a2ee",
+  version: "709000f9e3e2411a",
   description: "Prepare and reuse a company's quotes, quotations, invoices, proposals, tenders, reports, letters, slides and page mockups, and save a good result as a reusable template. Use when someone asks for one of these, asks to use or change their template, or asks to save something as a template. Produces drafts only; nothing is sent, issued or approved.",
   body: `# Company outputs
 
@@ -56613,25 +56613,7 @@ When a capability is missing, say which one and what that means for this request
     {
       kind: "reference",
       path: "references/cadence.md",
-      content: `# Where each capability exists
-
-Use this lookup only to find the command or tool. A listed command is not proof that this session may run it or that rendering will succeed; recheck the session's own tools and help.
-
-| Capability | Hosted workspace |
-|---|---|
-| Company facts | \`wiki_search\`, \`wiki_list\`, \`wiki_read\` |
-| Find past work | Not available yet |
-| Find template | Not available yet |
-| Read template | Not available yet |
-| Calculate | Not available yet |
-| Render | Not available yet |
-| Show | Not available yet |
-| Save file | Not available yet |
-| Save draft | Not available yet |
-| Approve | Not available yet |
-
-"Not available yet" means no such tool unless this session lists one. Say so plainly rather than asking for credentials or inventing a route.
-`
+      content: '# Where each capability exists\n\nUse this lookup only to find the command or tool. A listed command is not proof that this session may run it or that rendering will succeed; recheck the session\'s own tools and help.\n\n| Capability | Hosted workspace |\n|---|---|\n| Company facts | `wiki_search`, `wiki_list`, `wiki_read` |\n| Find past work | `artifact_find`, `artifact_read` |\n| Find template | Not available yet |\n| Read template | Not available yet |\n| Calculate | Not available yet |\n| Render | Not available yet |\n| Show | `artifact_put` for a new file or version, `artifact_show` for one already saved |\n| Save file | `artifact_put`, which also shows it |\n| Save draft | Not available yet |\n| Approve | Not available yet |\n\n"Not available yet" means no such tool unless this session lists one. Say so plainly rather than asking for credentials or inventing a route.\n\nWhen saving, set the label to the document type, such as `quotation`, and name the customer when you know it. Draft status such as `SAMPLE` belongs in the title and the document, not the label.\n'
     },
     {
       kind: "reference",
