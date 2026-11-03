@@ -366,6 +366,11 @@ merge approval on the **literal full SHA** just reviewed. Example syntax
 cadence audit approve --repo favcrm/cadence --pr <PR> --head <FULL_REVIEWED_SHA> --source "Operator in chat: approves the reviewed green PR head."
 ```
 
+On a hosted org the approval is project-scoped and names the ticket it
+authorizes, so the paste-ready form adds `--project <key> --issue <ID>`
+(CAD-2001); a hosted approval without them is refused rather than inferred
+from the repo. A local approval stays repo-scoped.
+
 Provide the operator a concrete paste-ready version with no placeholders,
 `read`, guessed SHA, or source over 200 characters. The agent never executes
 the approval itself. Record the returned approval id on the ticket, then:

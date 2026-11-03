@@ -1,7 +1,9 @@
 //! CAD-1752: the one resolver for "which project is this agent working in".
 //!
-//! An agent hired from the catalogue lives in `<state>/agents/<alias>/home`,
-//! which is no project repo, so a cwd lookup finds nothing. The project of a
+//! An agent with `params.catalogue` (the older direct catalogue hire; a hire
+//! is a profile now, CAD-1989, and CAD-1990 decides whether this arm is
+//! re-keyed or removed) lives in `<state>/agents/<alias>/home`, which is no
+//! project repo, so a cwd lookup finds nothing. The project of a
 //! turn comes from the task the turn carries: the issue of the running (else
 //! the single queued) dispatched message (the kickoff names the lane worktree). An agent with no
 //! such task falls back to its cwd, so an agent joined inside a repo behaves

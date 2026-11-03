@@ -251,18 +251,26 @@ looking.
   not require that daemon. Do not connect a runner blindly when it might claim
   unrelated waiting work. Agent identity is established by the supported
   authenticated path, not by supplying an alias or borrowing a human login.
-- Review evidence binds to the exact head: the merge gate counts distinct
-  reviewers, refuses the author's own, and voids every verdict when the head
-  moves. Read it back with `cadence audit verdicts` and confirm a verdict counts
+- Review evidence binds to the exact head and, on a hosted workspace, to the
+  issue's project (CAD-2001): the merge gate counts distinct reviewers, refuses
+  the author's own, and voids every verdict when the head moves. Read it back
+  with `cadence audit verdicts --project <key>` and confirm a verdict counts
   before treating a review as landed; in-chat findings are not automatically
-  gate evidence. A hosted `audit verdict` is not the per-PR note the native gate
-  reads (the tenant records artifact reviews), so never count it as one or
-  impersonate a reviewer — see `docs/guides/hosted-workspace.md` ("Reviewing
-  software changes"; CAD-1542, CAD-1981, AOS-473).
+  gate evidence. The project is explicit — never derived from the repository or
+  the cwd. A hosted verdict counts only when the workspace owner has attested
+  its principal's GitHub login (`cadence audit identities`) and admitted that
+  principal to the project (`cadence audit reviewers --project <key>`); the
+  gate counts principals, excludes the author by the attested login, and
+  refuses an unattested, contradictory or ambiguous note — see
+  `docs/guides/hosted-workspace.md` ("Reviewing software changes"; AOS-473,
+  CAD-2001).
 - When more than one Cadence build is on the host, `CADENCE_BIN` selects the one
   the gate invokes. A hosted-verb refusal can come from the client, the deployed
   service or an operation the tenant does not support: confirm the capability,
   report the exact refusal, and do not assume a stale client or bypass the gate.
+  A tenant that predates the project-scoped review verbs is refused by name —
+  the release order is the tenant server first, then this client — and that
+  refusal is never a pass.
 - Hosted project work and local software delivery are distinct. If the merge gate
   refuses, report its exact refusal; an exception remains operator-controlled and
   does not grant an agent merge or approval authority.

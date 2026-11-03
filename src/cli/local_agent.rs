@@ -1,4 +1,4 @@
-//! CLI for hosted local-agent coordination (CAD-1460).
+//! Hosted local-assignment verbs behind `agent` (CAD-1460).
 //!
 //! These commands talk to
 //! `/__platform/hosted-cadence/:organizationId/local-assignments`.

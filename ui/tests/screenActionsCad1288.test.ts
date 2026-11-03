@@ -92,3 +92,14 @@ async function main() {
   console.log("screenActionsCad1288 ok");
 }
 main().catch(error => { console.error(error); { throw error; }; });
+
+// SOC-54: the host that keeps every retained read refuses a profile removed
+// from Settings with `source_not_saved`; the frame must surface that code, not
+// collapse it to `failed`, or the app cannot explain what happened.
+{
+  const refusal = plainRefusal(new ApiError("that profile is no longer a saved source", 400, { code: "source_not_saved" }));
+  assert(refusal.code === "source_not_saved", `source_not_saved is mapped, not generic: ${refusal.code}`);
+  assert(/re-add/i.test(refusal.text), `the sentence names the fix: ${refusal.text}`);
+  const legacy = plainRefusal(new ApiError("source receipt is not the latest successful fetch", 400, { code: "stale_source" }));
+  assert(legacy.code === "stale_source", "an older daemon's stale_source still maps");
+}

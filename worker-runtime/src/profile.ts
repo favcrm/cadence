@@ -1,6 +1,7 @@
 import type { Extension } from "@earendil-works/pi-durable";
 import type { SkillManifest, SkillSource } from "agents/skills";
 import { OPERATIONAL_SKILL_VERSION } from "./contract.ts";
+import { COMPANY_OUTPUTS_FINGERPRINT, COMPANY_OUTPUTS_SKILL } from "./company-outputs.generated.ts";
 
 /**
  * The runtime's bundled prompt and skill profile.
@@ -103,6 +104,13 @@ function skillSource(pack: SkillManifest): SkillSource {
 }
 
 export const operationalSkills = skillSource(manifest);
+
+/** Independently versioned, and generated from the one `skills/company-outputs` source. */
+export const companyOutputSkills = skillSource({
+  id: "tenant-company-outputs",
+  fingerprint: COMPANY_OUTPUTS_FINGERPRINT,
+  skills: [COMPANY_OUTPUTS_SKILL],
+});
 
 /** Independently versioned: existing review drafts retain their original board-skill catalog stamp. */
 export const runtimeHealthSkills = skillSource({

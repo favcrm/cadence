@@ -15,7 +15,7 @@ use crate::issue::{
 
 mod epic;
 mod milestone;
-pub use epic::{run_epic, EpicAction};
+pub use epic::{decide_plan, propose_plan, run_epic, EpicAction};
 pub use milestone::{run_milestone, MilestoneAction};
 mod board_actions;
 mod checkout;
@@ -813,7 +813,9 @@ pub enum ProjectAction {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// List registered projects.
+    /// List registered projects. On a selected hosted org this reads the
+    /// org's own registry, including projects that exist only as their
+    /// tickets' key; `--sort`, `--limit` and `--fields` refuse there.
     #[command(after_long_help = crate::filter::GRAMMAR)]
     #[command(visible_alias = "list")]
     Ls {

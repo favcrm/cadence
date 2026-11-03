@@ -14,15 +14,24 @@ pub(crate) enum AuditAction {
     /// scope at ticket time.
     Approve {
         /// PR number the approval covers.
-        #[arg(long, required_unless_present = "issue", conflicts_with = "issue")]
+        #[arg(long, required_unless_present = "issue")]
         pr: Option<u64>,
         /// Full 40-hex head SHA the approval names — an approval never
         /// carries over to a later head.
         #[arg(long, required_unless_present = "issue")]
         head: Option<String>,
-        /// The ticket whose scope `--action scope` pre-approves.
-        #[arg(long, requires = "action")]
+        /// The ticket this approval is about. With `--action scope` (local,
+        /// operator connection) it is the ticket whose scope is pre-approved.
+        /// With `--pr` it is the issue a hosted merge approval authorizes:
+        /// the project-scoped approval is unique per issue, so an approval
+        /// recorded for another ticket can never answer this one.
+        #[arg(long)]
         issue: Option<String>,
+        /// The issue's project (hosted orgs; required there). The approval is
+        /// that project's and no other's — it is never inferred from the repo
+        /// or the cwd.
+        #[arg(long)]
+        project: Option<String>,
         /// Record a delegated approval: the daemon checks every
         /// safeguard and records it under this pane's own agent.
         #[arg(long, conflicts_with_all = ["issue", "id"])]
@@ -56,6 +65,15 @@ pub(crate) enum AuditAction {
         /// Full 40-hex head SHA — an approval for another head never counts.
         #[arg(long)]
         head: String,
+        /// Tracker issue id the approval authorizes (hosted orgs; required
+        /// there). The issue is part of the approval's identity, so an
+        /// approval recorded for another ticket never answers this read.
+        #[arg(long)]
+        issue: Option<String>,
+        /// The issue's project (hosted orgs; required there). The read is that
+        /// project's and no other's — never inferred from the repo or the cwd.
+        #[arg(long)]
+        project: Option<String>,
         /// `owner/name` (default: the cwd checkout's github.com origin).
         #[arg(long)]
         repo: Option<String>,
@@ -94,6 +112,11 @@ pub(crate) enum AuditAction {
         /// not repo-scoped, so a local read refuses it.
         #[arg(long)]
         repo: Option<String>,
+        /// The issue's project (hosted orgs; required there). This is the
+        /// scope of the read: the org answers that project's evidence only,
+        /// and the project is never inferred from `--repo` or the cwd.
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Record one reviewer's verdict for exactly this issue, PR and head
     /// (hosted orgs). The board takes the reviewer from the authenticated
@@ -137,20 +160,36 @@ pub(crate) enum AuditAction {
         /// declared and a caller it has not attested for that repo.
         #[arg(long)]
         repo: Option<String>,
-    },
-    /// Read-only (AOS-473): the workspace owner's reviewer attestations —
-    /// which GitHub login is which workspace principal, per repository. The
-    /// gate counts hosted verdicts by principal and excludes the author by
-    /// login, so the binding is the evidence. `--repo` selects the rows to
-    /// print (the verb reads the whole workspace; the default is the cwd
-    /// checkout's github.com origin). A hosted verb: a local org has no
-    /// attestations and refuses rather than answering an empty list.
-    Reviewers {
-        /// `owner/name` (default: the cwd checkout's github.com origin).
+        /// The issue's project (hosted orgs; required). The row is recorded
+        /// in that project's evidence only; the project is never inferred
+        /// from `--repo` or the cwd.
         #[arg(long)]
-        repo: Option<String>,
+        project: Option<String>,
+    },
+    /// Read-only (AOS-473, CAD-2001): one project's reviewer eligibility map
+    /// joined to the workspace owner's identity attestation — which principal
+    /// may review, and which GitHub login is that principal. The merge gate
+    /// counts hosted verdicts by principal and excludes the author by login,
+    /// so the join is the evidence. `--project` is required: a repo never
+    /// selects a project. A hosted verb: a local org has no attestations and
+    /// refuses rather than answering an empty list.
+    #[command(subcommand_negates_reqs = true)]
+    Reviewers {
+        /// Project key whose eligibility map is read. Required unless a
+        /// subcommand is given: `set` names its own (CAD-2005).
+        #[arg(long, required = true)]
+        project: Option<String>,
         #[command(subcommand)]
         action: Option<ReviewersAction>,
+    },
+    /// Read-only (CAD-2001): the workspace owner's principal→GitHub-login
+    /// attestation map. A code verdict needs both a project eligibility and an
+    /// attested login; this is where the login is bound, once for the whole
+    /// workspace. The tenant admits it for the live human owner only, so an
+    /// agent's call is a refusal, never an empty map.
+    Identities {
+        #[command(subcommand)]
+        action: Option<IdentitiesAction>,
     },
     /// Designate an agent to record delegated approvals for a project
     /// (operator only; `--revoke` withdraws the designation).
@@ -186,23 +225,44 @@ pub(crate) enum AuditAction {
     },
 }
 
-/// `cadence audit reviewers set` (AOS-473): the owner's attestation writer.
-/// The tenant checks the live owner and the `audit.approve` scope; this
-/// command sends only what it was given and refuses a row it can already
+/// `cadence audit reviewers set` (AOS-473, CAD-2001): the owner's eligibility
+/// writer. The tenant checks the live owner and the `audit.approve` scope;
+/// this command sends only what it was given and refuses a row it can already
 /// see is unusable.
 #[derive(Subcommand)]
 pub(crate) enum ReviewersAction {
-    /// Replace this repo's whole attestation map with the given
-    /// `<github_login>=<subject_id>` rows. A reviewer left out of the list
-    /// stops filing new verdicts for this repo; rows already filed keep their
-    /// stored login and stay countable, because evidence is never erasable.
+    /// Replace this project's whole eligibility map with the given
+    /// principals. A reviewer left out of the list stops filing new verdicts
+    /// for this project; rows already filed keep their stored principal and
+    /// login and stay countable, because evidence is never erasable. No
+    /// `--reviewer` clears the map.
+    ///
+    /// Eligibility is a project fact and the GitHub login is a separate
+    /// workspace attestation, so this verb names principals only: bind the
+    /// logins once with `cadence audit identities set`.
     Set {
-        /// `owner/name` — one of the project's declared repos.
+        /// Project key whose map is replaced.
         #[arg(long)]
-        repo: String,
-        /// `<github_login>=<subject_id>`, repeatable; the repo's whole set.
-        #[arg(long = "reviewer", required = true, value_name = "LOGIN=SUBJECT")]
+        project: String,
+        /// Workspace principal id (`user_…`), repeatable; the project's whole
+        /// map. Omitted, it clears the map.
+        #[arg(long = "reviewer", value_name = "SUBJECT_ID")]
         reviewer: Vec<String>,
+    },
+}
+
+/// `cadence audit identities set` (CAD-2001): the owner's workspace identity
+/// attestation. This is an attestation, never a claim of OAuth verification,
+/// and it grants no project eligibility by itself.
+#[derive(Subcommand)]
+pub(crate) enum IdentitiesAction {
+    /// Replace the workspace's whole principal→GitHub-login map. No
+    /// `--identity` clears it.
+    Set {
+        /// `<subject_id>=<github_login>`, repeatable; the workspace's whole
+        /// map.
+        #[arg(long = "identity", value_name = "SUBJECT=LOGIN")]
+        identity: Vec<String>,
     },
 }
 
@@ -239,12 +299,39 @@ pub(super) fn run(
             "audit reviewers reads and writes the hosted workspace's reviewer \
              attestations; select it with `--org <org>`. Nothing was sent",
         )),
+        // CAD-2001: the workspace identity map is the hosted owner's
+        // attestation, admitted for the live human owner only.
+        Some(AuditAction::Identities { .. }) => Err(Error::rejected(
+            "audit identities reads and writes the hosted workspace's identity \
+             attestations; select it with `--org <org>`. Nothing was sent",
+        )),
         Some(AuditAction::Scope { issue }) => {
             let (v, code) = cadence_agent::audit::scope_check(&state_dir, issue.trim());
             print_json(&v);
             Ok(code)
         }
-        Some(AuditAction::Approval { pr, head, repo }) => {
+        Some(AuditAction::Approval {
+            pr,
+            head,
+            issue,
+            project,
+            repo,
+        }) => {
+            // The local store binds `{repo, pr, head}` and records no project
+            // or issue; accepting either would claim a scope it never checked.
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped read: a local \
+                     approval is repo-scoped, so this read cannot honour it. Nothing was read"
+                )));
+            }
+            if let Some(issue) = issue {
+                return Err(Error::usage(format!(
+                    "--issue {issue} binds the hosted project-scoped read: a local approval \
+                     is repo-scoped and names no ticket, so this read cannot honour it. \
+                     Nothing was read"
+                )));
+            }
             let head = full_head(&head)?;
             let repo = match repo {
                 Some(r) => r,
@@ -259,6 +346,36 @@ pub(super) fn run(
             let (v, code) = cadence_agent::audit::approval_check(&state_dir, &repo, pr, &head);
             print_json(&v);
             Ok(code)
+        }
+        Some(action @ AuditAction::Approve { .. }) => {
+            // CAD-2001: `--project` and `--issue` with `--pr` are the hosted
+            // project-scoped approval. A local approval is repo-scoped and
+            // records neither, so accepting them here would claim a binding
+            // nothing checked — and `--issue` alone is the scope pre-approval.
+            if let AuditAction::Approve {
+                project,
+                issue,
+                pr,
+                ..
+            } = &action
+            {
+                if let Some(project) = project {
+                    return Err(Error::usage(format!(
+                        "--project {project} binds the hosted project-scoped approval: a local \
+                         approval is repo-scoped, so this command cannot honour it. Nothing was \
+                         recorded"
+                    )));
+                }
+                if issue.is_some() && pr.is_some() {
+                    return Err(Error::usage(
+                        "--issue with --pr names the ticket a hosted merge approval authorizes; \
+                         a local approval is repo-scoped. Record a scope pre-approval with \
+                         `--issue <ID> --action scope`, or a merge approval with `--pr` alone. \
+                         Nothing was recorded",
+                    ));
+                }
+            }
+            run_audit_evidence(&state_dir, action)
         }
         Some(action) => run_audit_evidence(&state_dir, action),
         None => cadence_agent::audit::run(&cadence_agent::audit::AuditOptions {
@@ -290,6 +407,7 @@ pub(super) fn verdicts(
     pr: u64,
     head: &str,
     repo: Option<&str>,
+    project: Option<&str>,
     notes_dir: Option<&std::path::Path>,
 ) -> Result<i32> {
     // A note names no repository, so this read cannot bind one. Answering
@@ -298,6 +416,15 @@ pub(super) fn verdicts(
         return Err(Error::usage(format!(
             "--repo {repo} binds the hosted read: local verdict notes are not \
              repo-scoped, so this read cannot honour it. Nothing was read"
+        )));
+    }
+    // CAD-2001: the same for the project. Local notes are the local org's own
+    // record and carry no project attribution; echoing the caller's project
+    // would claim a scope nothing checked.
+    if let Some(project) = project {
+        return Err(Error::usage(format!(
+            "--project {project} binds the hosted read: local verdict notes are not \
+             project-scoped, so this read cannot honour it. Nothing was read"
         )));
     }
     let head = full_head(head)?;
@@ -310,41 +437,84 @@ pub(super) fn verdicts(
     Ok(0)
 }
 
-/// `<github_login>=<subject_id>` rows for `audit reviewers set`. The tenant
-/// validates the login grammar and that the principal exists; these checks
-/// only stop a call that could never be recorded from being sent.
-pub(super) fn reviewer_pairs(rows: &[String]) -> Result<Vec<(String, String)>> {
-    if rows.is_empty() || rows.len() > 32 {
+/// Workspace principals for `audit reviewers set` (CAD-2001). Eligibility is a
+/// project fact, so each row is a bare `subject_id` — the GitHub login is a
+/// separate workspace attestation (`audit identities set`), and a row that
+/// still carries `login=subject` is refused with that two-step remedy rather
+/// than silently split. These checks only stop a call the tenant could never
+/// record from being sent.
+pub(super) fn reviewer_subjects(rows: &[String]) -> Result<Vec<String>> {
+    if rows.len() > 32 {
         return Err(Error::usage(
-            "audit reviewers set takes 1..32 --reviewer rows; nothing was sent",
+            "audit reviewers set takes at most 32 --reviewer rows; nothing was sent",
+        ));
+    }
+    let mut subjects: Vec<String> = Vec::new();
+    for row in rows {
+        let subject = row.trim();
+        if subject.contains('=') {
+            return Err(Error::usage(format!(
+                "--reviewer {row:?} carries a login: project eligibility names the \
+                 principal only. Bind the login once with `cadence audit identities set \
+                 --identity <subject_id>=<github_login>`, then list the principal here. \
+                 Nothing was sent"
+            )));
+        }
+        if subject.is_empty() || subject.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(Error::usage(format!(
+                "--reviewer {row:?} is not a workspace principal id; nothing was sent"
+            )));
+        }
+        if subjects.iter().any(|s| s == subject) {
+            return Err(Error::usage(format!(
+                "--reviewer names principal {subject} twice; one principal is one \
+                 reviewer. Nothing was sent"
+            )));
+        }
+        subjects.push(subject.to_string());
+    }
+    Ok(subjects)
+}
+
+/// `<subject_id>=<github_login>` rows for `audit identities set` (CAD-2001).
+/// The tenant validates the login grammar and that the principal exists; these
+/// checks only stop a call that could never be recorded from being sent.
+pub(super) fn identity_pairs(rows: &[String]) -> Result<Vec<(String, String)>> {
+    if rows.len() > 32 {
+        return Err(Error::usage(
+            "audit identities set takes at most 32 --identity rows; nothing was sent",
         ));
     }
     let mut pairs: Vec<(String, String)> = Vec::new();
     for row in rows {
-        let (login, subject) = row.split_once('=').ok_or_else(|| {
+        let (subject, login) = row.split_once('=').ok_or_else(|| {
             Error::usage(format!(
-                "--reviewer {row:?} is not <github_login>=<subject_id>; nothing was sent"
+                "--identity {row:?} is not <subject_id>=<github_login>; nothing was sent"
             ))
         })?;
-        let (login, subject) = (login.trim(), subject.trim());
-        if login.is_empty() || subject.is_empty() || subject.contains('=') {
+        let (subject, login) = (subject.trim(), login.trim());
+        if subject.is_empty()
+            || login.is_empty()
+            || login.contains('=')
+            || subject.chars().any(char::is_control)
+        {
             return Err(Error::usage(format!(
-                "--reviewer {row:?} is not <github_login>=<subject_id>; nothing was sent"
+                "--identity {row:?} is not <subject_id>=<github_login>; nothing was sent"
             )));
         }
-        if pairs.iter().any(|(l, _)| l.eq_ignore_ascii_case(login)) {
+        if pairs.iter().any(|(s, _)| s == subject) {
             return Err(Error::usage(format!(
-                "--reviewer names {login} twice; one login binds one principal. \
+                "--identity names principal {subject} twice; one principal binds one \
+                 login. Nothing was sent"
+            )));
+        }
+        if pairs.iter().any(|(_, l)| l.eq_ignore_ascii_case(login)) {
+            return Err(Error::usage(format!(
+                "--identity names login {login} twice; one login binds one principal. \
                  Nothing was sent"
             )));
         }
-        if pairs.iter().any(|(_, s)| s == subject) {
-            return Err(Error::usage(format!(
-                "--reviewer names principal {subject} twice; one principal binds \
-                 one login. Nothing was sent"
-            )));
-        }
-        pairs.push((login.to_string(), subject.to_string()));
+        pairs.push((subject.to_string(), login.to_string()));
     }
     Ok(pairs)
 }

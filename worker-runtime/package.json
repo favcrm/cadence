@@ -23,7 +23,7 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "bun test",
-    "build": "rm -rf dist && tsc -p tsconfig.build.json && bun scripts/build.mjs",
+    "build": "rm -rf dist && bun scripts/gen-company-outputs.mjs && tsc -p tsconfig.build.json && bun scripts/build.mjs",
     "verify": "bun run typecheck && bun run test && bun run build"
   },
   "dependencies": {

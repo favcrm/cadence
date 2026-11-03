@@ -1,8 +1,11 @@
 //! CAD-1019 slice 2: dispatch for a `Remote` org selection — maps the
 //! allowlisted local commands to AOS-128 verbs and runs them through
 //! [`cadence_agent::remote_cli`]. Anything outside the allowlist is refused
-//! *here*, before a request is ever built. Operator-only verbs never map.
-//! `issue project policy` is `project_policy`; project add/list/set-remote stay local.
+//! *here*, before a request is ever built. Operator-only daemon verbs never
+//! map.
+//! `issue project policy` is `project_policy`; `project new` is
+//! `project_new` and `issue project ls` is `project_ls` on a hosted org,
+//! while `issue project add`/`set-remote` stay local.
 
 use super::*;
 use cadence_agent::remote_cli::RemoteTarget;
@@ -185,8 +188,10 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
         } => {
             // Straight pass-through of the list grammar; the remote
             // tracker owns the same flags the local `issue ls` parses.
+            // CAD-1999: `--project` now crosses the wire — the hosted
+            // route filters one registered (or ticket-derived) project,
+            // so a repeated flag refuses rather than silently keeping one.
             for (flag, present) in [
-                ("--project", !project.is_empty()),
                 ("--stage", !stage.is_empty()),
                 ("--health", !health.is_empty()),
                 ("--since", since.is_some()),
@@ -206,6 +211,15 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                         "the remote route's filter does not implement it",
                     ));
                 }
+            }
+            if project.len() > 1 {
+                return Err(Error::rejected(
+                    "remote `issue ls` filters one --project at a time — the \
+                     hosted route takes a single key; nothing was sent",
+                ));
+            }
+            if let Some(key) = project.first() {
+                args.insert("project".into(), json!(key));
             }
             for (key, values) in [
                 ("status", status),
@@ -600,6 +614,99 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             args.insert("grants".into(), json!(grants));
             "project_policy"
         }
+        // CAD-1999: `cadence project new` on a hosted org registers an
+        // empty project — its key, its human-readable name and an optional
+        // issue-id prefix. The local-only flags register a git checkout and
+        // seed its PROJECT.md, which a hosted org has no path to, so they
+        // refuse before a request exists rather than being dropped. The
+        // name is required and sent as given: the registry keeps it
+        // distinct from the key (the key is lower-case, the name is the
+        // human label).
+        Commands::Project {
+            action:
+                ProjectCmd::New {
+                    key,
+                    name,
+                    repo,
+                    prefix,
+                    goal,
+                    agents,
+                    issue,
+                },
+        } => {
+            let mut local = Vec::new();
+            if repo.is_some() {
+                local.push("--repo");
+            }
+            if goal.is_some() {
+                local.push("--goal");
+            }
+            if !agents.is_empty() {
+                local.push("--agent");
+            }
+            if issue.is_some() {
+                local.push("--issue");
+            }
+            if !local.is_empty() {
+                return Err(Error::rejected(format!(
+                    "remote `project new` does not support {} — it registers an \
+                     empty hosted project, not a repo checkout or a seeded \
+                     PROJECT.md; nothing was sent",
+                    local.join(" ")
+                )));
+            }
+            let name = name.as_deref().map(str::trim).unwrap_or_default();
+            if name.is_empty() {
+                return Err(Error::rejected(
+                    "remote `project new` needs --name <human name> — the hosted \
+                     registry keeps it beside the key; nothing was sent",
+                ));
+            }
+            if name.len() > 200 {
+                return Err(Error::rejected(
+                    "remote `project new` --name must be at most 200 bytes — \
+                     nothing was sent",
+                ));
+            }
+            args.insert("key".into(), json!(key));
+            args.insert("name".into(), json!(name));
+            if let Some(prefix) = prefix {
+                args.insert("prefix".into(), json!(prefix));
+            }
+            "project_new"
+        }
+        // CAD-1999: `issue project ls` reads the hosted registry, which
+        // includes projects that exist only as their tickets' key. The
+        // route takes no arguments, so the local row transforms refuse
+        // instead of being applied to a shape the client does not own.
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Project {
+                    action:
+                        cadence_agent::issue::cli::ProjectAction::Ls {
+                            sort,
+                            limit,
+                            fields,
+                            json: _,
+                        },
+                },
+        } => {
+            for (flag, present) in [
+                ("--sort", sort.is_some()),
+                ("--limit", limit.is_some()),
+                ("--fields", !fields.is_empty()),
+            ] {
+                if present {
+                    return Err(unsupported(
+                        "issue project ls",
+                        flag,
+                        "the hosted project read returns the registry as it is; \
+                         sorting, truncating and field selection are local transforms",
+                    ));
+                }
+            }
+            "project_ls"
+        }
         Commands::Message {
             action:
                 MessageAction::Read {
@@ -767,9 +874,138 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             args.insert("payload".into(), Value::Object(payload));
             "settings_agents"
         }
+        Commands::Platform { action } => {
+            // CAD-1678: a hosted workspace owns its catalog, its accounts and
+            // its per-project default, so a flag naming any of them cannot
+            // cross faithfully — it refuses here rather than being silently
+            // ignored by the door. The tool and its input are the only caller
+            // facts that travel.
+            match action {
+                PlatformAction::Tools { project, .. } => {
+                    if project.is_some() {
+                        return Err(unsupported(
+                            "platform tools",
+                            "--project",
+                            "a hosted workspace resolves its own default account",
+                        ));
+                    }
+                    args.insert("operation".into(), json!("tools"));
+                }
+                PlatformAction::Call {
+                    tool,
+                    input,
+                    query,
+                    request,
+                    platform,
+                    account,
+                    project,
+                } => {
+                    if platform.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--platform",
+                            "a hosted workspace runs its own registered platforms",
+                        ));
+                    }
+                    if account.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--account",
+                            "a hosted workspace funds and resolves its own account",
+                        ));
+                    }
+                    if project.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--project",
+                            "a hosted workspace resolves its own project",
+                        ));
+                    }
+                    let body = match input {
+                        Some(input) => Some(super::platform::parse_platform_input(input)?),
+                        None => None,
+                    };
+                    let query = match query {
+                        Some(query) => Some(super::platform::parse_platform_input(query)?),
+                        None => None,
+                    };
+                    if body.is_none() && query.is_none() {
+                        return Err(Error::usage(
+                            "platform call needs --input or, on a hosted org, --query",
+                        ));
+                    }
+                    // The handle names the retry: an identical call replays the
+                    // door's recorded outcome instead of charging again, so a
+                    // second intentional run needs a fresh --request.
+                    let key = match request {
+                        Some(request) => {
+                            if !valid_platform_handle(request) {
+                                return Err(Error::invalid(
+                                    "platform_call",
+                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+                                ));
+                            }
+                            request.clone()
+                        }
+                        None => platform_replay_key(tool, query.as_ref(), body.as_ref()),
+                    };
+                    args.insert("operation".into(), json!("call"));
+                    args.insert("tool".into(), json!(tool));
+                    args.insert("key".into(), json!(key));
+                    if let Some(body) = body {
+                        args.insert("body".into(), body);
+                    }
+                    if let Some(query) = query {
+                        args.insert("query".into(), query);
+                    }
+                }
+                _ => return Err(unavailable(command)),
+            }
+            "platform_call"
+        }
         _ => return Err(unavailable(command)),
     };
     Ok((verb, args))
+}
+
+/// The hosted reply-token grammar (`[A-Za-z0-9_.:-]{1,128}`), checked here so
+/// a bad `--request` never reaches a paid call.
+fn valid_platform_handle(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
+/// CAD-1678: the reply key a hosted tool call replays under. The relay body
+/// has no header channel, so the token rides in the arguments; deriving it
+/// from the tool and its input means a resubmitted identical call reads the
+/// door's recorded outcome instead of charging a second time, while a
+/// different input is a different call.
+fn platform_replay_key(tool: &str, query: Option<&Value>, body: Option<&Value>) -> String {
+    use sha2::{Digest, Sha256};
+    #[derive(serde::Serialize)]
+    struct Material<'a> {
+        // The field order preserves the existing BTreeMap serialization.
+        body: Option<&'a Value>,
+        query: Option<&'a Value>,
+        tool: &'a str,
+    }
+    struct HashWriter(Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, &Material { body, query, tool })
+        .expect("JSON values serialize to the hash writer");
+    format!("pcli_{:x}", writer.0.finalize())
 }
 
 /// CAD-1568: `send`/`message send` → `message_send` arguments. Exactly
@@ -1327,11 +1563,13 @@ fn unavailable(command: &Commands) -> Error {
          remote verbs are: status, agent list, agent show, issue ls, \
          issue show, issue log, issue new, issue comment, issue set, \
          send/message send (--message required), message read, inbox (peek), \
-         issue project policy, wiki ls, wiki search, wiki cat, \
+         issue project policy, project new, issue project ls, wiki ls, \
+         wiki search, wiki cat, \
          wiki put (text), wiki cp, settings agents <verb>, master status, \
          team list, team invites, team invite, team revoke-invite, \
          team set-role, team remove, delivery requirements, audit approval, \
-         audit scope, audit approve (merge), issue project delivery. \
+         audit scope, audit approve (merge), audit verdicts, audit verdict, \
+         audit reviewers, audit identities, issue project delivery. \
          Use `--org local` or `cadence org switch` to run locally.",
         name(command)
     ))
@@ -1519,9 +1757,6 @@ pub(super) fn run(
             return local_agent::run(&target, &bridge, wake_timeout, local_state);
         }
     }
-    if let Commands::LocalAgent { action } = &command {
-        return local_agent::run(&target, action, wake_timeout, local_state);
-    }
     if let Commands::App { action } = &command {
         return super::hosted_app::run(&target, action);
     }
@@ -1661,6 +1896,20 @@ pub(super) fn run(
     if let Some(code) = merge_gate(&target, &command, wake_timeout)? {
         return Ok(code);
     }
+    // CAD-1999: a hosted project create is the live human workspace owner's
+    // own act — the same CAD-1586 rule the merge approval and Settings
+    // follow. A managed caller (worker, master, grant-bound argv child)
+    // spending the stored login would act as that owner, so it refuses
+    // before a request exists; the board's own owner check would otherwise
+    // be satisfied by the owner's credential, not by the caller.
+    if matches!(
+        &command,
+        Commands::Project {
+            action: ProjectCmd::New { .. }
+        }
+    ) {
+        refuse_managed(&target, "project new")?;
+    }
     let (verb, args) = verb_for(&command)?;
     // CAD-1568: a remote send keeps its caller-chosen `--message` id for
     // reconciliation. An `unknown` outcome — the response was lost after
@@ -1740,10 +1989,62 @@ pub(super) fn run(
     }
 }
 
+/// The explicit project a hosted gate call is scoped to. CAD-2001: the review
+/// evidence is project-scoped, so a missing project is an error — it is never
+/// inferred from `--repo` or the cwd checkout's origin, and no repo's first
+/// project is ever selected.
+fn project_arg(project: &Option<String>) -> Result<&str> {
+    project.as_deref().ok_or_else(|| {
+        Error::rejected(
+            "a hosted `audit` call needs an explicit --project <key>: the review evidence is \
+             project-scoped, and the project is never inferred from the repo or the cwd. \
+             Nothing was sent",
+        )
+    })
+}
+
+/// The explicit issue a hosted approval is about. An approval is unique per
+/// issue in its project, so an approval recorded for another ticket can never
+/// answer this one.
+fn issue_arg(issue: &Option<String>) -> Result<&str> {
+    issue.as_deref().ok_or_else(|| {
+        Error::rejected(
+            "a hosted `audit approval|approve` needs an explicit --issue <ID>: the approval is \
+             that issue's, and one recorded for another ticket never answers it. Nothing was \
+             sent",
+        )
+    })
+}
+
+/// The exact `{project, repo, issue, pr, head}` binding every project-scoped
+/// gate call carries. Each part is validated before a request exists.
+fn binding(
+    project: &Option<String>,
+    repo: &str,
+    issue: &str,
+    pr: u64,
+    head: &str,
+) -> Result<cadence_agent::delivery::hosted_gate::GateBinding> {
+    cadence_agent::delivery::hosted_gate::GateBinding::new(
+        project_arg(project)?,
+        repo,
+        issue,
+        pr,
+        head,
+    )
+}
+
 /// CAD-1946: the merge gate's commands against a hosted org — the reads
 /// `scripts/enqueue-reviewed` makes and the operator's merge approval.
 /// `None` for every other command. Output and exit codes match the local
 /// commands; the checks live in [`cadence_agent::delivery::hosted_gate`].
+///
+/// CAD-2001: every read and the approval are project-scoped. `--project` and
+/// `--issue` are required here (a hosted call without them refuses rather
+/// than guessing), and the tenant serves the project-scoped verbs. An older
+/// tenant refuses those names, which
+/// [`cadence_agent::remote_cli::PROJECT_SCOPED_GATE_VERBS`] reports as the
+/// release-order problem it is — never as "no evidence".
 fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> Result<Option<i32>> {
     use cadence_agent::delivery::hosted_gate;
     let repo_or_origin = |repo: &Option<String>| -> Result<String> {
@@ -1768,7 +2069,14 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             0,
         )),
         Commands::Audit {
-            action: Some(AuditAction::Approval { pr, head, repo }),
+            action:
+                Some(AuditAction::Approval {
+                    pr,
+                    head,
+                    issue,
+                    project,
+                    repo,
+                }),
             ..
         } => {
             let head = super::audit::full_head(head)?;
@@ -1776,9 +2084,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             printed(hosted_gate::approval(
                 target,
                 wake_timeout,
-                &repo,
-                *pr,
-                &head,
+                &binding(project, &repo, issue_arg(issue)?, *pr, &head)?,
             )?)
         }
         Commands::Audit {
@@ -1795,6 +2101,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     file,
                     text,
                     repo,
+                    project,
                 }),
             ..
         } => {
@@ -1854,10 +2161,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             let recorded = hosted_gate::verdict(
                 target,
                 wake_timeout,
-                &repo,
-                issue.trim(),
-                *pr,
-                &head,
+                &binding(project, &repo, issue, *pr, &head)?,
                 kind,
                 outcome,
                 title_outcome,
@@ -1874,6 +2178,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     pr,
                     head,
                     repo,
+                    project,
                     ..
                 }),
             ..
@@ -1883,28 +2188,42 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             printed(hosted_gate::verdicts(
                 target,
                 wake_timeout,
-                &repo,
-                issue.trim(),
-                *pr,
-                &head,
+                &binding(project, &repo, issue, *pr, &head)?,
             )?)
         }
         Commands::Audit {
-            action: Some(AuditAction::Reviewers { repo, action }),
+            action: Some(AuditAction::Reviewers { project, action }),
             ..
         } => match action {
-            None => printed(hosted_gate::reviewers(
-                target,
-                wake_timeout,
-                &repo_or_origin(repo)?,
-            )?),
-            Some(super::audit::ReviewersAction::Set { repo, reviewer }) => {
-                // The attestation is the workspace owner's own act: the stored
-                // login is not an agent's to spend (the CAD-1586 rule).
+            None => {
+                let project = project
+                    .as_deref()
+                    .ok_or_else(|| Error::rejected("audit reviewers needs --project"))?;
+                printed(hosted_gate::reviewers(target, wake_timeout, project)?)
+            }
+            Some(super::audit::ReviewersAction::Set { project, reviewer }) => {
+                // The eligibility map is the workspace owner's own act: the
+                // stored login is not an agent's to spend (the CAD-1586 rule).
                 refuse_managed(target, "audit reviewers set")?;
-                let pairs = super::audit::reviewer_pairs(reviewer)?;
+                let subjects = super::audit::reviewer_subjects(reviewer)?;
                 printed((
-                    hosted_gate::set_reviewers(target, wake_timeout, repo, &pairs)?,
+                    hosted_gate::set_reviewers(target, wake_timeout, project, &subjects)?,
+                    0,
+                ))
+            }
+        },
+        Commands::Audit {
+            action: Some(AuditAction::Identities { action }),
+            ..
+        } => match action {
+            None => printed(hosted_gate::identities(target, wake_timeout)?),
+            Some(super::audit::IdentitiesAction::Set { identity }) => {
+                // Attesting a login decides whose verdicts count, so it is the
+                // owner's own act exactly like the merge approval.
+                refuse_managed(target, "audit identities set")?;
+                let pairs = super::audit::identity_pairs(identity)?;
+                printed((
+                    hosted_gate::set_identities(target, wake_timeout, &pairs)?,
                     0,
                 ))
             }
@@ -1925,22 +2244,26 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     repo,
                     action,
                     id,
+                    project,
                 }),
             ..
         } => {
             refuse_managed(target, "audit approve")?;
-            if issue.is_some() || *delegated || scope.is_some() || id.is_some() || action != "merge"
-            {
+            if *delegated || scope.is_some() || id.is_some() || action != "merge" {
                 return Err(Error::usage(
-                    "remote `audit approve` records a merge approval only: --issue/--action \
-                     scope, --delegated, --scope and --id are not available on a hosted org. \
-                     Nothing was sent.",
+                    "remote `audit approve` records a merge approval only: --delegated, \
+                     --scope and --id are not available on a hosted org. Nothing was sent.",
                 ));
             }
             let pr = pr.ok_or_else(|| Error::rejected("--pr is required"))?;
             let head = super::audit::full_head(head.as_deref().unwrap_or_default())?;
             let repo = repo_or_origin(repo)?;
-            let receipt = hosted_gate::approve(target, wake_timeout, &repo, pr, &head, source)?;
+            let receipt = hosted_gate::approve(
+                target,
+                wake_timeout,
+                &binding(project, &repo, issue_arg(issue)?, pr, &head)?,
+                source,
+            )?;
             printed((receipt, 0))
         }
         Commands::Issue {
@@ -1972,7 +2295,9 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
 }
 
 /// The stored login is the human owner's; a managed caller spending it
-/// would act as the owner (the CAD-1586 rule in [`run`]).
+/// would act as the owner (the CAD-1586 rule in [`run`]). It covers the merge
+/// approval, the project eligibility map and the workspace identity
+/// attestation: each decides whose verdicts count.
 fn refuse_managed(target: &RemoteTarget, command: &str) -> Result<()> {
     if target.identity.is_some()
         || std::env::var_os("CADENCE_ALIAS").is_some()
@@ -2228,6 +2553,205 @@ mod read_contract_tests {
             Ok((verb, args)) => Ok((verb, Value::Object(args))),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    fn platform(action: PlatformAction) -> Commands {
+        Commands::Platform { action }
+    }
+
+    fn call_with(
+        tool: &str,
+        input: Option<&str>,
+        query: Option<&str>,
+        request: Option<&str>,
+    ) -> Commands {
+        platform(PlatformAction::Call {
+            tool: tool.into(),
+            input: input.map(str::to_string),
+            query: query.map(str::to_string),
+            request: request.map(str::to_string),
+            platform: None,
+            account: None,
+            project: None,
+        })
+    }
+
+    #[test]
+    fn hosted_platform_replay_key_is_stable_and_input_bound() {
+        let (_, args) = outcome(&call_with(
+            "generate_image",
+            Some(r#"{"prompt": "synthetic"}"#),
+            None,
+            None,
+        ))
+        .unwrap();
+        let key = args["key"].as_str().expect("a call carries a reply key");
+        assert!(valid_platform_handle(key), "{key}");
+        // The same command replays the same key; another input is another call.
+        assert_eq!(
+            outcome(&call_with(
+                "generate_image",
+                Some(r#"{"prompt": "synthetic"}"#),
+                None,
+                None
+            ))
+            .unwrap()
+            .1["key"],
+            json!(key)
+        );
+        assert_ne!(
+            outcome(&call_with(
+                "generate_image",
+                Some(r#"{"prompt": "a different prompt"}"#),
+                None,
+                None
+            ))
+            .unwrap()
+            .1["key"],
+            json!(key)
+        );
+        let ordered = outcome(&call_with(
+            "example_tool",
+            Some(r#"{"nested":{"a":1,"b":2},"name":"x"}"#),
+            None,
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        let reordered = outcome(&call_with(
+            "example_tool",
+            Some(r#"{"name":"x","nested":{"b":2,"a":1}}"#),
+            None,
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        assert_eq!(
+            ordered, reordered,
+            "object key order must not trigger a new charge"
+        );
+        let query_key = outcome(&call_with(
+            "read_posts",
+            None,
+            Some(r#"{"handle": "first"}"#),
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        let other_query_key = outcome(&call_with(
+            "read_posts",
+            None,
+            Some(r#"{"handle": "second"}"#),
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        assert_ne!(
+            query_key, other_query_key,
+            "distinct queries cannot share a replay"
+        );
+    }
+
+    #[test]
+    fn hosted_platform_refuses_an_invalid_request_handle() {
+        let refused = outcome(&call_with(
+            "generate_image",
+            Some("{}"),
+            None,
+            Some("bad handle"),
+        ))
+        .unwrap_err();
+        assert!(refused.contains("1-128"), "{refused}");
+    }
+
+    #[test]
+    fn hosted_platform_refuses_flags_the_workspace_owns() {
+        for (label, action) in [
+            (
+                "--project",
+                PlatformAction::Tools {
+                    json: true,
+                    project: Some("cadence".into()),
+                },
+            ),
+            (
+                "--platform",
+                PlatformAction::Call {
+                    tool: "generate_image".into(),
+                    input: Some("{}".into()),
+                    query: None,
+                    request: None,
+                    platform: Some("agenticos".into()),
+                    account: None,
+                    project: None,
+                },
+            ),
+            (
+                "--account",
+                PlatformAction::Call {
+                    tool: "generate_image".into(),
+                    input: Some("{}".into()),
+                    query: None,
+                    request: None,
+                    platform: None,
+                    account: Some("work".into()),
+                    project: None,
+                },
+            ),
+        ] {
+            let refused = outcome(&platform(action)).unwrap_err();
+            assert!(refused.contains(label), "{label}: {refused}");
+        }
+    }
+
+    #[test]
+    fn hosted_platform_mixed_query_and_body_preserve_distinct_replay_keys() {
+        use clap::Parser;
+
+        let replay_key = |body: &str, query: &str| {
+            let cli = Cli::try_parse_from([
+                "cadence",
+                "--org",
+                "acme",
+                "platform",
+                "call",
+                "example_tool",
+                "--input",
+                body,
+                "--query",
+                query,
+            ])
+            .unwrap_or_else(|error| {
+                panic!("a hosted tool must accept query fields alongside its POST body: {error}")
+            });
+            let (_, args) = outcome(&cli.command).expect("mixed-input call needs a replay key");
+            args["key"]
+                .as_str()
+                .expect("a hosted call needs a replay handle")
+                .to_owned()
+        };
+
+        let original = replay_key(r#"{"prompt":"alpha"}"#, r#"{"resource":"first"}"#);
+        let repeated = replay_key(r#"{"prompt":"alpha"}"#, r#"{"resource":"first"}"#);
+        let changed_query = replay_key(r#"{"prompt":"alpha"}"#, r#"{"resource":"second"}"#);
+        let changed_body = replay_key(r#"{"prompt":"beta"}"#, r#"{"resource":"first"}"#);
+
+        assert_eq!(
+            original, repeated,
+            "repeating the same mixed-input invocation must reconcile the original call"
+        );
+        assert_ne!(
+            original, changed_query,
+            "changing only the query must not replay a call for a different resource"
+        );
+        assert_ne!(
+            original, changed_body,
+            "changing only the body must not replay a call with different content"
+        );
     }
 
     struct AgentLs {
@@ -2505,6 +3029,7 @@ mod read_contract_tests {
     #[test]
     fn issue_ls_sends_only_the_filter_the_route_owns() {
         let (verb, args) = outcome(&issue_ls(|l| {
+            l.project = vec!["ops".into()];
             l.status = vec!["doing".into()];
             l.tags = vec!["t".into()];
             l.owner = vec!["me".into()];
@@ -2516,6 +3041,7 @@ mod read_contract_tests {
         assert_eq!(
             args,
             json!({
+                "project": "ops",
                 "status": ["doing"], "tag": ["t"], "owner": ["me"],
                 "plan": ["approved"], "open": true,
             })
@@ -2523,10 +3049,17 @@ mod read_contract_tests {
     }
 
     #[test]
+    fn issue_ls_refuses_more_than_one_project() {
+        // CAD-1999: the hosted route filters a single key; a repeated
+        // `--project` must refuse, never silently keep one of them.
+        let err = outcome(&issue_ls(|l| l.project = vec!["ops".into(), "cad".into()])).unwrap_err();
+        assert!(err.contains("one --project"), "{err}");
+    }
+
+    #[test]
     fn issue_ls_rejects_every_flag_the_route_cannot_apply() {
         type Cases = Vec<(&'static str, fn(&mut IssueLs))>;
         let cases: Cases = vec![
-            ("--project", |l| l.project = vec!["cadence".into()]),
             ("--stage", |l| l.stage = vec!["build".into()]),
             ("--health", |l| l.health = vec!["on_track".into()]),
             ("--since", |l| l.since = Some("7d".into())),
@@ -2729,8 +3262,82 @@ mod read_contract_tests {
     }
 
     #[test]
-    fn remote_project_add_and_list_stay_unmapped() {
+    fn remote_project_new_and_ls_map_but_add_and_set_remote_stay_unmapped() {
         use cadence_agent::issue::cli::ProjectAction;
+        let (verb, args) = outcome(&Commands::Project {
+            action: ProjectCmd::New {
+                key: "ops".into(),
+                name: Some("Operations".into()),
+                repo: None,
+                prefix: Some("OPS".into()),
+                goal: None,
+                agents: vec![],
+                issue: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "project_new");
+        assert_eq!(
+            args,
+            json!({"key": "ops", "name": "Operations", "prefix": "OPS"})
+        );
+
+        // The name is the hosted registry's own field: a create without it
+        // refuses, and the local repo/PROJECT.md flags never cross.
+        let err = outcome(&Commands::Project {
+            action: ProjectCmd::New {
+                key: "ops".into(),
+                name: None,
+                repo: None,
+                prefix: None,
+                goal: None,
+                agents: vec![],
+                issue: None,
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--name"), "{err}");
+        let err = outcome(&Commands::Project {
+            action: ProjectCmd::New {
+                key: "ops".into(),
+                name: Some("Operations".into()),
+                repo: Some(std::path::PathBuf::from("/tmp/ops")),
+                prefix: None,
+                goal: None,
+                agents: vec![],
+                issue: None,
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--repo"), "{err}");
+
+        let (verb, args) = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Ls {
+                    sort: None,
+                    limit: None,
+                    fields: vec![],
+                    json: false,
+                },
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "project_ls");
+        assert_eq!(args, json!({}));
+
+        let err = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Ls {
+                    sort: Some("key".into()),
+                    limit: None,
+                    fields: vec![],
+                    json: false,
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--sort"), "{err}");
+
         let add = outcome(&Commands::Issue {
             action: IssueAction::Project {
                 action: ProjectAction::Add {
@@ -2745,18 +3352,6 @@ mod read_contract_tests {
         })
         .unwrap_err();
         assert!(add.contains("not available on a remote org"), "{add}");
-        let ls = outcome(&Commands::Issue {
-            action: IssueAction::Project {
-                action: ProjectAction::Ls {
-                    sort: None,
-                    limit: None,
-                    fields: vec![],
-                    json: false,
-                },
-            },
-        })
-        .unwrap_err();
-        assert!(ls.contains("not available on a remote org"), "{ls}");
         let set_remote = outcome(&Commands::Issue {
             action: IssueAction::Project {
                 action: ProjectAction::SetRemote {

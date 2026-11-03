@@ -513,6 +513,57 @@ impl Store {
                 .is_some_and(|posts| posts.iter().any(|p| p["id"] == post_id)))
     }
 
+    /// The newest retained SOURCE reads of an installation among `ids`
+    /// (SOC-54), newest first and bounded. The caller passes the candidate set
+    /// — this context's own attachment window — so the work is bounded by that
+    /// window, not by the installation's whole history, and another context's
+    /// reads can neither starve nor slow this one. Kind is filtered before the
+    /// bound, so uploads or captions never spend it.
+    ///
+    /// The id list, not `install_id`, drives the plan: with an install
+    /// predicate SQLite prefers `app_tool_results_install` and scans the
+    /// installation's receipts in creation order, so a sparse candidate set
+    /// would cost history. Probing the primary key per candidate and checking
+    /// the installation here keeps the query at 500 point lookups — asserted by
+    /// the plan test, at production cardinality.
+    pub(crate) fn app_tool_source_results_for(
+        &self,
+        install: &str,
+        ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT id FROM app_tool_results
+              WHERE id IN ({placeholders})
+                AND json_extract(result,'$.kind')='social.source.posts'
+              ORDER BY created DESC, id DESC LIMIT ?"
+        );
+        let mut bindings: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+        for id in ids {
+            bindings.push(id);
+        }
+        let limit = limit as i64;
+        bindings.push(&limit);
+        let conn = self.conn();
+        let kept = conn
+            .prepare(&sql)?
+            .query_map(bindings.as_slice(), |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(conn);
+        let mut out = Vec::with_capacity(kept.len());
+        for id in kept {
+            let receipt = self.app_tool_result(&id)?;
+            if receipt["install_id"].as_str() == Some(install) {
+                out.push(receipt);
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn app_tool_results(&self, install: &str) -> Result<Value> {
         let conn = self.conn();
         let ids = conn

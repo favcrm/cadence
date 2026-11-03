@@ -26,19 +26,14 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
     ),
     (
         "Work",
-        &[
-            ("issue", "The issue board: the one public unit of work"),
-            ("plan", "Propose, decide and track an epic with its tickets"),
-        ],
+        &[(
+            "issue",
+            "The issue board: the one public unit of work, including epics",
+        )],
     ),
     (
         "Agents",
-        &[
-            ("send", "Enqueue a durable message to an agent"),
-            ("dispatch", "Start an issue and send its worker the kickoff"),
-            ("join", "Join a new worker agent to a group"),
-            ("agent", "List and manage registered agents"),
-        ],
+        &[("agent", "List and manage registered agents, including join")],
     ),
     (
         "Build",
@@ -138,6 +133,13 @@ const ADVANCED: &[&str] = &[
     "topic",
     "web",
     "workflow",
+    // Off the default help. Still listed by `help operator` / `help all`
+    // and still found by `cadence commands`. Canonical paths: `message send`,
+    // `agent join`, `issue epic`. `dispatch` stays this root verb.
+    "dispatch",
+    "join",
+    "plan",
+    "send",
 ];
 
 /// Verbs clap hides on purpose: plumbing no help view lists.
@@ -146,7 +148,6 @@ const ADVANCED: &[&str] = &[
 #[cfg(test)]
 const INTERNAL: &[&str] = &[
     "confine",
-    "local-agent",
     "mcp-agent",
     "mcp-permission",
     "rollout",
@@ -459,7 +460,10 @@ fn master_leaf_limits(path: &str) -> Option<&'static str> {
         "project new" => {
             "--goal and each --agent require --repo and take one plain token (letters, digits and . _ / = : -; no spaces, quotes or commas); repeat --agent for each agent"
         }
-        "plan propose" | "report file" | "master escalate" => {
+        "plan propose"
+        | "issue epic propose"
+        | "report file"
+        | "master escalate" => {
             "--file names a file under master/tmp (stage it with the write tool first)"
         }
         _ => return None,
@@ -508,7 +512,10 @@ mod tests {
             }
         }
         // Operator and advanced verbs stay off the default list.
-        for hidden in ["daemon", "rollout", "upgrade", "backup", "delivery", "job"] {
+        for hidden in [
+            "daemon", "rollout", "upgrade", "backup", "delivery", "job", "plan", "send",
+            "dispatch", "join",
+        ] {
             assert!(!help.contains(&format!("  {hidden} ")), "{hidden} listed");
         }
     }
@@ -580,15 +587,16 @@ mod tests {
         walk(&Cli::command(), "cadence", &mut found);
         assert!(found >= 20, "only {found} listers found");
         for argv in [
-            ["cadence", "issue", "list"],
-            ["cadence", "issue", "ls"],
-            ["cadence", "agent", "ls"],
-            ["cadence", "agent", "list"],
-            ["cadence", "memory", "list"],
-            ["cadence", "memory", "ls"],
-            ["cadence", "wiki", "list"],
-            ["cadence", "plan", "list"],
-            ["cadence", "job", "ls"],
+            &["cadence", "issue", "list"][..],
+            &["cadence", "issue", "ls"][..],
+            &["cadence", "agent", "ls"][..],
+            &["cadence", "agent", "list"][..],
+            &["cadence", "memory", "list"][..],
+            &["cadence", "memory", "ls"][..],
+            &["cadence", "wiki", "list"][..],
+            &["cadence", "plan", "list"][..],
+            &["cadence", "issue", "epic", "list"][..],
+            &["cadence", "job", "ls"][..],
         ] {
             assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
         }
@@ -640,7 +648,7 @@ mod tests {
         let hidden = originally_hidden();
         // `skill sync` is the hidden implementation `cadence update` calls.
         // `cadence skill install` stays the visible manual repair.
-        assert_eq!(hidden.len(), 13, "{hidden:?}");
+        assert_eq!(hidden.len(), 12, "{hidden:?}");
         for view in [
             render_root(false),
             render_root(true),

@@ -443,6 +443,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     head,
                     notes_dir,
                     repo,
+                    project,
                 }),
             ..
         } => Some((
@@ -450,16 +451,22 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             *pr,
             head.clone(),
             repo.clone(),
+            project.clone(),
             notes_dir.clone(),
         )),
         _ => None,
     };
-    if let Some((issue, pr, head, repo, notes_dir)) = verdict_args {
+    if let Some((issue, pr, head, repo, project, notes_dir)) = verdict_args {
         let tracker = tracker_pin()?;
         return match org::route(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
-            org::Routed::Local => {
-                audit::verdicts(&issue, pr, &head, repo.as_deref(), notes_dir.as_deref())
-            }
+            org::Routed::Local => audit::verdicts(
+                &issue,
+                pr,
+                &head,
+                repo.as_deref(),
+                project.as_deref(),
+                notes_dir.as_deref(),
+            ),
             org::Routed::Remote(target) => {
                 remote::run(target, cli.command, cli.wake_timeout, cli.state_dir)
             }
@@ -473,9 +480,6 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         &cli.command,
         Commands::Agent {
             action: AgentAction::Directory { .. } | AgentAction::Notify { .. },
-        } | Commands::LocalAgent {
-            action: local_agent::LocalAgentAction::Directory { .. }
-                | local_agent::LocalAgentAction::Notify { .. },
         }
     ) {
         let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), None)? {
@@ -730,7 +734,6 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         | Commands::Topic { .. }
         | Commands::Monitor { .. }
         | Commands::Status { .. }
-        | Commands::LocalAgent { .. }
         | Commands::Team { .. }
         | Commands::McpPermission { .. }
         | Commands::McpAgent

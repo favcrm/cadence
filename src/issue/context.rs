@@ -2,7 +2,11 @@
 //!
 //! The context reader is deliberately narrower than a file server: it reads
 //! one fixed, tracked manifest and the manifest's tracked text blobs from the
-//! selected project's declared repository at one immutable HEAD revision.
+//! selected project's declared repository at one immutable HEAD revision. The
+//! manifest is the project's own `docs/cadence/projects/<key>/project-context.yaml`
+//! when that is tracked, else the shared `docs/cadence/project-context.yaml`
+//! (which must name the same project) — one checkout can serve several
+//! projects (CAD-2001).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -17,6 +21,9 @@ use crate::memory;
 use crate::proc::{self, BoundedError};
 
 pub const DEFAULT_MANIFEST_PATH: &str = "docs/cadence/project-context.yaml";
+/// The per-project manifest, preferred when tracked: one checkout can
+/// serve several projects (CAD-2001), and each keeps its own opt-in.
+const PROJECT_MANIFEST_DIR: &str = "docs/cadence/projects";
 pub const MAX_MANIFEST_BYTES: usize = 32 * 1024;
 pub const MAX_MANIFEST_ENTRIES: usize = 32;
 pub const MAX_PATH_BYTES: usize = 256;
@@ -269,13 +276,36 @@ fn resolve_root(selected: &project::Project) -> Result<(PathBuf, &project::Repo)
             "project declares no local repository",
         ));
     }
-    if local.len() > 1 {
+    // Two rows naming one checkout are one repository (CAD-2001); only
+    // genuinely different checkouts make the source ambiguous, and that
+    // is named rather than resolved to the first row.
+    let mut distinct: Vec<&project::Repo> = Vec::new();
+    for repo in &local {
+        let declared = project::expand_home(repo.path.as_deref().unwrap_or_default());
+        let identity = declared.canonicalize().unwrap_or(declared);
+        let seen = distinct.iter().any(|row| {
+            let path = project::expand_home(row.path.as_deref().unwrap_or_default());
+            path.canonicalize().unwrap_or(path) == identity
+        });
+        if !seen {
+            distinct.push(repo);
+        }
+    }
+    if distinct.len() > 1 {
         return Err(SourceError::new(
             "ambiguous_repository",
-            "project declares multiple local repositories",
+            format!(
+                "project declares {} local repositories ({}); context source is ambiguous",
+                distinct.len(),
+                distinct
+                    .iter()
+                    .filter_map(|row| row.path.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         ));
     }
-    let repo = local[0];
+    let repo = distinct[0];
     let declared = project::expand_home(repo.path.as_deref().unwrap_or_default());
     if !declared.is_absolute() {
         return Err(SourceError::new(
@@ -439,37 +469,26 @@ fn unconfigured(project: &str, revision: Option<String>) -> PinnedContext {
 
 /// Pin the selected project's tracked context manifest and documents at its
 /// current HEAD, but only when that committed manifest sets
-/// `agent_delivery: true`. An unprovable opt-in (no repo, no HEAD, no
-/// manifest, unreadable or unparseable YAML) returns `unconfigured`, so
-/// existing dispatch behavior is untouched. Reuses the bounded readers and
-/// allowlist the board's context query uses; never accepts a caller-supplied
-/// path or revision.
+/// `agent_delivery: true`. The manifest is the project's own
+/// `docs/cadence/projects/<key>/project-context.yaml` when that is tracked,
+/// else the shared `docs/cadence/project-context.yaml` — whose `project:`
+/// must still name this project (`validate_manifest`). An unprovable opt-in
+/// (no repo, no HEAD, no manifest, unreadable or unparseable YAML) returns
+/// `unconfigured`, so existing dispatch behavior is untouched. Reuses the
+/// bounded readers and allowlist the board's context query uses; never
+/// accepts a caller-supplied path or revision.
 pub fn pin(selected: &project::Project, role: Option<&str>) -> PinnedContext {
-    let local: Vec<&project::Repo> = selected
-        .repos
-        .iter()
-        .filter(|repo| {
-            repo.path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty())
-        })
-        .collect();
-    if local.len() != 1 {
-        // No declared local repository, or several: no committed opt-in can
-        // be proven, so every existing dispatch path stays unchanged.
-        return unconfigured(&selected.key, None);
-    }
-    let declared = project::expand_home(local[0].path.as_deref().unwrap_or_default());
-    if !declared.is_absolute() {
-        return unconfigured(&selected.key, None);
-    }
+    // No declared local repository, several distinct ones, or one that is
+    // not a readable absolute checkout: no committed opt-in can be
+    // proven, so every existing dispatch path stays unchanged. (Two rows
+    // naming one checkout are one repository — CAD-2001.)
     let Ok((root, _)) = resolve_root(selected) else {
         return unconfigured(&selected.key, None);
     };
     let Ok(head) = head_of(&root) else {
         return unconfigured(&selected.key, None);
     };
-    let Ok(Some(text)) = read_blob(&root, &head, DEFAULT_MANIFEST_PATH) else {
+    let Ok(Some(text)) = select_manifest(&root, &head, &selected.key).1 else {
         // Absent, unreadable or oversized: the opt-in cannot be proven, so
         // delivery stays off and dispatch behaves exactly as before. The
         // board's context view reports an unusable manifest separately.
@@ -827,6 +846,46 @@ fn read_blob(root: &Path, head: &str, path: &str) -> Result<Option<String>, Blob
     Ok(None)
 }
 
+/// The per-project manifest path for `key`, or `None` when the key is not
+/// one safe path segment. A `project.yaml` is hand-editable, so its key is
+/// never trusted as a path component.
+fn project_manifest_path(key: &str) -> Option<String> {
+    cadence_core::issue::valid_key(key)
+        .then(|| format!("{PROJECT_MANIFEST_DIR}/{key}/project-context.yaml"))
+}
+
+/// The path this project prefers: its own per-project manifest, else the
+/// shared default.
+fn preferred_manifest_path(key: &str) -> String {
+    project_manifest_path(key).unwrap_or_else(|| DEFAULT_MANIFEST_PATH.to_string())
+}
+
+/// The manifest a project reads at `head` on a possibly shared checkout:
+/// `docs/cadence/projects/<key>/project-context.yaml` when it is tracked
+/// at HEAD, else the shared default. Returns the path to report and its
+/// text (`None` when neither is tracked).
+///
+/// A per-project path that exists but cannot be read is an error, never a
+/// silent fall back: the default may describe another project, and the
+/// `manifest.project == selected.key` guard is what keeps that honest.
+fn select_manifest(
+    root: &Path,
+    head: &str,
+    key: &str,
+) -> (String, Result<Option<String>, BlobError>) {
+    if let Some(path) = project_manifest_path(key) {
+        match read_blob(root, head, &path) {
+            Ok(Some(text)) => return (path, Ok(Some(text))),
+            Ok(None) => {}
+            Err(error) => return (path, Err(error)),
+        }
+    }
+    (
+        DEFAULT_MANIFEST_PATH.to_string(),
+        read_blob(root, head, DEFAULT_MANIFEST_PATH),
+    )
+}
+
 fn shorten(text: &str, max: usize) -> (String, bool) {
     if text.len() <= max {
         return (text.to_string(), false);
@@ -1182,11 +1241,15 @@ fn fail_closed(payload: Value) -> Value {
         .unwrap_or(Value::from(0));
     let mut limits = limits_json(true);
     limits["response_excerpt_reductions"] = reductions;
+    let manifest_path = payload
+        .pointer("/manifest/path")
+        .cloned()
+        .unwrap_or_else(|| Value::from(DEFAULT_MANIFEST_PATH));
     json!({
         "project": payload.get("project").cloned().unwrap_or(Value::Null),
         "state": "too_large",
         "manifest": {
-            "path": DEFAULT_MANIFEST_PATH,
+            "path": manifest_path,
             "state": "too_large",
             "revision": payload.pointer("/manifest/revision").cloned().unwrap_or(Value::Null),
             "entry_count": payload.pointer("/manifest/entry_count").cloned().unwrap_or(Value::Null),
@@ -1226,7 +1289,7 @@ pub fn bundle(
             return json!({
                 "project": selected.key,
                 "state": error.state,
-                "manifest": {"path": DEFAULT_MANIFEST_PATH, "state": error.state, "errors": [reason.clone()]},
+                "manifest": {"path": preferred_manifest_path(&selected.key), "state": error.state, "errors": [reason.clone()]},
                 "snapshot": RepoSnapshot {
                     head_revision: None,
                     expected_revision: expected_revision.map(str::to_string),
@@ -1242,14 +1305,15 @@ pub fn bundle(
             });
         }
     };
-    let manifest_result = read_blob(&source.root, &source.head, DEFAULT_MANIFEST_PATH);
+    let (manifest_path, manifest_result) =
+        select_manifest(&source.root, &source.head, &selected.key);
     let manifest_text = match manifest_result {
         Ok(Some(text)) => text,
         Ok(None) => {
             return cap_response(json!({
                 "project": selected.key,
                 "state": "missing",
-                "manifest": {"path": DEFAULT_MANIFEST_PATH, "state": "missing", "revision": source.head, "errors": ["tracked manifest is absent at HEAD"]},
+                "manifest": {"path": manifest_path, "state": "missing", "revision": source.head, "errors": ["tracked manifest is absent at HEAD"]},
                 "snapshot": source.snapshot,
                 "documents": [],
                 "memories": empty_memories(),
@@ -1262,7 +1326,7 @@ pub fn bundle(
             return cap_response(json!({
                 "project": selected.key,
                 "state": state,
-                "manifest": {"path": DEFAULT_MANIFEST_PATH, "state": state, "revision": source.head, "errors": [reason]},
+                "manifest": {"path": manifest_path, "state": state, "revision": source.head, "errors": [reason]},
                 "snapshot": source.snapshot,
                 "documents": [],
                 "memories": empty_memories(),
@@ -1274,7 +1338,7 @@ pub fn bundle(
         return cap_response(json!({
             "project": selected.key,
             "state": "too_large",
-            "manifest": {"path": DEFAULT_MANIFEST_PATH, "state": "too_large", "revision": source.head, "errors": [format!("manifest exceeds {MAX_MANIFEST_BYTES} bytes")]},
+            "manifest": {"path": manifest_path, "state": "too_large", "revision": source.head, "errors": [format!("manifest exceeds {MAX_MANIFEST_BYTES} bytes")]},
             "snapshot": source.snapshot,
             "documents": [],
             "memories": empty_memories(),
@@ -1287,7 +1351,7 @@ pub fn bundle(
             return cap_response(json!({
                 "project": selected.key,
                 "state": "conflict",
-                "manifest": {"path": DEFAULT_MANIFEST_PATH, "state": "conflict", "revision": source.head, "errors": [shorten(&format!("manifest YAML is invalid: {error}"), 512).0]},
+                "manifest": {"path": manifest_path, "state": "conflict", "revision": source.head, "errors": [shorten(&format!("manifest YAML is invalid: {error}"), 512).0]},
                 "snapshot": source.snapshot,
                 "documents": [],
                 "memories": empty_memories(),
@@ -1384,7 +1448,7 @@ pub fn bundle(
         "project": selected.key,
         "state": state,
         "manifest": {
-            "path": DEFAULT_MANIFEST_PATH,
+            "path": manifest_path,
             "state": if valid_manifest {"ready"} else {"conflict"},
             "revision": source.head,
             "entry_count": manifest_entry_count,
@@ -1712,5 +1776,108 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pinned, "old head\n");
+    }
+
+    /// CAD-2001: one checkout, two projects. Each reads its own tracked
+    /// manifest; the shared default serves only the project it names, and
+    /// a project the default does not name is refused, never given
+    /// another project's documents.
+    #[test]
+    fn a_shared_checkout_selects_each_projects_own_manifest() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        assert!(git(&["config", "user.email", "context@test"])
+            .status
+            .success());
+        assert!(git(&["config", "user.name", "context-test"])
+            .status
+            .success());
+        let manifest = |project: &str, document: &str| {
+            format!(
+                "schema: 1\nproject: {project}\nagent_delivery: true\ndocuments:\n  \
+                 - id: scope\n    kind: scope\n    path: docs/{document}.md\n    \
+                 title: Scope\n    required: true\n"
+            )
+        };
+        for (path, body) in [
+            (
+                DEFAULT_MANIFEST_PATH.to_string(),
+                manifest("alpha", "alpha"),
+            ),
+            (
+                "docs/cadence/projects/beta/project-context.yaml".to_string(),
+                manifest("beta", "beta"),
+            ),
+            ("docs/alpha.md".to_string(), "ALPHA\n".to_string()),
+            ("docs/beta.md".to_string(), "BETA\n".to_string()),
+        ] {
+            let full = repo.path().join(&path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, body).unwrap();
+        }
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-qm", "contexts"]).status.success());
+        let head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let fixture = |key: &str| project::Project {
+            key: key.to_string(),
+            prefix: key[..3].to_uppercase(),
+            repos: vec![project::Repo {
+                path: Some(repo.path().to_string_lossy().to_string()),
+                remote: None,
+                base: None,
+            }],
+            components: Vec::new(),
+            tags: Vec::new(),
+            default_owner: None,
+            build: None,
+            memory: None,
+            intake: None,
+            id: None,
+            policy: None,
+        };
+        let read = |key: &str| {
+            let (path, text) = select_manifest(repo.path(), &head, key);
+            let text = text.unwrap().expect("a manifest is tracked");
+            let manifest: ContextManifest = serde_yaml::from_str(&text).unwrap();
+            (path, manifest)
+        };
+        // beta's own manifest wins over the shared default.
+        let (path, manifest) = read("beta");
+        assert_eq!(path, "docs/cadence/projects/beta/project-context.yaml");
+        assert_eq!(manifest.project, "beta");
+        assert!(validate_manifest(&manifest, "beta").is_empty());
+        // alpha has no per-project manifest: the default, which names it.
+        let (path, manifest) = read("alpha");
+        assert_eq!(path, DEFAULT_MANIFEST_PATH);
+        assert!(validate_manifest(&manifest, "alpha").is_empty());
+        // gamma is named by neither: the default is read but refused.
+        let (path, manifest) = read("gamma");
+        assert_eq!(path, DEFAULT_MANIFEST_PATH);
+        assert!(!validate_manifest(&manifest, "gamma").is_empty());
+        // pin follows the same selection, and refuses the mismatch.
+        let pinned = pin(&fixture("beta"), None);
+        assert_eq!(pinned.state, "ready");
+        assert_eq!(pinned.documents[0].path, "docs/beta.md");
+        let pinned = pin(&fixture("alpha"), None);
+        assert_eq!(pinned.state, "ready");
+        assert_eq!(pinned.documents[0].path, "docs/alpha.md");
+        let pinned = pin(&fixture("gamma"), None);
+        assert_eq!(pinned.state, "conflict");
+        assert!(pinned.documents.is_empty());
+        // A key is never trusted as a path component.
+        assert!(project_manifest_path("../../etc").is_none());
+        assert!(project_manifest_path("agents").is_some());
+        assert_eq!(preferred_manifest_path("../x"), DEFAULT_MANIFEST_PATH);
     }
 }

@@ -20,7 +20,9 @@ import {
   settlePending,
   threadItems,
   threadRuns,
+  failWithdrawn,
   inFlightTurnKey,
+  unnamedTurnAnswered,
   itemMessage,
   sendBefore,
   rowPaintKey,
@@ -434,7 +436,7 @@ async function main() {
     equal(masterStatus(agents([{ alias: "master", state: "stopped" }]), false).kind, "stopped", "stopped");
     equal(masterStatus(agents([{ alias: "master", state: "idle" }]), false), { kind: "running", state: "idle" }, "running");
     equal(
-      masterStatus({ daemon: "unreachable", agents: [], totals: null, by_issue: {}, refresh_error: false, snapshot_age_secs: 0, stale: false } as AgentsPayload, false).kind,
+      masterStatus({ daemon: "unreachable", agents: [], totals: null, by_issue: {}, profiles: [], refresh_error: false, snapshot_age_secs: 0, stale: false } as AgentsPayload, false).kind,
       "offline",
       "daemon down",
     );
@@ -578,6 +580,12 @@ main().catch((e) => {
   equal(inFlightTurnKey(open, "ui-1"), "e2", "an untagged tool run after the send is that turn");
   equal(inFlightTurnKey(open, "server-id"), "e2", "a working id that matches no row still adopts the untagged run");
   equal(inFlightTurnKey(open, null), null, "a submit with no id does not claim an older run");
+  equal(inFlightTurnKey(open, null, true), "e2", "a working turn with no id owns the open run after the newest send");
+  equal(
+    inFlightTurnKey([...open, { type: "pending", key: "pnext", pending: { message: "ui-2", text: "next", state: "sent", at: 1 } }], null, true),
+    "e2",
+    "a send not yet stored is not what is running; the open run before it still is",
+  );
   const answered = threadItems(
     mergePage(null, {
       thread: { id: "t-flight" },
@@ -589,6 +597,25 @@ main().catch((e) => {
     }),
   );
   equal(inFlightTurnKey(answered, "ui-1"), null, "a landed answer is not still in flight");
+  equal(inFlightTurnKey(answered, null, true), null, "a landed answer is not in flight for an unnamed turn either");
+  {
+    const held = (message: string) => ({ message, text: `text ${message}`, state: "sent" as const, at: 1 });
+    const before = { ...mergePage(null, { thread: { id: "t" }, entries: [] }), pending: [held("q-1"), held("q-2")] };
+    const after = failWithdrawn(before, ["q-1", "not-here"], "withdrawn", () => "fresh");
+    equal(after.pending[0].state, "failed", "a withdrawn row fails");
+    equal(after.pending[0].message, "fresh", "a withdrawn row gets a fresh id");
+    equal(after.pending[0].text, "text q-1", "a withdrawn row keeps its text");
+    equal(after.pending[1], before.pending[1], "a row that was not withdrawn is untouched");
+    equal(failWithdrawn(before, [], "x", () => "fresh"), before, "nothing withdrawn changes nothing");
+  }
+  equal(unnamedTurnAnswered(answered), true, "a thread ending on an answer has no send waiting");
+  equal(unnamedTurnAnswered(open), false, "an open run is still waiting");
+  equal(
+    unnamedTurnAnswered([...answered, { type: "pending", key: "pnext", pending: { message: "ui-2", text: "next", state: "sent", at: 1 } }]),
+    false,
+    "a later send keeps its placeholder",
+  );
+  equal(inFlightTurnKey([], null, true), null, "an unnamed turn with no rows has nothing to own");
   const tagged = threadItems(
     mergePage(null, {
       thread: { id: "t-flight" },

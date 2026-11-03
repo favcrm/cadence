@@ -28,8 +28,8 @@ path does not require `provider.draft`. The optional legacy external-adapter
 and publisher setup commands below request separate financial consent:
 
 ```sh
-cadence --org <slug> local-agent tool --lane provider.draft
-cadence --org <slug> local-agent tool --lane publish.send
+cadence --org <slug> agent tool --lane provider.draft
+cadence --org <slug> agent tool --lane publish.send
 ```
 
 These use the existing device consent endpoints, not a new token issuer.
@@ -196,7 +196,7 @@ verb. `verb` is one of a fixed allowlist — `status`, `agent_list`,
 `agent_show`, `issue_ls`, `issue_show`, `issue_history`, `message_read`,
 `message_inbox`, `team_list`, `team_invites`, `issue_new`, `issue_comment`,
 `issue_set`, `team_invite`, `team_revoke_invite`, `team_set_role`,
-`team_remove`, `project_policy`, `message_send` — and
+`team_remove`, `project_policy`, `project_ls`, `project_new`, `message_send` — and
 `arguments` is a strict per-verb payload. Any
 other command is refused locally and never sent.
 
@@ -379,6 +379,47 @@ Each collaborating writer enrolls independently: a separate
 `XDG_CONFIG_HOME` (or separate account/machine) per identity, its own
 `cadence login` grant — credentials are never copied between homes.
 
+### Remote projects (CAD-1999)
+
+A hosted org keeps its own project registry, so a project can exist before
+any ticket does. `cadence project new` registers one; `cadence issue project
+ls` reads the registry, and `cadence issue ls --project <key>` reads its
+tickets (an empty registered project is an empty list).
+
+```sh
+cadence --org acme project new ops --name "Operations" [--prefix OPS]
+cadence --org acme issue project ls
+cadence --org acme issue ls --project ops
+```
+
+`project_new` arguments are exactly `{key, name, prefix?}`. `key` is 1-32
+lowercase letters, digits or hyphens; `name` is the required human label
+(1-200 bytes) and stays distinct from the key; `prefix` is the issue-id
+prefix (1-16 letters/digits starting with a letter, upper-cased, derived
+from the key when absent — letters/digits, up to 16, starting with a
+letter, else `ISSUE`; a local project keeps its own 1-8 character default
+of the key's first three letters/digits). The answer is
+`{project:{key,name,prefix,issues}, duplicate}`. The same key, name and
+prefix is the same project (`duplicate: true`); a key already registered —
+or already present only as its tickets' project — with a different name or
+prefix is `409 project_exists`; a prefix another project already uses is
+`409 prefix_conflict`. `project_ls` also reports the ticket-only projects,
+whose `name` is their key.
+
+Only a live human workspace owner is admitted to `project_new` (`cli.write`);
+`project_ls` is `cli.read`. A managed caller never spends the stored owner
+login for it: `--repo`, `--goal`, `--agent` and `--issue` refuse (a hosted
+org has no checkout or PROJECT.md), `--name` is required, `issue project ls`
+refuses `--sort`/`--limit`/`--fields`, and `issue ls` filters one `--project`
+per call. Nothing is renamed or deleted remotely. A `project_new` answer
+that is lost, unparsable (empty, 204, non-JSON), missing the requested
+project (a `null`, `{ok:true}` or foreign body), carrying a missing, invalid
+or different issue-id prefix, or a 5xx naming no pre-forward state is
+`outcome_unknown`: reconcile with `issue project ls` before repeating,
+since the same key, name and prefix is the same project.
+A board that predates CAD-1999 refuses the two registry verbs as an unknown
+verb — the command ends there, with no local fallback.
+
 ### Remote message send (CAD-1568)
 
 `cadence send` (and its `message send` form) enqueue a durable coordination
@@ -392,7 +433,7 @@ The selected row's UID is checked inside the enqueue transaction; removing
 or replacing that recipient before enqueue refuses the send rather than
 allowing a later generic lookup to redirect it.
 Personal assistants require separate assistant authority and local workers
-use the `local-agent`/local-assignment plane; neither is a remote-send recipient.
+use the local-assignment plane (`agent connect` and the other hosted `agent` verbs); neither is a remote-send recipient.
 Generic member-to-member `send` and the local-worker follow-up journey remain
 refused on this transport. Explicit directory-addressed FYIs use the separate
 [`agent notify` flow](guides/hosted-workspace.md#a-teammates-own-agent-collaboration-flow);

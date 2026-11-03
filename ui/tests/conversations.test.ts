@@ -75,6 +75,8 @@ let holdReconnect = false;
 let disconnectTranscript: (() => void) | null = null;
 let heldOperations: Array<(response: Response) => void> | null = null;
 const commandPosts: unknown[] = [];
+const commandSearches: string[] = [];
+let commandAnswer: unknown = null;
 // Set inside a check to hold one send in flight (pending state "sending").
 let deferSend: ((resolve: (r: Response) => void) => void) | null = null;
 const messagePosts: any[] = [];
@@ -146,7 +148,9 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     : json(masterSnapshot(url.searchParams.get("conversation") ?? "home-thread"));
   if (url.pathname === "/api/master/command") {
     commandPosts.push(JSON.parse(String(init!.body)));
+    commandSearches.push(url.search);
     if (hostedIdentity) { turn = null; queue = []; }
+    if (commandAnswer !== null) return json(commandAnswer);
     return json({ command: "x", ok: true, result: {} });
   }
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
@@ -661,9 +665,19 @@ turn = { state: "working", message: "m-gen", conversation: "c-gen", summary: "cu
 await React.act(async () => { await resources.masterConversation("c-gen").refresh(); });
 await settle();
 assert(bar() === null && stopButton(), "a hosted app shows its own working turn while Home is idle");
+conversationThread("c-gen").write((state) => ({ ...state!, pending: [{ message: "m-queued", text: "queued behind it", state: "sent", at: 1 }] }));
+commandAnswer = { ok: true, result: "Stopped.", withdrawn: ["m-queued"] };
 await React.act(async () => { stopButton()!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
+commandAnswer = null;
 equal(commandPosts.at(-1), { command: "stop", message: "m-gen" }, "hosted Stop controls the selected app message");
+{
+  const row = conversationThread("c-gen").get().data?.pending.find((p) => p.text === "queued behind it");
+  equal(row?.state, "failed", "the app pane hands back a message Stop withdrew");
+  assert(row?.message !== "m-queued", "the handed-back row has a fresh id");
+  conversationThread("c-gen").write((state) => ({ ...state!, pending: [] }));
+}
+assert((commandSearches.at(-1) ?? "").startsWith("?conversation=") && !commandSearches.at(-1)?.includes("home-thread"), `hosted Stop names its conversation, not Home (got ${commandSearches.at(-1)})`);
 assert(!stopButton(), "Stop refreshes the selected hosted conversation after the operation ends");
 turn = { state: "working", message: "m-other", conversation: "c-camp" };
 queue = [{ message: "m-gen", conversation: "c-gen" }];
@@ -796,6 +810,39 @@ assert(coldRuns[1].querySelector(".turn-head") !== null, "the new send paints it
 assert(coldRuns[1].querySelector('[data-kind="typing"]') !== null, "the new send's run owns the typing bubble");
 assert(coldRuns[0].querySelector('[data-kind="typing"]') === null, "the historical run is not typing for the new send");
 equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows cold history");
+// CAD-2011: a hosted board reports its working turn with no message id. The
+// open run is that turn: it types, and no second assistant head follows it.
+{
+  const before = turn;
+  convs["install-crm"].push(conv("c-hosted", { title: "Hosted turn" }));
+  threads["c-hosted"] = [
+    ent(1, "operator", "message", "hosted ask", "m-hosted"),
+    ent(2, "agent", "tool_call", "catalog_search: website", null),
+    ent(3, "agent", "tool_result", "ok", null),
+  ];
+  turn = { state: "working", message: null, conversation: "c-hosted" } as never;
+  await React.act(async () => { await conversationList("install-crm").refresh(); });
+  await settle();
+  await pick("Hosted turn");
+  await React.act(async () => {
+    await conversationThread("c-hosted").refresh();
+    await resources.masterConversation("c-hosted").refresh();
+  });
+  await settle();
+  equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "the open run types for an unnamed turn");
+  equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows an unnamed turn's run");
+  // The answer lands a read before the working flag clears: still one head.
+  threads["c-hosted"].push(ent(4, "agent", "turn_result", "hosted answer", null));
+  await React.act(async () => {
+    await conversationThread("c-hosted").refresh();
+    await resources.masterConversation("c-hosted").refresh();
+  });
+  await settle();
+  equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head under an unnamed turn's answer");
+  turn = before;
+  await React.act(async () => { await resources.masterConversation("c-hosted").refresh(); });
+  await settle();
+}
 // A differing daemon id whose rows are untagged must keep the adopted send
 // when the queue changes; otherwise the queued send steals the identity.
 convs["install-crm"].push(conv("c-split2", { title: "Split turn two" }));
