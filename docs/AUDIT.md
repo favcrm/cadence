@@ -73,7 +73,8 @@ a subagent. These verbs do not enforce it. The gate counts hosted verdicts by
 attested principal and refuses the author's principal, while local notes count
 by their self-declared `From:` alias, which is not attested; it cannot tell a
 fresh session from the author under one login; until it can, merges use the temporary
-`--exception --advisory ...` path (ends at `EXCEPTION_ENDS` in
+`--exception --advisory ...` path (exact-head operator approval and two
+advisory links, standards and spec-security; ends at `EXCEPTION_ENDS` in
 `scripts/delivery-gate`, 2026-11-10).
 
 The document says where it came from (AOS-473): `origin` is `local` for the

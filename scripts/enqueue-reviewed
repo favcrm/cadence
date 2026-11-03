@@ -101,6 +101,9 @@ ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 # The review standard is a fresh-session review (AGENTS.md "Review", CAD-1946), which
 # this gate cannot yet enforce. Refusals for a missing or shared reviewer point at
 # the temporary exception and the standard.
+# A filed row by the author is refused even under --exception; the review goes in as a link.
+AUTHOR_ROW_HINT = (" (a filed row under the author's identity is not waived by --exception; "
+                   "post the review as a PR comment and pass it as an --advisory URL)")
 REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a non-author session, "
                         "and this gate cannot yet tell one from the author under one login: use "
                         "--exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate. "
@@ -784,7 +787,7 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
             elif (n.get("github_login") or "").strip().lower() in authors:
                 reasons.append(
                     f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
-                    f"the owner attested that login as the PR author")
+                    f"the owner attested that login as the PR author{AUTHOR_ROW_HINT}")
             elif not hosted.get("author_principal"):
                 # CAD-2049: without the author's principal, no row can be proven
                 # not to be the author's — a second login is not a second person.
@@ -795,11 +798,11 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
             elif (n.get("reviewer_id") or "").strip() == hosted["author_principal"]:
                 reasons.append(
                     f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
-                    f"its principal is the PR author's ({hosted['author_principal']})")
+                    f"its principal is the PR author's ({hosted['author_principal']}){AUTHOR_ROW_HINT}")
             else:
                 counted.append(n)
         elif who in authors:
-            reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']})")
+            reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']}){AUTHOR_ROW_HINT}")
         else:
             counted.append(n)
     if hosted is not None:

@@ -346,7 +346,8 @@ the author's principal (local notes count by their self-declared `From:`
 alias, which is not attested), so a profile or separate session alone does not make a
 gate-counted verdict, and in-chat findings are not one either. Until the gate
 can tell a fresh session from the author, merges use the temporary
-`--exception --advisory ...` path (ends at `EXCEPTION_ENDS` in
+`--exception --advisory ...` path (exact-head operator approval and two
+advisory links, standards and spec-security; ends at `EXCEPTION_ENDS` in
 `scripts/delivery-gate`, 2026-11-10); see AGENTS.md "Review". The exception
 only checks that the advisory links are separate https URLs; it proves neither
 head binding nor that Browser QA ran. A verdict filed under the author's

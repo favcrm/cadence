@@ -686,13 +686,14 @@ During implementation and handoff:
   context from the work (a subagent qualifies; a fork or a resumed authoring
   session does not). Brief it with the PR, the exact head and the ticket, not
   your conclusions, and call it a fresh-session review, never independent
-  parties. The merge gate does not enforce this yet: hosted verdicts
-  count by attested principal (the author's is refused) and local notes by
+  parties. In the Cadence repository the merge gate does not enforce this yet: hosted
+  verdicts count by attested principal (the author's is refused) and local notes by
   their self-declared `From:` alias, so a same-login session cannot file a
-  gate-counted verdict. Post its findings as a PR comment; merges use the
-  temporary `--exception --advisory ...` path until `EXCEPTION_ENDS`
-  (2026-11-10), and it checks only that the links are https URLs. A second
-  attested human is not required.
+  gate-counted verdict. Post its findings as a PR comment. In the Cadence
+  repository itself, merges use the temporary `--exception --advisory ...`
+  path (exact-head operator approval and two advisory links) until
+  `EXCEPTION_ENDS` (2026-11-10); it checks only that the links are https URLs.
+  A second attested human is not required.
 - Make review converge. First inspect the complete change against acceptance;
   verify each blocking finding with a concrete failure scenario and source
   evidence before sending it to the author. Report the class of bug and all

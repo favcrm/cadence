@@ -37,7 +37,7 @@ Class `human` splits in two. These stay `human`, and the operator approves them 
 These become `delegated`: the rest of trigger 2 (data and deletion paths, the tracker write path, memory writes); trigger 5 (size and review rounds); and a ticket whose only `human` trigger is a schema or store-version change the operator pre-approved at ticket time (`cadence audit approve --issue <ID> --action scope`), when both reviewers state that the PR stays within that scope, name the pre-approval id, and add no new trigger. Only schema changes are pre-approvable; triggers 1, 3, 4, 6 and 7 never are.
 
 A designated agent approves a `delegated` PR with `cadence audit approve --pr <n> --head <full sha> --delegated [--scope <id>] --source "<notes>"`, run from its own pane. The daemon refuses it unless every safeguard holds:
-1. Two PASS verdict notes for the ticket and PR, each pinned to the exact head, from two distinct reviewers, compared by the alias their `From:` names. Neither reviewer is an author (the ticket's owner, the loop's worker, the PR's GitHub login) or the approver. No verdict note on that head may state anything but `auto` or `delegated`. This is the daemon's alias check, which predates the fresh-session review standard above and is not that standard: it needs two distinct aliases, and a fresh session under an existing alias is not yet recognised.
+1. Two PASS verdict notes for the ticket and PR, each pinned to the exact head, from two distinct reviewers, compared by the alias their `From:` names. Neither reviewer is an author (the ticket's owner, the loop's worker, the PR's GitHub login) or the approver. No verdict note on that head may state anything but `auto` or `delegated`. This is the daemon's alias check, which predates the fresh-session review standard below and is not that standard: it needs two distinct aliases, and a fresh session under an existing alias is not yet recognised.
 2. CI green at that head: every check the base branch requires has a completed, successful run from its required app (GitHub Actions), inside the check suite of a `pull_request` run of `.github/workflows/ci.yml` for that head; a same-named run from any other workflow counts for nothing. Commit statuses count for nothing, and a `qa-verdict` in any state but success refuses.
 3. Any gate change carries an independent acceptance check proving the bad case is refused (AGENTS.md "Gates and security work"). Reviewers check this, and their PASS states it.
 4. A mechanical path check, an allowlist that fails closed. Every changed path, both sides of a rename included, must be `delegable` and in no trigger list; a schema path passes only under a live scope pre-approval. Anything else needs the operator. The lists live in one place, [`docs/roles/risk-paths.toml`](risk-paths.toml), which the binary compiles in, and are enumerated below.
@@ -88,7 +88,8 @@ for send, publish, spend or deploy. It never stands in for a review pass and nev
 attested principal and, since CAD-2049, refuses the author's principal; local
 notes count by their self-declared `From:` alias, which is not attested. It
 cannot tell a fresh session from the author under one login. Until it can,
-merges use the temporary exception (`--exception --advisory ...`, ends at
+merges use the temporary exception (`--exception --advisory ...`: exact-head
+operator approval and two advisory links, standards and spec-security; ends at
 `EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-11-10). The exception only
 checks that the advisory links are separate https URLs; it proves neither head
 binding nor that Browser QA ran, and a verdict filed under the author's identity
