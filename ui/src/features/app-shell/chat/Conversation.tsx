@@ -44,6 +44,7 @@ import {
   discardPending,
   sendBefore,
   inFlightTurnKey,
+  unnamedTurnAnswered,
   itemMessage,
   newMessageId,
   rowPaintKey,
@@ -175,6 +176,8 @@ export interface HomeListProps {
   /** The running turn's message id, when a turn runs: a grouped turn uses it
    *  to show typing instead of a finished-looking answer. */
   running?: string | null;
+  /** A turn is verified working but the host gave no id for it (hosted boards). */
+  runningUnnamed?: boolean;
   /** Messages still queued behind the running turn: a run's send skips them. */
   queued?: string[];
   /** Whether the whole thread has no `turn_result`. Every host passes its
@@ -241,6 +244,7 @@ function HomeList({
   readOnly,
   liveAfter,
   running = null,
+  runningUnnamed = false,
   queued = [],
   legacyTranscript,
   onOpenIssue,
@@ -255,7 +259,7 @@ function HomeList({
   // current transcript may legitimately have answer-less runs (tool turns,
   // errors); those notes must stay in the trace, never become older answers.
   const allowLegacy = legacyTranscript;
-  const flightKey = inFlightTurnKey(items, running);
+  const flightKey = inFlightTurnKey(items, running, runningUnnamed);
   const queuedSet = useMemo(() => new Set(queued), [queued]);
   // The tail send: the newest user row that is not still queued. With the
   // daemon's id naming no user, this is the placeholder's only evidence.
@@ -284,12 +288,12 @@ function HomeList({
   // every segment that continues it.
   const workingSend = activeSendId(items, running);
   const workingRunKey = (() => {
-    if (running === null) return null;
     if (flightKey !== null) {
       for (const run of runs) {
         if (run.turn && run.items.some((item) => item.key === flightKey)) return run.key;
       }
     }
+    if (running === null) return null;
     // Without an opener, only a run whose send the working id names can be
     // the working one; a newer send with no rows yet is the placeholder's.
     if (workingSend === null) return null;
@@ -1301,6 +1305,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const runningMessage =
     turnState.kind === "working" || turnState.kind === "writing" ? turnState.stopMessage : null;
   const canStop = canControlTurns && !streamDown && runningMessage !== null;
+  // Working with no usable id: a hosted turn, or the id withheld while the
+  // stream reconnects. The open run is still that turn.
+  const runningUnnamed =
+    (turnState.kind === "working" || turnState.kind === "writing") && runningMessage === null;
   // After a reload or navigation the selected conversation may still be
   // waiting on another conversation's turn: read the master's state once
   // (the `master` stream frame keeps it live while it is queued).
@@ -1705,7 +1713,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     stickySends.current = new Map();
   }
   const runViews = useMemo(() => {
-    const flightKey = inFlightTurnKey(shown, runningMessage);
+    const flightKey = inFlightTurnKey(shown, runningMessage, runningUnnamed);
     const special = (item: ThreadItem) =>
       directiveByKey.get(item.key) != null || plan.has(item.key) || item.type === "hire";
     // The send each run belongs to, settled before anything is keyed: an
@@ -1720,12 +1728,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     // placeholder, even when an earlier answered run sits between them.
     const workingSend = activeSendId(shown, runningMessage);
     const workingRunKey = (() => {
-      if (runningMessage === null) return null;
       if (flightKey !== null) {
         for (const run of runs) {
           if (run.turn && run.items.some((item) => item.key === flightKey)) return run.key;
         }
       }
+      if (runningMessage === null) return null;
       // Without an opener, only a run whose send the working id names can be
       // the working one; a newer send with no rows yet is the placeholder's.
       if (workingSend === null) return null;
@@ -1832,7 +1840,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           !(message !== null && answeredByMessage.get(message) === true),
       };
     });
-  }, [runs, shown, directiveByKey, plan, runningMessage]);
+  }, [runs, shown, directiveByKey, plan, runningMessage, runningUnnamed]);
   // Only a run that will actually paint dots owns the indicator; a turn whose
   // answer already landed keeps the pane's standalone row while master state
   // still reports it working (the pre-CAD-1886 behaviour).
@@ -2187,7 +2195,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           // keeps a separate tail and must not reuse the turn's key.
           const reserveTyping =
             turnState.kind === "sending" ||
-            ((turnState.kind === "working" || turnState.kind === "writing") && !typingOwned);
+            ((turnState.kind === "working" || turnState.kind === "writing") && !typingOwned
+              && !(runningUnnamed && unnamedTurnAnswered(shown)));
           // The send this turn belongs to, stable from the optimistic row
           // through the stored operator row: the placeholder keeps that id
           // while the turn is in flight, including the working state before
@@ -2197,7 +2206,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           // behind it. Once a run claims the id, that run paints the head
           // and dots; a still-working turn that already answered keeps a
           // distinct tail key.
-          const flightKeyForTyping = inFlightTurnKey(shown, runningMessage);
+          const flightKeyForTyping = inFlightTurnKey(shown, runningMessage, runningUnnamed);
           const flightRun = flightKeyForTyping === null
             ? null
             : runs.find((run) => run.turn && run.items.some((item) => item.key === flightKeyForTyping)) ?? null;
