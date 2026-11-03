@@ -1289,7 +1289,7 @@ function MasterHome({
   };
 
 
-  const handBackWithdrawn = useCallback((id: number, r: MasterCommandResult) => {
+  const handBackWithdrawn = useCallback((r: MasterCommandResult) => {
     if (!r.withdrawn?.length) return;
     const withdrawn = r.withdrawn;
     const state = resources.masterThread.get().data;
@@ -1300,6 +1300,8 @@ function MasterHome({
     }
     // A message sent from another tab has no row here to hand back.
     if (!state || withdrawn.some((message) => !state.pending.some((row) => row.message === message))) {
+      // Its own card: the caller's card is about to take the command's result.
+      const id = ++cmdSeq.current;
       setCmds((c) => [...c, { id, name: "stop", ok: true, text: t("A queued message was withdrawn too. Send it again if you still need it.") }]);
     }
   }, [t]);
@@ -1331,7 +1333,7 @@ function MasterHome({
       api
         .masterCommand(name, arg || undefined)
         .then((r) => {
-          handBackWithdrawn(id, r);
+          handBackWithdrawn(r);
           const { text, value } = fmtCommandResult(r);
           setCmds((c) =>
             c.map((x) => (x.id === id ? { ...x, running: false, ok: r.ok, text, value } : x)),
@@ -1359,7 +1361,7 @@ function MasterHome({
       .masterCommand(command, undefined, undefined, message)
       .then((r) => {
         void resources.masterState.refresh();
-        handBackWithdrawn(id, r);
+        handBackWithdrawn(r);
         if (!r.ok) setCmds((c) => [...c, { id, name: command, ok: false, text: "The master did not accept the command." }]);
       })
       .catch((e: ApiError) => setCmds((c) => [...c, { id, name: command, ok: false, text: e.message }]));

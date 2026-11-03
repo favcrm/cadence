@@ -155,6 +155,18 @@ async function main() {
   await React.act(async () => { host.querySelector<HTMLButtonElement>('[aria-label="Stop this turn"]')!.click(); });
   await settle();
   assert(host.querySelector('[data-cmd="stop"]')?.textContent?.includes("A queued message was withdrawn too"), "a withdrawal with no row here still says so");
+  // Typed, the notice is its own card beside the command's answer.
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({ ...state!, pending: [] }));
+    resources.masterState.write(() => master as never);
+  });
+  await settle();
+  const cardsBefore = host.querySelectorAll('[data-cmd="stop"]').length;
+  await type("/stop");
+  await enter();
+  const typed = Array.from(host.querySelectorAll('[data-cmd="stop"]')).slice(cardsBefore).map((card) => card.textContent ?? "");
+  assert(typed.length === 2, `a typed stop shows its answer and the notice (got ${typed.length})`);
+  assert(typed.some((text) => text.includes("Stopped.")) && typed.some((text) => text.includes("A queued message was withdrawn too")), "the typed stop's notice is not overwritten by its answer");
   stopAnswer = null;
   (master as { turn: unknown }).turn = null;
 
