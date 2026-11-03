@@ -286,6 +286,8 @@ The gateway's real refusal shapes (AOS-243):
   that nothing was recorded. Team and settings writes require a receipt
   consistent with the requested change; reconcile an uncertain result using
   `team list`, `team invites` or the appropriate `settings agents` read.
+  Invite addresses are correlated using the tenant's whitespace and
+  lowercase normalization, without treating a different address as a match.
   The native grant-request receipt contains only the new request id; the
   grant-allow receipt does not echo the request id. Their shapes alone cannot
   prove a request-to-grant correlation; inspect `settings agents grant list`

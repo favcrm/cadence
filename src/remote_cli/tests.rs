@@ -5439,3 +5439,174 @@ fn cad2009_issue_create_correlates_producer_title_without_overtrimming() {
         }
     }
 }
+
+// Independently authored CAD-2009 Spec/security acceptance.
+// Append to src/remote_cli/tests.rs beside the existing hosted receipt tests.
+// Formatting-only changes are authorized. Do not change cases, expectations,
+// transport seam, scope checks, or no-replay assertions without reviewer agreement.
+//
+// Producer evidence read from the available local AgenticOS source:
+// packages/contracts/src/members.ts:47-51 applies JS trim().toLowerCase()
+// before z.email(); hosted-cadence-auth.ts:1240-1243 reuses that email schema;
+// apps/api/src/board/team-cli.ts:200-215 passes parsed.data.email to the write.
+// ECMAScript trim removes U+FEFF but does not remove U+0085. The latter is
+// neither part of the producer's canonical ASCII address nor a valid address
+// wrapper. These synthetic replies exercise the real authorize/call client,
+// not a live producer or the private receipt predicate.
+#[test]
+fn cad2009_team_invite_receipts_match_ecmascript_whitespace_without_overtrimming() {
+    let canonical = "new@example.test";
+    for (case, sent_email, received_email, confirmed) in [
+        (
+            "canonical ASCII control",
+            "New@Example.TEST",
+            canonical,
+            true,
+        ),
+        (
+            "producer strips surrounding BOM",
+            "\u{feff}New@Example.TEST\u{feff}",
+            canonical,
+            true,
+        ),
+        (
+            "producer trims spaces and BOM together",
+            " \u{feff} New@Example.TEST \u{feff} ",
+            canonical,
+            true,
+        ),
+        (
+            "foreign address cannot confirm BOM-wrapped input",
+            "\u{feff}New@Example.TEST\u{feff}",
+            "other@example.test",
+            false,
+        ),
+        (
+            "NEL-wrapped receipt is not the producer canonical address",
+            "New@Example.TEST",
+            "\u{0085}new@example.test\u{0085}",
+            false,
+        ),
+    ] {
+        // Cover the producer's two success statuses: 201 allocates a pending
+        // invite; 200 returns an existing pending invite. Use the requested
+        // role in both, so this test changes no role-correlation expectations.
+        for status in [200_u16, 201] {
+            let args = json!({"email": sent_email, "role": "member"});
+            let receipt = json!({"invite": {
+                "id": "inv_cad2009_unicode",
+                "email": received_email,
+                "role": "member",
+                "status": "pending",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "expiresAt": "2026-01-08T00:00:00.000Z"
+            }});
+            let (result, requests) = run(
+                vec![(status, "", receipt.clone())],
+                "team_invite",
+                args.as_object().unwrap().clone(),
+                10,
+            );
+            assert_eq!(
+                requests.len(),
+                2,
+                "{case}/HTTP {status}: no extra reads or replay"
+            );
+            assert_eq!(
+                hits(&requests, "/__platform/cli/authorize"),
+                1,
+                "{case}/HTTP {status}"
+            );
+            assert_eq!(
+                hits(&requests, "/__platform/cli/call"),
+                1,
+                "{case}/HTTP {status}"
+            );
+            let authorize = &requests[0];
+            assert_eq!(authorize["path"], "/__platform/cli/authorize", "{case}");
+            assert_eq!(authorize["body"]["version"], CLI_VERSION, "{case}");
+            assert_eq!(authorize["body"]["organization_id"], ORG_ID, "{case}");
+            assert_eq!(
+                authorize["body"]["requested_scopes"],
+                json!(["cli.write"]),
+                "{case}"
+            );
+            assert!(
+                authorize["body"]["audience"]
+                    .as_str()
+                    .is_some_and(|audience| audience.starts_with("http://127.0.0.1:")),
+                "{case}"
+            );
+            assert!(
+                authorize["body"]["ttl_seconds"]
+                    .as_u64()
+                    .is_some_and(|ttl| (1..=300).contains(&ttl)),
+                "{case}"
+            );
+            assert_eq!(authorize["body"].as_object().unwrap().len(), 5, "{case}");
+            let call = &requests[1];
+            assert_eq!(call["path"], "/__platform/cli/call", "{case}");
+            assert_eq!(call["body"]["version"], CLI_VERSION, "{case}");
+            assert_eq!(call["body"]["verb"], "team_invite", "{case}");
+            assert_eq!(
+                call["body"]["arguments"], args,
+                "{case}: outgoing input changed"
+            );
+            assert_eq!(
+                call["body"].as_object().unwrap().len(),
+                4,
+                "{case}: authority-shaped extra field"
+            );
+            assert!(
+                call["body"]["envelope"].as_str().is_some_and(|envelope| {
+                    envelope.split('.').count() == 3
+                        && envelope.split('.').all(|part| {
+                            !part.is_empty()
+                                && part.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric() || b"_-".contains(&byte)
+                                })
+                        })
+                }),
+                "{case}: missing single-use authorization envelope"
+            );
+            if confirmed {
+                assert_eq!(result.expect(case), receipt, "{case}/HTTP {status}");
+            } else {
+                let error = result.expect_err(case);
+                assert_eq!(error.kind(), "unknown", "{case}/HTTP {status}: {error}");
+                assert_eq!(crate::error::exit_code_for_kind(error.kind()), 1, "{case}");
+                let guidance = error.to_string();
+                assert!(
+                    guidance.contains("team list") || guidance.contains("team invites"),
+                    "{case}: {guidance}"
+                );
+                assert!(!guidance.contains("retry later"), "{case}: {guidance}");
+            }
+        }
+    }
+}
+
+// U+0085 input never reaches the producer: it is a control character under
+// the existing client team_argument_shape. Keep that predispatch guard; do
+// not "fix" normalization by trimming invalid input before admission.
+#[test]
+fn cad2009_team_invite_nel_input_keeps_definite_predispatch_refusal() {
+    let args = json!({
+        "email": "\u{0085}New@Example.TEST\u{0085}",
+        "role": "member"
+    });
+    let (result, requests) = run(
+        Vec::new(),
+        "team_invite",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    assert!(
+        requests.is_empty(),
+        "NEL input must send neither authorization nor mutation"
+    );
+    let error = result.expect_err("the existing control-character guard must reject NEL input");
+    assert_eq!(error.kind(), "rejected", "{error}");
+    assert_eq!(crate::error::exit_code_for_kind(error.kind()), 3);
+    assert!(!error.to_string().contains("outcome is unknown"), "{error}");
+}

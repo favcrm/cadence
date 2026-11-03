@@ -860,8 +860,8 @@ fn membership_role(value: &Value) -> Option<&str> {
 /// spelling; compare the sent address under the same normalization, without
 /// allocating.
 fn normalized_email_matches(sent: &str, received: &str) -> bool {
-    let received = received.trim();
-    !received.is_empty() && lowercase_chars(sent.trim()).eq(lowercase_chars(received))
+    let received = trim_tenant_text(received);
+    !received.is_empty() && lowercase_chars(trim_tenant_text(sent)).eq(lowercase_chars(received))
 }
 
 fn lowercase_chars(text: &str) -> impl Iterator<Item = char> + '_ {
