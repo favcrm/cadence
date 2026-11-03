@@ -2019,6 +2019,166 @@ fn settings_args(operation: &str, payload: Value) -> Map<String, Value> {
         .clone()
 }
 
+// CAD-2009: independently authored by the fresh-session Standards reviewer.
+// Authorization scope is deliberately unchanged: the hosted schema does not
+// list fleet.check, but that does not make this native read a settings write.
+// Current AgenticOS origin/staging 36dd174ea668e30cebe92a6fd0f6a57cc1902e98
+// refuses settings_agents with 409 container_required before execution.
+// These loopback peers exercise the real HTTP client, not current deployment.
+fn cad2009_assert_fleet_read_failure(error: &Error, requests: &[Value]) {
+    assert_eq!(error.kind(), "rejected", "{error}");
+    assert_eq!(crate::error::exit_code_for_kind(error.kind()), 3);
+    let diagnostic = error.to_string();
+    for false_claim in [
+        "outcome_unknown",
+        "may already have committed",
+        "may or may not have been applied",
+        "settings agents show",
+        "settings agents history",
+    ] {
+        assert!(
+            !diagnostic.contains(false_claim),
+            "a read failure must not claim an uncertain settings write: {diagnostic}"
+        );
+    }
+    assert_eq!(requests.len(), 2, "no automatic replay: {requests:?}");
+    assert_eq!(requests[0]["path"], "/__platform/cli/authorize");
+    assert_eq!(
+        requests[0]["body"]["requested_scopes"],
+        json!(["settings.write"]),
+        "effect classification must not change the hosted authorization contract"
+    );
+    assert_eq!(requests[1]["path"], "/__platform/cli/call");
+    assert_eq!(requests[1]["body"]["verb"], "settings_agents");
+    assert_eq!(
+        requests[1]["body"]["arguments"],
+        json!({"operation": "fleet.check", "expected_revision": null, "payload": {}})
+    );
+}
+
+#[test]
+fn cad2009_fleet_read_503_is_availability_not_mutation_uncertainty() {
+    let (result, requests) = run(
+        vec![(
+            503,
+            "",
+            json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+        )],
+        "settings_agents",
+        settings_args("fleet.check", json!({})),
+        10,
+    );
+    let error = result.unwrap_err();
+    cad2009_assert_fleet_read_failure(&error, &requests);
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("availability"), "{diagnostic}");
+    assert!(diagnostic.contains("retry later"), "{diagnostic}");
+}
+
+#[test]
+fn cad2009_fleet_read_container_required_remains_a_definite_refusal() {
+    let (result, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"ok": false, "error": {"code": "container_required"}}),
+        )],
+        "settings_agents",
+        settings_args("fleet.check", json!({})),
+        10,
+    );
+    let error = result.unwrap_err();
+    cad2009_assert_fleet_read_failure(&error, &requests);
+    assert_eq!(error.code(), Some("container_required"));
+}
+
+#[test]
+fn cad2009_fleet_read_lost_answer_is_not_mutation_uncertainty() {
+    use std::os::fd::AsRawFd;
+
+    fn accept_bounded(listener: &TcpListener) -> std::net::TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "fleet HTTP request deadline elapsed");
+            let mut descriptor = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: descriptor is initialized and the listener remains live.
+            let ready = unsafe {
+                libc::poll(
+                    &mut descriptor,
+                    1,
+                    remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+                )
+            };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+                continue;
+            }
+            assert_eq!(ready, 1, "CLI did not send the fleet HTTP request");
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            return socket;
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = target(&listener);
+    let worker = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let (socket, request) = read_request(accept_bounded(&listener));
+        assert!(check_authorize(&request));
+        assert_eq!(request.body["requested_scopes"], json!(["settings.write"]));
+        requests.push(json!({"path": request.path, "body": request.body}));
+        answer(
+            socket,
+            "200 OK",
+            "",
+            &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+        );
+
+        let (socket, request) = read_request(accept_bounded(&listener));
+        assert!(check_call(&request));
+        assert_eq!(request.body["verb"], "settings_agents");
+        assert_eq!(
+            request.body["arguments"],
+            json!({"operation": "fleet.check", "expected_revision": null, "payload": {}})
+        );
+        requests.push(json!({"path": request.path, "body": request.body}));
+        // Complete request observed, then close without an HTTP response.
+        drop(socket);
+        requests
+    });
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    store_credential(root.path(), &target.endpoint);
+    let result = call_verb_in(
+        &target,
+        "settings_agents",
+        settings_args("fleet.check", json!({})),
+        10,
+        root.path(),
+        |_| {},
+        |_| {},
+    );
+    let requests = worker.join().unwrap();
+    let error = result.unwrap_err();
+    cad2009_assert_fleet_read_failure(&error, &requests);
+    assert!(
+        error.to_string().contains("remote request failed"),
+        "{error}"
+    );
+}
+
 /// The native config-write result (`build_snapshot`): a revision token plus
 /// the whole config document. A 2xx that lacks either is not that receipt.
 fn config_snapshot(revision: &str) -> Value {

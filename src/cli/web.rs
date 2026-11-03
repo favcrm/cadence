@@ -217,7 +217,8 @@ fn remove_staging(state_dir: &Path, token: &str) {
 fn print_json(value: &Value) -> Result<()> {
     println!(
         "{}",
-        serde_json::to_string_pretty(value).map_err(|error| Error::internal(error.to_string()))?
+        cadence_agent::output::json_text(value)
+            .map_err(|error| Error::internal(error.to_string()))?
     );
     Ok(())
 }

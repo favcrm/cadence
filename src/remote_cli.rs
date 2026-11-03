@@ -419,7 +419,8 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                 .get("operation")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if settings_op_scope(operation) == "settings.write" {
+            // The hosted scope is deliberately broader than this read's effect.
+            if operation != "fleet.check" && settings_op_scope(operation) == "settings.write" {
                 mutation(settings_reconcile(operation))
             } else {
                 Effect::Read

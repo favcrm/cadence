@@ -3996,6 +3996,50 @@ mod cad2009_hosted_app_acceptance {
         MissingUpdatedAt,
     }
     #[derive(Clone, Copy, Debug)]
+    enum RefusalContradiction {
+        DataSucceeded,
+        OperationDispatched,
+        OperationExpired,
+        UnknownMutation,
+        UnknownOutcome,
+    }
+    const BLOCKER_OP: &str = "00000000-0000-4000-8000-000000002008";
+
+    #[derive(Clone, Copy, Debug)]
+    enum BlockerFault {
+        None,
+        Plain,
+        Incomplete,
+        ForeignWorkspace,
+        ForeignApp,
+        HeaderMismatch,
+        MissingHeader,
+        MalformedHeader,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum Action4xxReply {
+        PostDispatch(&'static str),
+        Unrecognized(u16),
+        EmptyObject,
+        Array,
+        Null,
+        MissingError,
+        MissingCode,
+        NonStringCode,
+        MissingMessage,
+        NonStringMessage,
+        EmptyMessage,
+        WrongOk,
+        WrongStatus,
+        ForeignHeader,
+        MalformedHeader,
+        PreEffect(u16, &'static str),
+        PreEffectAuth(u16, &'static str),
+        Blocking(&'static str, BlockerFault),
+        Contradictory(RefusalContradiction, bool),
+        TenantRevokeUnsupported,
+    }
+    #[derive(Clone, Copy, Debug)]
     enum Reply {
         Dropped,
         NonJson,
@@ -4009,6 +4053,7 @@ mod cad2009_hosted_app_acceptance {
         ReconcileReceipt(&'static str, ReconcileFault),
         ReconcileTerminal(ReceiptDisposition),
         ReconcilePending,
+        Action4xx(Action4xxReply),
         PreEffect503(&'static str, bool),
         PreEffect503Fault(&'static str, RefusalFault),
         Unproved503(&'static str),
@@ -4077,6 +4122,22 @@ mod cad2009_hosted_app_acceptance {
             });
         }
         receipt
+    }
+    fn blocking_operation_response(state: &str) -> Value {
+        assert!(matches!(state, "prepared" | "dispatched"));
+        let mut operation = successful_reconcile_receipt("update")["data"].clone();
+        operation["operation_id"] = json!(BLOCKER_OP);
+        operation["state"] = json!(state);
+        operation["installation"] = Value::Null;
+        operation["refusal"] = Value::Null;
+        json!({
+            "ok": false,
+            "error": {
+                "code": "operation_in_progress",
+                "message": "Reconcile the pending app operation before another change."
+            },
+            "operation": operation
+        })
     }
     fn terminal_revoke_receipt(disposition: ReceiptDisposition) -> Value {
         let mut receipt = successful_revoke_receipt();
@@ -4455,6 +4516,9 @@ mod cad2009_hosted_app_acceptance {
                                 | Reply::ReconcileTerminal(_)
                                 | Reply::ReconcilePending
                                 | Reply::PreEffect503Fault(_, _)
+                                | Reply::Action4xx(Action4xxReply::PreEffect(_, _))
+                                | Reply::Action4xx(Action4xxReply::PreEffectAuth(_, _))
+                                | Reply::Action4xx(Action4xxReply::TenantRevokeUnsupported)
                                 | Reply::RevokeTerminal(
                                     ReceiptDisposition::RefusedNotStarted
                                         | ReceiptDisposition::CancelledBeforeDispatch,
@@ -4604,6 +4668,216 @@ mod cad2009_hosted_app_acceptance {
                                     _ => format!("X-Hosted-App-Operation-Id: {OP}\r\n"),
                                 };
                                 (503, bytes, length, extra)
+                            }
+                            Reply::Action4xx(case) => {
+                                if matches!(
+                                    case,
+                                    Action4xxReply::PostDispatch(_)
+                                        | Action4xxReply::PreEffect(_, _)
+                                        | Action4xxReply::PreEffectAuth(_, _)
+                                ) {
+                                    assert!(matches!(
+                                        mutation,
+                                        Mutation::Install | Mutation::Update
+                                    ));
+                                }
+                                let mut status = 400;
+                                let mut header = format!("X-Hosted-App-Operation-Id: {OP}\r\n");
+                                let mut envelope = json!({
+                                    "ok": false,
+                                    "error": {
+                                        "code": "invalid_request",
+                                        "message": "Enter a valid app action."
+                                    }
+                                });
+                                match case {
+                                    Action4xxReply::PostDispatch(code) => {
+                                        status = 409;
+                                        assert!(matches!(
+                                            code,
+                                            "install_refused"
+                                                | "update_refused"
+                                                | "host_incompatible"
+                                        ));
+                                        envelope["error"]["code"] = json!(code);
+                                        envelope["error"]["message"] = json!(if code
+                                            == "host_incompatible"
+                                        {
+                                            "This release is not compatible with this workspace's Cadence."
+                                        } else {
+                                            "The app could not be changed. Nothing was confirmed."
+                                        });
+                                    }
+                                    Action4xxReply::Unrecognized(code_status) => {
+                                        status = code_status;
+                                        envelope["error"]["code"] =
+                                            json!("future_unproved_failure");
+                                    }
+                                    Action4xxReply::EmptyObject => envelope = json!({}),
+                                    Action4xxReply::Array => envelope = json!([]),
+                                    Action4xxReply::Null => envelope = Value::Null,
+                                    Action4xxReply::MissingError => envelope = json!({"ok": false}),
+                                    Action4xxReply::MissingCode => {
+                                        envelope["error"].as_object_mut().unwrap().remove("code");
+                                    }
+                                    Action4xxReply::NonStringCode => {
+                                        envelope["error"]["code"] = json!(17);
+                                    }
+                                    Action4xxReply::MissingMessage => {
+                                        envelope["error"]
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .remove("message");
+                                    }
+                                    Action4xxReply::NonStringMessage => {
+                                        envelope["error"]["message"] = json!(17);
+                                    }
+                                    Action4xxReply::EmptyMessage => {
+                                        envelope["error"]["message"] = json!("");
+                                    }
+                                    Action4xxReply::WrongOk => envelope["ok"] = json!(true),
+                                    Action4xxReply::WrongStatus => status = 409,
+                                    Action4xxReply::ForeignHeader => {
+                                        header = "X-Hosted-App-Operation-Id: 00000000-0000-4000-8000-000000009999\r\n".into();
+                                    }
+                                    Action4xxReply::MalformedHeader => {
+                                        header =
+                                            "X-Hosted-App-Operation-Id: invalid.operation.id\r\n"
+                                                .into();
+                                    }
+                                    Action4xxReply::PreEffect(code_status, code) => {
+                                        status = code_status;
+                                        let message = match (status, code) {
+                                            (400, "invalid_request") => "Enter a valid app action.",
+                                            (403, "owner_only") => "Current owner authority is required.",
+                                            (404, "not_found") => "This app is not available.",
+                                            (409, "operation_not_dispatched") => "The operation was cancelled or workspace authority changed.",
+                                            (409, "release_unavailable") => "This app release is not available to install.",
+                                            _ => panic!("not a source-proven pre-effect control"),
+                                        };
+                                        envelope = json!({"ok": false, "error": {
+                                            "code": code, "message": message
+                                        }});
+                                    }
+                                    Action4xxReply::PreEffectAuth(code_status, code) => {
+                                        status = code_status;
+                                        assert!(matches!(
+                                            (status, code),
+                                            (401, "unauthorized")
+                                                | (403, "forbidden" | "human_session_required")
+                                        ));
+                                        // The real humanActor middleware emits this flat family,
+                                        // before parsing an action or assigning its header.
+                                        envelope = json!({"ok": false, "code": code});
+                                        header.clear();
+                                    }
+                                    Action4xxReply::Contradictory(conflict, flat) => {
+                                        if flat {
+                                            status = 401;
+                                            envelope = json!({"ok": false, "code": "unauthorized"});
+                                        }
+                                        // Otherwise retain the source-proven nested
+                                        // 400 invalid_request envelope constructed above.
+                                        // Every case keeps the correct OP header.
+                                        let kind = match mutation {
+                                            Mutation::Install => "install",
+                                            Mutation::Update | Mutation::Reconcile => "update",
+                                            Mutation::Revoke => "revoke",
+                                        };
+                                        let mut operation =
+                                            successful_reconcile_receipt(kind)["data"].clone();
+                                        match conflict {
+                                            RefusalContradiction::DataSucceeded => {
+                                                envelope["data"] = operation;
+                                            }
+                                            RefusalContradiction::OperationDispatched => {
+                                                operation["state"] = json!("dispatched");
+                                                operation["installation"] = Value::Null;
+                                                envelope["operation"] = operation;
+                                            }
+                                            RefusalContradiction::OperationExpired => {
+                                                operation["state"] = json!("refused");
+                                                operation["installation"] = Value::Null;
+                                                operation["refusal"] = json!({
+                                                    "version": "hosted-app-mutation.v1",
+                                                    "operation_id": OP,
+                                                    "operation": kind,
+                                                    "outcome": "expired",
+                                                    "mutation": "unknown",
+                                                    "code": "dispatch_expired"
+                                                });
+                                                envelope["operation"] = operation;
+                                            }
+                                            RefusalContradiction::UnknownMutation => {
+                                                envelope["mutation"] = json!("unknown");
+                                            }
+                                            RefusalContradiction::UnknownOutcome => {
+                                                envelope["outcome"] = json!("expired");
+                                            }
+                                        }
+                                    }
+                                    Action4xxReply::Blocking(state, fault) => {
+                                        assert!(matches!(
+                                            mutation,
+                                            Mutation::Install | Mutation::Update | Mutation::Revoke
+                                        ));
+                                        status = 409;
+                                        envelope = blocking_operation_response(state);
+                                        header =
+                                            format!("X-Hosted-App-Operation-Id: {BLOCKER_OP}\r\n");
+                                        match fault {
+                                            BlockerFault::None => {}
+                                            BlockerFault::Plain => {
+                                                envelope
+                                                    .as_object_mut()
+                                                    .unwrap()
+                                                    .remove("operation");
+                                                // Even a header equal to this request's UUID is
+                                                // not proof when the blocker body is absent.
+                                                header =
+                                                    format!("X-Hosted-App-Operation-Id: {OP}\r\n");
+                                            }
+                                            BlockerFault::Incomplete => {
+                                                envelope["operation"]
+                                                    .as_object_mut()
+                                                    .unwrap()
+                                                    .remove("consent");
+                                            }
+                                            BlockerFault::ForeignWorkspace => {
+                                                envelope["operation"]["workspace_id"] =
+                                                    json!("ws_another_company");
+                                            }
+                                            BlockerFault::ForeignApp => {
+                                                envelope["operation"]["app"] = json!("another-app");
+                                            }
+                                            BlockerFault::HeaderMismatch => {
+                                                // Header is valid but disagrees with the blocker.
+                                                header =
+                                                    format!("X-Hosted-App-Operation-Id: {OP}\r\n");
+                                            }
+                                            BlockerFault::MissingHeader => header.clear(),
+                                            BlockerFault::MalformedHeader => {
+                                                header =
+                                                    "X-Hosted-App-Operation-Id: not-a-uuid\r\n"
+                                                        .into();
+                                            }
+                                        }
+                                    }
+                                    Action4xxReply::TenantRevokeUnsupported => {
+                                        assert!(matches!(mutation, Mutation::Revoke));
+                                        status = 409;
+                                        // The current tenant producer does not assign an
+                                        // operation header when it refuses unsupported revoke.
+                                        header.clear();
+                                        envelope = json!({"ok": false, "error": {
+                                            "code": "revoke_unsupported",
+                                            "message": "This board has no package approval to revoke. Nothing was changed. Disable the app on the board instead."
+                                        }});
+                                    }
+                                }
+                                let bytes = serde_json::to_vec(&envelope).unwrap();
+                                let length = bytes.len();
+                                (status, bytes, length, header)
                             }
                             Reply::Unproved503(code) => {
                                 let bytes = serde_json::to_vec(&json!({
@@ -5461,6 +5735,445 @@ mod cad2009_hosted_app_acceptance {
             );
             assert_unknown(&output, mutation, reply);
         }
+    }
+    // Independently authored CAD-2009 Spec/security acceptance; do not weaken.
+    #[test]
+    fn cad2009_app_proven_refusal_with_conflicting_evidence_is_unknown_without_replay() {
+        let fixture = Fixture::new();
+        for mutation in [
+            Mutation::Install,
+            Mutation::Update,
+            Mutation::Revoke,
+            Mutation::Reconcile,
+        ] {
+            for flat in [false, true] {
+                for conflict in [
+                    RefusalContradiction::DataSucceeded,
+                    RefusalContradiction::OperationDispatched,
+                    RefusalContradiction::OperationExpired,
+                    RefusalContradiction::UnknownMutation,
+                    RefusalContradiction::UnknownOutcome,
+                ] {
+                    let reply = Reply::Action4xx(Action4xxReply::Contradictory(conflict, flat));
+                    let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                    assert_eq!(
+                        requests,
+                        vec![mutation.body()],
+                        "{mutation:?}/{flat}/{conflict:?}: no replay"
+                    );
+                    assert_eq!(
+                        effects,
+                        vec![mutation.body()],
+                        "conflicting proof must not erase the recorded effect or observation"
+                    );
+                    assert_unknown(&output, mutation, reply);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_app_tenant_revoke_unsupported_is_definite_without_effect_or_replay() {
+        let fixture = Fixture::new();
+        let mutation = Mutation::Revoke;
+        let reply = Reply::Action4xx(Action4xxReply::TenantRevokeUnsupported);
+        let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+        assert_eq!(
+            requests,
+            vec![mutation.body()],
+            "unsupported revoke must not be replayed or replaced with disable"
+        );
+        assert!(
+            effects.is_empty(),
+            "the tenant refuses before journal begin or activation"
+        );
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        let response: Value = serde_json::from_slice(&output.stdout)
+            .expect("a proven tenant refusal must retain the original JSON response");
+        assert_eq!(
+            response,
+            json!({"ok": false, "error": {
+                "code": "revoke_unsupported",
+                "message": "This board has no package approval to revoke. Nothing was changed. Disable the app on the board instead."
+            }})
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("\"kind\":\"unknown\""));
+    }
+    // Independently authored CAD-2009 Spec/security acceptance; do not weaken.
+    #[test]
+    fn cad2009_app_reported_blocker_stays_unknown_and_retains_both_recovery_identities() {
+        let fixture = Fixture::new();
+        assert_ne!(OP, BLOCKER_OP);
+        for mutation in [Mutation::Install, Mutation::Update, Mutation::Revoke] {
+            for state in ["prepared", "dispatched"] {
+                // A changed well-formed app name cannot be proved foreign
+                // from listing_id or install_id in this request schema.
+                for fault in [BlockerFault::None, BlockerFault::ForeignApp] {
+                    let reply = Reply::Action4xx(Action4xxReply::Blocking(state, fault));
+                    let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                    assert_eq!(requests, vec![mutation.body()], "{mutation:?}/{state}/{fault:?}: no replay, substituted action or extra catalogue read");
+                    assert_eq!(
+                        effects,
+                        vec![mutation.body()],
+                        "a reported blocker must not erase a possible current-attempt effect"
+                    );
+                    assert_unknown(&output, mutation, reply);
+                    let guidance = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&output.stderr),
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                    // The existing helper already requires the requested OP,
+                    // same-org scope, exit 1 and no-blind-replay guidance.
+                    // A coherent same-workspace report adds a recovery hint;
+                    // it never replaces OP or proves the blocker had no effect.
+                    assert!(
+                        guidance.contains(BLOCKER_OP),
+                        "retain the reported blocker identity: {guidance}"
+                    );
+                    assert!(
+                        guidance.contains(&format!("app catalog operation {BLOCKER_OP}")),
+                        "reported blocker must be inspectable: {guidance}"
+                    );
+                    assert!(
+                        guidance.contains(&format!("app catalog reconcile {BLOCKER_OP}")),
+                        "reported blocker must be recoverable without replay: {guidance}"
+                    );
+                    let rendered = guidance.to_ascii_lowercase();
+                    for false_claim in [
+                        "nothing was changed",
+                        "not_started",
+                        "blocker was not applied",
+                    ] {
+                        assert!(
+                            !rendered.contains(false_claim),
+                            "unbound pending report proves no no-effect outcome: {guidance}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_app_unproved_blockers_remain_unknown_without_replay() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update, Mutation::Revoke] {
+            for state in ["prepared", "dispatched"] {
+                for fault in [
+                    BlockerFault::Plain,
+                    BlockerFault::Incomplete,
+                    BlockerFault::ForeignWorkspace,
+                    BlockerFault::ForeignApp,
+                    BlockerFault::HeaderMismatch,
+                    BlockerFault::MissingHeader,
+                    BlockerFault::MalformedHeader,
+                ] {
+                    let reply = Reply::Action4xx(Action4xxReply::Blocking(state, fault));
+                    let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                    assert_eq!(
+                        requests,
+                        vec![mutation.body()],
+                        "{mutation:?}/{state}/{fault:?}: no replay"
+                    );
+                    assert_eq!(
+                        effects,
+                        vec![mutation.body()],
+                        "invalid blocker proof must not erase a possible current-attempt effect"
+                    );
+                    assert_unknown(&output, mutation, reply);
+                }
+            }
+        }
+    }
+    // Independently authored CAD-2009 Spec/security acceptance; do not weaken.
+    // Historical producer: AgenticOS head marker
+    // 5f3ba80b2a2760eb3f24c714744d772a72a79bdc.
+    #[test]
+    fn cad2009_app_action_postdispatch_409s_are_unknown_without_replay() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update] {
+            let refused = if matches!(mutation, Mutation::Install) {
+                "install_refused"
+            } else {
+                "update_refused"
+            };
+            for code in [refused, "host_incompatible"] {
+                let reply = Reply::Action4xx(Action4xxReply::PostDispatch(code));
+                let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                assert_eq!(
+                    requests,
+                    vec![mutation.body()],
+                    "{mutation:?}/{code}: no replay"
+                );
+                assert_eq!(
+                    effects,
+                    vec![mutation.body()],
+                    "original effect was recorded before the ambiguous reply"
+                );
+                assert_unknown(&output, mutation, reply);
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_app_action_unusable_or_unrecognized_4xx_are_unknown_without_replay() {
+        let fixture = Fixture::new();
+        let mut cases = vec![
+            Action4xxReply::EmptyObject,
+            Action4xxReply::Array,
+            Action4xxReply::Null,
+            Action4xxReply::MissingError,
+            Action4xxReply::MissingCode,
+            Action4xxReply::NonStringCode,
+            Action4xxReply::MissingMessage,
+            Action4xxReply::NonStringMessage,
+            Action4xxReply::EmptyMessage,
+            Action4xxReply::WrongOk,
+            Action4xxReply::WrongStatus,
+            Action4xxReply::ForeignHeader,
+            Action4xxReply::MalformedHeader,
+        ];
+        cases.extend(
+            [400, 401, 403, 404, 409, 410, 413, 422]
+                .into_iter()
+                .map(Action4xxReply::Unrecognized),
+        );
+        for mutation in [
+            Mutation::Install,
+            Mutation::Update,
+            Mutation::Revoke,
+            Mutation::Reconcile,
+        ] {
+            for &case in &cases {
+                let reply = Reply::Action4xx(case);
+                let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                assert_eq!(
+                    requests,
+                    vec![mutation.body()],
+                    "{mutation:?}/{case:?}: no replay"
+                );
+                assert_eq!(
+                    effects,
+                    vec![mutation.body()],
+                    "unproved answer must not erase the original effect"
+                );
+                assert_unknown(&output, mutation, reply);
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_app_action_source_proven_4xx_stay_definite_without_effect_or_replay() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update] {
+            for case in [
+                Action4xxReply::PreEffect(400, "invalid_request"),
+                Action4xxReply::PreEffect(403, "owner_only"),
+                Action4xxReply::PreEffect(404, "not_found"),
+                Action4xxReply::PreEffect(409, "operation_not_dispatched"),
+                Action4xxReply::PreEffect(409, "release_unavailable"),
+                Action4xxReply::PreEffectAuth(401, "unauthorized"),
+                Action4xxReply::PreEffectAuth(403, "forbidden"),
+                Action4xxReply::PreEffectAuth(403, "human_session_required"),
+            ] {
+                let reply = Reply::Action4xx(case);
+                let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                assert_eq!(
+                    requests,
+                    vec![mutation.body()],
+                    "{mutation:?}/{case:?}: no replay"
+                );
+                assert!(
+                    effects.is_empty(),
+                    "source-proven refusal preceded the effect"
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(3),
+                    "{mutation:?}/{case:?}: {output:?}"
+                );
+                let response: Value = serde_json::from_slice(&output.stdout)
+                    .expect("a proven refusal must retain the original JSON response");
+                let code = match case {
+                    Action4xxReply::PreEffect(_, code) => response["error"]["code"] == code,
+                    Action4xxReply::PreEffectAuth(_, code) => response["code"] == code,
+                    _ => unreachable!(),
+                };
+                assert!(code, "wrong refusal returned: {response}");
+                assert_eq!(response["ok"], false);
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("\"kind\":\"unknown\""));
+            }
+        }
+    }
+    // Independently authored CAD-2009 Spec/security acceptance; do not weaken.
+    #[test]
+    fn cad2009_web_status_cli_honors_compact_and_pretty_through_daemon_rpc() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let expected = json!({
+            "phase": "status",
+            "org": ORG,
+            "site": "synthetic-site",
+            "siteId": "site_000000002009",
+            "revision": 4,
+            "state": "ready",
+            "liveUrl": null,
+            "nested": {"ready": true, "values": [1, 2]}
+        });
+        let mut parsed = Vec::new();
+        for format in ["compact", "pretty"] {
+            let root = tempfile::Builder::new()
+                .prefix("cad2009-web-json-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let config = root.path().join("config/cadence");
+            let auth = config.join("remote-auth");
+            let state = root.path().join("state");
+            fs::create_dir_all(&auth).unwrap();
+            fs::create_dir(&state).unwrap();
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o700)).unwrap();
+            private_file(
+                &config.join("orgs.json"),
+                &serde_json::to_vec(&json!({
+                    "selected": {"org": ORG},
+                    "connections": [{"selection": {"org": ORG}, "destination": {
+                        "mode": "remote", "endpoint": ENDPOINT, "org_id": WORKSPACE
+                    }}]
+                }))
+                .unwrap(),
+            );
+            let expires = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600;
+            private_file(&auth.join(format!("cli-{ORG}.json")), &serde_json::to_vec(&json!({
+                "version": "hosted-cadence-auth.v1", "organization_id": WORKSPACE,
+                "organization_slug": ORG, "audience": ENDPOINT,
+                "issuer": "https://issuer.board.localhost", "subject_id": "user_cad2009_synthetic",
+                "capabilities": ["web.read"], "access_token": TOKEN, "expires_at": expires
+            })).unwrap());
+
+            let listener = UnixListener::bind(cadence_agent::client::socket_path(&state)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (mut completion, completed) = UnixStream::pair().unwrap();
+            let document = expected.clone();
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut requests = Vec::new();
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "web JSON CLI fixture did not settle");
+                    let mut fds = [
+                        libc::pollfd {
+                            fd: listener.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: completed.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: both initialized pollfd entries refer to live owned descriptors.
+                    let ready = unsafe {
+                        libc::poll(
+                            fds.as_mut_ptr(),
+                            2,
+                            remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+                        )
+                    };
+                    if ready < 0 {
+                        assert_eq!(
+                            std::io::Error::last_os_error().kind(),
+                            std::io::ErrorKind::Interrupted
+                        );
+                        continue;
+                    }
+                    assert!(ready > 0, "web JSON CLI fixture deadline elapsed");
+                    // Drain a queued extra request before accepting subprocess completion.
+                    if fds[0].revents & libc::POLLIN != 0 {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        let mut line = String::new();
+                        BufReader::new(stream.try_clone().unwrap())
+                            .take(65_537)
+                            .read_line(&mut line)
+                            .unwrap();
+                        assert!(line.len() <= 65_536 && line.ends_with('\n'));
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        assert!(
+                            requests.is_empty(),
+                            "unexpected extra daemon request: {request}"
+                        );
+                        assert_eq!(request["method"], "platform_call");
+                        assert_eq!(
+                            request["params"],
+                            json!({
+                                "platform": "agenticos-web", "tool": "site_status", "account": ORG,
+                                "input": {"org": ORG, "slug": "synthetic-site", "wake_timeout": 3}
+                            })
+                        );
+                        requests.push(request);
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"ok": true, "result": {
+                                "result": "executed", "effect": "read", "platform_result": document
+                            }})
+                        )
+                        .unwrap();
+                    } else if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                        return requests;
+                    } else {
+                        panic!("unexpected web JSON fixture readiness");
+                    }
+                }
+            });
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+            command
+                .env_clear()
+                .current_dir(root.path())
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_STATE_HOME", root.path().join("xdg-state"))
+                .env("CADENCE_JSON", format)
+                .args(["--org", ORG, "--wake-timeout", "3", "--state-dir"])
+                .arg(&state)
+                .args(["web", "status", "synthetic-site"]);
+            let output = bounded_output(&mut command);
+            completion.write_all(b"done").unwrap();
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(output.status.code(), Some(0), "{format}: {output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            let value: Value = serde_json::from_str(&text).expect("exactly one full JSON document");
+            assert_eq!(value, expected, "format selection changed the document");
+            if format == "compact" {
+                assert_eq!(
+                    text.lines().count(),
+                    1,
+                    "compact web JSON was multiline: {text:?}"
+                );
+            } else {
+                assert!(
+                    text.lines().count() > 1,
+                    "pretty web JSON was not pretty: {text:?}"
+                );
+            }
+            assert!(text.ends_with('\n'));
+            parsed.push(value);
+        }
+        assert_eq!(parsed[0], parsed[1]);
     }
     #[test]
     fn cad2009_hosted_app_effectful_unusable_replies_are_unknown_and_not_replayed() {

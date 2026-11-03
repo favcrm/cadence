@@ -12,26 +12,139 @@ pub struct AppReply {
     pub operation_id: Option<String>,
 }
 
-fn unknown_outcome(target: &RemoteTarget, operation_id: Option<&str>) -> Error {
-    match operation_id {
-        Some(id) => Error::unknown(format!(
+fn unknown_outcome(
+    target: &RemoteTarget,
+    operation_id: Option<&str>,
+    reported_blocker: Option<&str>,
+) -> Error {
+    let mut message = match operation_id {
+        Some(id) => format!(
             "hosted app mutation outcome is unknown; in the same workspace inspect \
              `cadence --org {} app catalog operation {id}` and reconcile with \
              `cadence --org {} app catalog reconcile {id}` before deciding what to do; \
              do not retry blindly",
             target.org, target.org
-        )),
-        None => Error::unknown(format!(
+        ),
+        None => format!(
             "hosted app mutation outcome is unknown and no usable operation ID was supplied; \
              inspect `cadence --org {} app catalog ls` and consult the workspace owner \
              before retrying",
             target.org
-        )),
+        ),
+    };
+    if let Some(id) = reported_blocker {
+        use std::fmt::Write as _;
+        let _ = write!(
+            message,
+            "; the server also reported a pending operation in this workspace; inspect \
+             `cadence --org {} app catalog operation {id}` and \
+             `cadence --org {} app catalog reconcile {id}`",
+            target.org, target.org
+        );
     }
+    Error::unknown(message)
 }
 
 fn nonempty(value: &Value) -> bool {
     value.as_str().is_some_and(|text| !text.is_empty())
+}
+
+/// These route/status/code combinations are proved by the hosted producers
+/// to refuse this app request without applying its native mutation. A refusal
+/// to reconcile cannot settle the outcome of an earlier request.
+fn proven_app_refusal(suffix: &str, status: u16, answer: &Value) -> bool {
+    if !matches!(suffix, "/action" | "/revoke") {
+        return false;
+    }
+    let Some(reply) = answer.as_object() else {
+        return false;
+    };
+    if reply.get("ok") != Some(&Value::Bool(false))
+        || reply.contains_key("data")
+        || reply.contains_key("operation")
+        || reply.contains_key("mutation")
+        || reply.contains_key("outcome")
+    {
+        return false;
+    }
+    if let (None, Some(code)) = (
+        reply.get("error"),
+        reply.get("code").and_then(Value::as_str),
+    ) {
+        return matches!(
+            (status, code),
+            (401, "unauthorized") | (403, "forbidden" | "human_session_required")
+        );
+    }
+    let Some(error) = reply.get("error").and_then(Value::as_object) else {
+        return false;
+    };
+    if reply.contains_key("code")
+        || error.contains_key("mutation")
+        || error.contains_key("outcome")
+        || error.contains_key("operation_id")
+        || !error.get("message").is_some_and(nonempty)
+    {
+        return false;
+    }
+    let Some(code) = error.get("code").and_then(Value::as_str) else {
+        return false;
+    };
+    matches!(
+        (status, code),
+        (400, "invalid_request")
+            | (401, "unauthorized")
+            | (
+                403,
+                "owner_only"
+                    | "forbidden"
+                    | "human_session_required"
+                    | "membership_changed"
+                    | "tenant_mismatch"
+                    | "tenant_binding_required"
+            )
+            | (404, "not_found")
+            | (
+                409,
+                "operation_conflict"
+                    | "operation_not_dispatched"
+                    | "stale_installation"
+                    | "runtime_stopped"
+            )
+            | (410, "runtime_retired")
+            | (429, "wake_cooldown")
+    ) || (suffix == "/action"
+        && matches!(
+            (status, code),
+            (400, "validation_failed" | "installation_invalid")
+                | (403, "owner_required" | "installation_forbidden")
+                | (
+                    409,
+                    "release_mismatch"
+                        | "release_unavailable"
+                        | "catalog_ambiguous"
+                        | "catalogue_identity"
+                        | "already_current"
+                        | "downgrade_refused"
+                        | "review_changed"
+                        | "review_stale"
+                        | "update_blocked"
+                        | "access_unknown"
+                        | "package_unreadable"
+                        | "digest_mismatch"
+                        | "not_installable"
+                        | "tenant_placement_changed"
+                        | "installation_stale"
+                        | "app_storage_refused"
+                )
+                | (413, "payload_too_large")
+                | (503, "release_unavailable" | "check_unavailable")
+        ))
+        || (suffix == "/revoke"
+            && matches!(
+                (status, code),
+                (409, "revoke_unsupported" | "revoke_refused")
+            ))
 }
 
 fn sha256_hex(value: &str) -> bool {
@@ -105,6 +218,43 @@ fn confirmed_operation(target: &RemoteTarget, data: &Value, expected_id: &str) -
         }
         _ => false,
     }
+}
+
+/// A reported blocker is a recovery hint, not proof that it belongs to this
+/// request: the wire receipt omits the listing/install identity needed to
+/// establish that relationship.
+fn reported_blocker<'a>(
+    target: &RemoteTarget,
+    suffix: &str,
+    status: u16,
+    header: Option<&str>,
+    answer: &'a Value,
+) -> Option<&'a str> {
+    if !matches!(suffix, "/action" | "/revoke")
+        || status != 409
+        || answer["ok"] != false
+        || answer["error"]["code"] != "operation_in_progress"
+        || !nonempty(&answer["error"]["message"])
+        || answer.get("data").is_some()
+        || answer.get("mutation").is_some()
+        || answer.get("outcome").is_some()
+        || answer["error"].get("mutation").is_some()
+        || answer["error"].get("outcome").is_some()
+        || answer["error"].get("operation_id").is_some()
+    {
+        return None;
+    }
+    let operation = answer.get("operation")?;
+    let id = operation["operation_id"].as_str()?;
+    if id.len() != 36
+        || uuid::Uuid::parse_str(id).is_err()
+        || header != Some(id)
+        || !confirmed_operation(target, operation, id)
+        || !matches!(operation["state"].as_str(), Some("prepared" | "dispatched"))
+    {
+        return None;
+    }
+    Some(id)
 }
 
 fn confirmed_mutation(
@@ -236,7 +386,7 @@ pub fn request(
     .filter(|value| valid_id(value));
     let failure = |message: &str| {
         if mutating {
-            unknown_outcome(target, requested_id)
+            unknown_outcome(target, requested_id, None)
         } else {
             Error::rejected(message)
         }
@@ -296,7 +446,7 @@ pub fn request(
         .read_to_end(&mut bytes)
         .map_err(|error| {
             if mutating {
-                unknown_outcome(target, requested_id)
+                unknown_outcome(target, requested_id, None)
             } else {
                 error.into()
             }
@@ -306,23 +456,14 @@ pub fn request(
     }
     let answer: Value =
         serde_json::from_slice(&bytes).map_err(|_| failure("hosted app response was not JSON"))?;
-    // Both the current tenant and the prior hosted app protocol produce
-    // these two /action refusals before any app operation is dispatched.
-    let proven_pre_effect = suffix == "/action"
-        && status == 503
-        && answer["ok"] == false
-        && answer.pointer("/error/message").is_some_and(nonempty)
-        && matches!(
-            answer.pointer("/error/code").and_then(Value::as_str),
-            Some("release_unavailable" | "check_unavailable")
-        )
-        && (!has_operation_header
-            || operation_id
-                .as_deref()
-                .is_some_and(|id| Some(id) == requested_id));
+    let matching_header = !has_operation_header
+        || operation_id
+            .as_deref()
+            .is_some_and(|id| Some(id) == requested_id);
+    let proven_refusal = matching_header && proven_app_refusal(suffix, status, &answer);
     if mutating
         && (status == 202
-            || (status >= 500 && !proven_pre_effect)
+            || (!(200..300).contains(&status) && !proven_refusal)
             || matches!(
                 answer.pointer("/error/code").and_then(Value::as_str),
                 Some("outcome_uncertain" | "operation_expired")
@@ -338,7 +479,8 @@ pub fn request(
                     &answer,
                 )))
     {
-        return Err(unknown_outcome(target, requested_id));
+        let blocker = reported_blocker(target, suffix, status, operation_id.as_deref(), &answer);
+        return Err(unknown_outcome(target, requested_id, blocker));
     }
     Ok(AppReply {
         status,
