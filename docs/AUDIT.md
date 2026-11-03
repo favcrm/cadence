@@ -301,9 +301,11 @@ On the default store, daemon operator verbs, rollout verbs and the board's
 peer proof also refuse a caller with a known coding-agent runtime variable on
 its ancestry (CAD-2059). This is a guardrail against accidents, not a boundary:
 an agent that scrubs its environment, or starts through `systemd-run`, cron or
-`ssh localhost`, still passes. Other stores are not covered. The daemon and
-board strip these variables when they start, because a service started from an
-agent's shell is not that agent, so an agent-started board still passes.
+`ssh localhost`, still passes. Other stores are not covered. `cadence daemon
+start` and `cadence ui start` strip these variables from the service they start,
+because a service started from an agent's shell is not that agent, so a board
+started that way still passes. A direct `cadence ui run` from an agent's shell is
+not stripped, and neither is a marked board that outlives a daemon restart.
 
 Board writes moved first (CAD-313, ADR 0004 phase 1): the board's
 operator is the holder of a session opened with a `cadence ui login`
