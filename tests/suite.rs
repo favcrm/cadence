@@ -13385,13 +13385,14 @@ mod cad2064_artifact_acceptance {
     }
 
     fn openssl(dir: &Path, args: &[&str]) {
-        let status = Command::new("openssl")
+        let mut command = Command::new("openssl");
+        command
             .current_dir(dir)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::null());
+        let status = cadence_agent::reaper::status(&mut command)
             .expect("openssl is required for CAD-2064's disposable TLS fixture");
         assert!(status.success(), "openssl fixture step failed: {args:?}");
     }
@@ -13899,5 +13900,50 @@ mod cad2064_artifact_acceptance {
         }
         let board = Board::new(pages);
         assert_refused(&board, false, 2);
+    }
+
+    #[test]
+    fn valid_padded_base64_pages_preserve_exact_bytes_and_pin_version() {
+        let mut pages = valid_pages();
+        // Independent literal encodings: "ab" and "cdef", both padded.
+        pages[0]["content_base64"] = json!("YWI=");
+        pages[1]["offset"] = json!(2);
+        pages[1]["content_base64"] = json!("Y2RlZg==");
+        let board = Board::new(pages);
+        let output = board.run(false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        {
+            let calls = board.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            for call in calls.iter() {
+                assert_eq!(call["verb"], "artifact_read");
+            }
+            assert_eq!(
+                calls[0]["arguments"],
+                json!({
+                    "id": REQUESTED_ID, "offset": 0
+                })
+            );
+            assert_eq!(
+                calls[1]["arguments"],
+                json!({
+                    "id": REQUESTED_ID, "offset": 2, "version": VERSION
+                })
+            );
+        }
+        let destination = board.home.path().join("download.bin");
+        assert_eq!(fs::read(&destination).unwrap(), BYTES);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["file"]["id"], REQUESTED_ID);
+        assert_eq!(receipt["file"]["version"], VERSION);
+        assert_eq!(receipt["written"], destination.to_str().unwrap());
     }
 }
