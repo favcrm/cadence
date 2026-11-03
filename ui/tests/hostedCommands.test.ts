@@ -194,7 +194,7 @@ async function main() {
   await React.act(async () => { root.render(null); });
   await settle();
   function Pane() {
-    const actor = useConversationActor({ data: paneMaster, status: "ready" } as never, false, "app-a", null);
+    const actor = useConversationActor({ data: { ...master, actor_identity: paneMaster.actor_identity }, status: "ready" } as never, false, "app-a", null);
     return React.createElement(AssistantActorProvider, { actor, children: React.createElement(AssistantAboutButton) });
   }
   await React.act(async () => { root.render(React.createElement(LocaleProvider, null, React.createElement(Pane))); });
