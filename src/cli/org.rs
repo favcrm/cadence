@@ -1,7 +1,7 @@
 //! CAD-1019 slice 1a: a slim org registry — user preference, never authority.
 //!
-//! `orgs.json` under `$XDG_CONFIG_HOME/cadence` (or `~/.config/cadence`)
-//! holds the operator's org/connection selection. It is a preference file:
+//! `orgs.json` in the resolved consolidated or legacy config root holds the
+//! operator's org/connection selection. It is a preference file:
 //! nothing in it is a credential, and remote authority is enforced
 //! server-side by the device grant's audience/org binding. Writes therefore
 //! carry **no operator proof** — a preference can be set by any process the
@@ -854,11 +854,9 @@ fn settle(
 /// checks without taking or creating `orgs.lock`. Both fail closed: only a
 /// genuinely absent first-use path is "no registry" — a dangling symlink
 /// (including one in the config root above the registry), a permission error
-/// and a non-file all refuse. A config root this process declared but cannot
-/// use (a relative `XDG_CONFIG_HOME`, a `HOME` that is not absolute) is a
-/// broken selection, not an absent one, so it refuses too; with neither `HOME`
-/// nor `XDG_CONFIG_HOME` set there is nowhere a registry could be kept, and a
-/// local read still answers.
+/// and a non-file all refuse. A declared but unusable config, home or sandbox
+/// root is a broken selection, not an absent one. With no declared root at
+/// all, a local read still answers.
 fn read_selection_registry(mode: RegistryMode) -> Result<Option<Registry>> {
     let Some(path) = selection_registry_path()? else {
         return Ok(None);
@@ -880,10 +878,8 @@ fn read_selection_registry(mode: RegistryMode) -> Result<Option<Registry>> {
 }
 
 /// The registry path this process would use, or `None` when it declared no
-/// config root at all (`XDG_CONFIG_HOME`, else `HOME`) — nowhere a registry
-/// could be kept, so a local caller still answers. A root this process did
-/// declare but that cannot hold an absolute registry path is a broken
-/// selection and refuses here, before any local state is materialized.
+/// home, config root or sandbox. A declared but unusable root is a broken
+/// selection and refuses before any local state is materialized.
 fn selection_registry_path() -> Result<Option<PathBuf>> {
     match RegistryFile::path() {
         Ok(path) => Ok(Some(path)),
@@ -970,13 +966,13 @@ fn read_present_registry(path: &Path) -> Result<Registry> {
     present_registry(read_registry_raw(path)?)
 }
 
-/// Whether this process said where its config lives — `XDG_CONFIG_HOME`, else
-/// `HOME`. A registry path that cannot be built from a declared root is a
-/// broken selection; with neither set there is nowhere to keep one.
+/// Whether this process declared a home or config root, including a sandbox.
+/// A declared root that cannot be resolved is broken, not an absent registry.
 fn config_root_declared() -> bool {
-    ["XDG_CONFIG_HOME", "HOME"]
+    ["XDG_CONFIG_HOME", "HOME", "CADENCE_HOME"]
         .iter()
         .any(|name| std::env::var_os(name).is_some())
+        || cadence_agent::sandbox::profile().is_some()
 }
 
 /// The local state dir a caller that needs one materializes: an explicit pin,
@@ -1286,7 +1282,7 @@ pub(crate) enum OrgAction {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
@@ -1294,7 +1290,7 @@ mod tests {
     const EP_A: &str = "https://alpha.cadencecloud.app";
     const EP_B: &str = "https://beta.cadencecloud.app";
 
-    static RESOLVE_ENV: Mutex<()> = Mutex::new(());
+    pub(in crate::cli) static RESOLVE_ENV: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         home: tempfile::TempDir,
@@ -1371,6 +1367,197 @@ mod tests {
                 "destination": {"mode": "remote", "endpoint": endpoint, "org_id": org_id},
             }],
         })
+    }
+
+    // CAD-2009: independent integration acceptance; preserve these expectations.
+    #[test]
+    fn cad2009_home_registry_resolution_preserves_declared_root_refusals() {
+        const CHILD: &str = "CAD2009_HOME_REGISTRY_CASE";
+        const ROOT: &str = "CAD2009_HOME_REGISTRY_FIXTURE";
+        const DONE: &str = "CAD2009_HOME_REGISTRY_CHILD_EXERCISED";
+        const TEST: &str =
+            "cli::org::tests::cad2009_home_registry_resolution_preserves_declared_root_refusals";
+
+        let Some(case) = std::env::var_os(CHILD) else {
+            for case in [
+                "all-unset",
+                "xdg-only",
+                "cadence-home-only",
+                "invalid-cadence-home-only",
+                "invalid-cadence-home-xdg",
+                "symlink-cadence-home-only",
+                "symlink-cadence-home-xdg",
+                "relative-home-xdg",
+                "sandbox-invalid-base-xdg",
+                "sandbox-no-home-xdg",
+                "sandbox-overlap-xdg",
+                "sandbox-valid",
+                "fresh-exported-xdg",
+            ] {
+                let fixture = tempfile::tempdir().unwrap();
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env_clear()
+                    .env(CHILD, case)
+                    .env(ROOT, fixture.path())
+                    .env("PATH", "/usr/bin:/bin")
+                    .current_dir(fixture.path())
+                    .stdin(std::process::Stdio::null());
+                let output = cadence_agent::reaper::output(&mut command).unwrap();
+                assert!(
+                    output.status.success(),
+                    "case {case}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains(DONE),
+                    "case {case}: the exact child acceptance did not execute"
+                );
+            }
+            return;
+        };
+        let case = case.to_str().unwrap();
+        let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+        let home = root.join("home");
+        let xdg = root.join("xdg");
+        let install = root.join("install");
+        let base = root.join("sandboxes");
+        let sandbox = base.join("marked");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::write(sandbox.join(".cadence-sandbox"), br#"{"name":"marked"}"#).unwrap();
+
+        let write_local = |config: &Path, name: &str| {
+            std::fs::create_dir_all(config).unwrap();
+            let raw = serde_json::to_vec(&json!({
+                "selected": {"org": name},
+                "connections": [{
+                    "selection": {"org": name},
+                    "destination": {
+                        "mode": "local",
+                        "state_dir": root.join("unused-state"),
+                        "tracker_dir": root.join("unused-tracker")
+                    }
+                }]
+            }))
+            .unwrap();
+            let path = config.join("orgs.json");
+            std::fs::write(&path, &raw).unwrap();
+            (path, raw)
+        };
+        let mut originals = vec![
+            write_local(&install.join("config"), "home-fixture"),
+            write_local(&sandbox.join("config"), "sandbox-fixture"),
+        ];
+        if case != "fresh-exported-xdg" {
+            originals.push(write_local(&xdg.join("cadence"), "xdg-fixture"));
+        }
+        std::os::unix::fs::symlink(&install, root.join("linked-install")).unwrap();
+
+        // All environment changes below occur only in this isolated child.
+        if !matches!(
+            case,
+            "all-unset"
+                | "cadence-home-only"
+                | "invalid-cadence-home-only"
+                | "symlink-cadence-home-only"
+        ) {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        }
+        match case {
+            "cadence-home-only" => std::env::set_var("CADENCE_HOME", &install),
+            "invalid-cadence-home-only" | "invalid-cadence-home-xdg" => {
+                std::env::set_var("CADENCE_HOME", "relative-install");
+            }
+            "symlink-cadence-home-only" | "symlink-cadence-home-xdg" => {
+                std::env::set_var("CADENCE_HOME", root.join("linked-install"));
+            }
+            "relative-home-xdg" => std::env::set_var("HOME", "relative-home"),
+            "sandbox-invalid-base-xdg" => {
+                std::env::set_var("CADENCE_PROFILE", "sandbox:marked");
+                std::env::set_var("CADENCE_SANDBOX_ROOT", "relative-base");
+            }
+            "sandbox-no-home-xdg" | "sandbox-overlap-xdg" | "sandbox-valid" => {
+                std::env::set_var("CADENCE_PROFILE", "sandbox:marked");
+                std::env::set_var("CADENCE_SANDBOX_ROOT", &base);
+                if case != "sandbox-no-home-xdg" {
+                    std::env::set_var("HOME", &home);
+                }
+                if case == "sandbox-overlap-xdg" {
+                    std::env::set_var("CADENCE_HOME", &sandbox);
+                }
+            }
+            "fresh-exported-xdg" => std::env::set_var("HOME", &home),
+            "all-unset" | "xdg-only" => {}
+            _ => panic!("unknown case {case}"),
+        }
+
+        let expected = match case {
+            "xdg-only" => Some((xdg.join("cadence"), Some("xdg-fixture"))),
+            "cadence-home-only" => Some((install.join("config"), Some("home-fixture"))),
+            "sandbox-valid" => Some((sandbox.join("config"), Some("sandbox-fixture"))),
+            "fresh-exported-xdg" => Some((home.join(".cadence/config"), None)),
+            _ => None,
+        };
+        let allowed_login_lock = expected
+            .as_ref()
+            .filter(|(_, selected)| selected.is_some())
+            .map(|(config, _)| config.join("orgs.lock"));
+        if let Some((config, selected)) = expected {
+            assert_eq!(cadence_agent::home::config_dir().unwrap(), config, "{case}");
+            assert_eq!(
+                selected_org_readonly().unwrap().as_deref(),
+                selected,
+                "{case}"
+            );
+            for (path, _) in &originals {
+                assert!(
+                    !path.parent().unwrap().join("orgs.lock").exists(),
+                    "{case}: read-only selection created a registry lock"
+                );
+            }
+            // Every stored fixture is local: this must not need credentials.
+            assert!(saved_login_token(None).unwrap().is_none(), "{case}");
+        } else if case == "all-unset" {
+            assert!(cadence_agent::home::config_dir().is_err());
+            assert!(selected_org_readonly().unwrap().is_none());
+            assert!(saved_login_token(None).unwrap().is_none());
+        } else {
+            assert!(cadence_agent::home::config_dir().is_err(), "{case}");
+            assert!(
+                selected_org_readonly().is_err(),
+                "{case}: reported no saved org"
+            );
+            assert!(
+                saved_login_token(None).is_err(),
+                "{case}: silently went anonymous"
+            );
+        }
+        for (path, raw) in originals {
+            assert_eq!(std::fs::read(&path).unwrap(), raw, "{case}");
+            let lock = path.parent().unwrap().join("orgs.lock");
+            if lock.exists() {
+                assert_eq!(
+                    allowed_login_lock.as_deref(),
+                    Some(lock.as_path()),
+                    "{case}: saved-login inspection created a lock outside its valid selected root"
+                );
+            }
+        }
+        assert!(!home.join(".cadence").exists(), "{case}");
+        assert!(!home.join("pm").exists(), "{case}");
+        assert!(!root.join("unused-state").exists(), "{case}");
+        assert!(!root.join("unused-tracker").exists(), "{case}");
+        assert!(!root.join("relative-install").exists(), "{case}");
+        assert!(!root.join("relative-home").exists(), "{case}");
+        assert!(!root.join("relative-base").exists(), "{case}");
+        if case == "fresh-exported-xdg" {
+            assert!(!xdg.join("cadence").exists());
+        }
+        println!("{DONE}");
     }
 
     #[test]

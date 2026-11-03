@@ -427,11 +427,12 @@ whether or not it exists yet. A consolidated installation — a genuine first
 run, or one already living in `~/.cadence` — keeps its config under its own
 home even when the variable is exported: writing the first credential into the
 legacy root would make the next run see both layouts and refuse the
-installation as ambiguous. With no `HOME` at all, an absolute
-`XDG_CONFIG_HOME` still names the hosted config root, so hosted-only use needs
-no home. Inside the consolidated home a
-symlinked `~/.cadence`, `~/.cadence/config` or credential directory is refused
-rather than followed.
+installation as ambiguous. With `HOME` absent and no explicit home or
+sandbox profile, an absolute `XDG_CONFIG_HOME` still names the hosted config
+root. An absolute `CADENCE_HOME` without either variable uses its own `config`
+directory. An invalid declared home or stale sandbox profile refuses rather
+than falling back to another root. Inside the consolidated home a symlinked
+`~/.cadence`, `~/.cadence/config` or credential directory is refused.
 
 The state directory holds the daemon socket, so `<state>/cadence.sock` must
 fit the 107-byte Unix socket limit; `setup` and `dev up` refuse a longer path

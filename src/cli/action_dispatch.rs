@@ -26,7 +26,7 @@ pub(super) fn show_register_code(url: &str, code: &str, no_open: bool) -> Result
     open_login_url(url, no_open);
     Ok(())
 }
-fn issued_session_persistence_error(workspace: &str, dir: &Path, error: Error) -> Error {
+pub(super) fn issued_session_persistence_error(workspace: &str, dir: &Path, error: Error) -> Error {
     Error::unknown(format!(
         "a remote session was issued for workspace {workspace}, but local registration \
          could not be confirmed in {}: {error}. Inspect that directory and \

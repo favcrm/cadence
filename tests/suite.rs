@@ -2105,6 +2105,170 @@ fn cad2009_broken_org_registry_never_routes_implicit_work_to_local_tracker() {
 }
 
 // CAD-2009: a consumer closing stdout must not turn a refusal into success.
+// CAD-2009: independently authored; do not add tracker/state to this fixture.
+#[test]
+fn cad2009_fresh_broken_config_ancestry_cannot_return_local_verdicts() {
+    use std::process::Command;
+
+    for case in ["xdg-root", "xdg-cadence", "default-config"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let xdg = root.path().join("xdg");
+        let notes = root.path().join("notes");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&notes).unwrap();
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sentinel = "cad2009-ancestry-sentinel";
+        std::fs::write(
+            notes.join("20261101-120000-synthetic-verdict.md"),
+            format!(
+                "# Verdict: CAD-999 Standards review — pass\n\
+                 > Issue: CAD-999\n\
+                 > From: {sentinel}\n\n\
+                 ## Verdict\n\
+                 pass — PR #5, head {head}\n\n\
+                 Risk: auto\n"
+            ),
+        )
+        .unwrap();
+        let command = || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+            command
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(root.path())
+                .stdin(std::process::Stdio::null())
+                .args([
+                    "audit", "verdicts", "--issue", "CAD-999", "--pr", "5", "--head", head,
+                ])
+                .arg("--notes-dir")
+                .arg(&notes);
+            if case != "default-config" {
+                command.env("XDG_CONFIG_HOME", &xdg);
+            }
+            command
+        };
+        let positive = cadence_agent::reaper::output(&mut command()).unwrap();
+        assert!(
+            positive.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&positive.stderr)
+        );
+        assert!(String::from_utf8_lossy(&positive.stdout).contains(sentinel));
+        assert!(!home.join(".cadence").exists());
+        assert!(!home.join("pm").exists());
+        assert!(!home.join(".local/state/cadence").exists());
+
+        let link = match case {
+            "xdg-root" => xdg.clone(),
+            "xdg-cadence" => {
+                std::fs::create_dir(&xdg).unwrap();
+                xdg.join("cadence")
+            }
+            "default-config" => home.join(".config"),
+            _ => unreachable!(),
+        };
+        let missing = root.path().join("missing-target");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        let refused = cadence_agent::reaper::output(&mut command()).unwrap();
+        assert!(
+            !refused.status.success(),
+            "{case}: broken ancestor returned {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        assert!(!String::from_utf8_lossy(&refused.stdout).contains(sentinel));
+        assert_eq!(std::fs::read_link(&link).unwrap(), missing);
+        assert!(
+            !missing.exists(),
+            "{case}: materialized the dangling target"
+        );
+        assert!(!home.join(".cadence").exists(), "{case}");
+        assert!(!home.join("pm").exists(), "{case}");
+        assert!(!home.join(".local/state/cadence").exists(), "{case}");
+        assert!(!xdg.join("cadence/orgs.lock").exists(), "{case}");
+    }
+}
+
+// CAD-2009: independently authored stale-profile host-isolation acceptance.
+#[test]
+fn cad2009_stale_profile_cannot_read_or_switch_the_host_registry() {
+    use std::process::Command;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let config = home.join(".cadence/config");
+    let base = root.path().join("sandboxes");
+    std::fs::create_dir_all(&config).unwrap();
+    let registry = config.join("orgs.json");
+    let connections = ["host-a", "host-b"].map(|name| {
+        serde_json::json!({
+            "selection": {"org": name},
+            "destination": {
+                "mode": "local",
+                "state_dir": root.path().join("unused-state"),
+                "tracker_dir": root.path().join("unused-tracker")
+            }
+        })
+    });
+    let raw = serde_json::to_vec(&serde_json::json!({
+        "selected": {"org": "host-a"},
+        "connections": connections
+    }))
+    .unwrap();
+    std::fs::write(&registry, &raw).unwrap();
+    let command = |args: &[&str], stale: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(root.path())
+            .stdin(std::process::Stdio::null())
+            .args(args);
+        if stale {
+            command
+                .env("CADENCE_PROFILE", "sandbox:gone")
+                .env("CADENCE_SANDBOX_ROOT", &base);
+        }
+        command
+    };
+    // Prove the synthetic host registry is valid before testing isolation.
+    let positive = cadence_agent::reaper::output(&mut command(&["org", "inspect"], false)).unwrap();
+    assert!(
+        positive.status.success(),
+        "{}",
+        String::from_utf8_lossy(&positive.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&positive.stdout).unwrap();
+    assert_eq!(value["org"], "host-a");
+    assert_eq!(std::fs::read(&registry).unwrap(), raw);
+    // The positive org read legitimately creates its lock; remove only this
+    // test-owned fixture lock so each stale command must refuse before open.
+    std::fs::remove_file(config.join("orgs.lock")).unwrap();
+
+    for args in [
+        vec!["org", "list"],
+        vec!["org", "inspect"],
+        vec!["org", "switch", "host-b"],
+    ] {
+        let refused = cadence_agent::reaper::output(&mut command(&args, true)).unwrap();
+        assert!(
+            !refused.status.success(),
+            "{args:?}: stale profile returned {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let stdout = String::from_utf8_lossy(&refused.stdout);
+        assert!(!stdout.contains("host-a"), "{args:?}: read host selection");
+        assert!(!stdout.contains("host-b"), "{args:?}: read host selection");
+        assert_eq!(std::fs::read(&registry).unwrap(), raw, "{args:?}");
+        assert!(!config.join("orgs.lock").exists(), "{args:?}");
+        assert!(!base.exists(), "{args:?}");
+        assert!(!root.path().join("unused-state").exists(), "{args:?}");
+        assert!(!root.path().join("unused-tracker").exists(), "{args:?}");
+    }
+}
+
 #[test]
 fn cad2009_closed_stdout_preserves_offline_app_check_refusal() {
     use std::os::unix::net::UnixStream;

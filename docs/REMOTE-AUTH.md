@@ -185,14 +185,16 @@ requires explicit `--issuer` and `--org`. Browser login uses PKCE and
 short-lived device codes; denial, expiry, mismatched identity or audience
 refuse before recording the org or credential. Org records use the
 verified workspace slug and canonical `https://<slug>.cadencecloud.app`
-endpoint. Credentials are stored at
-`$XDG_CONFIG_HOME/cadence/remote-auth/cli-<slug>.json` (0600), bound to
-the verified workspace ID and endpoint, and never sent to another host.
+endpoint. Credentials are stored in the resolved config root as
+`remote-auth/cli-<slug>.json` (0600), bound to the verified workspace ID and
+endpoint, and never sent to another host.
 
-An absent org registry permits standalone local operation. A registry that
-cannot be inspected or parsed, or is a symbolic link, refuses implicit
-destination selection instead of silently selecting local state. Explicit
-local state bindings and managed callers keep their existing routing.
+An absent org registry permits standalone local operation. A registry or
+declared config/home root that cannot be inspected or parsed, a dangling
+ancestor, or a symlinked registry refuses implicit destination selection
+instead of silently selecting local state. A stale sandbox profile refuses
+rather than reading the host registry. Explicit local state bindings and managed
+callers keep their existing routing.
 
 ### Advanced custom issuer trust
 
