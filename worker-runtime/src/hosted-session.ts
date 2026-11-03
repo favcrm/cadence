@@ -208,8 +208,7 @@ export class HostedSession<
           // The board flips its link to `live` on a `master` frame and on
           // nothing else, so a stream that never sends one reads
           // "reconnecting" forever — the stale banner then never clears.
-          // This object is the master: it answered, and it holds no live
-          // native turn, so the honest snapshot is idle. A host projection
+          // It reports this object's real turn state. A host projection
           // composes under those runtime fields and cannot replace them.
           send(masterFrame);
           for (const entry of threadEntries(stream.snapshot.entries, thinking))

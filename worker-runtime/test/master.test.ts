@@ -54,7 +54,7 @@ describe("master payload", () => {
     });
     expect(state.queued).toBe(0);
     expect(state.queue).toEqual([]);
-    expect(state.commands).toEqual(["new", "stop"]);
+    expect(state.commands).toEqual(["stop"]);
     // Business identity survives without overriding the runtime's authority.
     expect(state.identity).toEqual({ look: "guard" });
   });
