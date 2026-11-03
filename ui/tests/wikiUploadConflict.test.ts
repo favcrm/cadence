@@ -40,20 +40,23 @@ async function upload(): Promise<unknown> {
   }
 }
 
-// A refused write: the board stored nothing.
-reply = { conflict: "if_rev", current_rev: "newer-rev", path: "global/brief.md" };
-try {
-  await upload();
-  throw new Error("a refused upload was reported as saved");
-} catch (error) {
-  assert(error instanceof WikiError, "the refusal is a WikiError");
-  assert(error.status === 409, "the refusal keeps its conflict status");
+async function main(): Promise<void> {
+  // A refused write: the board stored nothing.
+  reply = { conflict: "if_rev", current_rev: "newer-rev", path: "global/brief.md" };
+  try {
+    await upload();
+    throw new Error("a refused upload was reported as saved");
+  } catch (error) {
+    assert(error instanceof WikiError, "the refusal is a WikiError");
+    assert(error.status === 409, "the refusal keeps its conflict status");
+  }
+  assert(uploads === 1, "the conflict was reported for the upload that was attempted");
+
+  // The same adapter still reports a real save.
+  reply = { kind: "text", rev: "saved-rev", path: "global/brief.md" };
+  const saved = (await upload()) as { outcome: string; index: string };
+  assert(saved.outcome === "applied" && saved.index === "covered", "a stored page is still reported as saved");
+
+  console.log("wiki upload conflict checks passed");
 }
-assert(uploads === 1, "the conflict was reported for the upload that was attempted");
-
-// The same adapter still reports a real save.
-reply = { kind: "text", rev: "saved-rev", path: "global/brief.md" };
-const saved = (await upload()) as { outcome: string; index: string };
-assert(saved.outcome === "applied" && saved.index === "covered", "a stored page is still reported as saved");
-
-console.log("wiki upload conflict checks passed");
+void main();
