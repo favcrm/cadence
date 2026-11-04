@@ -2733,7 +2733,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("`cadence-no-such-pdftotext` is not installed"), "{err}");
+        assert!(
+            err.contains("`cadence-no-such-pdftotext` is not installed"),
+            "{err}"
+        );
         assert!(err.contains("poppler-utils"), "{err}");
         assert!(!err.contains("could not be read"), "{err}");
         assert!(!err.contains("corrupt"), "{err}");
