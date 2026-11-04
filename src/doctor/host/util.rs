@@ -85,8 +85,10 @@ pub(super) fn dir_size_limited(path: &Path, budget: usize) -> (u64, bool, usize)
 }
 
 /// One kill remedy. `comm` and `cwd` belong to another process. They follow a `#`,
-/// but a line break ends that comment and some shells do not treat `#` as one when
-/// interactive, so each is quoted, or `?` when it has no safe printed form.
+/// but a line break ends that comment, and some shells do not treat `#` as one when
+/// interactive, which makes each word an argument to `kill`. So each is quoted, or `?`
+/// when it has no safe printed form, and labelled: a process named `-1` must not
+/// reach `kill` as a bare word, where it would signal everything this user can.
 pub(super) fn kill_line(pid: impl std::fmt::Display, comm: &str, cwd: &str, age: &str) -> String {
     // `?` already means unknown here, so it stays bare.
     let shown = |value: &str| {
@@ -96,7 +98,7 @@ pub(super) fn kill_line(pid: impl std::fmt::Display, comm: &str, cwd: &str, age:
             .unwrap_or_else(|| "?".to_string())
     };
     format!(
-        "kill {pid}  # {}  cwd={}  age={age}",
+        "kill {pid}  # comm={}  cwd={}  age={age}",
         shown(comm),
         shown(cwd)
     )

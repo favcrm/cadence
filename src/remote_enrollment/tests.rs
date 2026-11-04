@@ -1123,7 +1123,7 @@ fn a_reenroll_before_a_committed_bind_is_unknown_and_a_retry_settles_it() {
 /// working and what to do then.
 #[test]
 fn the_unknown_bind_message_prints_a_command_only_when_it_is_safe_to_paste() {
-    for path in ["/private/has space", "/private/$HOME;x`y`"] {
+    for path in ["/private/has space", "/private/$HOME;x$(y)"] {
         let shown = continuity_unknown(Path::new(path)).to_string();
         assert!(
             shown.contains(&format!("bind-continuity --enrollment-dir '{path}'`")),

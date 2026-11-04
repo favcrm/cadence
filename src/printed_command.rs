@@ -20,10 +20,12 @@ fn deceptive(c: char) -> bool {
 }
 
 /// One single-quoted argument, or `None` when the value has no safe printed form.
+/// A backtick is safe inside the quotes, but [`command`] wraps its output in backticks
+/// and one in the value would end that span early.
 pub(crate) fn arg(value: &str) -> Option<String> {
     let safe = !value
         .chars()
-        .any(|c| matches!(c, '\'' | '\\' | '"') || c.is_control() || deceptive(c));
+        .any(|c| matches!(c, '\'' | '\\' | '"' | '`') || c.is_control() || deceptive(c));
     safe.then(|| format!("'{value}'"))
 }
 
@@ -111,7 +113,8 @@ pub(crate) mod tests {
     }
 
     /// Paths with no safe printed form.
-    pub(crate) const UNPRINTABLE: [&str; 9] = [
+    pub(crate) const UNPRINTABLE: [&str; 10] = [
+        "/private/x`touch owned`",
         "/private/it's",
         "/private/a'; touch owned; '",
         "/private/back\\slash",
@@ -127,7 +130,7 @@ pub(crate) mod tests {
     fn a_printable_value_is_quoted_and_survives_json() {
         for value in [
             "/private/has space",
-            "/private/$HOME;x`y`",
+            "/private/$HOME;x$(y)",
             "/private/#hash",
             "/private/-n",
             "/private/&|<>*?[a]",

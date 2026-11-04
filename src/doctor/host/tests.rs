@@ -1033,13 +1033,13 @@ fn orphans_flag_deleted_worktrees_and_old_test_binaries() {
         kills,
         vec![
             format!(
-                "kill 20  # 't'  cwd='{}'  age=1m",
+                "kill 20  # comm='t'  cwd='{}'  age=1m",
                 repo.join(".cadence/wt/gone").display()
             )
             .as_str(),
             // No cwd link → `?`, never a guess.
-            "kill 22  # 't'  cwd=?  age=3h",
-            "kill 23  # 't'  cwd=?  age=2h",
+            "kill 22  # comm='t'  cwd=?  age=3h",
+            "kill 23  # comm='t'  cwd=?  age=2h",
         ],
         "{}",
         c.remedy
@@ -4572,7 +4572,7 @@ fn kill_lines_name_comm_cwd_and_age_from_proc() {
     let line = &lines[0];
     assert!(
         line.starts_with(&format!(
-            "kill {pid}  # 'sleep'  cwd='{}'  age=",
+            "kill {pid}  # comm='sleep'  cwd='{}'  age=",
             cwd.display()
         )),
         "{line}"
@@ -4710,7 +4710,18 @@ use std::os::unix::ffi::OsStrExt;
 #[test]
 fn a_kill_line_stays_one_line_for_a_crafted_cwd_or_comm() {
     let line = kill_line(7, "sleep", "/repo/a;touch owned", "1m");
-    assert_eq!(line, "kill 7  # 'sleep'  cwd='/repo/a;touch owned'  age=1m");
+    assert_eq!(
+        line,
+        "kill 7  # comm='sleep'  cwd='/repo/a;touch owned'  age=1m"
+    );
+    // Each word after the `#` carries a label, so none can be a pid or `-1` to `kill`
+    // in a shell that does not treat `#` as a comment.
+    let line = kill_line(7, "-1", "/repo", "1m");
+    assert_eq!(line, "kill 7  # comm='-1'  cwd='/repo'  age=1m");
+    assert_eq!(
+        kill_line(7, "?", "?", "?"),
+        "kill 7  # comm=?  cwd=?  age=?"
+    );
     for (comm, cwd) in [
         ("sleep", "/a\ntouch owned\nb"),
         ("x\ntouch owned", "/repo"),
