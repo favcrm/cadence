@@ -7354,14 +7354,19 @@ mod cad2100_classifier_merge_base {
         let (code, answer, stderr) = daemon.classify(&scenario(&head, &repo.tip), json!({}));
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(class_of(&answer), "strict", "{answer}");
-        let renamed: Vec<&Value> = answer["changes"]
+        // CAD-2117: both ends are recorded, as a delete of the old path and an add of the new.
+        assert_eq!(
+            paths_of(&answer),
+            ["docs/guide.md", "docs/guide2.md"],
+            "{answer}"
+        );
+        let statuses: Vec<&Value> = answer["changes"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|c| c["status"] == "R")
+            .map(|c| &c["status"])
             .collect();
-        assert_eq!(renamed.len(), 1, "{answer}");
-        assert_eq!(renamed[0]["path"], json!("docs/guide2.md"), "{answer}");
+        assert_eq!(statuses, [&json!("D"), &json!("A")], "{answer}");
         // Both lists are read at main's tip. Tightened there, an ordinary edit is sensitive;
         // the PR's own copy of a list changes nothing.
         let zone = |main: &str, name: &str| repo.touching(name, main, &["src/zone/lib.rs"]);
