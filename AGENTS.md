@@ -35,7 +35,8 @@ prose and an authoritative source disagree, the source wins.
   `git show origin/main:scripts/<name>` into one scratch directory and run it from
   inside the repo (`git fetch origin main` first: a stale ref is not detected). A PR
   editing the gate is judged by main's copy, never its own. No `origin/main` here
-  means no check. It guards accidents, not an adversary.
+  means no check; with `origin/main` present, a gate file missing or unreadable
+  on either side refuses. It guards accidents, not an adversary.
 - Risk classes, triggers, who approves what: `docs/roles/risk-classes.md`.
 - Path lists: `docs/roles/one-review-paths.toml` (review count),
   `docs/roles/risk-paths.toml` (triggers; the daemon compiles it in).

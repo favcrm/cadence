@@ -43,6 +43,12 @@ unless ALL of these hold for the pinned head:
     verdicts --project` and `cadence audit approval --project --issue`. The
     project is never derived from the repo or the cwd, and a hosted read that
     cannot name it is refused rather than answered from repo-scoped evidence;
+  * this gate is main's (CAD-2108): its own bytes and the sibling delivery-gate
+    equal origin/main:scripts/<name>, read by local git from the current
+    directory with no network. Differing, or a file unreadable on either side
+    while origin/main exists, refuses (--dry-run warns and runs). No origin/main
+    in the current directory means no check. A stale local origin/main is not
+    detected. The first stdout line names the gate's content hash;
   * a ticket comment for this head lists those verdict notes (created after
     the other gates pass; dry-run only checks an existing comment);
   * for a human-class diff (a path trigger, more than 1500 changed lines, any
@@ -2011,21 +2017,26 @@ def self_test():
     return 0 if not failures else 1
 
 
+MAIN_REF = "refs/remotes/origin/main"  # fully qualified: a local branch or tag named origin/main cannot shadow it
+
+
+def main_ref_present():
+    """True when MAIN_REF resolves here (False: not a repo, no such ref, no git)."""
+    try:
+        r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", MAIN_REF + "^{commit}"],
+                           capture_output=True)
+    except OSError:
+        return False
+    return r.returncode == 0
+
+
 def git_main_blob(name):
-    """(state, bytes): `ok`, `no-ref` (origin/main unreadable here: not a repo, no such
-    ref, no git) or `unreadable` (the ref is there but the file is not)."""
+    """origin/main's scripts/<name> bytes, or None when git cannot read it."""
     try:
-        ref = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "origin/main^{commit}"],
-                             capture_output=True)
+        blob = subprocess.run(["git", "show", f"{MAIN_REF}:scripts/{name}"], capture_output=True)
     except OSError:
-        return "no-ref", b""
-    if ref.returncode != 0:
-        return "no-ref", b""
-    try:
-        blob = subprocess.run(["git", "show", f"origin/main:scripts/{name}"], capture_output=True)
-    except OSError:
-        return "unreadable", b""
-    return ("ok", blob.stdout) if blob.returncode == 0 else ("unreadable", b"")
+        return None
+    return blob.stdout if blob.returncode == 0 else None
 
 
 def check_gate_copy(dry_run):
@@ -2048,35 +2059,31 @@ def check_gate_copy(dry_run):
         digest.update(name.encode() + b"\0" + (files[name] or b"") + b"\0")
     short = digest.hexdigest()[:12]
     problems = []
-    unchecked = False
+    if not main_ref_present():
+        print(f"{ME}: gate {short} (unchecked)", flush=True)
+        print(f"{ME}: gate not compared with origin/main (no origin/main in the current directory)",
+              file=sys.stderr)
+        return []
     for name in sorted(files):
-        state, main_bytes = git_main_blob(name)
-        if state == "no-ref":
-            unchecked = True
-            break
+        main_bytes = git_main_blob(name)
         if files[name] is None:
             problems.append(f"{name} cannot be read here, so it cannot be compared with origin/main")
-        elif state == "unreadable":
+        elif main_bytes is None:
             problems.append(f"scripts/{name} cannot be read from origin/main, so equality is unproven")
         elif files[name] != main_bytes:
             problems.append(f"{name} differs from origin/main:scripts/{name}")
-    if unchecked:
-        print(f"{ME}: gate {short}: not compared with origin/main (no origin/main in the current directory)",
-              file=sys.stderr)
-        print(f"{ME}: gate {short} (unchecked)")
-        return []
     if not problems:
-        print(f"{ME}: gate {short} (same as origin/main)")
+        print(f"{ME}: gate {short} (same as origin/main)", flush=True)
         return []
     how = ("run main's copy from inside the repo: d=$(mktemp -d) && for f in enqueue-reviewed delivery-gate; do "
-           "git show origin/main:scripts/$f > $d/$f; done && chmod +x $d/enqueue-reviewed && "
+           "git show refs/remotes/origin/main:scripts/$f > $d/$f; done && chmod +x $d/enqueue-reviewed && "
            "$d/enqueue-reviewed <args> (git fetch origin main first if your origin/main is old)")
     if dry_run:
-        print(f"{ME}: gate {short} (differs from origin/main; dry run continues)")
+        print(f"{ME}: gate {short} (differs from origin/main; dry run continues)", flush=True)
         for p in problems:
             print(f"{ME}: warning: {p}; a real enqueue refuses; {how}", file=sys.stderr)
         return []
-    print(f"{ME}: gate {short} (differs from origin/main)")
+    print(f"{ME}: gate {short} (differs from origin/main)", flush=True)
     return [f"{p}; this gate would sign with rules main does not have; {how}" for p in problems]
 
 

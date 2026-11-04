@@ -394,7 +394,9 @@ The gate refuses (dry run: warns) when `scripts/enqueue-reviewed` or
 line names the gate's content hash. Recover by writing both files from
 `git show origin/main:scripts/<name>` into a scratch directory and running that
 copy from inside the repo; fetch `origin/main` first, since a stale ref is not
-detected. A PR that edits the gate is enqueued from main's copy.
+detected. With `origin/main` present, a gate file missing or unreadable on either
+side refuses; with no `origin/main` there is no check. A PR that edits the gate is
+enqueued from main's copy.
 
 Temporary path (CAD-1946; remove this note when it ends): while the hosted
 reviewer attestation cannot be produced, add `--exception --advisory
