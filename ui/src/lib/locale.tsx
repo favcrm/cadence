@@ -1837,7 +1837,6 @@ Object.assign(zhTW, {
   "Keep it running": "保持執行",
   "Live view": "即時檢視",
   "No browser session": "沒有瀏覽器工作階段",
-  "No page open": "沒有已開啟的頁面",
   "No session": "沒有工作階段",
   "Open live view again": "重新開啟即時檢視",
   "Open live view": "開啟即時檢視",

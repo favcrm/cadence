@@ -1722,6 +1722,33 @@ for (const mode of ["404", "unavailable"] as const) {
   await m.unmount();
 }
 
+// ===== the header is one row: name and state, address, actions =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in?next=1", instructions: "Sign in." });
+  await openTab(m);
+  const head = el(m.host, ".bz-panel .cv-head")!;
+  assert(el(head, ".bz-title #bz-heading") && el(head, ".bz-title .bz-badge"), "Browser and its state sit together in the header");
+  assert(!el(head, ".arttype") && el(head, ".bz-globe svg"), "a plain globe, no box");
+  const addr = el(head, ".bz-addr")!;
+  assert(addr && !el(m.host, ".bz-panel > .bz-addr"), "the address is inline in the header, not a row of its own");
+  equal(addr.getAttribute("title"), "https://login.supplier-example.test/sign-in?next=1", "with the full address as its title");
+  assert(el(head, ".bz-host")!.tagName === "B" && !el(head, ".bz-scheme"), "host in bold, no scheme");
+  assert(el(head, "[data-bz-dock] [data-bz-act=view]") && el(head, "[data-bz-dock] [data-bz-act=stop]"), "Open live view and Stop are in the header");
+  assert(!el(m.host, ".bz-panel > [data-bz-dock]") && !el(m.host, ".cv-foot"), "no bar at the foot");
+  assert(btn(m, "view")!.getAttribute("aria-label") === "Open live view" && btn(m, "stop")!.getAttribute("aria-label") === "Stop session", "the actions keep accessible names");
+  await click(btn(m, "view")!);
+  assert(!el(head, ".bz-addr") && el(head, "[data-bz-act=stop]"), "with the frame open the address goes and Stop stays");
+  await click(btn(m, "stop")!);
+  assert(el(head, "[data-bz-act=go]") && el(head, "[data-bz-act=keep]") && head.hasAttribute("data-confirm"), "the confirm replaces the actions in the header");
+  await m.unmount();
+}
+{
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/" });
+  await openTab(m);
+  assert(!el(m.host, ".bz-addr .bz-rest"), "a bare / adds no second line");
+  await m.unmount();
+}
+
 console.log("browser canvas tests passed");
 }
 main().then(() => process.exit(0), (e) => { console.error(e); process.exit(1); });
