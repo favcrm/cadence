@@ -1117,20 +1117,89 @@ fn a_reenroll_before_a_committed_bind_is_unknown_and_a_retry_settles_it() {
     assert!(require_bound_enrollment(&current(&dir).unwrap(), &retried, &dir).is_ok());
 }
 
+/// A refusal reaches stderr as JSON. A command is safe to paste from there only if
+/// JSON encoding leaves it unchanged.
+fn survives_json(text: &str) -> bool {
+    serde_json::to_string(text).unwrap() == format!("\"{text}\"")
+}
+
+const UNPRINTABLE_PATHS: [&str; 5] = [
+    "/private/it's",
+    "/private/a'; touch owned; '",
+    "/private/back\\slash",
+    "/private/dq\"uote",
+    "/private/new\nline",
+];
+
 /// The recovery command stays pasteable, and the message states when it stops
 /// working and what to do then.
 #[test]
-fn the_unknown_bind_message_quotes_its_command_and_states_the_limit() {
-    let shown = continuity_unknown(Path::new("/private/has space")).to_string();
+fn the_unknown_bind_message_prints_a_command_only_when_it_is_safe_to_paste() {
+    for path in ["/private/has space", "/private/$HOME;x`y`"] {
+        let shown = continuity_unknown(Path::new(path)).to_string();
+        assert!(
+            shown.contains(&format!("bind-continuity --enrollment-dir '{path}'`")),
+            "{shown}"
+        );
+        assert!(survives_json(&shown), "{shown}");
+        assert!(shown.contains("five minutes"), "{shown}");
+        assert!(
+            shown.contains("new private enrollment directory"),
+            "{shown}"
+        );
+    }
+    for path in UNPRINTABLE_PATHS {
+        let shown = continuity_unknown(Path::new(path)).to_string();
+        assert!(shown.contains("bind-continuity"), "{shown}");
+        assert!(!shown.contains("--enrollment-dir '"), "{shown}");
+        assert!(shown.contains("cannot be printed"), "{shown}");
+    }
+}
+
+#[test]
+fn the_missing_pin_remedy_prints_a_command_only_when_it_is_safe_to_paste() {
+    let issuer = "https://issuer.example.test";
+    let shown = missing_pin_remedy(issuer, "/private/has space/trusted-issuer");
+    assert!(survives_json(&shown), "{shown}");
     assert!(
-        shown.contains("bind-continuity --enrollment-dir '/private/has space'`"),
+        shown.contains("'/private/has space/trusted-issuer'"),
         "{shown}"
     );
-    assert!(shown.contains("five minutes"), "{shown}");
-    assert!(
-        shown.contains("new private enrollment directory"),
-        "{shown}"
-    );
+    for path in UNPRINTABLE_PATHS {
+        let shown = missing_pin_remedy(issuer, path);
+        assert!(!shown.contains("echo"), "{shown}");
+        assert!(shown.contains("cannot be printed"), "{shown}");
+        let shown = missing_pin_remedy(path, "/private/trusted-issuer");
+        assert!(!shown.contains("echo"), "{shown}");
+    }
+}
+
+/// The remedy has to work, not only look safe: run the command as printed, then
+/// read the pin through the real reader.
+#[test]
+fn the_missing_pin_command_as_printed_writes_a_pin_the_reader_accepts() {
+    let issuer = "https://issuer.example.test";
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("has space");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let refusal = require_trusted_issuer(&dir, issuer)
+        .unwrap_err()
+        .to_string();
+    assert!(survives_json(&refusal), "{refusal}");
+    let (_, command) = refusal
+        .split_once("then retry: ")
+        .expect("a printed command");
+    let mut shell = std::process::Command::new("sh");
+    shell.arg("-c").arg(command);
+    let output = crate::reaper::output(&mut shell).unwrap();
+    assert!(output.status.success(), "{command}");
+    require_trusted_issuer(&dir, issuer).unwrap();
+    let mode = fs::metadata(dir.join(TRUSTED_ISSUER))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
 }
 
 #[test]
@@ -2979,9 +3048,9 @@ fn login_refuses_a_slug_that_is_not_one_dns_label_before_any_request() {
 // --- CAD-1125: first-run pin refusals (review acceptance checks) ---
 
 #[test]
-fn missing_pin_refusal_names_the_shell_quoted_file_and_commands() {
+fn missing_pin_refusal_names_the_quoted_file_and_commands() {
     // Fresh auth dir: login creates it, then the NotFound refusal
-    // carries the printf/chmod remedy against the exact pin path.
+    // carries the echo/chmod remedy against the exact pin path.
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("e");
     let err = login_browser("http://127.0.0.1:1", "ws_real", "acme", &dir, |_, _| Ok(()))
@@ -2989,10 +3058,10 @@ fn missing_pin_refusal_names_the_shell_quoted_file_and_commands() {
         .unwrap()
         .to_string();
     let file = dir.join(TRUSTED_ISSUER).display().to_string();
-    let quoted = shell_quote(&file);
+    let quoted = format!("'{file}'");
     assert!(err.contains("Trusted issuer pin is missing"), "{err}");
     assert!(
-        err.contains(&format!("printf '%s\\n' 'http://127.0.0.1:1' > {quoted}")),
+        err.contains(&format!("echo 'http://127.0.0.1:1' > {quoted}")),
         "{err}"
     );
     assert!(err.contains(&format!("chmod 600 {quoted}")), "{err}");
@@ -3005,7 +3074,7 @@ fn missing_pin_refusal_names_the_shell_quoted_file_and_commands() {
 #[test]
 fn symlinked_pin_refuses_without_a_write_command() {
     // ELOOP from O_NOFOLLOW is not "missing": the refusal must not print
-    // `printf > <pin>` — that command would clobber the symlink target.
+    // `echo > <pin>` — that command would clobber the symlink target.
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("e");
     fs::create_dir(&dir).unwrap();
@@ -3018,15 +3087,16 @@ fn symlinked_pin_refuses_without_a_write_command() {
         .unwrap()
         .to_string();
     assert!(err.contains("cannot be opened"), "{err}");
-    assert!(!err.contains("printf"), "{err}");
+    assert!(!err.contains("echo"), "{err}");
+    assert!(!err.contains('>'), "{err}");
     assert!(!err.contains("chmod"), "{err}");
     assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
 }
 
 #[test]
-fn auth_dir_with_a_quote_cannot_break_the_printed_command() {
-    // A crafted --auth-dir containing ' must not escape the single
-    // quotes in the printed remedy.
+fn auth_dir_with_a_quote_prints_no_command() {
+    // A crafted --auth-dir containing ' has no printed form that survives the
+    // JSON a refusal reaches stderr in, so the remedy names the file instead.
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("it's");
     let err = login_browser("http://127.0.0.1:1", "ws_real", "acme", &dir, |_, _| Ok(()))
@@ -3034,12 +3104,10 @@ fn auth_dir_with_a_quote_cannot_break_the_printed_command() {
         .unwrap()
         .to_string();
     let file = dir.join(TRUSTED_ISSUER).display().to_string();
-    // The raw, unescaped path (with a bare ') never appears.
-    assert!(!err.contains(&format!(">{file}")), "{err}");
-    assert!(!err.contains(&format!("> '{file}'")), "{err}");
-    // The shell-quoted form does.
-    assert!(err.contains(&format!("> {}", shell_quote(&file))), "{err}");
-    assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    assert!(err.contains(&file), "{err}");
+    assert!(err.contains("cannot be printed"), "{err}");
+    assert!(!err.contains("echo"), "{err}");
+    assert!(!err.contains("chmod"), "{err}");
 }
 
 #[test]
