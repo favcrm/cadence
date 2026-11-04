@@ -805,8 +805,10 @@ fn browser_continuity_bind_refuses_expired_challenge_before_proof() {
 
 #[test]
 fn browser_continuity_bind_classifies_issuer_refusals_without_losing_pending_key() {
-    // A refusal proves the bind did not commit, so it is definite. An
-    // `authority_unavailable` answer may follow a commit attempt, so it is not.
+    // A refusal is definite for the request it answers. It says nothing about an
+    // earlier attempt whose reply was lost, so no message claims the key is
+    // unbound. An `authority_unavailable` answer may follow a commit attempt on
+    // this request, so it is unknown.
     for (status, code, reason, kind, expected) in [
         (
             "401 Unauthorized",
@@ -982,11 +984,12 @@ fn continuity_post_refuses_redirect_without_forwarding_child_bearer() {
 }
 
 #[test]
-fn continuity_post_bounds_errors_and_parks_lost_replies_as_uncertain() {
+fn continuity_challenge_post_bounds_errors_and_parks_lost_replies_as_uncertain() {
+    const CHALLENGE: &str = "/v1/hosted-cadence/continuity/challenge";
     let oversized = TcpListener::bind("127.0.0.1:0").unwrap();
     let issuer = format!("http://{}", oversized.local_addr().unwrap());
     let server = thread::spawn(move || {
-        let (mut request, _) = continuity_request(&oversized, "/continuity/bind");
+        let (mut request, _) = continuity_request(&oversized, CHALLENGE);
         let body = "X".repeat(MAX_RESPONSE as usize + 1);
         write!(
             request,
@@ -996,19 +999,73 @@ fn continuity_post_bounds_errors_and_parks_lost_replies_as_uncertain() {
         .unwrap();
         request.write_all(body.as_bytes()).unwrap();
     });
-    let error = post_continuity(&issuer, "/continuity/bind", CHILD, json!({})).unwrap_err();
+    let error = post_continuity(&issuer, CHALLENGE, CHILD, json!({})).unwrap_err();
+    assert_eq!(error.kind(), "rejected", "{error}");
     assert!(format!("{error}").contains("Invalid"));
     server.join().unwrap();
 
     let lost = TcpListener::bind("127.0.0.1:0").unwrap();
     let issuer = format!("http://{}", lost.local_addr().unwrap());
     let server = thread::spawn(move || {
-        let (request, _) = continuity_request(&lost, "/continuity/bind");
+        let (request, _) = continuity_request(&lost, CHALLENGE);
         drop(request);
     });
-    let error = post_continuity(&issuer, "/continuity/bind", CHILD, json!({})).unwrap_err();
+    let error = post_continuity(&issuer, CHALLENGE, CHILD, json!({})).unwrap_err();
+    assert_eq!(error.kind(), "rejected", "{error}");
     assert!(format!("{error}").contains("uncertain"));
     server.join().unwrap();
+}
+
+/// A changed enrollment is seen only after `bind_browser` returned, so the bind
+/// may have committed. Every identity field counts, and none reads as refused.
+#[test]
+fn a_changed_enrollment_after_a_bind_is_unknown_never_refused() {
+    let enrolled = || EnrollmentInfo {
+        organization_id: "ws_real".into(),
+        audience: "https://real.board.example.test".into(),
+        subject_id: "hsp_subject".into(),
+        agent_id: "hca_agent".into(),
+        expires_at: 0,
+    };
+    let bound = || ContinuityInfo {
+        lineage_id: LINEAGE.into(),
+        organization_id: "ws_real".into(),
+        audience: "https://real.board.example.test".into(),
+        subject_id: "hsp_subject".into(),
+        agent_id: "hca_agent".into(),
+        generation: 1,
+    };
+    let dir = Path::new("/private/enroll");
+    assert!(require_bound_enrollment(&enrolled(), &bound(), dir).is_ok());
+    let changes: [fn(&mut ContinuityInfo); 4] = [
+        |b| b.organization_id = "ws_other".into(),
+        |b| b.audience = "https://other.board.example.test".into(),
+        |b| b.subject_id = "hsp_other".into(),
+        |b| b.agent_id = "hca_other".into(),
+    ];
+    for change in changes {
+        let mut changed = bound();
+        change(&mut changed);
+        let error = require_bound_enrollment(&enrolled(), &changed, dir).unwrap_err();
+        assert_eq!(error.kind(), "unknown", "{error}");
+        assert!(format!("{error}").contains("/private/enroll"), "{error}");
+    }
+}
+
+/// The recovery command stays pasteable, and the message states when it stops
+/// working and what to do then.
+#[test]
+fn the_unknown_bind_message_quotes_its_command_and_states_the_limit() {
+    let shown = continuity_unknown(Path::new("/private/has space")).to_string();
+    assert!(
+        shown.contains("bind-continuity --enrollment-dir '/private/has space'`"),
+        "{shown}"
+    );
+    assert!(shown.contains("five minutes"), "{shown}");
+    assert!(
+        shown.contains("new private enrollment directory"),
+        "{shown}"
+    );
 }
 
 #[test]

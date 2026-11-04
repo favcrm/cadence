@@ -756,10 +756,21 @@ reviewer rather than sharing one identity.
 The child expires no later than its bridge, which is capped at five minutes.
 After expiry, repeat `browser` and owner consent; `renew` deliberately refuses
 a browser record. This is a short-lived result sender, not persistent team
-login. AOS-68's continuity routes are not mounted and no browser renewal or
-sleep/wake guarantee is implied. Local removal does not revoke the hosted
-credential; the server checks live membership and revocation at receipt.
-Production flags remain off until a separate rollout approves them.
+login. No browser renewal or sleep/wake guarantee is implied. Local removal does
+not revoke the hosted credential; the server checks live membership and
+revocation at receipt. Production flags remain off until a separate rollout
+approves them.
+
+`browser --bind-continuity`, or `remote enrollment bind-continuity
+--enrollment-dir <dir>` afterwards, binds a private continuity key to the child
+where the issuer serves continuity. The key is written before either request,
+and a retry uses the same key. A lost or unproven bind answer exits as an unknown
+outcome: keep the directory and run `bind-continuity` again, which reports the
+binding if it committed. That works only while the child is valid. After it
+expires the directory cannot finish, so repeat `browser` with owner consent in a
+new private enrollment directory. A refusal is definite for the request it
+answers; it does not prove that an earlier attempt, whose answer was lost, did
+not commit.
 
 ## Board sign-in through the device grant (CAD-777)
 
