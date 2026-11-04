@@ -673,6 +673,10 @@ fn hosted_assignment_target(
     if bound.org != selector {
         return Err(managed_org_refused());
     }
+    let credential_path =
+        cadence_agent::local_assignment::reporting::agent_credential_path(state_dir, &message_id)?;
+    let (assignment_id, claim_id, generation) =
+        (bound.assignment_id, bound.claim_id, bound.generation);
     let target = cadence_agent::remote_cli::RemoteTarget {
         identity: Some(cadence_agent::remote_cli::CliIdentityPin {
             subject_id: bound.subject_id,
@@ -686,6 +690,14 @@ fn hosted_assignment_target(
         Error::rejected("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
     cadence_agent::remote_cli::cli_material(&dir, &target)?;
+    // CAD-2149: this session's hosted verbs use a credential of its own.
+    cadence_agent::remote_cli::bind_managed_session(cadence_agent::remote_cli::AgentSlot::new(
+        credential_path,
+        &target,
+        assignment_id,
+        claim_id,
+        generation,
+    ));
     Ok(target)
 }
 
@@ -2071,6 +2083,121 @@ pub(super) mod tests {
             Resolved::Local(path) => assert_eq!(path, dir),
             Resolved::Remote(target) => panic!("omitted --org resolved {}", target.endpoint),
         }
+    }
+
+    // CAD-2149: a managed caller's settlement binds its agent credential, and the
+    // verb path then asks the board for it; an unmanaged caller binds nothing.
+    #[test]
+    fn managed_settlement_binds_the_agent_credential_and_the_verb_path_uses_it() {
+        use std::io::{BufRead, Read, Write};
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let dir = managed_state(&env);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        write_login(&env, "user_claimant", "https://issuer.example/original");
+        // The login and binding name the loopback board instead of EP_A.
+        let login = env
+            .home
+            .path()
+            .join("config/cadence/remote-auth/cli-acme.json");
+        let text = std::fs::read_to_string(&login)
+            .unwrap()
+            .replace(EP_A, &endpoint);
+        std::fs::write(&login, text).unwrap();
+        let kickoff = cadence_agent::local_assignment::Kickoff {
+            alias: "worker-1",
+            issue_id: "CAD-1460",
+            assignment_id: "hla_00000000000000000000000000000001",
+            worktree: "/tmp/not-a-checkout",
+            message_id: "msg-live",
+            claim_id: "hlc_00000000000000000000000000000001",
+            generation: 4,
+            organization_id: "ws_binding",
+            audience: &endpoint,
+            subject_id: Some("user_claimant"),
+            issuer: Some("https://issuer.example/original"),
+        };
+        cadence_agent::local_assignment::reporting::store_kickoff_binding(
+            &dir,
+            "acme",
+            &endpoint,
+            &kickoff,
+            "hosted kickoff",
+        )
+        .unwrap();
+
+        // Unmanaged: nothing is bound.
+        cadence_agent::remote_cli::unbind_managed_session();
+        std::env::remove_var("CADENCE_ALIAS");
+        std::env::remove_var("CADENCE_STATE_DIR");
+        env.write_registry(&remote_registry("acme", EP_B, "ws_registry", true));
+        resolve(Some("acme"), None, None).unwrap();
+        assert!(cadence_agent::remote_cli::bound_session().is_none());
+
+        // Managed: settlement binds this claim's slot ...
+        std::env::set_var("CADENCE_STATE_DIR", &dir);
+        std::env::set_var("CADENCE_ALIAS", "worker-1");
+        let server = serve_show(&dir, json!([hosted_message("msg-live", "running")]), 3_000);
+        let Resolved::Remote(target) = resolve(Some("acme"), None, None).unwrap() else {
+            panic!("a live binding resolved local");
+        };
+        server.join().unwrap();
+        let slot = cadence_agent::remote_cli::bound_session().expect("no session was bound");
+        assert_eq!(slot.claim_id, "hlc_00000000000000000000000000000001");
+        assert_eq!(slot.generation, 4);
+        assert_eq!(
+            slot.path,
+            dir.join("hosted-assignments").join("msg-live.agent")
+        );
+        // ... and the verb path's first request is the mint, not a login authorize.
+        let board = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let reply = r#"{"ok":false,"code":"capability_unavailable"}"#;
+            write!(
+                socket,
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .unwrap();
+            line
+        });
+        let mut args = serde_json::Map::new();
+        args.insert("id".into(), json!("SYN-1"));
+        args.insert("body".into(), json!("Synthetic"));
+        let outcome = cadence_agent::remote_cli::call_verb(
+            &target,
+            "issue_comment",
+            args,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            10,
+            |_| {},
+        );
+        let first = board.join().unwrap();
+        assert!(
+            first.contains(
+                "/local-assignments/hla_00000000000000000000000000000001/agent-credential"
+            ),
+            "the first request was {first}"
+        );
+        assert!(outcome.is_err());
+        cadence_agent::remote_cli::unbind_managed_session();
     }
 
     #[test]

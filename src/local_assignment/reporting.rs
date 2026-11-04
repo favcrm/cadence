@@ -203,6 +203,16 @@ pub struct HostedBindingTarget {
     /// Member and issuer written at claim time. Never filled from a later login.
     pub subject_id: String,
     pub issuer: String,
+    /// The claim this binding serves; the agent credential is minted for it.
+    pub assignment_id: String,
+    pub claim_id: String,
+    pub generation: u64,
+}
+
+/// Where a session's own credential for this kickoff is cached, beside its
+/// `.bind` file (CAD-2149). Private, short-lived, and gone with the binding.
+pub fn agent_credential_path(state_dir: &Path, message_id: &str) -> Result<PathBuf> {
+    Ok(binding_path(state_dir, message_id)?.with_extension("agent"))
 }
 
 /// Read the live hosted target for `message_id`.
@@ -244,6 +254,9 @@ pub fn hosted_binding_target(
         organization_id: file.organization_id,
         subject_id,
         issuer,
+        assignment_id: file.assignment_id,
+        claim_id: file.claim_id,
+        generation: file.generation,
     }))
 }
 
@@ -700,7 +713,15 @@ fn mark_accepted(path: &Path, state: &str) -> Result<()> {
         return Ok(());
     }
     binding.reported_state = Some(state.to_string());
-    write_kickoff_file(path, &binding)
+    write_kickoff_file(path, &binding)?;
+    drop_agent_credential(path);
+    Ok(())
+}
+
+/// The assignment is over: its cached credential goes with it. The board ends
+/// it on its own; this only keeps a dead token off the disk.
+fn drop_agent_credential(binding: &Path) {
+    let _ = fs::remove_file(binding.with_extension("agent"));
 }
 
 fn mark_fenced(path: &Path) -> Result<()> {
@@ -715,7 +736,9 @@ fn mark_fenced(path: &Path) -> Result<()> {
         return Ok(());
     }
     binding.settled = true;
-    write_kickoff_file(path, &binding)
+    write_kickoff_file(path, &binding)?;
+    drop_agent_credential(path);
+    Ok(())
 }
 
 struct FileLock {

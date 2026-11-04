@@ -541,7 +541,7 @@ cadence --org acme agent profile archive ap_<profile-id> --latest
   `POST /api/agent-profiles`). `get`, `edit` and `archive` refuse and say what
   is missing; they never fall back to another store.
 
-**A managed agent cannot be stopped from the server.** With `CADENCE_ALIAS`
+**On its own, a managed agent cannot be stopped from the server.** With `CADENCE_ALIAS`
 (or a grant) set, the client refuses a profile write: "a managed agent can't
 edit profiles; propose the change". That is a client check and nothing more.
 The hosted board refuses an `agent` or `service` principal, but a managed agent
@@ -550,8 +550,37 @@ and the board has no fact that tells the two apart. So an agent that bypasses
 the client (a direct call with the saved login, or an unmanaged shell) is judged
 as the person whose login it uses. Treat the saved login as the person's, keep
 it out of agent environments, and have agents propose changes (`agent
-propose-hire`). Closing this needs a server-side fact, such as a distinct
-principal for a managed session; it is tracked as AOS-502.
+propose-hire`). The next paragraph is what a hosted kickoff adds.
+
+**A managed session has a credential of its own (CAD-2149, AOS-502).** On a
+hosted kickoff, the session's hosted CLI verbs are sent on an `agent` credential
+bound to its claim. A comment, an attachment and a review are recorded as the
+agent. `issue new`, `issue set` and `issue say` still record the member, as do
+`my_work` and the member's private artifacts. The board also refuses the
+owner-only writes: profile writes, team changes and `platform call`, even on an
+owner's assignment, and `team list` is refused for a managed agent. The client
+mints it on the member's login at first use and caches it 0600 beside the
+kickoff's `.bind` file, for at most 15 minutes; there is no refresh token, so
+renewal is another mint, and the file goes when the assignment ends.
+
+Stays on the member's login: claim, daemon reports and `agent report`; every
+wiki action; `artifact put`; and the audit verdicts (`audit_verdict`,
+`audit_verdict_project`). Not available to a managed agent session at all:
+`settings agents` and `master status`. They always refuse, and their message
+talks about a login grant; read it as "a managed agent session can't use this".
+
+**This is attribution and server-side refusal, not a security boundary.** The
+session runs as the same OS user and can still read the member's login file
+until CAD-2148 confines it.
+
+What the client does when the credential is not available:
+
+| Board answer | Client |
+| --- | --- |
+| mint `404`, or `409 renewable_login_required` | keeps the login, one line on stderr |
+| authorize or call `403 human_session_required` (a workspace not yet updated to accept it) | keeps the login for the rest of the command, one line on stderr |
+| any other mint answer, or an unusable `200` | refuses; nothing is sent and the login is not used in its place |
+| the agent's own refusals: `401`, `403 forbidden`, and the rest | final, never retried on the login |
 
 ### Leaving a message for a role on a ticket
 

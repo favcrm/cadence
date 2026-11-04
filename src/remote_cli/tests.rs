@@ -6773,3 +6773,349 @@ fn cad2127_platform_status_correlates_both_selectors() {
         );
     }
 }
+
+// CAD-2149: a managed session's hosted verbs ride its own credential. These
+// drive the real client (`call_verb_until_retry`) against a synthetic board and
+// read what the board saw: which bearer carried each request.
+mod agent_credential_acceptance {
+    use super::*;
+    use std::sync::Mutex;
+
+    const AGENT: &str = "hct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const ASSIGNMENT: &str = "hla_00000000-0000-4000-8000-000000000001";
+    const CLAIM: &str = "hlc_00000000-0000-4000-8000-000000000002";
+    const ISSUER: &str = "https://issuer.invalid";
+    const SUBJECT: &str = "usr_member";
+
+    /// What the synthetic board answers, by route and bearer.
+    struct Board {
+        mint: (u16, Value),
+        agent_authorize: (u16, Value),
+        agent_call: (u16, Value),
+        login_call: (u16, Value),
+    }
+
+    fn minted() -> (u16, Value) {
+        (
+            200,
+            json!({
+                "version": "hosted-cadence-local-assignment.v1",
+                "assignment_id": ASSIGNMENT,
+                "generation": 1,
+                "claim_id": CLAIM,
+                "principal": {"kind": "agent", "agent_id": CLAIM, "actor": format!("agents/{CLAIM}")},
+                "capabilities": ["cli.read", "cli.write", "wiki.read"],
+                "credential": {
+                    "credential_id": "hca_00000000-0000-4000-8000-000000000003",
+                    "access_token": AGENT,
+                    "token_type": "Bearer",
+                    "issued_at": now().unwrap(),
+                    "expires_at": now().unwrap() + 900,
+                    "renewal": "remint",
+                },
+            }),
+        )
+    }
+
+    fn envelope(n: usize) -> Value {
+        json!({"version": CLI_VERSION, "envelope": format!("h.e.{n}"),
+            "bearer": "x", "expires_at": 0, "actor": "users/o", "scope": ["cli.read"], "issuer": "i"})
+    }
+
+    fn comment_receipt() -> Value {
+        json!({"issue": {"id": "SYN-1"}, "comment": {"body": "Synthetic"}})
+    }
+
+    fn board() -> Board {
+        Board {
+            mint: minted(),
+            agent_authorize: (200, envelope(0)),
+            agent_call: (200, comment_receipt()),
+            login_call: (200, comment_receipt()),
+        }
+    }
+
+    fn status_line(status: u16) -> &'static str {
+        match status {
+            200 => "200 OK",
+            401 => "401 Unauthorized",
+            403 => "403 Forbidden",
+            404 => "404 Not Found",
+            409 => "409 Conflict",
+            500 => "500 Internal Server Error",
+            _ => "400 Bad Request",
+        }
+    }
+
+    struct Session {
+        target: RemoteTarget,
+        dir: PathBuf,
+        slot: AgentSlot,
+        _root: tempfile::TempDir,
+        _listener: TcpListener,
+        seen: std::sync::Arc<Mutex<Vec<Request>>>,
+        notes: Mutex<Vec<String>>,
+    }
+
+    /// `n` is the exact number of requests the board will serve.
+    fn session(board: Board, n: usize) -> Session {
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let (listener, seen, _server) = finite_worker(n, move |_, socket, req| {
+            let (status, body) = if req.path.ends_with("/agent-credential") {
+                board.mint.clone()
+            } else if req.path.ends_with("/authorize") {
+                if req.bearer == AGENT {
+                    board.agent_authorize.clone()
+                } else {
+                    let version = if req.path.contains("/wiki/") {
+                        WIKI_VERSION
+                    } else {
+                        CLI_VERSION
+                    };
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        200,
+                        json!({"version": version, "envelope": format!("h.l.{n}")}),
+                    )
+                }
+            } else if req.bearer == AGENT {
+                board.agent_call.clone()
+            } else {
+                board.login_call.clone()
+            };
+            write_answer(socket, status_line(status), "", &body);
+        });
+        let target = RemoteTarget {
+            identity: Some(CliIdentityPin {
+                subject_id: SUBJECT.into(),
+                issuer: ISSUER.into(),
+            }),
+            ..target(&listener)
+        };
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("auth");
+        let assignments = root.path().join("hosted-assignments");
+        for path in [&dir, &assignments] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let login = json!({"version": "hosted-cadence-auth.v1", "organization_id": ORG_ID,
+            "organization_slug": ORG, "audience": target.endpoint, "issuer": ISSUER,
+            "subject_id": SUBJECT, "capabilities": ["cli.read", "cli.write", "wiki.read"],
+            "access_token": BRIDGE, "expires_at": now().unwrap() + 300});
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(format!("cli-{ORG}.json")))
+            .unwrap();
+        file.write_all(login.to_string().as_bytes()).unwrap();
+        let slot = AgentSlot::new(
+            assignments.join("msg_1.agent"),
+            &target,
+            ASSIGNMENT.into(),
+            CLAIM.into(),
+            1,
+        );
+        Session {
+            target,
+            dir,
+            slot,
+            _root: root,
+            _listener: listener,
+            seen,
+            notes: Mutex::new(Vec::new()),
+        }
+    }
+
+    impl Session {
+        fn send(&self, managed: bool, verb: &str, args: Value) -> Result<Value> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            call_verb_until_retry(
+                &self.target,
+                verb,
+                args.as_object().unwrap().clone(),
+                deadline,
+                10,
+                &self.dir,
+                true,
+                managed.then_some(&self.slot),
+                |line| self.notes.lock().unwrap().push(line.to_string()),
+                |_| {},
+            )
+            .map(|answer| match answer {
+                RemoteAnswer::Ok(body) | RemoteAnswer::Conflict(body) => body,
+            })
+        }
+
+        fn comment(&self, managed: bool) -> Result<Value> {
+            self.send(
+                managed,
+                "issue_comment",
+                json!({"id": "SYN-1", "body": "Synthetic"}),
+            )
+        }
+
+        /// (route, which bearer) for every request the board served.
+        fn trail(&self) -> Vec<(String, &'static str)> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|req| {
+                    let route = req.path.rsplit('/').next().unwrap().to_string();
+                    let bearer = match req.bearer.as_str() {
+                        AGENT => "agent",
+                        BRIDGE => "login",
+                        _ => "other",
+                    };
+                    (route, bearer)
+                })
+                .collect()
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.notes.lock().unwrap().clone()
+        }
+    }
+
+    fn step(route: &str, bearer: &'static str) -> (String, &'static str) {
+        (route.to_string(), bearer)
+    }
+
+    #[test]
+    fn a_managed_comment_is_sent_on_the_agent_credential_and_it_is_cached_private() {
+        let s = session(board(), 5);
+        s.comment(true).unwrap();
+        s.comment(true).unwrap();
+        // One mint on the member's login, then only the agent bearer; the second
+        // comment reuses the cached credential instead of minting again.
+        assert_eq!(
+            s.trail(),
+            vec![
+                step("agent-credential", "login"),
+                step("authorize", "agent"),
+                step("call", "agent"),
+                step("authorize", "agent"),
+                step("call", "agent"),
+            ]
+        );
+        let mint = s.seen.lock().unwrap()[0].body.clone();
+        assert_eq!(
+            mint,
+            json!({"version": "hosted-cadence-local-assignment.v1", "organization_id": ORG_ID,
+                "expected_generation": 1, "claim_id": CLAIM})
+        );
+        let meta = std::fs::metadata(&s.slot.path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert!(std::fs::read_to_string(&s.slot.path)
+            .unwrap()
+            .contains(AGENT));
+        assert!(s.lines().is_empty(), "{:?}", s.lines());
+    }
+
+    #[test]
+    fn a_board_without_the_mint_keeps_the_login_with_one_line() {
+        for (status, body) in [
+            (404, json!({"ok": false, "code": "not_found"})),
+            (
+                409,
+                json!({"ok": false, "code": "renewable_login_required"}),
+            ),
+        ] {
+            let mut b = board();
+            b.mint = (status, body);
+            let s = session(b, 3);
+            s.comment(true).unwrap();
+            assert_eq!(
+                s.trail(),
+                vec![
+                    step("agent-credential", "login"),
+                    step("authorize", "login"),
+                    step("call", "login"),
+                ],
+                "HTTP {status}"
+            );
+            assert_eq!(s.lines().len(), 1, "{:?}", s.lines());
+            assert!(!s.slot.path.exists());
+        }
+    }
+
+    #[test]
+    fn wiki_and_the_audit_verdicts_stay_on_the_login_and_a_review_rides_the_credential() {
+        let mut b = board();
+        b.agent_call = (
+            200,
+            json!({"review": {"artifact": "a", "digest": "d", "decision": "approve"}}),
+        );
+        let s = session(b, 9);
+        s.send(true, "read", json!({"path": "notes"})).unwrap();
+        s.send(true, "audit_verdict_project", json!({"project": "p"}))
+            .unwrap();
+        s.send(true, "audit_verdict", json!({"repo": "r"})).unwrap();
+        assert_eq!(
+            s.trail(),
+            vec![
+                step("authorize", "login"),
+                step("call", "login"),
+                step("authorize", "login"),
+                step("call", "login"),
+                step("authorize", "login"),
+                step("call", "login"),
+            ]
+        );
+        // `issue review` is judged against an artifact's author, and an attach
+        // from this session is recorded as the agent: it must be the agent too.
+        s.send(
+            true,
+            "issue_review",
+            json!({"artifact": "a", "digest": "d", "decision": "approve"}),
+        )
+        .unwrap();
+        let trail = s.trail();
+        assert_eq!(
+            trail[6..],
+            [
+                step("agent-credential", "login"),
+                step("authorize", "agent"),
+                step("call", "agent"),
+            ]
+        );
+        assert!(s.lines().is_empty());
+    }
+
+    // The board's own `issued_at` bounds the lifetime; a slow mint (the client
+    // reads the clock after the answer) is not aged out of it.
+    #[test]
+    fn a_slow_mint_is_judged_from_the_boards_issued_at() {
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint: "http://127.0.0.1:1".into(),
+            org_id: ORG_ID.into(),
+            identity: None,
+        };
+        let slot = AgentSlot::new(
+            PathBuf::from("/nonexistent/x.agent"),
+            &target,
+            ASSIGNMENT.into(),
+            CLAIM.into(),
+            1,
+        );
+        let answer = |issued: u64, expires: u64| {
+            let mut value = minted().1;
+            value["credential"]["issued_at"] = json!(issued);
+            value["credential"]["expires_at"] = json!(expires);
+            value
+        };
+        let at = 1_000_000;
+        let check = |issued, expires, at| {
+            agent_credential::validated(&slot, &target, Some(&answer(issued, expires)), at)
+        };
+        // Issued 8 s before the client looked at the clock: still usable.
+        assert!(check(at - 8, at - 8 + 900, at).is_ok());
+        // Past its own lifetime, issued in the future, or longer than 900 s.
+        assert!(check(at - 901, at - 1, at).is_err());
+        assert!(check(at + 60, at + 960, at).is_err());
+        assert!(check(at, at + 100_000, at).is_err());
+    }
+}
