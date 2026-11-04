@@ -1931,10 +1931,9 @@ fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
             crate::store::app_capabilities::SOURCE_PAGE_AFTER_SQL
         ))
         .unwrap()
-        .query_map(
-            params![install, &context_id, fence, 0.0f64, "zzzz", 5i64],
-            |row| row.get::<_, String>(3),
-        )
+        .query_map(params![install, &context_id, 0.0f64, "zzzz", 5i64], |row| {
+            row.get::<_, String>(3)
+        })
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
@@ -2072,4 +2071,125 @@ fn cad2042_pre_v62_writer_still_produces_a_pageable_receipt() {
     assert_eq!(row.0, 1, "the trigger marks a source read");
     assert_eq!(row.1.as_deref(), Some("install-old"));
     assert_eq!(row.2.as_deref(), Some("ctx-old"));
+}
+
+/// CAD-2120: the cursor is opaque, not authenticated, so a caller can name any
+/// scan-start fence. A low fence must cost a bounded index range, not the
+/// scoped history, and must end in a restart rather than a silent empty scan.
+#[test]
+fn cad2120_low_run_fence_is_bounded_and_restarts_the_scan() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("fence.sqlite3");
+    drop(Store::open(&path).unwrap());
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3000)
+             INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema,install_id,context_id,source_post_read)
+               SELECT 'c'||i,'r','s','','','source'||i,'q'||i,'b','i','{}','d',i,2,'inst','ctx',1 FROM n;",
+        )
+        .unwrap();
+    }
+    let s = Store::open_for_schema_tests(&path).unwrap();
+    let watermark = s.app_source_run_watermark().unwrap();
+    // An honest fence returns the page.
+    let page = s
+        .app_source_run_candidates("inst", "ctx", None, watermark, 10)
+        .unwrap();
+    assert_eq!(page.len(), 10);
+    // A forged low fence would hide all 3000 rows. It must be refused after a
+    // bounded look, not answered empty after walking the scope.
+    let err = s
+        .app_source_run_candidates("inst", "ctx", None, 0, 10)
+        .unwrap_err();
+    assert_eq!(err.code(), Some("stale_cursor"), "{err}");
+    // A forged fence only arrives with a cursor, which takes the continuation
+    // SQL: the same bound must hold there.
+    let err = s
+        .app_source_run_candidates("inst", "ctx", Some((2999.0, "c2999")), 0, 10)
+        .unwrap_err();
+    assert_eq!(err.code(), Some("stale_cursor"), "{err}");
+    // A fence that only hides a few recent rows still pages.
+    let some = s
+        .app_source_run_candidates("inst", "ctx", None, watermark - 5, 10)
+        .unwrap();
+    assert_eq!(some.len(), 10);
+    assert_eq!(some[0].0, "c2995");
+}
+
+/// CAD-2120: the decision on the v62 backfill cursor. A missing progress row
+/// is completion on a v62 store and a fault below it.
+#[test]
+fn cad2120_missing_backfill_progress_is_decided_by_the_version() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("progress.sqlite3");
+    drop(Store::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(Store::source_scope_progress(&conn).unwrap(), None);
+    conn.execute("UPDATE schema_version SET version=61", [])
+        .unwrap();
+    assert!(Store::source_scope_progress(&conn).is_err());
+    conn.execute(
+        "INSERT INTO app_schema_progress(name,cursor) VALUES('cad2042-source-scope',7)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(Store::source_scope_progress(&conn).unwrap(), Some(7));
+}
+
+/// CAD-2120: concurrent openers of a v61 store with several backfill batches.
+/// A loser used to fail on the progress row the winner deleted. The timing is
+/// the scheduler's, but every interleaving must succeed.
+#[test]
+fn cad2120_concurrent_openers_of_a_v61_store_all_succeed() {
+    for round in 0..5 {
+        concurrent_v61_round(round);
+    }
+}
+
+fn concurrent_v61_round(round: usize) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(format!("race{round}.sqlite3"));
+    drop(Store::open(&path).unwrap());
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated,context_id)
+               VALUES('r','inst',1,'sha256:bundle','{}','sha256:snap','lead','req-r','succeeded',1.0,1.0,'ctx');
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<170000)
+             INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema)
+               SELECT 'c'||i,'r','s','','','source'||i,'q'||i,'b','i','{\"kind\":\"social.source.posts\"}','d',i,2 FROM n;
+             DROP TRIGGER IF EXISTS app_capability_results_source_scope;
+             DROP INDEX IF EXISTS app_capability_results_source;
+             INSERT OR REPLACE INTO app_schema_progress(name,cursor) VALUES('cad2042-source-scope',0);
+             UPDATE schema_version SET version=61;",
+        )
+        .unwrap();
+    }
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let (path, gate) = (path.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                Store::open_for_schema_tests(&path)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap().expect("every opener reaches v62");
+    }
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 62);
+    let progress: i64 = conn
+        .query_row("SELECT COUNT(*) FROM app_schema_progress", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(progress, 0);
 }
