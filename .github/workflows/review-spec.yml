@@ -179,7 +179,7 @@ jobs:
             try {
               const r = await fetch(`${TENANT}/__platform/review-jobs/${action}`, {
                 method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-                body: JSON.stringify(body), signal: AbortSignal.timeout(60000),
+                body: JSON.stringify(body), redirect: 'error', signal: AbortSignal.timeout(60000),
               });
               let json = null;
               try { json = await r.json(); } catch {}
@@ -596,7 +596,7 @@ jobs:
             try {
               const r = await fetch(`${TENANT}/__platform/review-jobs/verdict`, {
                 method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-                body: JSON.stringify(payload), signal: AbortSignal.timeout(60000),
+                body: JSON.stringify(payload), redirect: 'error', signal: AbortSignal.timeout(60000),
               });
               status = r.status;
               try { json = await r.json(); } catch {}
