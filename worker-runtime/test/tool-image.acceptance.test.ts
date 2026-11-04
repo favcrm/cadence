@@ -8,7 +8,7 @@ import {
   MemoryStorage,
 } from "@earendil-works/pi-durable";
 import { createAI } from "agents/models/pi-ai";
-import type { AppScope, RuntimeTool } from "../src/contract.ts";
+import type { AppScope, RuntimeTool, ToolContent } from "../src/contract.ts";
 import { runtimeExtension } from "../src/engine.ts";
 import { defaultModel, meteredBinding, withDefaultModel } from "../src/model.ts";
 import { rawSessionFrame } from "../src/session-stream.ts";
@@ -336,13 +336,17 @@ describe("visual tool results through the hosted model path", () => {
     }
   });
 
-  it("names a gateway image refusal instead of reporting a network outage", async () => {
+  /** A model that captures once, then refuses any request carrying image bytes. */
+  async function refusingModel() {
+    const requests: string[] = [];
     let calls = 0;
     const binding = meteredBinding(
       {
-        async requestModel() {
+        async requestModel(input) {
           calls += 1;
-          if (calls > 1)
+          const sent = JSON.stringify(input);
+          requests.push(sent);
+          if (sent.includes("image_url"))
             return Response.json(
               {
                 error: {
@@ -353,31 +357,33 @@ describe("visual tool results through the hosted model path", () => {
               },
               { status: 404 },
             );
-          return new Response(
-            frame({ role: "assistant", content: "" }) +
-              frame({
-                tool_calls: [
-                  {
-                    index: 0,
-                    id: "capture-1",
-                    type: "function",
-                    function: { name: "capture", arguments: "{}" },
-                  },
-                ],
-              }) +
-              frame({}, "tool_calls") +
-              "data: [DONE]\n\n",
-            { headers: { "content-type": "text/event-stream" } },
-          );
+          const body =
+            calls === 1
+              ? frame({ role: "assistant", content: "" }) +
+                frame({
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "capture-1",
+                      type: "function",
+                      function: { name: "capture", arguments: "{}" },
+                    },
+                  ],
+                }) +
+                frame({}, "tool_calls")
+              : frame({ role: "assistant", content: "" }) +
+                frame({ content: "answered in text" }) +
+                frame({}, "stop");
+          return new Response(body + "data: [DONE]\n\n", {
+            headers: { "content-type": "text/event-stream" },
+          });
         },
       },
       () => ({ conversation: "1", task: "2", cutoff: "3" }),
     );
     const model = defaultModel("default", true);
     const models = createModels();
-    models.setProvider(
-      withDefaultModel(createAI({ binding: binding as Ai }).provider, model),
-    );
+    models.setProvider(withDefaultModel(createAI({ binding: binding as Ai }).provider, model));
     const registry = createRegistry();
     registry.install(
       runtimeExtension(
@@ -387,19 +393,12 @@ describe("visual tool results through the hosted model path", () => {
         true,
       ),
     );
-    const harness = await Harness.open(
-      new MemoryStorage(),
-      { models, registry },
-      BACKGROUND_CONTEXT,
-    );
-    try {
-      const conversation = await harness.root(BACKGROUND_CONTEXT, {
-        agent: { model: { provider: model.provider, modelId: model.id } },
-      });
-      const operation = await conversation.submit(
-        { type: "input", content: "Inspect this page." },
-        BACKGROUND_CONTEXT,
-      );
+    const harness = await Harness.open(new MemoryStorage(), { models, registry }, BACKGROUND_CONTEXT);
+    const conversation = await harness.root(BACKGROUND_CONTEXT, {
+      agent: { model: { provider: model.provider, modelId: model.id } },
+    });
+    const turn = async (content: string) => {
+      const operation = await conversation.submit({ type: "input", content }, BACKGROUND_CONTEXT);
       await operation.wait(BACKGROUND_CONTEXT);
       const records = await conversation.entries(
         { order: "ascending" },
@@ -407,12 +406,62 @@ describe("visual tool results through the hosted model path", () => {
         undefined,
         BACKGROUND_CONTEXT,
       );
-      const text = JSON.stringify(threadEntries(records.items, true));
-      expect(text).toContain("The selected model cannot read images.");
-      expect(text).not.toContain("could not be reached");
+      return { records: records.items, thread: JSON.stringify(threadEntries(records.items, true)) };
+    };
+    return { requests, turn, close: () => harness.close(BACKGROUND_CONTEXT) };
+  }
+
+  it("names a gateway image refusal instead of reporting a network outage", async () => {
+    const model = await refusingModel();
+    try {
+      const { thread } = await model.turn("Inspect this page.");
+      expect(thread).toContain("The selected model cannot read images.");
+      expect(thread).not.toContain("could not be reached");
+      expect(thread).not.toContain("answered in text");
     } finally {
-      await harness.close(BACKGROUND_CONTEXT);
+      await model.close();
     }
+  });
+
+  it("lets a later turn answer after a refusal, without the image and without losing it", async () => {
+    const model = await refusingModel();
+    try {
+      await model.turn("Inspect this page.");
+      const { thread, records } = await model.turn("Forget the image and say hello.");
+      expect(thread).toContain("answered in text");
+      const last = model.requests.at(-1)!;
+      expect(last).not.toContain(PNG);
+      expect(last).toContain("the selected model cannot read images");
+      // The model input changed; the stored conversation did not.
+      expect(JSON.stringify(records)).toContain(PNG);
+    } finally {
+      await model.close();
+    }
+  });
+
+  it("does not retry a refusal when the image is not in older history", async () => {
+    const seen: string[] = [];
+    const binding = meteredBinding(
+      {
+        async requestModel(input) {
+          seen.push(JSON.stringify(input));
+          return Response.json(
+            { error: { message: "private", code: "image_input_unavailable" } },
+            { status: 404 },
+          );
+        },
+      },
+      () => ({ conversation: "1", task: "2", cutoff: "3" }),
+    );
+    const response = (await binding.run("default", {
+      messages: [
+        { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${PNG}` } }] },
+      ],
+    })) as Response;
+    expect(seen).toHaveLength(1);
+    expect(await response.json()).toEqual({
+      error: { code: "image_input_unavailable", message: "image_input_unavailable" },
+    });
   });
 
   it("does not rewrite a gateway refusal outside the allowlist", async () => {
@@ -457,6 +506,50 @@ function capturing(onRun: (app: unknown) => void): RuntimeTool {
     },
   };
 }
+
+describe("a part that is neither text nor an image", () => {
+  const output = (accepts: boolean, part: unknown) =>
+    (runtimeExtension(
+      {
+        name: "synthetic",
+        tools: [
+          {
+            name: "relay",
+            description: "Relay a synthetic part.",
+            parameters: { type: "object", properties: {}, additionalProperties: false },
+            replay: "safe",
+            execute: async () => ({ output: [part as ToolContent] }),
+          },
+        ],
+      },
+      undefined,
+      undefined,
+      accepts,
+    ).tools![0]!.execute as (...args: unknown[]) => Promise<unknown>)(
+      {},
+      { conversationId: 1, taskId: 2, now: () => 1000 },
+      { abortSignal: new AbortController().signal },
+    );
+
+  it("is refused with or without the host's opt-in", async () => {
+    for (const accepts of [false, true])
+      for (const part of [
+        { type: "file", data: "UNVALIDATED" },
+        { type: "text", text: 42, data: "UNVALIDATED" },
+        { data: "UNVALIDATED" },
+      ]) {
+        const result = await output(accepts, part);
+        expect(result).toMatchObject({ isError: true });
+        expect(JSON.stringify(result)).not.toContain("UNVALIDATED");
+      }
+  });
+
+  it("redacts image bytes from raw frames even with no media type", () => {
+    const frame = rawSessionFrame({ part: { type: "image", data: "UNVALIDATED" } });
+    expect(frame).not.toContain("UNVALIDATED");
+    expect(frame).toContain('"redacted":true');
+  });
+});
 
 describe("image results keep the tool authority and app-scope order", () => {
   const app = { appId: "synthetic-app" } as unknown as AppScope;

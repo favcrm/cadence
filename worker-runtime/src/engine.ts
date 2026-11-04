@@ -21,14 +21,19 @@ import { MAX_IMAGE_BASE64_CHARS, MAX_IMAGE_PARTS } from "./image-limits.ts";
  * Nothing here is exported from the package root: application code never sees
  * a registration, hook, prompt section or engine model.
  */
-// A single result must fit within the whole-request image budget.
 const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 
-function imageError(output: readonly ToolContent[], acceptsImages: boolean): string | undefined {
+/**
+ * Tool output is text or a validated image and nothing else: the engine would
+ * otherwise carry any other part straight through as if it were an image.
+ * A single result must fit within the whole-request image budget.
+ */
+function outputError(output: readonly ToolContent[], acceptsImages: boolean): string | undefined {
   let count = 0;
   let bytes = 0;
   for (const part of output) {
-    if (part.type !== "image") continue;
+    if (part.type === "text" && typeof part.text === "string") continue;
+    if (part.type !== "image") return "Tool output is invalid.";
     if (!acceptsImages) return "Image input is unavailable for this session.";
     count += 1;
     bytes += typeof part.data === "string" ? part.data.length : 0;
@@ -98,9 +103,9 @@ function registration(
           invocation(api, app),
           { abortSignal: context.abortSignal },
         );
-        // Image output is validated after the handler and before anything
-        // reaches the model or the stored result.
-        const error = result.output && imageError(result.output, acceptsImages);
+        // Output is validated after the handler and before anything reaches
+        // the model or the stored result.
+        const error = result.output && outputError(result.output, acceptsImages);
         if (error)
           return {
             output: [{ type: "text" as const, text: error }],

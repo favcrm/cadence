@@ -171,6 +171,7 @@ export interface MeteredBinding {
 function boundImageHistory(
   input: Record<string, unknown>,
   maxImages: number,
+  notice = "[An image was omitted from this request to fit the image limit.]",
 ): Record<string, unknown> {
   if (!Array.isArray(input.messages)) return input;
   const omitted = new Map<number, Set<number>>();
@@ -230,16 +231,16 @@ function boundImageHistory(
         ...message,
         content: message.content.map((part: unknown, partIndex: number) =>
           indexes.has(partIndex)
-            ? {
-                type: "text",
-                text: "[An image was omitted from this request to fit the image limit.]",
-              }
+            ? { type: "text", text: notice }
             : part,
         ),
       };
     }),
   };
 }
+
+const IMAGE_REFUSED_NOTICE =
+  "[An image was omitted because the selected model cannot read images.]";
 
 /**
  * Gateway refusal codes the runtime may name. Anything else stays private: the
@@ -249,28 +250,61 @@ const PUBLIC_MODEL_REFUSALS: ReadonlySet<string> = new Set([
   IMAGE_INPUT_UNAVAILABLE,
 ]);
 
-/**
- * Carry an allowlisted refusal code into the engine's private error text, so
- * the transcript reads the code rather than classifying the gateway's prose.
- * A response without a recognized code passes through unread by the caller.
- */
-async function withPublicRefusal(response: Response): Promise<Response> {
-  if (response.ok) return response;
-  let code: unknown;
+/** The refusal code of a JSON gateway error, when it is an allowlisted one. */
+async function publicRefusal(response: Response): Promise<string | null> {
+  if (response.ok || !response.headers.get("content-type")?.includes("json"))
+    return null;
   try {
     const body: unknown = await response.clone().json();
-    code =
+    const code =
       typeof body === "object" && body !== null && "error" in body
         ? (body.error as { code?: unknown } | null)?.code
         : undefined;
+    return typeof code === "string" && PUBLIC_MODEL_REFUSALS.has(code)
+      ? code
+      : null;
   } catch {
-    return response;
+    return null;
   }
-  if (typeof code !== "string" || !PUBLIC_MODEL_REFUSALS.has(code))
-    return response;
+}
+
+/**
+ * Carry an allowlisted refusal code into the engine's private error text, so
+ * the failed turn names it. The gateway's own message is dropped, and any other
+ * response passes through unchanged.
+ */
+function withRefusalCode(response: Response, code: string | null): Response {
+  if (code === null) return response;
   return Response.json(
     { error: { code, message: code } },
     { status: response.status },
+  );
+}
+
+function hasImage(content: unknown): boolean {
+  return (
+    Array.isArray(content) &&
+    content.some(
+      (part: unknown) =>
+        typeof part === "object" &&
+        part !== null &&
+        "type" in part &&
+        part.type === "image_url",
+    )
+  );
+}
+
+/**
+ * Whether a refused request can go without its images: only when they are all
+ * older history. A screenshot the model was just handed stays a visible
+ * refusal, because answering without it would read as having seen it.
+ */
+function imagesOnlyInHistory(input: Record<string, unknown>): boolean {
+  if (!Array.isArray(input.messages)) return false;
+  const messages = input.messages as { content?: unknown }[];
+  return (
+    !hasImage(messages.at(-1)?.content) &&
+    messages.some((message) => hasImage(message?.content))
   );
 }
 
@@ -311,13 +345,24 @@ export function meteredBinding(
           { status: 409 },
         );
       }
-      const response = await withPublicRefusal(
-        await transport.requestModel(
-          boundImageHistory(input, maxImagesPerRequest),
+      const bounded = boundImageHistory(input, maxImagesPerRequest);
+      let response = await transport.requestModel(
+        bounded,
+        current,
+        options?.signal,
+      );
+      let refusal = await publicRefusal(response);
+      // A stored screenshot would otherwise be refused on every later turn,
+      // leaving a conversation that can only be reset. History is untouched.
+      if (refusal === IMAGE_INPUT_UNAVAILABLE && imagesOnlyInHistory(bounded)) {
+        response = await transport.requestModel(
+          boundImageHistory(bounded, 0, IMAGE_REFUSED_NOTICE),
           current,
           options?.signal,
-        ),
-      );
+        );
+        refusal = await publicRefusal(response);
+      }
+      response = withRefusalCode(response, refusal);
       const metered = onModelResolved ? captureResolvedModel(response, onModelResolved) : response;
       if (options?.returnRawResponse !== false) return metered;
       return metered.json();

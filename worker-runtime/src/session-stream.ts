@@ -12,12 +12,12 @@ export function rawSessionFrame(event: unknown): string {
     if (value === null || typeof value !== "object" || Array.isArray(value))
       return value;
     const part = value as Record<string, unknown>;
-    if (
-      part.type === "image" &&
-      typeof part.data === "string" &&
-      typeof part.mimeType === "string"
-    ) {
-      return { type: "image", mimeType: part.mimeType, redacted: true };
+    if (part.type === "image" && typeof part.data === "string") {
+      return {
+        type: "image",
+        ...(typeof part.mimeType === "string" ? { mimeType: part.mimeType } : {}),
+        redacted: true,
+      };
     }
     return value;
   });

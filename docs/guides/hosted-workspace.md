@@ -81,6 +81,12 @@ parts with an explicit notice to the model. The count defaults to one; a host
 may set `maxImagesPerRequest` from one to four only when every model its alias
 may resolve to permits that many. The private durable history is not changed.
 
+A gateway refuses image input for a model that cannot take it with a JSON error
+whose `error.code` is `image_input_unavailable`. A turn whose newest message holds
+the image fails with that named reason. A later request whose images are all older
+history is retried once with them replaced by a notice, so the conversation can
+continue; its stored history is unchanged.
+
 Image input is off by default. A host may set `acceptsToolImages: true` only
 when its model gateway can receive images and verifies the resolved model and
 image pricing for each request. Without that opt-in, an image result reports

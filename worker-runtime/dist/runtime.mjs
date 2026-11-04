@@ -55857,12 +55857,14 @@ var IMAGE_INPUT_UNAVAILABLE = "image_input_unavailable";
 
 // src/engine.ts
 var BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
-function imageError(output, acceptsImages) {
+function outputError(output, acceptsImages) {
   let count = 0;
   let bytes = 0;
   for (const part of output) {
-    if (part.type !== "image")
+    if (part.type === "text" && typeof part.text === "string")
       continue;
+    if (part.type !== "image")
+      return "Tool output is invalid.";
     if (!acceptsImages)
       return "Image input is unavailable for this session.";
     count += 1;
@@ -55890,7 +55892,7 @@ function registration(tool, authority, resolveApp, acceptsImages) {
       const run = async () => {
         const app = resolveApp === undefined ? null : await resolveApp(api, context);
         const result = await tool.execute(input, invocation(api, app), { abortSignal: context.abortSignal });
-        const error = result.output && imageError(result.output, acceptsImages);
+        const error = result.output && outputError(result.output, acceptsImages);
         if (error)
           return {
             output: [{ type: "text", text: error }],
@@ -56310,7 +56312,7 @@ function captureResolvedModel(response, onModelResolved) {
     headers: response.headers
   });
 }
-function boundImageHistory(input, maxImages) {
+function boundImageHistory(input, maxImages, notice = "[An image was omitted from this request to fit the image limit.]") {
   if (!Array.isArray(input.messages))
     return input;
   const omitted = new Map;
@@ -56348,30 +56350,39 @@ function boundImageHistory(input, maxImages) {
         return message;
       return {
         ...message,
-        content: message.content.map((part, partIndex) => indexes.has(partIndex) ? {
-          type: "text",
-          text: "[An image was omitted from this request to fit the image limit.]"
-        } : part)
+        content: message.content.map((part, partIndex) => indexes.has(partIndex) ? { type: "text", text: notice } : part)
       };
     })
   };
 }
+var IMAGE_REFUSED_NOTICE = "[An image was omitted because the selected model cannot read images.]";
 var PUBLIC_MODEL_REFUSALS = new Set([
   IMAGE_INPUT_UNAVAILABLE
 ]);
-async function withPublicRefusal(response) {
-  if (response.ok)
-    return response;
-  let code;
+async function publicRefusal(response) {
+  if (response.ok || !response.headers.get("content-type")?.includes("json"))
+    return null;
   try {
     const body = await response.clone().json();
-    code = typeof body === "object" && body !== null && "error" in body ? body.error?.code : undefined;
+    const code = typeof body === "object" && body !== null && "error" in body ? body.error?.code : undefined;
+    return typeof code === "string" && PUBLIC_MODEL_REFUSALS.has(code) ? code : null;
   } catch {
-    return response;
+    return null;
   }
-  if (typeof code !== "string" || !PUBLIC_MODEL_REFUSALS.has(code))
+}
+function withRefusalCode(response, code) {
+  if (code === null)
     return response;
   return Response.json({ error: { code, message: code } }, { status: response.status });
+}
+function hasImage(content) {
+  return Array.isArray(content) && content.some((part) => typeof part === "object" && part !== null && ("type" in part) && part.type === "image_url");
+}
+function imagesOnlyInHistory(input) {
+  if (!Array.isArray(input.messages))
+    return false;
+  const messages = input.messages;
+  return !hasImage(messages.at(-1)?.content) && messages.some((message) => hasImage(message?.content));
 }
 function meteredBinding(transport, identity, onModelResolved, maxImagesPerRequest = 1) {
   if (!Number.isSafeInteger(maxImagesPerRequest) || maxImagesPerRequest < 1 || maxImagesPerRequest > MAX_IMAGE_PARTS)
@@ -56388,7 +56399,14 @@ function meteredBinding(transport, identity, onModelResolved, maxImagesPerReques
           }
         }, { status: 409 });
       }
-      const response = await withPublicRefusal(await transport.requestModel(boundImageHistory(input, maxImagesPerRequest), current, options?.signal));
+      const bounded = boundImageHistory(input, maxImagesPerRequest);
+      let response = await transport.requestModel(bounded, current, options?.signal);
+      let refusal = await publicRefusal(response);
+      if (refusal === IMAGE_INPUT_UNAVAILABLE && imagesOnlyInHistory(bounded)) {
+        response = await transport.requestModel(boundImageHistory(bounded, 0, IMAGE_REFUSED_NOTICE), current, options?.signal);
+        refusal = await publicRefusal(response);
+      }
+      response = withRefusalCode(response, refusal);
       const metered = onModelResolved ? captureResolvedModel(response, onModelResolved) : response;
       if (options?.returnRawResponse !== false)
         return metered;
@@ -56998,8 +57016,12 @@ function rawSessionFrame(event) {
     if (value === null || typeof value !== "object" || Array.isArray(value))
       return value;
     const part = value;
-    if (part.type === "image" && typeof part.data === "string" && typeof part.mimeType === "string") {
-      return { type: "image", mimeType: part.mimeType, redacted: true };
+    if (part.type === "image" && typeof part.data === "string") {
+      return {
+        type: "image",
+        ...typeof part.mimeType === "string" ? { mimeType: part.mimeType } : {},
+        redacted: true
+      };
     }
     return value;
   });
