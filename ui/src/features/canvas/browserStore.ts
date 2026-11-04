@@ -21,7 +21,7 @@
  *   unavailable is never read again;
  * - no viewer URL is ever held here (see browserClient.viewBrowser).
  */
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { canvasSnapshot, onArtifactFocus, onArtifactsEmptied, showDrawer } from "./canvasStore";
 import { onPrivateSessionReset } from "../../lib/privateSession";
 import { readBrowser, stopBrowser, type BrowserSession } from "./browserClient";
@@ -63,6 +63,8 @@ let again = false;
 /** The host's turn is running (see `useBrowserFeed`). */
 let watching = false;
 let failedReads = 0;
+/** The last read failed with no live session to lose sight of: tried again, slowly, until one answers. */
+let retrying = false;
 
 const alerts = new Set<(text: string) => void>();
 /** Words for the board's toast: a failure the person has to act on or would
@@ -118,7 +120,7 @@ export function tabVisible(s: BrowserTabState): boolean {
 }
 
 /** Poll while a session is live or being stopped, or a turn is running. */
-export function pollDelay(s: BrowserTabState, turnRunning = false): number | null {
+export function pollDelay(s: BrowserTabState, turnRunning = false, retry = false): number | null {
   if (s.conversation === null) return null;
   // A board that has not answered at all is tried again, slowly: a reload in
   // the middle of a takeover must not leave a live session with no Stop. A
@@ -127,11 +129,11 @@ export function pollDelay(s: BrowserTabState, turnRunning = false): number | nul
   if (s.availability !== "available") return null;
   if (s.session?.state === "handoff") return POLL.handoff;
   if (s.session?.state === "active" || s.stop === "stopping") return POLL.active;
-  return turnRunning ? POLL.turn : null;
+  return turnRunning ? POLL.turn : retry ? POLL.probe : null;
 }
 
 function schedule(): void {
-  const delay = pollDelay(state, watching);
+  const delay = pollDelay(state, watching, retrying);
   if (delay === null) {
     if (timer !== null) clearTimeout(timer);
     timer = null;
@@ -140,7 +142,7 @@ function schedule(): void {
   if (timer !== null) return;
   timer = setTimeout(() => {
     timer = null;
-    // A hidden tab does not poll; the next tick (or visibility) catches up.
+    // A hidden tab does not poll; the next tick catches up.
     if (typeof document !== "undefined" && document.hidden) schedule();
     else void refreshBrowser();
   }, delay);
@@ -161,6 +163,7 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
     return;
   }
   failedReads = 0;
+  retrying = false;
   const prev = state.session?.state;
   const next = read.session;
   // A new takeover request brings a hidden tab back.
@@ -187,7 +190,10 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
  *  and once, says the state cannot be loaded; only for a live session. */
 function readFailed(): void {
   // With no live session there is nothing to lose sight of: no session, no noise.
-  if (state.session?.state !== "active" && state.session?.state !== "handoff" && state.stop === "idle") return;
+  if (state.session?.state !== "active" && state.session?.state !== "handoff" && state.stop === "idle") {
+    retrying = true;
+    return;
+  }
   if (!state.loadError) set({ ...state, loadError: true });
   if (++failedReads === ALERT_AFTER) alertBrowser("Can't load the browser state.");
 }
@@ -235,6 +241,7 @@ export function feedBrowser(conversation: string | null): void {
   reading = false;
   again = false;
   failedReads = 0;
+  retrying = false;
   if (conversation === null) watching = false;
   if (timer !== null) clearTimeout(timer);
   timer = null;
@@ -283,8 +290,14 @@ export function useBrowserFeed(conversation: string | null, running: boolean, re
   useEffect(() => {
     if (conversation !== null) void refreshBrowser();
   }, [conversation, revision]);
+  const was = useRef({ running: false, on: false });
   useEffect(() => {
-    watchBrowser(running && !expired);
+    const on = running && !expired;
+    // The turn settling reads once more even if the window had already ended
+    // (watchBrowser reads on its own when it stops a watch that was on).
+    if (was.current.running && !running && !was.current.on) void refreshBrowser();
+    was.current = { running, on };
+    watchBrowser(on);
   }, [conversation, running, expired]);
 }
 
@@ -370,9 +383,11 @@ export async function confirmStop(): Promise<void> {
   reading = false;
   again = false;
   const prior = state.session;
+  failedReads = 0;
   set({
     ...state,
     stop: "idle",
+    loadError: false,
     session: prior ? { ...prior, state: "ended", instructions: null } : prior,
   });
   void refreshBrowser();

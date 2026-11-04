@@ -1636,6 +1636,76 @@ for (const turn of [1, 4]) {
   hostEl.remove();
 }
 
+// ===== the final rounds: Stop clears a failed read, a failed last read is retried, the settle read =====
+{
+  // 1. A successful Stop with reads failing says Ended, not Can't load.
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await openTab(m);
+  board.mode = "network";
+  await advance(3000);
+  assert(text(el(m.host, ".bz-badge")).includes("Can't load"), "a failed read on a live session says so");
+  await click(btn(m, "stop")!);
+  equal(board.stops, 1, "Stop reaches the board");
+  assert(!store.browserSnapshot().loadError && text(el(m.host, ".bz-badge")).includes("Ended"), `a stop that succeeded reads Ended: ${text(el(m.host, ".bz-badge"))}`);
+  await m.unmount();
+}
+{
+  // 2. A failed settle read with no live session is retried slowly, silently, until one answers.
+  const m = await start({ state: "none" });
+  await React.act(async () => { store.watchBrowser(true); });
+  board.mode = "network";
+  await React.act(async () => { store.watchBrowser(false); });
+  await settle();
+  const failed = board.gets;
+  await advance(95_000);
+  assert(board.gets >= failed + 3, `retried every 30 s (${failed} -> ${board.gets})`);
+  equal(toasts.length, 0, "silently");
+  assert(!store.browserSnapshot().loadError && !el(m.host, ".bz-card"), "with no card and no label");
+  board.mode = "ok";
+  board.body = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." };
+  await advance(31_000);
+  equal(store.browserSnapshot().session?.state, "handoff", "the session the failed read hid shows once one read answers");
+  await m.unmount();
+}
+{
+  const m = await start({ state: "none" });
+  await React.act(async () => { store.watchBrowser(true); });
+  board.mode = "network";
+  await React.act(async () => { store.watchBrowser(false); });
+  await settle();
+  board.mode = "ok";
+  await advance(31_000);
+  const answered = board.gets;
+  await advance(10 * 60_000);
+  equal(board.gets, answered, "once one read answers, an idle none makes zero reads again");
+  await m.unmount();
+}
+{
+  // 3 and 4. The final read at expiry, and at the turn settling after it, through the hook alone.
+  const Feed = (props: { running: boolean }) => { store.useBrowserFeed("c1", props.running, "r1"); return null; };
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const root = createRoot(hostEl);
+  const render = (running: boolean) => React.act(async () => { root.render(React.createElement(Feed, { running })); });
+  reset({ body: { state: "none" } });
+  Object.defineProperty(document, "hidden", { value: true, configurable: true });
+  await render(true);
+  await settle();
+  const g0 = board.gets;
+  await advance(WINDOW - 5000);
+  equal(board.gets, g0, "a hidden tab's ticks read nothing before the window ends");
+  await advance(10_000);
+  equal(board.gets, g0 + 1, "the window ending makes one final read");
+  board.body = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." };
+  await render(false);
+  await settle();
+  equal(board.gets, g0 + 2, "the turn settling after the window still reads once more");
+  equal(store.browserSnapshot().session?.state, "handoff", "and finds the session");
+  await React.act(async () => { root.unmount(); });
+  hostEl.remove();
+  delete (document as any).hidden;
+}
+
 console.log("browser canvas tests passed");
 }
 main().then(() => process.exit(0), (e) => { console.error(e); process.exit(1); });
