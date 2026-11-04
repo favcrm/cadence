@@ -259,13 +259,15 @@ export function useCanvasFeed(opts: {
   items: ThreadItem[];
   loaded: boolean;
   running: string | null;
+  /** Default true. False keeps a card from opening the drawer by itself. */
+  autoOpen?: boolean;
 }): void {
-  const { conversation, surface, composerKey, items, loaded, running } = opts;
+  const { conversation, surface, composerKey, items, loaded, running, autoOpen } = opts;
   const mark = useRef<{ conversation: string | null; seq: number | null }>({ conversation: null, seq: null });
   useEffect(() => {
     if (mark.current.conversation !== conversation) mark.current = { conversation, seq: null };
     if (!loaded || conversation === null) return;
     if (mark.current.seq === null) mark.current.seq = topSeq(items);
-    feedCanvas({ conversation, surface, composerKey, ...feedParts(items, mark.current.seq, running) });
-  }, [conversation, surface, composerKey, items, loaded, running]);
+    feedCanvas({ conversation, surface, composerKey, autoOpen, ...feedParts(items, mark.current.seq, running) });
+  }, [conversation, surface, composerKey, items, loaded, running, autoOpen]);
 }

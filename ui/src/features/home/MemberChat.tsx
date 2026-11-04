@@ -227,7 +227,9 @@ export default function MemberChat({
   // wired to the canvas and the Browser tab explicitly. A new entry in the
   // thread is when a session may have started, so it re-reads the browser.
   const conversationId = surface?.conversation ?? null;
-  useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null });
+  // Auto-open is off here: an artifact opens the drawer when the person asks,
+  // so on a phone the drawer never covers the chat they are reading.
+  useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null, autoOpen: false });
   useEffect(() => {
     feedBrowser(conversationId);
     return () => feedBrowser(null);

@@ -5,11 +5,15 @@
  *
  * Rules (the ticket's):
  * - the drawer opens by itself only for the FIRST artifact of a turn the
- *   operator started, and only when that artifact arrives live;
+ *   operator started, and only when that artifact arrives live, and only on a
+ *   host that has not turned auto-open off (`FeedInput.autoOpen`: the member
+ *   chat does, so the drawer never covers the chat on a phone);
  * - a drawer the operator closed stays closed for the rest of that turn;
  * - the drawer closes when the conversation changes;
  * - opening an artifact already open focuses its tab; closing the active
- *   tab selects a neighbour; closing the last collapses the drawer.
+ *   tab selects a neighbour; closing the last collapses the drawer, unless the
+ *   Browser tab (browserStore.ts, not modelled here) has a live session or was
+ *   opened on its own, and then the drawer stays on it.
  */
 import { useSyncExternalStore } from "react";
 import { onPrivateSessionReset } from "../../lib/privateSession";
@@ -112,6 +116,8 @@ export interface FeedInput {
   working: Working | null;
   /** The turn in flight, if any — a close is remembered against it. */
   turn: string | null;
+  /** Default true. False: no card ever opens the drawer by itself. */
+  autoOpen?: boolean;
 }
 
 const listeners = new Set<() => void>();
@@ -232,7 +238,7 @@ export function feedCanvas(input: FeedInput): void {
     if (tabs.some((t) => t.id === ref.id)) {
       tabs = tabs.map((t) => (t.id === ref.id ? withVersion(t, ref, card.turn) : t));
     }
-    if (card.live && card.operatorTurn && card.turn && !autoOpened.has(card.turn) && !closedTurns.has(card.turn)) {
+    if (input.autoOpen !== false && card.live && card.operatorTurn && card.turn && !autoOpened.has(card.turn) && !closedTurns.has(card.turn)) {
       autoOpened.add(card.turn);
       if (!tabs.some((t) => t.id === ref.id)) tabs = [...tabs, newTab(ref, card.turn)];
       open = true;

@@ -119,9 +119,9 @@ function AddressRow({ b }: { b: BrowserTabState }) {
         )}
       </div>
       {live && b.session?.signedIn ? (
-        <span className="bz-signed" title={t("Signed in. The assistant only reads the current page.")}>
-          {t("Signed in")}
-          <span className="sr-only">. {t("The assistant only reads the current page.")}</span>
+        <span className="bz-signed" title={t("A person has had control of this session. The assistant only reads the current page.")}>
+          {t("You had control")}
+          <span className="sr-only">. {t("A person has had control of this session. The assistant only reads the current page.")}</span>
         </span>
       ) : null}
     </div>
@@ -145,10 +145,10 @@ function Says({ b, compact }: { b: BrowserTabState; compact: boolean }) {
           {clamp ? t("Show all") : t("Show less")}
         </button>
       ) : null}
-      <p className="bz-says-f">{t("Written by the assistant from what it read. It can be wrong or shaped by the page. Check the address before you type anything.")}</p>
+      <p className="bz-says-f">{t("Written by the assistant from what it read. It can be wrong or shaped by the page. The address shown is the last page the assistant read: check the address in the live view itself before you type anything.")}</p>
       {!compact && parts ? (
         <p className="bz-says-addr">
-          <small>{t("You will be on this page")}</small>
+          <small>{t("Last page the assistant read")}</small>
           <code>
             <span>{parts.scheme}</span>
             <b>{parts.host}</b>
@@ -295,6 +295,17 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
     if (document.activeElement === document.body) (document.getElementById("bz-tab") ?? heading.current)?.focus();
   });
 
+  // A fast 503: the focus the stop left on the dock (or nowhere) goes to the retry.
+  useEffect(() => {
+    if (b.stop !== "failed") return;
+    const at = document.activeElement;
+    // Nowhere, the dock, or the places the rescue parks focus while a stop is
+    // in flight (the heading or the tab): all of them are the panel's, not the person's choice.
+    if (at === document.body || at === dockRef.current || at === heading.current || at === document.getElementById("bz-tab")) {
+      root.current?.querySelector<HTMLElement>('[data-bz-act="stop"]')?.focus();
+    }
+  }, [b.stop]);
+
   const onFocusIn = (e: FocusEvent<HTMLElement>) => { claim.current = e.target; };
   const onFocusOut = (e: FocusEvent<HTMLElement>) => {
     const to = e.relatedTarget as Node | null;
@@ -302,7 +313,14 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
     if ((to === null && e.target.isConnected) || (to !== null && !e.currentTarget.contains(to))) claim.current = null;
   };
 
-  const focusSoon = (selector: string) => requestAnimationFrame(() => root.current?.querySelector<HTMLElement>(selector)?.focus());
+  // Focus a control in the panel, but only if the person's focus is still in
+  // the panel (or nowhere): a late answer must never pull keystrokes away from
+  // the chat draft, least of all into the provider's page.
+  const focusSoon = (selector: string) => requestAnimationFrame(() => {
+    const at = document.activeElement;
+    if (at !== document.body && !root.current?.contains(at)) return;
+    root.current?.querySelector<HTMLElement>(selector)?.focus();
+  });
 
   const openView = async () => {
     const mine = ++attempt.current;
@@ -381,8 +399,7 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
             <span className="cv-bar bz-bar" aria-hidden><i className="cv-bar-run" /></span>
           </EmptyState>
           {phase === "active" && b.handedBack ? <div role="status"><Notice>{t("Handed back. The assistant is reading again.")}</Notice></div> : null}
-          {phase === "active" && b.session?.signedIn ? <Notice>{t("You signed in on this session. The assistant will only read the current page, not move to others.")}</Notice> : null}
-          {showFrame ? frame() : null}
+          {phase === "active" && b.session?.signedIn ? <Notice>{t("A person has had control of this session. The assistant will only read the current page, not move to others.")}</Notice> : null}
         </>
       );
     }
@@ -391,7 +408,6 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
         <>
           <Says b={b} compact />
           {reopenFailed ? <ErrorNotice>{t("Couldn't open the live view again. The current view is unchanged.")}</ErrorNotice> : null}
-          {frame()}
         </>
       );
     }
@@ -439,13 +455,17 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
         </ErrorNotice>
       ) : null}
       {sessionBody()}
+      {/* One fixed slot, whatever the rest of the body shows (stopping, a
+          failed stop, a failed read): React must never remount the frame, which
+          would load the bearer URL again. */}
+      {showFrame ? frame() : null}
     </>
   );
 
   const elapsed = b.stopStartedAt === null ? 0 : Math.max(0, Math.round((now - b.stopStartedAt) / 1000));
   let dock: React.ReactNode = null;
   if (b.stop === "confirm") {
-    const lost = b.session?.signedIn ? ` ${t("You are signed in here, and that is lost.")}` : "";
+    const lost = b.session?.signedIn ? ` ${t("Anything signed in to this session is lost.")}` : "";
     const takeover = b.session?.state === "handoff" ? ` ${t("The takeover ends.")}` : "";
     dock = (
       <>
@@ -480,7 +500,7 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
         <>
           {failed}
           <div className="bz-dock-row">
-            <button key="view" type="button" className={viewing ? "btn" : "btn btn-primary"} data-bz-act="view" disabled={wait} aria-disabled={wait} onClick={() => void openView()}>
+            <button key="view" type="button" className={viewing ? "btn" : "btn btn-primary"} data-bz-act="view" aria-disabled={wait} onClick={() => { if (!wait) void openView(); }}>
               {wait ? <span className="btn-spin" aria-hidden /> : null}
               <span className="btn-label">{viewing || viewer.phase === "error" ? t("Open live view again") : t("Open live view")}</span>
             </button>

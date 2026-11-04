@@ -421,7 +421,14 @@ export default function CanvasDrawer() {
                 <button type="button" role="tab" aria-selected={on} className="cv-tab-label" onClick={() => focusTab(x.id)}>
                   {x.title}
                 </button>
-                <button type="button" className="cv-tab-close" aria-label={`${t("Close")} ${x.title}`} onClick={() => closeTab(x.id)}>
+                <button type="button" className="cv-tab-close" aria-label={`${t("Close")} ${x.title}`} onClick={() => {
+                    closeTab(x.id);
+                    // The tab that held focus is gone: the next one, or the drawer, takes it.
+                    requestAnimationFrame(() => {
+                      const next = rootRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+                      (next ?? rootRef.current)?.focus();
+                    });
+                  }}>
                   <IconClose size={10} />
                 </button>
               </span>

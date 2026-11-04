@@ -32,6 +32,8 @@ export interface BrowserTabState {
   loadError: boolean;
   /** A session has been seen live (active or handoff) in this conversation. */
   everLive: boolean;
+  /** The first reads all failed, so the board is not known either way yet. */
+  probeFailed: boolean;
   /** The tab's x was used: no tab, session still running. */
   hidden: boolean;
   /** The drawer was opened on the Browser tab (artifact tabs open it too). */
@@ -44,13 +46,15 @@ export interface BrowserTabState {
   handedBack: boolean;
 }
 
-const POLL = { active: 3000, handoff: 2000 } as const;
+const POLL = { active: 3000, handoff: 2000, probe: 30_000 } as const;
 const listeners = new Set<() => void>();
 let state: BrowserTabState = empty(null);
-/** Bumped on every conversation change and read, so a stale answer is dropped. */
+/** Bumped on every conversation change and on a confirmed stop, so a stale answer is dropped. */
 let epoch = 0;
 let timer: ReturnType<typeof setTimeout> | null = null;
 let reading = false;
+/** A read was asked for while one was in flight: it runs once that one ends. */
+let again = false;
 
 function empty(conversation: string | null): BrowserTabState {
   return {
@@ -59,6 +63,7 @@ function empty(conversation: string | null): BrowserTabState {
     session: null,
     loadError: false,
     everLive: false,
+    probeFailed: false,
     hidden: false,
     open: false,
     focused: false,
@@ -97,7 +102,12 @@ export function tabVisible(s: BrowserTabState): boolean {
 
 /** Poll only while a session is live or being stopped. */
 export function pollDelay(s: BrowserTabState): number | null {
-  if (s.conversation === null || s.availability !== "available") return null;
+  if (s.conversation === null) return null;
+  // A board that has not answered at all is tried again, slowly: a reload in
+  // the middle of a takeover must not leave a live session with no Stop. A
+  // definite unavailable or 404 ends it.
+  if (s.availability === "unknown") return s.probeFailed ? POLL.probe : null;
+  if (s.availability !== "available") return null;
   if (s.session?.state === "handoff") return POLL.handoff;
   if (s.session?.state === "active" || s.stop === "stopping") return POLL.active;
   return null;
@@ -130,7 +140,7 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
       if (!state.loadError) set({ ...state, loadError: true });
       return;
     }
-    set({ ...state, availability: "unavailable", session: null, loadError: false, open: false, focused: false, stop: "idle" });
+    set({ ...state, availability: "unavailable", session: null, loadError: false, probeFailed: false, open: false, focused: false, stop: "idle" });
     return;
   }
   const prev = state.session?.state;
@@ -145,6 +155,7 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
     // The same session keeps its identity, so an unchanged poll changes nothing.
     session: sameSession(state.session, next) ? state.session : next,
     loadError: false,
+    probeFailed: false,
     everLive: state.everLive || next.state === "active" || next.state === "handoff",
     hidden: asked ? false : state.hidden,
     // A failed stop is about the phase it failed in.
@@ -161,7 +172,11 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
  *  conversation change or a confirmed stop is dropped (see `epoch`). */
 export async function refreshBrowser(): Promise<void> {
   const conversation = state.conversation;
-  if (conversation === null || reading) return;
+  if (conversation === null) return;
+  if (reading) {
+    again = true;
+    return;
+  }
   reading = true;
   const mine = epoch;
   try {
@@ -170,11 +185,21 @@ export async function refreshBrowser(): Promise<void> {
   } catch {
     // Keep what is shown. Only a tab that already exists says it cannot load;
     // a board we have never heard from offers none.
-    if (mine === epoch && state.availability === "available" && !state.loadError) set({ ...state, loadError: true });
+    if (mine === epoch) {
+      if (state.availability === "available") {
+        if (!state.loadError) set({ ...state, loadError: true });
+      } else if (state.availability === "unknown" && !state.probeFailed) {
+        set({ ...state, probeFailed: true });
+      }
+    }
   } finally {
     if (mine === epoch) {
       reading = false;
       schedule();
+      if (again) {
+        again = false;
+        void refreshBrowser();
+      }
     }
   }
 }
@@ -184,6 +209,7 @@ export function feedBrowser(conversation: string | null): void {
   if (conversation === state.conversation) return;
   epoch++;
   reading = false;
+  again = false;
   if (timer !== null) clearTimeout(timer);
   timer = null;
   set(empty(conversation));
@@ -219,7 +245,7 @@ export function hideBrowser(): void {
 export function closeBrowserDrawer(): void {
   // A confirm left pending must not wait there when the drawer reopens.
   if (state.open || state.focused || state.stop === "confirm") {
-    set({ ...state, open: false, stop: state.stop === "confirm" ? "idle" : state.stop });
+    set({ ...state, open: false, focused: false, stop: state.stop === "confirm" ? "idle" : state.stop });
   }
 }
 
@@ -231,9 +257,11 @@ onArtifactFocus((source) => {
 });
 
 // Closing the last artifact keeps the drawer, and a live view in it, on the
-// Browser tab when there is one.
+// Browser tab only when it has something to show: a live session, or a drawer
+// the person opened on it. A tab with no session would be an empty panel.
 onArtifactsEmptied(() => {
-  if (!tabVisible(state)) return false;
+  const live = state.session?.state === "active" || state.session?.state === "handoff";
+  if (!tabVisible(state) || !(live || state.open)) return false;
   set({ ...state, open: true, focused: true });
   return true;
 });
@@ -272,6 +300,7 @@ export async function confirmStop(): Promise<void> {
   // drop it, so it cannot bring `active` and Stop back.
   epoch++;
   reading = false;
+  again = false;
   const prior = state.session;
   set({
     ...state,
