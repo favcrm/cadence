@@ -308,6 +308,12 @@ fn require_install() -> Result<ClientInstall> {
     identify(&exe)?.ok_or_else(client_only_required)
 }
 
+/// The notice is only for a positively identified client-only installation.
+pub(super) fn notice_install() -> Option<(PathBuf, String)> {
+    let install = require_install().ok()?;
+    Some((install.prefix, install.tag))
+}
+
 /// A client-only installation's `update`: the public release, client only.
 /// Refuses every command-line option outside `CLIENT_ARGS` (native flags,
 /// global `--org`/`--state-dir`, explicit defaults, `update status`) before
@@ -378,7 +384,7 @@ pub(crate) fn run(
 }
 
 /// `vMAJOR.MINOR.PATCH` with plain digits; anything else has no known order.
-fn version_key(tag: &str) -> Option<[u64; 3]> {
+pub(super) fn version_key(tag: &str) -> Option<[u64; 3]> {
     let mut parts = tag.strip_prefix('v')?.split('.');
     let mut key = [0u64; 3];
     for slot in &mut key {
@@ -524,7 +530,7 @@ fn run_limited(cmd: &mut Command, timeout: Duration, limit: usize, what: &str) -
 /// GitHub API (CAD-1479: the catalogue is the default; `--release-source`
 /// remains the advanced https:// override and a source failure refuses,
 /// never silently falling back to GitHub).
-fn latest_tag(release_source: Option<&str>) -> Result<String> {
+pub(super) fn latest_tag(release_source: Option<&str>) -> Result<String> {
     let base = cadence_agent::releases::resolve_base(release_source)?;
     let source =
         cadence_agent::releases::source_for(&base, cadence_agent::releases::PROFILE_PUBLIC_CLIENT)?;
