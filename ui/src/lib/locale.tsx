@@ -899,6 +899,7 @@ Object.assign(zhTW, {
 });
 
 Object.assign(zhTW, {
+  "No pull-request titles were recorded between these releases.": "這兩個版本之間未記錄任何提取要求標題。",
   "(declare only what the provider granted)": "（只宣告供應商已授予的權限）", "(opens in a new tab)": "（在新分頁開啟）", "(optional — blank keeps the current scopes)": "（選填，留空則保留目前的權限範圍）", "(optional — blank keeps the current values)": "（選填，留空則保留目前的值）", "(required — enter every field)": "（必填，請輸入每個欄位）", "(server default)": "（伺服器預設值）",
   "(set here)": "（在此設定）", "1 change since the installed release.": "自已安裝的版本以來有 1 項變更。", "API token": "API 權杖", "Access could not be confirmed": "無法確認存取權限", "Account details may be incomplete": "帳戶詳細資料可能不完整", "Account information is unavailable. Refresh to try again.": "無法取得帳戶資訊。請重新整理後再試一次。",
   "Account request failed": "帳戶要求失敗", "Account summary": "帳戶摘要", "Active turns can finish during the drain. The updater checks the release lease before proceeding.": "排空期間，進行中的回合可以完成。更新程式會在繼續前檢查發行版本租約。", "Add a connection": "新增連線", "Add connection": "新增連線", "Advanced: custody risk acceptance": "進階：保管風險確認",

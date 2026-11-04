@@ -105,14 +105,20 @@ pub(super) fn get(state_dir: &Path) -> HttpResp {
     let update_available = check
         .as_ref()
         .is_some_and(|c| c["up_to_date"].as_bool() == Some(false));
+    let available_changes = check.as_ref().filter(|c| {
+        c["changes_available"].as_bool() == Some(true)
+            && c["changes"].is_array()
+            && c["change_count"].as_u64().is_some()
+    });
     json_response(json!({
         "current": current,
         "check": check,
         "checked_at": checked_at,
         "checking": BOARD_UPDATE.checking.load(Ordering::SeqCst),
         "update_available": update_available,
-        "change_count": check.as_ref().and_then(|c| c["change_count"].as_u64()).unwrap_or(0),
-        "changes": check.as_ref().map(|c| c["changes"].clone()).unwrap_or(json!([])),
+        "changes_available": available_changes.is_some(),
+        "change_count": available_changes.and_then(|c| c["change_count"].as_u64()),
+        "changes": available_changes.map(|c| &c["changes"]),
         "migration": check.as_ref().and_then(|c| c["schema"]["migration"].as_bool()).unwrap_or(false),
         "blockers": check.as_ref().map(|c| c["blockers"].clone()).unwrap_or(json!([])),
         "running": run.running,

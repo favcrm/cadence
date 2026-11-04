@@ -1133,7 +1133,9 @@ pub(super) fn resolve_update(
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
 ) -> Result<Resolved> {
-    resolve_local_maintenance(LocalMaintenance::Update, org, state, tracker)
+    let resolved = resolve_local_maintenance(LocalMaintenance::Update, org, state, tracker)?;
+    eprint_line("scope: local Cadence installation; hosted workspaces are not updated");
+    Ok(resolved)
 }
 
 /// `cadence setup` installs on this machine. It shares the local-maintenance
@@ -1219,7 +1221,7 @@ fn resolve_local_maintenance(
         }
         None => Registry::default(),
     };
-    match org.or(org_env.as_deref()) {
+    let resolved = match org.or(org_env.as_deref()) {
         // A deliberate selector is honored or refused — never ignored.
         Some(name) => {
             let conn = registry
@@ -1260,7 +1262,14 @@ fn resolve_local_maintenance(
             }) => local_resolved(&selection.org, state_dir, tracker_dir),
             _ => cadence_agent::client::state_dir().map(Resolved::Local),
         },
+    }?;
+    if let (LocalMaintenance::Update, Some(selected)) = (command, &registry.selected) {
+        eprint_line(&format!(
+            "saved default: {} (unchanged; not used for this update)",
+            selected.org
+        ));
     }
+    Ok(resolved)
 }
 
 /// `cadence org` subcommands (see `run`).
