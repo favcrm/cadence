@@ -312,7 +312,7 @@ fn assignment_unknown(org: &str, path: &str, body: Option<&Value>) -> Error {
             .expect("writing to a String cannot fail");
     }
     message.push_str(
-        "; the outcome is unknown. Inspect `cadence agent status` in the same \
+        "; the outcome is unknown. Inspect `cadence agent assignments` in the same \
          selected workspace and reconcile the original assignment and operation \
          before deciding whether to retry; do not replay blindly",
     );
@@ -334,20 +334,23 @@ fn assignment_custody_failed(
     if let Some(claim) = assignment.claim_id.as_deref() {
         write!(&mut message, "; claim_id={claim}").expect("writing to a String cannot fail");
     }
-    if let Some(operation) = body
-        .get("operation_id")
-        .and_then(Value::as_str)
-        .filter(|value| hosted_id(value))
-    {
-        write!(&mut message, "; operation_id={operation}")
-            .expect("writing to a String cannot fail");
+    // Claim, report and reassign carry `operation_id`; queue's key is
+    // `idempotency_key`. Name whichever the body holds.
+    for key in ["operation_id", "idempotency_key"] {
+        if let Some(value) = body
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| hosted_id(value))
+        {
+            write!(&mut message, "; {key}={value}").expect("writing to a String cannot fail");
+        }
     }
     if let Some(generation) = body.get("expected_generation").and_then(Value::as_u64) {
         write!(&mut message, "; expected_generation={generation}")
             .expect("writing to a String cannot fail");
     }
     message.push_str(
-        "; inspect `cadence agent status` in the same selected workspace and reconcile \
+        "; inspect `cadence agent assignments` in the same selected workspace and reconcile \
          the original assignment before deciding whether to retry; do not replay blindly",
     );
     Error::internal(message)
@@ -1034,6 +1037,9 @@ impl<H: CoordHttp> Coordinator<H> {
                 stamp(attempt, &assignment);
             }
             Ok(())
+        })
+        .map_err(|error| {
+            assignment_custody_failed(&self.org_id, "queue", &assignment, &body, error)
         })?;
         Ok(assignment)
     }
@@ -3361,6 +3367,7 @@ mod cad2009_assignment_acceptance {
 
     include!("local_assignment/cad2009_activation_acceptance.rs");
     include!("local_assignment/cad2009_confirmed_custody_acceptance.rs");
+    include!("local_assignment/cad2096_queue_custody_acceptance.rs");
 
     fn exercise(mutation: Mutation) {
         for answer in [
