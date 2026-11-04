@@ -202,14 +202,59 @@ function AttachChips({
                 <svg viewBox="0 0 24 24"><path d="M5 3h9l5 5v13H5zM14 3v6h5" /></svg>
               )}
             </span>
+            {/* A failed row keeps its warning glyph and puts Remove at the
+                trailing edge, so the way out is visible without hovering. */}
+            {a.status !== "failed" && (
+              <button
+                type="button"
+                className="app-chat-remove"
+                aria-label={`${t("Remove")} ${a.name}`}
+                title={`${t("Remove")} ${a.name}`}
+                onClick={(e: MouseEvent<HTMLButtonElement>) => {
+                  // Only keyboard or assistive activation (detail 0) on the
+                  // button that holds focus moves focus; a pointer click never does.
+                  const keyboard = e.detail === 0 && document.activeElement === e.currentTarget;
+                  onRemove(a, keyboard
+                    ? { removed: a.key, next: ordered[i + 1]?.key ?? null, prev: ordered[i - 1]?.key ?? null }
+                    : null);
+                }}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            )}
+          </span>
+          {/* One column holds the name/meta line and, when the file failed,
+              its reason: both share the left edge right of the icon slot. */}
+          <span className="app-chat-filebody">
+            <span className="app-chat-filename">
+              <span className="app-chat-chip-name">{a.name}</span>
+              <small>
+                {attachMeta(a.name, a.size, t)}
+                {a.status !== "ready" && (
+                  <span className="app-chat-touch-status">{` · ${t(a.status === "uploading" ? "Uploading…" : "Failed")}`}</span>
+                )}
+              </small>
+            </span>
+            {a.status === "failed" && a.error && (
+              <small className="app-chat-upload-error" role="alert" title={displayAttachError(a.error, t)}>
+                {displayAttachError(a.error, t)}
+              </small>
+            )}
+          </span>
+          {a.status === "failed" && !a.permanent && (
+            <button type="button" className="lnk app-chat-chip-retry" onClick={() => onRetry(a)}>
+              {t("Retry")}
+            </button>
+          )}
+          {a.status === "failed" && (
             <button
               type="button"
-              className="app-chat-remove"
+              className="app-chat-remove app-chat-remove-trailing"
               aria-label={`${t("Remove")} ${a.name}`}
               title={`${t("Remove")} ${a.name}`}
               onClick={(e: MouseEvent<HTMLButtonElement>) => {
-                // Only keyboard or assistive activation (detail 0) on the
-                // button that holds focus moves focus; a pointer click never does.
                 const keyboard = e.detail === 0 && document.activeElement === e.currentTarget;
                 onRemove(a, keyboard
                   ? { removed: a.key, next: ordered[i + 1]?.key ?? null, prev: ordered[i - 1]?.key ?? null }
@@ -219,25 +264,6 @@ function AttachChips({
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M6 6l12 12M18 6L6 18" />
               </svg>
-            </button>
-          </span>
-          <span className="app-chat-filename">
-            <span className="app-chat-chip-name">{a.name}</span>
-            <small>
-              {attachMeta(a.name, a.size, t)}
-              {a.status !== "ready" && (
-                <span className="app-chat-touch-status">{` · ${t(a.status === "uploading" ? "Uploading…" : "Failed")}`}</span>
-              )}
-            </small>
-          </span>
-          {a.status === "failed" && a.error && (
-            <small className="app-chat-upload-error" role="alert" title={displayAttachError(a.error, t)}>
-              {displayAttachError(a.error, t)}
-            </small>
-          )}
-          {a.status === "failed" && !a.permanent && (
-            <button type="button" className="lnk app-chat-chip-retry" onClick={() => onRetry(a)}>
-              {t("Retry")}
             </button>
           )}
         </div>
@@ -666,7 +692,7 @@ export default function Composer({
       className="app-chat-attach"
       aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : "unavailable"}`}
       title={attachEnabled
-        ? t("Attach files (txt, md, csv — up to 10 MiB each; PDF/image processing is not available yet)")
+        ? t("Attach files (pdf, txt, md, csv, json, yaml, xml — up to 10 MiB each)")
         : typeof attach === "object" ? attach.reason : t("Attach is unavailable")}
       disabled={!!block || !attachEnabled}
       onClick={() => fileInput.current?.click()}

@@ -18,31 +18,38 @@ The local-administrative session represents one shared local-admin account,
 not distinct human users; older unbound sessions must reauthenticate. Verified
 named issuer/workspace/subject accounts remain distinct.
 
-**Availability: text, Markdown and CSV only.** The allowlist is `.txt`,
-`.md` and `.csv`. A Home message carries Home uploads; an app conversation
-carries uploads scoped to its installation, context and conversation, and only
-while the installation's current exact-approved bundle declares `file.upload`
-(see [Scope and retry rules](#scope-and-retry-rules)). **PDF and image files
-(`.pdf`, `.png`, `.jpg`, `.jpeg`, `.webp`) are refused with a specific reason**
-at the composer, the board route and the daemon: their processing is CAD-1233.
-An uploaded CSV is a retained text attachment the assistant can read; it is
-not a staged import — the CRM review/mapping bridge (preview, field mapping,
-consent) is CAD-1233, so nothing here imports rows, infers consent or builds a
-campaign. Retention and quota are described in
+**Availability: a PDF, or structured text.** The allowlist is `.pdf`, `.txt`,
+`.md`, `.markdown`, `.csv`, `.tsv`, `.json`, `.jsonl`, `.yaml`, `.yml` and
+`.xml`. A Home message carries Home uploads; an app conversation carries
+uploads scoped to its installation, context and conversation, and only while
+the installation's current exact-approved bundle declares `file.upload` (see
+[Scope and retry rules](#scope-and-retry-rules)). **Image files (`.png`,
+`.jpg`, `.jpeg`, `.webp`, `.gif`) are refused with a specific reason** at the
+composer, the board route and the daemon: their representation to a model is
+CAD-1233. An uploaded CSV is a retained text attachment the assistant can read;
+it is not a staged import — the CRM review/mapping bridge (preview, field
+mapping, consent) is CAD-1233, so nothing here imports rows, infers consent or
+builds a campaign. Retention and quota are described in
 [Quota admission contract](#quota-admission-contract).
 
 ## What an operator can attach
 
-- Kinds (interim allowlist, enforced by daemon byte-sniff, not the extension
-  alone): `.txt`, `.md`, `.csv`. The extension must match the sniffed bytes.
+- Kinds (enforced by daemon byte-sniff, not the extension alone): `.pdf` and
+  the UTF-8 text kinds `.txt`, `.md`, `.markdown`, `.csv`, `.tsv`, `.json`,
+  `.jsonl`, `.yaml`, `.yml`, `.xml`. The extension must match the sniffed
+  bytes.
+- A `.pdf` is retained as the original and read through the same bounded
+  `pdftotext` seam the wiki ingest uses, under the attachment text cap. A
+  corrupt, encrypted or text-free (image-only) PDF is refused at upload with
+  its own reason — never retained as an attachment the assistant cannot read,
+  and no OCR is attempted.
 - Size: at most **10 MiB** per file; at most **5 files** per message.
 - Attachments fail closed: unsafe symlinks or ownership/modes in the captured
   operational workspace path, or in legacy quota custody, make uploads refuse.
-- The composer pre-checks the same list and cap and its file picker offers
-  only `.txt,.md,.csv`; the daemon's checks are the enforcement. A `.pdf`,
-  `.png`, `.jpg`, `.jpeg` or `.webp` upload (by name or by sniffed bytes) is
-  refused with "PDF and image processing is not available yet" — no parser,
-  OCR or image processing runs on attachments.
+- The composer pre-checks the same list and cap and its file picker offers only
+  those extensions; the daemon's checks are the enforcement. A `.png`, `.jpg`,
+  `.jpeg`, `.webp` or `.gif` upload (by name or by sniffed bytes) is refused
+  with "Image processing is not available yet".
 
 ## The path a file takes
 

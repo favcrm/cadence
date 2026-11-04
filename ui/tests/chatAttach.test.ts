@@ -20,9 +20,17 @@ function equal(actual: unknown, expected: unknown, what: string): void {
 
 // ---- the v1 allowlist and cap (client pre-check; the daemon re-checks) ---
 
-equal(ATTACH_EXTS, ["txt", "md", "csv"], "the interim processable allowlist");
-equal(attachRefusal("brief.pdf", 100)?.includes("not available yet"), true, "PDF is honestly unavailable");
-equal(attachRefusal("reference.png", 100)?.includes("not available yet"), true, "image is honestly unavailable");
+equal(
+  ATTACH_EXTS,
+  ["pdf", "txt", "md", "markdown", "csv", "tsv", "json", "jsonl", "yaml", "yml", "xml"],
+  "the processable allowlist",
+);
+equal(attachRefusal("brief.pdf", 100), null, "a PDF passes the pre-flight check");
+equal(attachRefusal("data.json", 100), null, "JSON passes the pre-flight check");
+equal(attachRefusal("conf.yaml", 100), null, "YAML passes the pre-flight check");
+equal(attachRefusal("rows.tsv", 100), null, "TSV passes the pre-flight check");
+equal(attachRefusal("feed.xml", 100), null, "XML passes the pre-flight check");
+equal(attachRefusal("reference.png", 100)?.includes("Image processing is not available yet"), true, "an image is honestly unavailable");
 equal(ATTACH_MAX_BYTES, 10 * 1024 * 1024, "10 MiB cap");
 
 equal(attachRefusal("notes.txt", 100), null, "a small text file goes");
@@ -82,9 +90,11 @@ equal(isPermanentUploadFailure(429), false, "a rate limit is retryable");
 equal(isPermanentUploadFailure(undefined), false, "an abort is retryable");
 equal(attachMeta("customers.csv", 180 * 1024), "180 KB · CSV", "size and kind like the mock's file rows");
 equal(
-  (unresolvedHint([{ ...item("a", "failed"), error: "PDF and image processing is not available yet — .pdf cannot be attached" }]) ?? "").includes(".pdf cannot be attached"),
+  (unresolvedHint([{ ...item("a", "failed"), error: "Image processing is not available yet — .png cannot be attached" }]) ?? "").includes(".png cannot be attached"),
   true,
   "the hold line carries the specific reason, not a generic count",
 );
+equal(attachMeta("invoice.pdf", 142 * 1024), "142 KB · PDF", "a PDF row says PDF");
+equal(attachMeta("data.json", 2 * 1024), "2 KB · JSON", "a JSON row says JSON");
 
 console.log("chatAttach.test.ts: all assertions passed");

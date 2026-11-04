@@ -237,11 +237,7 @@ impl ChatFile {
                 self.id
             )));
         }
-        let text = String::from_utf8(bytes)
-            .map_err(|_| Error::rejected(format!("attachment '{}' is not UTF-8 text", self.id)))?;
-        // The read re-runs the write-time gate: a blob that would not
-        // pass `secret::guard` today is withheld, never served.
-        crate::secret::guard(&format!("chat-file/{}", self.name), &text)?;
+        let text = checked_attachment_text(&self.name, &self.mime, &bytes)?;
         let (text, truncated) = if text.len() > CHAT_FILE_TEXT_CAP {
             let mut cut = super::take_bytes(&text, CHAT_FILE_TEXT_CAP.saturating_sub(16));
             cut.push_str(" …[truncated]");
@@ -358,51 +354,161 @@ fn sniffed_kind(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// The structured-text extensions, mapped to the MIME the board records.
+/// All of them are UTF-8 text, so the write-time decode and secret scan are
+/// the whole validation; nothing here is parsed by format.
+const TEXT_EXTS: [(&str, &str); 10] = [
+    ("txt", "text/plain"),
+    ("md", "text/markdown"),
+    ("markdown", "text/markdown"),
+    ("csv", "text/csv"),
+    ("tsv", "text/tab-separated-values"),
+    ("json", "application/json"),
+    ("jsonl", "application/x-ndjson"),
+    ("yaml", "application/yaml"),
+    ("yml", "application/yaml"),
+    ("xml", "application/xml"),
+];
+
 /// The claimed extension must match the real bytes; `mime` is the
 /// stored content type. Refuses anything off the allowlist
-/// (executables, html/svg, archives, corrupt/empty magic). PDF and
-/// image kinds — by extension or by sniffed bytes — are refused with a
-/// specific reason: their processing is a separate ticket (CAD-1233).
+/// (executables, html/svg, archives, corrupt/empty magic). Image kinds —
+/// by extension or by sniffed bytes — are refused with a specific
+/// reason: their representation is CAD-1233.
 fn check_kind(name: &str, bytes: &[u8]) -> Result<&'static str> {
     let ext = claimed_ext(name);
     let ext = ext.as_str();
     let sniffed = sniffed_kind(bytes);
-    if matches!(ext, "pdf" | "png" | "jpg" | "jpeg" | "webp")
-        || matches!(sniffed, "pdf" | "png" | "jpeg" | "webp")
+    if matches!(ext, "png" | "jpg" | "jpeg" | "webp" | "gif")
+        || matches!(sniffed, "png" | "jpeg" | "webp")
     {
         return Err(Error::rejected(format!(
-            "chat_file_upload refused '{name}': PDF and image processing is not \
-             available yet — the interim allowlist is txt, md and csv",
+            "chat_file_upload refused '{name}': image processing is not available \
+             yet — the allowlist is pdf, txt, md, markdown, csv, tsv, json, jsonl, \
+             yaml and xml",
         )));
     }
-    let allowed = matches!(ext, "txt" | "md" | "csv");
-    if !allowed {
-        return Err(Error::rejected(format!(
-            "chat_file_upload: '.{ext}' is not an attachable type — the interim \
-             allowlist is txt, md and csv",
-        )));
-    }
-    let mime = match ext {
-        "txt" | "md" | "csv" if sniffed == "text" => match ext {
-            "csv" => "text/csv",
-            "md" => "text/markdown",
-            _ => "text/plain",
-        },
-        _ => {
+    if ext == "pdf" {
+        if sniffed != "pdf" {
             return Err(Error::rejected(format!(
-                "chat_file_upload refused '{name}': a '.{ext}' file must sniff as \
+                "chat_file_upload refused '{name}': a '.pdf' file must sniff as \
                  its declared kind — the bytes did not (extension and client MIME \
                  are never the enforcement boundary)"
             )));
         }
+        return Ok("application/pdf");
+    }
+    let Some((_, mime)) = TEXT_EXTS.iter().find(|(candidate, _)| *candidate == ext) else {
+        return Err(Error::rejected(format!(
+            "chat_file_upload: '.{ext}' is not an attachable type — the allowlist is \
+             pdf, txt, md, markdown, csv, tsv, json, jsonl, yaml and xml",
+        )));
     };
+    if sniffed != "text" {
+        return Err(Error::rejected(format!(
+            "chat_file_upload refused '{name}': a '.{ext}' file must sniff as \
+             its declared kind — the bytes did not (extension and client MIME \
+             are never the enforcement boundary)"
+        )));
+    }
     Ok(mime)
 }
 
-/// `true` for the kinds `chat_file_read` returns text for; everything
-/// else is metadata-only in v1 (no PDF/OCR/image extraction).
+/// The extracted text of one retained attachment, from the exact bytes the
+/// caller already verified against the row's size and digest. Text kinds are
+/// their own text; a PDF is read through the same bounded `pdftotext` seam the
+/// wiki ingest uses, so an unreadable or text-free PDF refuses instead of
+/// becoming an attachment the assistant cannot read.
+fn attachment_text(name: &str, mime: &str, bytes: &[u8]) -> Result<String> {
+    if mime != "application/pdf" {
+        if !text_kind(mime) {
+            return Err(Error::rejected(format!(
+                "attachment '{name}' is not a text source"
+            )));
+        }
+        return std::str::from_utf8(bytes)
+            .map(|text| text.to_string())
+            .map_err(|e| {
+                Error::rejected(format!("chat_file_upload '{name}': not UTF-8 text: {e}"))
+            });
+    }
+    use std::io::Write;
+    let mut staged = tempfile::NamedTempFile::new().map_err(|e| {
+        Error::rejected(format!(
+            "chat_file_upload '{name}': staging the PDF failed: {e}"
+        ))
+    })?;
+    staged
+        .write_all(bytes)
+        .and_then(|()| staged.flush())
+        .map_err(|e| {
+            Error::rejected(format!(
+                "chat_file_upload '{name}': staging the PDF failed: {e}"
+            ))
+        })?;
+    let (output, bounds) = crate::proc::run_bounded_limited(
+        std::process::Command::new("pdftotext")
+            .args(["-enc", "UTF-8", "-nopgbrk"])
+            .arg(staged.path())
+            .arg("-"),
+        std::time::Duration::from_secs(20),
+        CHAT_FILE_TEXT_CAP,
+    )
+    .map_err(|e| {
+        Error::rejected(format!(
+            "chat_file_upload refused '{name}': the PDF could not be read: {e}"
+        ))
+    })?;
+    if bounds.stdout_exceeded {
+        return Err(Error::rejected(format!(
+            "chat_file_upload refused '{name}': the PDF's text exceeds the {CHAT_FILE_TEXT_CAP}-byte cap"
+        )));
+    }
+    if !output.status.success() {
+        return Err(Error::rejected(format!(
+            "chat_file_upload refused '{name}': the PDF is corrupt, encrypted or \
+             otherwise unreadable"
+        )));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|_| {
+        Error::rejected(format!(
+            "chat_file_upload refused '{name}': the PDF's text is not UTF-8"
+        ))
+    })?;
+    if text.trim().is_empty() {
+        return Err(Error::rejected(format!(
+            "chat_file_upload refused '{name}': the PDF has no extractable text — \
+             a scanned or image-only PDF needs OCR, which is not available yet"
+        )));
+    }
+    Ok(text)
+}
+
+/// The one gate an attachment's text passes before it is retained, before a
+/// send references it, and before a read returns it: extract, then scan for
+/// credentials. The same bytes therefore produce the same verdict at every
+/// boundary.
+fn checked_attachment_text(name: &str, mime: &str, bytes: &[u8]) -> Result<String> {
+    let text = attachment_text(name, mime, bytes)?;
+    crate::secret::guard(&format!("chat-file/{name}"), &text)?;
+    Ok(text)
+}
+
+/// `true` for the kinds `chat_file_read` returns text for: the structured text
+/// kinds and a PDF, whose text is extracted under the same cap.
 pub fn text_kind(mime: &str) -> bool {
-    matches!(mime, "text/plain" | "text/markdown" | "text/csv")
+    mime == "application/pdf"
+        || matches!(
+            mime,
+            "text/plain"
+                | "text/markdown"
+                | "text/csv"
+                | "text/tab-separated-values"
+                | "application/json"
+                | "application/x-ndjson"
+                | "application/yaml"
+                | "application/xml"
+        )
 }
 
 impl Store {
@@ -565,14 +671,10 @@ impl Store {
         let sha256 = sha256_hex(&bytes);
         let head = sniff_head(&bytes);
         let mime = check_kind(&name, head)?.to_string();
-        // Text kinds carry the credential scan before retention — the
-        // same gate as a wiki text write.
-        if text_kind(&mime) {
-            let text = std::str::from_utf8(&bytes).map_err(|e| {
-                Error::rejected(format!("chat_file_upload '{name}': not UTF-8 text: {e}"))
-            })?;
-            crate::secret::guard(&format!("chat-file/{name}"), text)?;
-        }
+        // Every kind carries its read gate before retention: the text is
+        // extracted (a PDF through the bounded converter) and scanned for
+        // credentials — the same check a read runs.
+        checked_attachment_text(&name, &mime, &bytes)?;
 
         let existing = {
             let conn = self.conn();
@@ -689,11 +791,7 @@ impl Store {
         }
         let sha256 = sha256_hex(&bytes);
         let mime = check_kind(&name, sniff_head(&bytes))?.to_string();
-        if text_kind(&mime) {
-            let text = std::str::from_utf8(&bytes)
-                .map_err(|e| Error::rejected(format!("chat upload is not UTF-8 text: {e}")))?;
-            crate::secret::guard(&format!("chat-file/{name}"), text)?;
-        }
+        checked_attachment_text(&name, &mime, &bytes)?;
         if let Some(existing) =
             self.chat_file_by_user_sha(&sha256, scope, context_id, user_id, thread_id)?
         {
@@ -898,8 +996,8 @@ impl Store {
         let cap = cap.min(CHAT_FILE_MAX_BYTES);
         if !text_kind(&file.mime) {
             return Err(Error::rejected(format!(
-                "attachment '{}' is not a ready text source — only txt, md and csv \
-                 rows can be referenced",
+                "attachment '{}' is not a ready text source — only a text kind or a \
+                 PDF can be referenced",
                 file.id
             )));
         }
@@ -923,7 +1021,7 @@ impl Store {
         let cap = cap.min(CHAT_FILE_MAX_BYTES);
         if !text_kind(&file.mime) {
             return Err(Error::rejected(format!(
-                "attachment '{}' is not a ready text source — only txt, md and csv rows can be referenced",
+                "attachment '{}' is not a ready text source — only a text kind or a PDF can be referenced",
                 file.id
             )));
         }
@@ -955,29 +1053,21 @@ impl Store {
                 file.id
             )));
         }
-        // The same first-block sniff the upload ran: a row whose bytes
-        // now shape as html/svg is not an allowed text source.
-        let head = sniff_head(&bytes);
-        if sniffed_kind(head) != "text" {
+        // The same kind check the upload ran: a row whose bytes no longer
+        // sniff as its declared kind is not a ready source.
+        let declared = check_kind(&file.name, sniff_head(&bytes))
+            .map_err(|e| Error::rejected(format!("attachment '{}' is not ready — {e}", file.id)))?;
+        if declared != file.mime {
             return Err(Error::rejected(format!(
-                "attachment '{}' is not ready — the retained bytes do not sniff as \
-                 the allowed text kinds",
-                file.id
+                "attachment '{}' is not ready — the retained MIME '{}' does not \
+                 match the sniffed kind '{declared}'",
+                file.id, file.mime
             )));
         }
-        let text = std::str::from_utf8(&bytes).map_err(|_| {
-            Error::rejected(format!(
-                "attachment '{}' is not ready — the retained bytes are not UTF-8 text",
-                file.id
-            ))
-        })?;
-        crate::secret::guard(&format!("chat-file/{}", file.name), text).map_err(|e| {
-            Error::rejected(format!(
-                "attachment '{}' is not ready — the retained text failed the secret \
-                 scan: {e}",
-                file.id
-            ))
-        })?;
+        // Readiness is the read gate: the text must still extract (a PDF
+        // through the bounded converter) and still pass the secret scan.
+        checked_attachment_text(&file.name, &file.mime, &bytes)
+            .map_err(|e| Error::rejected(format!("attachment '{}' is not ready — {e}", file.id)))?;
         Ok(bytes)
     }
 }
@@ -2545,15 +2635,57 @@ mod tests {
         let (dir, s) = store();
         let refused =
             |bytes: &[u8], name: &str| put(&s, dir.path(), bytes, name).unwrap_err().to_string();
-        // PDF/image claims are refused while no processing contract
-        // exists — a magic prefix is not processing.
-        assert!(refused(b"hello", "fake.pdf").contains("not available yet"));
-        // a zip named .png is refused the same way (no image processing)
-        assert!(refused(b"PK\x03\x04rest", "a.png").contains("not available yet"));
+        // A .pdf whose bytes are not a PDF refuses: a name is not a kind.
+        assert!(refused(b"hello", "fake.pdf").contains("sniff"));
+        // An image is refused with the image reason, not a generic one.
+        assert!(refused(b"PK\x03\x04rest", "a.png").contains("image processing"));
         // svg is text-ish by shape but off the allowlist
         assert!(refused(b"<svg></svg>", "x.txt").contains("sniff"));
         // an unsupported extension refuses before sniffing
         assert!(refused(b"MZ", "a.exe").contains("not an attachable type"));
+    }
+
+    /// A PDF is a text source only when its text can actually be read. The
+    /// refusal is what stops an unreadable attachment reaching a turn.
+    #[test]
+    fn pdf_is_read_only_when_its_text_extracts() {
+        let (dir, s) = store();
+        let err = put(
+            &s,
+            dir.path(),
+            b"%PDF-1.4\nnot a real document",
+            "broken.pdf",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("corrupt, encrypted") || err.contains("could not be read"),
+            "{err}"
+        );
+    }
+
+    /// The structured text kinds are retained as text and read back verbatim.
+    #[test]
+    fn structured_text_kinds_are_readable() {
+        let (dir, s) = store();
+        let cases: [(&str, &[u8], &str); 6] = [
+            ("data.json", br#"{"total":42}"#, "application/json"),
+            (
+                "data.jsonl",
+                b"{\"a\":1}\n{\"b\":2}\n",
+                "application/x-ndjson",
+            ),
+            ("conf.yaml", b"total: 100\n", "application/yaml"),
+            ("conf.yml", b"total: 100\n", "application/yaml"),
+            ("rows.tsv", b"a\tb\n1\t2\n", "text/tab-separated-values"),
+            ("feed.xml", b"<rss><item>x</item></rss>", "application/xml"),
+        ];
+        for (name, bytes, mime) in cases {
+            let file = put(&s, dir.path(), bytes, name).unwrap();
+            assert_eq!(file.mime, mime, "{name}");
+            let out = read(&s, dir.path(), &file).unwrap();
+            assert_eq!(out["text"], json!(String::from_utf8_lossy(bytes)), "{name}");
+        }
     }
 
     #[test]
