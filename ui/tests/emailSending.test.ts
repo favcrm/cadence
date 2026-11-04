@@ -87,8 +87,9 @@ async function mount(world: World, viewer = { operator: true, readOnly: false })
       }
       case "GET /api/crm-send/origin": return json(world.origin);
       case "POST /api/crm-send/origin":
-        world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsubscribe_origin !== null };
-        return json(world.origin);
+world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsubscribe_origin !== null };
+        // As the daemon does: the receipt names the value, and only a read says `stored`.
+        return json({ unsubscribe_origin: body.unsubscribe_origin });
       case "POST /api/crm-smtp/bind": {
         const row = world.connections.find((r) => r.id === body.connection_id);
         const next = bindingFor(row);
@@ -283,6 +284,7 @@ async function main() {
     const m = await mount(world);
     await m.open("Unsubscribe links");
     await m.settle(() => assert(m.host.querySelector("#email-origin"), "origin field"));
+    assert(m.button("Save") === undefined, "Save appears only after a change");
     const input = m.host.querySelector("#email-origin") as HTMLInputElement;
     await m.React.act(async () => {
       const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), "value")!.set!;
@@ -291,6 +293,10 @@ async function main() {
     });
     await m.click(m.button("Save"));
     await m.settle(() => assert(m.host.textContent!.includes("Unsubscribe links now use https://cadence.example.com"), "origin saved"));
+    await m.settle(() => assert(m.host.textContent!.includes("(set here)"), "a read confirms it is stored"));
+    assert(m.button("Clear"), "a stored address can be cleared");
+    await m.click(m.button("Clear"));
+    await m.settle(() => assert(m.host.textContent!.includes("Your own address was cleared"), "origin cleared"));
     equal(world.posts.find((p) => p.path === "/api/crm-send/origin")!.body, { unsubscribe_origin: "https://cadence.example.com" }, "origin body");
     await m.unmount();
   }

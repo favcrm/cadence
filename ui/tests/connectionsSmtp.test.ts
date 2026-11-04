@@ -536,6 +536,22 @@ async function main() {
     assert(text5().includes("Check configuration"), "the drawer has the local check action");
     assert(text5().includes("Disconnect"), "the drawer offers disconnect");
   });
+  // A credential typed for one account must never carry to another: rows stay
+  // reachable by keyboard behind the drawer, so this path is real.
+  await act(async () => { (byTextIn(host5, "button", "Update credentials…") as HTMLButtonElement).click(); });
+  const typed = host5.querySelector('.crm-drawer input[type="password"], .crm-drawer input') as HTMLInputElement;
+  assert(typed, "the update form opened");
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(typed), "value")!.set!.call(typed, "ALPHA-SECRET");
+    typed.dispatchEvent(new window.Event("input", { bubbles: true }) as unknown as Event);
+  });
+  const otherRow = accountRows().find((row) => row !== smtpAccountRow && /ghost/i.test(row.textContent ?? "")) as HTMLButtonElement;
+  assert(otherRow, "a second account row exists");
+  await act(async () => { otherRow.click(); });
+  await settle(() => {
+    const values = Array.from(host5.querySelectorAll<HTMLInputElement>(".crm-drawer input")).map((i) => i.value);
+    assert(!values.includes("ALPHA-SECRET"), "the typed credential did not follow to the other account");
+  });
   await act(async () => {
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }) as unknown as Event);
   });

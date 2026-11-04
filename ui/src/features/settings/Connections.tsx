@@ -17,6 +17,7 @@ import {
   canManage,
   capabilityWords,
   connectionCapabilities,
+  connectionNeedsAttention,
   enrollmentSupport,
   isAvailable,
   pinWord,
@@ -54,7 +55,7 @@ import { useTranslate } from "../../lib/locale";
  */
 // UI-owned copy: kept as English keys, translated at render (never stored translated).
 const UI_CUSTODY_UNPROTECTED = "The daemon cannot isolate this credential from agents using the same system account, so it refused to store it — nothing was stored. To save it anyway, tick the storage-consent box below, then retry — it is never pre-selected.";
-const UI_ENROLL_UNCERTAIN = "Could not confirm the connection was added. Refresh connections before retrying.";
+const UI_ENROLL_UNCERTAIN = "Could not confirm the connection was added. Check your connections before retrying.";
 
 const ENROLL_ERROR: Record<string, string> = {
   // The only stable code the daemon actually emits on this path
@@ -394,7 +395,7 @@ function ConnectionsIndex({
               ) : (
                 <ul className="settings-rows" aria-label={t("connections")}>
                   {rows.map((row) => {
-                    const flagged = row.kind === "enrolled" && !isAvailable(row);
+                    const flagged = connectionNeedsAttention(row);
                     const service = groups.find((group) => group.provider === row.provider)?.label ?? row.provider;
                     return (
                       <li key={row.id}>
@@ -413,7 +414,10 @@ function ConnectionsIndex({
             </div>
           )}
           {open && (
+            // Keyed to the account: rows stay reachable by keyboard behind the drawer, and a
+            // typed credential or armed Disconnect must never carry over to another account.
             <SettingsDrawer
+              key={open.id}
               title={isSmtpSender(open) && open.smtp?.sender ? open.smtp.sender : open.account}
               onClose={() => setOpenId(null)}
             >
@@ -423,11 +427,17 @@ function ConnectionsIndex({
                 capabilities={connectionCapabilities(providers, open.provider)}
                 canWrite={canWrite}
                 standalone
-                providerMetaPending={providersState?.status !== "ok" && !catalogUnavailable}
-                onChanged={refresh}
+                providerMetaPending={
+                  !providers.some((item) => item.provider === open.provider) &&
+                  providersState?.status !== "ok" &&
+                  !catalogUnavailable
+                }
+                onChanged={() => {
+                  if (listRes) void listRes.invalidate();
+                }}
                 onRevoked={() => {
                   setOpenId(null);
-                  refresh();
+                  if (listRes) void listRes.invalidate();
                 }}
               />
             </SettingsDrawer>

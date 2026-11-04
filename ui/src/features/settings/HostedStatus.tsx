@@ -45,7 +45,7 @@ export default function HostedStatus({
           <Link href="/settings/connections" className="settings-row">
             <span className="settings-row-text">
               <b>{t("Connections")}</b>
-              <small>{t("{count} accounts").replace("{count}", String(rows.length))}</small>
+              <small>{rows.length === 1 ? t("1 account") : t("{count} accounts").replace("{count}", String(rows.length))}</small>
             </span>
             {attention > 0 && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
           </Link>

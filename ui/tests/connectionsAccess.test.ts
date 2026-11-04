@@ -64,6 +64,7 @@ const FORBIDDEN_TEXT = [
   "not found",
   "not on this board",
   "Add connection",
+  "+ Add",
   "Save connection",
   "Update credentials",
   "Disconnect",

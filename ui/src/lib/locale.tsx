@@ -9,6 +9,11 @@ type Scope = "user" | "organization";
 type Preferences = { organization_locale: Locale | null; user_locale: Locale | null };
 
 const zhTW: Record<string, string> = {
+  "1 account": "1 個帳戶",
+  "approved for this board": "已獲准用於此看板",
+  "Could not confirm the connection was added. Check your connections before retrying.": "無法確認連線已新增。請先檢查連線，再重試。",
+  "Connections are available to the operator. Use Sign in if you are the operator.": "連線僅供營運者使用。如你是營運者，請登入。",
+  "No installed app sends email, so there is nothing to choose yet.": "沒有已安裝的應用程式會發送電郵，因此暫時無須選擇。",
   "Use a different address (optional)": "使用其他地址（選填）",
   "Your own address was cleared.": "已清除自訂地址。",
   "Advanced custody": "進階保管",

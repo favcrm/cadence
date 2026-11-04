@@ -61,7 +61,7 @@ export function settingsRedirect(section: SettingsSection, meta: SettingsMeta): 
   if (groups.some((group) => group.items.some((item) => item.section === section))) return null;
   // Agents is the bare /settings route; a board without it opens on its first working page.
   const workspace = groups.find((group) => group.label === "Workspace")?.items[0];
-  return workspace?.section ?? groups[0]?.items[0]?.section ?? null;
+  return workspace?.section ?? groups[0]?.items[0]?.section ?? "preferences";
 }
 
 /** The current section's name for the breadcrumb. */

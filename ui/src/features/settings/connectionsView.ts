@@ -32,6 +32,8 @@ export function pinWord(status: Pick<Connection["status"], "manifest_status">): 
   switch (status.manifest_status) {
     case "matched":
       return "reviewed contract matches the deployment";
+    case "approved":
+      return "approved for this board";
     case "missing":
       return "deployment has no reported contract to compare";
     default:
@@ -40,12 +42,18 @@ export function pinWord(status: Pick<Connection["status"], "manifest_status">): 
 }
 
 /**
- * Does the owner have something to fix? Only when the account itself can't be
- * used. A contract pin that differs is a fact about the deployed provider, not
- * the account, and nothing the owner does changes it, so it raises no flag.
+ * Can apps actually use this account? The same rule the daemon applies when it
+ * binds one, so a row never looks healthy while apps are refused. A hosted board
+ * reports its accounts as `approved`, which is its own form of matched.
  */
+export function connectionNeedsAttention(row: Connection): boolean {
+  if (row.kind !== "enrolled") return false;
+  const status: string | undefined = row.status.manifest_status;
+  return !isAvailable(row) || (status !== "matched" && status !== "approved");
+}
+
 export function connectionsNeedingAttention(rows: readonly Connection[]): number {
-  return rows.filter((row) => row.kind === "enrolled" && !isAvailable(row)).length;
+  return rows.filter(connectionNeedsAttention).length;
 }
 
 /** The connection's readiness in one plain line. */

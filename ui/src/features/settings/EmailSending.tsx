@@ -179,6 +179,7 @@ function SenderRow({ target, rows, hostedSmtp, viewer }: {
   const [failed, setFailed] = useState(false);
   useEffect(() => {
     const controller = new AbortController();
+    setFailed(false);
     readSmtpBinding(target.scope).then(
       (bound) => {
         if (!controller.signal.aborted) setBinding(bound);
@@ -222,6 +223,7 @@ function OriginRow({ viewer }: { viewer: Viewer }) {
   const [origin, setOrigin] = useState<string | null | undefined>(undefined);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
+    setFailed(false);
     sendClient.sendOriginShow().then(
       (value: unknown) => setOrigin(parseOriginReceipt(value).unsubscribeOrigin),
       () => setFailed(true),
@@ -499,12 +501,14 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
     setPending(true);
     setError(null);
     setNote(null);
-    void sendClient
-      .sendOriginSet(value)
-      .then((value2) => {
-        const receipt = apply(value2);
+    // Re-read after writing: only the read says what is now stored, on every board.
+    void Promise.resolve()
+      .then(() => sendClient.sendOriginSet(value))
+      .then(() => sendClient.sendOriginShow())
+      .then((shown) => {
+        const receipt = apply(shown);
         setNote(
-          !receipt.stored || receipt.unsubscribeOrigin === null
+          value === null || receipt.unsubscribeOrigin === null
             ? { key: "origin-cleared" }
             : { key: "origin-set", value: receipt.unsubscribeOrigin },
         );
@@ -540,7 +544,7 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
           className="crm-field-row"
           onSubmit={(e) => {
             e.preventDefault();
-            save(input);
+            if (input.trim() !== "") save(input);
           }}
         >
           <div className="crm-field">
@@ -557,7 +561,9 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
             />
           </div>
           <div className="crm-toolbar" style={{ alignSelf: "end" }}>
-            <Button type="submit" size="sm" loading={pending} disabled={pending}>{t("Save")}</Button>
+            {input.trim() !== "" && input.trim() !== (stored ? origin ?? "" : "") && (
+              <Button type="submit" size="sm" loading={pending} disabled={pending}>{t("Save")}</Button>
+            )}
             {stored && (
               <Button size="sm" disabled={pending} onClick={() => save(null)}>{t("Clear")}</Button>
             )}
