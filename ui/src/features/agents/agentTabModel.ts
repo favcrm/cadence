@@ -1,25 +1,36 @@
-/** CAD-1752: the agent page's tabs; the active one rides the URL as `?tab=`. */
+/** The agent page's sections; the active one rides the URL as `?tab=`. */
 export const AGENT_TABS = [
-  { id: "overview", label: "Overview" },
-  { id: "work", label: "Work" },
-  { id: "history", label: "History" },
-  { id: "job", label: "Job" },
-  { id: "knowledge", label: "Knowledge" },
+  { id: "instructions", label: "Instructions" },
   { id: "skills", label: "Skills" },
-  { id: "tools", label: "MCP & tools" },
-  { id: "access", label: "Access" },
-  { id: "settings", label: "Settings" },
+  { id: "tools", label: "Tools" },
+  { id: "history", label: "History" },
 ] as const;
 
-export type AgentTab = (typeof AGENT_TABS)[number]["id"];
+/** Beyond the strip: `overview` is the chat, `settings` the gear drawer. */
+export type AgentTab = (typeof AGENT_TABS)[number]["id"] | "overview" | "settings";
+
+/** Where a link to a section that has moved lands. */
+const MOVED_TABS = new Map<string, AgentTab>([
+  ["settings", "settings"],
+  ["job", "instructions"],
+  ["knowledge", "settings"],
+  ["access", "settings"],
+  ["work", "overview"],
+]);
 
 export function parseAgentTab(value: string | null): AgentTab {
   const hit = AGENT_TABS.find((tab) => tab.id === value);
-  return hit ? hit.id : "overview";
+  if (hit) return hit.id;
+  return (value !== null && MOVED_TABS.get(value)) || "overview";
 }
 
-/** The four skills Cadence bundles; every agent on the host loads all of them today. */
-export const BUNDLED_SKILLS = ["cadence", "business-documents", "company-outputs", "website-builder"] as const;
+/** The skills Cadence bundles; every agent on the host loads all of them today. */
+export const BUNDLED_SKILLS = [
+  { name: "cadence", line: "Tickets, threads and reports" },
+  { name: "business-documents", line: "Document intake, templates and pricing checks" },
+  { name: "company-outputs", line: "Quotes, invoices, proposals and reports" },
+  { name: "website-builder", line: "Build and publish a static website" },
+] as const;
 
 export type HistoryFilter = "all" | "turns" | "messages" | "reports" | "memory";
 

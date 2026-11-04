@@ -101,6 +101,11 @@ export function roleOf(
   return id ? (payload?.roles.find((r) => r.id === id) ?? null) : null;
 }
 
+/** A profile's own role. It has no runtime for `roleOf` to match on. */
+export function roleOfProfile(profile: HiredProfile, payload: AgentRolesPayload | null): AgentRole | null {
+  return payload?.roles.find((r) => r.id === profile.catalogue) ?? null;
+}
+
 /** How many profiles were hired from this role. */
 export function onTeamCount(role: AgentRole, profiles: HiredProfile[]): number {
   return profiles.filter((p) => p.catalogue === role.id).length;

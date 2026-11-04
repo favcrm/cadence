@@ -13,6 +13,7 @@ import SeatCard from "./SeatCard";
 import { MASTER } from "../home/master";
 import { ROLES } from "../settings/ModelDefaults";
 import RecruitChat from "./RecruitChat";
+import type { ToastMsg } from "../../ui/Toast";
 import AgentPage from "./AgentPage";
 import HireSheet from "./HireSheet";
 import ProfileSeat, { ConnectRuntime, workText } from "./ProfileSeat";
@@ -63,6 +64,7 @@ export default function Agents({
   onAsk,
   onOpenAgent: setOpen,
   onTab,
+  onToast,
   onRecruit,
   onOpenIssue,
   onRetry,
@@ -84,6 +86,7 @@ export default function Agents({
   onAsk: () => void;
   onOpenAgent: (alias: string | null) => void;
   onTab: (tab: AgentTab) => void;
+  onToast: (kind: ToastMsg["kind"], text: string) => void;
   onRecruit: (on: boolean) => void;
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
@@ -198,11 +201,13 @@ export default function Agents({
         groups={groups}
         rosterLoaded={payload != null}
         rosterFailed={payload == null && state.status === "failed"}
+        rosterStale={state.status === "stale" || (payload != null && state.status === "failed")}
         onRetryRoster={onRetry}
         operator={operator}
         onRetryAccess={onRetryAccess}
         hostedBoard={hostedBoard}
         hiredWork={openHired ? profileWork(openHired, issueCards) : null}
+        onToast={onToast}
       />
     );
   }
