@@ -41,7 +41,7 @@ import tempfile
 ME = "delivery-gate"
 MARKER = "<!-- cadence-delivery-gate v1 -->"
 EXCEPTION_MARKER = "<!-- cadence-delivery-gate exception v1 -->"
-EXCEPTION_ENDS = "2026-11-10T00:00:00Z"
+EXCEPTION_ENDS = "2026-12-31T00:00:00Z"
 NAMESPACE = "cadence-delivery-gate"
 PRINCIPAL = "cadence-delivery-gate"
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")

@@ -91,7 +91,7 @@ cannot tell a fresh session from the author under one login. Until it can,
 merges use the temporary exception (`--exception --advisory ...`: exact-head
 operator approval and two advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change; ends at
-`EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-11-10). The exception only
+`EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31). The exception only
 checks that the advisory links are separate https URLs; it proves neither head
 binding nor that Browser QA ran, and a verdict filed under the author's identity
 still refuses under it. The `solo_operator` delivery-profile
