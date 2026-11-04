@@ -32,7 +32,30 @@ impl Drop for Rig {
     }
 }
 
+/// Keep SIGCHLD from waking the client's socket reads. The daemon and board
+/// threads this rig starts spawn `git`. A child that exits while its parent
+/// thread has signals blocked (as `Command::spawn` does across the fork) has
+/// the SIGCHLD queued on the process instead of dropped as ignored, and the
+/// kernel then wakes any thread that does not block it. When that is the thread
+/// in a timed `recv`, the call fails with EINTR: a socket with a receive
+/// timeout is never restarted, whatever the signal's disposition, and ureq 3.4.2
+/// does not retry it. Blocking it here is inherited by every thread `start`
+/// spawns; `wait`/`waitpid` do not need it delivered.
+fn block_sigchld() {
+    // SAFETY: a local signal set and a mask change on the calling thread.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGCHLD);
+        assert_eq!(
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()),
+            0
+        );
+    }
+}
+
 fn start() -> Rig {
+    block_sigchld();
     let dir = tempfile::Builder::new()
         .prefix("c2018-http")
         .tempdir()
