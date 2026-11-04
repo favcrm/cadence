@@ -72,10 +72,9 @@ decision 2026-11-03): a non-author session with no inherited context, including
 a subagent. These verbs do not enforce it. The gate counts hosted verdicts by
 attested principal and refuses the author's principal, while local notes count
 by their self-declared `From:` alias, which is not attested. Review
-workflows are live (CAD-2081 stage 3): a cheap first pass beside fresh-session
-reviews on gate, security, schema and release PRs, and two of them satisfy other PRs.
-On hosted today `routine` and `ui/**` PRs still use the temporary `--exception
---advisory ...` path (ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31).
+workflows (CAD-2081 stage 3) and the temporary `--exception --advisory ...` path
+(ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31) are described in
+AGENTS.md "Review", as is why agents file no hosted verdict.
 
 CAD-2081 row shape: a hosted row with `identity_source: "workflow-oidc"` has no
 `github_login` and carries `run_id`, `run_attempt`, `workflow_sha`, `jti` and

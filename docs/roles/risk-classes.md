@@ -93,12 +93,10 @@ operator approval and two advisory links, standards and spec-security, plus brow
 change; ends at
 `EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31). The exception only
 checks that the advisory links are separate https URLs; it proves neither head
-binding nor that Browser QA ran, and a verdict filed under the author's identity
-still refuses under it. The `solo_operator` delivery-profile
+binding nor that Browser QA ran. Agents file no hosted verdict (AGENTS.md "Review"). The `solo_operator` delivery-profile
 field still exists in code; it is not this standard. A workflow-issued reviewer
-identity (CAD-2081) is counted by the gate and its workflows are live: a cheap first
-pass beside fresh-session reviews on gate, security, schema and release PRs, and two
-of them satisfy other PRs; see AGENTS.md "Review".
+identity (CAD-2081) is counted by the gate and its workflows are live; their role is
+in AGENTS.md "Review".
 
 ### Review count by diff (CAD-957)
 A PR whose every change qualifies under the one-review allowlist

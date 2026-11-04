@@ -615,10 +615,9 @@ change, even where the board asks for fewer or no approval. A hosted `routine`
 PR needs this route too, because a hosted board has no readiness record yet; ends at `EXCEPTION_ENDS` in
 `scripts/delivery-gate`, 2026-12-31); see AGENTS.md "Review". The exception
 only checks that the advisory links are separate https URLs; it proves neither
-head binding nor that Browser QA ran. A same-person verdict
-still refuses under it, so a session that is not a distinct attested principal
-(`cadence audit identities`) posts its findings as a PR comment and does not run
-`audit verdict` below.
+head binding nor that Browser QA ran. Agents in this workspace do
+not run `audit verdict` below: they post findings as a PR comment and use it as
+the advisory link (AGENTS.md "Review"). The command is documented for what it does.
 
 ```sh
 cadence --org acme audit verdict --project <project-key> --repo <owner/name> \

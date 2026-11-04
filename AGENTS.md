@@ -148,21 +148,18 @@ the code you just wrote.
   advisory. Of the advisory links, it checks
   only that they are separate https URLs; it proves neither head binding nor
   that Browser QA ran. A second attested human is not required.
-- **Post findings as a PR comment; file no hosted verdict.** File a hosted
-  verdict (`cadence audit verdict`) only as a distinct attested principal from
-  the PR author; check with `cadence audit identities`. `favcrm-dev` and
-  `cc-syntax` are one person, so an attestation on another login is not
-  distinct. While the author's login has no attested principal the gate refuses
-  every owner-attested row, so no owner-attested route is open; attest the
-  author only to their own existing principal, never a new one, which would make
-  a same-person row count. A hosted verdict has no retraction verb and is
-  head-pinned: a same-person row is refused, `--exception` included, and moving
-  the head, which voids every other row, is the only legitimate way past it. A
-  Browser QA verdict is a countable row too: file none; the comment is the
-  advisory. Local notes are not hosted rows. A workflow-issued row
-  (`identity_source: workflow-oidc`) carries no login or person; on gate,
-  security, schema and release PRs it is a first pass, not a replacement for a
-  real review.
+- **Agents file no hosted verdict in this workspace.** Post findings as a PR
+  comment; that comment is the advisory link for `standards`, `spec-security` or
+  `browser-qa`. `favcrm-dev` and `cc-syntax` are one person, and the gate
+  refuses every owner-attested row while the author's login has no attested
+  principal. A filed row has no retraction verb and is head-pinned; a
+  same-person row refuses, `--exception` included, and moving the head voids
+  every other row. Changing reviewer identities is the operator's decision
+  alone, never a way to make a row count. Workflow-issued rows
+  (`review-standards.yml` and `review-spec.yml`; no login or person) are a cheap
+  first pass on gate, security, schema and release PRs, where fresh-session Opus
+  reviews stay the real review; two rows satisfy other PRs, with the operator
+  check still applying outside the auto-paths allowlist.
 - **The changed set is anchored to main's live tip.** GitHub's PR base SHA can stay
   older than the real merge base after main is merged into the branch, so a PR
   that merges main and restores an old file diffs as docs-only against it.
@@ -225,8 +222,8 @@ the code you just wrote.
   re-dispatched, or an empty commit pushed, for a new head and a new verdict. A
   session holding admin can still rewrite the workflow or sign directly until
   agents lose admin. There is no Browser QA workflow: off the exception a `ui/` PR
-  needs a countable Browser QA verdict from a distinct attested principal, and
-  refuses without it. `--exception` is otherwise unchanged, but a workflow row that does not hold refuses under it
+  needs a countable Browser QA verdict, which no agent here files, and refuses
+  without it. `--exception` is otherwise unchanged, but a workflow row that does not hold refuses under it
   too.
 - One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
