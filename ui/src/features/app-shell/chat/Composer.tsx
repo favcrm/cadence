@@ -85,9 +85,10 @@ export interface ComposerProps {
   /**
    * Full density only: a complete `/verb [arg]` submits through here
    * (never to the thread). Compact panes with their own commands
-   * (`/new`) pass it too; without it every submission is a send.
+   * (`/new`) pass it too; without it every submission is a send. `false`
+   * means no such verb: the words may be a message, so the box keeps them.
    */
-  onCommand?: (name: string, arg: string) => void;
+  onCommand?: (name: string, arg: string) => boolean | void;
   /** The verbs the menu offers, when this board cannot run them all. */
   commands?: readonly SlashCommand[];
   /** A real send completed validation — deliver `body` (with `refs`).
@@ -489,8 +490,7 @@ export default function Composer({
     const cmd = parseSlash(body);
     if (cmd && !menu && onCommand !== undefined) {
       // A compact pane with its own commands (`/new`): exact verb.
-      onCommand(cmd.name, cmd.arg);
-      finishCommand();
+      if (onCommand(cmd.name, cmd.arg) !== false) finishCommand();
     } else if (cmd && !menu) {
       // An unsupported slash verb is never forwarded as chat — the
       // composer refuses it in place. Full-density menus cannot reach
@@ -498,8 +498,7 @@ export default function Composer({
       onNotice?.({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name: cmd.name } });
       return;
     } else if (cmd) {
-      onCommand?.(cmd.name, cmd.arg);
-      finishCommand();
+      if (onCommand?.(cmd.name, cmd.arg) !== false) finishCommand();
     } else {
       // Capture the ready rows by key+generation, not by file id: two
       // distinct rows can legitimately share a dedup id, and a later row

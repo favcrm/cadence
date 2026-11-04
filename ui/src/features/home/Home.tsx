@@ -1311,7 +1311,7 @@ function MasterHome({
 
   /** One `/` verb → the board's command route; its answer is a card. */
   const runCommand = useCallback(
-    (name: string, arg: string) => {
+    (name: string, arg: string): boolean | void => {
       const id = ++cmdSeq.current;
       if (name === "help") {
         setCmds((c) => [...c, { id, name, ok: true, text: t(helpText(offered)) }]);
@@ -1323,7 +1323,7 @@ function MasterHome({
           ...c,
           { id, name, ok: false, text: `Unknown command — \`/help\` lists what the master accepts.` },
         ]);
-        return;
+        return false;
       }
       if (!offered.includes(known)) {
         setCmds((c) => [

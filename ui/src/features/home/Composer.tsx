@@ -31,7 +31,7 @@ export default function Composer({
 }: {
   block: string | null;
   seed: { text: string; n: number; refs?: ThreadRef[] };
-  onCommand: (name: string, arg: string) => void;
+  onCommand: (name: string, arg: string) => boolean | void;
   commands?: readonly SlashCommand[];
   /** Enter or the button actually submitted — chat, slash, or an Ask-master draft. */
   onSent: () => void;
