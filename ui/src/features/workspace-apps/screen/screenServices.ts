@@ -42,6 +42,7 @@ function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): A
   // conflict, so collapsing it would strand the panel in an unusable state.
   if (operation?.startsWith("campaign-work.") && status === 409 && error instanceof ApiError && error.code === "stale_revision")
     return { code: "stale_revision", text: "These campaign work details changed. Reload them before saving again." };
+  if (operation === "sends.approve" && error instanceof ApiError && error.code === "no_recipients") return { code: "no_recipients", text: "No one in this audience can be emailed." };
   const code = ({ 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict", 503: "unavailable" } as Record<number, string>)[status] ?? "failed";
   return { code, text: status === 401 || status === 403 ? "This app's access is no longer available." : status === 409 ? "That changed. Refresh before trying again." : "Cadence refused this request. Inspect fresh status before retrying an effect." };
 }
@@ -215,6 +216,7 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
   const audience = object(facts.audience) ? facts.audience : null;
   const freeze = audience && object(audience.freeze) ? audience.freeze : null;
   if (freeze) { show("Audience", freeze.freeze_id); show("Recipients", freeze.final_count); show("Recipient ceiling", freeze.max_recipients); show("Audience digest", freeze.digest); }
+  if (operation === "sends.approve" && freeze?.final_count === 0) throw new ApiError("No recipients", 400, { code: "no_recipients" });
   if (operation === "sends.approve" && (!freeze || !Number.isSafeInteger(freeze.final_count) || Number(freeze.final_count) < 1 || typeof facts.content_revision !== "number" || typeof facts.send_digest !== "string")) throw new ApiError("Incomplete frozen send facts", 502);
   if (operation === "sends.approve" || operation === "content.approve" || operation === "smtp.test-send") return plainCard(operation, facts, content, freeze);
   show("Frozen send digest", facts.send_digest);

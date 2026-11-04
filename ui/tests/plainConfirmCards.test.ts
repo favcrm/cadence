@@ -13,10 +13,12 @@ const receipt: MountReceipt = {
   digest: `sha256:${"e".repeat(64)}`, display_scope_key: "f".repeat(64), display_session_key: "1".repeat(64), remote_images: [],
 };
 
+let refusalText = "";
 async function card(operation: string, facts: Record<string, unknown>, args: Record<string, unknown> = {}): Promise<RecordCard | string> {
   globalThis.fetch = async () => new Response(JSON.stringify({ confirmation_token: "b".repeat(64), card: { operation, facts } }), { status: 200, headers: { "Content-Type": "application/json" } });
   const services = recordServices(receipt, "own-domain", { current: () => true, refused: () => {}, command: () => {} });
   const plan = await services.planner(operation as never, args);
+  refusalText = "text" in plan ? String(plan.text) : "";
   return "recordCard" in plan && plan.recordCard ? plan.recordCard : "refused";
 }
 const labels = (rows: { label: string }[] | undefined) => (rows ?? []).map(r => r.label).join("|");
@@ -47,7 +49,8 @@ async function main(): Promise<void> {
   check(await audienceOf({ base: { mode: "custom", customer_ids: ["a"] } }) === "1 chosen customer", "one chosen customer");
   check(await audienceOf({ base: { mode: "custom", customer_count: 3 } }) === "3 chosen customers", "customer_count when ids not sent");
   check(await audienceOf({ base: undefined }) === undefined, "no base omits the Audience row");
-  check(await sendWith({ ...freeze, final_count: 0 }) === "refused", "zero recipients are refused");
+  check(await sendWith({ ...freeze, final_count: 0 }) === "refused" && refusalText === "No one in this audience can be emailed.", "zero recipients are refused in plain words");
+  check(await sendWith({ ...freeze, final_count: -1 }) === "refused", "negative recipients are refused");
   // Validation is unchanged: each required fact still refuses.
   for (const bad of [{ content_revision: undefined }, { send_digest: undefined }, { audience: {} }, { audience: { freeze: { ...freeze, final_count: "9" } } }]) {
     const r = await card("sends.approve", { send_id: "s", content_revision: 2, send_digest: "sha256:cc", audience: { freeze }, ...bad });

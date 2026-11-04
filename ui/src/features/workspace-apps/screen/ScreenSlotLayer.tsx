@@ -29,7 +29,7 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
       {field && <label className="wa-stack">{field.label}
         {field.choices ? <select value={input} onChange={e => setInput(e.target.value)} disabled={view.pending}><option value="">Select…</option>{field.choices.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}</select>
           : field.field === "brief" ? <textarea value={input} readOnly rows={6} />
-          : <input type={field.field === "to_email" ? "email" : "url"} value={input} maxLength={field.field === "to_email" ? 320 : 2048} onChange={e => setInput(e.target.value)} disabled={view.pending} />}
+          : <input className="wa-input" type={field.field === "to_email" ? "email" : "url"} value={input} maxLength={field.field === "to_email" ? 320 : 2048} onChange={e => setInput(e.target.value)} disabled={view.pending} />}
       </label>}
       <p>{card.retry ?? "No automatic retry. If the result is uncertain, inspect fresh status before requesting another effect."}</p>
       <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
