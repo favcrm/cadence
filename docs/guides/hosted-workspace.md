@@ -651,8 +651,10 @@ notes, and refuses an answer naming another project, repository, issue or
 head. Add `--body` to also print each note's findings as `body` (with
 `body_truncated`), which is how a `REVISE` is read; the gate never passes it and
 the text never decides a count. The text is the reviewer's, so control
-characters and bidirectional overrides print as U+FFFD, and it is bounded
-(16 KiB per note on the board). A board that predates the field still answers
+characters and anything a person cannot see, such as format characters and
+line separators, print as U+FFFD. It is bounded at 16 KiB per note and 128 KiB
+per answer on the board, with the newest notes' text kept first, so an older
+note can read empty with `body_truncated` set when the budget runs out. A board that predates the field still answers
 the rows, prints a line on stderr, and marks `bodies: "unavailable: …"`; local
 orgs refuse `--body` because their notes are files you can open. The merge
 gate also runs whichever `cadence` you point it at: set
