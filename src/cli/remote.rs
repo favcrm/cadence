@@ -1019,6 +1019,12 @@ fn verb_for(
                              run the read against the local agenticos-provider account",
                         ));
                     }
+                    if !valid_platform_tool_slug(tool) {
+                        return Err(Error::invalid(
+                            "platform_call",
+                            "tool must be 1-128 of a-z 0-9 _ . - starting with a-z or 0-9",
+                        ));
+                    }
                     let body = match input {
                         Some(input) => Some(super::platform::parse_platform_input(input)?),
                         None => None,
@@ -1057,6 +1063,94 @@ fn verb_for(
                         args.insert("query".into(), query);
                     }
                 }
+                PlatformAction::Status {
+                    request,
+                    job,
+                    tool,
+                    input,
+                    query,
+                } => {
+                    let body = match input {
+                        Some(input) => Some(super::platform::parse_platform_input(input)?),
+                        None => None,
+                    };
+                    let query = match query {
+                        Some(query) => Some(super::platform::parse_platform_input(query)?),
+                        None => None,
+                    };
+                    if (body.is_some() || query.is_some()) && tool.is_none() {
+                        return Err(Error::usage(
+                            "platform status with --input or --query requires --tool <tool>",
+                        ));
+                    }
+                    let key = match request {
+                        Some(request) => {
+                            if !valid_platform_handle(request) {
+                                return Err(Error::invalid(
+                                    "platform_status",
+                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+                                ));
+                            }
+                            Some(request.clone())
+                        }
+                        None if tool.is_some() => {
+                            if body.is_none() && query.is_none() {
+                                return Err(Error::usage(
+                                    "platform status with --tool needs --request <handle>, or --input/--query to derive the handle",
+                                ));
+                            }
+                            Some(platform_replay_key(
+                                tool.as_deref().unwrap_or_default(),
+                                query.as_ref(),
+                                body.as_ref(),
+                            ))
+                        }
+                        None => None,
+                    };
+                    if let Some(job_id) = job {
+                        if !valid_media_job_id(job_id) {
+                            return Err(Error::invalid(
+                                "platform_status",
+                                "job must be med_ followed by 1-80 of A-Z a-z 0-9 _ -",
+                            ));
+                        }
+                        args.insert("jobId".into(), json!(job_id));
+                    }
+                    if key.is_none() && job.is_none() {
+                        return Err(Error::usage(
+                            "platform status requires --request <handle>, --job <job-id>, or --tool <tool> with --input/--query",
+                        ));
+                    }
+                    args.insert("operation".into(), json!("status"));
+                    if let Some(key) = key {
+                        args.insert("key".into(), json!(key));
+                    }
+                    if let Some(tool) = tool {
+                        if !valid_platform_tool_slug(tool) {
+                            return Err(Error::invalid(
+                                "platform_status",
+                                "tool must be 1-128 of a-z 0-9 _ . - starting with a-z or 0-9",
+                            ));
+                        }
+                        args.insert("tool".into(), json!(tool));
+                    }
+                    if let Some(body) = body {
+                        args.insert("body".into(), body);
+                    }
+                    if let Some(query) = query {
+                        args.insert("query".into(), query);
+                    }
+                }
+                PlatformAction::Artifact { reference, .. } => {
+                    if !valid_media_artifact_ref(reference) {
+                        return Err(Error::invalid(
+                            "platform_artifact",
+                            "artifact ref must be med_<job-id>.<64-lowercase-hex-sha256>",
+                        ));
+                    }
+                    args.insert("operation".into(), json!("artifact"));
+                    args.insert("ref".into(), json!(reference));
+                }
                 _ => return Err(unavailable(command_path)),
             }
             "platform_call"
@@ -1074,6 +1168,38 @@ fn valid_platform_handle(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
+fn valid_media_job_id(value: &str) -> bool {
+    value.strip_prefix("med_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.len() <= 80
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    })
+}
+
+fn valid_media_artifact_ref(value: &str) -> bool {
+    let Some((job_id, digest)) = value.split_once('.') else {
+        return false;
+    };
+    valid_media_job_id(job_id)
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn valid_platform_tool_slug(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= 128
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes.all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+        })
 }
 
 /// CAD-1678: the reply key a hosted tool call replays under. The relay body
@@ -1537,6 +1663,251 @@ fn artifact(
             Ok(0)
         }
     }
+}
+
+/// Maximum size of a retained media artifact (`10 MiB`, matching `ARTIFACT_BYTES_MAX`).
+const PLATFORM_MEDIA_ARTIFACT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+fn remote_platform_artifact<E, P>(
+    target: &cadence_agent::remote_cli::RemoteTarget,
+    reference: &str,
+    out: &std::path::Path,
+    wake_timeout: u64,
+    eprint_line: E,
+    print_json: P,
+) -> Result<i32>
+where
+    E: Fn(&str),
+    P: Fn(&Value),
+{
+    if !valid_media_artifact_ref(reference) {
+        return Err(Error::invalid(
+            "platform_artifact",
+            "artifact ref must be med_<job-id>.<64-lowercase-hex-sha256>",
+        ));
+    }
+    if std::fs::symlink_metadata(out).is_ok() {
+        return Err(Error::rejected(format!(
+            "cannot create {}: file already exists; nothing was requested or written",
+            out.display()
+        )));
+    }
+    eprint_line(&format!(
+        "cadence platform org={} operation=artifact ref={reference}",
+        target.org
+    ));
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(wake_timeout))
+        .ok_or_else(|| Error::rejected("invalid wake timeout"))?;
+    let receipt = collect_platform_artifact(reference, out, |offset| {
+        let mut args = serde_json::Map::new();
+        args.insert("operation".into(), json!("artifact"));
+        args.insert("ref".into(), json!(reference));
+        args.insert("offset".into(), json!(offset));
+        match cadence_agent::remote_cli::call_verb(
+            target,
+            "platform_call",
+            args,
+            deadline,
+            wake_timeout,
+            &eprint_line,
+        )? {
+            cadence_agent::remote_cli::RemoteAnswer::Ok(body) => Ok(body),
+            cadence_agent::remote_cli::RemoteAnswer::Conflict(_) => {
+                Err(Error::rejected("remote media artifact read conflicted"))
+            }
+        }
+    });
+    let receipt = match receipt {
+        Ok(receipt) => receipt,
+        Err(error) => return remote_failure(error),
+    };
+    print_json(&receipt);
+    Ok(0)
+}
+
+fn collect_platform_artifact(
+    reference: &str,
+    out: &std::path::Path,
+    mut fetch: impl FnMut(u64) -> Result<Value>,
+) -> Result<Value> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if !valid_media_artifact_ref(reference) {
+        return Err(Error::invalid(
+            "platform_artifact",
+            "artifact ref must be med_<job-id>.<64-lowercase-hex-sha256>",
+        ));
+    }
+    if std::fs::symlink_metadata(out).is_ok() {
+        return Err(Error::rejected(format!(
+            "cannot create {}: file already exists; nothing was written",
+            out.display()
+        )));
+    }
+    let (expected_job, expected_digest) = reference.split_once('.').expect("validated ref");
+    let mut spool = {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".cadence-media-artifact-");
+        #[cfg(unix)]
+        builder.permissions(std::fs::Permissions::from_mode(0o600));
+        builder.tempfile().map_err(|e| {
+            Error::rejected(format!(
+                "cannot open private media artifact spool: {e}; nothing was written"
+            ))
+        })?
+    };
+    let mut offset = 0u64;
+    let mut pinned_total: Option<u64> = None;
+    let mut pinned_mime: Option<String> = None;
+    let mut hasher = Sha256::new();
+    loop {
+        let reply = fetch(offset)?;
+        let data = reply
+            .get("data")
+            .filter(|v| v.is_object())
+            .unwrap_or(&reply);
+        if data.get("ref").and_then(Value::as_str) != Some(reference)
+            || data.get("jobId").and_then(Value::as_str) != Some(expected_job)
+            || data.get("digest").and_then(Value::as_str) != Some(expected_digest)
+        {
+            return Err(Error::rejected(
+                "remote media artifact response does not match the requested ref/digest; nothing was written",
+            ));
+        }
+        let mime = data
+            .get("mime")
+            .and_then(Value::as_str)
+            .filter(|m| matches!(*m, "image/png" | "image/jpeg"))
+            .ok_or_else(|| {
+                Error::rejected(
+                    "remote media artifact has an unsupported or missing MIME type; nothing was written",
+                )
+            })?;
+        if let Some(prev) = pinned_mime.as_deref() {
+            if prev != mime {
+                return Err(Error::rejected(
+                    "remote media artifact MIME changed across pages; nothing was written",
+                ));
+            }
+        } else {
+            pinned_mime = Some(mime.to_string());
+        }
+        let page_offset = data.get("offset").and_then(Value::as_u64).ok_or_else(|| {
+            Error::rejected("remote media artifact page is missing offset; nothing was written")
+        })?;
+        let total = data
+            .get("total")
+            .and_then(Value::as_u64)
+            .filter(|t| *t > 0 && *t <= PLATFORM_MEDIA_ARTIFACT_MAX_BYTES)
+            .ok_or_else(|| {
+                Error::rejected(
+                    "remote media artifact total size is missing or out of bounds; nothing was written",
+                )
+            })?;
+        if let Some(prev_total) = pinned_total {
+            if prev_total != total {
+                return Err(Error::rejected(
+                    "remote media artifact total size changed across pages; nothing was written",
+                ));
+            }
+        } else {
+            pinned_total = Some(total);
+        }
+        if page_offset != offset {
+            return Err(Error::rejected(
+                "remote media artifact page offset is not contiguous; nothing was written",
+            ));
+        }
+        let encoded = data
+            .get("content_base64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Error::rejected(
+                    "remote media artifact page is missing content_base64; nothing was written",
+                )
+            })?;
+        use base64::Engine;
+        let chunk = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| {
+                Error::rejected(
+                    "remote media artifact content_base64 is invalid; nothing was written",
+                )
+            })?;
+        if let Some(declared_bytes) = data.get("bytes").and_then(Value::as_u64) {
+            if declared_bytes != chunk.len() as u64 {
+                return Err(Error::rejected(
+                    "remote media artifact page byte count does not match decoded bytes; nothing was written",
+                ));
+            }
+        }
+        if chunk.is_empty() || offset + (chunk.len() as u64) > total {
+            return Err(Error::rejected(
+                "remote media artifact page made no progress or exceeded total; nothing was written",
+            ));
+        }
+        spool.write_all(&chunk).map_err(|e| {
+            Error::rejected(format!(
+                "cannot write media artifact spool: {e}; nothing was written"
+            ))
+        })?;
+        hasher.update(&chunk);
+        offset += chunk.len() as u64;
+        if offset == total {
+            break;
+        }
+    }
+    let total = pinned_total.unwrap_or(0);
+    let got_digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if got_digest != expected_digest || offset != total {
+        return Err(Error::rejected(
+            "the media artifact's bytes do not match its SHA-256 digest; nothing was written",
+        ));
+    }
+    spool.seek(SeekFrom::Start(0)).map_err(|e| {
+        Error::rejected(format!(
+            "cannot rewind media artifact spool: {e}; nothing was written"
+        ))
+    })?;
+    let mut verified_bytes = Vec::with_capacity(total as usize);
+    spool.read_to_end(&mut verified_bytes).map_err(|e| {
+        Error::rejected(format!(
+            "cannot read media artifact spool: {e}; nothing was written"
+        ))
+    })?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut target_file = options
+        .open(out)
+        .map_err(|e| Error::rejected(format!("cannot create {}: {e}", out.display())))?;
+    if let Err(error) = target_file
+        .write_all(&verified_bytes)
+        .and_then(|()| target_file.sync_all())
+    {
+        let _ = std::fs::remove_file(out);
+        return Err(Error::rejected(format!(
+            "cannot write {}: {error}; partial file removed",
+            out.display()
+        )));
+    }
+    Ok(json!({
+        "ref": reference,
+        "jobId": expected_job,
+        "digest": expected_digest,
+        "mime": pinned_mime.unwrap_or_else(|| "image/png".into()),
+        "bytes": total,
+        "written": out.display().to_string(),
+    }))
 }
 
 /// Remote blob cats stay under the default wiki upload cap. A larger
@@ -2205,6 +2576,19 @@ where
     if let Commands::Artifact { action } = &command {
         return artifact(&target, action, wake_timeout);
     }
+    if let Commands::Platform {
+        action: PlatformAction::Artifact { reference, out },
+    } = &command
+    {
+        return remote_platform_artifact(
+            &target,
+            reference,
+            out,
+            wake_timeout,
+            eprint_line,
+            print_json,
+        );
+    }
     if let Commands::Wiki {
         action:
             WikiAction::Cp {
@@ -2272,6 +2656,26 @@ where
                 .map(str::to_string)
         })
         .flatten();
+    let platform_key = (verb == "platform_call")
+        .then(|| args.get("key").and_then(Value::as_str).map(str::to_string))
+        .flatten();
+    if verb == "platform_call" {
+        let op = args
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or("call");
+        let mut line = format!("cadence platform org={} operation={op}", target.org);
+        if let Some(tool) = args.get("tool").and_then(Value::as_str) {
+            line.push_str(&format!(" tool={tool}"));
+        }
+        if let Some(key) = platform_key.as_deref() {
+            line.push_str(&format!(" request={key}"));
+        }
+        if let Some(job_id) = args.get("jobId").and_then(Value::as_str) {
+            line.push_str(&format!(" job={job_id}"));
+        }
+        eprint_line(&line);
+    }
     let deadline = std::time::Instant::now()
         .checked_add(std::time::Duration::from_secs(wake_timeout))
         .ok_or_else(|| Error::rejected("invalid wake timeout"))?;
@@ -2295,6 +2699,15 @@ where
                     target.org
                 ));
             }
+            if let Some(key) = platform_key.filter(|_| error.kind() == "unknown") {
+                eprint_line(&format!(
+                    "remote platform call `{key}` on org `{}` was not confirmed — \
+                     reconcile read-only with `cadence --org {} platform status --request {key}` \
+                     before repeating; replaying `platform call` returns a recorded outcome, \
+                     or starts and charges a new call if `{key}` was not recorded.",
+                    target.org, target.org
+                ));
+            }
             return remote_failure(error);
         }
     };
@@ -2316,6 +2729,11 @@ where
             }
             if wiki_text(&command, &body)? {
                 return Ok(0);
+            }
+            if matches!(&command, Commands::Platform { .. }) {
+                for summary in super::platform::platform_human_summary(&body) {
+                    eprint_line(&summary);
+                }
             }
             // The ordinary hosted answer is one JSON document under the
             // shared stdout policy, like a local verb's.
@@ -4294,6 +4712,522 @@ mod read_contract_tests {
             assert!(!message.contains("--org local"), "{message}");
             assert!(!message.contains("org switch"), "{message}");
             assert!(message.contains("nothing was sent"), "{message}");
+        }
+    }
+
+    // CAD-2127: `platform status` is a read that resolves the same request
+    // handle a `platform call` used — by `--request`, by `--job`, or by
+    // deriving the identical `pcli_<sha256>` key from `--tool` plus its
+    // input/query.
+    fn status_with(
+        request: Option<&str>,
+        job: Option<&str>,
+        tool: Option<&str>,
+        input: Option<&str>,
+        query: Option<&str>,
+    ) -> Commands {
+        platform(PlatformAction::Status {
+            request: request.map(str::to_string),
+            job: job.map(str::to_string),
+            tool: tool.map(str::to_string),
+            input: input.map(str::to_string),
+            query: query.map(str::to_string),
+        })
+    }
+
+    /// The mapped refusal for a command that must never build a request.
+    fn refusal(command: &Commands) -> Error {
+        match verb_for(command, None) {
+            Ok((verb, _)) => panic!("`{verb}` must refuse before any request is built"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn hosted_platform_status_maps_a_request_handle_or_job_id_to_a_read() {
+        let (verb, args) = outcome(&status_with(Some("cad2127-run-1"), None, None, None, None))
+            .expect("a request handle is a complete status target");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args, json!({"operation": "status", "key": "cad2127-run-1"}));
+
+        let (verb, args) = outcome(&status_with(None, Some("med_job-1"), None, None, None))
+            .expect("a hosted media job id is a complete status target");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args, json!({"operation": "status", "jobId": "med_job-1"}));
+
+        // Both targets may ride together; neither dispatches or polls.
+        let (_, args) = outcome(&status_with(
+            Some("cad2127-run-1"),
+            Some("med_job-1"),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            args,
+            json!({"operation": "status", "key": "cad2127-run-1", "jobId": "med_job-1"})
+        );
+    }
+
+    #[test]
+    fn hosted_platform_status_derives_exactly_the_call_key_from_tool_and_body() {
+        // The status key must be the same replay handle the failed call used:
+        // a derived key that differed would reconcile the wrong request.
+        for (tool, input, query) in [
+            ("generate_image", Some(r#"{"prompt": "synthetic"}"#), None),
+            ("read_posts", None, Some(r#"{"handle": "first"}"#)),
+            (
+                "example_tool",
+                Some(r#"{"prompt": "synthetic"}"#),
+                Some(r#"{"resource": "first"}"#),
+            ),
+        ] {
+            let (verb, call_args) = outcome(&call_with(tool, input, query, None))
+                .expect("the call maps to a replay key");
+            assert_eq!(verb, "platform_call");
+            let call_key = call_args["key"]
+                .as_str()
+                .expect("a call carries its reply key")
+                .to_owned();
+            assert!(
+                call_key.starts_with("pcli_"),
+                "a derived handle is the sha256 replay key: {call_key}"
+            );
+            assert_eq!(call_key.len(), "pcli_".len() + 64, "{call_key}");
+
+            let (verb, status_args) = outcome(&status_with(None, None, Some(tool), input, query))
+                .expect("tool plus its input derives the same handle");
+            assert_eq!(verb, "platform_call");
+            assert_eq!(status_args["operation"], json!("status"));
+            assert_eq!(status_args["key"], json!(call_key));
+            assert_eq!(status_args["tool"], json!(tool));
+            assert!(
+                valid_platform_handle(&call_key),
+                "the derived handle is the wire grammar: {call_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_platform_status_refuses_bad_handles_jobs_and_missing_targets() {
+        // Everything below is decided in `verb_for`, before any request exists.
+        let bad_handles: Vec<String> = vec![
+            String::new(),
+            "bad handle".into(),
+            "bad/handle".into(),
+            "a".repeat(129),
+        ];
+        for handle in bad_handles {
+            let error = refusal(&status_with(Some(handle.as_str()), None, None, None, None));
+            assert_eq!(error.kind(), "rejected", "{handle:?}: {error}");
+            let message = error.to_string();
+            assert!(message.contains("1-128"), "{handle:?}: {message}");
+        }
+
+        let too_long = format!("med_{}", "a".repeat(81));
+        for job in ["job-1", "med_", "med_bad/job", too_long.as_str()] {
+            let error = refusal(&status_with(None, Some(job), None, None, None));
+            assert_eq!(error.kind(), "rejected", "{job:?}: {error}");
+            let message = error.to_string();
+            assert!(message.contains("med_"), "{job:?}: {message}");
+        }
+
+        // No target at all.
+        let error = refusal(&status_with(None, None, None, None, None));
+        assert_eq!(error.kind(), "usage", "{error}");
+        let message = error.to_string();
+        assert!(message.contains("--request"), "{message}");
+        assert!(message.contains("--job"), "{message}");
+
+        // A tool with no request and no body/query cannot derive a handle.
+        let error = refusal(&status_with(None, None, Some("generate_image"), None, None));
+        assert_eq!(error.kind(), "usage", "{error}");
+        let message = error.to_string();
+        assert!(message.contains("--input"), "{message}");
+        assert!(message.contains("--query"), "{message}");
+
+        // Body/query without a tool cannot name the tool the key hashed.
+        let error = refusal(&status_with(None, None, None, Some("{}"), None));
+        assert_eq!(error.kind(), "usage", "{error}");
+        let message = error.to_string();
+        assert!(message.contains("--tool"), "{message}");
+    }
+
+    // CAD-2127 follow-up (independent security review): the hosted call echoes
+    // the tool name on the pre-call correlation line and puts it on the wire,
+    // so a name outside the slug grammar — notably one carrying a newline or
+    // control byte that could forge that line — is refused while the call is
+    // mapped, before any request or stderr correlation exists.
+    #[test]
+    fn hosted_platform_refuses_an_unsafe_tool_name_before_dispatch() {
+        let too_long = format!("a{}", "a".repeat(128));
+        for tool in [
+            "GenerateImage",
+            "generate image",
+            "generate\nimage",
+            "generate\rimage",
+            "generate\u{1b}image",
+            "-generate_image",
+            ".generate_image",
+            "generate/image",
+            "genérate_image",
+            "",
+            too_long.as_str(),
+        ] {
+            let error = refusal(&call_with(tool, Some("{}"), None, None));
+            assert_eq!(error.kind(), "rejected", "{tool:?}: {error}");
+            let message = error.to_string();
+            assert!(message.contains("a-z"), "{tool:?}: {message}");
+            // The refusal is a fixed sentence: the rejected name cannot forge
+            // a second line in the caller's terminal.
+            assert!(!message.contains('\n'), "{tool:?}: {message:?}");
+            assert!(!message.contains('\r'), "{tool:?}: {message:?}");
+        }
+        // The same guard accepts the declared slug, so it is a grammar check,
+        // not a blanket refusal.
+        assert!(outcome(&call_with("generate_image", Some("{}"), None, None)).is_ok());
+    }
+
+    #[test]
+    fn hosted_platform_artifact_maps_a_verified_ref_and_refuses_bad_ones() {
+        let digest = "a".repeat(64);
+        let reference = format!("med_job-1.{digest}");
+        let (verb, args) = outcome(&platform(PlatformAction::Artifact {
+            reference: reference.clone(),
+            out: PathBuf::from("/tmp/cad2127-image.png"),
+        }))
+        .expect("a complete ref maps to the artifact read");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args, json!({"operation": "artifact", "ref": reference}));
+
+        // A ref without a job id, a short/upper-case digest, or a non-hex
+        // digest cannot name a retained artifact, so it refuses locally.
+        for bad in [
+            "med_job-1".to_string(),
+            format!("job-1.{digest}"),
+            format!("med_.{digest}"),
+            format!("med_job-1.{}", "a".repeat(63)),
+            format!("med_job-1.{}", "A".repeat(64)),
+            format!("med_job-1.{}", "z".repeat(64)),
+        ] {
+            let error = refusal(&platform(PlatformAction::Artifact {
+                reference: bad.clone(),
+                out: PathBuf::from("/tmp/cad2127-image.png"),
+            }));
+            assert_eq!(error.kind(), "rejected", "{bad}: {error}");
+            let message = error.to_string();
+            assert!(message.contains("med_<job-id>"), "{bad}: {message}");
+        }
+    }
+
+    fn artifact_ref_for(bytes: &[u8]) -> (String, String) {
+        use sha2::{Digest, Sha256};
+        let digest: String = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        (format!("med_job1.{digest}"), digest)
+    }
+
+    fn artifact_page(
+        reference: &str,
+        job_id: &str,
+        digest: &str,
+        mime: &str,
+        offset: u64,
+        total: u64,
+        chunk: &[u8],
+    ) -> Value {
+        use base64::Engine;
+        json!({
+            "ok": true,
+            "data": {
+                "ref": reference,
+                "jobId": job_id,
+                "digest": digest,
+                "mime": mime,
+                "offset": offset,
+                "total": total,
+                "bytes": chunk.len(),
+                "content_base64": base64::engine::general_purpose::STANDARD.encode(chunk),
+            },
+        })
+    }
+
+    fn run_artifact_pages(
+        reference: &str,
+        out: &std::path::Path,
+        pages: Vec<std::result::Result<Value, String>>,
+    ) -> (Result<Value>, usize) {
+        let served = std::cell::Cell::new(0usize);
+        let mut pages = pages.into_iter();
+        let result = collect_platform_artifact(reference, out, |_offset| {
+            served.set(served.get() + 1);
+            match pages.next() {
+                Some(Ok(page)) => Ok(page),
+                Some(Err(message)) => Err(Error::rejected(message)),
+                None => Err(Error::rejected(
+                    "the download asked for a page it should not need",
+                )),
+            }
+        });
+        (result, served.get())
+    }
+
+    // CAD-2127: a multi-page artifact is spooled, checked page by page and in
+    // full, and only then created at the destination.
+    #[test]
+    fn a_multi_page_artifact_is_verified_before_the_destination_is_created() {
+        let bytes = b"\x89PNG\r\n\x1a\nsynthetic-provider-image-bytes";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let total = bytes.len() as u64;
+        let split = 8usize; // page one keeps the PNG signature intact
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("image.png");
+        let mut fetched = Vec::new();
+        let mut existed_during_fetch = false;
+        let receipt = collect_platform_artifact(&reference, &out, |offset| {
+            fetched.push(offset);
+            existed_during_fetch |= out.exists();
+            let chunk = if offset == 0 {
+                &bytes[..split]
+            } else {
+                &bytes[split..]
+            };
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "image/png",
+                offset,
+                total,
+                chunk,
+            ))
+        })
+        .expect("a verified two-page artifact is written");
+        assert_eq!(fetched, vec![0, split as u64], "pages are contiguous");
+        assert!(
+            !existed_during_fetch,
+            "the destination must not exist before the full digest check"
+        );
+        assert_eq!(receipt["ref"].as_str(), Some(reference.as_str()));
+        assert_eq!(receipt["jobId"], json!("med_job1"));
+        assert_eq!(receipt["digest"].as_str(), Some(digest.as_str()));
+        assert_eq!(receipt["mime"], json!("image/png"));
+        assert_eq!(receipt["bytes"], json!(total));
+        assert_eq!(
+            receipt["written"].as_str(),
+            Some(out.to_str().unwrap()),
+            "the receipt names the created file"
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), bytes.as_slice());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a retained artifact stays private");
+    }
+
+    #[test]
+    fn an_existing_destination_is_refused_before_any_page_is_fetched() {
+        let bytes = b"\x89PNG\r\n\x1a\nsynthetic-provider-image-bytes";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let split = 8usize;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("image.png");
+        std::fs::write(&out, b"keep me").unwrap();
+        let (result, served) = run_artifact_pages(
+            &reference,
+            &out,
+            vec![Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "image/png",
+                0,
+                bytes.len() as u64,
+                &bytes[..split],
+            ))],
+        );
+        let error = result.expect_err("an existing file must never be adopted");
+        assert_eq!(error.kind(), "rejected", "{error}");
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(served, 0, "no page may be fetched for an existing file");
+        assert_eq!(std::fs::read(&out).unwrap(), b"keep me".as_slice());
+    }
+
+    #[test]
+    fn an_unverified_artifact_page_leaves_no_partial_file() {
+        let bytes = b"\x89PNG\r\n\x1a\nsynthetic-provider-image-bytes";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let total = bytes.len() as u64;
+        let split = 8usize;
+        let first = || {
+            artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "image/png",
+                0,
+                total,
+                &bytes[..split],
+            )
+        };
+        let second = |offset, total, chunk: &[u8]| {
+            artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "image/png",
+                offset,
+                total,
+                chunk,
+            )
+        };
+        let (other_reference, other_digest) = artifact_ref_for(b"not the served bytes");
+
+        let cases: Vec<(&str, Vec<std::result::Result<Value, String>>)> = vec![
+            (
+                "a foreign ref",
+                vec![
+                    Ok(first()),
+                    Ok(artifact_page(
+                        &format!("med_other.{digest}"),
+                        "med_job1",
+                        &digest,
+                        "image/png",
+                        split as u64,
+                        total,
+                        &bytes[split..],
+                    )),
+                ],
+            ),
+            (
+                "a foreign job id",
+                vec![
+                    Ok(first()),
+                    Ok(artifact_page(
+                        &reference,
+                        "med_job2",
+                        &digest,
+                        "image/png",
+                        split as u64,
+                        total,
+                        &bytes[split..],
+                    )),
+                ],
+            ),
+            (
+                "a foreign digest",
+                vec![
+                    Ok(first()),
+                    Ok(artifact_page(
+                        &reference,
+                        "med_job1",
+                        &"0".repeat(64),
+                        "image/png",
+                        split as u64,
+                        total,
+                        &bytes[split..],
+                    )),
+                ],
+            ),
+            (
+                "a non-contiguous offset",
+                vec![
+                    Ok(first()),
+                    Ok(second(split as u64 + 1, total, &bytes[split..])),
+                ],
+            ),
+            (
+                "a changed total",
+                vec![
+                    Ok(first()),
+                    Ok(second(split as u64, total + 1, &bytes[split..])),
+                ],
+            ),
+            (
+                "a changed mime",
+                vec![
+                    Ok(first()),
+                    Ok(artifact_page(
+                        &reference,
+                        "med_job1",
+                        &digest,
+                        "image/jpeg",
+                        split as u64,
+                        total,
+                        &bytes[split..],
+                    )),
+                ],
+            ),
+            (
+                "a digest that does not match the bytes",
+                vec![
+                    Ok(artifact_page(
+                        &other_reference,
+                        "med_job1",
+                        &other_digest,
+                        "image/png",
+                        0,
+                        total,
+                        &bytes[..split],
+                    )),
+                    Ok(artifact_page(
+                        &other_reference,
+                        "med_job1",
+                        &other_digest,
+                        "image/png",
+                        split as u64,
+                        total,
+                        &bytes[split..],
+                    )),
+                ],
+            ),
+            (
+                "a later page fetch error",
+                vec![Ok(first()), Err("the second page never arrived".into())],
+            ),
+        ];
+
+        for (label, pages) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("image.png");
+            let (result, served) = run_artifact_pages(&reference, &out, pages);
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), "rejected", "{label}: {error}");
+            assert!(
+                !out.exists(),
+                "{label}: a refused download must leave no file at {}",
+                out.display()
+            );
+            assert!(served >= 1, "{label}: no page was fetched");
+            assert!(
+                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+                "{label}: the destination directory must stay empty"
+            );
+        }
+
+        // A total of zero or beyond the supported bound cannot be a real
+        // artifact, so it is refused before the destination is created.
+        for total in [0u64, PLATFORM_MEDIA_ARTIFACT_MAX_BYTES + 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("image.png");
+            let (result, _) = run_artifact_pages(
+                &reference,
+                &out,
+                vec![Ok(artifact_page(
+                    &reference,
+                    "med_job1",
+                    &digest,
+                    "image/png",
+                    0,
+                    total,
+                    &bytes[..split],
+                ))],
+            );
+            let error = result.expect_err("an impossible total must refuse");
+            assert_eq!(error.kind(), "rejected", "{total}: {error}");
+            assert!(!out.exists(), "{total}: {error}");
         }
     }
 }
