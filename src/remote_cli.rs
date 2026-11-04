@@ -1971,6 +1971,16 @@ fn settings_sync_files_exact(
         }
 }
 
+/// Seam note (CAD-2096): the receipt validators in this file (`normalized_pin_pair`,
+/// `provider_pin_matches`, `canonical_model_id`, the trim/tri-state field matchers and
+/// `settings_snapshot_document`) deliberately mirror native normalization in
+/// `agent_settings.rs` (`normalize_pin`/`parse_pin_text`, `build_snapshot`) and
+/// `model_defaults::validate_model_id`. The native module owns the rules; this side is
+/// a read-only check of what a hosted tenant says it committed, kept separate so a
+/// malformed or foreign receipt is refused without the hosted wire taking a native
+/// dependency. Update rule: any change to native settings normalization must change
+/// the matching validator here in the same PR, with a receipt test for the old and new
+/// spelling, since a hosted tenant may lag the client.
 /// A settings write answers its operation's own receipt family. The snapshot
 /// document covers the config writes; the nested shapes, the catalogue and
 /// the grant decisions answer their own bounded records. `fleet.check` is a
