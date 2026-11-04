@@ -836,18 +836,113 @@ fn verdict_answer(
 /// countable evidence. A refused or unreadable answer is exit 1 — never the
 /// notes folder on this machine, which would answer an empty list and read as
 /// "nothing was filed".
+///
+/// `include_body` (CAD-2150) is the operator's `--body`: it also asks for each
+/// note's review text. The merge gate never sets it, so its request and the
+/// document it parses are exactly what they were. A board that predates the
+/// field refuses it with [`VERDICT_BODY_UNSUPPORTED`]; the read is then repeated
+/// without it, so the rows still print and `bodies` says the text is not shown.
 pub fn verdicts(
     target: &RemoteTarget,
     wake_timeout: u64,
     binding: &GateBinding,
+    include_body: bool,
 ) -> Result<(Value, i32)> {
-    let body = call(
-        target,
-        wake_timeout,
-        "audit_verdicts_project",
-        binding.arguments(),
-    )?;
-    verdicts_answer(&body, binding)
+    if !include_body {
+        let body = call(
+            target,
+            wake_timeout,
+            "audit_verdicts_project",
+            binding.arguments(),
+        )?;
+        return verdicts_answer(&body, binding);
+    }
+    let mut asked = binding.arguments();
+    asked.insert("include_body".to_string(), json!(true));
+    match call(target, wake_timeout, "audit_verdicts_project", asked) {
+        Ok(body) => verdicts_answer_with_bodies(&body, binding),
+        Err(Error::Structured(s)) if s.code == crate::remote_cli::VERDICT_BODY_UNSUPPORTED => {
+            crate::output::eprint_line(
+                "audit verdicts: this board predates review text, so the findings are not \
+                 shown; the rows below are unchanged",
+            );
+            let body = call(
+                target,
+                wake_timeout,
+                "audit_verdicts_project",
+                binding.arguments(),
+            )?;
+            let (mut doc, code) = verdicts_answer(&body, binding)?;
+            doc["bodies"] = json!("unavailable: the board predates review text");
+            Ok((doc, code))
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Most of one note's review text printed (the board already bounds it; this
+/// is the client's own limit on untrusted input).
+const VERDICT_BODY_PRINT_MAX: usize = 16 * 1024;
+
+/// Board-supplied review text for a terminal: control characters other than
+/// newline and tab, and the bidirectional overrides that can reorder what an
+/// operator reads, become U+FFFD; the length is bounded at a character boundary.
+fn printable_body(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if out.len() + c.len_utf8() > VERDICT_BODY_PRINT_MAX {
+            break;
+        }
+        let bidi = matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        );
+        out.push(if (c.is_control() && c != '\n' && c != '\t') || bidi {
+            '\u{FFFD}'
+        } else {
+            c
+        });
+    }
+    out
+}
+
+/// The validated answer plus each row's review text. The gate's
+/// [`verdict_entry`] builds the row and ignores `body`, so the text can neither
+/// change what a row says nor make a refused row pass; it is attached here, by
+/// position, only for the operator's print. A row without a usable `body` (a
+/// board that ignored the field) simply has none, and `bodies` says so.
+pub(crate) fn verdicts_answer_with_bodies(
+    body: &Value,
+    binding: &GateBinding,
+) -> Result<(Value, i32)> {
+    let (mut doc, code) = verdicts_answer(body, binding)?;
+    if code != 0 {
+        return Ok((doc, code));
+    }
+    let raw = body["verdicts"].as_array().cloned().unwrap_or_default();
+    let mut missing = false;
+    if let Some(rows) = doc["verdicts"].as_array_mut() {
+        for (entry, row) in rows.iter_mut().zip(raw.iter()) {
+            match row.get("body") {
+                Some(Value::String(text)) => {
+                    let shown = printable_body(text);
+                    entry["body_truncated"] = json!(
+                        row["body_truncated"] == json!(true)
+                            || shown.chars().count() < text.chars().count()
+                    );
+                    entry["body"] = json!(shown);
+                }
+                Some(Value::Null) => entry["body"] = Value::Null,
+                _ => missing = true,
+            }
+        }
+    }
+    doc["bodies"] = json!(if missing {
+        "unavailable: the board sent no review text"
+    } else {
+        "included"
+    });
+    Ok((doc, code))
 }
 
 /// The kinds a hosted row may name. `spec` is retired by AOS-473 but a row
@@ -1548,6 +1643,55 @@ mod tests {
                "skipped": [],
                "verdicts": [entry("favcrm/cadence", "standards", "user_a", "alice",
                                   "20261101120000")]})
+    }
+
+    #[test]
+    fn review_text_is_attached_for_the_operator_and_ignored_by_the_gate_reader() {
+        // CAD-2150: the gate's reader never sees `body`; the operator's does,
+        // with terminal control and bidi characters replaced.
+        let mut doc = hosted_doc();
+        doc["verdicts"][0]["body"] = json!("fix A\n\tfix B \u{1b}[31mred\u{202e}x\r");
+        doc["verdicts"][0]["body_truncated"] = json!(false);
+        let (plain, _) = verdicts_answer(&doc, &binding()).unwrap();
+        assert!(plain["verdicts"][0].get("body").is_none());
+        assert!(plain.get("bodies").is_none());
+        let (shown, code) = verdicts_answer_with_bodies(&doc, &binding()).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(shown["bodies"], "included");
+        assert_eq!(
+            shown["verdicts"][0]["body"],
+            "fix A\n\tfix B \u{fffd}[31mred\u{fffd}x\u{fffd}"
+        );
+        assert_eq!(shown["verdicts"][0]["body_truncated"], false);
+        // Every field the gate reads is the same with and without the text.
+        for key in [
+            "name",
+            "reviewer",
+            "outcome",
+            "kind",
+            "risk",
+            "github_login",
+        ] {
+            assert_eq!(
+                shown["verdicts"][0][key], plain["verdicts"][0][key],
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_text_is_bounded_and_a_board_without_it_is_named() {
+        let mut doc = hosted_doc();
+        doc["verdicts"][0]["body"] = json!("é".repeat(VERDICT_BODY_PRINT_MAX));
+        let (shown, _) = verdicts_answer_with_bodies(&doc, &binding()).unwrap();
+        let text = shown["verdicts"][0]["body"].as_str().unwrap();
+        assert!(text.len() <= VERDICT_BODY_PRINT_MAX);
+        assert_eq!(shown["verdicts"][0]["body_truncated"], true);
+        // A board that ignored the field sends no `body`: the rows still print.
+        let (bare, code) = verdicts_answer_with_bodies(&hosted_doc(), &binding()).unwrap();
+        assert_eq!(code, 0);
+        assert!(bare["verdicts"][0].get("body").is_none());
+        assert_eq!(bare["bodies"], "unavailable: the board sent no review text");
     }
 
     #[test]

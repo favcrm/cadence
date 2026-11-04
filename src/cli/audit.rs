@@ -117,6 +117,13 @@ pub(crate) enum AuditAction {
         /// and the project is never inferred from `--repo` or the cwd.
         #[arg(long)]
         project: Option<String>,
+        /// Hosted orgs only (CAD-2150): also print each note's review text as
+        /// `body`, so a REVISE can be read. Never sent by the merge gate and
+        /// never counted; the text is board-supplied, bounded, and printed
+        /// with control characters replaced. A board that predates it still
+        /// answers the rows, with `bodies` saying the text is unavailable.
+        #[arg(long)]
+        body: bool,
     },
     /// Record one reviewer's verdict for exactly this issue, PR and head
     /// (hosted orgs). The board takes the reviewer from the authenticated

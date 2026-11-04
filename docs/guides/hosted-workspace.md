@@ -640,7 +640,14 @@ Read them back under the same org with `cadence --org acme audit verdicts
 --project <project-key> --repo <owner/name> --issue <issue-id> --pr <number>
 --head <full-sha>`; a hosted selection answers from the org, never from local
 notes, and refuses an answer naming another project, repository, issue or
-head. The merge gate also runs whichever `cadence` you point it at: set
+head. Add `--body` to also print each note's findings as `body` (with
+`body_truncated`), which is how a `REVISE` is read; the gate never passes it and
+the text never decides a count. The text is the reviewer's, so control
+characters and bidirectional overrides print as U+FFFD, and it is bounded
+(16 KiB per note on the board). A board that predates the field still answers
+the rows, prints a line on stderr, and marks `bodies: "unavailable: …"`; local
+orgs refuse `--body` because their notes are files you can open. The merge
+gate also runs whichever `cadence` you point it at: set
 `CADENCE_BIN` when more than one build is on the host, or a stale client's
 missing hosted verb will read like a gate refusal.
 

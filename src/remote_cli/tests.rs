@@ -3013,6 +3013,37 @@ fn cad2009_project_mutation_capability_failure_remains_unknown() {
     assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
 }
 
+/// CAD-2150: a board that predates `include_body` refuses the field as an
+/// invalid request. Only a request that asked for the text gets the typed
+/// code, so the caller can re-read without it; the plain read keeps the
+/// release-order refusal.
+#[test]
+fn cad2150_board_without_review_text_gets_a_typed_refusal_only_when_asked() {
+    let refused = json!({"ok": false, "error": {"code": "invalid_request"}});
+    let mut asked = json!({"project": "synthetic"}).as_object().unwrap().clone();
+    asked.insert("include_body".to_string(), json!(true));
+    let (result, _) = run(
+        vec![(400, "", refused.clone())],
+        "audit_verdicts_project",
+        asked,
+        10,
+    );
+    match result.unwrap_err() {
+        crate::error::Error::Structured(s) => {
+            assert_eq!(s.code, super::VERDICT_BODY_UNSUPPORTED);
+        }
+        other => panic!("expected the typed code, got {other}"),
+    }
+    let plain = json!({"project": "synthetic"}).as_object().unwrap().clone();
+    let (result, _) = run(
+        vec![(400, "", refused)],
+        "audit_verdicts_project",
+        plain,
+        10,
+    );
+    assert!(result.unwrap_err().to_string().contains("Release order"));
+}
+
 /// CAD-2001: a tenant that cannot serve a project-scoped *read* (503
 /// capability_unavailable) is a release-order refusal — never "no evidence"
 /// and never a fallback to the older repo-scoped verb. The matching write

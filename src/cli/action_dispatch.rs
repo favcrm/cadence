@@ -563,6 +563,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     notes_dir,
                     repo,
                     project,
+                    body,
                 }),
             ..
         } => Some((
@@ -572,12 +573,17 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             repo.clone(),
             project.clone(),
             notes_dir.clone(),
+            *body,
         )),
         _ => None,
     };
-    if let Some((issue, pr, head, repo, project, notes_dir)) = verdict_args {
+    if let Some((issue, pr, head, repo, project, notes_dir, body)) = verdict_args {
         let tracker = tracker_pin()?;
         return match org::route(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
+            org::Routed::Local if body => Err(Error::usage(
+                "--body reads a hosted org's review text; a local read has the note files \
+                 themselves. Nothing was read",
+            )),
             org::Routed::Local => audit::verdicts(
                 &issue,
                 pr,

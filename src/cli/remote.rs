@@ -3040,6 +3040,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                     head,
                     repo,
                     project,
+                    body,
                     ..
                 }),
             ..
@@ -3050,6 +3051,7 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                 target,
                 wake_timeout,
                 &binding(project, &repo, issue, *pr, &head)?,
+                *body,
             )?)
         }
         Commands::Audit {
