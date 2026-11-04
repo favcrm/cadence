@@ -24,6 +24,7 @@ interface World {
   contexts: any[];
   origin: { unsubscribe_origin: string | null; stored: boolean };
   posts: { path: string; body: any }[];
+  failConnectionsOnce?: boolean;
 }
 
 const smtpRow = (id: string, over: any = {}) => ({
@@ -78,7 +79,12 @@ async function mount(world: World, viewer = { operator: true, readOnly: false },
       case "GET /api/app-installations":
         return json(world.installations ?? [{ install_id: "install-crm", name: "crm", title: "CRM", smtp_custody: true }, { install_id: "install-social", name: "social-content", title: "Social" }]);
       case "GET /api/app-installations/install-crm/contexts": return json({ contexts: world.contexts });
-      case "GET /api/connections": return json({ connections: world.connections });
+      case "GET /api/connections":
+        if (world.failConnectionsOnce) {
+          world.failConnectionsOnce = false;
+          return json({ error: "connections are unavailable" }, 503);
+        }
+        return json({ connections: world.connections });
       case "POST /api/crm-smtp/show": {
         const found = world.bindings && Object.hasOwn(world.bindings, body.context_id)
           ? world.bindings[body.context_id]
@@ -312,6 +318,14 @@ async function main() {
     await m.open("Unsubscribe links");
     await m.settle(() => assert(m.host.textContent!.includes("Every email"), "origin visible"));
     assert(!m.button("Save") && !m.host.querySelector("#email-origin"), "no origin write controls");
+    await m.unmount();
+  }
+  // A failed read offers Retry, and Retry recovers.
+  {
+    const m = await mount(fresh({ failConnectionsOnce: true }));
+    await m.settle(() => assert(m.button("Retry"), "a failed read offers Retry"));
+    await m.click(m.button("Retry"));
+    await m.settle(() => assert(m.rowFor("CRM · Acme"), "Retry loads the page"));
     await m.unmount();
   }
   // A hosted board's links always use its own address: there is no setting to show.

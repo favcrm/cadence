@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { resources } from "../../lib/resources";
 import { useTranslate } from "../../lib/locale";
 import Link from "../../ui/Link";
+import { ResourceGate } from "../../ui/ResourceStatus";
 import { useMaybeResource } from "../../lib/useResource";
 import { connectionsNeedingAttention } from "./connectionsView";
 
@@ -41,6 +42,21 @@ export default function HostedStatus({
             </small>
           </span>
         </div>
+        {listRes && list && !rows && (
+          <div className="settings-row">
+            <span className="settings-row-text">
+              <b>{t("Connections")}</b>
+              <small>
+                <ResourceGate
+                  state={list}
+                  loading="loading connections…"
+                  failed="could not load connections"
+                  onRetry={() => void listRes.refresh()}
+                />
+              </small>
+            </span>
+          </div>
+        )}
         {rows && (
           <Link href="/settings/connections" className="settings-row">
             <span className="settings-row-text">

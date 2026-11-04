@@ -9,6 +9,7 @@ type Scope = "user" | "organization";
 type Preferences = { organization_locale: Locale | null; user_locale: Locale | null };
 
 const zhTW: Record<string, string> = {
+  "This account is managed through its own sign-in. To change it, connect it again from Add.": "此帳戶透過其自身登入管理。如需更改，請從「新增」重新連接。",
   "1 account": "1 個帳戶",
   "approved for this board": "已獲准用於此看板",
   "Could not confirm the connection was added. Check your connections before retrying.": "無法確認連線已新增。請先檢查連線，再重試。",

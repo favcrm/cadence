@@ -44,7 +44,7 @@ export function pinWord(status: Pick<Connection["status"], "manifest_status">): 
 /**
  * Can apps actually use this account? The same rule the daemon applies when it
  * binds one, so a row never looks healthy while apps are refused. A hosted board
- * reports its accounts as `approved`, which is its own form of matched.
+ * reports its own email accounts as `approved`, which is its form of matched.
  */
 export function connectionNeedsAttention(row: Connection): boolean {
   if (row.kind !== "enrolled") return false;

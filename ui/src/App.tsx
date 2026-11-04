@@ -1498,7 +1498,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             )}
             {route.section === "models" && <ModelDefaults />}
             {route.section === "connections" && (
-              <Connections viewer={viewer} page={route.page} />
+              <Connections viewer={viewer} page={route.page} hostedBoard={Boolean(meta?.settings_sections)} />
             )}
             {route.section === "email" && <EmailSending viewer={viewer} fixedUnsubscribeAddress={Boolean(meta?.settings_sections)} />}
             {route.section === "templates" && <Templates />}

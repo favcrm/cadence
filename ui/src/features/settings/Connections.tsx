@@ -185,7 +185,10 @@ const emptyGate = {
 export default function Connections({
   viewer,
   page,
+  hostedBoard = false,
 }: {
+  /** A hosted board manages keys for you, and only serves the actions it can do. */
+  hostedBoard?: boolean;
   viewer: {
     operator: boolean | null;
     readOnly: boolean;
@@ -200,7 +203,7 @@ export default function Connections({
   // Unknown access grants nothing on any Connections route. Reuse the
   // index's checking/unavailable state until the bounded proof answers.
   if (viewer.operator === null) {
-    return <ConnectionsIndex viewer={viewer} canWrite={false} />;
+    return <ConnectionsIndex viewer={viewer} canWrite={false} hostedBoard={hostedBoard} />;
   }
   const provenViewer = { ...viewer, operator: viewer.operator };
   if (page?.kind === "add" || page?.kind === "addProvider") {
@@ -209,9 +212,9 @@ export default function Connections({
   if (page?.kind === "detail") {
     // Keyed to the id: an id change remounts the page so a stale
     // per-mount `answered` flag can never carry the proof across ids.
-    return <ConnectionsDetail key={page.id} viewer={provenViewer} canWrite={canWrite} id={page.id} />;
+    return <ConnectionsDetail key={page.id} viewer={provenViewer} canWrite={canWrite} id={page.id} hostedBoard={hostedBoard} />;
   }
-  return <ConnectionsIndex viewer={viewer} canWrite={canWrite} />;
+  return <ConnectionsIndex viewer={viewer} canWrite={canWrite} hostedBoard={hostedBoard} />;
 }
 
 /**
@@ -298,7 +301,9 @@ export function CustodyStatusPanel({ canWrite }: { canWrite: boolean }) {
 function ConnectionsIndex({
   viewer,
   canWrite,
+  hostedBoard,
 }: {
+  hostedBoard: boolean;
   viewer: {
     operator: boolean | null;
     readOnly: boolean;
@@ -364,9 +369,11 @@ function ConnectionsIndex({
         <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
       ) : (
         <>
-          <div className="mb-3">
-            <RecentCredentialRequestList />
-          </div>
+          {!hostedBoard && (
+            <div className="mb-3">
+              <RecentCredentialRequestList />
+            </div>
+          )}
           <ResourceGate
             state={listState ?? emptyGate}
             loading="loading connections…"
@@ -427,6 +434,7 @@ function ConnectionsIndex({
                 capabilities={connectionCapabilities(providers, open.provider)}
                 canWrite={canWrite}
                 standalone
+                hostedBoard={hostedBoard}
                 providerMetaPending={
                   !providers.some((item) => item.provider === open.provider) &&
                   providersState?.status !== "ok" &&
@@ -676,7 +684,9 @@ function ConnectionsDetail({
   viewer,
   canWrite,
   id,
+  hostedBoard,
 }: {
+  hostedBoard: boolean;
   viewer: { operator: boolean; readOnly: boolean };
   canWrite: boolean;
   id: string;
@@ -780,6 +790,7 @@ function ConnectionsDetail({
                 canWrite={canWrite}
                 standalone
                 providerMetaPending={providerUnknown}
+                hostedBoard={hostedBoard}
                 onChanged={refresh}
                 onRevoked={() => {
                   refresh();
@@ -813,6 +824,7 @@ export function ConnectionDetail({
   canWrite,
   standalone = false,
   providerMetaPending = false,
+  hostedBoard = false,
   onChanged,
   onRevoked,
 }: {
@@ -820,6 +832,8 @@ export function ConnectionDetail({
   provider?: ConnectionProvider | null;
   capabilities: string | null;
   canWrite: boolean;
+  /** Only what this board serves: its own email accounts can be updated or removed. */
+  hostedBoard?: boolean;
   /** Standalone page: the card owns the heading; skip the inner title. */
   standalone?: boolean;
   /** Provider metadata is still loading or failed — its absence is not
@@ -1128,7 +1142,32 @@ export function ConnectionDetail({
           {t(verifyNote.text)}
         </p>
       )}
-      {canWrite && (
+      {canWrite && hostedBoard && !isSmtpSender(row) && (
+        <p className="text-label text-ink-400 mt-3">
+          {t("This account is managed through its own sign-in. To change it, connect it again from Add.")}
+        </p>
+      )}
+      {canWrite && hostedBoard && isSmtpSender(row) && (
+        <div className="flex flex-wrap items-center gap-2 mt-3">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              setRevoking(false);
+              setRotating((v) => !v);
+            }}
+          >{t("Update credentials…")}</Button>
+          <Button
+            variant="danger"
+            size="sm"
+            onClick={() => {
+              setRotating(false);
+              setRevoking((v) => !v);
+            }}
+          >{t("Disconnect…")}</Button>
+        </div>
+      )}
+      {canWrite && !hostedBoard && (
         <div className="flex flex-wrap items-center gap-2 mt-3">
           <Button variant="secondary" size="sm" onClick={check} loading={checking}>
             {checking ? t("Checking…") : t("Check configuration")}
@@ -1180,7 +1219,7 @@ export function ConnectionDetail({
       {!canWrite && managed && (
         <p className="text-micro text-ink-500 mt-2">{t("Updating credentials and disconnecting are the operator's on an editable board.")}</p>
       )}
-      {managed && rotating && !entryRequired && (
+      {managed && rotating && (hostedBoard || !entryRequired) && (
         <RotateForm row={row} onDone={onChanged} onClose={() => setRotating(false)} />
       )}
       {managed && revoking && (

@@ -103,6 +103,9 @@ export default function EmailSending({
   const [rows, setRows] = useState<Connection[] | null>(null);
   const [hostedSmtp, setHostedSmtp] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  // One drawer at a time: rows stay reachable by keyboard behind an open one.
+  const [openRow, setOpenRow] = useState<string | null>(null);
 
   useEffect(() => {
     // CAD-1193: unresolved role (null) waits; only a proven operator
@@ -122,7 +125,7 @@ export default function EmailSending({
       },
     );
     return () => controller.abort();
-  }, [viewer.operator]);
+  }, [viewer.operator, attempt]);
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="email-sending-title">
@@ -144,8 +147,15 @@ export default function EmailSending({
       ) : !viewer.operator ? (
         <PageState title={t("Operator access required")}>{t("Email sending is available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
       ) : error !== null ? (
-        <p className="text-label text-fail" role="alert">
+        <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert">
           {error}
+          <Button
+            size="sm"
+            onClick={() => {
+              setError(null);
+              setAttempt((n) => n + 1);
+            }}
+          >{t("Retry")}</Button>
         </p>
       ) : targets === null || rows === null ? (
         <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
@@ -159,13 +169,23 @@ export default function EmailSending({
             {targets.map((target) => (
               <SenderRow
                 key={`${target.scope.installId}:${target.scope.contextId}`}
+                open={openRow === `${target.scope.installId}:${target.scope.contextId}`}
+                onOpen={() => setOpenRow(`${target.scope.installId}:${target.scope.contextId}`)}
+                onClose={() => setOpenRow(null)}
                 target={target}
                 rows={rows}
                 hostedSmtp={hostedSmtp}
                 viewer={viewer}
               />
             ))}
-            {!fixedUnsubscribeAddress && <OriginRow viewer={viewer} />}
+            {!fixedUnsubscribeAddress && (
+              <OriginRow
+                viewer={viewer}
+                open={openRow === "origin"}
+                onOpen={() => setOpenRow("origin")}
+                onClose={() => setOpenRow(null)}
+              />
+            )}
           </div>
         </div>
       )}
@@ -174,14 +194,16 @@ export default function EmailSending({
 }
 
 /** One app: which account it sends from. The choice lives in the drawer. */
-function SenderRow({ target, rows, hostedSmtp, viewer }: {
+function SenderRow({ target, rows, hostedSmtp, viewer, open, onOpen, onClose }: {
+  open: boolean;
+  onOpen: () => void;
+  onClose: () => void;
   target: Target;
   rows: Connection[];
   hostedSmtp: boolean;
   viewer: Viewer;
 }) {
   const t = useTranslate();
-  const [open, setOpen] = useState(false);
   const [binding, setBinding] = useState<SmtpBinding | null | undefined>(undefined);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
@@ -207,7 +229,7 @@ function SenderRow({ target, rows, hostedSmtp, viewer }: {
         : live ?? t("The chosen sender needs re-checking");
   return (
     <>
-      <button type="button" className="settings-row" onClick={() => setOpen(true)}>
+      <button type="button" className="settings-row" onClick={onOpen}>
         <span className="settings-row-text">
           <b>{target.label}</b>
           <small>{line}</small>
@@ -215,7 +237,7 @@ function SenderRow({ target, rows, hostedSmtp, viewer }: {
         {binding && live === null && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
       </button>
       {open && (
-        <SettingsDrawer title={target.label} onClose={() => setOpen(false)}>
+        <SettingsDrawer title={target.label} onClose={onClose}>
           <SenderCard target={target} rows={rows} hostedSmtp={hostedSmtp} viewer={viewer} />
         </SettingsDrawer>
       )}
@@ -224,9 +246,13 @@ function SenderRow({ target, rows, hostedSmtp, viewer }: {
 }
 
 /** Where unsubscribe links point. Set here only to override the default. */
-function OriginRow({ viewer }: { viewer: Viewer }) {
+function OriginRow({ viewer, open, onOpen, onClose }: {
+  viewer: Viewer;
+  open: boolean;
+  onOpen: () => void;
+  onClose: () => void;
+}) {
   const t = useTranslate();
-  const [open, setOpen] = useState(false);
   const [origin, setOrigin] = useState<string | null | undefined>(undefined);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
@@ -238,7 +264,7 @@ function OriginRow({ viewer }: { viewer: Viewer }) {
   }, [open]);
   return (
     <>
-      <button type="button" className="settings-row" onClick={() => setOpen(true)}>
+      <button type="button" className="settings-row" onClick={onOpen}>
         <span className="settings-row-text">
           <b>{t("Unsubscribe links")}</b>
           <small>{failed ? t("Couldn't read the address") : origin === undefined ? t("Reading…") : origin ?? t("Not set")}</small>
@@ -246,7 +272,7 @@ function OriginRow({ viewer }: { viewer: Viewer }) {
         {origin === null && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
       </button>
       {open && (
-        <SettingsDrawer title={t("Unsubscribe links")} onClose={() => setOpen(false)}>
+        <SettingsDrawer title={t("Unsubscribe links")} onClose={onClose}>
           <OriginCard viewer={viewer} />
         </SettingsDrawer>
       )}
@@ -511,7 +537,10 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
     // Re-read after writing: only the read says what is now stored, on every board.
     void Promise.resolve()
       .then(() => sendClient.sendOriginSet(value))
-      .then(() => sendClient.sendOriginShow())
+      .then(() =>
+        // The write landed. A failed read mustn't report it as failed or show the old value.
+        sendClient.sendOriginShow().catch(() => ({ unsubscribe_origin: value, stored: value !== null })),
+      )
       .then((shown) => {
         const receipt = apply(shown);
         setNote(

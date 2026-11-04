@@ -584,6 +584,22 @@ async function main() {
     assert(!text6().includes("Login verified"), "no simulated success ships");
   });
 
+  // A hosted board offers only what it serves. Its email accounts can be updated or
+  // removed; there's no local check or secure entry, and a sign-in account has neither.
+  act(() => {
+    root6.render(React.createElement(ConnectionsPage, {
+      viewer: { operator: true, readOnly: false },
+      page: { kind: "detail", id: "c-smtp" },
+      hostedBoard: true,
+    }));
+  });
+  await settle(() => {
+    assert(text6().includes("Update credentials"), "hosted email account can be updated");
+    assert(text6().includes("Disconnect"), "hosted email account can be removed");
+    assert(!text6().includes("Check configuration"), "no local check on a hosted board");
+    assert(!text6().includes("secure entry"), "no secure entry on a hosted board");
+  });
+
   // The built-in Local outbox detail has NO edit/disconnect actions.
   act(() => {
     root6.render(React.createElement(ConnectionsPage, {
