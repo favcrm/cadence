@@ -42,6 +42,7 @@ function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): A
   // conflict, so collapsing it would strand the panel in an unusable state.
   if (operation?.startsWith("campaign-work.") && status === 409 && error instanceof ApiError && error.code === "stale_revision")
     return { code: "stale_revision", text: "These campaign work details changed. Reload them before saving again." };
+  if (operation === "sends.approve" && error instanceof ApiError && error.code === "no_recipients") return { code: "no_recipients", text: "No one in this audience can be emailed." };
   const code = ({ 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict", 503: "unavailable" } as Record<number, string>)[status] ?? "failed";
   return { code, text: status === 401 || status === 403 ? "This app's access is no longer available." : status === 409 ? "That changed. Refresh before trying again." : "Cadence refused this request. Inspect fresh status before retrying an effect." };
 }
@@ -119,7 +120,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
         const card = recordCard(operation, facts, object(raw.card.live) ? raw.card.live : undefined);
         let used = false;
         const expires = Date.now() + 60000;
-        return { label: "Confirm", records: true, recordCard: card, run: async input => {
+        return { label: card.confirm ?? "Confirm", records: true, recordCard: card, run: async input => {
           if (used || !current() || Date.now() >= expires) return { ok: false, refusal: { code: "expired", text: "This confirmation has expired." } };
           used = true; // Never retry a confirmation, including an uncertain network outcome.
           try {
@@ -154,6 +155,56 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
   };
 }
 
+/** The subject as an owner reads it: the merge tag shows as "{first name}", never its fallback. */
+const plainSubject = (subject: string) => subject.replace(/\{\{\s*first_name\s*(?:\|[^}]*)?\}\}/g, "{first name}");
+
+/**
+ * CAD-2146: send approval, content approval and test send in plain words, the
+ * values an owner decides on first and the ids, digests and revisions collapsed.
+ * Native and hosted prepare replies carry different facts, so every row is
+ * optional except what recordCard already requires; a missing fact is omitted.
+ */
+const PLAIN_RETRY = "If the result is unclear, check its status before trying again.";
+function plainCard(operation: "sends.approve" | "content.approve" | "smtp.test-send", facts: ActionArgs, content: ActionArgs, freeze: ActionArgs | null): RecordCard {
+  const facts_: RecordCard["facts"] = [], details: NonNullable<RecordCard["details"]> = [];
+  const add = (rows: { label: string; value: string }[], label: string, value: unknown) => { if (value !== undefined && value !== null && value !== "") rows.push({ label, value: typeof value === "object" ? JSON.stringify(value) : String(value) }); };
+  const subject = typeof facts.subject === "string" ? facts.subject : typeof content.subject === "string" ? content.subject : undefined;
+  const outer = object(facts.binding) ? facts.binding : null;
+  const binding = outer && object(outer.binding) ? outer.binding : outer;
+  const sender = binding && object(binding.sender) ? binding.sender : object(facts.sender) ? facts.sender : null;
+  const address = sender && typeof sender.address === "string" ? sender.address : undefined;
+  const from = address ? (typeof sender?.name === "string" && sender.name ? `${sender.name} <${address}>` : address) : undefined;
+  const bindingDetails = () => { if (binding) for (const [label, key] of [["SMTP connection", "connection_id"], ["Binding revision", "link_revision"], ["Binding state", "state"], ["Binding digest", "digest"]]) add(details, label, binding[key]); };
+  if (subject !== undefined) add(facts_, operation === "content.approve" ? "Subject" : "Email", plainSubject(subject));
+  if (operation === "content.approve") {
+    add(facts_, "Version", content.revision ?? facts.revision);
+    add(details, "Campaign", content.campaign_id ?? facts.campaign_id); add(details, "Name", content.name); add(details, "Content digest", content.content_digest ?? facts.content_digest);
+    return { operation, title: "Approve this email?", note: "Nothing is sent yet.", retry: PLAIN_RETRY, confirm: "Approve", facts: facts_, details };
+  }
+  if (operation === "smtp.test-send") {
+    add(facts_, "From", from);
+    add(details, "Version", content.revision); add(details, "Name", content.name);
+    add(details, "Campaign", content.campaign_id ?? facts.campaign_id); bindingDetails();
+    return { operation, title: "Send one test email?", note: "Sends this email to one address.", retry: PLAIN_RETRY, confirm: "Send test", facts: facts_, details, input: { field: "to_email", label: "Send to" } };
+  }
+  const count = Number(freeze?.final_count), people = `${count.toLocaleString("en")} ${count === 1 ? "person" : "people"}`;
+  const base = freeze && object(freeze.base) ? freeze.base : null;
+  const excluded = freeze?.exclusion_list_id !== undefined && freeze?.exclusion_list_id !== null;
+  let audience: string | undefined;
+  if (base?.mode === "all") audience = excluded ? "Everyone who can be emailed, except an exclusion list" : "Everyone who can be emailed";
+  else if (base?.mode === "segment") audience = typeof base.segment_name === "string" && base.segment_name ? base.segment_name : "A saved segment";
+  else if (base?.mode === "custom") {
+    const chosen = Array.isArray(base.customer_ids) ? base.customer_ids.length : base.customer_count;
+    if (typeof chosen === "number" && Number.isSafeInteger(chosen)) audience = chosen === 1 ? "1 chosen customer" : `${chosen.toLocaleString("en")} chosen customers`;
+  }
+  if (audience && excluded && base?.mode !== "all") audience += ", except an exclusion list";
+  add(facts_, "Audience", audience); facts_.push({ label: "Recipients", value: count.toLocaleString("en"), strong: true }); add(facts_, "From", from);
+  add(details, "Send", facts.send_id); add(details, "State", facts.state); add(details, "Campaign", facts.campaign_id); add(details, "Content version", facts.content_revision); add(details, "Content digest", facts.content_digest);
+  add(details, "Send digest", facts.send_digest); add(details, "Audience id", freeze?.freeze_id); add(details, "Segment", base?.mode === "segment" ? base.segment_id : undefined); add(details, "Exclusion list", freeze?.exclusion_list_id); add(details, "Audience digest", freeze?.digest); add(details, "Recipient limit", freeze?.max_recipients);
+  bindingDetails(); add(details, "Unsubscribe origin", facts.unsubscribe_origin);
+  return { operation, title: `Send to ${people}?`, note: "This can't be undone.", retry: PLAIN_RETRY, confirm: `Send to ${people}`, facts: facts_, details };
+}
+
 function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionArgs): RecordCard {
   const rows: RecordCard["facts"] = [];
   const show = (label: string, value: unknown) => { if (value !== undefined && value !== null) rows.push({ label, value: typeof value === "object" ? JSON.stringify(value) : String(value) }); };
@@ -165,7 +216,9 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
   const audience = object(facts.audience) ? facts.audience : null;
   const freeze = audience && object(audience.freeze) ? audience.freeze : null;
   if (freeze) { show("Audience", freeze.freeze_id); show("Recipients", freeze.final_count); show("Recipient ceiling", freeze.max_recipients); show("Audience digest", freeze.digest); }
-  if (operation === "sends.approve" && (!freeze || !Number.isSafeInteger(freeze.final_count) || typeof facts.content_revision !== "number" || typeof facts.send_digest !== "string")) throw new ApiError("Incomplete frozen send facts", 502);
+  if (operation === "sends.approve" && freeze?.final_count === 0) throw new ApiError("No recipients", 400, { code: "no_recipients" });
+  if (operation === "sends.approve" && (!freeze || !Number.isSafeInteger(freeze.final_count) || Number(freeze.final_count) < 1 || typeof facts.content_revision !== "number" || typeof facts.send_digest !== "string")) throw new ApiError("Incomplete frozen send facts", 502);
+  if (operation === "sends.approve" || operation === "content.approve" || operation === "smtp.test-send") return plainCard(operation, facts, content, freeze);
   show("Frozen send digest", facts.send_digest);
   const outer = object(facts.binding) ? facts.binding : null;
   const binding = outer && object(outer.binding) ? outer.binding : outer;
@@ -243,7 +296,6 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
   const card: RecordCard = { operation, facts: rows };
   if (operation === "works.review") card.input = { field: "choice", label: "Your decision on this exact revision", choices: [{ value: "approve", label: "Approve this revision" }, { value: "changes", label: "Request changes" }] };
   if (operation === "works.export") card.input = { field: "choice", label: "Export format for this approved revision", choices: [{ value: "html", label: "HTML" }, { value: "markdown", label: "Markdown" }] };
-  if (operation === "smtp.test-send") card.input = { field: "to_email", label: "Test recipient (one email address)" };
   if (operation === "sends.resolve") card.input = { field: "resolution", label: "Resolve uncertain outcome — this does not resend", choices: [{ value: "accepted", label: "Accepted by the server" }, { value: "failed", label: "Failed" }] };
   if (operation === "origin.manage") card.input = { field: "unsubscribe_origin", label: "Daemon-global unsubscribe origin (blank clears it)", value: typeof facts.unsubscribe_origin === "string" ? facts.unsubscribe_origin : "" };
   if (operation === "chat.campaign.brief") { show("Effect", facts.effect); card.input = { field: "brief", label: "Send this brief to the assistant", value: typeof facts.brief === "string" ? facts.brief : "" }; }
