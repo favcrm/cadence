@@ -454,6 +454,12 @@ jobs:
         run: node --test ../scripts/app-dev/*.test.mjs
       - run: bun run build
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
+      # CAD-2084: compile the UI tests under the nightly's CommonJS config so a
+      # test that does not compile fails the PR. Compile only; the tests run
+      # nightly.
+      - name: Compile UI tests
+        if: ${{ needs.change-scope.outputs.ui != 'false' }}
+        run: bunx tsrs -p tsconfig.tests.json --outDir "$RUNNER_TEMP/ui-tests"
       # CAD-1850: consumers vendor exact, committed runtime bytes and hashes.
       # Check the canonical source and deterministic output in this same gate.
       - name: Hosted runtime package checks
