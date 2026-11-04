@@ -298,10 +298,12 @@ const RECONCILE_ISSUE_COMMENT: &str = "the comment may or may not have been reco
 const RECONCILE_ISSUE_SET: &str = "the edit may or may not have been applied — read `issue show` for the same issue (a new rev proves it) before repeating it";
 const RECONCILE_ISSUE_ATTACH: &str = "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it";
 const RECONCILE_ISSUE_REVIEW: &str = "the verdict may or may not have been recorded — read the same issue before repeating it; a reviewer holds one verdict per revision";
-const RECONCILE_ISSUE_MESSAGE_SEND: &str = "the message may or may not have been stored — repeat `issue say` with the same \
+const RECONCILE_ISSUE_MESSAGE_SEND: &str =
+    "the message may or may not have been stored — repeat `issue say` with the same \
     --message, --to, --from and text: an identical retry reports `duplicate` and stores \
     nothing new, and any difference is refused as a conflict";
-const RECONCILE_ISSUE_MESSAGES_READ: &str = "the read point may or may not have moved — repeating the same call is safe, because \
+const RECONCILE_ISSUE_MESSAGES_READ: &str =
+    "the read point may or may not have moved — repeating the same call is safe, because \
     it only moves forward";
 const RECONCILE_PROJECT_POLICY: &str = "the recorded policy may or may not have been written — read the project's recorded policy again before repeating it";
 const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been registered — read `issue project ls` with the same explicit --org before repeating it; the same key, name and prefix is the same project";
@@ -5148,7 +5150,7 @@ fn call_verb_until_retry(
         {
             return Err(Error::unknown(format!(
                 "the remote answered without a matching receipt — {}",
-                lost_mutation_note(verb)
+                mutation_reconcile(verb).unwrap_or(RECONCILE_UNKNOWN)
             )));
         }
         if verb == "issue_attach" && (200..300).contains(&status) {
