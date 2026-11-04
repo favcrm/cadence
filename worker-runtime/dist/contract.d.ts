@@ -150,6 +150,8 @@ export interface RuntimeTools {
  *   personal address or preferences.
  * - `company_agent` is one company agent's identity and job, not a tool grant
  *   or the member's private profile.
+ * - `agent_profile` is an external session's profile context, not an
+ *   authenticated agent, tool grant or the member's private profile.
  */
 export type AssistantIdentityContext = {
     readonly scope: "personal";
@@ -182,6 +184,15 @@ export type AssistantIdentityContext = {
         /** Plain text, trimmed, 1–2000 characters; only newline controls allowed. */
         readonly responsibilities: string;
         readonly revision: string;
+    };
+} | {
+    readonly scope: "agent_profile";
+    readonly profile: {
+        readonly name: string;
+        readonly role: string;
+        readonly instructions: string;
+        readonly skills: readonly string[];
+        readonly revision: number;
     };
 };
 /**

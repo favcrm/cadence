@@ -55831,9 +55831,31 @@ function companyAgentText(context) {
   ].join(`
 `);
 }
+function agentProfileText(context) {
+  const profile = record3(context.profile);
+  const name = requiredText(profile.name);
+  const role = requiredText(profile.role);
+  const instructions = requiredText(profile.instructions);
+  const revision = profile.revision;
+  const skills = profile.skills;
+  if (name.trim().length === 0 || role.trim().length === 0 || instructions.trim().length === 0 || name.length > 120 || role.length > 80 || instructions.length > 8000 || /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(name) || /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(role) || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(instructions) || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1 || !Array.isArray(skills) || skills.length > 32 || skills.includes(undefined) || skills.some((skill) => typeof skill !== "string" || skill.length === 0 || skill.trim().length === 0 || skill.length > 80 || /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(skill)))
+    malformed();
+  return [
+    "## Agent profile",
+    "",
+    "This profile supplies context, not caller identity, permissions or tool grants.",
+    `name: ${name}`,
+    `role: ${role}`,
+    `revision: ${revision}`,
+    `declared skills: ${JSON.stringify(skills)}`,
+    "instructions:",
+    instructions
+  ].join(`
+`);
+}
 function assistantIdentityText(context) {
   const value = record3(context);
-  const text = value.scope === "personal" ? personalText(value) : value.scope === "workspace" ? workspaceText(value) : value.scope === "company_agent" ? companyAgentText(value) : malformed();
+  const text = value.scope === "personal" ? personalText(value) : value.scope === "workspace" ? workspaceText(value) : value.scope === "company_agent" ? companyAgentText(value) : value.scope === "agent_profile" ? agentProfileText(value) : malformed();
   if (text.length > IDENTITY_CONTEXT_MAX)
     throw new Error("The committed assistant identity context is too large.");
   return text;
