@@ -167,6 +167,18 @@ HUMAN_EXACT = {
     "crates/cadence-core/src/delivery_requirements.rs",
     "crates/cadence-core/src/delivery_rules.rs",
     "src/daemon/delivery_requirements_rpc.rs",
+    # CAD-2117: what feeds or enforces the classification: the policy that
+    # picks the lean classes, the crate root (it can `#[path]` a module), the
+    # hosted evaluator entry, and the unattended-landing gate.
+    "crates/cadence-core/src/delivery.rs",
+    "crates/cadence-core/src/lib.rs",
+    "crates/cadence-core/src/evaluate.rs",
+    "src/daemon/unattended_landing.rs",
+    # Module roots that can redirect `delivery_requirements` (`#[path]` or an
+    # inline module), the hosted wrapper of `evaluate`, and the approve route.
+    # A floor, not a complete list.
+    "src/issue/mod.rs", "src/lib.rs",
+    "crates/cadence-core/src/wasm.rs", "src/daemon/delivery_rpc.rs",
     "docs/AUDIT.md", "tests/safety_floor.rs",
 }
 
@@ -327,6 +339,15 @@ def pr_changes(pr, head, base, base_oid, main_tip=None):
     # CAD-2117: `git merge-base` alone picks one of several best common ancestors
     # (a criss-cross merge), and the diff from the wrong one can hide a restored
     # file. More than one is refused: nothing here can say which is the right base.
+    # CAD-2117: a shallow checkout can cut the history short, so `merge-base --all`
+    # may see one base where there are several. Refused, and so is an unreadable
+    # answer. A partial clone (blob:none, tree:0) keeps full history and passes.
+    rc, shallow, err = run(["git", "rev-parse", "--is-shallow-repository"])
+    if rc != 0 or shallow.strip() not in ("true", "false"):
+        raise RuntimeError(f"cannot tell whether this checkout is shallow: {err.strip() or shallow.strip()!r} (fail closed)")
+    if shallow.strip() == "true":
+        raise RuntimeError("this checkout is shallow, so the merge bases may be hidden and the changed set "
+                           "ambiguous; run `git fetch --unshallow` and retry (fail closed)")
     rc, mbs, err = run(["git", "merge-base", "--all", anchor, head])
     bases = mbs.split()
     if rc != 0 or not bases or not all(FULL_SHA.fullmatch(b) for b in bases):
