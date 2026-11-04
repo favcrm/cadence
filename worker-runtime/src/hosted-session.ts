@@ -34,6 +34,7 @@ import {
   readGenerationIdentity,
   readHeldSubmission,
   readSubmissionEntry,
+  readSubmissionRequestId,
   type HeldSubmission,
   type TaskSql,
 } from "./identity.ts";
@@ -55,6 +56,7 @@ import {
 import {
   OperationScopes,
   parseEntryAppScope,
+  parseEntryOperationId,
   type EngineEvidence,
   type OperationEnvelope,
   type OperationScopeSql,
@@ -132,7 +134,10 @@ export class HostedSession<
       ctx.storage.sql as unknown as OperationScopeSql,
     );
     const acceptsImages = options.acceptsToolImages === true;
-    const model = defaultModel(options.modelAlias, acceptsImages);
+    const model = defaultModel(
+      options.modelAlias,
+      acceptsImages || options.attachedImages !== undefined,
+    );
     const authority: ToolAuthority = {
       toolRefusal: (name) => options.toolRefusal(name),
       authorizeTool: (name) => options.authorizeTool(name),
@@ -177,6 +182,15 @@ export class HostedSession<
       operationContextExtension(
         (root) => this.operationAppScope(root),
         operationMessages,
+        options.attachedImages === undefined
+          ? undefined
+          : (roots, app, signal) => {
+              const operationIds = this.operationIds(roots);
+              return operationIds.length === 0
+                ? Promise.resolve([])
+                : options.attachedImages!({ operationIds, app }, signal);
+            },
+        options.maxImagesPerRequest,
       ),
     );
     guardOperationRequests(this.models, operationMessages);
@@ -559,6 +573,29 @@ export class HostedSession<
       root,
     );
     return parseEntryAppScope(entry.kind, entry.data);
+  }
+
+  /** The message ids of the run's own placed board inputs, never prompt text. */
+  private operationIds(roots: readonly number[]): string[] {
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const root of roots) {
+      const entry = readSubmissionEntry(
+        this.ctx.storage.sql as unknown as TaskSql,
+        String(root),
+      );
+      const id = parseEntryOperationId(entry.kind, entry.data);
+      // A pre-board legacy input cannot carry host attachment bindings.
+      if (id === null) continue;
+      if (
+        id !== readSubmissionRequestId(this.ctx.storage.sql as unknown as TaskSql, String(root)) ||
+        seen.has(id)
+      )
+        throw new Error("The active operation's message identity is unavailable.");
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
   }
 
   /** What the runtime has not settled yet, so the board can show queued/running/parked. */

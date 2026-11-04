@@ -56025,6 +56025,16 @@ function readSubmissionEntry(sql, submissionId) {
     throw unavailable();
   return entry;
 }
+function readSubmissionRequestId(sql, submissionId) {
+  const unavailable = () => new Error(`Submission "${submissionId}" has no readable request identity.`);
+  const id = Number(submissionId);
+  if (!Number.isSafeInteger(id) || id <= 0)
+    throw unavailable();
+  const submission = record4(sql, "pi_submissions", id);
+  if (submission === null || submission.type !== "input" || typeof submission.requestId !== "string")
+    throw unavailable();
+  return submission.requestId;
+}
 function submissionHeld(sql, operationId) {
   if (!hasSubmissions(sql))
     return false;
@@ -56512,6 +56522,13 @@ function parseEntryAppScope(kind, data) {
     return null;
   return parseAppScope(data.app);
 }
+function parseEntryOperationId(kind, data) {
+  if (kind !== BOARD_MESSAGE_KIND)
+    return null;
+  if (typeof data !== "object" || data === null || Array.isArray(data) || !("messageId" in data))
+    throw new Error("The stored operation entry is malformed.");
+  return requireOperationId(data.messageId);
+}
 function sameAppScope(left, right) {
   return (left?.installId ?? null) === (right?.installId ?? null) && (left?.contextId ?? null) === (right?.contextId ?? null);
 }
@@ -56650,7 +56667,29 @@ function runAppScope(inputs, load) {
   }
   return scope ?? null;
 }
-function operationContextExtension(load, authored) {
+function imageMessage(images, maxImages) {
+  if (!Array.isArray(images) || images.length > maxImages || images.length > MAX_IMAGE_PARTS)
+    throw new Error("The active operation's images are invalid or exceed the image limit.");
+  if (images.length === 0)
+    return null;
+  let encodedBytes = 0;
+  for (const image of images) {
+    if (image === null || typeof image !== "object" || image.type !== "image" || image.mimeType !== "image/png" && image.mimeType !== "image/jpeg" && image.mimeType !== "image/webp" || typeof image.data !== "string" || image.data.length === 0 || image.data.length > MAX_IMAGE_BASE64_CHARS || image.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(image.data))
+      throw new Error("The active operation's image is invalid.");
+    encodedBytes += image.data.length;
+    if (encodedBytes > MAX_IMAGE_BASE64_CHARS)
+      throw new Error("The active operation's images exceed the image limit.");
+  }
+  return {
+    role: "user",
+    content: [
+      { type: "text", text: "Images attached to the active user messages, in attachment order:" },
+      ...images.map(({ data, mimeType }) => ({ type: "image", data, mimeType }))
+    ],
+    timestamp: Date.now()
+  };
+}
+function operationContextExtension(load, authored, attachedImages, maxImages = 1) {
   return {
     name: "hosted-operation-context",
     hooks: [
@@ -56662,12 +56701,18 @@ function operationContextExtension(load, authored) {
             if (run === undefined || run.taskId !== api.taskId || run.inputs.length === 0)
               throw new Error("The active run's operation envelope is unavailable.");
             const app = runAppScope(run.inputs, load);
+            if (context.abortSignal?.aborted)
+              throw new Error("The active operation was cancelled.");
+            const image = attachedImages ? imageMessage(await attachedImages(run.inputs, app, context.abortSignal), maxImages) : null;
+            if (context.abortSignal?.aborted)
+              throw new Error("The active operation was cancelled.");
+            const messages = image === null ? request.messages : [...request.messages, image];
             if (app === null) {
-              const attested = withAttestation(request.messages, authored);
+              const attested = withAttestation(messages, authored);
               return attested === undefined ? undefined : { messages: attested };
             }
             return {
-              messages: withSystemContext(request.messages, appScopeText(app), authored)
+              messages: withSystemContext(messages, appScopeText(app), authored)
             };
           } catch {
             return;
@@ -57303,7 +57348,7 @@ class HostedSession extends DurableObject {
       throw new Error("HostedSession requires a named conversation");
     this.operationScopes = new OperationScopes(ctx.storage.sql);
     const acceptsImages = options.acceptsToolImages === true;
-    const model = defaultModel(options.modelAlias, acceptsImages);
+    const model = defaultModel(options.modelAlias, acceptsImages || options.attachedImages !== undefined);
     const authority = {
       toolRefusal: (name) => options.toolRefusal(name),
       authorizeTool: (name) => options.authorizeTool(name)
@@ -57321,7 +57366,10 @@ class HostedSession extends DurableObject {
       guardModelRequests(this.models, identityMessages);
     }
     const operationMessages = new WeakSet;
-    this.registry.install(operationContextExtension((root) => this.operationAppScope(root), operationMessages));
+    this.registry.install(operationContextExtension((root) => this.operationAppScope(root), operationMessages, options.attachedImages === undefined ? undefined : (roots, app, signal) => {
+      const operationIds = this.operationIds(roots);
+      return operationIds.length === 0 ? Promise.resolve([]) : options.attachedImages({ operationIds, app }, signal);
+    }, options.maxImagesPerRequest));
     guardOperationRequests(this.models, operationMessages);
     for (const group of options.tools) {
       this.registry.install(runtimeExtension(group, authority, this.toolAppScope, acceptsImages));
@@ -57504,6 +57552,21 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
   operationAppScope(root) {
     const entry = readSubmissionEntry(this.ctx.storage.sql, root);
     return parseEntryAppScope(entry.kind, entry.data);
+  }
+  operationIds(roots) {
+    const ids = [];
+    const seen = new Set;
+    for (const root of roots) {
+      const entry = readSubmissionEntry(this.ctx.storage.sql, String(root));
+      const id = parseEntryOperationId(entry.kind, entry.data);
+      if (id === null)
+        continue;
+      if (id !== readSubmissionRequestId(this.ctx.storage.sql, String(root)) || seen.has(id))
+        throw new Error("The active operation's message identity is unavailable.");
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
   }
   async pendingOperations() {
     return this.harness.pending();

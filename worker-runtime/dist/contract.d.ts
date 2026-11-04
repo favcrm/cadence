@@ -246,6 +246,19 @@ export interface HostedSessionOptions {
      */
     readonly maxImagesPerRequest?: 1 | 2 | 3 | 4;
     /**
+     * Resolve the images attached to the active run's admitted operations.
+     * The runtime supplies the operation ids and common app scope from its own
+     * placed entries on every attempt, including retries and recovery. The host
+     * must revalidate authority and retained bytes; throwing refuses the model
+     * request. Images are transient and are not written into the transcript.
+     */
+    attachedImages?(input: {
+        operationIds: readonly string[];
+        app: AppScope | null;
+    }, signal?: AbortSignal): Promise<readonly Extract<ToolContent, {
+        type: "image";
+    }>[]>;
+    /**
      * One model request through the platform proxy. The runtime relays the
      * returned bytes unchanged and only observes the served-model label.
      */

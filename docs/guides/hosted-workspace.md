@@ -113,6 +113,16 @@ that image input is unavailable instead of silently dropping it. This runtime
 contract does not itself provide browser access, select a vision model or add
 image support to AgenticOS's gateway.
 
+**Operator-attached images.** A host can instead supply `attachedImages` to
+resolve images belonging to the active operation IDs and their common app
+scope. The host must reauthorize the actor and scope, verify the retained
+bytes, and prove the selected gateway model and its image accounting before
+returning PNG, JPEG or WebP parts. The runtime checks the image count, encoded
+size and base64 form, injects the parts into that model request, and refuses
+the attempt if the callback fails. Attachment bytes are not written to the
+transcript. This callback does not enable image-returning tools; those retain
+their separate `acceptsToolImages` opt-in.
+
 **Hosted identity.** A host that has a committed assistant identity may supply
 two optional domain-data callbacks on `HostedSessionOptions`: `identity()`
 returns personal, workspace, company-agent or agent-profile context, and
