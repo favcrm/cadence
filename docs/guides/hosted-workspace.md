@@ -115,7 +115,7 @@ image support to AgenticOS's gateway.
 
 **Hosted identity.** A host that has a committed assistant identity may supply
 two optional domain-data callbacks on `HostedSessionOptions`: `identity()`
-returns the current personal profile or workspace identity, and
+returns personal, workspace, company-agent or agent-profile context, and
 `threadContext()` returns the thread's public projection. Both carry data only.
 A host may also supply `projectThread` to add entries, such as artifact cards, to
 what every thread read reports; its contract is on `HostedSessionOptions`.
@@ -123,9 +123,9 @@ Prompt text, model messages, engine hooks and SDK types are not accepted
 through them, and a generic host that supplies neither keeps its current
 behavior.
 
-When `identity()` is configured, the runtime renders the established personal
-setup or workspace instructions privately, resolves the identity for each
-operation, and stores it once per operation root in the session object's
+When `identity()` is configured, the runtime renders the relevant identity
+privately, resolves it for each operation, and stores it once per operation root
+in the session object's
 existing `tenant_identity_snapshots` table (insert-once; a stored snapshot is
 never rewritten). Admission resolves the identity before accepting new work,
 and every actual generation must carry the exact message object the runtime
@@ -135,6 +135,11 @@ operation, never to an operation already running, and a malformed or
 unavailable identity refuses the operation instead of falling back to a generic
 prompt. The summarizer's `completeSimple` path keeps its original
 normalization, authentication and transport.
+
+An `agent_profile` carries a name, role, revision, up to 8,000 UTF-16 code
+units of instructions and up to 32 declared skills. It is context only: it
+neither authenticates an agent nor grants capabilities. The host remains
+responsible for resolving the profile and authorizing every operation.
 
 **Hosted app scope.** `HostedSession.submit(text, operationId, app?)` and
 `ask(prompt, operationId?, app?)` accept the host-verified `AppScope` of the
