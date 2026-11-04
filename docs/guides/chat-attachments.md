@@ -101,11 +101,12 @@ builds a campaign. Retention and quota are described in
    carries a daemon-minted `chf-<32-hex>` id and its digest is verified on read.
 5. `thread_send` accepts `attachments: [{id}]` (1–5 ids, `chf-` grammar) from
    the operator chat only. **Readiness is checked against the actual bytes,
-   not the row's existence**: the row must be a text kind, the blob must
+   not the row's existence**: the row must be a readable kind, the blob must
    exist as a regular file, and its bounded content must still match the
-   declared size and digest, sniff as an allowed text kind, decode as UTF-8
-   and pass the secret gate. An altered, unreadable, oversized or
-   non-text row refuses the send before the message is queued. Version-1
+   declared size and digest, sniff as the declared kind, extract (a PDF
+   through the bounded converter; a text kind by decoding) and pass the
+   secret gate. An altered, unreadable, oversized or mislabelled row refuses
+   the send before the message is queued. Version-1
    paths derive from the validated stored owner/thread/attachment tuple;
    legacy paths derive from the validated stored digest, never request data.
 6. The resolved `{id,name,size,mime,sha256}` rows are stored on the entry's
@@ -134,10 +135,12 @@ builds a campaign. Retention and quota are described in
    any byte is read. A non-master agent is refused. The master's gate-2
    allowlists admit `chat_file_read` in home and app turns.
 9. Read re-verifies the same opened bytes (bounded by the cap) against the
-   row's digest and returns `{extractable:true, text: <bounded>}` for text
-   kinds (≤64k chars, `secret::guard` re-run). A non-text row (none can be
-   uploaded) returns `{extractable:false}` metadata only — no fabricated
-   extraction.
+   row's digest, re-proves that its bytes still sniff as the row's declared
+   kind — the Home operator read reaches this projection without the readiness
+   helper, so the proof lives here too — and returns
+   `{extractable:true, text: <bounded>}` for a readable kind (≤64k chars,
+   `secret::guard` re-run). A mislabelled row is refused; no fabricated
+   extraction is ever returned.
 
 ## Scope and retry rules
 
@@ -187,10 +190,12 @@ builds a campaign. Retention and quota are described in
   `chat_file_read` both re-check with a bounded no-follow open).
 - A board upload-staging name that already exists (the board uses
   exclusive create and never truncates or deletes a path it did not create).
-- Empty or oversized files; extensions outside the interim allowlist;
+- Empty or oversized files; extensions outside the allowlist;
   extension/magic mismatches; unknown or grammar-bad `chf-` ids on
   `thread_send`.
-- PDF/image uploads, whatever their extension or claimed MIME.
+- Image uploads, whatever their extension or claimed MIME. A PDF is accepted
+  when its bytes are a PDF and its text extracts; a corrupt, encrypted or
+  text-free PDF is refused.
 - An app-scoped upload or send without the exact-approved `file.upload`
   declaration, or whose installation, context or conversation does not match
   the stored row.

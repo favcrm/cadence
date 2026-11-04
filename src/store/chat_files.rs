@@ -237,6 +237,7 @@ impl ChatFile {
                 self.id
             )));
         }
+        prove_declared_kind(&self.name, &self.mime, &bytes)?;
         let text = checked_attachment_text(&self.name, &self.mime, &bytes)?;
         let (text, truncated) = if text.len() > CHAT_FILE_TEXT_CAP {
             let mut cut = super::take_bytes(&text, CHAT_FILE_TEXT_CAP.saturating_sub(16));
@@ -380,7 +381,7 @@ fn check_kind(name: &str, bytes: &[u8]) -> Result<&'static str> {
     let ext = ext.as_str();
     let sniffed = sniffed_kind(bytes);
     if matches!(ext, "png" | "jpg" | "jpeg" | "webp" | "gif")
-        || matches!(sniffed, "png" | "jpeg" | "webp")
+        || matches!(sniffed, "png" | "jpeg" | "webp" | "image/gif")
     {
         return Err(Error::rejected(format!(
             "chat_file_upload refused '{name}': image processing is not available \
@@ -482,6 +483,24 @@ fn attachment_text(name: &str, mime: &str, bytes: &[u8]) -> Result<String> {
         )));
     }
     Ok(text)
+}
+
+/// A row's declared MIME must still match what its bytes sniff as. Upload
+/// proves it once; readiness and every read prove it again, because a row is
+/// reached through paths that do not share the readiness helper — the Home
+/// operator read goes straight from the digest check to `read_projection`.
+fn prove_declared_kind(name: &str, mime: &str, bytes: &[u8]) -> Result<()> {
+    let declared = check_kind(name, sniff_head(bytes)).map_err(|e| {
+        Error::rejected(format!(
+            "the '{name}' attachment's bytes do not match its declared kind: {e}"
+        ))
+    })?;
+    if declared != mime {
+        return Err(Error::rejected(format!(
+            "the '{name}' attachment declares '{mime}' but its bytes sniff as '{declared}'"
+        )));
+    }
+    Ok(())
 }
 
 /// The one gate an attachment's text passes before it is retained, before a
@@ -1053,17 +1072,9 @@ impl Store {
                 file.id
             )));
         }
-        // The same kind check the upload ran: a row whose bytes no longer
-        // sniff as its declared kind is not a ready source.
-        let declared = check_kind(&file.name, sniff_head(&bytes))
+        // The same kind proof the upload and every read run.
+        prove_declared_kind(&file.name, &file.mime, &bytes)
             .map_err(|e| Error::rejected(format!("attachment '{}' is not ready — {e}", file.id)))?;
-        if declared != file.mime {
-            return Err(Error::rejected(format!(
-                "attachment '{}' is not ready — the retained MIME '{}' does not \
-                 match the sniffed kind '{declared}'",
-                file.id, file.mime
-            )));
-        }
         // Readiness is the read gate: the text must still extract (a PDF
         // through the bounded converter) and still pass the secret scan.
         checked_attachment_text(&file.name, &file.mime, &bytes)
@@ -2645,8 +2656,58 @@ mod tests {
         assert!(refused(b"MZ", "a.exe").contains("not an attachable type"));
     }
 
-    /// A PDF is a text source only when its text can actually be read. The
-    /// refusal is what stops an unreadable attachment reaching a turn.
+    /// A minimal, well-formed one-page PDF whose only text is `text`. Built
+    /// here rather than embedded as a fixture, so the test exercises the real
+    /// converter against a real document instead of asserting that a blob
+    /// happens to pass.
+    fn minimal_pdf(text: &str) -> Vec<u8> {
+        let content = format!("BT /F1 24 Tf 20 100 Td ({text}) Tj ET\n");
+        let objects = [
+            "<</Type/Catalog/Pages 2 0 R>>".to_string(),
+            "<</Type/Pages/Kids[3 0 R]/Count 1>>".to_string(),
+            "<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>".to_string(),
+            format!("<</Length {}>>\nstream\n{content}endstream", content.len()),
+            "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>".to_string(),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<</Size {}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// The PDF path end to end: a real document uploads, and reading it back
+    /// returns the text the converter recovered — not a metadata-only row.
+    #[test]
+    fn a_real_pdf_uploads_and_reads_back_its_text() {
+        let (dir, s) = store();
+        let file = put(&s, dir.path(), &minimal_pdf("Invoice 42"), "invoice.pdf").unwrap();
+        assert_eq!(file.mime, "application/pdf");
+        let out = read(&s, dir.path(), &file).unwrap();
+        assert_eq!(
+            out["text"].as_str().unwrap_or_default().trim(),
+            "Invoice 42"
+        );
+        assert_eq!(out["extractable"], json!(true));
+    }
+
+    /// A PDF whose bytes are a PDF but which no converter can read is refused
+    /// at upload, so it never becomes an attachment the assistant cannot read.
     #[test]
     fn pdf_is_read_only_when_its_text_extracts() {
         let (dir, s) = store();
@@ -2658,10 +2719,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(
-            err.contains("corrupt, encrypted") || err.contains("could not be read"),
-            "{err}"
-        );
+        assert!(err.contains("corrupt, encrypted"), "{err}");
     }
 
     /// The structured text kinds are retained as text and read back verbatim.
@@ -2742,6 +2800,31 @@ mod tests {
         assert_eq!(md.mime, "text/markdown");
         let out = read(&s, dir.path(), &csv).unwrap();
         assert_eq!(out["text"], json!("a,b\n1,2"));
+    }
+
+    /// The Home operator read goes straight from the digest check to
+    /// `read_projection`, never through the readiness helper. The kind proof
+    /// therefore has to live in the projection too, or a row whose label and
+    /// bytes disagree would be served as text on that one path.
+    #[test]
+    fn a_row_whose_label_disagrees_with_its_bytes_is_refused_on_read() {
+        let bytes = b"%PDF-1.4\n".to_vec();
+        let file = ChatFile {
+            id: format!("chf-{}", "a".repeat(32)),
+            sha256: sha256_hex(&bytes),
+            size: bytes.len() as u64,
+            mime: "application/json".to_string(),
+            name: "payload.json".to_string(),
+            scope: CHAT_FILE_SCOPE_HOME.to_string(),
+            context_id: String::new(),
+            uploader: format!("acu-{}", "b".repeat(32)),
+            user_id: None,
+            thread_id: None,
+            location_version: None,
+            created: 0.0,
+        };
+        let err = file.read_projection(bytes).unwrap_err().to_string();
+        assert!(err.contains("do not match its declared kind"), "{err}");
     }
 
     #[test]
