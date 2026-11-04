@@ -87,17 +87,16 @@ for send, publish, spend or deploy. It never stands in for a review pass and nev
 **Not yet enforced.** `scripts/enqueue-reviewed` counts hosted verdicts by
 attested principal and, since CAD-2049, refuses the author's principal; local
 notes count by their self-declared `From:` alias, which is not attested. It
-cannot tell a fresh session from the author under one login. Until it can,
-merges use the temporary exception (`--exception --advisory ...`: exact-head
+cannot tell a fresh session from the author under one login. Until it can, a hosted
+`routine` or `ui/**` PR merges with the temporary exception (`--exception --advisory ...`: exact-head
 operator approval and two advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change; ends at
 `EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31). The exception only
 checks that the advisory links are separate https URLs; it proves neither head
-binding nor that Browser QA ran, and a verdict filed under the author's identity
-still refuses under it. The `solo_operator` delivery-profile
+binding nor that Browser QA ran. Agents file no hosted verdict (AGENTS.md "Review"). The `solo_operator` delivery-profile
 field still exists in code; it is not this standard. A workflow-issued reviewer
-identity (CAD-2081) is counted by the gate, but its workflows are not shipped yet;
-see AGENTS.md "Review".
+identity (CAD-2081) is counted by the gate and its workflows are live; their role is
+in AGENTS.md "Review".
 
 ### Review count by diff (CAD-957)
 A PR whose every change qualifies under the one-review allowlist

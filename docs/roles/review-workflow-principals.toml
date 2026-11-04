@@ -16,8 +16,8 @@
 #
 # Only `standards` and `spec-security` are accepted; any other kind, or a
 # malformed entry, makes the whole file unreadable and every workflow row
-# refuses. There is no Browser QA workflow, so a `ui/` PR still needs a Browser
-# QA verdict from a session. Changing this file is class `human`
+# refuses. There is no Browser QA workflow, so on a `ui/` PR the Browser QA
+# session posts a PR comment (AGENTS.md "Review"). Changing this file is class `human`
 # (risk-classes.md trigger 7).
 
 [principals.svc_review_standards]

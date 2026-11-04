@@ -62,9 +62,11 @@ fresh-context session that is not the author, a subagent included (AGENTS.md
 "Review"). This gate does not enforce that: hosted verdicts count by attested
 principal and the author's is refused, local notes count by their self-declared
 `From:` alias (not attested), so it cannot tell a fresh session from the author
-under one login. CAD-2081 adds workflow-issued rows (see AGENTS.md "Review"), but
-their workflows (CAD-2088) are not live until their environment and keys are set
-up, so until then the temporary exception below is the merge path.
+under one login. CAD-2081 adds workflow-issued rows (see AGENTS.md "Review"); their
+workflows (CAD-2088) are live, a cheap first pass beside fresh-session reviews on
+gate, security, schema and release PRs, and two of them satisfy other PRs. On
+hosted today `routine` and `ui/**` PRs still need the temporary exception below,
+which runs to 2026-12-31.
 
 CAD-1946 temporary exception: `--exception --advisory standards=<url> --advisory
 spec-security=<url>` (and `browser-qa=<url>` for a `ui/` change) waives only the
@@ -120,13 +122,24 @@ WORKFLOW_KINDS = ("standards", "spec-security")
 # A filed row by the author is refused even under --exception, and an advisory link does not clear it.
 AUTHOR_ROW_HINT = (" (a filed row under the author's identity still refuses under --exception, and an "
                    "advisory link does not clear it. The author's own review can never be an advisory; "
-                   "only a fresh non-author session's review can)")
+                   "only a fresh non-author session's review can. A hosted row has no retraction verb and "
+                   "is head-pinned. Agents file no hosted verdict: post findings as a PR comment, which is "
+                   "the advisory link; AGENTS.md \"Review\")")
+# The author has no attested principal: no row is filed yet by "the author", so no permanence claim.
+UNATTESTED_AUTHOR_HINT = (" (changing reviewer identities is the operator's decision alone, never a way to "
+                          "make a row count. Agents file no hosted verdict: post findings as a PR comment, "
+                          "which is the advisory link; AGENTS.md \"Review\")")
+# Local notes are not hosted rows: no permanence claim.
+LOCAL_AUTHOR_ROW_HINT = (" (a note under the author's identity still refuses under --exception, and an "
+                         "advisory link does not clear it. The author's own review can never be an advisory; "
+                         "only a fresh non-author session's review can)")
 REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a non-author session, "
-                        "and this gate cannot yet tell one from the author under one login: use "
-                        "--exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate "
-                        "(workflow-issued reviews, CAD-2081/CAD-2088, are not live yet). "
-                        "A verdict filed under the author's identity still refuses under the exception, "
-                        "so a same-login session posts its findings as a PR comment and files no verdict)")
+                        "and this gate cannot yet tell one from the author under one login. On hosted, "
+                        "agents file no verdict: post findings as a PR comment, which is the advisory link "
+                        "(AGENTS.md \"Review\"). Routes: workflow-issued rows (dispatch review-standards.yml "
+                        "and review-spec.yml; a cheap first pass on gate, security, schema and release PRs, "
+                        "where fresh-session Opus reviews stay the real review; two rows satisfy other PRs), "
+                        "or --exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate)")
 
 # Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
 # AGENTS.md list. A verdict note's `Risk: human` also makes a diff human.
@@ -1081,7 +1094,7 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
                 reasons.append(
                     f"verdict {n['name']} cannot be proven independent: the PR author "
                     f"{hosted.get('author_login') or '(unknown login)'} has no attested principal "
-                    "(`cadence audit identities set --identity <subject>=<login>`)")
+                    f"(`cadence audit identities set --identity <subject>=<login>`){UNATTESTED_AUTHOR_HINT}")
             elif (n.get("reviewer_id") or "").strip() == hosted["author_principal"]:
                 reasons.append(
                     f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
@@ -1089,7 +1102,7 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
             else:
                 counted.append(n)
         elif who in authors:
-            reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']}){AUTHOR_ROW_HINT}")
+            reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']}){LOCAL_AUTHOR_ROW_HINT}")
         else:
             counted.append(n)
     if hosted is not None:
@@ -1132,7 +1145,9 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
             reasons.append(f"the Standards and Spec/security verdicts come from the same reviewer; two distinct reviewers are required{REVIEW_STANDARD_HINT}")
     if need_qa and not by("browser-qa"):
         reasons.append(f"a ui/ change needs a pass Browser QA verdict for {issue} pinned to this head, from someone other than the author; "
-                       "the review workflows file only Standards and Spec/security, so they cannot supply it")
+                       "the review workflows file only Standards and Spec/security, so they cannot supply it; "
+                       "on hosted, agents file no Browser QA verdict: post the findings as a PR comment and use it "
+                       "as the browser-qa advisory under --exception (AGENTS.md \"Review\")")
     return reasons, counted
 
 

@@ -606,16 +606,18 @@ the author's principal (local notes count by their self-declared `From:`
 alias, which is not attested), so a profile or separate session alone does not make a
 gate-counted verdict, and in-chat findings are not one either. Until the gate
 can tell a fresh session from the author (the workflow-issued reviews of
-CAD-2081, not shipped yet; AGENTS.md "Review"), merges use the temporary
+CAD-2081 are live as a cheap first pass beside fresh-session reviews on gate, security,
+schema and release PRs, and two of them satisfy other PRs; AGENTS.md "Review"), a hosted
+`routine` or `ui/**` PR still merges with the temporary
 `--exception --advisory ...` path (exact-head operator approval and two
 advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change, even where the board asks for fewer or no approval. A hosted `routine`
 PR needs this route too, because a hosted board has no readiness record yet; ends at `EXCEPTION_ENDS` in
 `scripts/delivery-gate`, 2026-12-31); see AGENTS.md "Review". The exception
 only checks that the advisory links are separate https URLs; it proves neither
-head binding nor that Browser QA ran. A verdict filed under the author's
-identity still refuses under it, so a session on the author's login posts its
-findings as a PR comment and does not run `audit verdict` below.
+head binding nor that Browser QA ran. Agents in this workspace do
+not run `audit verdict` below: they post findings as a PR comment and use it as
+the advisory link (AGENTS.md "Review"). The command is documented for what it does.
 
 ```sh
 cadence --org acme audit verdict --project <project-key> --repo <owner/name> \
@@ -652,7 +654,7 @@ gate also runs whichever `cadence` you point it at: set
 missing hosted verb will read like a gate refusal.
 
 A hosted verdict counts only on the owner's attestations (AOS-473, CAD-2001),
-except a workflow-issued row (CAD-2081; the workflows are not shipped yet), which
+except a workflow-issued row (CAD-2081; the workflows are live), which
 has no login and counts only for a principal in
 `docs/roles/review-workflow-principals.toml` at main's tip (AGENTS.md "Review"):
 the workspace owner binds each principal's GitHub login once for the workspace,

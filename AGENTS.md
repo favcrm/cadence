@@ -136,17 +136,30 @@ the code you just wrote.
   since CAD-2049, refuses the author's principal; local notes count by their
   self-declared `From:` alias, which is not attested. It cannot tell a fresh
   session from the author when both act under one login. Two routes exist.
-  Workflow-issued reviews (below) are the intended one; their workflows are in
-  `.github/workflows/` (CAD-2088) but are not live until the `cadence-review`
-  environment and its keys are set up and the first run files a verdict. Until
-  then, merge through the temporary exception (`--exception --advisory
-  standards=<url> --advisory spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
-  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31). Of the advisory
-  links, it checks only that they are separate https URLs; it proves
-  neither head binding nor that Browser QA ran. A verdict filed under the
-  author's identity still refuses under the exception, so a same-login
-  session posts its findings as a PR comment and files no verdict. A second
-  attested human is not required.
+  Workflow-issued reviews (below, CAD-2088) are live: dispatch
+  `review-standards.yml` and `review-spec.yml`. The operator's working rule is
+  that gate, security, schema and release PRs keep fresh-session Opus reviews and
+  the workflow rows are a cheap first pass; on other PRs two workflow rows
+  satisfy the requirement. On hosted today `routine` and `ui/**` PRs still need
+  the temporary exception (`--exception --advisory standards=<url> --advisory
+  spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
+  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31); the Browser
+  QA session posts a PR comment, and that comment is the `browser-qa=<url>`
+  advisory. Of the advisory links, it checks
+  only that they are separate https URLs; it proves neither head binding nor
+  that Browser QA ran. A second attested human is not required.
+- **Agents file no hosted verdict in this workspace.** Post findings as a PR
+  comment; that comment is the advisory link for `standards`, `spec-security` or
+  `browser-qa`. `favcrm-dev` and `cc-syntax` are one person, and the gate
+  refuses every owner-attested row while the author's login has no attested
+  principal. A filed row has no retraction verb and is head-pinned; a
+  same-person row refuses, `--exception` included, and moving the head voids
+  every other row. Changing reviewer identities is the operator's decision
+  alone, never a way to make a row count. Workflow-issued rows
+  (`review-standards.yml` and `review-spec.yml`; no login or person) are a cheap
+  first pass on gate, security, schema and release PRs, where fresh-session Opus
+  reviews stay the real review; two rows satisfy other PRs, with the operator
+  check still applying outside the auto-paths allowlist.
 - **The changed set is anchored to main's live tip.** GitHub's PR base SHA can stay
   older than the real merge base after main is merged into the branch, so a PR
   that merges main and restores an old file diffs as docs-only against it.
@@ -165,7 +178,7 @@ the code you just wrote.
   evidence comment's `Base:` stays the PR's recorded base commit; `Merge base
   judged:` and `Main tip:` record what was judged. A PR on another base keeps the
   PR's base.
-- **Workflow-issued reviews (CAD-2081; workflows in CAD-2088, not live until set up).** The
+- **Workflow-issued reviews (CAD-2081; workflows in CAD-2088).** The
   gate counts a hosted row whose `identity_source` is `workflow-oidc` only when
   all of these hold, each read at gate time: its principal is in
   `docs/roles/review-workflow-principals.toml` at the live tip of `main` (not the
@@ -208,9 +221,9 @@ the code you just wrote.
   The tenant stops re-filing, not re-rolling: a run can be cancelled and
   re-dispatched, or an empty commit pushed, for a new head and a new verdict. A
   session holding admin can still rewrite the workflow or sign directly until
-  agents lose admin. There is no Browser QA workflow: a `ui/` PR still needs a
-  Browser QA verdict from a session, and refuses without it. `--exception` is
-  otherwise unchanged, but a workflow row that does not hold refuses under it
+  agents lose admin. There is no Browser QA workflow: off the exception a `ui/` PR
+  needs a countable Browser QA verdict, which no agent here files, and refuses
+  without it. `--exception` is otherwise unchanged, but a workflow row that does not hold refuses under it
   too.
 - One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
@@ -356,8 +369,8 @@ looking.
 - Review evidence binds to the exact head and, on a hosted workspace, to the
   issue's project (CAD-2001): the merge gate counts distinct attested principals, refuses
   the author's own, and voids every verdict when the head moves. Read it back
-  with `cadence audit verdicts --project <key>` and confirm a verdict counts
-  before treating a review as landed; in-chat findings are not automatically
+  with `cadence audit verdicts --project <key>` to see what counts; do not file
+  a verdict to find out. In-chat findings are not automatically
   gate evidence. The project is explicit — never derived from the repository or
   the cwd. A hosted verdict counts only when the workspace owner has attested
   its principal's GitHub login (`cadence audit identities`) and admitted that
