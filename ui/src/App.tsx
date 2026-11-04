@@ -1500,7 +1500,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             {route.section === "connections" && (
               <Connections viewer={viewer} page={route.page} />
             )}
-            {route.section === "email" && <EmailSending viewer={viewer} />}
+            {route.section === "email" && <EmailSending viewer={viewer} fixedUnsubscribeAddress={Boolean(meta?.settings_sections)} />}
             {route.section === "templates" && <Templates />}
             {route.section === "preferences" && <Preferences organizationDefault={!meta?.settings_sections} />}
             {route.section === "general" && <General />}

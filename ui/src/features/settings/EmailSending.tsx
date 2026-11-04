@@ -90,7 +90,14 @@ function appContextLabel(app: string, context: string): string {
   return app === context ? app : `${app} · ${context}`;
 }
 
-export default function EmailSending({ viewer }: { viewer: Viewer }) {
+export default function EmailSending({
+  viewer,
+  fixedUnsubscribeAddress = false,
+}: {
+  viewer: Viewer;
+  /** A hosted board's links always use its own address, so there's nothing to set. */
+  fixedUnsubscribeAddress?: boolean;
+}) {
   const t = useTranslate();
   const [targets, setTargets] = useState<Target[] | null>(null);
   const [rows, setRows] = useState<Connection[] | null>(null);
@@ -158,7 +165,7 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
                 viewer={viewer}
               />
             ))}
-            <OriginRow viewer={viewer} />
+            {!fixedUnsubscribeAddress && <OriginRow viewer={viewer} />}
           </div>
         </div>
       )}

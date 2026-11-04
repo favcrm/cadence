@@ -45,7 +45,7 @@ const bindingFor = (row: any, over: any = {}) => ({
   ...over,
 });
 
-async function mount(world: World, viewer = { operator: true, readOnly: false }) {
+async function mount(world: World, viewer = { operator: true, readOnly: false }, fixedUnsubscribeAddress = false) {
   const { Window } = require("happy-dom");
   const win = new Window({ url: "http://localhost/settings/email" });
   for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "HTMLSelectElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
@@ -134,7 +134,7 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
   };
   const button = (label: string) =>
     Array.from(host.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === label) as HTMLButtonElement | undefined;
-  await React.act(async () => { root.render(React.createElement(EmailSending, { viewer })); });
+  await React.act(async () => { root.render(React.createElement(EmailSending, { viewer, fixedUnsubscribeAddress })); });
   // A row is a name and one line; everything else is in the drawer it opens.
   const open = async (name: string) => {
     await settle(() => assert(rowFor(name), `row ${name}`));
@@ -312,6 +312,13 @@ async function main() {
     await m.open("Unsubscribe links");
     await m.settle(() => assert(m.host.textContent!.includes("Every email"), "origin visible"));
     assert(!m.button("Save") && !m.host.querySelector("#email-origin"), "no origin write controls");
+    await m.unmount();
+  }
+  // A hosted board's links always use its own address: there is no setting to show.
+  {
+    const m = await mount(fresh(), { operator: true, readOnly: false }, true);
+    await m.settle(() => assert(m.rowFor("CRM · Acme"), "the app row renders"));
+    assert(!m.rowFor("Unsubscribe links"), "no unsubscribe setting on a hosted board");
     await m.unmount();
   }
   console.log("email sending checks passed");
