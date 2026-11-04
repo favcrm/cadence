@@ -197,8 +197,8 @@ function agentProfileText(context: Record<string, unknown>): string {
     name.length > 120 ||
     role.length > 80 ||
     instructions.length > 8000 ||
-    /[\x00-\x1f\x7f-\x9f]/.test(name) ||
-    /[\x00-\x1f\x7f-\x9f]/.test(role) ||
+    /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(name) ||
+    /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(role) ||
     /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(instructions) ||
     typeof revision !== "number" ||
     !Number.isSafeInteger(revision) ||
@@ -212,7 +212,7 @@ function agentProfileText(context: Record<string, unknown>): string {
         skill.length === 0 ||
         skill.trim().length === 0 ||
         skill.length > 80 ||
-        /[\x00-\x1f\x7f-\x9f]/.test(skill),
+        /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(skill),
     )
   )
     malformed();

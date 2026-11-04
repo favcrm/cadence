@@ -47,7 +47,9 @@ import { OperationScopes } from "../src/operation-scope.ts";
  *    counted code points would admit the 8,001-unit case and fail here. A
  *    sparse skill array is refused too: `Array.prototype.some` skips holes, so
  *    a hole must be rejected explicitly or a profile with an undeclared skill
- *    slot would be admitted.
+ *    slot would be admitted. An interior TAB in the name, role or declared
+ *    skills is admitted — the host's stored profiles contain them — while
+ *    other control characters are still refused.
  *
  * 2. Over the real engine (`Harness` + `identityContextExtension` +
  *    `guardModelRequests` + `IdentitySnapshots`), a valid profile's full 8,000
@@ -227,9 +229,25 @@ describe("agent profile identity refusal", () => {
       });
       expect(await session.submit("allowed whitespace", "op-tabs")).toBe(true);
 
+      // The host's profile store permits an interior TAB in the name, role and
+      // declared skills. Those are valid stored values, not control
+      // characters, so the guard must admit them; only other controls are
+      // refused below.
+      current = profileContext({
+        name: "Led\tger",
+        role: "book\tkeeper",
+        instructions: "Reconcile invoices.",
+        skills: ["invoices\treview"],
+        revision: 2,
+      });
+      expect(await session.submit("interior tab", "op-interior-tab")).toBe(
+        true,
+      );
+
       expect(submissions.map((entry) => entry.operationId)).toEqual([
         "op-limit",
         "op-tabs",
+        "op-interior-tab",
       ]);
 
       let refusals = 0;
@@ -349,14 +367,15 @@ describe("agent profile identity refusal", () => {
         "a skill list with one hole",
       );
 
-      // A refused admission reserves nothing: only the two admitted
-      // operations have a binding, and the engine saw only those two.
+      // A refused admission reserves nothing: only the three admitted
+      // operations have a binding, and the engine saw only those three.
       const rows = database
         .prepare(
           "SELECT operation_id FROM tenant_operation_scopes ORDER BY operation_id",
         )
         .all() as Array<{ operation_id: string }>;
       expect(rows.map((row) => row.operation_id)).toEqual([
+        "op-interior-tab",
         "op-limit",
         "op-tabs",
       ]);
@@ -494,7 +513,7 @@ describe("agent profile operation snapshot", () => {
     // Exactly 8,000 UTF-16 code units, with astral characters at the end.
     const instructions = `${"a".repeat(7990)}🚀🚀🚀🚀🚀`;
     expect(instructions.length).toBe(8000);
-    const skills = ["invoices", "reconciliation", "ledger"];
+    const skills = ["invoices\treview", "reconciliation", "ledger"];
     let revision = 1;
     let loads = 0;
     const load = async () => {
@@ -502,8 +521,8 @@ describe("agent profile operation snapshot", () => {
       return assistantIdentityText({
         scope: "agent_profile",
         profile: {
-          name: "Ledger",
-          role: "bookkeeper",
+          name: "Led\tger",
+          role: "book\tkeeper",
           instructions,
           skills,
           revision,
@@ -572,6 +591,8 @@ describe("agent profile operation snapshot", () => {
       // The full declared context reaches the model: all 8,000 code units,
       // the declared skills and the revision, with no capability grant.
       expect(beforeTool.identitySystem).toContain(IDENTITY_HEADING);
+      expect(beforeTool.identitySystem).toContain("name: Led\tger");
+      expect(beforeTool.identitySystem).toContain("role: book\tkeeper");
       expect(beforeTool.identitySystem).toContain(instructions);
       expect(beforeTool.identitySystem).toContain(
         `declared skills: ${JSON.stringify(skills)}`,
@@ -597,6 +618,8 @@ describe("agent profile operation snapshot", () => {
       expect(scripted.observations).toHaveLength(3);
       const next = scripted.observations[2]!;
       expect(next.identitySystem).toContain("revision: 2");
+      expect(next.identitySystem).toContain("name: Led\tger");
+      expect(next.identitySystem).toContain("role: book\tkeeper");
       expect(next.identitySystem).toContain(instructions);
       expect(next.identitySystem).toContain(
         `declared skills: ${JSON.stringify(skills)}`,
