@@ -508,7 +508,7 @@ pub fn require_bound_enrollment(
         || bound.agent_id() != enrolled.agent_id()
     {
         return Err(Error::unknown(format!(
-            "Browser enrollment changed after continuity binding; inspect the original \
+            "Browser enrollment changed during continuity binding; inspect the original \
              enrollment directory {} before retrying",
             dir.display()
         )));

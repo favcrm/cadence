@@ -1052,6 +1052,71 @@ fn a_changed_enrollment_after_a_bind_is_unknown_never_refused() {
     }
 }
 
+/// The order that reaches the check through the real flow: the caller reads one
+/// enrollment, a re-enroll replaces it, and the bind then commits for the
+/// replacement. The caller is told the outcome is unknown, never refused, and a
+/// retry settles it from the saved binding without another request.
+#[test]
+fn a_reenroll_before_a_committed_bind_is_unknown_and_a_retry_settles_it() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let at = now().unwrap();
+    let server = thread::spawn(move || {
+        let (mut challenge, _) =
+            continuity_request(&listener, "/v1/hosted-cadence/continuity/challenge");
+        respond(
+            &mut challenge,
+            &json!({
+                "version":"hosted-cadence-continuity.v1",
+                "challengeId":format!("ch_{}", "A".repeat(43)),
+                "operationId":format!("op_{}", "B".repeat(43)),
+                "nonce":"C".repeat(43), "registryEpoch":"D".repeat(43),
+                "issuedAtMs":at*1000,"expiresAtMs":at*1000+30_000
+            }),
+        );
+        let (mut bind, _) = continuity_request(&listener, "/v1/hosted-cadence/continuity/bind");
+        respond(
+            &mut bind,
+            &json!({
+                "version":"hosted-cadence-continuity.v1", "delivery":"bound",
+                "lineageId":LINEAGE, "keyId":format!("key_{}", "E".repeat(43)),
+                "generation":1, "organizationId":"ws_real",
+                "audience":"https://real.board.example.test", "subjectId":"hsp_subject",
+                "bridgeId":"hcb_bridge", "agentId":"hca_replacement", "credentialKind":"child"
+            }),
+        );
+    });
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("enroll");
+    trust(&dir, &issuer);
+    let browser_child = || {
+        let mut child = record(at + 120);
+        child.issuer = issuer.clone();
+        child.source = EnrollmentSource::Browser;
+        child.service_token = None;
+        child
+    };
+    save(&dir, &browser_child()).unwrap();
+    let enrolled = current(&dir).unwrap();
+
+    let mut replacement = browser_child();
+    replacement.agent_id = "hca_replacement".into();
+    save(&dir, &replacement).unwrap();
+
+    let bound = bind_browser(&dir).unwrap();
+    server.join().unwrap();
+    let error = require_bound_enrollment(&enrolled, &bound, &dir).unwrap_err();
+    assert_eq!(error.kind(), "unknown", "{error}");
+    assert!(matches!(
+        read_continuity_locked(&dir).unwrap().state,
+        ContinuityState::Bound
+    ));
+
+    // The listener is gone, so a retry that sent any request would fail.
+    let retried = bind_browser(&dir).unwrap();
+    assert!(require_bound_enrollment(&current(&dir).unwrap(), &retried, &dir).is_ok());
+}
+
 /// The recovery command stays pasteable, and the message states when it stops
 /// working and what to do then.
 #[test]
