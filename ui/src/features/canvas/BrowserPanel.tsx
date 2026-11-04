@@ -161,20 +161,34 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
   const live = phase === "active" || phase === "handoff";
   const stopping = b.stop === "stopping";
   const viewing = viewer.phase === "loading" || viewer.phase === "open";
-  // A takeover over, or any other phase, tears the frame down. A stop in
-  // flight does not: the view stays (inert) until the stop has succeeded.
-  const showFrame = viewing && phase === "handoff";
+  // A takeover over tears a frame that is still loading down, and so does any
+  // other phase. A stop in flight does not: the view stays (inert) until the stop
+  // has succeeded. A frame already open when the person presses Done stays, view
+  // only (inert), while the assistant reads on: the same node, never reloaded.
+  const viewOnly = phase === "active" && viewer.phase === "open" && !fetching;
+  const showFrame = viewing && (phase === "handoff" || viewOnly);
   const asking = phase === "handoff" && !stopping && !showFrame;
   const loadingUrl = viewer.phase === "loading" ? viewer.url : null;
   const instructions = b.session?.instructions ?? "";
 
   useEffect(() => {
-    if (phase !== "handoff" && (viewer.phase !== "idle" || fetching)) {
+    if (phase !== "handoff" && !viewOnly && (viewer.phase !== "idle" || fetching)) {
       attempt.current++;
       setFetching(false);
       setViewer({ phase: "idle" });
     }
-  }, [phase, viewer.phase, fetching]);
+  }, [phase, viewer.phase, fetching, viewOnly]);
+
+  // Focus inside the frame goes with the takeover: it moves to the tab, or the
+  // heading, never onto Stop, and only if the person is still where the view was.
+  const box = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!viewOnly) return;
+    const at = document.activeElement;
+    if (at !== document.body && !(at && box.current?.contains(at))) return;
+    claim.current = null;
+    (document.getElementById("bz-tab") ?? heading.current)?.focus();
+  }, [viewOnly]);
 
   // The frame is refused by the board's own CSP: say so now. Only an enforced
   // `frame-src` violation for the viewer's own origin counts. (A frame refused
@@ -400,7 +414,7 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
           </div>
         ) : null}
         {showFrame && (viewer.phase === "loading" || viewer.phase === "open") ? (
-          <div className="bz-viewer" data-phase={viewer.phase} inert={stopping || undefined}>
+          <div className="bz-viewer" ref={box} data-phase={viewer.phase} inert={stopping || viewOnly || undefined}>
             <iframe
               key={viewer.n}
               data-bz-frame
@@ -415,6 +429,8 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
             />
           </div>
         ) : null}
+        {/* Outside the inert box, which assistive tech skips. */}
+        {viewOnly ? <span className="sr-only" role="status">{t("Live view, view only while the assistant reads.")}</span> : null}
       </div>
     </div>
   );

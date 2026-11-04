@@ -1845,6 +1845,7 @@ Object.assign(zhTW, {
   "Show less": "顯示較少",
   "Stop session": "停止工作階段",
   "Your assistant:": "您的助理：",
+  "Live view, view only while the assistant reads.": "即時檢視，助理閱讀期間僅供檢視。",
   "Can't load the browser state.": "無法載入瀏覽器狀態。",
   "Couldn't load the live view. Check your connection, or it may not be allowed on this board yet.": "無法載入即時檢視。請檢查網絡連線；此看板亦可能尚未允許即時檢視。",
   "Stop the session?": "停止工作階段？",
