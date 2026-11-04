@@ -99,7 +99,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
-use crate::printed_command::path_arg;
+use crate::printed_command::{path_arg, shown};
 use crate::rollout::{db_file, SCHEMA_VERSION};
 use crate::secret::{self, Allowlist, Severity};
 
@@ -2066,7 +2066,8 @@ pub fn interrupted_restore_leftovers(state_dir: &Path) -> Vec<PathBuf> {
 /// files exist. The daemon checks this before anything opens or creates
 /// `cadence.sqlite3`: a daemon started over them would build a fresh,
 /// empty store next to the previous one. The error names every leftover
-/// and the `mv` that recovers each case. CAD-767: record-file asides in
+/// and the `mv` that recovers each case, or the steps in words when those
+/// paths cannot be printed as safe commands. CAD-767: record-file asides in
 /// `app-records/` refuse the same way — each is put back into its own
 /// directory, never the state-dir root.
 pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
@@ -2090,11 +2091,11 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
              previous files. Then start the daemon again",
             leftovers
                 .iter()
-                .map(|p| p.display().to_string())
+                .map(|p| shown(p))
                 .collect::<Vec<_>>()
                 .join(", "),
-            state_dir.display(),
-            db_file(state_dir).display(),
+            shown(state_dir),
+            shown(&db_file(state_dir)),
         )));
     }
     // Unreachable after the check above, and harmless if that ever changes.
@@ -2135,7 +2136,7 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
     };
     let listed = leftovers
         .iter()
-        .map(|p| p.display().to_string())
+        .map(|p| shown(p))
         .collect::<Vec<_>>()
         .join(", ");
     let live = db_file(state_dir);
@@ -2145,7 +2146,7 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
                 "{live} exists too. If it is not the store you restored (for \
                  example an empty store created after the interruption), move {live} and its \
                  -wal/-shm out of the state dir first",
-                live = live.display(),
+                live = shown(&live),
             )
         } else {
             format!(
@@ -2153,7 +2154,7 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
                  out of the state dir: mkdir -p {dir} && mv {files} {dir}. If it is not (for \
                  example an empty store created after the interruption), move {live} and its \
                  -wal/-shm out of the state dir first, then put the previous store back: {put_back}",
-                live = live.display(),
+                live = shown(&live),
                 dir = quote(&aside_dir),
                 files = leftovers
                     .iter()
@@ -2183,7 +2184,7 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
     Err(Error::rejected(format!(
         "an interrupted restore left {listed} in {}; refusing to open the store there. \
          {recovery}. Then start the daemon again",
-        state_dir.display()
+        shown(state_dir)
     )))
 }
 

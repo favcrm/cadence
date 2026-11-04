@@ -1162,6 +1162,76 @@ fn the_missing_pin_remedy_prints_a_command_only_when_it_is_safe_to_paste() {
     }
 }
 
+#[test]
+fn enrollment_remedies_are_inert_when_the_whole_line_is_pasted() {
+    use crate::printed_command::tests::{assert_inert_when_pasted, CRAFTED};
+    for name in CRAFTED {
+        let path = format!("/private/{name}");
+        assert_inert_when_pasted(&continuity_unknown(Path::new(&path)).to_string());
+        assert_inert_when_pasted(&missing_pin_remedy(
+            "https://issuer.example.test",
+            Path::new(&path),
+        ));
+        assert_inert_when_pasted(&missing_pin_remedy(&path, Path::new("/private/pin")));
+    }
+}
+
+/// The issuer is known and safe when only the path is the problem, so name it.
+#[test]
+fn the_missing_pin_fallback_says_which_value_failed() {
+    let issuer = "https://issuer.example.test";
+    let shown = missing_pin_remedy(issuer, Path::new("/private/it's/pin"));
+    assert!(shown.contains(&format!("'{issuer}'")), "{shown}");
+    assert!(shown.contains("this path cannot"), "{shown}");
+    let shown = missing_pin_remedy("https://a'b", Path::new("/private/pin"));
+    assert!(shown.contains("this issuer cannot"), "{shown}");
+    assert!(!shown.contains("a'b"), "{shown}");
+}
+
+#[test]
+fn a_missing_continuity_route_says_the_issuer_does_not_serve_it() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let path = "/v1/hosted-cadence/continuity/challenge";
+    let server = thread::spawn(move || {
+        let (mut request, _) = continuity_request(&listener, path);
+        write!(
+            request,
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let error = post_continuity(&issuer, path, CHILD, json!({})).unwrap_err();
+    assert_eq!(error.kind(), "rejected", "{error}");
+    assert!(format!("{error}").contains("does not serve"), "{error}");
+    server.join().unwrap();
+}
+
+/// Re-enrolling in this directory would spend a consent and then refuse, so say so
+/// first. Without a continuity key the plain advice is right.
+#[test]
+fn an_expired_enrollment_with_a_continuity_key_names_a_new_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("enroll");
+    let issuer = "https://issuer.example.test";
+    trust(&dir, issuer);
+    let mut child = record(now().unwrap().saturating_sub(10));
+    child.issuer = issuer.into();
+    child.source = EnrollmentSource::Browser;
+    child.service_token = None;
+    save(&dir, &child).unwrap();
+
+    let shown = bind_browser(&dir).unwrap_err().to_string();
+    assert!(shown.contains("re-enroll"), "{shown}");
+
+    fs::write(dir.join(CONTINUITY_RECORD), b"{}").unwrap();
+    let shown = bind_browser(&dir).unwrap_err().to_string();
+    assert!(
+        shown.contains("new private enrollment directory"),
+        "{shown}"
+    );
+}
+
 /// The remedy has to work, not only look safe: run the command as printed, then
 /// read the pin through the real reader.
 #[test]
@@ -3092,7 +3162,8 @@ fn auth_dir_with_a_quote_prints_no_command() {
         .unwrap()
         .to_string();
     let file = dir.join(TRUSTED_ISSUER).display().to_string();
-    assert!(err.contains(&file), "{err}");
+    assert!(!err.contains(&file), "the raw path must not print: {err}");
+    assert!(err.contains("trusted-issuer"), "{err}");
     assert!(err.contains("cannot be printed"), "{err}");
     assert!(!err.contains("echo"), "{err}");
     assert!(!err.contains("chmod"), "{err}");

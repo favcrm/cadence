@@ -1859,9 +1859,8 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                     project,
                     Sev::Warn,
                     format!(
-                        "orphan worktree {}/{rel} — no open PR or issue; \
-                         inspect, then {}",
-                        root.display(),
+                        "orphan worktree {} — no open PR or issue; inspect, then {}",
+                        crate::printed_command::shown(&root.join(&rel)),
                         orphan_worktree_remedy(&root, &rel)
                     ),
                 ));

@@ -179,7 +179,7 @@ fn check_dir(dir: &Path) -> Result<()> {
     if md.mode() & 0o077 != 0 {
         return Err(refuse(format!(
             "{} has mode {:03o}; it must be private — run {}",
-            dir.display(),
+            crate::printed_command::shown(dir),
             md.mode() & 0o777,
             crate::printed_command::with_path("chmod 700", dir, "")
         )));
@@ -261,7 +261,7 @@ pub fn read_secret(state_dir: &Path) -> Result<String> {
         return Err(refuse(format!(
             "{} has mode {:03o}; it must be readable by this user only — run \
              {}, then `cadence ui login --rotate` (another user may have read it)",
-            path.display(),
+            crate::printed_command::shown(&path),
             md.mode() & 0o777,
             crate::printed_command::with_path("chmod 600", &path, "")
         )));
@@ -384,7 +384,7 @@ pub fn read_private(state_dir: &Path, name: &str) -> Result<Vec<u8>> {
             "capability_unavailable",
             format!(
                 "{} has mode {:03o}; it must be private — run {}",
-                path.display(),
+                crate::printed_command::shown(&path),
                 md.mode() & 0o777,
                 crate::printed_command::with_path("chmod 600", &path, "")
             ),
@@ -1800,6 +1800,15 @@ mod tests {
         let shown = read_secret(&state).unwrap_err().to_string();
         assert!(shown.contains("`chmod 700 VALUE_1`"), "{shown}");
         assert!(shown.contains("cannot be printed"), "{shown}");
+
+        for name in crate::printed_command::tests::CRAFTED {
+            let state = root.path().join(name);
+            fs::create_dir(&state).unwrap();
+            ensure_secret(&state).unwrap();
+            chmod(&dir(&state), 0o755);
+            let shown = read_secret(&state).unwrap_err().to_string();
+            crate::printed_command::tests::assert_inert_when_pasted(&shown);
+        }
     }
 
     /// S2: every loose shape is refused and never repaired — the mode is

@@ -6,7 +6,8 @@
 //! runs the rest of a crafted path. Shell syntax has no readable way to write
 //! `'` inside quotes without one of those characters, so the rule is simple: a
 //! printed command must be unchanged by JSON encoding. A value that cannot meet
-//! that is never printed in or beside the command.
+//! that is never printed in or beside the command, and [`shown`] names a path in the
+//! sentence around it, since a person may paste the whole line.
 
 use std::path::Path;
 
@@ -33,6 +34,24 @@ pub(crate) fn arg(value: &str) -> Option<String> {
 /// would name a different path.
 pub(crate) fn path_arg(path: &Path) -> Option<String> {
     arg(path.to_str()?)
+}
+
+/// A path in a sentence near a command. It reads as the path, quoted, so pasting the
+/// whole line cannot run it. A path that cannot be quoted safely shows with each
+/// unsafe character as `?`: close enough to recognise, and inert.
+pub(crate) fn shown(path: &Path) -> String {
+    path_arg(path).unwrap_or_else(|| {
+        path.to_string_lossy()
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || "/._-+@:,%=".contains(c) {
+                    c
+                } else {
+                    '?'
+                }
+            })
+            .collect()
+    })
 }
 
 /// One piece of a printed command. Only `Fixed` is emitted as written, and it must
@@ -111,6 +130,26 @@ pub(crate) mod tests {
     pub(crate) fn survives_json(text: &str) -> bool {
         serde_json::to_string(text).unwrap() == format!("\"{text}\"")
     }
+
+    /// Run a whole message as a person pasting the whole line would. Anything crafted
+    /// to run would create `owned` in the working directory.
+    pub(crate) fn assert_inert_when_pasted(message: &str) {
+        let root = tempfile::tempdir().unwrap();
+        let mut shell = std::process::Command::new("sh");
+        shell.arg("-c").arg(message).current_dir(root.path());
+        crate::reaper::output(&mut shell).unwrap();
+        assert!(!root.path().join("owned").exists(), "{message:?}");
+    }
+
+    /// Names built to run `touch owned` when printed raw in a sentence.
+    pub(crate) const CRAFTED: [&str; 6] = [
+        "x;touch owned;y",
+        "x $(touch owned) y",
+        "x`touch owned`y",
+        "x'; touch owned; '",
+        "x\ntouch owned\ny",
+        "x\\'; touch owned; #",
+    ];
 
     /// Paths with no safe printed form.
     pub(crate) const UNPRINTABLE: [&str; 10] = [
@@ -191,6 +230,21 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn a_path_in_a_sentence_is_inert_and_still_recognisable() {
+        assert_eq!(shown(Path::new("/repo/has space")), "'/repo/has space'");
+        assert_eq!(shown(Path::new("/repo/it's")), "/repo/it?s");
+        assert_eq!(shown(Path::new("/repo/工作's")), "/repo/工作?s");
+        assert_eq!(
+            shown(Path::new(OsStr::from_bytes(b"/repo/\xff"))),
+            "/repo/?"
+        );
+        for name in CRAFTED {
+            let path = format!("/repo/{name}");
+            assert_inert_when_pasted(&format!("left {} in place", shown(Path::new(&path))));
+        }
+    }
+
     /// A refused value appears nowhere in the output, not only outside the command:
     /// a person copies the whole field or the whole line.
     #[test]
@@ -198,11 +252,11 @@ pub(crate) mod tests {
         for value in UNPRINTABLE {
             let parts = [Part::Fixed("chmod 700 "), Part::Path(Path::new(value))];
             assert_eq!(bare_command(&parts), None, "{value:?}");
-            let shown = command(&parts);
-            assert!(!shown.contains(value), "{shown:?}");
-            assert!(shown.contains("cannot be printed"), "{shown:?}");
-            let shown = with_path("chmod 700", Path::new(value), "");
-            assert!(!shown.contains(value), "{shown:?}");
+            let printed = command(&parts);
+            assert!(!printed.contains(value), "{printed:?}");
+            assert!(printed.contains("cannot be printed"), "{printed:?}");
+            let printed = with_path("chmod 700", Path::new(value), "");
+            assert!(!printed.contains(value), "{printed:?}");
         }
     }
 }

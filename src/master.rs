@@ -890,7 +890,8 @@ impl Login {
 }
 
 /// The command that gives the master its own Claude login (operator
-/// decision, 2026-09-24: a separate login is the default).
+/// decision, 2026-09-24: a separate login is the default), or the same in words
+/// when the state dir cannot be printed as a safe command.
 pub fn login_command(state_dir: &Path) -> String {
     use crate::printed_command::{bare_command, Part};
     bare_command(&[
@@ -946,7 +947,8 @@ pub fn has_login_for(provider: &str, state_dir: &Path) -> bool {
     }
 }
 
-/// The command that gives the master its own login for `provider`.
+/// The command that gives the master its own login for `provider`, or the same in
+/// words when the state dir cannot be printed as a safe command.
 /// Pi has no non-interactive login verb — the operator runs the TUI
 /// against the master's config dir and types `/login`.
 pub fn login_command_for(provider: &str, state_dir: &Path) -> String {

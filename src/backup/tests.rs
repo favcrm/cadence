@@ -2309,3 +2309,20 @@ fn an_unprintable_state_dir_gets_no_recovery_command() {
         }
     }
 }
+
+/// A person may paste the whole message, not only the command in it.
+#[test]
+fn a_restore_message_is_inert_when_the_whole_line_is_pasted() {
+    use crate::printed_command::tests::{assert_inert_when_pasted, CRAFTED};
+    for name in CRAFTED {
+        let root = TempDir::new().unwrap();
+        let state = root.path().join(name);
+        std::fs::create_dir(&state).unwrap();
+        let aside = state.join("cadence.sqlite3.replaced-20260923T000000Z-deadbeef");
+        std::fs::write(&aside, b"previous store").unwrap();
+        // With a live store too, so the message also names it.
+        std::fs::write(db_file(&state), b"live").unwrap();
+        let err = refuse_interrupted_restore(&state).unwrap_err().to_string();
+        assert_inert_when_pasted(&err);
+    }
+}

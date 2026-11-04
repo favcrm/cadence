@@ -621,7 +621,7 @@ fn reuse_lane(
                  --name {name} would start a second lane. Re-run without \
                  --name to reuse it, or close it first with {finish}",
                 id = front.id,
-                path = lane.display(),
+                path = crate::printed_command::shown(lane),
                 finish = {
                     use crate::printed_command::{command, Part};
                     command(&[
