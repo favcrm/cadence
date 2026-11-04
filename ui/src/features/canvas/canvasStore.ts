@@ -5,13 +5,18 @@
  *
  * Rules (the ticket's):
  * - the drawer opens by itself only for the FIRST artifact of a turn the
- *   operator started, and only when that artifact arrives live;
+ *   operator started, and only when that artifact arrives live, and only on a
+ *   host that has not turned auto-open off (`FeedInput.autoOpen`: the member
+ *   chat does, so the drawer never covers the chat on a phone);
  * - a drawer the operator closed stays closed for the rest of that turn;
  * - the drawer closes when the conversation changes;
  * - opening an artifact already open focuses its tab; closing the active
- *   tab selects a neighbour; closing the last collapses the drawer.
+ *   tab selects a neighbour; closing the last collapses the drawer, unless the
+ *   Browser tab (browserStore.ts, not modelled here) has a live session or was
+ *   opened on its own, and then the drawer stays on it.
  */
 import { useSyncExternalStore } from "react";
+import { onPrivateSessionReset } from "../../lib/privateSession";
 
 export type ArtifactKind = "md" | "pdf" | "html" | "image" | "csv";
 export const ARTIFACT_KINDS: readonly ArtifactKind[] = ["md", "pdf", "html", "image", "csv"];
@@ -111,6 +116,8 @@ export interface FeedInput {
   working: Working | null;
   /** The turn in flight, if any — a close is remembered against it. */
   turn: string | null;
+  /** Default true. False: no card ever opens the drawer by itself. */
+  autoOpen?: boolean;
 }
 
 const listeners = new Set<() => void>();
@@ -127,6 +134,24 @@ function emptyState(
   surface: Surface = "home",
 ): CanvasState {
   return { conversation, surface, composerKey, open: false, tabs: [], active: null, working: null };
+}
+
+/** An artifact took the active tab: "user" for a card or tab click, "auto"
+ *  for the feed's one auto-open per turn. The session tab (browserStore.ts) is
+ *  not modelled here; it listens instead. */
+export type FocusSource = "user" | "auto";
+const artifactFocusListeners = new Set<(source: FocusSource) => void>();
+export function onArtifactFocus(listener: (source: FocusSource) => void): void {
+  artifactFocusListeners.add(listener);
+}
+function artifactFocused(source: FocusSource): void {
+  for (const l of [...artifactFocusListeners]) l(source);
+}
+/** The last artifact tab closed. A listener answers true to keep the drawer
+ *  open on something else it shows (the Browser tab). */
+const emptiedListeners = new Set<() => boolean>();
+export function onArtifactsEmptied(listener: () => boolean): void {
+  emptiedListeners.add(listener);
 }
 
 function set(next: CanvasState): void {
@@ -203,6 +228,7 @@ export function feedCanvas(input: FeedInput): void {
   let tabs = state.tabs;
   let open = state.open;
   let active = state.active;
+  let focused = false;
   for (const card of input.cards) {
     if (seen.has(card.key)) continue;
     seen.add(card.key);
@@ -212,11 +238,12 @@ export function feedCanvas(input: FeedInput): void {
     if (tabs.some((t) => t.id === ref.id)) {
       tabs = tabs.map((t) => (t.id === ref.id ? withVersion(t, ref, card.turn) : t));
     }
-    if (card.live && card.operatorTurn && card.turn && !autoOpened.has(card.turn) && !closedTurns.has(card.turn)) {
+    if (input.autoOpen !== false && card.live && card.operatorTurn && card.turn && !autoOpened.has(card.turn) && !closedTurns.has(card.turn)) {
       autoOpened.add(card.turn);
       if (!tabs.some((t) => t.id === ref.id)) tabs = [...tabs, newTab(ref, card.turn)];
       open = true;
       active = ref.id;
+      focused = true;
     }
   }
   if (tabs.length === 0) {
@@ -225,6 +252,7 @@ export function feedCanvas(input: FeedInput): void {
   } else if (active === null || !tabs.some((t) => t.id === active)) {
     active = tabs[0].id;
   }
+  if (focused) artifactFocused("auto");
   const composerKey = input.composerKey;
   const working = sameWorking(input.working, state.working) ? state.working : input.working;
   if (
@@ -249,10 +277,13 @@ export function openArtifact(ref: ArtifactRef): void {
       )
     : [...state.tabs, newTab(ref, null)];
   set({ ...state, tabs, active: ref.id, open: true });
+  artifactFocused("user");
 }
 
 export function focusTab(id: string): void {
-  if (state.tabs.some((t) => t.id === id) && state.active !== id) set({ ...state, active: id });
+  if (!state.tabs.some((t) => t.id === id)) return;
+  if (state.active !== id) set({ ...state, active: id });
+  artifactFocused("user");
 }
 
 export function closeTab(id: string): void {
@@ -260,7 +291,8 @@ export function closeTab(id: string): void {
   if (index < 0) return;
   const tabs = state.tabs.filter((t) => t.id !== id);
   if (tabs.length === 0) {
-    closeDrawerFor(currentTurn);
+    const kept = [...emptiedListeners].some((l) => l());
+    if (!kept) closeDrawerFor(currentTurn);
     set({ ...state, tabs, active: null, open: false });
     return;
   }
@@ -278,6 +310,16 @@ export function closeDrawer(): void {
   closeDrawerFor(currentTurn);
   set({ ...state, open: false });
 }
+
+/** Show the drawer again over the tabs it already holds (the Browser tab
+ *  was hiding itself out of a drawer that it alone had opened). */
+export function showDrawer(): void {
+  if (state.tabs.length > 0 && !state.open) set({ ...state, open: true });
+}
+
+// A confirmed identity change drops this conversation's tabs: titles and
+// versions belong to the person who was signed in.
+onPrivateSessionReset(() => resetCanvas());
 
 export function selectVersion(id: string, version: number): void {
   set({

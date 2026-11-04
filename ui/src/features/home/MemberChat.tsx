@@ -20,6 +20,9 @@ import {
 } from "./thread";
 import { memberThreadReader } from "./memberThread";
 import { ImageConversation } from "../canvas/imageConversation";
+import { useCanvasFeed } from "../canvas/feed";
+import { BrowserCard } from "../canvas/BrowserPanel";
+import { feedBrowser, refreshBrowser } from "../canvas/browserStore";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
@@ -219,6 +222,23 @@ export default function MemberChat({
     return () => clearInterval(timer);
   }, [loaded, store]);
 
+  // CAD-2103: this surface does not feed the canvas by itself, so the
+  // assistant's conversation (the same id the image provider below uses) is
+  // wired to the canvas and the Browser tab explicitly. A new entry in the
+  // thread is when a session may have started, so it re-reads the browser.
+  const conversationId = surface?.conversation ?? null;
+  // Auto-open is off here: an artifact opens the drawer when the person asks,
+  // so on a phone the drawer never covers the chat they are reading.
+  useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null, autoOpen: false });
+  useEffect(() => {
+    feedBrowser(conversationId);
+    return () => feedBrowser(null);
+  }, [conversationId]);
+  const newestSeq = lastSeq(thread.data);
+  useEffect(() => {
+    if (conversationId !== null) void refreshBrowser();
+  }, [conversationId, newestSeq]);
+
   const [glideTick, setGlide] = useState(0);
   const scrollPanel = useCallback((kind: "glide" | "jump") => {
     const el = scrollRef.current;
@@ -398,6 +418,7 @@ export default function MemberChat({
               onRetry={onRetry}
               onDiscard={onDiscard}
             />
+            <BrowserCard />
             </ImageConversation.Provider>
           </div>
 

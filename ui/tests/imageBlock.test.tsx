@@ -510,7 +510,7 @@ canvasStore.resetCanvas(null, null, "home");
 host.job = finished;
 {
   const m = await mount(React.createElement(ImageBlock, { entry: entry() }), true, "c1");
-  assert(el(m.host, "img"), "a host that feeds no canvas still loads its images");
+  assert(el(m.host, "img"), "a host that has not fed the canvas yet still loads its images");
   await React.act(async () => { (el(m.host, "button.imgopen") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
   assert(el(m.host, "[data-canvas-drawer]"), "and its click still opens the canvas");
@@ -647,7 +647,7 @@ for (const sheet of [false, true]) {
   await m.unmount();
 }
 
-// ===== the hosted member chat feeds no canvas, and still loads its image =====
+// ===== the hosted member chat loads its image and opens it in the canvas =====
 reset();
 canvasStore.resetCanvas(null, null, "home");
 host.expect = "cm1";

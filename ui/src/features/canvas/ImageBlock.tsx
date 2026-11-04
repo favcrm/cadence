@@ -293,8 +293,9 @@ function Block({ entry, job }: { entry: ThreadEntry; job: NonNullable<ReturnType
   const open = () => {
     if (!artifact) return;
     armed.current = true;
-    // A host that feeds no canvas (the member chat) has none for this
-    // conversation yet; the drawer only opens for the conversation it holds.
+    // A host that has not fed this conversation to the canvas yet (the member
+    // chat feeds it once its thread loads) holds none for it; the drawer only
+    // opens for the conversation it holds.
     const held = canvasSnapshot();
     if (held.conversation !== conversation) resetCanvas(conversation, null, held.surface);
     openArtifact({ ...artifact, title: job.title.trim() || artifact.title, aspect: job.aspect });

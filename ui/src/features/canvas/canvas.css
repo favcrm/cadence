@@ -215,3 +215,84 @@
   .imgdots i { opacity: 0.7; }
   .imgover, .vidover, .vidplay { transition: none; }
 }
+
+/* ---- CAD-2103: the Browser tab (session-backed; mockups/browser-canvas-tab) ----
+   Kept at the end of the file, apart from the artifact rules above. */
+.cv-pane, .bz-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.cv-pane[hidden], .bz-panel[hidden] { display: none; }
+.bz-panel { position: relative; }
+.bz-dot { flex: none; width: 7px; height: 7px; border-radius: 9999px; background: var(--c, var(--color-ink-500)); }
+.bz-dot[data-pulse] { animation: bz-pulse 1.4s ease-in-out infinite; }
+.cv-tab[data-kind="session"] .cv-tab-label { display: inline-flex; align-items: center; gap: 6px; }
+.cv-tab[data-kind="session"] .cv-tab-label svg { flex: none; }
+@keyframes bz-pulse { 50% { opacity: 0.35; } }
+.bz-badge { display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 9999px; background: color-mix(in srgb, var(--c, var(--color-accent)) 16%, transparent); color: var(--c, var(--color-accent)); font: 500 var(--text-micro) var(--font-sans); }
+.arttype:has(> svg) { color: var(--color-accent); }
+
+.bz-addr { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 6px 12px; background: var(--color-ink-875); border-bottom: 1px solid var(--color-ink-800); }
+/* The address wraps rather than clips: the real domain is the part that must stay readable. */
+.bz-url { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 0 6px; min-height: 1.75rem; padding: 3px 10px; border: 1px solid var(--color-ink-700); border-radius: .25rem; background: var(--color-ink-900); font: var(--text-label) var(--font-mono); color: var(--color-ink-500); overflow-wrap: anywhere; }
+.bz-url[data-empty] { font-family: var(--font-sans); }
+.bz-url svg { flex: none; }
+.bz-host { color: var(--color-ink-100); font-weight: 600; }
+/* Only the tail is capped: the host, the part that names the site, never needs an in-row scroll. */
+.bz-rest { flex: 1 1 100%; min-width: 0; max-height: 3.4rem; overflow-y: auto; }
+.cv-title .bz-sub { flex-wrap: wrap; gap: 2px 6px; white-space: normal; }
+.cv-title .bz-remind { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.cv-title b[tabindex]:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; border-radius: 2px; }
+.canvas-drawer:focus { outline: none; }
+.bz-signed { flex: none; padding: 1px 7px; border-radius: 9999px; background: color-mix(in srgb, var(--color-ok) 12%, transparent); color: var(--color-ok); font: 500 var(--text-micro) var(--font-sans); }
+
+.bz-body { gap: 12px; padding-bottom: 7.5rem; }
+.bz-bar { display: block; width: 12rem; margin: 12px auto 0; }
+.bz-tag { display: block; margin-top: 10px; font: var(--text-micro) var(--font-mono); color: var(--color-ink-500); overflow-wrap: anywhere; }
+
+/* The assistant's words: framed and attributed, plain text only. */
+.bz-says { flex: none; border: 1px solid color-mix(in srgb, var(--color-warn) 40%, var(--color-ink-700)); border-radius: .5rem; background: var(--color-ink-850); overflow: hidden; }
+.bz-says-h { padding: 7px 12px; font-size: var(--text-micro); font-weight: 600; color: var(--color-ink-100); background: color-mix(in srgb, var(--color-warn) 8%, transparent); }
+.bz-says-t { margin: 0; padding: 10px 12px 4px; color: var(--color-ink-100); font-size: var(--text-body); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.bz-says-t[data-clamp="compact"] { max-height: 4.6em; overflow: hidden; -webkit-mask-image: linear-gradient(#000 60%, transparent); mask-image: linear-gradient(#000 60%, transparent); }
+.bz-says-t[data-clamp="full"] { max-height: 7.5em; overflow: hidden; -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
+.bz-more { margin: 0 12px 8px; }
+.bz-says-f { margin: 0; padding: 6px 12px 10px; font-size: var(--text-micro); color: var(--color-ink-500); line-height: 1.45; }
+.bz-says-addr { margin: 0; padding: 8px 12px; border-top: 1px solid var(--color-ink-800); display: grid; gap: 2px; }
+.bz-says-addr small { color: var(--color-ink-500); font-size: var(--text-micro); }
+.bz-says-addr code { max-height: 7rem; overflow-y: auto; font: 400 var(--text-secondary) var(--font-mono); color: var(--color-ink-400); overflow-wrap: anywhere; }
+.bz-says-addr code b { font-weight: 600; color: var(--color-ink-100); }
+
+
+/* The dock floats over the page; only the actions that apply. */
+.bz-dock { position: absolute; left: 50%; bottom: 44px; transform: translateX(-50%); width: max-content; max-width: calc(100% - 24px); padding: 8px; border: 1px solid var(--color-ink-700); border-radius: .5rem; background: var(--color-ink-850); box-shadow: 0 5px 20px rgb(0 0 0 / 0.18); display: grid; gap: 6px; z-index: 2; }
+.bz-dock:focus-visible { outline: 2px solid var(--color-accent); }
+.bz-dock-row { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 8px; }
+.bz-dock p { margin: 0 2px; max-width: 24rem; color: var(--color-ink-300); font-size: var(--text-label); line-height: 1.45; text-align: center; }
+.bz-dock p.bz-hint { color: var(--color-ink-500); font-size: var(--text-micro); }
+.bz-dock p.bz-alert { color: var(--color-fail); }
+.bz-elapsed { font-variant-numeric: tabular-nums; }
+
+/* The live view: a frame to the provider's own page, scoped by frame-src. */
+.bz-viewer { flex: 1 0 auto; display: flex; flex-direction: column; border: 1px solid var(--color-edge); border-radius: .5rem; overflow: hidden; background: var(--color-ink-850); }
+.bz-viewer:focus-within { border-color: var(--color-accent); }
+.bz-viewer-bar span { min-width: 0; overflow-wrap: anywhere; }
+.bz-viewer-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 2px 8px; padding: 5px 10px; background: var(--color-ink-800); color: var(--color-ink-400); font-size: var(--text-micro); }
+.bz-viewer-bar b { color: var(--color-ink-300); font-weight: 500; }
+.bz-viewer iframe { flex: 1 1 14rem; min-height: 14rem; width: 100%; border: 0; background: var(--color-ink-100); }
+
+/* The card's host: its own line, wrapped, and clipped from the START (the last
+   lines stay visible), so the registrable end is always readable. */
+.bz-card-host { display: flex; flex-direction: column-reverse; line-height: 1.4; max-height: 2.8em; overflow: hidden; white-space: normal; overflow-wrap: anywhere; color: var(--color-ink-200); }
+.bz-says[data-compact] .bz-says-addr code { max-height: 3.4rem; }
+.bz-card-wrap { padding: 4px 0; }
+.bz-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; width: 100%; max-width: min(100%, 26rem); padding: 9px 10px; text-align: left; }
+.bz-card:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .bz-dot[data-pulse], .cv-bar-run { animation: none; }
+}
+.canvas-drawer[data-mode="sheet"] .bz-dock { left: 8px; right: 8px; width: auto; transform: none; max-width: none; }
+.canvas-drawer[data-mode="sheet"] .bz-dock-row .btn { flex: 1 1 8rem; min-height: 2.25rem; }
+.canvas-drawer[data-mode="sheet"] .cv-iconbtn { min-width: 2.25rem; min-height: 2.25rem; }
+.canvas-drawer[data-mode="sheet"] .cv-tab-close { min-width: 2.25rem; min-height: 2.25rem; }
+
+.bz-body .sempty, .bz-body .snotice, .bz-body .serror { flex: none; }
+.bz-body .sempty { text-align: center; }
