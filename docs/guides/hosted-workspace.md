@@ -31,8 +31,8 @@ installation. It sends only a sign-in and one read, then reports each step:
 - It renews a login that is due, as any hosted command does. It does not use a
   native daemon, the local tracker or a local fallback.
 - Optional access a login did not ask for is listed with its login flag and is
-  not a fault. A new login replaces the saved login's access, so name every
-  flag you still need.
+  not a fault. A new login replaces the saved login's access, and a `--web` or
+  `--settings` login does not include the wiki.
 
 ## What runs where
 

@@ -2707,24 +2707,34 @@ fn renewal_refusal(
     body: &Value,
     correlation: Option<&crate::remote_enrollment::IssuerCorrelation>,
 ) -> Error {
-    let code = body
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     // The issuer's id is shown only when the header was valid (see
     // `issuer_correlation`). It is a support reference, never an authority.
     let request = correlation
         .map(|c| format!(" (issuer request {})", c.request_id))
         .unwrap_or_default();
-    match (status, code) {
-        (401, "invalid_token") | (400, "invalid_grant") => reject(format!(
+    if renewal_session_ended(status, body) {
+        reject(format!(
             "the renewable CLI session was rejected by the issuer — run `cadence login` again{request}"
-        )),
-        _ => reject(format!(
+        ))
+    } else {
+        reject(format!(
             "remote CLI session renewal is not complete (HTTP {status}); your saved login \
              is kept, retry the command later{request}"
-        )),
+        ))
     }
+}
+
+/// The issuer's terminal refresh-grant refusals: the one proof a fresh login
+/// is the remedy for a renewal that did not complete.
+fn renewal_session_ended(status: u16, body: &Value) -> bool {
+    let code = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    matches!(
+        (status, code),
+        (401, "invalid_token") | (400, "invalid_grant")
+    )
 }
 
 fn validate_renewal_response(

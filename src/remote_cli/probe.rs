@@ -7,6 +7,7 @@
 //! refusal a real command would print. A credential, an envelope or a raw
 //! response body never reaches a [`Check`].
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -14,9 +15,10 @@ use serde_json::{json, Value};
 
 use super::{
     auth_dir, authorize_answer, decode_refusal, envelope_of, local_status_at, post,
-    refusal_correlation, renewed_credential, request_timeout, Credential, Refusal, RemoteTarget,
-    Surface, AUTH_TIMEOUT, CALL_TIMEOUT,
+    refusal_correlation, renewal_session_ended, renewed_credential_with, request_timeout,
+    Credential, Error, Refusal, RemoteTarget, Result, Surface, AUTH_TIMEOUT, CALL_TIMEOUT,
 };
+use crate::remote_enrollment::{cli_session_post_detailed, IssuerAnswer};
 
 /// How long the whole live pass may take. Doctor reports a slow service; it
 /// does not wait one out.
@@ -108,7 +110,7 @@ fn login(target: &RemoteTarget) -> String {
 /// one to pass reports `skipped` rather than a second copy of its failure.
 pub fn run(target: &RemoteTarget, offline: bool) -> Vec<Check> {
     match auth_dir(None) {
-        Ok(dir) => checks_at(&dir, target, offline),
+        Ok(dir) => checks_at(&dir, target, offline, cli_session_post_detailed),
         Err(_) => vec![Check::with(
             "credential",
             Status::Fail,
@@ -118,7 +120,13 @@ pub fn run(target: &RemoteTarget, offline: bool) -> Vec<Check> {
     }
 }
 
-pub(super) fn checks_at(dir: &Path, target: &RemoteTarget, offline: bool) -> Vec<Check> {
+/// `run` with the credential dir and the issuer's renewal POST injectable.
+pub(super) fn checks_at(
+    dir: &Path,
+    target: &RemoteTarget,
+    offline: bool,
+    renew: impl FnOnce(&Path, &str, &str, &str, Value, Instant) -> Result<IssuerAnswer>,
+) -> Vec<Check> {
     let status = local_status_at(dir, target);
     let credential = credential_check(&status, target);
     if credential.status != Status::Ok {
@@ -140,7 +148,7 @@ pub(super) fn checks_at(dir: &Path, target: &RemoteTarget, offline: bool) -> Vec
             checks.push(Check::skipped(id, "--offline: not checked"));
         }
     } else {
-        checks.extend(live_checks(dir, target, &scopes));
+        checks.extend(live_checks(dir, target, &scopes, renew));
     }
     checks.push(scopes_check(&scopes, target));
     checks
@@ -150,11 +158,17 @@ fn credential_check(status: &Value, target: &RemoteTarget) -> Check {
     match status["state"].as_str().unwrap_or_default() {
         "renewable" => Check::ok(
             "credential",
-            "a renewable login is saved; this does not prove the workspace accepts it",
+            format!(
+                "a renewable login is saved, unused for up to {}; this does not prove the workspace accepts it",
+                remaining(status, "session_idle_expires_at")
+            ),
         ),
         "access_valid_until_expiry" => Check::ok(
             "credential",
-            "a login is saved until its access expires; it cannot renew itself",
+            format!(
+                "a login is saved for {} and cannot renew itself",
+                remaining(status, "access_expires_at")
+            ),
         ),
         "no_credential" => Check::with(
             "credential",
@@ -183,22 +197,67 @@ fn credential_check(status: &Value, target: &RemoteTarget) -> Check {
     }
 }
 
-fn live_checks(dir: &Path, target: &RemoteTarget, scopes: &[&str]) -> Vec<Check> {
+/// What the issuer did during a renewal, recorded where it happens. Renewal's
+/// error is a sentence for a person, and doctor must not parse it.
+enum IssuerSeen {
+    Unreached,
+    Answered {
+        status: u16,
+        ended: bool,
+        request: Option<String>,
+    },
+}
+
+/// A saved expiry as time from the moment `local_status` observed it.
+fn remaining(status: &Value, key: &str) -> String {
+    let left = status[key]
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_sub(status["observed_at"].as_u64().unwrap_or(0));
+    match left {
+        0..=119 => format!("{left} seconds"),
+        120..=7199 => format!("{} minutes", left / 60),
+        7200..=172_799 => format!("{} hours", left / 3600),
+        _ => format!("{} days", left / 86_400),
+    }
+}
+
+fn live_checks(
+    dir: &Path,
+    target: &RemoteTarget,
+    scopes: &[&str],
+    renew: impl FnOnce(&Path, &str, &str, &str, Value, Instant) -> Result<IssuerAnswer>,
+) -> Vec<Check> {
     let Some(deadline) = Instant::now().checked_add(BUDGET) else {
-        return Vec::new();
+        return vec![
+            out_of_time("auth"),
+            Check::skipped("read", "needs a working login"),
+            Check::skipped("wiki", "needs a working login"),
+        ];
     };
-    let cred = match renewed_credential(dir, target, deadline) {
+    let seen = RefCell::new(None);
+    let renewed = renewed_credential_with(
+        dir,
+        target,
+        deadline,
+        |dir, issuer, path, bearer, body, until| {
+            let answer = renew(dir, issuer, path, bearer, body, until);
+            *seen.borrow_mut() = Some(match &answer {
+                Ok(answer) => IssuerSeen::Answered {
+                    status: answer.status,
+                    ended: renewal_session_ended(answer.status, &answer.body),
+                    request: answer.correlation.as_ref().map(|c| c.request_id.clone()),
+                },
+                Err(_) => IssuerSeen::Unreached,
+            });
+            answer
+        },
+    );
+    let cred = match renewed {
         Ok(cred) => cred,
-        // Renewal's own text already names the next step, and it separates a
-        // session the issuer rejected from one that is only not renewed yet.
         Err(error) => {
             return vec![
-                Check::with(
-                    "auth",
-                    Status::Fail,
-                    "the saved login could not be renewed".into(),
-                    error.to_string(),
-                ),
+                renewal_failed(target, seen.into_inner(), &error),
                 Check::skipped("read", "needs a working login"),
                 Check::skipped("wiki", "needs a working login"),
             ];
@@ -222,6 +281,55 @@ fn live_checks(dir: &Path, target: &RemoteTarget, scopes: &[&str]) -> Vec<Check>
         read_check(target, &cred, &envelope, deadline),
         wiki_check(target, &cred, scopes, deadline),
     ]
+}
+
+/// A renewal that did not complete. Login is the remedy only when the issuer
+/// proved the session ended: renewal comes first on most runs, so an outage
+/// must not read as a login problem here either.
+fn renewal_failed(target: &RemoteTarget, seen: Option<IssuerSeen>, error: &Error) -> Check {
+    match seen {
+        // Nothing was sent: another command holds the login, or the saved
+        // login cannot be renewed from here, and renewal's text says which.
+        None if error.kind() == "busy" => out_of_time("auth"),
+        None => Check::with(
+            "auth",
+            Status::Fail,
+            "the saved login cannot be renewed on this machine".into(),
+            error.to_string(),
+        ),
+        Some(IssuerSeen::Unreached) => Check::with(
+            "auth",
+            Status::Fail,
+            "could not reach the sign-in service; this says nothing about your login".into(),
+            "check this machine's network, then retry; the saved login is kept".into(),
+        ),
+        Some(IssuerSeen::Answered {
+            status,
+            ended,
+            request,
+        }) => {
+            let request = request.map_or(String::new(), |id| format!(" (issuer request {id})"));
+            if ended {
+                Check::with(
+                    "auth",
+                    Status::Fail,
+                    format!("the hosted session has ended (HTTP {status}){request}"),
+                    login(target),
+                )
+            } else if status == 200 {
+                unrecognised("auth", "a renewal")
+            } else {
+                Check::with(
+                    "auth",
+                    Status::Fail,
+                    format!(
+                        "the sign-in service did not complete renewal (HTTP {status}); this does not show a problem with your login{request}"
+                    ),
+                    "retry later; the saved login is kept".into(),
+                )
+            }
+        }
+    }
 }
 
 /// One authorize on `surface`. On refusal, the finished check instead of an
@@ -403,11 +511,7 @@ pub fn exit_code(checks: &[Check]) -> i32 {
 }
 
 fn overall(checks: &[Check]) -> &'static str {
-    match checks.iter().map(|c| c.status).max() {
-        Some(Status::Fail) => "fail",
-        Some(Status::Warn | Status::Unknown) => "warn",
-        _ => "ok",
-    }
+    ["ok", "warn", "fail"][exit_code(checks) as usize]
 }
 
 pub fn report_json(target: &RemoteTarget, checks: &[Check]) -> Value {

@@ -28,9 +28,14 @@ pub(super) fn run_remote(
     client_only: bool,
 ) -> i32 {
     let kind = if client_only { "client-only" } else { "native" };
-    let version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CADENCE_BUILD_COMMIT"));
     let mut checks = vec![
-        Check::ok("install", format!("{kind} installation, version {version}")),
+        Check::ok(
+            "install",
+            format!(
+                "{kind} installation, version {}",
+                cadence_agent::overview::BUILD_ID
+            ),
+        ),
         Check::ok(
             "selection",
             format!(

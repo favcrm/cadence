@@ -155,7 +155,8 @@ pub(crate) enum Commands {
     /// 0 ok, 1 warn, 2 fail. With a hosted org selected, plain doctor
     /// instead checks that connection from this machine, on any
     /// installation: saved login, live sign-in, a read, the wiki and what
-    /// this login can do, with the same exit codes.
+    /// this login can do, with the same exit codes. It renews a login that
+    /// is due, as any hosted command does, and changes nothing else.
     Doctor {
         /// Run the host watchdog checks instead of the environment probe.
         #[arg(long)]
