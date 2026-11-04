@@ -262,7 +262,8 @@ function browserLocale(): Locale {
   if (typeof navigator === "undefined") return "en";
   const languages = navigator.languages?.length ? navigator.languages : [navigator.language];
   for (const language of languages) {
-    if (/^zh-(TW|Hant)(-|$)/i.test(language)) return "zh-TW";
+    // zh-HK/zh-MO read written Chinese: the catalogue is stored under zh-TW.
+    if (/^zh-(TW|Hant|HK|MO)(-|$)/i.test(language)) return "zh-TW";
     if (/^en(-|$)/i.test(language)) return "en";
   }
   return "en";
@@ -1096,6 +1097,10 @@ Object.assign(zhTW, {
   "Installing…": "安裝中…", "Install and record approval": "安裝並記錄核准", "manage app": "管理應用程式", "Manage is the operator's": "管理由操作員負責", "Ask an admin to change access, updates or remove.": "如需變更存取權、更新或移除，請請管理員處理。", "Back to Apps": "返回應用程式",
   "← Apps": "← 應用程式", "Manage {title}": "管理 {title}", "Removed. Restore brings it back within its 30-day window.": "已移除。還原可在 30 天內將其恢復。", "Removed. The 30-day restore window has closed, so it stays removed.": "已移除。30 天還原期限已過，因此維持移除狀態。", "App package": "應用程式套件", "Automatic updates": "自動更新", "Updates that change what this app can reach still ask you.": "改變此應用程式可觸及範圍的版本仍會詢問你。", "This release changes what {title} can reach.": "此版本改變了 {title} 可觸及的範圍。", "Automatic updates for {title}": "{title} 的自動更新", "An update is ready to review.": "有更新可供審查。",
   "No update is currently flagged.": "目前沒有標示任何更新。", "Installed version {version}.": "已安裝版本 {version}。", "App package path or Git URL": "應用程式套件路徑或 Git URL", "Check update": "檢查更新", "Proposed version {version} · {name}": "建議版本 {version} · {name}", "New digest:": "新摘要：",
+  "Checking update status…": "正在檢查更新狀態…", "Update status unavailable.": "無法確認更新狀態。", "Review published versions": "檢視已發佈版本", "Browse published apps": "瀏覽已發佈應用程式",
+  "Check the catalogue for published updates.": "請查看應用程式目錄中的已發佈更新。",
+  "Removed — restore it to review published updates.": "已移除 — 還原後即可檢視已發佈的更新。",
+  "Removed — updates are unavailable.": "已移除 — 無法使用更新。",
   "Package validation reported secret warnings; review the source before applying.": "套件驗證回報了機密資訊警告；套用前請先審查原始碼。", "Applying…": "套用中…", "Apply checked update": "套用已檢查的更新", "Connections and setup": "連線與設定", "The accounts and helpers {title} uses.": "{title} 使用的帳戶與輔助工具。", "No outside accounts.": "沒有外部帳戶。",
   "Open its page": "開啟其頁面", "Access": "存取", "Let {title} work": "允許 {title} 運作", "Off — the app is removed.": "已關閉 — 應用程式已移除。", "Off — it can't run or use its connections. Its data is kept.": "已關閉 — 無法執行或使用其連線。其資料會保留。", "On — it can run and use its connections.": "已開啟 — 可執行並使用其連線。",
   "Restore {title}": "還原 {title}", "Removed apps restore within 30 days, with the same data.": "已移除的應用程式可在 30 天內還原，資料保持不變。", "The restore window has closed.": "還原期限已過。", "Remove {title}": "移除 {title}", "Takes the app and its data out of this workspace. You'll see exactly what goes before anything is deleted.": "會將應用程式及其資料從此工作區移除。刪除任何內容前，你會先看到將被移除的確切項目。", "Remove app…": "移除應用程式…",
