@@ -936,6 +936,28 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
             names = sorted({n["name"] for n in stamped if n["stamp"] == newest})
             if len(names) > 1:
                 reasons.append(f"cannot order two verdicts by one reviewer with the same file-name stamp: {' and '.join(names)}")
+    # CAD-2081 follow-up: the counted-kind filter below drops `other` rows before
+    # the workflow checks run, so a workflow row of that kind produced no refusal
+    # at all. Validate every workflow row here, whatever kind it names.
+    if hosted is not None:
+        reserved = hosted.get("workflow_principals")
+        for v in verdicts:
+            if v["outcome"] != "pass" or v["kind"] != "other":
+                continue
+            who = identity(v)
+            if is_workflow_row(v):
+                why = workflow_reason(v, hosted)
+                if why:
+                    reasons.append(why)
+            elif who in (reserved or {}):
+                reasons.append(
+                    f"verdict {v['name']} names workflow principal {who} but is not a "
+                    "workflow-issued row; it counts for nothing")
+            elif who.startswith("svc_") and reserved is None:
+                reasons.append(
+                    f"verdict {v['name']} names service principal {who}, and "
+                    f"{WORKFLOW_PRINCIPALS_FILE} cannot be read to tell whether it is reserved "
+                    "(fail closed)")
     # Counted: the latest recognised, stamped note per (reviewer, kind), when it passes.
     latest = {}
     for v in verdicts:
@@ -1905,6 +1927,37 @@ def self_test():
             ok = bool(reasons) and not counted and any(expected in r for r in reasons)
             detail = "; ".join(reasons) or "no refusal"
         print(f"{'ok  ' if ok else 'FAIL'} {label}: {detail}")
+        failures += 0 if ok else 1
+
+    def workflow_hosted():
+        return {"repo": "o/r", "project": "p", "author_login": "author",
+                "author_principal": "usr_author", "pr_base": "main",
+                "workflow_principals": {
+                    "svc_std": {"kind": "standards",
+                                "workflow": ".github/workflows/review-standards.yml"}},
+                "workflow_file": lambda sha, path: ""}
+
+    def workflow_row(name, principal, kind):
+        return {"name": name, "stamp": "20261103-000000", "reviewer": "",
+                "reviewer_id": principal, "github_login": "", "repo": "o/r",
+                "kind": kind, "outcome": "pass", "title_outcome": "pass",
+                "section_outcome": "pass", "risk": "auto",
+                "identity_source": "workflow-oidc",
+                "base_sha": "a" * 40, "workflow_sha": "b" * 40}
+
+    # CAD-2081 follow-up: an uncounted kind used to drop the row before the
+    # workflow checks, so these produced no refusal.
+    workflow_cases = [
+        ("a workflow row of an uncounted kind refuses",
+         workflow_row("d.md", "svc_std", "other"), "may file only standards, not other"),
+        ("an unlisted workflow principal refuses",
+         workflow_row("e.md", "svc_ghost", "other"), "not in docs/roles/review-workflow-principals.toml"),
+    ]
+    for label, verdict, expected in workflow_cases:
+        reasons, counted = check_reviews(
+            [verdict], True, False, set(), "CAD-1", workflow_hosted())
+        ok = not counted and any(expected in r for r in reasons)
+        print(f"{'ok  ' if ok else 'FAIL'} {label}: {'; '.join(reasons) or 'no refusal'}")
         failures += 0 if ok else 1
     return 0 if not failures else 1
 

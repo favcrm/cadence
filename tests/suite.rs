@@ -1084,6 +1084,35 @@ mod cad2081_workflow_verdicts {
     }
 
     #[test]
+    fn a_workflow_row_of_an_uncounted_kind_still_refuses() {
+        let f = Fixture::new();
+        // The counted-kind filter drops `other` rows before the workflow checks,
+        // so an unlisted principal or the wrong kind used to vanish silently.
+        let unlisted = f.wrow(
+            "20261103-000300-o.md",
+            "20261103-000300",
+            "svc_other",
+            "other",
+        );
+        refused(
+            &f,
+            scenario(vec![f.std(), f.spec(), unlisted]),
+            "svc_other is not in docs/roles/review-workflow-principals.toml",
+        );
+        let listed_other = f.wrow(
+            "20261103-000400-o.md",
+            "20261103-000400",
+            "svc_std",
+            "other",
+        );
+        refused(
+            &f,
+            scenario(vec![f.std(), f.spec(), listed_other]),
+            "principal svc_std may file only standards, not other",
+        );
+    }
+
+    #[test]
     fn a_missing_or_malformed_allowlist_at_mains_tip_refuses_every_workflow_row() {
         let f = Fixture::new();
         let rows = || vec![f.std(), f.spec()];
