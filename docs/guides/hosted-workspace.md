@@ -471,7 +471,7 @@ cadence --org acme agent profile archive ap_<profile-id> --latest
   the profile at the revision you give and leaves the rest as stored.
 - Field names are the board's. `--set FIELD=VALUE` sends text, `--set-json
   FIELD=JSON` sends a value that is not text (`skills` is an array), and
-  `--file FIELD=PATH|-` sends a file's or stdin's text unchanged. The client
+  `--file FIELD=PATH|-` sends a file's or stdin's text unchanged, and a hosted board trims it when it saves, so a final newline doesn't survive. The client
   holds no field list and no limits: the board refuses an unknown field or a
   value that is too long, with its own code (`invalid_request`).
 - `edit` and `archive` need `--expect-rev N` or `--latest`. `--latest` reads the
