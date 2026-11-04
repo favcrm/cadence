@@ -74,6 +74,7 @@ async function advance(ms: number) {
   await settle();
 }
 
+const masterTurn = () => (board.masterTurn ? { state: "working", message: "o1", summary: "working", since: 1, conversation: "cmaster" } : null);
 // What the board's toast would be told.
 const toasts: string[] = [];
 store.onBrowserAlert((text) => toasts.push(text));
@@ -101,6 +102,7 @@ const board = {
   late: false,
   /** The member's turn in the history: 0 none, 1 open (a send and a tool call), 2 answered. */
   turn: 0,
+  masterTurn: false,
   conversation: "c1",
 };
 globalThis.fetch = (async (input: unknown, init?: { method?: string; signal?: AbortSignal }) => {
@@ -139,7 +141,7 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string; signal?: Ab
   }
   if (url.pathname === "/api/threads/master/stream") {
     const body = new ReadableStream<Uint8Array>({ start(controller) {
-      controller.enqueue(new TextEncoder().encode('event: master\ndata: {"alias":"master","live":true,"turn":null,"queue":[]}\n\n'));
+      controller.enqueue(new TextEncoder().encode(`event: master\ndata: ${JSON.stringify({ alias: "master", live: true, turn: masterTurn(), queue: [] })}\n\n`));
       init?.signal?.addEventListener("abort", () => controller.close(), { once: true });
     } });
     return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
@@ -149,7 +151,7 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string; signal?: Ab
     return new Response(JSON.stringify({ thread, entries: [{ seq: 1, role: "operator", kind: "message", text: "hello", message: "o1" }], cursor: 1, more_before: false, more_after: false }), { status: 200, headers: { "Content-Type": "application/json" } });
   }
   if (url.pathname === "/api/agents") return new Response(JSON.stringify({ daemon: "reachable", agents: [{ alias: "master", state: "idle" }], totals: null, by_issue: {} }), { status: 200 });
-  if (url.pathname === "/api/master/state") return new Response(JSON.stringify({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }), { status: 200 });
+  if (url.pathname === "/api/master/state") return new Response(JSON.stringify({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true, turn: masterTurn(), queue: [] }), { status: 200 });
   if (url.pathname === "/api/member-assistant/state") {
     return new Response(JSON.stringify({ conversation_id: "cm1", assistant: { org: "o", sub: "u", assistant_id: "a", alias: "assistant", conversation_id: "cm1", state: "ready", bootstrap_state: null } }), { status: 200 });
   }
@@ -161,7 +163,9 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string; signal?: Ab
     ];
     if (board.turn > 0) {
       entries.push({ seq: 7, role: "member", kind: "message", text: "look it up", message: "m3" }, { seq: 8, role: "agent", kind: "tool_call", text: "browser: open", message: "m3" });
-      if (board.turn > 1) entries.push({ seq: 9, role: "agent", kind: "turn_result", text: "Done, take over.", message: "m3" });
+      if (board.turn === 2) entries.push({ seq: 9, role: "agent", kind: "turn_result", text: "Done, take over.", message: "m3" });
+      // 3: the turn goes on with one more step and still no answer.
+      if (board.turn === 3) entries.push({ seq: 10, role: "agent", kind: "tool_call", text: "browser: read", message: "m3" });
     }
     if (board.late) {
       // A second turn the person started, whose artifact arrives after the chat mounted.
@@ -196,7 +200,7 @@ async function mount() {
 }
 function reset(over: Partial<typeof board> = {}) {
   timers.clear();
-  Object.assign(board, { mode: "ok", body: { state: "none", signedIn: false, url: null, instructions: null }, gets: 0, views: 0, stops: 0, stopStatus: 200, stopHold: false, release: null, late: false, turn: 0, getHang: false, viewHang: false, getHold: false, releaseGet: null, viewHold: false, releaseView: null, viewStatus: 200, viewUrl: VIEWER, conversation: "c1" }, over);
+  Object.assign(board, { mode: "ok", body: { state: "none", signedIn: false, url: null, instructions: null }, gets: 0, views: 0, stops: 0, stopStatus: 200, stopHold: false, release: null, late: false, turn: 0, masterTurn: false, getHang: false, viewHang: false, getHold: false, releaseGet: null, viewHold: false, releaseView: null, viewStatus: 200, viewUrl: VIEWER, conversation: "c1" }, over);
   toasts.length = 0;
   store.resetBrowser();
   canvasStore.resetCanvas("c1", "home", "home");
@@ -1384,15 +1388,18 @@ for (const body of [
 }
 
 // ===== item 1: a session or takeover that starts mid-turn shows with no reload =====
+let chats = 0;
 async function mountChat() {
+  // Each chat is its own scope: the thread store outlives a mount.
+  const scope = `s${++chats}:u1`;
   const MemberChat = require("../src/features/home/MemberChat").default;
   const hostEl = document.createElement("div");
   document.body.append(hostEl);
   const root = createRoot(hostEl);
   await React.act(async () => {
-    root.render(React.createElement(LocaleProvider, null, React.createElement(MemberChat, { scope: "s1:u1", readOnly: false, onOpenIssue: () => undefined }), React.createElement(CanvasDrawer)));
+    root.render(React.createElement(LocaleProvider, null, React.createElement(MemberChat, { scope, readOnly: false, onOpenIssue: () => undefined }), React.createElement(CanvasDrawer)));
   });
-  return { host: hostEl, unmount: async () => { await React.act(async () => { root.unmount(); }); hostEl.remove(); } };
+  return { host: hostEl, scope, unmount: async () => { await React.act(async () => { root.unmount(); }); hostEl.remove(); } };
 }
 {
   reset({ body: { state: "none" }, conversation: "cm1" });
@@ -1482,6 +1489,115 @@ async function mountChat() {
     await advance(30_000);
     equal(board.gets, after, `${hosted ? "hosted" : "native"}: leaving Home stops it`);
   }
+}
+
+// ===== the member chat's turn is bounded: 3 minutes from the thread's last change =====
+const WINDOW = 3 * 60_000;
+{
+  // Reopening a chat mid-turn polls from the start, with no new entry to wake it.
+  reset({ body: { state: "none" }, conversation: "cm1", turn: 1 });
+  const c = await mountChat();
+  await advance(4000);
+  board.body = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." };
+  await advance(3000);
+  assert(el(c.host, ".bz-card"), "a chat opened mid-turn sees a session that starts with no new entry");
+  await c.unmount();
+}
+{
+  reset({ body: { state: "none" }, conversation: "cm1", turn: 1 });
+  const c = await mountChat();
+  await advance(WINDOW - 20_000);
+  const before = board.gets;
+  assert(before > 20, `a turn with no answer is read on a short interval (${before})`);
+  await advance(40_000);
+  const ended = board.gets;
+  await advance(60 * 60_000);
+  equal(board.gets, ended, "after the window it stays at zero reads for an hour, with one last read at the end");
+  assert(ended <= before + 12, `and nothing like a poll went on past it (${before} -> ${ended})`);
+  equal(toasts.length, 0, "no toast for the window ending");
+  // A new thread entry restarts it.
+  board.turn = 3;
+  await advance(7000);
+  const restarted = board.gets;
+  await advance(6000);
+  assert(board.gets >= restarted + 2, "a new entry reopens the window");
+  await advance(WINDOW + 10_000);
+  const closed = board.gets;
+  await advance(10 * 60_000);
+  equal(board.gets, closed, "and it closes again");
+  await c.unmount();
+}
+{
+  // An answer closes it at once.
+  reset({ body: { state: "none" }, conversation: "cm1", turn: 1 });
+  const c = await mountChat();
+  await advance(6000);
+  board.turn = 2;
+  await advance(7000);
+  const done = board.gets;
+  await advance(60_000);
+  equal(board.gets, done, "an answered turn is not polled");
+  await c.unmount();
+}
+{
+  // A failed send is no running turn.
+  reset({ body: { state: "none" }, conversation: "cm1" });
+  const { memberThreadStore } = require("../src/features/home/memberThread") as typeof import("../src/features/home/memberThread");
+  const { addPending, settlePending } = require("../src/features/home/thread") as typeof import("../src/features/home/thread");
+  const c = await mountChat();
+  await advance(8000);
+  await React.act(async () => { memberThreadStore(c.scope).write((st: any) => settlePending(addPending(st, "p1", "look it up", 1), "p1", { ok: false, error: "offline" })); });
+  await advance(2000);
+  const quiet = board.gets;
+  await advance(60_000);
+  equal(board.gets, quiet, "a failed pending send does not poll");
+  await c.unmount();
+}
+
+// ===== the operator's running turn drives polling =====
+{
+  const Home = require("../src/features/home/Home").default;
+  const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
+  for (const running of [true, false]) {
+    reset({ body: { state: "none" }, conversation: "cmaster", masterTurn: running });
+    resources.masterThread.reset();
+    const hostEl = document.createElement("div");
+    document.body.append(hostEl);
+    const root = createRoot(hostEl);
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
+        readOnly: false, hosted: true, overview: resources.overview.get(), onOpenIssue: () => undefined,
+        onOpenDecision: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      }), React.createElement(CanvasDrawer)));
+    });
+    for (let i = 0; i < 4; i++) await advance(1000);
+    const base = board.gets;
+    await advance(20_000);
+    if (running) assert(board.gets >= base + 8, `a running master turn polls the board in none (${base} -> ${board.gets})`);
+    else equal(board.gets, base, "an idle master does not");
+    await React.act(async () => { root.unmount(); });
+    hostEl.remove();
+  }
+}
+
+// ===== a failed read with no live session shows nothing; focus never lands on Stop =====
+{
+  const m = await start({ state: "none" });
+  board.mode = "network";
+  for (let i = 0; i < 4; i++) await React.act(async () => { await store.refreshBrowser(); });
+  await settle();
+  assert(!el(m.host, ".bz-card") && !store.browserSnapshot().loadError, "a failed read in none shows no card and no error");
+  equal(toasts.length, 0, "and no toast");
+  await m.unmount();
+}
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await React.act(async () => { btn(m, "view")!.focus(); });
+  board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  await advance(2000);
+  assert(btn(m, "stop") && document.activeElement !== btn(m, "stop"), "when the takeover ends under focus, focus is not on Stop");
+  await m.unmount();
 }
 
 console.log("browser canvas tests passed");

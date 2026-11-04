@@ -15,8 +15,10 @@
  *   control, and this is how the board notices. While the host says a turn is
  *   running it polls in any state, because the assistant starts a session or
  *   asks for a takeover partway through a turn, with no thread entry to say
- *   so, and reads once more when the turn settles. An idle `none` never polls,
- *   and a board that answered unavailable is never read again;
+ *   so, and reads once more when the turn settles. The member chat counts a
+ *   turn as running for at most 3 minutes after its thread last changed, so
+ *   polling is bounded; an idle `none` never polls, and a board that answered
+ *   unavailable is never read again;
  * - no viewer URL is ever held here (see browserClient.viewBrowser).
  */
 import { useEffect, useSyncExternalStore } from "react";
@@ -182,8 +184,10 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
 }
 
 /** A failed read keeps what is shown. One failure is a blip; only a run of them,
- *  and once, says the state cannot be loaded. */
+ *  and once, says the state cannot be loaded; only for a live session. */
 function readFailed(): void {
+  // With no live session there is nothing to lose sight of: no session, no noise.
+  if (state.session?.state !== "active" && state.session?.state !== "handoff" && state.stop === "idle") return;
   if (!state.loadError) set({ ...state, loadError: true });
   if (++failedReads === ALERT_AFTER) alertBrowser("Can't load the browser state.");
 }

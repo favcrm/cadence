@@ -1853,6 +1853,5 @@ Object.assign(zhTW, {
   "Waiting for you": "等待您",
   "in canvas": "在畫布中",
   "Hide Browser tab. The session keeps running.": "隱藏瀏覽器分頁。工作階段會繼續執行。",
-  "stopping": "停止中",
   "Anything signed in to this session is lost.": "在此工作階段登入的內容將會失去。",
 });

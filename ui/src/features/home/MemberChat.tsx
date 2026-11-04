@@ -20,7 +20,7 @@ import {
 } from "./thread";
 import { memberThreadReader } from "./memberThread";
 import { ImageConversation } from "../canvas/imageConversation";
-import { topSeq, useCanvasFeed } from "../canvas/feed";
+import { useCanvasFeed } from "../canvas/feed";
 import { BrowserCard } from "../canvas/BrowserPanel";
 import { useBrowserFeed } from "../canvas/browserStore";
 import {
@@ -68,6 +68,9 @@ interface MemberSurface {
 }
 
 const LOADING_IDENTITY: IdentityRead = { state: "loading" };
+
+/** How long after the thread last changed a turn is still taken to be running. */
+const TURN_WINDOW_MS = 3 * 60_000;
 
 export default function MemberChat({
   scope,
@@ -229,13 +232,20 @@ export default function MemberChat({
   // Auto-open is off here: an artifact opens the drawer when the person asks,
   // so on a phone the drawer never covers the chat they are reading.
   useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null, autoOpen: false });
-  // There is no turn state on this surface: a turn is open from a send or a
-  // stored entry newer than the history shown on open until its answer lands.
+  // There is no turn state on this surface, so a turn counts as open while the
+  // thread does not end on an answer (or a failed send) AND it changed within
+  // TURN_WINDOW_MS, from mount or from its newest change. A turn that ends with
+  // no answer therefore stops being watched; any new entry restarts the window.
   const tail = [...items].reverse().find((i) => !["system", "artifact", "image", "video", "hire"].includes(i.type));
+  const changed = `${lastSeq(thread.data) ?? 0}:${thread.data?.pending?.length ?? 0}`;
+  const [expired, setExpired] = useState(false);
+  useEffect(() => {
+    setExpired(false);
+    const id = setTimeout(() => setExpired(true), TURN_WINDOW_MS);
+    return () => clearTimeout(id);
+  }, [conversationId, changed]);
   const turnOpen =
-    tail !== undefined &&
-    tail.type !== "answer" &&
-    (tail.type === "pending" ? tail.pending.state !== "failed" : topSeq(items) > (liveAfter.current ?? 0));
+    tail !== undefined && tail.type !== "answer" && !(tail.type === "pending" && tail.pending.state === "failed") && !expired;
   useBrowserFeed(conversationId, turnOpen, lastSeq(thread.data));
 
   const [glideTick, setGlide] = useState(0);
