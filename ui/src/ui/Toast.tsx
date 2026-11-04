@@ -16,7 +16,7 @@ export default function Toast({ msg }: { msg: ToastMsg | null }) {
   return (
     <div
       role="status"
-      className={`fixed bottom-5 left-1/2 -translate-x-1/2 z-40 card px-4 py-2.5 num text-label shadow-2xl shadow-black/60 max-w-[80vw] ${KIND[msg.kind]}`}
+      className={`board-toast fixed bottom-5 left-1/2 -translate-x-1/2 z-40 card px-4 py-2.5 num text-label shadow-2xl shadow-black/60 max-w-[80vw] ${KIND[msg.kind]}`}
     >
       {msg.text}
     </div>

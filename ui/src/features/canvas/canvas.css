@@ -271,3 +271,5 @@
 .canvas-drawer[data-mode="sheet"] .bz-dock .btn { flex: 1 1 8rem; min-height: 2.25rem; }
 .canvas-drawer[data-mode="sheet"] .cv-iconbtn { min-width: 2.25rem; min-height: 2.25rem; }
 .canvas-drawer[data-mode="sheet"] .cv-tab-close { min-width: 2.25rem; min-height: 2.25rem; }
+/* A phone's canvas is the whole screen with its actions at the foot: the board's toast rides above them. */
+body:has(.canvas-drawer[data-mode="sheet"]) .board-toast { bottom: 4.5rem; }
