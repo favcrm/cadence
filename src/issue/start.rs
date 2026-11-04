@@ -619,10 +619,14 @@ fn reuse_lane(
             return Err(Error::rejected(format!(
                 "{id} already has an open worktree '{slug}' at {path} — \
                  --name {name} would start a second lane. Re-run without \
-                 --name to reuse it, or close it first with `cadence issue \
-                 finish {id} --worktree {path}`",
+                 --name to reuse it, or close it first with {finish}",
                 id = front.id,
-                path = lane.display()
+                path = lane.display(),
+                finish = crate::printed_command::with_path(
+                    &format!("cadence issue finish {} --worktree", front.id),
+                    lane,
+                    "",
+                ),
             )));
         }
     }

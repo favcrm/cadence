@@ -1117,19 +1117,7 @@ fn a_reenroll_before_a_committed_bind_is_unknown_and_a_retry_settles_it() {
     assert!(require_bound_enrollment(&current(&dir).unwrap(), &retried, &dir).is_ok());
 }
 
-/// A refusal reaches stderr as JSON. A command is safe to paste from there only if
-/// JSON encoding leaves it unchanged.
-fn survives_json(text: &str) -> bool {
-    serde_json::to_string(text).unwrap() == format!("\"{text}\"")
-}
-
-const UNPRINTABLE_PATHS: [&str; 5] = [
-    "/private/it's",
-    "/private/a'; touch owned; '",
-    "/private/back\\slash",
-    "/private/dq\"uote",
-    "/private/new\nline",
-];
+use crate::printed_command::tests::{survives_json, UNPRINTABLE as UNPRINTABLE_PATHS};
 
 /// The recovery command stays pasteable, and the message states when it stops
 /// working and what to do then.
@@ -1159,17 +1147,17 @@ fn the_unknown_bind_message_prints_a_command_only_when_it_is_safe_to_paste() {
 #[test]
 fn the_missing_pin_remedy_prints_a_command_only_when_it_is_safe_to_paste() {
     let issuer = "https://issuer.example.test";
-    let shown = missing_pin_remedy(issuer, "/private/has space/trusted-issuer");
+    let shown = missing_pin_remedy(issuer, Path::new("/private/has space/trusted-issuer"));
     assert!(survives_json(&shown), "{shown}");
     assert!(
         shown.contains("'/private/has space/trusted-issuer'"),
         "{shown}"
     );
     for path in UNPRINTABLE_PATHS {
-        let shown = missing_pin_remedy(issuer, path);
+        let shown = missing_pin_remedy(issuer, Path::new(path));
         assert!(!shown.contains("echo"), "{shown}");
         assert!(shown.contains("cannot be printed"), "{shown}");
-        let shown = missing_pin_remedy(path, "/private/trusted-issuer");
+        let shown = missing_pin_remedy(path, Path::new("/private/trusted-issuer"));
         assert!(!shown.contains("echo"), "{shown}");
     }
 }

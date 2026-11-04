@@ -1871,11 +1871,11 @@ impl Pm {
             "the tracker has an interrupted write: a writer exited without \
              finishing, leaving {}{tail}. Nothing was replayed or committed and \
              the lock itself is free.{foreign} The write's outcome is uncertain — check \
-             `git -C {} status` and `cadence issue lint`, then commit or discard \
+             {} and `cadence issue lint`, then commit or discard \
              those paths yourself; writes touching them resume once they are resolved, \
              while writes to disjoint paths (via lock_for_paths) proceed.{trailer}",
             named.join(", "),
-            self.dir.display()
+            crate::printed_command::with_path("git -C", &self.dir, " status")
         ))
     }
 }

@@ -88,6 +88,7 @@ pub mod overview;
 pub mod peer;
 pub mod pi_policy;
 pub mod platform;
+pub mod printed_command;
 pub mod proc;
 pub(crate) mod protected_pi_profile;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

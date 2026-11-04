@@ -99,6 +99,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::printed_command::path_arg;
 use crate::rollout::{db_file, SCHEMA_VERSION};
 use crate::secret::{self, Allowlist, Severity};
 
@@ -2073,7 +2074,30 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
     if leftovers.is_empty() {
         return Ok(());
     }
-    let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
+    // Each command names these paths, so all of them must be printable. The restored
+    // target has the leftover's own directory and a shorter name of the same file.
+    let aside_dir = default_dir(state_dir);
+    let printable = std::iter::once(aside_dir.as_path())
+        .chain(leftovers.iter().map(PathBuf::as_path))
+        .all(|p| path_arg(p).is_some());
+    if !printable {
+        return Err(Error::rejected(format!(
+            "an interrupted restore left {} in {}; refusing to open the store there. These \
+             paths cannot be printed as safe commands, so recover by hand. If {} exists and is \
+             the store you restored, move these files out of the state dir. If it is not, move \
+             it and its -wal/-shm out first, then rename each `.replaced-` file back to the name \
+             before that suffix. Remove any `.orphaned-` file after inspection; those are not \
+             previous files. Then start the daemon again",
+            leftovers
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            state_dir.display(),
+            db_file(state_dir).display(),
+        )));
+    }
+    let quote = |p: &Path| path_arg(p).unwrap_or_else(|| p.display().to_string());
     let is_orphan = |p: &&PathBuf| {
         p.file_name()
             .unwrap_or_default()
@@ -2115,7 +2139,6 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
         .join(", ");
     let live = db_file(state_dir);
     let recovery = if live.exists() {
-        let aside_dir = default_dir(state_dir);
         let mut s = if put_back.is_empty() {
             format!(
                 "{live} exists too. If it is not the store you restored (for \

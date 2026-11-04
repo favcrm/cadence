@@ -2256,3 +2256,56 @@ fn cad767_orphan_markers_refuse_restore_and_start() {
     );
     assert!(marker.exists());
 }
+
+/// The recovery has to work as printed: run it, then look at the store.
+#[test]
+fn the_printed_put_back_command_restores_the_previous_store() {
+    let root = TempDir::new().unwrap();
+    let state = root.path().join("has space");
+    std::fs::create_dir(&state).unwrap();
+    let aside = state.join("cadence.sqlite3.replaced-20260923T000000Z-deadbeef");
+    std::fs::write(&aside, b"previous store").unwrap();
+
+    let err = refuse_interrupted_restore(&state).unwrap_err().to_string();
+
+    assert!(crate::printed_command::tests::survives_json(&err), "{err}");
+    let (_, rest) = err.split_once("Put the previous store back: ").expect(&err);
+    let (command, _) = rest.split_once(". Then start").expect(&err);
+    let mut shell = std::process::Command::new("sh");
+    shell.arg("-c").arg(command);
+    assert!(
+        crate::reaper::output(&mut shell).unwrap().status.success(),
+        "{command}"
+    );
+    assert_eq!(std::fs::read(db_file(&state)).unwrap(), b"previous store");
+    assert!(!aside.exists());
+}
+
+/// A state dir that cannot be printed safely gets no runnable recovery. An `mv` or
+/// `rm` here would run the rest of a crafted name when pasted from the JSON.
+#[test]
+fn an_unprintable_state_dir_gets_no_recovery_command() {
+    for name in ["it's", "a'; touch canary; '", "back\\slash", "dq\"uote"] {
+        let root = TempDir::new().unwrap();
+        let state = root.path().join(name);
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(
+            state.join("cadence.sqlite3.replaced-20260923T000000Z-deadbeef"),
+            b"previous store",
+        )
+        .unwrap();
+        std::fs::write(
+            state.join("cadence.sqlite3.orphaned-20260923T000000Z-deadbeef"),
+            b"quarantined",
+        )
+        .unwrap();
+
+        let err = refuse_interrupted_restore(&state).unwrap_err().to_string();
+
+        assert!(err.contains("cannot be printed"), "{err}");
+        assert!(err.contains("rename each"), "{err}");
+        for command in ["mv '", "rm '", "mkdir -p"] {
+            assert!(!err.contains(command), "{command} in {err}");
+        }
+    }
+}

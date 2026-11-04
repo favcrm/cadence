@@ -1860,9 +1860,13 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                     Sev::Warn,
                     format!(
                         "orphan worktree {}/{rel} — no open PR or issue; \
-                         inspect, then `git -C {} worktree remove {rel}`",
+                         inspect, then {}",
                         root.display(),
-                        root.display()
+                        crate::printed_command::with_path(
+                            "git -C",
+                            &root,
+                            &format!(" worktree remove {rel}"),
+                        )
                     ),
                 ));
             }
