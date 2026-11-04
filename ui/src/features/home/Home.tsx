@@ -52,6 +52,7 @@ import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat
 import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
+import { useSendHandoff } from "./sendHandoff";
 import { memberScope } from "./memberThread";
 import { CloudContentNotice, StreamBanner, ThreadTurn, time } from "./ThreadView";
 import CredentialRequestList from "../connections/CredentialRequestCard";
@@ -904,7 +905,8 @@ function MasterHome({
   const canAttach = !readOnly && attachDestination !== undefined;
 
   const masterRow = agents.data?.agents.find((a) => a.alias === MASTER);
-  const submitting = (thread.data?.pending ?? []).some((p) => p.state !== "failed");
+  const handoff = useSendHandoff(thread.data?.entries ?? [], thread.data?.pending ?? [], master);
+  const submitting = handoff !== null || (thread.data?.pending ?? []).some((p) => p.state !== "failed");
   const turn = turnState(master.data, masterRow, submitting);
   // The turn bar (turnBar.ts) is the same derivation Conversation uses, so
   // the two surfaces cannot disagree: Stop only for the running turn's own
@@ -921,7 +923,10 @@ function MasterHome({
     {
       master: master.data,
       entries: threadEntries,
-      pendingMessages: (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message),
+      pendingMessages: [
+        ...(thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message),
+        ...(handoff !== null ? [handoff] : []),
+      ],
       awaitingApproval: permissionPending,
       // Actions stay off until the stream has proved the turn is current, even
       // while a first connection shows no outage notice.
@@ -1026,7 +1031,9 @@ function MasterHome({
           unnamed: !turn.message,
         }
       : turn.kind === "submitting"
-        ? { message: null, since: null }
+        // Once the send is stored, rows of its turn may land before the state
+        // names it: this id makes them this turn, not an older one.
+        ? { message: handoff, since: null }
         : null;
   // The ResizeObserver re-subscribes when the name-row indicator appears
   // or clears (its content lives inside the observed list): a running
@@ -1056,6 +1063,13 @@ function MasterHome({
   useEffect(() => {
     if (master.status !== "failed") void resources.masterState.refresh();
   }, [agents.data, master.status]);
+  // A read already out may predate the stored send, so ask for one after it.
+  // Before the refresh below, which would otherwise join this one. A turn the
+  // state already names needs no read.
+  const handoffUnread = handoff !== null && !master.data?.turn;
+  useEffect(() => {
+    if (handoffUnread) void resources.masterState.invalidate();
+  }, [handoffUnread]);
   // Turn boundaries land on the thread stream before the agents row
   // moves — a `turn_result` or a queued `message` tail revalidates the
   // state immediately so the working row clears with the reply, not a
