@@ -360,10 +360,11 @@ fn a_refused_upload_stops_before_finalize_and_nothing_goes_live() {
     let site = tiny_site(root.path());
     let (addr, log) = serve(Arc::new(|seen: &Seen| {
         if seen.method == "POST" && seen.path == "/v1/web-sites/uploads" {
+            let sent: Value = serde_json::from_slice(&seen.body).unwrap();
             return (
                 200,
                 json!({"ok": true, "data": {
-                    "siteId": SITE, "uploadId": UPLOAD, "manifestDigest": "x",
+                    "siteId": SITE, "uploadId": UPLOAD, "manifestDigest": sent["manifestDigest"],
                     "missingPaths": ["index.html"], "expiresAt": "2030-01-01T00:00:00.000Z"}}),
             );
         }
@@ -499,10 +500,12 @@ fn action_handler(state: &'static str, approval: Value) -> Handler {
                 json!({"ok": true, "data": {"siteId": SITE, "slug": "my-site", "revision": 4}}),
             ),
             ("POST", p) if p == format!("/v1/web-sites/sites/{SITE}/actions") => {
+                let sent: Value = serde_json::from_slice(&seen.body).unwrap();
                 let mut action = json!({
-                    "actionId": "act_44444444", "siteId": SITE, "operation": "publish",
-                    "state": state, "releaseId": RELEASE, "expectedRevision": 4,
-                    "resultRevision": null, "manifestDigest": "a".repeat(64),
+                    "actionId": "act_44444444", "siteId": SITE, "operation": sent["operation"],
+                    "state": state, "releaseId": sent.get("releaseId").cloned().unwrap_or(Value::Null),
+                    "expectedRevision": sent["expectedRevision"],
+                    "resultRevision": null, "manifestDigest": sent.get("releaseId").map(|_| "a".repeat(64)),
                     "liveUrl": null, "approvalUrl": null,
                     "approvalExpiresAt": null, "updatedAt": "2030-01-01T00:00:00.000Z"
                 });
