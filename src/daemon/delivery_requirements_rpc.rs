@@ -1252,7 +1252,11 @@ mod tests {
             &[modified.clone(), renamed.clone()]
         ));
         // a missing entry (a revert the list hides) and an extra one both refuse
-        assert!(!changed_set_matches_trees(&base, &head, &[renamed.clone()]));
+        assert!(!changed_set_matches_trees(
+            &base,
+            &head,
+            std::slice::from_ref(&renamed)
+        ));
         let extra = json!({"filename": "a.rs", "status": "modified"});
         assert!(!changed_set_matches_trees(
             &base,
