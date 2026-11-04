@@ -60,7 +60,7 @@
 //! session. By default (operator decision, 2026-09-24) the master has
 //! its own, separate login: `master start` copies nothing, reports
 //! `login: none` and prints [`login_command`]
-//! (`CLAUDE_CONFIG_DIR=<state>/master/claude claude auth login`), and
+//! (`CLAUDE_CONFIG_DIR='<state>/master/claude' claude auth login`), and
 //! Needs-you shows that command while the dir holds no login. `master
 //! start --copy-login` is the opt-in copy ([`copy_login`]), with its
 //! token-rotation risk. Residue: the master's tree can read its own
@@ -898,6 +898,11 @@ pub fn login_command(state_dir: &Path) -> String {
         Part::Path(&claude_config_dir(state_dir)),
         Part::Fixed(" claude auth login"),
     ])
+    .unwrap_or_else(|| {
+        "Set CLAUDE_CONFIG_DIR to the master claude directory under the state dir, whose path \
+         cannot be printed as a safe command, then run claude auth login"
+            .to_string()
+    })
 }
 
 /// Does the master's config dir hold a login?
@@ -953,6 +958,11 @@ pub fn login_command_for(provider: &str, state_dir: &Path) -> String {
                 Part::Path(&provider_config_dir("pi", state_dir)),
                 Part::Fixed(" pi  # then type /login"),
             ])
+            .unwrap_or_else(|| {
+                "Set PI_CODING_AGENT_DIR to the master pi directory under the state dir, whose \
+                 path cannot be printed as a safe command, then run pi and type /login"
+                    .to_string()
+            })
         }
         _ => login_command(state_dir),
     }
@@ -1937,9 +1947,23 @@ mod tests {
             assert!(shown.contains("'/a;touch owned;b/"), "{shown}");
             assert!(shown.contains(program), "{shown}");
 
-            let shown = super::login_command_for(provider, Path::new("/a'; touch owned; '"));
-            assert!(shown.contains("=VALUE_1 "), "{shown}");
-            assert!(shown.contains("cannot be printed"), "{shown}");
+            for dir in [
+                "/a'; touch owned; '",
+                "/x;touch owned;#'",
+                "/x\\y; touch owned; #",
+                "/a\ntouch owned\nb",
+            ] {
+                let shown = super::login_command_for(provider, Path::new(dir));
+                assert!(!shown.contains("touch owned"), "{shown:?}");
+                assert!(shown.contains("cannot be printed"), "{shown:?}");
+
+                // As a person would paste it: nothing runs but a harmless missing command.
+                let root = tempfile::tempdir().unwrap();
+                let mut shell = std::process::Command::new("sh");
+                shell.arg("-c").arg(&shown).current_dir(root.path());
+                crate::reaper::output(&mut shell).unwrap();
+                assert!(!root.path().join("owned").exists(), "{shown:?}");
+            }
         }
     }
 

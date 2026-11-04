@@ -1033,13 +1033,13 @@ fn orphans_flag_deleted_worktrees_and_old_test_binaries() {
         kills,
         vec![
             format!(
-                "kill 20  # t  cwd={}  age=1m",
+                "kill 20  # 't'  cwd='{}'  age=1m",
                 repo.join(".cadence/wt/gone").display()
             )
             .as_str(),
             // No cwd link → `?`, never a guess.
-            "kill 22  # t  cwd=?  age=3h",
-            "kill 23  # t  cwd=?  age=2h",
+            "kill 22  # 't'  cwd=?  age=3h",
+            "kill 23  # 't'  cwd=?  age=2h",
         ],
         "{}",
         c.remedy
@@ -4571,7 +4571,10 @@ fn kill_lines_name_comm_cwd_and_age_from_proc() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     let line = &lines[0];
     assert!(
-        line.starts_with(&format!("kill {pid}  # sleep  cwd={}  age=", cwd.display())),
+        line.starts_with(&format!(
+            "kill {pid}  # 'sleep'  cwd='{}'  age=",
+            cwd.display()
+        )),
         "{line}"
     );
     // Just spawned: seconds old, never an unknown `?`.
@@ -4706,13 +4709,14 @@ use std::os::unix::ffi::OsStrExt;
 /// remedy a person pastes.
 #[test]
 fn a_kill_line_stays_one_line_for_a_crafted_cwd_or_comm() {
-    let line = kill_line(7, "sleep", "/repo/it's fine", "1m");
-    assert_eq!(line, "kill 7  # sleep  cwd=/repo/it's fine  age=1m");
+    let line = kill_line(7, "sleep", "/repo/a;touch owned", "1m");
+    assert_eq!(line, "kill 7  # 'sleep'  cwd='/repo/a;touch owned'  age=1m");
     for (comm, cwd) in [
         ("sleep", "/a\ntouch owned\nb"),
         ("x\ntouch owned", "/repo"),
         ("sleep", "/a\u{2028}touch owned"),
         ("sleep", "/a\rtouch owned"),
+        ("sleep", "/it's; touch owned"),
     ] {
         let line = kill_line(7, comm, cwd, "1m");
         assert_eq!(line.lines().count(), 1, "{line:?}");

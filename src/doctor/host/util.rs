@@ -84,15 +84,16 @@ pub(super) fn dir_size_limited(path: &Path, budget: usize) -> (u64, bool, usize)
     (total, truncated, visited)
 }
 
-/// One kill remedy. `comm` and `cwd` belong to another process and the note goes
-/// after a `#`, so a line break in either would start a new command on paste.
+/// One kill remedy. `comm` and `cwd` belong to another process. They follow a `#`,
+/// but a line break ends that comment and some shells do not treat `#` as one when
+/// interactive, so each is quoted, or `?` when it has no safe printed form.
 pub(super) fn kill_line(pid: impl std::fmt::Display, comm: &str, cwd: &str, age: &str) -> String {
+    // `?` already means unknown here, so it stays bare.
     let shown = |value: &str| {
-        if crate::printed_command::plain_text(value) {
-            value.to_string()
-        } else {
-            "?".to_string()
-        }
+        Some(value)
+            .filter(|value| *value != "?")
+            .and_then(crate::printed_command::arg)
+            .unwrap_or_else(|| "?".to_string())
     };
     format!(
         "kill {pid}  # {}  cwd={}  age={age}",

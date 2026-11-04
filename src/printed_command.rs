@@ -5,7 +5,8 @@
 //! if it contains any of them. `'\''` becomes `'\\''`, which ends the quote and
 //! runs the rest of a crafted path. Shell syntax has no readable way to write
 //! `'` inside quotes without one of those characters, so the rule is simple: a
-//! printed command must be unchanged by JSON encoding, otherwise print none.
+//! printed command must be unchanged by JSON encoding. A value that cannot meet
+//! that is never printed in or beside the command.
 
 use std::path::Path;
 
@@ -18,15 +19,11 @@ fn deceptive(c: char) -> bool {
         | '\u{e0000}'..='\u{e007f}')
 }
 
-/// Whether text is safe to show on one line of something a person may paste:
-/// no line break can start a new command, and nothing disguises what follows.
-pub(crate) fn plain_text(value: &str) -> bool {
-    !value.chars().any(|c| c.is_control() || deceptive(c))
-}
-
 /// One single-quoted argument, or `None` when the value has no safe printed form.
 pub(crate) fn arg(value: &str) -> Option<String> {
-    let safe = plain_text(value) && !value.chars().any(|c| matches!(c, '\'' | '\\' | '"'));
+    let safe = !value
+        .chars()
+        .any(|c| matches!(c, '\'' | '\\' | '"') || c.is_control() || deceptive(c));
     safe.then(|| format!("'{value}'"))
 }
 
@@ -44,52 +41,52 @@ pub(crate) enum Part<'a> {
     Path(&'a Path),
 }
 
-/// The command text, plus a note naming any value that has no safe printed form.
-/// Such a value becomes a `VALUE_n` placeholder with no shell meaning. Pasting it
-/// cannot act on the real path, though a command may still run against the
-/// placeholder, which is why the note says what to set it to.
-fn render(parts: &[Part]) -> (String, String) {
+/// The command text, using a `VALUE_n` placeholder for each value with no safe
+/// printed form, and how many placeholders it used. A refused value is never
+/// repeated: anything near a command may be pasted or copied along with it.
+fn render(parts: &[Part]) -> (String, usize) {
     let mut command = String::new();
-    let mut unprintable = Vec::new();
+    let mut placeholders = 0;
     for part in parts {
-        let (quoted, shown) = match part {
+        let quoted = match part {
             Part::Fixed(text) => {
                 command.push_str(text);
                 continue;
             }
-            Part::Value(value) => (arg(value), value.to_string()),
-            Part::Path(path) => (path_arg(path), path.display().to_string()),
+            Part::Value(value) => arg(value),
+            Part::Path(path) => path_arg(path),
         };
         match quoted {
             Some(quoted) => command.push_str(&quoted),
             None => {
-                let name = format!("VALUE_{}", unprintable.len() + 1);
-                command.push_str(&name);
-                unprintable.push(format!("{name} set to {shown}"));
+                placeholders += 1;
+                command.push_str(&format!("VALUE_{placeholders}"));
             }
         }
     }
-    let note = if unprintable.is_empty() {
-        String::new()
+    (command, placeholders)
+}
+
+/// A backticked command for a sentence. A value with no safe printed form becomes
+/// a placeholder with no shell meaning. Pasting it cannot act on the real value,
+/// though a command may still run against the placeholder, so the note says so.
+pub(crate) fn command(parts: &[Part]) -> String {
+    let (command, placeholders) = render(parts);
+    if placeholders == 0 {
+        format!("`{command}`")
     } else {
         format!(
-            " with {} (it cannot be printed as a safe command)",
-            unprintable.join(" and ")
+            "`{command}` (VALUE_ stands for a value that cannot be printed as a safe command; \
+             do not paste this as written)"
         )
-    };
-    (command, note)
+    }
 }
 
-/// A backticked command for a sentence.
-pub(crate) fn command(parts: &[Part]) -> String {
-    let (command, note) = render(parts);
-    format!("`{command}`{note}")
-}
-
-/// A command with nothing around it, for a field or a line of its own.
-pub(crate) fn bare_command(parts: &[Part]) -> String {
-    let (command, note) = render(parts);
-    format!("{command}{note}")
+/// A command with nothing around it, for a field a person copies or a line of its
+/// own. `None` when any value has no safe printed form: the caller says it in words.
+pub(crate) fn bare_command(parts: &[Part]) -> Option<String> {
+    let (command, placeholders) = render(parts);
+    (placeholders == 0).then_some(command)
 }
 
 /// [`command`] for the common shape: fixed words, one path, fixed words.
@@ -173,36 +170,36 @@ pub(crate) mod tests {
     #[test]
     fn every_value_in_a_command_is_quoted_or_replaced() {
         let parts = |root, name| {
-            bare_command(&[
+            [
                 Part::Fixed("git -C "),
                 Part::Path(Path::new(root)),
                 Part::Fixed(" worktree remove "),
                 Part::Value(name),
-            ])
+            ]
         };
         assert_eq!(
-            parts("/repo", "x; touch owned"),
+            bare_command(&parts("/repo", "x; touch owned")).unwrap(),
             "git -C '/repo' worktree remove 'x; touch owned'"
         );
-        let shown = parts("/re'po", "x'; touch owned; '");
+        let shown = command(&parts("/re'po", "x'; touch owned; '"));
         assert!(
-            shown.starts_with("git -C VALUE_1 worktree remove VALUE_2 with VALUE_1 set to"),
+            shown.starts_with("`git -C VALUE_1 worktree remove VALUE_2`"),
             "{shown}"
         );
-        assert!(shown.contains("cannot be printed"), "{shown}");
     }
 
+    /// A refused value appears nowhere in the output, not only outside the command:
+    /// a person copies the whole field or the whole line.
     #[test]
-    fn plain_text_refuses_what_could_start_a_new_line_or_disguise_one() {
-        assert!(plain_text("/private/it's a path;$x"));
-        for value in [
-            "a\ntouch owned",
-            "a\rb",
-            "a\u{1b}[31m",
-            "a\u{202e}b",
-            "a\u{2028}b",
-        ] {
-            assert!(!plain_text(value), "{value:?}");
+    fn a_refused_value_appears_nowhere_in_the_output() {
+        for value in UNPRINTABLE {
+            let parts = [Part::Fixed("chmod 700 "), Part::Path(Path::new(value))];
+            assert_eq!(bare_command(&parts), None, "{value:?}");
+            let shown = command(&parts);
+            assert!(!shown.contains(value), "{shown:?}");
+            assert!(shown.contains("cannot be printed"), "{shown:?}");
+            let shown = with_path("chmod 700", Path::new(value), "");
+            assert!(!shown.contains(value), "{shown:?}");
         }
     }
 }
