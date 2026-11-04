@@ -1007,7 +1007,7 @@ function MasterHome({
   // CAD-2103: the browser is a hosted board's. A native board never feeds it,
   // so it never reads /api/browser. The operator's Home is the same
   // conversation the canvas is fed, so the card and tab follow it.
-  useBrowserFeed(hosted === true ? (homeConversation ?? null) : null, activeTurn && turnOrigin === null, lastSeq(thread.data) ?? null);
+  useBrowserFeed(hosted === true ? (homeConversation ?? null) : null, activeTurn && turnOrigin === null, `${lastSeq(thread.data) ?? 0}:${thread.data?.pending?.length ?? 0}`);
   // The running turn's name-row activity anchors to this turn's own
   // message id — the item holding its newest stored entry (a pending
   // row has no stored entry yet, so its row is the anchor while it

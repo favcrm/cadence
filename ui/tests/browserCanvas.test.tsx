@@ -162,7 +162,7 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string; signal?: Ab
       { seq: 3, role: "agent", kind: "turn_result", text: "Done.", message: "m1" },
     ];
     if (board.turn > 0) {
-      entries.push({ seq: 7, role: "member", kind: "message", text: "look it up", message: "m3" }, { seq: 8, role: "agent", kind: "tool_call", text: "browser: open", message: "m3" });
+      entries.push({ seq: 7, role: "member", kind: "message", text: "look it up", message: "m3" }, { seq: 8, role: "agent", kind: board.turn === 4 ? "assistant_text" : "tool_call", text: "browser: open", message: "m3" });
       if (board.turn === 2) entries.push({ seq: 9, role: "agent", kind: "turn_result", text: "Done, take over.", message: "m3" });
       // 3: the turn goes on with one more step and still no answer.
       if (board.turn === 3) entries.push({ seq: 10, role: "agent", kind: "tool_call", text: "browser: read", message: "m3" });
@@ -1493,14 +1493,15 @@ async function mountChat() {
 
 // ===== the member chat's turn is bounded: 3 minutes from the thread's last change =====
 const WINDOW = 3 * 60_000;
-{
+// 4: the turn's last entry is a commentary line.
+for (const turn of [1, 4]) {
   // Reopening a chat mid-turn polls from the start, with no new entry to wake it.
-  reset({ body: { state: "none" }, conversation: "cm1", turn: 1 });
+  reset({ body: { state: "none" }, conversation: "cm1", turn });
   const c = await mountChat();
   await advance(4000);
   board.body = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." };
   await advance(3000);
-  assert(el(c.host, ".bz-card"), "a chat opened mid-turn sees a session that starts with no new entry");
+  assert(el(c.host, ".bz-card"), `a chat opened mid-turn (tail ${turn}) sees a session that starts with no new entry`);
   await c.unmount();
 }
 {
@@ -1598,6 +1599,41 @@ const WINDOW = 3 * 60_000;
   await advance(2000);
   assert(btn(m, "stop") && document.activeElement !== btn(m, "stop"), "when the takeover ends under focus, focus is not on Stop");
   await m.unmount();
+}
+
+// ===== the operator's send that is never answered is watched for the window only =====
+{
+  const Home = require("../src/features/home/Home").default;
+  const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
+  const { addPending } = require("../src/features/home/thread") as typeof import("../src/features/home/thread");
+  reset({ body: { state: "none" }, conversation: "cmaster" });
+  resources.masterThread.reset();
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const root = createRoot(hostEl);
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
+      readOnly: false, hosted: true, overview: resources.overview.get(), onOpenIssue: () => undefined,
+      onOpenDecision: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+    }), React.createElement(CanvasDrawer)));
+  });
+  for (let i = 0; i < 4; i++) await advance(1000);
+  const idle = board.gets;
+  await advance(30_000);
+  equal(board.gets, idle, "an idle operator Home is not polled");
+  await React.act(async () => { resources.masterThread.write((st: any) => addPending(st, "p9", "look it up", 1)); });
+  await advance(WINDOW - 20_000);
+  assert(board.gets > idle + 20, `a send is read on a short interval (${idle} -> ${board.gets})`);
+  await advance(40_000);
+  const ended = board.gets;
+  await advance(60 * 60_000);
+  equal(board.gets, ended, "never answered: zero reads for an hour after the window");
+  equal(toasts.length, 0, "and no toast");
+  await React.act(async () => { resources.masterThread.write((st: any) => ({ ...st, entries: [...st.entries, { seq: 50, role: "agent", kind: "tool_call", text: "browser: read", message: "o9" }] })); });
+  await advance(6000);
+  assert(board.gets >= ended + 2, "a new entry reopens it");
+  await React.act(async () => { root.unmount(); });
+  hostEl.remove();
 }
 
 console.log("browser canvas tests passed");

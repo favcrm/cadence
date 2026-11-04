@@ -15,13 +15,13 @@
  *   control, and this is how the board notices. While the host says a turn is
  *   running it polls in any state, because the assistant starts a session or
  *   asks for a takeover partway through a turn, with no thread entry to say
- *   so, and reads once more when the turn settles. The member chat counts a
- *   turn as running for at most 3 minutes after its thread last changed, so
- *   polling is bounded; an idle `none` never polls, and a board that answered
+ *   so, and reads once more when the turn settles. A running turn is
+ *   watched for at most 3 minutes after its thread last changed, so polling is
+ *   bounded; an idle `none` never polls, and a board that answered
  *   unavailable is never read again;
  * - no viewer URL is ever held here (see browserClient.viewBrowser).
  */
-import { useEffect, useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { canvasSnapshot, onArtifactFocus, onArtifactsEmptied, showDrawer } from "./canvasStore";
 import { onPrivateSessionReset } from "../../lib/privateSession";
 import { readBrowser, stopBrowser, type BrowserSession } from "./browserClient";
@@ -249,6 +249,10 @@ export function resetBrowser(): void {
 
 onPrivateSessionReset(resetBrowser);
 
+/** A running turn is watched for this long after the thread last changed (or the
+ *  turn started): one bound for every host, however the host decides it runs. */
+const TURN_WINDOW_MS = 3 * 60_000;
+
 /** The host's turn started or settled. While it runs the store polls in any
  *  state; the turn settling reads once more, for a session started after the
  *  last entry was read. */
@@ -260,9 +264,18 @@ export function watchBrowser(running: boolean): void {
 }
 
 /** A host's whole wiring: the conversation in view, whether its turn is
- *  running, and a revision that changes when its thread does (a new entry is
- *  when a session may have started). Leaving ends it all. */
-export function useBrowserFeed(conversation: string | null, running: boolean, revision: number | null): void {
+ *  running, and a revision that changes when its thread does, a pending send
+ *  included (a new entry is when a session may have started). A running turn is
+ *  watched for TURN_WINDOW_MS from the last revision or the turn starting, then
+ *  read once more and left; a new revision restarts it. Leaving ends it all. */
+export function useBrowserFeed(conversation: string | null, running: boolean, revision: string): void {
+  const [expired, setExpired] = useState(false);
+  useEffect(() => {
+    setExpired(false);
+    if (!running) return;
+    const id = setTimeout(() => setExpired(true), TURN_WINDOW_MS);
+    return () => clearTimeout(id);
+  }, [conversation, running, revision]);
   useEffect(() => {
     feedBrowser(conversation);
     return () => feedBrowser(null);
@@ -271,8 +284,8 @@ export function useBrowserFeed(conversation: string | null, running: boolean, re
     if (conversation !== null) void refreshBrowser();
   }, [conversation, revision]);
   useEffect(() => {
-    watchBrowser(running);
-  }, [conversation, running]);
+    watchBrowser(running && !expired);
+  }, [conversation, running, expired]);
 }
 
 export function openBrowser(): void {
