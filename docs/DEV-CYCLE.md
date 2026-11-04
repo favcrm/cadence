@@ -34,7 +34,7 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    enforce that yet; merges use the temporary `--exception` (exact-head operator approval and two
    advisory links, standards and spec-security, plus browser-qa for a `ui/`
    change) until `EXCEPTION_ENDS`
-   (2026-11-10).
+   (2026-12-31).
 5. The version-one delivery tiers apply to clean default-equivalent policies
    by default after the reviewed implementation is installed; the introducing
    PR must still satisfy the current trusted-base gates. Routine changes need
@@ -396,7 +396,7 @@ browser-qa=<url>` for a `ui/` change) to the enqueue. It waives only the
 missing reviewer attestation and, on a hosted routine PR, the readiness proof
 hosted cannot yet produce; the evidence names both. The advisory reviews are PR comments posted by
 separately assigned sessions, and the operator approves each exact head. The
-path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10).
+path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31).
 
 The helper enforces exact-head checks, verdicts, evidence and approval. Queue
 position is not merge evidence: watch the merge-group run and verify the

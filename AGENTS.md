@@ -131,7 +131,7 @@ the code you just wrote.
   environment and its keys are set up and the first run files a verdict. Until
   then, merge through the temporary exception (`--exception --advisory
   standards=<url> --advisory spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
-  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10). Of the advisory
+  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31). Of the advisory
   links, it checks only that they are separate https URLs; it proves
   neither head binding nor that Browser QA ran. A verdict filed under the
   author's identity still refuses under the exception, so a same-login
@@ -452,7 +452,7 @@ limitation; only an authorized operator can decide an exception.
   comments from fresh-session reviews (see the review standard above); the gate
   cannot prove freshness, and the operator accepts that and approves each
   exact head. The path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`
-  (2026-11-10).
+  (2026-12-31).
 
 ### Checks: trust exit codes, not filtered text
 
