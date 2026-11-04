@@ -1625,16 +1625,19 @@ fn production_port_gate(profile: Option<&str>, port: u16) -> Result<()> {
 
 // ---------- verbs ----------
 
-/// Single-quoted for `sh`.
 /// The command that stops a sandbox's persisted tailnet share under the grant.
 fn share_stop_command(sb: &Sandbox) -> String {
-    crate::printed_command::with_path(
-        &format!("{ALLOW_GLOBAL_ENV}=1 cadence --state-dir"),
-        &sb.state_dir(),
-        " ui tailscale stop",
-    )
+    use crate::printed_command::{command, Part};
+    let state_dir = sb.state_dir();
+    command(&[
+        Part::Fixed(ALLOW_GLOBAL_ENV),
+        Part::Fixed("=1 cadence --state-dir "),
+        Part::Path(&state_dir),
+        Part::Fixed(" ui tailscale stop"),
+    ])
 }
 
+/// Single-quoted for `sh`.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }

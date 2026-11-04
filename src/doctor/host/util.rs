@@ -84,6 +84,23 @@ pub(super) fn dir_size_limited(path: &Path, budget: usize) -> (u64, bool, usize)
     (total, truncated, visited)
 }
 
+/// One kill remedy. `comm` and `cwd` belong to another process and the note goes
+/// after a `#`, so a line break in either would start a new command on paste.
+pub(super) fn kill_line(pid: impl std::fmt::Display, comm: &str, cwd: &str, age: &str) -> String {
+    let shown = |value: &str| {
+        if crate::printed_command::plain_text(value) {
+            value.to_string()
+        } else {
+            "?".to_string()
+        }
+    };
+    format!(
+        "kill {pid}  # {}  cwd={}  age={age}",
+        shown(comm),
+        shown(cwd)
+    )
+}
+
 /// POSIX single-quoting for a path emitted inside a shell command —
 /// `'a b'` and `'\''`-escaped, so `rm -rf <it>` can never split a
 /// path like `/home/ubuntu/My Project` into extra arguments. Paths
@@ -540,7 +557,7 @@ pub(super) fn kill_lines(proc_root: &Path, pids: &[u32]) -> Vec<String> {
             let age = pid_age_secs(&dir, uptime)
                 .map(age_label)
                 .unwrap_or_else(|| "?".to_string());
-            Some(format!("kill {pid}  # {comm}  cwd={cwd}  age={age}"))
+            Some(kill_line(pid, &comm, &cwd, &age))
         })
         .collect()
 }

@@ -622,11 +622,15 @@ fn reuse_lane(
                  --name to reuse it, or close it first with {finish}",
                 id = front.id,
                 path = lane.display(),
-                finish = crate::printed_command::with_path(
-                    &format!("cadence issue finish {} --worktree", front.id),
-                    lane,
-                    "",
-                ),
+                finish = {
+                    use crate::printed_command::{command, Part};
+                    command(&[
+                        Part::Fixed("cadence issue finish "),
+                        Part::Value(&front.id),
+                        Part::Fixed(" --worktree "),
+                        Part::Path(lane),
+                    ])
+                },
             )));
         }
     }

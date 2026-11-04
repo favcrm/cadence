@@ -1862,11 +1862,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                         "orphan worktree {}/{rel} — no open PR or issue; \
                          inspect, then {}",
                         root.display(),
-                        crate::printed_command::with_path(
-                            "git -C",
-                            &root,
-                            &format!(" worktree remove {rel}"),
-                        )
+                        orphan_worktree_remedy(&root, &rel)
                     ),
                 ));
             }
@@ -2604,8 +2600,40 @@ fn gc_not_permitted(row: Row, detail: String, refused: &[String]) -> Row {
     row
 }
 
+/// The command that removes an orphan worktree. Its directory name comes from
+/// `read_dir`, so it is as untrusted as the checkout's path.
+fn orphan_worktree_remedy(root: &Path, rel: &str) -> String {
+    use crate::printed_command::{command, Part};
+    command(&[
+        Part::Fixed("git -C "),
+        Part::Path(root),
+        Part::Fixed(" worktree remove "),
+        Part::Value(rel),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_crafted_orphan_worktree_name_cannot_run_as_a_command() {
+        let shown = super::orphan_worktree_remedy(
+            std::path::Path::new("/repo"),
+            ".cadence/wt/x;touch owned;y",
+        );
+        assert_eq!(
+            shown,
+            "`git -C '/repo' worktree remove '.cadence/wt/x;touch owned;y'`"
+        );
+        let shown = super::orphan_worktree_remedy(
+            std::path::Path::new("/repo"),
+            ".cadence/wt/x'; touch owned; '",
+        );
+        assert!(
+            shown.starts_with("`git -C '/repo' worktree remove VALUE_1`"),
+            "{shown}"
+        );
+    }
+
     /// CAD-149: the gc row names what the caller rule kept this caller
     /// from sweeping — a warning with the remedy, never silence.
     #[test]

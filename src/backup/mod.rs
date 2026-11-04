@@ -2097,7 +2097,8 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
             db_file(state_dir).display(),
         )));
     }
-    let quote = |p: &Path| path_arg(p).unwrap_or_else(|| p.display().to_string());
+    // Unreachable after the check above, and harmless if that ever changes.
+    let quote = |p: &Path| path_arg(p).unwrap_or_else(|| "VALUE_1".to_string());
     let is_orphan = |p: &&PathBuf| {
         p.file_name()
             .unwrap_or_default()

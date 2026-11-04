@@ -1,3 +1,5 @@
+use crate::printed_command::tests::{survives_json, UNPRINTABLE};
+
 #[test]
 fn submissions_responses_get_the_larger_read_bound() {
     assert_eq!(
@@ -1117,8 +1119,6 @@ fn a_reenroll_before_a_committed_bind_is_unknown_and_a_retry_settles_it() {
     assert!(require_bound_enrollment(&current(&dir).unwrap(), &retried, &dir).is_ok());
 }
 
-use crate::printed_command::tests::{survives_json, UNPRINTABLE as UNPRINTABLE_PATHS};
-
 /// The recovery command stays pasteable, and the message states when it stops
 /// working and what to do then.
 #[test]
@@ -1136,7 +1136,7 @@ fn the_unknown_bind_message_prints_a_command_only_when_it_is_safe_to_paste() {
             "{shown}"
         );
     }
-    for path in UNPRINTABLE_PATHS {
+    for path in UNPRINTABLE {
         let shown = continuity_unknown(Path::new(path)).to_string();
         assert!(shown.contains("bind-continuity"), "{shown}");
         assert!(!shown.contains("--enrollment-dir '"), "{shown}");
@@ -1153,7 +1153,7 @@ fn the_missing_pin_remedy_prints_a_command_only_when_it_is_safe_to_paste() {
         shown.contains("'/private/has space/trusted-issuer'"),
         "{shown}"
     );
-    for path in UNPRINTABLE_PATHS {
+    for path in UNPRINTABLE {
         let shown = missing_pin_remedy(issuer, Path::new(path));
         assert!(!shown.contains("echo"), "{shown}");
         assert!(shown.contains("cannot be printed"), "{shown}");

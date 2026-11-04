@@ -1780,8 +1780,6 @@ mod tests {
         assert_eq!(read_secret(s.path()).unwrap(), first);
     }
 
-    /// S2: every loose shape is refused and never repaired — the mode is
-    /// exactly what it was after the refusal.
     /// These paths used to print unquoted, so a crafted name ran as a command even
     /// from the decoded message.
     #[test]
@@ -1800,10 +1798,12 @@ mod tests {
         ensure_secret(&state).unwrap();
         chmod(&dir(&state), 0o755);
         let shown = read_secret(&state).unwrap_err().to_string();
-        assert!(shown.contains("`chmod 700 THAT_PATH`"), "{shown}");
+        assert!(shown.contains("`chmod 700 VALUE_1`"), "{shown}");
         assert!(shown.contains("cannot be printed"), "{shown}");
     }
 
+    /// S2: every loose shape is refused and never repaired — the mode is
+    /// exactly what it was after the refusal.
     #[test]
     fn a_loose_secret_is_refused_never_repaired() {
         for loose in [0o640, 0o604, 0o620, 0o602, 0o644, 0o660] {

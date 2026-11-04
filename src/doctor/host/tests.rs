@@ -4701,3 +4701,22 @@ fn tailnet_check_prints_the_whole_remedy_chain() {
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
+
+/// A line break in another process's cwd or name must not start a new line in a
+/// remedy a person pastes.
+#[test]
+fn a_kill_line_stays_one_line_for_a_crafted_cwd_or_comm() {
+    let line = kill_line(7, "sleep", "/repo/it's fine", "1m");
+    assert_eq!(line, "kill 7  # sleep  cwd=/repo/it's fine  age=1m");
+    for (comm, cwd) in [
+        ("sleep", "/a\ntouch owned\nb"),
+        ("x\ntouch owned", "/repo"),
+        ("sleep", "/a\u{2028}touch owned"),
+        ("sleep", "/a\rtouch owned"),
+    ] {
+        let line = kill_line(7, comm, cwd, "1m");
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        assert!(!line.contains("touch owned"), "{line:?}");
+        assert!(line.starts_with("kill 7  # "), "{line:?}");
+    }
+}
