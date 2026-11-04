@@ -584,7 +584,7 @@ CAD-2081, not shipped yet; AGENTS.md "Review"), merges use the temporary
 advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change, even where the board asks for fewer or no approval. A hosted `routine`
 PR needs this route too, because a hosted board has no readiness record yet; ends at `EXCEPTION_ENDS` in
-`scripts/delivery-gate`, 2026-11-10); see AGENTS.md "Review". The exception
+`scripts/delivery-gate`, 2026-12-31); see AGENTS.md "Review". The exception
 only checks that the advisory links are separate https URLs; it proves neither
 head binding nor that Browser QA ran. A verdict filed under the author's
 identity still refuses under it, so a session on the author's login posts its

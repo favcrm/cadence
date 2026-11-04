@@ -5,20 +5,35 @@
  * so Composer stays a thin wrapper and the rules are testable.
  */
 
-export const ATTACH_EXTS = ["txt", "md", "csv"];
+/** The kinds the composer offers and the daemon accepts: a PDF, whose text the
+ *  daemon extracts under its own cap, and the UTF-8 structured text kinds. */
+export const ATTACH_EXTS = [
+  "pdf",
+  "txt",
+  "md",
+  "markdown",
+  "csv",
+  "tsv",
+  "json",
+  "jsonl",
+  "yaml",
+  "yml",
+  "xml",
+];
 type Translate = (english: string) => string;
 const identity: Translate = (english) => english;
-/** The file picker's accept list — both densities share it. PDF and
- *  image kinds are deliberately absent: no reviewed processing contract
- *  exists, so they are refused at selection and at the daemon. */
+/** The file picker's accept list — both densities share it. Image kinds are
+ *  absent: their representation is CAD-1233, so a selection of one is refused
+ *  here and at the daemon rather than uploaded as unprocessed bytes. */
 export const ATTACH_ACCEPT = ATTACH_EXTS.map((e) => `.${e}`).join(",");
 export const ATTACH_MAX_BYTES = 10 * 1024 * 1024;
 export const ATTACH_MAX_FILES = 5;
 
-/** The kinds the ticket names but this interim build cannot process.
- *  A selection of one is refused with this sentence, not silently
- *  dropped and not uploaded as unprocessed bytes. */
-export const ATTACH_UNAVAILABLE_EXTS = ["pdf", "png", "jpg", "jpeg", "webp"];
+/** Image kinds this build cannot represent to a model yet. */
+export const ATTACH_UNAVAILABLE_EXTS = ["png", "jpg", "jpeg", "webp", "gif"];
+
+/** The allowlist as the operator reads it in a refusal. */
+const ATTACH_LIST = "pdf, txt, md, markdown, csv, tsv, json, jsonl, yaml and xml";
 
 export interface AttachDestination {
   /** Absent for Home; app uploads must carry their install and conversation. */
@@ -55,9 +70,9 @@ export interface AttachItem {
 export function attachRefusal(name: string, size: number): string | null {
   const ext = name.toLowerCase().split(".").pop() ?? "";
   if (ATTACH_UNAVAILABLE_EXTS.includes(ext))
-    return `PDF and image processing is not available yet — .${ext} cannot be attached`;
+    return `Image processing is not available yet — .${ext} cannot be attached`;
   if (!ATTACH_EXTS.includes(ext))
-    return `${ext ? `.${ext}` : "that type"} is not attachable (txt, md, csv)`;
+    return `${ext ? `.${ext}` : "that type"} is not attachable (${ATTACH_LIST})`;
   if (size === 0) return "empty file — nothing to attach";
   if (size > ATTACH_MAX_BYTES) return `over 10 MiB — rejected`;
   return null;
@@ -66,12 +81,16 @@ export function attachRefusal(name: string, size: number): string | null {
 /** The daemon words a refusal "chat_file_upload refused 'x.txt': …"; the
  *  operator reads only the reason, never the RPC name or the file again. */
 export function displayAttachError(message: string, t: Translate = identity): string {
+  const image = /^Image processing is not available yet — (\.[^ ]+) cannot be attached$/.exec(message);
+  if (image)
+    return t("Image processing is not available yet — {ext} cannot be attached").replace("{ext}", () => image[1]);
+  // Rows retained before images were narrowed carry the older sentence.
   const unavailable = /^PDF and image processing is not available yet — (\.[^ ]+) cannot be attached$/.exec(message);
   if (unavailable)
     return t("PDF and image processing is not available yet — {ext} cannot be attached").replace("{ext}", () => unavailable[1]);
-  const unsupported = /^(.+?) is not attachable \(txt, md, csv\)$/.exec(message);
+  const unsupported = /^(.+?) is not attachable \(([^)]+)\)$/.exec(message);
   if (unsupported)
-    return `${unsupported[1]} ${t("is not attachable (txt, md, csv)")}`;
+    return `${unsupported[1]} ${t(`is not attachable (${unsupported[2]})`)}`;
   const count = /^at most (\d+) attachments per message$/.exec(message);
   if (count)
     return t("at most {count} attachments per message").replace("{count}", () => count[1]);
@@ -81,7 +100,7 @@ export function displayAttachError(message: string, t: Translate = identity): st
 export function userUploadError(message: string): string {
   const reason = message
     .replace(/^chat_file_upload(?: refused)?(?: '[^']*')?:\s*/, "")
-    .replace(/ — the interim allowlist is txt, md and csv$/, "")
+    .replace(/ — the (?:interim )?allowlist is .+$/, "")
     .trim();
   return reason.charAt(0).toUpperCase() + reason.slice(1);
 }
@@ -92,10 +111,31 @@ export function isPermanentUploadFailure(status: number | undefined): boolean {
   return status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
+/** The kind label for a row's meta line. Only the kinds the allowlist can
+ *  actually produce are named; anything else falls back to its extension. */
+const KIND_LABELS: Record<string, string> = {
+  csv: "CSV",
+  tsv: "TSV",
+  json: "JSON",
+  jsonl: "JSONL",
+  yaml: "YAML",
+  yml: "YAML",
+  xml: "XML",
+  pdf: "PDF",
+};
+
 /** Size and kind for a file row, e.g. `180 KB · Text`. */
 export function attachMeta(name: string, size: number, t: Translate = identity): string {
   const ext = name.toLowerCase().split(".").pop() ?? "";
-  const kind = ext === "csv" ? "CSV" : ext === "md" ? t("Markdown") : ext === "txt" ? t("Text") : ext ? ext.toUpperCase() : t("File");
+  const kind =
+    KIND_LABELS[ext] ??
+    (ext === "md" || ext === "markdown"
+      ? t("Markdown")
+      : ext === "txt"
+        ? t("Text")
+        : ext
+          ? ext.toUpperCase()
+          : t("File"));
   const kb = size < 1024 ? `${size} B` : size < 1024 * 1024 ? `${Math.round(size / 1024)} KB` : `${(size / 1024 / 1024).toFixed(1)} MB`;
   return `${kb} · ${kind}`;
 }
