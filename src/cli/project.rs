@@ -6,11 +6,13 @@ use cadence_agent::issue::cli::PolicyVisibility;
 /// `cadence project` verbs.
 #[derive(Subcommand)]
 pub(crate) enum ProjectCmd {
-    /// Create project `<key>`, optionally register a git repo and seed
-    /// `<pm>/<key>/PROJECT.md` (goal, staffing, default stages and empty
-    /// milestones). Idempotent for the same key and mode; conflicts, an
-    /// invalid key, unsafe repo paths and non-Git paths are refused without
-    /// replacing metadata. The operator or the master, through the daemon.
+    /// Create a local project or register a project in a hosted workspace.
+    ///
+    /// Locally, optionally register a git repo and seed `<pm>/<key>/PROJECT.md`
+    /// (goal, staffing, default stages and empty milestones). Idempotent for
+    /// the same key and mode; conflicts, an invalid key, unsafe repo paths and
+    /// non-Git paths are refused without replacing metadata. The operator or
+    /// the master, through the daemon.
     ///
     /// On a selected hosted org this registers an empty project in the
     /// org's own registry: `--name` is required, the repo/PROJECT.md flags

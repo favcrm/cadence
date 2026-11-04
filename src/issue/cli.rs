@@ -152,6 +152,7 @@ pub enum IssueAction {
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND; `--tag` is the exception — all must be
     /// present. The grammar prints from `crate::filter::GRAMMAR`.
+    /// For hosted routing restrictions, inspect `cadence schema issue ls`.
     #[command(after_long_help = crate::filter::GRAMMAR)]
     #[command(visible_alias = "list")]
     Ls {
