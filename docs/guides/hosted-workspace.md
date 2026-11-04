@@ -456,7 +456,9 @@ is clean or merged; leave it intact for reconciliation.
 ### Managing agent profiles from the CLI (CAD-2101)
 
 The owner can do from the CLI what the agent page does for a profile. Name the
-org on every call; the echoed `org=` line is the destination.
+org with `--org` on every call. A saved default org or `CADENCE_ORG` does not
+count: a profile command that would use one is refused before any request
+(`org_not_named`), reads included. The echoed `org=` line is the destination.
 
 ```sh
 cadence --org acme agent profile get ap_<profile-id>
@@ -480,9 +482,10 @@ cadence --org acme agent profile archive ap_<profile-id> --latest
   board's `revision_conflict` and writes nothing. `archive` is an edit of
   `status`.
 - Refusals keep the board's code: `not_permitted`, `unauthorized`, `not_found`,
-  `alias_taken`, `invalid_request`, `capability_unavailable`. They exit 3, like
-  every other hosted refusal. A lost answer to a write exits 1 with the read to
-  run before repeating it (`agent profile get`, `agent profiles`).
+  `alias_taken`, `invalid_request`. They exit 3, like every other hosted
+  refusal. A write whose answer is lost or is a server error, including
+  `capability_unavailable`, exits 1 (outcome unknown) with the read to run
+  before repeating it (`agent profile get`, `agent profiles`).
 - Creating and editing are a live human owner's act. A member is refused by the
   board. A board that predates these commands answers "update the board first";
   nothing is written.
@@ -500,7 +503,7 @@ the client (a direct call with the saved login, or an unmanaged shell) is judged
 as the person whose login it uses. Treat the saved login as the person's, keep
 it out of agent environments, and have agents propose changes (`agent
 propose-hire`). Closing this needs a server-side fact, such as a distinct
-principal for a managed session; it is not done here.
+principal for a managed session; it is tracked as AOS-502.
 
 ### Leaving a message for a role on a ticket
 
