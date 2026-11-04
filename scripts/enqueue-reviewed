@@ -123,9 +123,14 @@ WORKFLOW_KINDS = ("standards", "spec-security")
 AUTHOR_ROW_HINT = (" (a filed row under the author's identity still refuses under --exception, and an "
                    "advisory link does not clear it. The author's own review can never be an advisory; "
                    "only a fresh non-author session's review can. A hosted verdict is permanent and "
-                   "head-pinned, and only moving the head clears it: post findings as a PR comment and "
-                   "file no hosted verdict unless you are a distinct attested principal; an attestation "
-                   "on another login of the author's own person is not distinct)")
+                   "head-pinned, and moving the head is the only legitimate way past a same-person row: post "
+                   "findings as a PR comment and file no hosted verdict unless you are a distinct attested "
+                   "principal (`cadence audit identities`); an attestation on another login of the author's "
+                   "own person is not distinct)")
+# The author has no attested principal: no row is filed yet by "the author", so no permanence claim.
+UNATTESTED_AUTHOR_HINT = (" (attest the author only to their own existing principal, never a new one, because that "
+                          "would make a same-person row count; post findings as a PR comment and file no hosted "
+                          "verdict unless you are a distinct attested principal)")
 # Local notes are not hosted rows: no permanence claim.
 LOCAL_AUTHOR_ROW_HINT = (" (a note under the author's identity still refuses under --exception, and an "
                          "advisory link does not clear it. The author's own review can never be an advisory; "
@@ -135,8 +140,8 @@ REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a no
                         "post findings as a PR comment rather than file a hosted verdict as the author's "
                         "person, which is permanent and head-pinned (AGENTS.md \"Review\"). Routes: "
                         "workflow-issued rows (dispatch review-standards.yml and review-spec.yml; a first "
-                        "pass on gate, security, schema and release PRs, not a replacement for a real "
-                        "review), or --exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate)")
+                        "pass, not a replacement for a real review on gate, security, schema and release "
+                        "PRs, where two such rows satisfy other PRs), or --exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate)")
 
 # Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
 # AGENTS.md list. A verdict note's `Risk: human` also makes a diff human.
@@ -1091,8 +1096,7 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
                 reasons.append(
                     f"verdict {n['name']} cannot be proven independent: the PR author "
                     f"{hosted.get('author_login') or '(unknown login)'} has no attested principal "
-                    "(`cadence audit identities set --identity <subject>=<login>`)"
-                    f"{AUTHOR_ROW_HINT}")
+                    f"(`cadence audit identities set --identity <subject>=<login>`){UNATTESTED_AUTHOR_HINT}")
             elif (n.get("reviewer_id") or "").strip() == hosted["author_principal"]:
                 reasons.append(
                     f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
@@ -1143,7 +1147,9 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
             reasons.append(f"the Standards and Spec/security verdicts come from the same reviewer; two distinct reviewers are required{REVIEW_STANDARD_HINT}")
     if need_qa and not by("browser-qa"):
         reasons.append(f"a ui/ change needs a pass Browser QA verdict for {issue} pinned to this head, from someone other than the author; "
-                       "the review workflows file only Standards and Spec/security, so they cannot supply it")
+                       "the review workflows file only Standards and Spec/security, so they cannot supply it; "
+                       "only a distinct attested principal may file one, so post the Browser QA findings as a PR comment "
+                       "and use it as the browser-qa advisory under --exception")
     return reasons, counted
 
 

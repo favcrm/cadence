@@ -143,23 +143,26 @@ the code you just wrote.
   satisfy the requirement. On hosted today `routine` and `ui/**` PRs still need
   the temporary exception (`--exception --advisory standards=<url> --advisory
   spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
-  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31); `ui/**` also
-  needs a Browser QA verdict from a session. Of the advisory links, it checks
+  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31); the Browser
+  QA session posts a PR comment, and that comment is the `browser-qa=<url>`
+  advisory. Of the advisory links, it checks
   only that they are separate https URLs; it proves neither head binding nor
   that Browser QA ran. A second attested human is not required.
-- **Post findings as a PR comment; file no hosted verdict.** Do not file a
-  hosted verdict (`cadence audit verdict`) unless you are a distinct attested
-  principal from the PR author. `favcrm-dev` and `cc-syntax` are one person:
-  being attested on a different login does not make you distinct. While the PR
-  author's login has no attested principal, the gate refuses every
-  owner-attested row, so no owner-attested route is open; do not attest the
-  author to another principal to get around it, which would make a same-person
-  row count. A hosted verdict has no retraction verb and is head-pinned: the
-  gate refuses a same-person row, `--exception` included, and only moving the
-  head clears it, which voids every other row. Local notes are not hosted
-  rows. The distinct route is a workflow-issued row
-  (`identity_source: workflow-oidc`), which carries no login or person; it is a
-  first pass, not a replacement for a real review.
+- **Post findings as a PR comment; file no hosted verdict.** File a hosted
+  verdict (`cadence audit verdict`) only as a distinct attested principal from
+  the PR author; check with `cadence audit identities`. `favcrm-dev` and
+  `cc-syntax` are one person, so an attestation on another login is not
+  distinct. While the author's login has no attested principal the gate refuses
+  every owner-attested row, so no owner-attested route is open; attest the
+  author only to their own existing principal, never a new one, which would make
+  a same-person row count. A hosted verdict has no retraction verb and is
+  head-pinned: a same-person row is refused, `--exception` included, and moving
+  the head, which voids every other row, is the only legitimate way past it. A
+  Browser QA verdict is a countable row too: file none; the comment is the
+  advisory. Local notes are not hosted rows. A workflow-issued row
+  (`identity_source: workflow-oidc`) carries no login or person; on gate,
+  security, schema and release PRs it is a first pass, not a replacement for a
+  real review.
 - **The changed set is anchored to main's live tip.** GitHub's PR base SHA can stay
   older than the real merge base after main is merged into the branch, so a PR
   that merges main and restores an old file diffs as docs-only against it.
@@ -221,9 +224,9 @@ the code you just wrote.
   The tenant stops re-filing, not re-rolling: a run can be cancelled and
   re-dispatched, or an empty commit pushed, for a new head and a new verdict. A
   session holding admin can still rewrite the workflow or sign directly until
-  agents lose admin. There is no Browser QA workflow: a `ui/` PR still needs a
-  Browser QA verdict from a session, and refuses without it. `--exception` is
-  otherwise unchanged, but a workflow row that does not hold refuses under it
+  agents lose admin. There is no Browser QA workflow: off the exception a `ui/` PR
+  needs a countable Browser QA verdict from a distinct attested principal, and
+  refuses without it. `--exception` is otherwise unchanged, but a workflow row that does not hold refuses under it
   too.
 - One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
@@ -369,8 +372,8 @@ looking.
 - Review evidence binds to the exact head and, on a hosted workspace, to the
   issue's project (CAD-2001): the merge gate counts distinct attested principals, refuses
   the author's own, and voids every verdict when the head moves. Read it back
-  with `cadence audit verdicts --project <key>` and confirm a verdict counts
-  before treating a review as landed; in-chat findings are not automatically
+  with `cadence audit verdicts --project <key>` to see what counts; do not file
+  a verdict to find out. In-chat findings are not automatically
   gate evidence. The project is explicit — never derived from the repository or
   the cwd. A hosted verdict counts only when the workspace owner has attested
   its principal's GitHub login (`cadence audit identities`) and admitted that
