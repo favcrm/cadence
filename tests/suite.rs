@@ -7885,7 +7885,7 @@ if (mode === 'keys') {
         }
         fn nothing_leaked_to_the_tenant(&self) {
             assert!(
-                self.hits("/__platform/").is_empty() && self.hits("anthropic").is_empty(),
+                self.hits("/__platform/").is_empty() && self.hits("openrouter").is_empty(),
                 "calls were made: {:?}",
                 self.reqs
             );
@@ -7946,8 +7946,8 @@ if (mode === 'keys') {
             ("vars.REVIEW_SEAL_PUBLIC_KEY", k.pub_a.clone()),
             ("secrets.REVIEW_SEAL_PRIVATE_KEY", k.priv_a.clone()),
             (
-                "secrets.ANTHROPIC_API_KEY",
-                "sk-ant-throwaway-test".to_string(),
+                "secrets.OPENROUTER_API_KEY",
+                "sk-or-throwaway-test".to_string(),
             ),
             ("runner.temp", runner.display().to_string()),
         ] {
@@ -8183,7 +8183,7 @@ if (mode === 'keys') {
             wf,
             &keys().pub_a,
             "review-output",
-            &json!({ "model": "claude-opus-5-5", "output": output }),
+            &json!({ "model": "deepseek/deepseek-v4.1-flash-1017", "output": output }),
         )
     }
 
@@ -8197,29 +8197,37 @@ if (mode === 'keys') {
         )
     }
 
-    // A streamed reply: message_start, a thinking block, the text in two deltas, the stop reason
-    // in message_delta, message_stop (event shapes of the Messages streaming API).
+    // A streamed reply in OpenRouter's chat-completions chunk shape: a role chunk, a ping, a
+    // reasoning chunk, the text in two content deltas, the finish reason on its own chunk, a
+    // usage chunk and the [DONE] sentinel.
+    fn or_chunk(delta: Value, finish: Value) -> Value {
+        json!({ "type": "chunk", "id": "gen-1", "object": "chat.completion.chunk", "model": "deepseek/deepseek-v4.1-flash-1017", "provider": "Stub", "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }] })
+    }
+
     fn model_events(text: &str, stop: Option<&str>) -> Vec<Value> {
         let mid = text
             .char_indices()
             .nth(text.chars().count() / 2)
             .map_or(0, |(i, _)| i);
         let mut ev = vec![
-            json!({ "type": "message_start", "message": { "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [], "stop_reason": null, "usage": { "input_tokens": 1, "output_tokens": 1 } } }),
+            or_chunk(json!({ "role": "assistant", "content": "" }), Value::Null),
             json!({ "type": "ping" }),
-            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "" } }),
-            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "hmm" } }),
-            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": "sig" } }),
-            json!({ "type": "content_block_stop", "index": 0 }),
-            json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "text", "text": "" } }),
-            json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "text_delta", "text": &text[..mid] } }),
-            json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "text_delta", "text": &text[mid..] } }),
-            json!({ "type": "content_block_stop", "index": 1 }),
+            or_chunk(json!({ "content": "", "reasoning": "hmm" }), Value::Null),
+            or_chunk(json!({ "content": &text[..mid] }), Value::Null),
+            or_chunk(json!({ "content": &text[mid..] }), Value::Null),
         ];
         if let Some(stop) = stop {
-            ev.push(json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": { "output_tokens": 15 } }));
+            ev.push(or_chunk(json!({ "content": "" }), json!(stop)));
         }
-        ev.push(json!({ "type": "message_stop" }));
+        ev.push(json!({ "type": "usage", "choices": [], "usage": { "prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0 } }));
+        ev.push(json!({ "type": "done", "raw": "[DONE]" }));
+        ev
+    }
+
+    // What the provider sends for a refusal: the refusal text in `delta.refusal`, content that may
+    // still be well-formed, and `finish_reason: stop` (not a refusal finish reason).
+    fn with_refusal(mut ev: Vec<Value>, refusal: &str) -> Vec<Value> {
+        ev.insert(3, or_chunk(json!({ "refusal": refusal }), Value::Null));
         ev
     }
 
@@ -8233,7 +8241,7 @@ if (mode === 'keys') {
         replies: Value,
         env_over: &[(&str, Option<&str>)],
     ) -> Run {
-        let sc = json!({ "routes": [route("api.anthropic.com/v1/messages", replies)] });
+        let sc = json!({ "routes": [route("openrouter.ai/api/v1/chat/completions", replies)] });
         run_job(wf, "review", &sc, env_over, &|r| {
             std::fs::create_dir_all(r.join("in")).unwrap();
             std::fs::write(r.join("in/review-input.json"), input.to_string()).unwrap();
@@ -8378,7 +8386,7 @@ if (mode === 'keys') {
             let f = wf.file;
             let prepare = flat(wf.job("prepare"));
             assert!(
-                secret_names(&prepare).is_empty() && !prepare.contains("ANTHROPIC"),
+                secret_names(&prepare).is_empty() && !prepare.contains("OPENROUTER"),
                 "{f}: prepare references a secret"
             );
             assert!(
@@ -8389,7 +8397,7 @@ if (mode === 'keys') {
             assert_eq!(
                 review,
                 std::collections::BTreeSet::from(
-                    ["ANTHROPIC_API_KEY", "REVIEW_SEAL_PRIVATE_KEY"].map(String::from)
+                    ["OPENROUTER_API_KEY", "REVIEW_SEAL_PRIVATE_KEY"].map(String::from)
                 ),
                 "{f}: review secrets"
             );
@@ -8400,18 +8408,19 @@ if (mode === 'keys') {
                 "{f}: file secrets"
             );
             assert!(
-                !file.contains("ANTHROPIC"),
+                !file.contains("OPENROUTER"),
                 "{f}: the file job must never mention the model key"
             );
             let mut holders = Vec::new();
             assert!(
-                !flat(&wf.doc["env"]).contains("ANTHROPIC") && !flat(wf.on()).contains("ANTHROPIC"),
+                !flat(&wf.doc["env"]).contains("OPENROUTER")
+                    && !flat(wf.on()).contains("OPENROUTER"),
                 "{f}: top level"
             );
             for (jn, job) in wf.doc["jobs"].as_object().unwrap() {
-                assert!(!flat(&json!({ "e": job.get("environment"), "o": job.get("outputs"), "env": job.get("env") })).contains("ANTHROPIC"), "{f}: {jn} job level");
+                assert!(!flat(&json!({ "e": job.get("environment"), "o": job.get("outputs"), "env": job.get("env") })).contains("OPENROUTER"), "{f}: {jn} job level");
                 for (i, s) in job["steps"].as_array().unwrap().iter().enumerate() {
-                    if flat(s).contains("ANTHROPIC_API_KEY") {
+                    if flat(s).contains("OPENROUTER_API_KEY") {
                         holders.push(format!("{jn}#{i}"));
                     }
                 }
@@ -8419,13 +8428,13 @@ if (mode === 'keys') {
             assert_eq!(
                 holders.len(),
                 1,
-                "{f}: ANTHROPIC_API_KEY holders {holders:?}"
+                "{f}: OPENROUTER_API_KEY holders {holders:?}"
             );
             assert!(holders[0].starts_with("review#"), "{f}: {holders:?}");
-            assert!(wf.step("review")["env"]["ANTHROPIC_API_KEY"]
+            assert!(wf.step("review")["env"]["OPENROUTER_API_KEY"]
                 .as_str()
                 .unwrap()
-                .contains("secrets.ANTHROPIC_API_KEY"));
+                .contains("secrets.OPENROUTER_API_KEY"));
             assert!(
                 !flat(&wf.doc).contains("inherit"),
                 "{f}: no secrets: inherit"
@@ -8644,7 +8653,7 @@ if (mode === 'keys') {
                     r.out
                 );
                 assert!(
-                    r.hits("anthropic").is_empty() && r.files().is_empty(),
+                    r.hits("openrouter").is_empty() && r.files().is_empty(),
                     "{}: {name}: artifacts or model call",
                     wf.file
                 );
@@ -8689,7 +8698,7 @@ if (mode === 'keys') {
                     r.out
                 );
                 assert!(
-                    r.hits("anthropic").is_empty() && r.files().is_empty(),
+                    r.hits("openrouter").is_empty() && r.files().is_empty(),
                     "{}: {name}: artifacts or model call",
                     wf.file
                 );
@@ -8759,7 +8768,7 @@ if (mode === 'keys') {
                 );
                 assert!(
                     r.hits("compare").is_empty()
-                        && r.hits("anthropic").is_empty()
+                        && r.hits("openrouter").is_empty()
                         && r.files().is_empty(),
                     "{}: {name} went on",
                     wf.file
@@ -8917,14 +8926,14 @@ if (mode === 'keys') {
             );
             let mut out = good_output(&wf);
             out["checks"][0]["note"] = json!(format!("the ticket says {M}"));
-            let reply = model_reply(&out.to_string(), "end_turn");
+            let reply = model_reply(&out.to_string(), "stop");
             let r = run_review(&wf, &input, json!([reply]), &[]);
             assert_eq!(r.code, Some(0), "{}", r.out);
-            let calls = r.hits("api.anthropic.com");
+            let calls = r.hits("openrouter.ai/api/v1/chat/completions");
             assert_eq!(calls.len(), 1);
             let body: Value = serde_json::from_str(calls[0]["body"].as_str().unwrap()).unwrap();
             assert!(
-                body["messages"][0]["content"].as_str().unwrap().contains(M),
+                body["messages"][1]["content"].as_str().unwrap().contains(M),
                 "the model must see the opened ticket"
             );
             assert!(
@@ -8932,7 +8941,10 @@ if (mode === 'keys') {
                 "no tools"
             );
             assert_eq!(body["model"], wf.env_str("REVIEW_MODEL"));
-            assert_eq!(calls[0]["headers"]["x-api-key"], "sk-ant-throwaway-test");
+            assert_eq!(
+                calls[0]["headers"]["authorization"],
+                "Bearer sk-or-throwaway-test"
+            );
             seen.push(r.out.clone());
             let sealed_out = r
                 .read("out/review-output.json")
@@ -8959,7 +8971,7 @@ if (mode === 'keys') {
             for s in seen {
                 assert!(!s.contains(M), "{}: ticket text in a log", wf.file);
             }
-            assert!(!f.out.contains("sk-ant"));
+            assert!(!f.out.contains("sk-or"));
         }
     }
 
@@ -8990,7 +9002,7 @@ if (mode === 'keys') {
             no_seal["sealed_ticket"] = Value::Null;
             let mut other_head = input.clone();
             other_head["head"] = json!("dddddddddddddddddddddddddddddddddddddddd");
-            let ok = model_reply(&good_output(&wf).to_string(), "end_turn");
+            let ok = model_reply(&good_output(&wf).to_string(), "stop");
             let cases: Vec<ReviewCase> = vec![
                 (
                     "tampered ciphertext",
@@ -9047,7 +9059,7 @@ if (mode === 'keys') {
                 assert!(r.failed(), "{}: {name} must fail", wf.file);
                 assert!(r.out.contains(reason), "{}: {name}: {}", wf.file, r.out);
                 assert!(
-                    r.hits("anthropic").is_empty(),
+                    r.hits("openrouter").is_empty(),
                     "{}: {name}: the model was called",
                     wf.file
                 );
@@ -9064,34 +9076,36 @@ if (mode === 'keys') {
             let revise = json!({ "outcome": "revise", "risk_level": "auto", "risk_triggers": [], "checks": [] }).to_string();
             let mut no_stop = model_events(&good, None);
             let mut mid_error = model_events(&good, None);
-            mid_error.truncate(8);
+            mid_error.truncate(4);
             mid_error.push(json!({ "type": "error", "error": { "type": "overloaded_error", "message": "Overloaded" } }));
-            no_stop.retain(|e| e["type"] != "message_stop");
-            let mut bad_event = model_events(&good, Some("end_turn"));
-            bad_event.insert(8, json!({ "type": "x", "raw": "{not json" }));
-            let truncated = model_events(&good, None)[..8].to_vec();
+            no_stop.retain(|e| e["type"] != "done");
+            let mut bad_event = model_events(&good, Some("stop"));
+            bad_event.insert(4, json!({ "type": "x", "raw": "{not json" }));
+            let truncated = model_events(&good, None)[..4].to_vec();
+            let mut other_choice = model_events(&good, Some("stop"));
+            other_choice[4]["choices"][0]["index"] = json!(1);
             let cases: Vec<(&str, Value, &str, usize)> = vec![
                 (
                     "refusal",
-                    json!([model_reply(&revise, "refusal")]),
+                    json!([{ "status": 200, "sse": with_refusal(model_events(&revise, Some("stop")), "I can't help with that.") }]),
                     "stopped with refusal",
                     1,
                 ),
                 (
-                    "max tokens",
-                    json!([model_reply(&good, "max_tokens")]),
-                    "stopped with max_tokens",
+                    "finish length",
+                    json!([model_reply(&good, "length")]),
+                    "stopped with length",
                     1,
                 ),
                 (
-                    "pause turn",
-                    json!([model_reply(&good, "pause_turn")]),
-                    "stopped with pause_turn",
+                    "finish content filter",
+                    json!([model_reply(&good, "content_filter")]),
+                    "stopped with content_filter",
                     1,
                 ),
                 (
-                    "tool use stop",
-                    json!([model_reply(&good, "tool_use")]),
+                    "finish tool calls",
+                    json!([model_reply(&good, "tool_calls")]),
                     "model stopped early",
                     1,
                 ),
@@ -9120,6 +9134,18 @@ if (mode === 'keys') {
                     1,
                 ),
                 (
+                    "choice index other than 0",
+                    json!([{ "status": 200, "sse": other_choice }]),
+                    "stream failed",
+                    1,
+                ),
+                (
+                    "finish reason error",
+                    json!([model_reply(&good, "error")]),
+                    "stream failed",
+                    1,
+                ),
+                (
                     "unparseable event",
                     json!([{ "status": 200, "sse": bad_event }]),
                     "stream failed",
@@ -9127,13 +9153,13 @@ if (mode === 'keys') {
                 ),
                 (
                     "not json",
-                    json!([model_reply("sorry, no", "end_turn")]),
+                    json!([model_reply("sorry, no", "stop")]),
                     "not JSON",
                     1,
                 ),
                 (
                     "empty text",
-                    json!([model_reply("", "end_turn")]),
+                    json!([model_reply("", "stop")]),
                     "not JSON",
                     1,
                 ),
@@ -9145,7 +9171,7 @@ if (mode === 'keys') {
                 ),
                 (
                     "thrown fetch",
-                    json!([{ "throw": true }, model_reply(&good, "end_turn")]),
+                    json!([{ "throw": true }, model_reply(&good, "stop")]),
                     "call failed or timed out",
                     1,
                 ),
@@ -9163,13 +9189,13 @@ if (mode === 'keys') {
                 ),
                 (
                     "5xx then a dropped stream",
-                    json!([{ "status": 503, "text": "x" }, { "status": 200, "sse": model_events(&good, None)[..8].to_vec(), "drop": true }, model_reply(&good, "end_turn")]),
+                    json!([{ "status": 503, "text": "x" }, { "status": 200, "sse": model_events(&good, None)[..4].to_vec(), "drop": true }, model_reply(&good, "stop")]),
                     "call failed or timed out",
                     2,
                 ),
                 (
                     "5xx then a stream error",
-                    json!([{ "status": 500, "text": "x" }, { "status": 200, "sse": [{ "type": "error", "error": { "type": "api_error", "message": "x" } }] }, model_reply(&good, "end_turn")]),
+                    json!([{ "status": 500, "text": "x" }, { "status": 200, "sse": [{ "type": "error", "error": { "type": "api_error", "message": "x" } }] }, model_reply(&good, "stop")]),
                     "stream failed",
                     2,
                 ),
@@ -9179,7 +9205,7 @@ if (mode === 'keys') {
                 assert!(r.failed(), "{}: {name} must fail", wf.file);
                 assert!(r.out.contains(reason), "{}: {name}: {}", wf.file, r.out);
                 assert_eq!(
-                    r.hits("api.anthropic.com").len(),
+                    r.hits("openrouter.ai/api/v1/chat/completions").len(),
                     requests,
                     "{}: {name}: request count",
                     wf.file
@@ -9197,19 +9223,33 @@ if (mode === 'keys') {
             // A transient status then a good stream is the most it ever bills twice for (nothing was generated).
             for status in [500, 429, 503] {
                 let again =
-                    json!([{ "status": status, "text": "oops" }, model_reply(&good, "end_turn")]);
+                    json!([{ "status": status, "text": "oops" }, model_reply(&good, "stop")]);
                 let r = run_review(&wf, &input, again, &[]);
                 assert_eq!(r.code, Some(0), "{}: {status}: {}", wf.file, r.out);
-                assert_eq!(r.hits("api.anthropic.com").len(), 2);
+                assert_eq!(r.hits("openrouter.ai/api/v1/chat/completions").len(), 2);
             }
             // A good stream is read once, however the text is split across events.
-            let r = run_review(&wf, &input, json!([model_reply(&good, "end_turn")]), &[]);
+            let r = run_review(&wf, &input, json!([model_reply(&good, "stop")]), &[]);
             assert_eq!(r.code, Some(0), "{}", r.out);
-            assert_eq!(r.hits("api.anthropic.com").len(), 1);
-            let body: Value =
-                serde_json::from_str(r.hits("api.anthropic.com")[0]["body"].as_str().unwrap())
-                    .unwrap();
+            assert_eq!(r.hits("openrouter.ai/api/v1/chat/completions").len(), 1);
+            let body: Value = serde_json::from_str(
+                r.hits("openrouter.ai/api/v1/chat/completions")[0]["body"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
             assert_eq!(body["stream"], true, "the call must stream");
+            // The data-handling controls and the schema constraint ride on every request.
+            assert_eq!(
+                (
+                    &body["provider"]["zdr"],
+                    &body["provider"]["data_collection"],
+                    &body["response_format"]["type"]
+                ),
+                (&json!(true), &json!("deny"), &json!("json_schema")),
+                "{}: provider controls",
+                wf.file
+            );
         }
     }
 
@@ -9415,12 +9455,16 @@ if (mode === 'keys') {
             let cases: Vec<(&str, Value, bool)> = vec![
                 (
                     "success",
-                    json!([model_reply(&poisoned_ok.to_string(), "end_turn")]),
+                    json!([model_reply(&poisoned_ok.to_string(), "stop")]),
                     true,
                 ),
-                ("refusal text", json!([model_reply(&p, "refusal")]), false),
+                (
+                    "refusal text",
+                    json!([{ "status": 200, "sse": with_refusal(model_events("{}", Some("stop")), &p) }]),
+                    false,
+                ),
                 ("odd stop reason", json!([model_reply("{}", &p)]), false),
-                ("not json", json!([model_reply(&p, "end_turn")]), false),
+                ("not json", json!([model_reply(&p, "stop")]), false),
                 (
                     "400 body",
                     json!([{ "status": 400, "json": { "error": { "message": p, "type": p } } }]),
@@ -9431,10 +9475,9 @@ if (mode === 'keys') {
                 (
                     "model name and usage",
                     json!([{ "status": 200, "sse": [
-                        { "type": "message_start", "message": { "model": p, "usage": { "input_tokens": p, "output_tokens": p } } },
-                        { "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "{}" } },
-                        { "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": p } },
-                        { "type": "message_stop" }] }]),
+                        { "type": "chunk", "model": p, "provider": p, "choices": [{ "index": 0, "delta": { "content": "{}" }, "finish_reason": null }] },
+                        { "type": "chunk", "model": p, "choices": [{ "index": 0, "delta": { "content": "" }, "finish_reason": "stop" }], "usage": { "prompt_tokens": p, "completion_tokens": p } },
+                        { "type": "done", "raw": "[DONE]" }] }]),
                     true,
                 ),
                 (
@@ -9449,7 +9492,7 @@ if (mode === 'keys') {
                 ),
                 (
                     "dropped stream",
-                    json!([{ "status": 200, "sse": model_events(&p, None)[..8].to_vec(), "drop": true }]),
+                    json!([{ "status": 200, "sse": model_events(&p, None)[..4].to_vec(), "drop": true }]),
                     false,
                 ),
             ];
@@ -10422,11 +10465,9 @@ if (mode === 'keys') {
                 [(&in_small, 3, 1, 1), (&in_large, 2000, 4, 987_654)]
             {
                 let text = output_of_size(&wf, note, cites).to_string();
-                let mut ev = model_events(&text, Some("end_turn"));
-                ev[0]["message"]["usage"] =
-                    json!({ "input_tokens": tokens, "output_tokens": tokens });
+                let mut ev = model_events(&text, Some("stop"));
                 let last = ev.len() - 2;
-                ev[last]["usage"] = json!({ "output_tokens": tokens });
+                ev[last]["usage"] = json!({ "prompt_tokens": tokens, "completion_tokens": tokens });
                 runs.push(run_review(
                     &wf,
                     input,
@@ -10537,7 +10578,7 @@ if (mode === 'keys') {
                     let r = run_review(
                         &wf,
                         &input,
-                        json!([model_reply(&o.to_string(), "end_turn")]),
+                        json!([model_reply(&o.to_string(), "stop")]),
                         &[],
                     );
                     assert_eq!(r.code, Some(0), "{}", r.out);
@@ -10597,7 +10638,7 @@ if (mode === 'keys') {
                 let r = run_review(
                     &wf,
                     &input,
-                    json!([model_reply(&o.to_string(), "end_turn")]),
+                    json!([model_reply(&o.to_string(), "stop")]),
                     &[],
                 );
                 assert!(
@@ -10639,7 +10680,7 @@ if (mode === 'keys') {
                 let r = run_review(
                     &wf,
                     &inp,
-                    json!([model_reply(&good_output(&wf).to_string(), "end_turn")]),
+                    json!([model_reply(&good_output(&wf).to_string(), "stop")]),
                     &[],
                 );
                 assert!(
@@ -10649,7 +10690,7 @@ if (mode === 'keys') {
                     r.out
                 );
                 assert!(
-                    r.hits("anthropic").is_empty(),
+                    r.hits("openrouter").is_empty(),
                     "{}: ticket {name}: the model was called",
                     wf.file
                 );
@@ -11051,7 +11092,7 @@ if (mode === 'keys') {
                     "{}: {name}: the diff was read after a refused comparison",
                     wf.file
                 );
-                assert!(r.files().is_empty() && r.hits("anthropic").is_empty());
+                assert!(r.files().is_empty() && r.hits("openrouter").is_empty());
                 assert_log_clean(name, &r);
             }
             // Ahead and diverged (main moved after the PR merged it) are both fine.
@@ -11173,15 +11214,20 @@ if (mode === 'keys') {
 
     fn chunked_events(text: &str, chunk: usize, stop: Option<&str>) -> Vec<Value> {
         let chars: Vec<char> = text.chars().collect();
-        let mut ev =
-            vec![json!({ "type": "message_start", "message": { "model": "claude-opus-5-5" } })];
+        let mut ev = vec![or_chunk(
+            json!({ "role": "assistant", "content": "" }),
+            Value::Null,
+        )];
         for part in chars.chunks(chunk) {
-            ev.push(json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": part.iter().collect::<String>() } }));
+            ev.push(or_chunk(
+                json!({ "content": part.iter().collect::<String>() }),
+                Value::Null,
+            ));
         }
         if let Some(stop) = stop {
-            ev.push(json!({ "type": "message_delta", "delta": { "stop_reason": stop } }));
+            ev.push(or_chunk(json!({ "content": "" }), json!(stop)));
         }
-        ev.push(json!({ "type": "message_stop" }));
+        ev.push(json!({ "type": "done", "raw": "[DONE]" }));
         ev
     }
 
@@ -11195,13 +11241,16 @@ if (mode === 'keys') {
             let r = run_review(
                 &wf,
                 &input,
-                json!([{ "status": 200, "sse": chunked_events(&ok, 1_000, Some("end_turn")) }]),
+                json!([{ "status": 200, "sse": chunked_events(&ok, 1_000, Some("stop")) }]),
                 &[],
             );
             assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
-            let body: Value =
-                serde_json::from_str(r.hits("api.anthropic.com")[0]["body"].as_str().unwrap())
-                    .unwrap();
+            let body: Value = serde_json::from_str(
+                r.hits("openrouter.ai/api/v1/chat/completions")[0]["body"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
             assert_eq!(
                 (body["max_tokens"].as_u64(), &body["stream"]),
                 (Some(64_000), &json!(true))
@@ -11212,12 +11261,12 @@ if (mode === 'keys') {
             let cases: Vec<(&str, Vec<Value>, bool)> = vec![
                 (
                     "over by characters",
-                    chunked_events(&long, 1_000, Some("end_turn")),
+                    chunked_events(&long, 1_000, Some("stop")),
                     false,
                 ),
                 (
                     "over by bytes",
-                    chunked_events(&euro, 1_000, Some("end_turn")),
+                    chunked_events(&euro, 1_000, Some("stop")),
                     false,
                 ),
                 (
@@ -11231,12 +11280,12 @@ if (mode === 'keys') {
                 ),
                 (
                     "over then a refusal stop",
-                    chunked_events(&long, 1_000, Some("refusal")),
+                    with_refusal(chunked_events(&long, 1_000, Some("stop")), "no"),
                     false,
                 ),
                 (
-                    "over then max_tokens",
-                    chunked_events(&long, 1_000, Some("max_tokens")),
+                    "over then length",
+                    chunked_events(&long, 1_000, Some("length")),
                     false,
                 ),
             ];
@@ -11254,7 +11303,7 @@ if (mode === 'keys') {
                     "{}: {name} wrote output",
                     wf.file
                 );
-                assert_eq!(r.hits("api.anthropic.com").len(), 1);
+                assert_eq!(r.hits("openrouter.ai/api/v1/chat/completions").len(), 1);
             }
         }
     }
@@ -11263,7 +11312,7 @@ if (mode === 'keys') {
     fn only_a_429_or_a_5xx_status_is_retried() {
         for wf in all() {
             let (input, _) = prepared(&wf);
-            let good = model_reply(&good_output(&wf).to_string(), "end_turn");
+            let good = model_reply(&good_output(&wf).to_string(), "stop");
             for status in [400, 401, 402, 403, 404, 408, 409, 413, 422, 499] {
                 let r = run_review(
                     &wf,
@@ -11273,7 +11322,7 @@ if (mode === 'keys') {
                 );
                 assert!(r.failed(), "{}: {status}", wf.file);
                 assert_eq!(
-                    r.hits("api.anthropic.com").len(),
+                    r.hits("openrouter.ai/api/v1/chat/completions").len(),
                     1,
                     "{}: {status} was retried",
                     wf.file
@@ -11288,14 +11337,14 @@ if (mode === 'keys') {
                 );
                 assert_eq!(r.code, Some(0), "{}: {status}: {}", wf.file, r.out);
                 assert_eq!(
-                    r.hits("api.anthropic.com").len(),
+                    r.hits("openrouter.ai/api/v1/chat/completions").len(),
                     2,
                     "{}: {status}",
                     wf.file
                 );
                 let r = run_review(&wf, &input, json!([{ "status": status, "text": "x" }]), &[]);
                 assert!(
-                    r.failed() && r.hits("api.anthropic.com").len() == 2,
+                    r.failed() && r.hits("openrouter.ai/api/v1/chat/completions").len() == 2,
                     "{}: {status} twice",
                     wf.file
                 );
@@ -11361,10 +11410,10 @@ if (mode === 'keys') {
     fn the_model_fetch_never_follows_a_redirect() {
         for wf in all() {
             let (input, _) = prepared(&wf);
-            let good = model_reply(&good_output(&wf).to_string(), "end_turn");
+            let good = model_reply(&good_output(&wf).to_string(), "stop");
             let r = run_review(&wf, &input, json!([good.clone()]), &[]);
             assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
-            for q in r.hits("api.anthropic.com") {
+            for q in r.hits("openrouter.ai/api/v1/chat/completions") {
                 assert_eq!(
                     q["redirect"], "error",
                     "{}: the model fetch must carry redirect: 'error'",
@@ -11383,7 +11432,7 @@ if (mode === 'keys') {
                     r.out
                 );
                 assert_eq!(
-                    r.hits("api.anthropic.com").len(),
+                    r.hits("openrouter.ai/api/v1/chat/completions").len(),
                     1,
                     "{}: {status}: a redirect must not be retried",
                     wf.file
@@ -11398,7 +11447,7 @@ if (mode === 'keys') {
         for wf in all() {
             let (input, _) = prepared(&wf);
             let good = good_output(&wf).to_string();
-            let stop = |reason: &str| json!({ "type": "message_delta", "delta": { "stop_reason": reason }, "usage": { "output_tokens": 1 } });
+            let stop = |reason: &str| or_chunk(json!({ "content": "" }), json!(reason));
             let with_stops = |stops: &[&str]| {
                 let mut ev = model_events(&good, None);
                 let at = ev.len() - 1;
@@ -11408,15 +11457,15 @@ if (mode === 'keys') {
                 json!([{ "status": 200, "sse": ev }])
             };
             // The same reason repeated is one reason.
-            let r = run_review(&wf, &input, with_stops(&["end_turn", "end_turn"]), &[]);
+            let r = run_review(&wf, &input, with_stops(&["stop", "stop"]), &[]);
             assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
             assert!(r.read("out/review-output.json").is_some());
             // Two reasons that differ, in either order, even when the last would be fine.
             for stops in [
-                ["refusal", "end_turn"],
-                ["end_turn", "refusal"],
-                ["end_turn", "max_tokens"],
-                ["max_tokens", "end_turn"],
+                ["content_filter", "stop"],
+                ["stop", "content_filter"],
+                ["stop", "length"],
+                ["length", "stop"],
             ] {
                 let r = run_review(&wf, &input, with_stops(&stops), &[]);
                 assert!(
@@ -11426,7 +11475,7 @@ if (mode === 'keys') {
                     r.out
                 );
                 assert_eq!(
-                    r.hits("api.anthropic.com").len(),
+                    r.hits("openrouter.ai/api/v1/chat/completions").len(),
                     1,
                     "{}: {stops:?}",
                     wf.file

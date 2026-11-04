@@ -34,7 +34,7 @@ name: review-standards # per axis
 #
 # Needs, created by the operator and not by this file: the `cadence-review`
 # environment (deployment branches limited to main, no required reviewers) with
-# secrets ANTHROPIC_API_KEY (referenced by review only) and REVIEW_SEAL_PRIVATE_KEY
+# secrets OPENROUTER_API_KEY (referenced by review only) and REVIEW_SEAL_PRIVATE_KEY
 # (review and file), and the repo variable REVIEW_SEAL_PUBLIC_KEY. Without the
 # branch limit, a workflow edited on a side branch could read the secrets.
 
@@ -62,7 +62,7 @@ env:
   REPO: favcrm/cadence
   PROJECT: cadence
   TENANT: https://fav-limited.cadencecloud.app
-  REVIEW_MODEL: claude-opus-5-5
+  REVIEW_MODEL: deepseek/deepseek-v4.1-flash-1017
   KIND: standards # per axis
   CHECKS: scope,repo-rules,check-integrity,clarity # per axis
   PR: ${{ inputs.pr }}
@@ -295,7 +295,7 @@ jobs:
           path: ${{ runner.temp }}/in
       - name: Review the diff with a fresh model session
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           REVIEW_SEAL_PRIVATE_KEY: ${{ secrets.REVIEW_SEAL_PRIVATE_KEY }}
           REVIEW_SEAL_PUBLIC_KEY: ${{ vars.REVIEW_SEAL_PUBLIC_KEY }}
         run: |
@@ -379,23 +379,27 @@ jobs:
           const schema = { type: 'object', additionalProperties: false, required: ['outcome', 'risk_level', 'risk_triggers', 'checks'], properties: {
             outcome: { type: 'string', enum: ['pass', 'revise'] }, risk_level: { type: 'string', enum: ['auto', 'human'] },
             risk_triggers: { type: 'array', items: { type: 'integer' } }, checks: { type: 'array', items: check } } };
-          // No tools, no shell, no checkout, no thinking-off: one request, structured output only.
+          // No tools, no shell, no checkout: one request, structured output only. OpenRouter routes only to
+          // providers that accept every parameter sent (require_parameters, so json_schema is enforced or the call
+          // is refused), that do not retain or train on prompts (data_collection deny, zdr); with no such
+          // provider the call fails with a 404 and nothing is filed.
           const body = JSON.stringify({
-            model: E.REVIEW_MODEL, max_tokens: 64000, stream: true, thinking: { type: 'adaptive' },
-            output_config: { effort: 'high', format: { type: 'json_schema', schema } },
-            system, messages: [{ role: 'user', content: user }],
+            model: E.REVIEW_MODEL, max_tokens: 64000, stream: true, reasoning: { effort: 'high' },
+            provider: { require_parameters: true, data_collection: 'deny', zdr: true },
+            response_format: { type: 'json_schema', json_schema: { name: 'review', strict: true, schema } },
+            messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
           });
           // Streamed, so headers arrive at once and Node's 300 s headers timeout cannot fire; the whole call
           // has one 15-minute deadline. A second request is made only after an explicit 429 or 5xx status
           // (nothing was generated); a timeout, a dropped stream or a mid-stream error fails closed, so one
           // run never pays for two generations.
           async function ask() {
-            const r = await fetch('https://api.anthropic.com/v1/messages', {
+            const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
               method: 'POST', body, redirect: 'error', signal: AbortSignal.timeout(900000),
-              headers: { 'x-api-key': E.ANTHROPIC_API_KEY, 'anthropic-version': '2026-10-21', 'content-type': 'application/json' },
+              headers: { authorization: `Bearer ${E.OPENROUTER_API_KEY}`, 'content-type': 'application/json' },
             });
             if (!r.ok) return { status: r.status };
-            let text = '', stop = null, buf = '', failed = false, big = false;
+            let text = '', stop = null, buf = '', failed = false, big = false, refused = false;
             const dec = new TextDecoder();
             for await (const chunk of r.body) {
               buf += dec.decode(chunk, { stream: true });
@@ -403,14 +407,20 @@ jobs:
               while ((i = buf.indexOf('\n\n')) >= 0) {
                 const ev = buf.slice(0, i); buf = buf.slice(i + 2);
                 const line = ev.split('\n').find((l) => l.startsWith('data: '));
-                if (!line) continue;
+                if (!line) continue; // keep-alive comments (": OPENROUTER PROCESSING") carry no data
+                if (line === 'data: [DONE]') continue;
                 let d; try { d = JSON.parse(line.slice(6)); } catch { failed = true; continue; }
-                if (d.type === 'content_block_delta' && d.delta?.type === 'text_delta' && typeof d.delta.text === 'string') { text += d.delta.text; if (text.length > 60000) big = true; }
-                else if (d.type === 'message_delta' && typeof d.delta?.stop_reason === 'string') { if (stop === null) stop = d.delta.stop_reason; else if (stop !== d.delta.stop_reason) failed = true; }
-                else if (d.type === 'error') failed = true;
+                // A provider error inside a 200 stream is a chunk with a top-level error.
+                if (d === null || typeof d !== 'object' || d.error !== undefined) { failed = true; continue; }
+                for (const c of Array.isArray(d.choices) ? d.choices : []) {
+                  if (c.index !== 0) { failed = true; continue; }
+                  if (typeof c.delta?.content === 'string') { text += c.delta.content; if (text.length > 60000) big = true; }
+                  if (typeof c.delta?.refusal === 'string' && c.delta.refusal !== '') refused = true;
+                  if (typeof c.finish_reason === 'string') { if (stop === null) stop = c.finish_reason; else if (stop !== c.finish_reason) failed = true; }
+                }
               }
             }
-            return big ? { status: 200, big: true } : failed ? { status: 200, broken: true } : { status: 200, text, stop };
+            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop };
           }
           let res = null;
           for (let i = 1; i <= 2; i++) {
@@ -422,7 +432,7 @@ jobs:
             die(r.broken ? 'the model stream failed; nothing filed' : `model request failed: HTTP ${r.status}; nothing filed`);
           }
           if (Buffer.byteLength(res.text) > 60000) die('model output is too large to file; nothing filed');
-          if (res.stop !== 'end_turn') die(['refusal', 'max_tokens', 'pause_turn'].includes(res.stop) ? `model stopped with ${res.stop}; nothing filed` : 'model stopped early; nothing filed');
+          if (res.stop !== 'stop') die(['refusal', 'content_filter', 'length'].includes(res.stop) ? `model stopped with ${res.stop}; nothing filed` : 'model stopped early; nothing filed');
           let parsed;
           try { parsed = JSON.parse(res.text); } catch { die('model output is not JSON; nothing filed'); }
           fs.mkdirSync(`${E.RUNNER_TEMP}/out`, { recursive: true });
@@ -443,7 +453,7 @@ jobs:
     needs: review
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment: cadence-review # for REVIEW_SEAL_PRIVATE_KEY only; no step references ANTHROPIC_API_KEY
+    environment: cadence-review # for REVIEW_SEAL_PRIVATE_KEY only; no step references OPENROUTER_API_KEY
     permissions:
       id-token: write
     steps:
