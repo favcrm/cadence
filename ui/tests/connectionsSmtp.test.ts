@@ -641,7 +641,58 @@ async function main() {
     equal(sent.username, liveRow.smtp.username, "hosted update keeps the live username");
     equal(sent.sender, liveRow.smtp.sender, "hosted update keeps the live sender");
     equal(sent.sender_name, "Example Owner", "hosted update keeps the sender name");
+    // A definite refusal arrives nested under `error`, and keeps its specific words.
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (init?.method === "POST" && String(input).includes("/rotate"))
+        return new Response(JSON.stringify({ ok: false, error: { code: "smtp_auth", message: "no" } }), {
+          status: 400, headers: { "Content-Type": "application/json" },
+        });
+      return earlierFetch(input as RequestInfo | URL, init);
+    }) as typeof fetch;
+    const passwordAgain = hostR.querySelector('input[type="password"]') as HTMLInputElement;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!.call(passwordAgain, "wrong");
+      passwordAgain.dispatchEvent(new window.Event("input", { bubbles: true }) as unknown as Event);
+    });
+    await act(async () => {
+      hostR.querySelector("form")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }) as unknown as Event);
+    });
+    await settle(() => assert((hostR.textContent ?? "").includes("Couldn't sign in"), "a hosted refusal keeps its specific words"), 30000);
+    globalThis.fetch = earlierFetch;
     await act(async () => rootR.unmount());
+  }
+
+  // A list the board couldn't fully read says so, rather than looking complete or empty.
+  {
+    const earlierFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (String(input).endsWith("/api/connections") && (init?.method ?? "GET") === "GET")
+        return new Response(JSON.stringify({ connections: [], hosted_smtp: true, connections_unavailable: { code: "x" } }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      return earlierFetch(input as RequestInfo | URL, init);
+    }) as typeof fetch;
+    const hostP = document.createElement("div");
+    document.body.appendChild(hostP);
+    const rootP = createRoot(hostP);
+    act(() => {
+      rootP.render(React.createElement(ConnectionsPage, {
+        viewer: { operator: true, readOnly: false },
+        hostedBoard: true,
+      }));
+    });
+    await act(async () => {
+      await Promise.all([resources.connections.refresh(), resources.connectionsPartial.refresh()]);
+    });
+    await settle(() => {
+      const text = hostP.textContent ?? "";
+      assert(text.includes("may be incomplete"), "a partial list says so");
+      assert(!text.includes("No accounts connected"), "a partial list isn't presented as empty");
+      assert(text.includes("Retry"), "a partial list offers Retry");
+    }, 30000);
+    await act(async () => rootP.unmount());
+    globalThis.fetch = earlierFetch;
+    await act(async () => { await resources.connections.refresh(); });
   }
 
   // The built-in Local outbox detail has NO edit/disconnect actions.

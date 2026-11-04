@@ -9,6 +9,9 @@ type Scope = "user" | "organization";
 type Preferences = { organization_locale: Locale | null; user_locale: Locale | null };
 
 const zhTW: Record<string, string> = {
+  "Some connected accounts couldn't be loaded, so this list may be incomplete.": "部分已連接帳戶無法載入，此清單可能不完整。",
+  "Some accounts couldn't be loaded": "部分帳戶無法載入",
+  "Couldn't confirm the connection. Check it before trying again.": "無法確認連線。請先檢查，再重試。",
   "This account is managed through its own sign-in. To change it, connect it again from Add.": "此帳戶透過其自身登入管理。如需更改，請從「新增」重新連接。",
   "1 account": "1 個帳戶",
   "approved for this board": "已獲准用於此看板",

@@ -326,9 +326,16 @@ function ConnectionsIndex({
   const rows = listState?.data ?? [];
   const providers = providersState?.data ?? [];
   const catalogUnavailable = providersState?.status === "empty";
+  const partialRes = viewer.operator && hostedBoard ? resources.connectionsPartial : null;
+  const partialState = useMaybeResource(partialRes);
+  useEffect(() => {
+    if (partialRes) void partialRes.revalidate();
+  }, [partialRes]);
+  const partial = partialState?.data?.partial === true;
   const refresh = () => {
-    if (listRes) void listRes.revalidate();
+    if (listRes) void listRes.refresh();
     if (providersRes) void providersRes.revalidate();
+    if (partialRes) void partialRes.refresh();
   };
   const groups = serviceGroups(providers, rows);
   const [openId, setOpenId] = useState<string | null>(null);
@@ -394,7 +401,13 @@ function ConnectionsIndex({
           )}
           {listState?.data && (
             <div className="space-y-3 min-w-0">
-              {rows.length === 0 ? (
+              {partial && (
+                <p className="text-label text-fail flex flex-wrap items-center gap-2 mb-3" role="alert" data-state="connections-partial">
+                  {t("Some connected accounts couldn't be loaded, so this list may be incomplete.")}
+                  <Button size="sm" onClick={refresh}>{t("Retry")}</Button>
+                </p>
+              )}
+              {rows.length === 0 && partial ? null : rows.length === 0 ? (
                 <section className="settings-rows px-4 py-6 text-center" aria-label={t("connections")}>
                   <p className="text-secondary text-ink-300">{t("No accounts connected")}</p>
                   <p className="text-label text-ink-500 mt-1">{t("Connect an account so your apps can post or send email.")}</p>

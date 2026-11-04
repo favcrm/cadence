@@ -24,6 +24,12 @@ export default function HostedStatus({
   useEffect(() => {
     if (listRes) void listRes.revalidate();
   }, [listRes]);
+  const partialRes = canReadConnections ? resources.connectionsPartial : null;
+  const partialState = useMaybeResource(partialRes);
+  useEffect(() => {
+    if (partialRes) void partialRes.revalidate();
+  }, [partialRes]);
+  const partial = partialState?.data?.partial === true;
   const build = meta.build_commit ? meta.build_commit.slice(0, 12) : null;
   const rows = list?.data ?? null;
   const attention = rows ? connectionsNeedingAttention(rows) : 0;
@@ -61,9 +67,15 @@ export default function HostedStatus({
           <Link href="/settings/connections" className="settings-row">
             <span className="settings-row-text">
               <b>{t("Connections")}</b>
-              <small>{rows.length === 1 ? t("1 account") : t("{count} accounts").replace("{count}", String(rows.length))}</small>
+              <small>
+                {partial
+                  ? t("Some accounts couldn't be loaded")
+                  : rows.length === 1
+                    ? t("1 account")
+                    : t("{count} accounts").replace("{count}", String(rows.length))}
+              </small>
             </span>
-            {attention > 0 && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
+            {(attention > 0 || partial) && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
           </Link>
         )}
       </div>

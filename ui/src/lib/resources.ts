@@ -309,4 +309,8 @@ export const resources = {
   connections: cache.resource<Connection[]>("connections", () =>
     api.connections().then((r) => r.connections),
   ),
+  /** Whether that list is partial, because the board couldn't reach the platform's accounts. */
+  connectionsPartial: cache.resource<{ partial: boolean }>("connections-partial", () =>
+    api.connections().then((r) => ({ partial: r.connections_unavailable !== undefined })),
+  ),
 };

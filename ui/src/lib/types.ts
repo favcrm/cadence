@@ -1593,6 +1593,8 @@ export interface ConnectionsPayload {
   /** CAD-1126: enrolled SMTP senders send through the hosted
    *  `smtp.internal` pass-through (a hosted workspace). */
   hosted_smtp?: boolean;
+  /** The list is partial: the board couldn't reach the platform's accounts. */
+  connections_unavailable?: { code?: string; message?: string };
 }
 
 export interface ConnectionPayload {

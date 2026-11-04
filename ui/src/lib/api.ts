@@ -332,10 +332,12 @@ async function post<T>(path: string, body: object, operation?: PrivateOperation)
     const parsed = await resp.json().catch(() => null);
     op.assertCurrent();
     if (!resp.ok) {
+      // Some routes nest the code under `error`, as the read path already allows for.
+      const nestedCode = parsed?.code ?? parsed?.error?.code;
       throw new ApiError(
         errorMessage(parsed, `${resp.status} ${resp.statusText}`),
         resp.status,
-        parsed ?? undefined,
+        parsed ? { ...parsed, ...(nestedCode === undefined ? {} : { code: nestedCode }) } : undefined,
       );
     }
     return parsed as T;

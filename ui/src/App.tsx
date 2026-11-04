@@ -321,17 +321,17 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const personalGeneration = privateSessionGeneration();
   const personalIdentity = JSON.stringify([personalGeneration, meta.session?.id, meta.session?.user?.sub, meta.actor]);
 
+  // A board that says what Settings it serves never shows a page it doesn't.
+  const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
+  useEffect(() => {
+    if (settingsTarget) navigate(hrefFor({ screen: "settings", section: settingsTarget }), { replace: true });
+  }, [settingsTarget]);
   // CAD-1312: the header's organisation label is the hosted board's
   // configured company display name (`GET /api/platform-account`, already
   // projected server-side). Local and tailnet boards have no configured
   // organisation — the label stays the neutral "Cadence", never a
   // hostname, user or project name. One nonblocking read per page load;
   // a failure or missing name leaves the fallback.
-  // A board that says what Settings it serves never shows a page it doesn't.
-  const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
-  useEffect(() => {
-    if (settingsTarget) navigate(hrefFor({ screen: "settings", section: settingsTarget }), { replace: true });
-  }, [settingsTarget]);
   const [orgName, setOrgName] = useState("Cadence");
   useEffect(() => {
     if (meta === null) return;
