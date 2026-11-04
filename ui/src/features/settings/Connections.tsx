@@ -328,14 +328,10 @@ function ConnectionsIndex({
   const catalogUnavailable = providersState?.status === "empty";
   const partialRes = viewer.operator && hostedBoard ? resources.connectionsPartial : null;
   const partialState = useMaybeResource(partialRes);
-  useEffect(() => {
-    if (partialRes) void partialRes.revalidate();
-  }, [partialRes]);
   const partial = partialState?.data?.partial === true;
   const refresh = () => {
     if (listRes) void listRes.refresh();
     if (providersRes) void providersRes.revalidate();
-    if (partialRes) void partialRes.refresh();
   };
   const groups = serviceGroups(providers, rows);
   const [openId, setOpenId] = useState<string | null>(null);

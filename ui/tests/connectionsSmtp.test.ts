@@ -682,7 +682,7 @@ async function main() {
       }));
     });
     await act(async () => {
-      await Promise.all([resources.connections.refresh(), resources.connectionsPartial.refresh()]);
+      await resources.connections.refresh();
     });
     await settle(() => {
       const text = hostP.textContent ?? "";

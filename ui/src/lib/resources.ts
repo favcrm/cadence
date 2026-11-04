@@ -34,6 +34,7 @@ import type {
 
 /** The app's one query cache — every screen reads its stores from here. */
 export const cache = new QueryCache();
+let connectionsListPartial = false;
 
 const unavailablePrivateRecord = (error: unknown) => error instanceof ApiError &&
   (error.status === 401 || error.status === 403 || error.status === 404);
@@ -307,10 +308,17 @@ export const resources = {
    * only (CAD-585). Operator-only, like the providers read.
    */
   connections: cache.resource<Connection[]>("connections", () =>
-    api.connections().then((r) => r.connections),
+    api.connections().then((r) => {
+      connectionsListPartial = r.connections_unavailable !== undefined;
+      resources.connectionsPartial.write(() => ({ partial: connectionsListPartial }));
+      return r.connections;
+    }),
   ),
-  /** Whether that list is partial, because the board couldn't reach the platform's accounts. */
-  connectionsPartial: cache.resource<{ partial: boolean }>("connections-partial", () =>
-    api.connections().then((r) => ({ partial: r.connections_unavailable !== undefined })),
-  ),
+  /**
+   * Whether that list is partial, because the board couldn't reach the platform's
+   * accounts. The list read sets it, so the two can't disagree and nothing reads twice.
+   */
+  connectionsPartial: cache.resource<{ partial: boolean }>("connections-partial", async () => ({
+    partial: connectionsListPartial,
+  })),
 };

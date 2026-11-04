@@ -26,9 +26,6 @@ export default function HostedStatus({
   }, [listRes]);
   const partialRes = canReadConnections ? resources.connectionsPartial : null;
   const partialState = useMaybeResource(partialRes);
-  useEffect(() => {
-    if (partialRes) void partialRes.revalidate();
-  }, [partialRes]);
   const partial = partialState?.data?.partial === true;
   const build = meta.build_commit ? meta.build_commit.slice(0, 12) : null;
   const rows = list?.data ?? null;
