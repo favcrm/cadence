@@ -304,11 +304,13 @@ The gateway's real refusal shapes (AOS-243):
   can itself send a blocked report; if its answer is lost, the result remains
   unknown alongside the local failure. If a correlated receipt confirms the
   remote action but local custody cannot be recorded, the error says the action
-  was confirmed and identifies the local failure. Inspect `cadence agent status`
-  in the same selected workspace and retain the assignment, claim, generation
-  and operation identifiers before deciding whether to retry. Unsupported work
-  kinds are never started locally; a confirmed receipt is recorded before that
-  local refusal.
+  was confirmed and identifies the local failure. This holds for queue, claim,
+  report and reassignment alike: the error names the workspace, assignment,
+  generation and the request's `operation_id` (or `idempotency_key` for queue).
+  Inspect `cadence agent assignments` in the same selected workspace and
+  retain those identifiers before deciding whether to retry; do not replay
+  blindly. Unsupported work kinds are never started locally; a confirmed
+  receipt is recorded before that local refusal.
 - Hosted app release mutations retain the caller's operation UUID. On an
   unproved response, inspect `app catalog operation` or `reconcile` for that
   UUID in the same workspace; do not create a new operation blindly.
