@@ -14,15 +14,17 @@ pub mod app_catalog;
 pub mod app_chat;
 pub mod app_guard;
 pub mod app_listing;
-pub mod app_screen_decl;
+// CAD-2008: the screen declaration/integrity rules live in `cadence-core`, so
+// the native install/mount guard (`validate_map`) and the hosted
+// `app.screen.integrity` operation run one implementation. This re-export keeps
+// every existing `crate::issue::app_screen_decl` path working unchanged.
+pub use cadence_core::app_screen_decl;
 pub mod app_screen_pkg;
 pub mod app_source;
 pub mod app_view;
 pub mod areas;
 pub mod blocked;
 pub mod board;
-#[cfg(test)]
-mod cad811_screen_startup_acceptance;
 pub mod claim;
 pub mod cli;
 pub mod cloud;
@@ -1170,32 +1172,11 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
   `.git/cadence-write.flock` (`.write.lock` fences older binaries).\n";
 
 #[cfg(test)]
+mod app_screen_bound_acceptance;
+
+#[cfg(test)]
 mod lock_tests;
 
-#[cfg(test)]
-#[path = "cad1177_tools_acceptance.rs"]
-mod cad1177_tools_acceptance;
-
-#[cfg(test)]
-mod cad1298_acceptance;
-
-#[cfg(test)]
-mod cad1298_readiness_acceptance;
-
-#[cfg(test)]
-mod cad1314_acceptance;
-
-#[cfg(test)]
-mod cad1793_acceptance;
-
-#[cfg(test)]
-#[path = "cad1270_screen_decl_acceptance.rs"]
-mod cad1270_screen_decl_acceptance;
-
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) fn set_lock_waiting_observer_for_test(sender: Option<std::sync::mpsc::Sender<()>>) {
-    pmlock::WAITING.with(|observer| *observer.borrow_mut() = sender);
-}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -137,7 +137,7 @@ export default function EditorPane({
   const save = async () => {
     if (savingRef.current || !dirty || status !== "ready") return;
     if (readOnly) {
-      onToast("err", "writes are disabled on this board — sign in as the operator to edit.");
+      onToast("err", "writes are disabled on this board — sign in with editing access to edit.");
       return;
     }
     savingRef.current = true;

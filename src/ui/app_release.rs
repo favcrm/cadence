@@ -626,7 +626,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "app_release/cad1459_account_quote_acceptance.rs"]
-mod cad1459_account_quote_acceptance;

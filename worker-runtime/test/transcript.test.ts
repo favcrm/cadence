@@ -2,7 +2,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "bun:test";
 import { BOARD_MESSAGE_KIND } from "../src/contract.ts";
-import { threadEntries } from "../src/transcript.ts";
+import { projectedThreadEntries, threadEntries } from "../src/transcript.ts";
 
 const input = (
   id: string,
@@ -65,6 +65,10 @@ const toolResult = (
   ],
 });
 
+/** Most cases here pin identity and kinds; `created` has its own case below. */
+const entriesWithoutTime = (...args: Parameters<typeof threadEntries>) =>
+  threadEntries(...args).map(({ created: _created, ...entry }) => entry);
+
 describe("board transcript identity", () => {
   it("keeps repeated and differently punctuated inputs bound to their recorded message ids", () => {
     const records = [
@@ -72,7 +76,7 @@ describe("board transcript identity", () => {
       input("2", "Hello.", { messageId: "second" }),
       input("3", "hello", { messageId: "third" }),
     ];
-    expect(threadEntries(records, true)).toEqual([
+    expect(entriesWithoutTime(records, true)).toEqual([
       {
         seq: 1,
         role: "operator",
@@ -105,7 +109,7 @@ describe("board transcript identity", () => {
     };
     const current = input("3", "Same text", { messageId: "actual-send" });
     expect(
-      threadEntries([legacy, other, current], true).map(
+      entriesWithoutTime([legacy, other, current], true).map(
         (entry) => entry.message,
       ),
     ).toEqual([undefined, undefined, "actual-send"]);
@@ -119,7 +123,7 @@ describe("board transcript identity", () => {
       ],
     };
     expect(
-      threadEntries([input("1", "Question", { messageId: 42 }), answer], true),
+      entriesWithoutTime([input("1", "Question", { messageId: 42 }), answer], true),
     ).toEqual([
       { seq: 1, role: "operator", kind: "message", text: "Question" },
       { seq: 2, role: "system", kind: "message", text: "Provider diagnostic" },
@@ -161,7 +165,7 @@ describe("board transcript identity", () => {
       ],
     };
     expect(
-      threadEntries(
+      entriesWithoutTime(
         [input("1", "Question", { messageId: "input-id" }), answer],
         true,
       ),
@@ -194,10 +198,10 @@ describe("board transcript identity", () => {
       ],
       "stop",
     );
-    expect(threadEntries([answer], false)).toEqual([
+    expect(entriesWithoutTime([answer], false)).toEqual([
       { seq: 1, role: "agent", kind: "turn_result", text: "Visible answer" },
     ]);
-    expect(threadEntries([answer], true).map((entry) => entry.kind)).toEqual([
+    expect(entriesWithoutTime([answer], true).map((entry) => entry.kind)).toEqual([
       "thinking",
       "thinking",
       "turn_result",
@@ -206,7 +210,7 @@ describe("board transcript identity", () => {
 
   it("keeps a tool-turn text as commentary and marks only a completed answer", () => {
     expect(
-      threadEntries(
+      entriesWithoutTime(
         [
           input("1", "Question", { messageId: "m" }),
           assistant(
@@ -247,7 +251,7 @@ describe("board transcript identity", () => {
 
   it("marks only the final text part of a terminal response", () => {
     expect(
-      threadEntries(
+      entriesWithoutTime(
         [
           assistant(
             "1",
@@ -268,7 +272,7 @@ describe("board transcript identity", () => {
 
   it("maps tool calls and results into the board's tools group", () => {
     expect(
-      threadEntries(
+      entriesWithoutTime(
         [
           assistant(
             "1",
@@ -317,7 +321,7 @@ describe("board transcript identity", () => {
 
   it("treats a length-limited response as completed but not an errored one", () => {
     expect(
-      threadEntries(
+      entriesWithoutTime(
         [
           assistant(
             "1",
@@ -352,14 +356,14 @@ describe("board transcript identity", () => {
       };
     };
     const failures = (records: EntryRecord[]) =>
-      threadEntries(records, false).filter(
+      entriesWithoutTime(records, false).filter(
         (entry) => entry.payload?.status === "failed",
       );
     const reason = (message?: string) =>
       failures([failed("2", message), input("3", "again")])[0]?.payload?.error;
 
     it("projects a terminal error as a failed turn_result with a safe reason", () => {
-      const entries = threadEntries(
+      const entries = entriesWithoutTime(
         [
           input("1", "hi"),
           failed("2", "400 from https://gw.internal/v1?key=sk-secret refused"),
@@ -378,7 +382,7 @@ describe("board transcript identity", () => {
     });
 
     it("shows nothing for a retryable error that Pi then retried successfully", () => {
-      const entries = threadEntries(
+      const entries = entriesWithoutTime(
         [
           input("1", "hi"),
           failed("2", "429 too many requests"),
@@ -408,8 +412,8 @@ describe("board transcript identity", () => {
 
     it("keeps earlier seqs stable while a held error resolves (live stream)", () => {
       const held = [input("1", "hi"), failed("2", "529 overloaded")];
-      const before = threadEntries(held, false);
-      const after = threadEntries(
+      const before = entriesWithoutTime(held, false);
+      const after = entriesWithoutTime(
         [...held, assistant("3", [{ type: "text", text: "ok" }], "stop")],
         false,
       );
@@ -427,6 +431,9 @@ describe("board transcript identity", () => {
 
     it("passes our billing code through and classifies the rest", () => {
       expect(reason("403 billing_unavailable")).toBe("billing_unavailable");
+      expect(reason("404 image_input_unavailable")).toBe(
+        "The selected model cannot read images.",
+      );
       expect(reason("request timed out")).toBe("The model request timed out.");
       expect(reason("429 too many requests")).toBe(
         "The model is busy right now.",
@@ -448,7 +455,67 @@ describe("board transcript identity", () => {
     });
 
     it("does not surface an aborted turn", () => {
-      expect(threadEntries([assistant("2", [], "aborted")], false)).toEqual([]);
+      expect(entriesWithoutTime([assistant("2", [], "aborted")], false)).toEqual([]);
     });
+  });
+
+  // CAD-2015: the board's message times and "Thought for" come from here.
+  it("stamps an entry with the engine's recorded time, and invents none", () => {
+    const at = Date.UTC(2026, 10, 3, 1, 41);
+    const stamped = input("1", "hi");
+    const timed = threadEntries(
+      [{ ...stamped, model: [{ role: "user", content: "hi", timestamp: at }] }],
+      false,
+    );
+    expect(timed[0].created).toBe("2026-11-03T01:41:00.000Z");
+    const untimed = threadEntries(
+      [{ ...stamped, model: [{ role: "user", content: "hi", timestamp: 0 }] }],
+      false,
+    );
+    expect(Object.hasOwn(untimed[0], "created")).toBe(false);
+  });
+});
+
+describe("projectedThreadEntries", () => {
+  const records = [input("1", "hello")];
+
+  it("returns the runtime's entries unchanged without a projection", () => {
+    expect(projectedThreadEntries(records, false)).toEqual(
+      threadEntries(records, false),
+    );
+  });
+
+  it("applies the host's projection without changing the stored records", () => {
+    const before = JSON.stringify(records);
+    // Anchored to an entry and renumbered from there, as the contract asks: what
+    // follows the anchor moves by one, consistently, on every read.
+    const seen = projectedThreadEntries(records, false, (entries) =>
+      entries.flatMap((entry, index) =>
+        index === 0
+          ? [entry, { seq: 2, role: "agent", kind: "artifact", text: "" }]
+          : [{ ...entry, seq: entry.seq + 1 }],
+      ),
+    );
+    expect(seen.map((entry) => entry.kind)).toContain("artifact");
+    expect(seen.map((entry) => entry.seq)).toEqual(seen.map((_, index) => index + 1));
+    expect(seen).toHaveLength(threadEntries(records, false).length + 1);
+    expect(JSON.stringify(records)).toBe(before);
+  });
+
+  it("hands the host's projection the operator entry's app binding, and keeps it", () => {
+    const app = { install_id: "install_ledger", context_id: "campaign" };
+    const scoped = [
+      input("1", "ledger question", {
+        messageId: "op-1",
+        app: { installId: "install_ledger", contextId: "campaign" },
+      }),
+    ];
+    let given: unknown;
+    const seen = projectedThreadEntries(scoped, false, (entries) => {
+      given = entries[0]?.payload?.app;
+      return entries;
+    });
+    expect(given).toEqual(app);
+    expect(seen[0]?.payload?.app).toEqual(app);
   });
 });

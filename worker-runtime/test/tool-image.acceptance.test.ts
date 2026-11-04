@@ -1,11 +1,18 @@
 import { describe, expect, it } from "bun:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
+import {
+  createRegistry,
+  type Extension,
+  Harness,
+  MemoryStorage,
+} from "@earendil-works/pi-durable";
 import { createAI } from "agents/models/pi-ai";
+import type { AppScope, RuntimeTool } from "../src/contract.ts";
 import { runtimeExtension } from "../src/engine.ts";
 import { defaultModel, meteredBinding, withDefaultModel } from "../src/model.ts";
 import { rawSessionFrame } from "../src/session-stream.ts";
+import type { ToolAuthority } from "../src/tool-policy.ts";
 import { threadEntries } from "../src/transcript.ts";
 
 // A synthetic one-pixel PNG; no real browsing or provider call is involved.
@@ -88,6 +95,8 @@ async function observe(
           },
         ],
       },
+      undefined,
+      undefined,
       acceptImages,
     ),
   );
@@ -325,5 +334,202 @@ describe("visual tool results through the hosted model path", () => {
         payload: { is_error: true },
       });
     }
+  });
+
+  it("names a gateway image refusal instead of reporting a network outage", async () => {
+    let calls = 0;
+    const binding = meteredBinding(
+      {
+        async requestModel() {
+          calls += 1;
+          if (calls > 1)
+            return Response.json(
+              {
+                error: {
+                  message: "Image input is unavailable for the selected model.",
+                  type: "invalid_request_error",
+                  code: "image_input_unavailable",
+                },
+              },
+              { status: 404 },
+            );
+          return new Response(
+            frame({ role: "assistant", content: "" }) +
+              frame({
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "capture-1",
+                    type: "function",
+                    function: { name: "capture", arguments: "{}" },
+                  },
+                ],
+              }) +
+              frame({}, "tool_calls") +
+              "data: [DONE]\n\n",
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        },
+      },
+      () => ({ conversation: "1", task: "2", cutoff: "3" }),
+    );
+    const model = defaultModel("default", true);
+    const models = createModels();
+    models.setProvider(
+      withDefaultModel(createAI({ binding: binding as Ai }).provider, model),
+    );
+    const registry = createRegistry();
+    registry.install(
+      runtimeExtension(
+        { name: "synthetic-browser", tools: [capturing(() => {})] },
+        undefined,
+        undefined,
+        true,
+      ),
+    );
+    const harness = await Harness.open(
+      new MemoryStorage(),
+      { models, registry },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const conversation = await harness.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: model.provider, modelId: model.id } },
+      });
+      const operation = await conversation.submit(
+        { type: "input", content: "Inspect this page." },
+        BACKGROUND_CONTEXT,
+      );
+      await operation.wait(BACKGROUND_CONTEXT);
+      const records = await conversation.entries(
+        { order: "ascending" },
+        100,
+        undefined,
+        BACKGROUND_CONTEXT,
+      );
+      const text = JSON.stringify(threadEntries(records.items, true));
+      expect(text).toContain("The selected model cannot read images.");
+      expect(text).not.toContain("could not be reached");
+    } finally {
+      await harness.close(BACKGROUND_CONTEXT);
+    }
+  });
+
+  it("does not rewrite a gateway refusal outside the allowlist", async () => {
+    const binding = meteredBinding(
+      {
+        async requestModel() {
+          return Response.json(
+            { error: { message: "private upstream detail", code: "other" } },
+            { status: 404 },
+          );
+        },
+      },
+      () => ({ conversation: "1", task: "2", cutoff: "3" }),
+    );
+    const response = (await binding.run("default", {
+      messages: [],
+    })) as Response;
+    expect(await response.json()).toEqual({
+      error: { message: "private upstream detail", code: "other" },
+    });
+  });
+});
+
+function capturing(onRun: (app: unknown) => void): RuntimeTool {
+  return {
+    name: "capture",
+    description: "Capture the synthetic page.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    replay: "safe",
+    async execute(_input, invocation) {
+      onRun(invocation.app);
+      return {
+        output: [
+          { type: "text", text: "Synthetic page capture." },
+          { type: "image", data: PNG, mimeType: "image/png" },
+        ],
+      };
+    },
+  };
+}
+
+describe("image results keep the tool authority and app-scope order", () => {
+  const app = { appId: "synthetic-app" } as unknown as AppScope;
+  const api = { conversationId: 1, taskId: 2, now: () => 1000 };
+  const call = (tool: NonNullable<Extension["tools"]>[number]) =>
+    (tool.execute as (...args: unknown[]) => Promise<unknown>)({}, api, {
+      abortSignal: new AbortController().signal,
+    });
+  const allow: ToolAuthority = {
+    toolRefusal: () => undefined,
+    authorizeTool: async () => {},
+  };
+  const order = (
+    authority: ToolAuthority,
+    resolve: () => Promise<AppScope | null>,
+    acceptImages = true,
+  ) => {
+    const handled: unknown[] = [];
+    const tool = runtimeExtension(
+      { name: "synthetic-browser", tools: [capturing((a) => handled.push(a))] },
+      authority,
+      resolve,
+      acceptImages,
+    ).tools![0]!;
+    return { handled, run: () => call(tool) };
+  };
+
+  it("hands an authorized app-scoped call its scope and returns its image", async () => {
+    const { handled, run } = order(allow, async () => app);
+    const result = await run();
+    expect(handled).toEqual([app]);
+    expect(JSON.stringify(result)).toContain(PNG);
+  });
+
+  it("does not resolve scope or reach the handler for a refused or revoked call", async () => {
+    for (const authority of [
+      { ...allow, toolRefusal: () => "tool_effect_refused" },
+      {
+        ...allow,
+        authorizeTool: async () => {
+          throw new Error("session_revoked");
+        },
+      },
+    ] satisfies ToolAuthority[]) {
+      let resolved = 0;
+      const { handled, run } = order(authority, async () => {
+        resolved += 1;
+        return app;
+      });
+      const outcome = await run().then(
+        (value) => JSON.stringify(value),
+        (error: Error) => error.message,
+      );
+      expect(outcome).toMatch(/tool_effect_refused|session_revoked/);
+      expect(outcome).not.toContain(PNG);
+      expect(resolved).toBe(0);
+      expect(handled).toHaveLength(0);
+    }
+  });
+
+  it("refuses an unattributable call rather than running it as Home", async () => {
+    const { handled, run } = order(allow, async () => {
+      throw new Error("operation envelope unavailable");
+    });
+    await expect(run()).rejects.toThrow("operation envelope unavailable");
+    expect(handled).toHaveLength(0);
+  });
+
+  it("refuses an image from a scoped call when the host has not opted in", async () => {
+    const { handled, run } = order(allow, async () => app, false);
+    const result = JSON.stringify(await run());
+    expect(handled).toEqual([app]);
+    expect(result).toContain("Image input is unavailable for this session.");
+    expect(result).not.toContain(PNG);
   });
 });

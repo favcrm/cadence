@@ -37,8 +37,6 @@ use crate::issue::line_times::LineTimes;
 use crate::issue::{board, project};
 
 mod assembly;
-#[cfg(test)]
-mod cad1751_budget_acceptance;
 mod commands;
 mod github;
 mod github_cache;
@@ -878,19 +876,38 @@ impl<'a> StatusClock<'a> {
 
 /// The tracker project an agent works in: the longest declared repo
 /// path its cwd sits under (worktrees under `.cadence/wt/` included).
-/// "" — a global row — when nothing matches.
+/// "" — a global row — when nothing matches, and also when the deepest
+/// match is a tie: a checkout several projects register (CAD-2001)
+/// attributes the agent to none of them rather than to the last
+/// equal-depth claimant, which would relabel its rows for the wrong
+/// project and soften a real failure under `--project`.
 fn agent_project(a: &Value, repos: &[(PathBuf, String)]) -> String {
     let Some(cwd) = a["cwd"].as_str().filter(|c| !c.is_empty()) else {
         return String::new();
     };
     let cwd = PathBuf::from(cwd);
     let cwd = cwd.canonicalize().unwrap_or(cwd);
-    repos
+    // One entry per project: several rows may name the same checkout.
+    let mut hits: Vec<(&str, usize)> = Vec::new();
+    for (path, key) in repos {
+        if !cwd.starts_with(path) {
+            continue;
+        }
+        let depth = path.components().count();
+        match hits.iter_mut().find(|entry| entry.0 == key.as_str()) {
+            Some(entry) => entry.1 = entry.1.max(depth),
+            None => hits.push((key.as_str(), depth)),
+        }
+    }
+    let deepest = hits.iter().map(|(_, depth)| *depth).max().unwrap_or(0);
+    let mut at_depth = hits
         .iter()
-        .filter(|(path, _)| cwd.starts_with(path))
-        .max_by_key(|(path, _)| path.components().count())
-        .map(|(_, key)| key.clone())
-        .unwrap_or_default()
+        .filter(|(_, depth)| *depth == deepest)
+        .map(|(key, _)| *key);
+    match (at_depth.next(), at_depth.next()) {
+        (Some(only), None) => only.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// The needs-me rows one agent contributes: its `agent_list` row (state,
@@ -2074,6 +2091,18 @@ mod tests {
         assert_eq!(agent_project(&a, &repos), "inner");
         assert_eq!(agent_project(&json!({"cwd": "/elsewhere"}), &repos), "");
         assert_eq!(agent_project(&json!({}), &repos), "");
+        // CAD-2001: two projects on one checkout tie at the same depth,
+        // so neither is named — and two rows of one project still are.
+        let shared = vec![
+            (root.clone(), "alpha".to_string()),
+            (root.clone(), "beta".to_string()),
+        ];
+        assert_eq!(agent_project(&a, &shared), "");
+        let twice = vec![
+            (root.clone(), "alpha".to_string()),
+            (root.clone(), "alpha".to_string()),
+        ];
+        assert_eq!(agent_project(&a, &twice), "alpha");
     }
 
     // ---- CAD-267: default-branch CI from Actions runs ----
@@ -2830,7 +2859,11 @@ mod tests {
             prefix: "CAD".into(),
             repos: vec![project::Repo {
                 path: Some(repo.to_string_lossy().into()),
-                remote: Some("git@github.com:favcrm/cadence.git".into()),
+                remote: Some(if BUILD_REMOTE == "unknown" {
+                    "git@github.com:favcrm/cadence.git".into()
+                } else {
+                    BUILD_REMOTE.into()
+                }),
                 base: None,
             }],
             components: vec![],
@@ -2849,7 +2882,15 @@ mod tests {
         // the declared remote matches; on foreign checkouts (unknown
         // remote) nothing matches — either outcome is consistent.
         if BUILD_REMOTE != "unknown" {
-            assert_eq!(m.map(|(k, _)| k), Some("cadence".to_string()));
+            assert_eq!(m.clone().map(|(k, _)| k), Some("cadence".to_string()));
+            // Two projects registering the build repo name no single
+            // project (CAD-2001): drift still measures, unattributed.
+            let mut twin = p.clone();
+            twin.key = "cadence-twin".into();
+            assert_eq!(
+                build_repo_match(&[p.clone(), twin]).map(|(k, _)| k),
+                Some(String::new())
+            );
         } else {
             assert!(m.is_none());
         }

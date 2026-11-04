@@ -114,6 +114,12 @@ pub fn add(root: &Path, dir: &Path, branch: Option<&str>, base: &str) -> Result<
 /// new checkout becomes the agent's cwd. Clean failures: no git repo
 /// under `base`, a pre-existing worktree dir, or a branch collision.
 pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
+    create_worktree_on(base, name, None)
+}
+
+/// Create a lane cut from an explicitly named base ref. `None` keeps the
+/// historical resolution (configured integration ref, then the remote HEAD).
+pub fn create_worktree_on(base: &Path, name: &str, base_ref: Option<&str>) -> Result<PathBuf> {
     proto::identifier(name, "Worktree name")?;
     let root = main_root(base)?;
     let dir = layout::worktree_dir(&root, name);
@@ -159,7 +165,7 @@ pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
                 "Branch '{branch}' already exists without matching lifecycle ownership — refusing reuse"
             )));
         }
-        let resolved = crate::issue::start::resolve_base(&root, None, None)?;
+        let resolved = crate::issue::start::resolve_base(&root, base_ref, None)?;
         if let Some(warning) = &resolved.warning {
             eprintln!("cadence: {warning}");
         }

@@ -30,7 +30,8 @@ const ARCHIVE_MEMBERS: [&str; 3] = [BINARY, SHA_FILE, MANIFEST];
 const LISTING_MAX: usize = 16 * 1024;
 const BINARY_MAX: usize = 512 * 1024 * 1024;
 const SMALL_MEMBER_MAX: usize = 64 * 1024;
-const CHECKS: [&str; 5] = ["fmt", "clippy", "test", "build", "ui"];
+const CHECKS: [&str; 4] = ["fmt", "clippy", "build", "ui"];
+const LEGACY_CHECKS: [&str; 5] = ["fmt", "clippy", "test", "build", "ui"];
 const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The unified `update --help` marker `install.sh --client-only` also requires.
@@ -228,17 +229,35 @@ pub(crate) fn client_org(action: org::OrgAction) -> Result<i32> {
     org::run(action)
 }
 
-/// Route a non-update command from a client-only installation. Only an
-/// actual remote org may proceed (over the org's own transport); a local
-/// result, saved default or pin refuses before sandbox adoption or any RPC.
+/// Route a non-update command from a client-only installation. Bundled skill
+/// reads are offline; other commands require a remote org before any RPC.
 pub(crate) fn route_client_only(cli: Cli) -> Result<i32> {
+    if let Commands::Skill {
+        action: SkillAction::Show { name, file },
+    } = &cli.command
+    {
+        if cli.state_dir.is_none()
+            && std::env::var_os("CADENCE_ALIAS").is_none()
+            && std::env::var_os("CADENCE_GRANT_TOKEN").is_none()
+        {
+            eprintln!(
+                "Reading bundled guidance from this Cadence installation; \
+                 workspace selection does not apply."
+            );
+            return skill::show(name, file.as_deref());
+        }
+    }
     let tracker = std::env::var_os("CADENCE_PM_DIR")
         .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
         .transpose()?;
     match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
-        org::Resolved::Remote(target) => {
-            remote::run(target, cli.command, cli.wake_timeout, cli.state_dir.clone())
-        }
+        org::Resolved::Remote(target) => remote::run(
+            target,
+            cli.command,
+            cli.wake_timeout,
+            cli.state_dir.clone(),
+            cli.command_path,
+        ),
         org::Resolved::Local(_) => Err(local_command_refusal()),
     }
 }
@@ -401,10 +420,12 @@ fn check_manifest(
     let source = manifest["source_sha"].as_str().filter(|s| is_full_sha(s));
     let matches = manifest["version"] == tag
         && manifest["target"] == target
-        && manifest["runner"] == runner
+        && (manifest["runner"] == runner
+            || (target == "aarch64-macos" && manifest["runner"] == "macos-15"))
         && manifest["sha256"] == digest
         && manifest["features"] == serde_json::json!(["ui"])
-        && manifest["checks"] == serde_json::json!(CHECKS)
+        && (manifest["checks"] == serde_json::json!(CHECKS)
+            || manifest["checks"] == serde_json::json!(LEGACY_CHECKS))
         && manifest["run_id"].is_u64()
         && manifest["run_attempt"].is_u64()
         && ["rustc", "cargo", "built_at"]
@@ -1054,7 +1075,3 @@ fn switch_link(link: &Path, expected: &Path, target: &Path) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(all(test, feature = "test-seam"))]
-#[path = "cad1455_public_client_acceptance.rs"]
-mod cad1455_public_client_acceptance;

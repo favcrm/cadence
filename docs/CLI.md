@@ -73,6 +73,12 @@ session has reloaded the guidance — start a fresh session or reread it at
 a task boundary. Client-only update does not install guidance or start a
 daemon. A sandbox profile still does not write the shared home.
 
+In an unmanaged native session, `cadence skill status` and `cadence skill show`
+inspect this machine even when a hosted org is the saved default. An explicit
+remote `--org` or `CADENCE_ORG` is refused rather than ignored. Managed and
+grant-bound sessions retain their existing routing and permission checks.
+This does not change skill installation authority or client-only policy.
+
 `--to` runs the same checks as `upgrade --sha`: the sha is on main, CI's
 `test` job passed on that exact sha, the sha256 and manifest match, and the
 build-provenance attestation verifies for the repository. A sha that is not
@@ -124,9 +130,27 @@ candidate only after its build-provenance attestation verifies and its
 manifest matches this platform and version. It does not downgrade, delete old
 releases or touch the daemon.
 
+Older client updaters can reject newer release manifests after the CI check
+list or macOS runner changes. If an installed updater reports a manifest
+mismatch, use the signed release's `install.sh --client-only` to reinstall;
+the old updater cannot repair its own manifest validation.
+
 From a client-only installation, local daemon and state commands refuse with
 exit 3. Remote org verbs route to their org, and bounded
 login, auth, org and offline management stays available.
+
+An unmanaged client-only installation can read its bundled guidance offline:
+
+```sh
+cadence-client skill show cadence --file SKILL.md
+```
+
+This reads the copy embedded in the installed executable, not a workspace or
+an installed provider skill; it makes no request and does not change the
+workspace default. Omit `--file` for the bundled file manifest. Managed
+callers keep their existing routing and permission checks; installation and
+status commands remain unchanged. Reading it does not mean an already-running
+agent session has reloaded it.
 
 This mode needs a published release whose `cadence update --help` carries the
 client-only marker (`Upgrade a client-only installation`). The published
@@ -150,7 +174,7 @@ per-agent filesystem confinement and provider sandboxes remain separate.
 ```
 cadence dev up [--name <n>] [--build <path>]   # create/start; writes the dev marker into the store
 eval "$(cadence dev env)"                      # point this shell at it
-cadence dev reload [--build <path>]            # restart from a local binary
+cadence dev reload [--name <n>] [--build <path>]  # restart from a local binary (clean shell, not one `dev env` exported)
 cadence dev status | down | env | ls | reset <name>
 ```
 
@@ -159,6 +183,19 @@ They do not change that selection or access the hosted org's credentials,
 transport or container wake path. An explicitly remote `--org` or
 `CADENCE_ORG` refuses; explicit local state/tracker bindings and managed
 callers' identity restrictions remain in force.
+
+`reload`, `down` and `reset` delete or restart a sandbox, so they refuse in a
+shell that `dev env` exported (the exports name the sandbox's own roots, and a
+marker is not proof). Do not simply retry them from a clean shell. First check
+the sandbox root the refusal names: if it is a live installation (a tracker, a
+daemon database, hosted credentials), its marker is planted — stop, and run
+nothing. Only when this shell came from `cadence dev env` and that root is a
+disposable sandbox, run the verb with the sandbox exports removed: `env -u
+CADENCE_STATE_DIR -u CADENCE_PM_DIR -u XDG_CONFIG_HOME -u CADENCE_PROFILE
+cadence dev down <name>` (likewise `dev reload --name <name>`, which takes
+`--name`, and `dev reset <name>`). The refusal prints the same warning first.
+So the sequence `eval "$(cadence dev env kk)"; cadence dev reload` is not
+available in one shell: open a clean shell for the restart.
 
 `dev reload` defaults to the newest of the repo's `target/release/cadence` and
 `target/debug/cadence`. It claims no rollout lease, checks no attestation and
@@ -220,6 +257,15 @@ and scripts. Prefer `cadence update`; it does their steps in order.
   low-level verified install that `update` calls. `--allow-unattested` rolls
   back to a hand-built release already on disk.
 
+## Root names
+
+The default `cadence --help` lists nouns. Actions sit under them.
+
+- `issue epic propose`, `issue epic approve` and `issue epic reject` write a plan. `plan propose`, `plan approve` and `plan reject` are the same writes. `plan ls` and `plan show` stay: `issue epic ls` and `issue epic show` are the epic board, not the proposal list.
+- `agent join <group> <provider>` adds a worker. `cadence join` still parses.
+- `message send` is the canonical enqueue. `cadence send` still parses.
+- Dispatch stays `cadence dispatch <id> --to <alias>`. It starts an issue, so it is not under `agent`.
+
 ## Finding a command
 
 `cadence commands` and `cadence schema` are offline. They do not open a
@@ -270,13 +316,142 @@ the board owns the ticket and this machine runs it. `--org local` alone
 is the standalone board, not "the local agent".
 
 The hosted binding lives under the `agent` noun:
-`agent connect|watch|assignments|disconnect|reassign`, each taking
-`--org <hosted>`. `local-agent` remains a hidden alias for one release;
-`local-agent report` is still the explicit claim reporter.
+`agent connect|watch|assignments|disconnect|reassign|report|tool`, each taking
+`--org <hosted>`. `agent report` is the explicit claim reporter.
+`agent connect --fyi-only` registers an extra alias and leaves the
+assignment default in place.
 
 `cadence send <alias> --wait[=SECS]` waits for the turn's terminal state
 (the same path as the hidden `message ask`). A remote send is a durable
 enqueue only and refuses `--wait`.
+
+## Cadence home, overrides and isolation (CAD-1922)
+
+One resolver (`src/home.rs`) answers every Cadence path, and `cadence doctor
+--host` reports the branch it took under the `layout` check. It only resolves:
+nothing here creates, moves, copies or deletes an installation's data.
+
+**A first run** — no existing tracker, state directory or hosted config is
+present anywhere — uses one consolidated home, `~/.cadence` (or
+`$CADENCE_HOME` when set):
+
+| Path | Contents |
+| --- | --- |
+| `~/.cadence/state/` | runtime state, socket, database (0700) |
+| `~/.cadence/tracker/` | Git tracker |
+| `~/.cadence/vault/` | knowledge vault |
+| `~/.cadence/workspace/` | operational upload workspace |
+| `~/.cadence/repos/` | managed repo checkouts |
+| `~/.cadence/config/` | hosted config and credentials, private (0700; files 0600) |
+
+The executable stays wherever it was installed (`~/.local/bin`). A directory
+the consolidated home creates is made 0700 (the home root and every missing
+ancestor below it, on the first credential write) and the home root of a first
+run is kept 0700; a directory that already exists keeps its mode, and an
+existing installation's directories are never re-chmod'ed.
+
+**An existing installation keeps the paths it has**: tracker `~/pm`, runtime
+state `$XDG_STATE_HOME/cadence` or `~/.local/state/cadence`, vault
+`<tracker>/wiki`, hosted config and credentials `$XDG_CONFIG_HOME/cadence`.
+Any one of those present keeps every path on the legacy branch, so resolution
+cannot switch a live install away from its data. A bare `state/`, `tracker/` or
+`config/` directory under `~/.cadence` — an `overview-gh.json` cache, lane
+worktrees under `~/.cadence/wt` — is not an installation and never overrides a
+legacy one; `cadence doctor --host` reports such a stray home, and nothing in
+it is removed. The branch is sticky: once `~/.cadence` holds real installation
+data (the tracker's `pm.yaml`, the daemon database `state/cadence.sqlite3`, or
+the hosted `config/orgs.json` / `config/remote-auth/credential.json`), a legacy path that turns
+up later (a stray `~/pm`, an old saved binding) can neither flip the
+installation nor be preferred silently — **both at once is refused**, naming
+every root, so nothing is guessed. A probe that cannot be answered (a
+permission error, a dangling symlink) counts as present, so an installation the
+resolver could not inspect is never switched. There is **no automatic
+migration, no implicit default switch and no new empty tracker**: moving an
+existing installation is a separate operator-approved, backed-up operation with
+validation and rollback, which this build does not perform. A
+`~/.cadence/LAYOUT` marker, the directory's existence or same-uid ownership are
+reported at most; none of them switches a live install.
+
+The vault follows the tracker the consolidated branch owns: `<home>/tracker`
+keeps `<home>/vault`, and every other tracker — the legacy `~/pm`, or any
+`CADENCE_PM_DIR` that is not that one, including one that merely sits under the
+home — keeps `<tracker>/wiki`. An explicit `CADENCE_HOME` is the exception it
+always was: it keeps `<home>/vault` for every tracker. The branch's own
+tracker, not the string prefix of a path, decides the rest, so a
+per-directory override (`cadence switch local` exports the pair, a sandbox
+exports its own) only overrides its own directory and never moves the vault or
+the hosted config.
+
+A CI job, container or test suite with its own `$HOME` is a first run like any
+other and gets `~/.cadence` **inside that isolated home** — never the host's
+installation. Name it explicitly with `CADENCE_HOME` when the environment
+wants a fixed root.
+
+**Documented overrides.** `CADENCE_HOME`, `XDG_CONFIG_HOME` and `--auth-dir`
+must be absolute and a relative value is refused; `CADENCE_PM_DIR`,
+`CADENCE_STATE_DIR` and `XDG_STATE_HOME` are used as given, as they always
+were.
+
+- `CADENCE_HOME` — the consolidated home root. Use it for a system install
+  (`CADENCE_HOME=/var/lib/cadence`), for a separate profile, or to return to
+  `~/.cadence` after an installation exists elsewhere. Hosted credentials
+  follow the evidence, not the flag: an exported `XDG_CONFIG_HOME` names
+  their root (`$XDG_CONFIG_HOME/cadence`, whether or not it exists yet), a
+  legacy root that already holds something keeps them, and otherwise they
+  live in `<CADENCE_HOME>/config` — including when
+  `CADENCE_PM_DIR`/`CADENCE_STATE_DIR` are also set.
+- `CADENCE_PM_DIR` — tracker, in either layout. Overrides only the tracker.
+- `CADENCE_STATE_DIR` — runtime state, in either layout. Overrides only the
+  state dir.
+- `--state-dir` — the same per command, and what a sandbox passes. Naming a
+  legacy root counts as the same explicit choice of that installation as the
+  exported variable.
+- `--auth-dir` — hosted credentials, per command.
+
+None of these chooses the layout, with one exception: exporting
+`CADENCE_STATE_DIR` or `CADENCE_PM_DIR`, or passing `--state-dir`, *at a legacy root* (`$XDG_STATE_HOME/
+cadence`, `~/.local/state/cadence`, `~/pm`) is an explicit choice of that
+installation, and it resolves to the legacy branch — creating that directory
+would otherwise make the installation ambiguous on the next run. Every other
+override (including the pair `cadence switch local` exports into its own
+process) changes its own directory and nothing else, so one command cannot
+flip the vault or the hosted config mid-run.
+
+`CADENCE_HOME` is refused when it contains `..` or when any existing ancestor
+is a symlink: that root is authoritative for credentials, so a planted link
+above it would redirect them.
+
+`XDG_CONFIG_HOME` names the config root of a legacy installation, and of any
+run given an explicit `CADENCE_HOME`, where it names the credential root
+whether or not it exists yet. A consolidated installation — a genuine first
+run, or one already living in `~/.cadence` — keeps its config under its own
+home even when the variable is exported: writing the first credential into the
+legacy root would make the next run see both layouts and refuse the
+installation as ambiguous. With no `HOME` at all, an absolute
+`XDG_CONFIG_HOME` still names the hosted config root, so hosted-only use needs
+no home. Inside the consolidated home a
+symlinked `~/.cadence`, `~/.cadence/config` or credential directory is refused
+rather than followed.
+
+The state directory holds the daemon socket, so `<state>/cadence.sock` must
+fit the 107-byte Unix socket limit; `setup` and `dev up` refuse a longer path
+rather than failing later.
+
+`cadence dev` instances are isolated on every axis: `dev up` exports
+`CADENCE_PROFILE`, `CADENCE_STATE_DIR`, `CADENCE_PM_DIR` and
+`XDG_CONFIG_HOME` for its own root, and the resolver maps that profile to the
+sandbox root as the home — `CADENCE_HOME` is deliberately *not* exported, so
+the overlap guard can read it as evidence of a real installation. A caller's
+consolidated home, system install or hosted credentials therefore never leak
+in, and every verb refuses a root
+that overlaps production's state dir, tracker, home or config dir — including
+one named by an exported `CADENCE_HOME`. `status`, `env` and the global opt-in
+gate exempt an exported dir that is exactly the sandbox's own, so a shell
+exported by `dev env` can inspect itself; `reset`, `down` and `reload` keep
+the strict inventory with no exemption. A sandbox
+created before this change keeps its old vault at `<root>/pm/wiki`; its
+vault now resolves to `<root>/vault`, so `cadence dev reset <name>` starts it
+over rather than migrating it.
 
 ## Native cloud-agent connections (CAD-1853)
 
@@ -440,6 +615,13 @@ not its pathname. Changed content is refused. Optional `--digest sha256:<hex>`
 checks canonical payload JSON, not a raw-file `sha256sum`. An argv-only master
 permission cannot authorize a Settings mutation or issue another grant.
 App-scoped assistant turns gain no settings authority.
+
+A profile's job (standing instructions) is readable by the operator and by a
+runtime registered against that profile (`agent context <profile>`); other
+agents and members get none (`agent list` omits it, `agent context` refuses).
+One stated exception: a group-root agent can register a member against a
+profile, and so can read that job through `agent show`, because a root's `join`
+needs the job to write the member's briefing.
 
 ### Master recovery and hosted use
 

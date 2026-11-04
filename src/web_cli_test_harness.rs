@@ -4,6 +4,3 @@
 
 #[path = "cli/web_transport_tests.rs"]
 mod transport_tests;
-
-#[path = "cli/web_tls_acceptance.rs"]
-mod tls_acceptance;

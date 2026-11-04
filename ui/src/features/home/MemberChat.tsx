@@ -2,10 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
+import { displayUiNotice } from "../../lib/uiNotice";
 import type { ThreadRef } from "../../lib/types";
 import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
 import { tailTop } from "./dock";
+import { useDockHeight } from "./useDockHeight";
 import { memberHistory, memberThreadStore, memberWrite, sendToAssistant } from "./memberThread";
 import { initialFollow, motionBehavior, onSend, type Follow } from "./scrollFollow";
 import {
@@ -17,6 +19,7 @@ import {
   WINDOW,
 } from "./thread";
 import { memberThreadReader } from "./memberThread";
+import { ImageConversation } from "../canvas/imageConversation";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
@@ -99,7 +102,7 @@ export default function MemberChat({
   const [sendNote, setSendNote] = useState<string | null>(null);
   const follow = useRef<Follow>(initialFollow());
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const liveAfter = useRef<number>(0);
+  const liveAfter = useRef<number | null>(null);
 
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   // History truth is carried in the member payload (round 3): a
@@ -110,6 +113,12 @@ export default function MemberChat({
   // genuine accepted refresh is the only thing that flips `loaded`.
   const history = memberHistory(thread);
   const loaded = history.loaded;
+  // The seq watermark for the enter animation: set before the first loaded
+  // render paints its rows, so history stays still. A later first message in
+  // an empty thread still rises in.
+  if (liveAfter.current === null && loaded) {
+    liveAfter.current = lastSeq(thread.data) ?? 0;
+  }
   const moreBefore = thread.data?.moreBefore === true;
 
   // The assistant's surface state — the bound conversation, whether
@@ -210,19 +219,23 @@ export default function MemberChat({
     return () => clearInterval(timer);
   }, [loaded, store]);
 
-  // The seq watermark for the enter animation, captured once loaded.
-  useEffect(() => {
-    if (loaded && liveAfter.current === 0) {
-      liveAfter.current = lastSeq(thread.data) ?? 0;
-    }
-  }, [loaded, thread.data]);
-
   const [glideTick, setGlide] = useState(0);
   const scrollPanel = useCallback((kind: "glide" | "jump") => {
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTo({ top: tailTop(el.scrollHeight, el.clientHeight), behavior: motionBehavior(false, kind) });
   }, []);
+  // The dock grows with its note, and the thread's bottom padding follows it.
+  const dockRef = useRef<HTMLDivElement | null>(null);
+  const keepDockTail = useCallback(
+    (onTail: boolean) => {
+      // Nothing unpins `follow` here, so only the reader's position counts:
+      // someone reading history stays where they are while they type.
+      if (onTail) scrollPanel("jump");
+    },
+    [scrollPanel],
+  );
+  useDockHeight(dockRef, scrollRef, keepDockTail);
   const engage = useCallback(() => {
     const next = onSend(follow.current);
     follow.current = next.state;
@@ -374,26 +387,38 @@ export default function MemberChat({
                 </button>
               </div>
             ) : null}
+            <ImageConversation.Provider value={surface?.conversation ?? null}>
             <Conversation
               mode={{ kind: "home" }}
               items={shown}
               legacyTranscript={!items.some((item) => item.type === "answer")}
               readOnly={readOnly}
-              liveAfter={liveAfter.current}
+              liveAfter={liveAfter.current ?? 0}
               onOpenIssue={onOpenIssue}
               onRetry={onRetry}
               onDiscard={onDiscard}
             />
+            </ImageConversation.Provider>
           </div>
 
-          {sendNote !== null && (
-            <div className="text-micro text-ink-500 px-1 pb-1" role="status">{sendNote}</div>
-          )}
-          <div className="chatdock" data-chat-dock>
+          <div className="chatdock" ref={dockRef} data-chat-dock>
+            {/* Inside the dock: it is absolutely placed, so a note before it
+                would sit behind the composer. */}
+            {sendNote !== null && (
+              <div className="text-micro text-ink-500 px-1 pb-1" role="status">{sendNote}</div>
+            )}
             <SharedComposer
               density="full"
               storeKey={`member-assist:${scope}`}
               block={readOnly ? t("The board is read-only.") : null}
+              // A `/` command is not sent here, and Enter must not look dead.
+              onNotice={(notice) =>
+                setSendNote(
+                  typeof notice !== "string" && notice.key.startsWith("Unsupported command")
+                    ? t("Commands aren't available in this chat, so this wasn't sent. To send it as a message, start with something other than /.")
+                    : displayUiNotice(notice, t),
+                )
+              }
               onSend={({ body }) => {
                 void sendToAssistant(scope, body).then((receipt) => {
                   // The actual receipt decides the note: a queued-but-

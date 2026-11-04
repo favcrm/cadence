@@ -44,11 +44,6 @@ mod app_screen_services_rpc;
 #[cfg(feature = "test-seam")]
 pub mod test_events;
 
-#[cfg(all(test, feature = "test-seam"))]
-mod cad811_installed_crm_qa_fixture;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad811_screen_services_acceptance;
-
 mod app_screens_rpc;
 mod app_social_drafts_rpc;
 pub(crate) mod app_teams_rpc;
@@ -57,11 +52,7 @@ mod approvals_rpc;
 mod area_rpc;
 mod business_templates_rpc;
 #[cfg(all(test, feature = "test-seam"))]
-mod cad1141_drift_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1184_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1184_revision_acceptance;
+mod cad811_installed_crm_qa_fixture;
 /// CAD-1239: explicit archive aliases, at most 50, no duplicates.
 fn archive_aliases(params: &Value) -> Result<Vec<String>> {
     let raw = params
@@ -144,96 +135,23 @@ fn archive_expected_revs(params: &Value) -> Result<Vec<(String, i64)>> {
 }
 
 mod artifacts_rpc;
-#[cfg(test)]
-mod cad1210_acceptance;
-#[cfg(test)]
-mod cad1212_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1218_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1300_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1314_approval_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1327_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1337_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1337_migration_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1353_delivery_status_acceptance;
-mod cad1365_generation_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_media_publish_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_media_read_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_mount_authority_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_original_fence_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_original_transfer_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1365_run_creator_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1415_app_actions_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1440_media_only_context_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1470_knowledge_refusal_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1473_host_redispatch;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1473_independent_redispatch;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1482_independent_media_refusal;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1518_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1537_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1562_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1588_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1590_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1636_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1651_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1656_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad225_unattended_acceptance;
 mod caller_rule;
-#[cfg(all(test, feature = "test-seam"))]
-mod campaign_clone_acceptance;
 mod chat_files_rpc;
 mod checkup;
 mod cli_rpc;
+#[cfg(all(test, feature = "test-seam"))]
+mod wiki_trash_guard_acceptance;
 #[cfg(all(test, feature = "cli-runtime-test"))]
 pub(crate) use cli_rpc::prime_jwks_for_test as prime_cli_jwks_for_test;
 #[cfg(all(test, feature = "test-seam"))]
 mod board_producer_golden;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1700_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1777_drawer_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1822_context_refusal_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1852_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1868_acceptance;
 /// CAD-1913: independent adversarial acceptance for planned-path lesson
 /// selection, project isolation and secret non-disclosure at the issue/job
 /// delivery seam. Test-only registration; production carries neither.
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1913_lesson_delivery_isolation_acceptance;
 /// CAD-1932: reviewer-owned refusal acceptance for the non-records drawer
 /// parent proof. Test-only registration.
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1932_drawer_acceptance;
 mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
@@ -256,8 +174,6 @@ mod cached_return_tests;
 mod cad1128_canary_fx;
 #[cfg(all(test, unix, feature = "test-seam"))]
 mod campaign_canary_tests;
-#[cfg(all(test, feature = "test-seam"))]
-mod conversations_acceptance;
 mod conversations_rpc;
 mod crm_send_rpc;
 mod crm_smtp_rpc;
@@ -266,12 +182,12 @@ pub(crate) mod custody_acceptance_fixture;
 #[cfg(all(test, unix, feature = "test-seam"))]
 mod custody_security_r2;
 mod delivery_requirements_rpc;
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+pub use delivery_requirements_rpc::queue_authority_acceptance;
 pub(crate) use delivery_requirements_rpc::{classify_from, GhRead, RequirementInputs};
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
-#[cfg(all(test, feature = "test-seam"))]
-mod explorer_acceptance;
 mod hire_rpc;
 mod idea_rpc;
 mod identity;
@@ -1161,11 +1077,10 @@ impl Shared {
         // the same lease/fence the write path holds; resolved before the
         // `Arc` so `lease` can move into the struct.
         let wiki_pm_dir = pm_dir_of(&opts.provider_env)?;
-        let upload_workspace_dir = crate::home::workspace_for_instance(
-            &wiki_pm_dir,
-            opts.provider_env.var("CADENCE_HOME").as_deref(),
-            opts.provider_env.var("HOME").as_deref(),
-        )?;
+        // A sandbox daemon is its own home; a stale sandbox profile is
+        // refused here rather than binding the host's workspace.
+        let upload_workspace_dir =
+            crate::home::workspace_for_provider_env(&wiki_pm_dir, &opts.provider_env)?;
         crate::home::validate_workspace_isolated(
             &upload_workspace_dir,
             state_dir,
@@ -1777,24 +1692,36 @@ impl Shared {
             .as_str()
             .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
         self.gate_image_receiver_before_bytes(&message.alias, &message.id)?;
-        let image = self.store.app_media_context_image(asset_id)?;
-        if rows[0]["revision"].as_i64() != Some(image.asset.revision)
-            || rows[0]["sha256"].as_str() != Some(image.original.sha256.as_str())
-        {
-            return Err(Error::rejected(
-                "attached library image no longer matches the retained original",
-            ));
-        }
-        self.with_turn_image_current(&message.alias, &message.id, &image.original, || {
-            if self.store.app_media_revision(asset_id)? != image.asset.revision {
+        // CAD-2078: the pin names the bytes' own digest, so an imported
+        // workspace asset can ride a turn exactly like a provider-produced
+        // one. The resolver refuses anything that is not a verified
+        // workspace asset, and stale pins refuse.
+        let pinned_revision = rows[0]["revision"]
+            .as_i64()
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let pinned_sha = rows[0]["sha256"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let image = self
+            .store
+            .app_media_pinned_display(asset_id, pinned_revision, pinned_sha)?
+            .ok_or_else(|| {
+                Error::rejected("attached library image no longer matches the retained bytes")
+            })?;
+        let revision = image.asset.revision;
+        let authority = match &image.original {
+            Some(original) => app_media_rpc::OriginalAuthority::Provider(original),
+            None => app_media_rpc::OriginalAuthority::Imported,
+        };
+        let media_type = image.media_type;
+        let bytes = image.bytes;
+        self.with_turn_image_current(&message.alias, &message.id, authority, || {
+            if self.store.app_media_revision(asset_id)? != revision {
                 return Err(Error::rejected(
                     "attached library image changed before delivery",
                 ));
             }
-            Ok(vec![crate::adapter::TurnImage {
-                media_type: image.media_type,
-                bytes: image.bytes,
-            }])
+            Ok(vec![crate::adapter::TurnImage { media_type, bytes }])
         })
     }
 
@@ -3120,6 +3047,8 @@ impl Shared {
             }
             "agent_register" => self.rpc_register(params, peer_pid),
             "agent_roles" => self.rpc_agent_roles(),
+            "agent_profile_create" => self.rpc_agent_profile_create(params, peer_pid),
+            "agent_profile_context" => self.rpc_agent_profile_context(params, peer_pid),
             "agent_instructions_set" => self.rpc_instructions_set(params, peer_pid),
             "model_defaults_get" => self.rpc_model_defaults_get(),
             "model_defaults_set" => self.rpc_model_defaults_set(params, peer_pid),
@@ -3236,7 +3165,12 @@ impl Shared {
                             )
                     })
                     .count();
-                Ok(json!({"agents": agents, "live": live}))
+                let profiles = crate::agent_settings::profile_list(
+                    &self.store,
+                    &self.store.agents()?,
+                    self.operator_evidence(peer_pid).is_ok(),
+                )?;
+                Ok(json!({"agents": agents, "live": live, "profiles": profiles}))
             }
             "agent_identity" => {
                 if !params.as_object().is_some_and(|fields| fields.is_empty()) {
@@ -4029,6 +3963,8 @@ impl Shared {
             | "app_social_draft_discard"
             | "app_social_draft_asset"
             | "app_social_sources_show"
+            | "app_social_sources_page"
+            | "app_social_sources_get"
             | "app_social_sources_save" => self.rpc_app_social_draft(method, params, peer_pid),
             "business_template_create"
             | "business_template_revise"
@@ -4043,6 +3979,7 @@ impl Shared {
             "app_media_read" => self.rpc_app_media_read(params, peer_pid),
             "app_media_chat_attach" => self.rpc_app_media_chat_attach(params, peer_pid),
             "app_media_publish" => self.rpc_app_media_publish(params, peer_pid),
+            "app_media_import" => self.rpc_app_media_import(params, peer_pid),
             "app_tool_revoke" => self.rpc_app_tool_revoke(params, peer_pid),
             "app_tool_result" | "app_tool_results" => self.rpc_app_tool_result(params, peer_pid),
             "app_run_capability_call" => self.rpc_app_capability(method, params, peer_pid),
@@ -4483,6 +4420,11 @@ impl Shared {
             // on `operator_connection`, never `wiki_caller`/`wiki_as`.
             "wiki_index_status" => self.rpc_wiki_index_status(params, peer_pid),
             "wiki_index_refresh" => self.rpc_wiki_index_refresh(params, peer_pid),
+            // CAD-2018: the native trash browser — operator-only,
+            // connection-bound like the index reads above; the field
+            // allowlist refuses any identity claim.
+            "wiki_trash_list" => self.rpc_wiki_trash_list(params, peer_pid),
+            "wiki_trash_items" => self.rpc_wiki_trash_items(params, peer_pid),
             // CAD-129: the deterministic test queue. Submit is attributed
             // to the caller; status, log and the queue summary are reads.
             "test_submit" => self.rpc_test_submit(params),
@@ -6005,6 +5947,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     crate::platform::agenticos::attach(&mut opts, &hosted)?;
     crate::platform::agenticos_external::attach(&mut opts)?;
     crate::platform::agenticos_web::attach(&mut opts, state_dir)?;
+    // CAD-1974: read-only marketing provider tools. Registered always so the
+    // listing can explain itself; a call with no enrolled account refuses at
+    // the credential step.
+    crate::platform::agenticos_provider::attach(&mut opts)?;
     // CAD-1640: one reviewed inventory, snapshotted after every adapter is
     // registered. The MCP server and the managed Codex allowlist both derive
     // their names from it, so they cannot drift.

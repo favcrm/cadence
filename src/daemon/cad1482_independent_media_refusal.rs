@@ -913,3 +913,6 @@ fn cad1482_unattached_library_image_inspect_refuses_without_bytes_or_provider_su
         "HTTP inspect fetched a provider artifact"
     );
 }
+
+#[path = "cad1962_media_import_acceptance.rs"]
+mod cad1962_media_import_acceptance;

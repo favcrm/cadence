@@ -1,5 +1,5 @@
 import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_DRAWER_CLOSE, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
   type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
@@ -54,7 +54,7 @@ export interface ScreenActions {
    *  `screen-surfaces.v1` capability: an independent open mounts a separate
    *  drawer frame in the shell's own fixed overlay instead of promoting
    *  this frame. */
-  onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize): void;
+  onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize, context?: unknown): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
@@ -99,7 +99,8 @@ export type MountReceipt = { mount: string; bridge_nonce: string; generation: nu
   tools?: string[];
   /** CAD-1365: host-held media metadata for a `screen-media.v1` package
    *  — the daemon-minted record of the media permissions the screen
-   *  DECLARED (`media.read` / `media.publish`, either or both, never
+   *  DECLARED (`media.read` / `media.publish` / `media.import`, any
+   *  subset, never
    *  wider). Declaration metadata only: dispatch still requires the
    *  mount's action token and the child's `screen-media.v1` opt-in, and
    *  the daemon re-proves the declaration natively on every call. */
@@ -130,14 +131,14 @@ export function parseMount(value: unknown, tag: string): MountReceipt | null {
   const toolsOk = tools === undefined || (Array.isArray(tools) && tools.length <= 32 &&
     new Set(tools).size === tools.length && tools.every(a => typeof a === "string" && TOOL_ALIAS.test(a)));
   // `media` is a closed object when present: exactly
-  // {contract:"screen-media.v1", may:[1..2 distinct declared verbs]}.
+  // {contract:"screen-media.v1", may:[1..4 distinct declared verbs]}.
   const media = v.media;
   const mediaOk = media === undefined || (typeof media === "object" && media !== null && !Array.isArray(media) &&
     Object.keys(media as Record<string, unknown>).sort().join() === "contract,may" &&
     (media as Record<string, unknown>).contract === SCREEN_MEDIA_V1 &&
     Array.isArray((media as Record<string, unknown>).may) &&
     ((media as Record<string, unknown>).may as unknown[]).length >= 1 &&
-    ((media as Record<string, unknown>).may as unknown[]).length <= 3 &&
+    ((media as Record<string, unknown>).may as unknown[]).length <= 4 &&
     new Set((media as Record<string, unknown>).may as unknown[]).size === ((media as Record<string, unknown>).may as unknown[]).length &&
     ((media as Record<string, unknown>).may as unknown[]).every(m => isMediaVerb(m as string)));
   const action = v.action_token;
@@ -276,6 +277,11 @@ export class ScreenChannel extends FrameChannel {
    *  private parent token); the ready opt-in and call args cannot choose
    *  it. */
   surfaceRole: ScreenSurfaceRole = "primary";
+  /** SOC-55 — the bounded context this host-created drawer child was opened
+   *  with. It is host-local data, never authority, and lives only on this
+   *  child mount; a reopen starts with a new channel. */
+  drawerContext: unknown = null;
+  setDrawerContext(context: unknown): void { this.drawerContext = context ?? null; }
   private surfaceState: { role: ScreenSurfaceRole; modal: boolean } | null = null;
   private surfaceSent: string | null = null;
   /** CAD-1615 — tell the child which surface its frame is in (legacy). The
@@ -336,7 +342,7 @@ export class ScreenChannel extends FrameChannel {
   private drawerVerbs(): readonly ScreenDrawerVerb[] | null {
     if (this.shape !== "v2" || !(this.wantsPresentation || this.wantsSurfaces) ||
         !this.actions?.onScreenDrawer || !this.receipt.action_token) return null;
-    return this.surfaceRole === "drawer" ? [SCREEN_DRAWER_CLOSE] : SCREEN_DRAWER_VERBS;
+    return this.surfaceRole === "drawer" ? SCREEN_DRAWER_CHILD_VERBS : SCREEN_DRAWER_VERBS;
   }
   protected drawerCapable(): readonly ScreenDrawerVerb[] | false { return this.drawerVerbs() ?? false; }
   /** One validated host-local presentation request. It is never dispatched
@@ -354,12 +360,20 @@ export class ScreenChannel extends FrameChannel {
       reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "bad_args", text: "That request is not valid." } });
       return;
     }
+    if (parsed.mode === "context") {
+      reply({ v: 2, op: "reply", id: request.id, ok: true, data: { context: this.drawerContext } });
+      return;
+    }
+    if (parsed.mode === "drawer" && "context" in parsed && !independent) {
+      reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "This app cannot pass context to a drawer here." } });
+      return;
+    }
     if (parsed.mode === "outlet") {
       onDrawer("outlet", undefined, independent);
       reply({ v: 2, op: "reply", id: request.id, ok: true, data: { mode: "outlet" } });
       return;
     }
-    onDrawer("drawer", parsed.surface, independent, parsed.size);
+    onDrawer("drawer", parsed.surface, independent, parsed.size, parsed.context);
     reply({ v: 2, op: "reply", id: request.id, ok: true, data: { mode: "drawer", surface: parsed.surface } });
   }
   private calls = 0;

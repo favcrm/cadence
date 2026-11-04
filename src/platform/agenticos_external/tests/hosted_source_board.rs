@@ -1344,11 +1344,12 @@ fn cad1303_discard_is_operator_only_refuses_in_use_and_stale_and_hides_for_good(
     drop(stop);
 }
 
-/// CAD-1923: a draft from a source receipt that a newer fetch replaced is
-/// refused with the stable `stale_source` code, over RPC and on the board
-/// relay, so the app can tell it from an unknown failure.
+/// SOC-54: the library keeps posts an earlier fetch proved, so a retained
+/// read backs a draft after a newer fetch replaced the handle's freshness —
+/// on RPC and on the board relay. The refusal that remains is a receipt whose
+/// profile is no longer a saved source (`source_not_saved`, CAD-1923 renamed).
 #[test]
-fn cad1923_a_stale_source_receipt_is_refused_with_a_code_on_the_board_path() {
+fn soc54_a_retained_read_backs_a_draft_until_its_profile_is_removed() {
     let (mut stop, root, state) = boot_daemon(door_1303);
     let op = |method: &str, params: Value| operator(&state, method, params);
     let fixture = social_fixture(root.path());
@@ -1436,9 +1437,23 @@ fn cad1923_a_stale_source_receipt_is_refused_with_a_code_on_the_board_path() {
             "source":{"kind":"tool_receipt","receipt_id":receipt,"post_id":"post-1"}})
     };
 
-    let error = rpc("app_social_draft_create", create(&old, "d-1923-rpc")).unwrap_err();
-    assert_eq!(error.code(), Some("stale_source"), "{error}");
-    let mut body = create(&old, "d-1923-http");
+    // The newer fetch replaced the handle's freshness; the earlier retained
+    // read still backs a draft, because the library keeps what it proved.
+    rpc("app_social_draft_create", create(&old, "soc54-old-rpc"))
+        .expect("an older retained read is still a source");
+    rpc("app_social_draft_create", create(&new, "soc54-new-rpc"))
+        .expect("the newest read is a source too");
+
+    // Removing the profile from Settings withdraws that authority; the code is
+    // stable over RPC and on the board relay.
+    let records = crate::store::app_records::RecordStore::open(&state, &install).unwrap();
+    records
+        .app_social_sources_save(&context, 1, &[], "src-1923-clear")
+        .unwrap();
+    let error = rpc("app_social_draft_create", create(&new, "soc54-unsaved-rpc"))
+        .expect_err("a receipt whose profile is no longer a source must refuse");
+    assert_eq!(error.code(), Some("source_not_saved"), "{error}");
+    let mut body = create(&new, "soc54-unsaved-http");
     body["action_token"] = action.clone();
     let mut response = agent
         .post(format!("{base}/api/app-social-drafts/create"))
@@ -1456,12 +1471,291 @@ fn cad1923_a_stale_source_receipt_is_refused_with_a_code_on_the_board_path() {
     let reply: Value = response.body_mut().read_json().unwrap_or(Value::Null);
     assert_eq!(
         (status, reply["code"].as_str()),
-        (400, Some("stale_source")),
+        (400, Some("source_not_saved")),
         "{reply}"
     );
 
-    // The latest receipt still drafts.
-    rpc("app_social_draft_create", create(&new, "d-1923-new")).unwrap();
+    // Restored: the retained read works again, but a post it never returned
+    // is still refused.
+    records
+        .app_social_sources_save(&context, 2, &["juicysuite_crm".to_owned()], "src-1923-back")
+        .unwrap();
+    rpc("app_social_draft_create", create(&old, "soc54-restored")).unwrap();
+    let mut foreign = create(&old, "soc54-foreign-post");
+    foreign["source"]["post_id"] = json!("post-not-in-this-read");
+    rpc("app_social_draft_create", foreign).expect_err("a post outside the receipt must refuse");
+    drop(stop);
+}
+
+/// SOC-55: the paged retained library and the exact source read through the
+/// real daemon path. Two retained reads of one saved handle return the same
+/// post id under their own receipt ids; the page keeps both pairs, the exact
+/// read resolves each without paging, another context sees neither the item
+/// nor a draft from this context's receipt, and the owning context still
+/// accepts an older retained read.
+#[test]
+fn soc55_source_pages_and_exact_reads_are_scoped_and_attributable() {
+    let (stop, root, state) = boot_daemon(door_1303);
+    let op = |method: &str, params: Value| operator(&state, method, params);
+    let fixture = social_fixture(root.path());
+    let (install, context) = social_install(&op, &fixture, true);
+    let records = crate::store::app_records::RecordStore::open(&state, &install).unwrap();
+    records
+        .app_social_sources_save(&context, 0, &["juicysuite_crm".to_owned()], "src-55")
+        .unwrap();
+    // A second context in the same install: same operator, same screen, its
+    // own retained scope.
+    let other = op(
+        "app_context_create",
+        json!({"install_id":install,"label":"Other","input_defaults":{},"request_id":"ctx-55-other"}),
+    );
+    let other = other["context"]["id"]
+        .as_str()
+        .or_else(|| other["id"].as_str())
+        .unwrap()
+        .to_owned();
+    records
+        .app_social_sources_save(&other, 0, &["juicysuite_crm".to_owned()], "src-55-other")
+        .unwrap();
+    crate::operator_auth::ensure_secret(&state).unwrap();
+    let secret = crate::operator_auth::read_secret(&state).unwrap();
+    let nonce = op(
+        "operator_link_mint",
+        json!({"secret":secret,"origin":"loopback"}),
+    )["nonce"]
+        .clone();
+    let session = op(
+        "operator_session_open",
+        json!({"nonce":nonce,"origin":"loopback"}),
+    );
+    let (token, key) = (session["token"].clone(), session["key"].clone());
+    let mount = |context: &str, generation: i64| {
+        let mint = op(
+            "app_screen_mint",
+            json!({"install_id":install,"context_id":context,"tag":"feed","token":token,"key":key,"origin":"loopback","generation":generation}),
+        );
+        let nonce = mint["mount"].as_str().unwrap().rsplit('/').next().unwrap();
+        op("app_screen_consume", json!({"nonce":nonce}));
+        mint["action_token"].clone()
+    };
+    let action = mount(&context, 1);
+    let rpc = |action: &Value, method: &str, extra: Value| {
+        let mut params = json!({"action_token":action,"token":token,"key":key,"origin":"loopback"});
+        for (name, value) in extra.as_object().unwrap() {
+            params[name] = value.clone();
+        }
+        scoped(Asserted::Operator, || {
+            crate::client::rpc(&state, method, params)
+        })
+    };
+    let fetch = |request: &str| {
+        rpc(
+            &action,
+            "app_tool_invoke",
+            json!({"tool_alias":"instagram.read","input":{"handle":"juicysuite_crm"},"request_id":request}),
+        )
+        .unwrap()["receipt"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let older = fetch("fetch-55-a");
+    let newer = fetch("fetch-55-b");
+    assert_ne!(older, newer, "each fetch retains its own receipt");
+
+    for cursor in [json!(null), json!(7), json!({}), json!([])] {
+        let invalid = rpc(
+            &action,
+            "app_social_sources_page",
+            json!({"tool_alias":"drafts","cursor":cursor}),
+        )
+        .expect_err("a present non-string cursor must be refused");
+        assert_eq!(invalid.code(), Some("invalid_cursor"), "{invalid}");
+    }
+
+    let page = rpc(
+        &action,
+        "app_social_sources_page",
+        json!({"tool_alias":"drafts"}),
+    )
+    .unwrap();
+    assert_eq!(page["availability"], "available", "{page}");
+    assert!(page["next_cursor"].is_null(), "{page}");
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{page}");
+    let store = crate::store::Store::open(&state.join("cadence.sqlite3")).unwrap();
+    let created = |id: &str| {
+        store.app_tool_result(id).unwrap()["created_at"]
+            .as_f64()
+            .unwrap()
+    };
+    let mut expected = [
+        (created(&older), older.clone()),
+        (created(&newer), newer.clone()),
+    ];
+    expected.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["post"]["receipt_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(_, id)| id.as_str())
+            .collect::<Vec<_>>(),
+        "the page is newest receipt first with an id tie-break: {page}"
+    );
+    for item in items {
+        assert_eq!(item["handle"], "juicysuite_crm", "{item}");
+        assert_eq!(item["post"]["id"], "post-1", "{item}");
+        assert_eq!(item["post"]["published_at"], 1_790_467_200i64, "{item}");
+        assert_eq!(
+            item["post"]["permalink"], "https://www.instagram.com/p/AbCd123/",
+            "{item}"
+        );
+        assert_eq!(item["post"]["caption"], "Door caption", "{item}");
+        assert!(item["post"]["receipt_id"].as_str().is_some(), "{item}");
+    }
+    // The repeated post id stays attributable: each pair resolves exactly.
+    for receipt in [&older, &newer] {
+        let got = rpc(
+            &action,
+            "app_social_sources_get",
+            json!({"tool_alias":"drafts","receipt_id":receipt,"post_id":"post-1"}),
+        )
+        .unwrap();
+        assert_eq!(got["item"]["post"]["receipt_id"], receipt.as_str(), "{got}");
+        assert_eq!(got["item"]["post"]["id"], "post-1", "{got}");
+    }
+    // A post the receipt never returned is null too.
+    let mismatched = rpc(
+        &action,
+        "app_social_sources_get",
+        json!({"tool_alias":"drafts","receipt_id":newer,"post_id":"post-not-returned"}),
+    )
+    .unwrap();
+    assert!(mismatched["item"].is_null(), "{mismatched}");
+    // The owning context still accepts the older retained read.
+    rpc(
+        &action,
+        "app_social_draft_create",
+        json!({"tool_alias":"drafts","request_id":"draft-55-own","caption":"A caption",
+            "source":{"kind":"tool_receipt","receipt_id":older,"post_id":"post-1"}}),
+    )
+    .unwrap();
+    // A backdated insert after the scan began must not join it: the cursor
+    // carries the snapshot fence, and the real handler refuses with a stable
+    // `stale_cursor` code the client can restart on.
+    for index in 0..65u32 {
+        records
+            .app_social_tool_receipt_attach(
+                &context,
+                &format!("app-tool-scan-{index:03}"),
+                1.0 + f64::from(index),
+                "social.source.posts",
+            )
+            .unwrap();
+    }
+    let scan = rpc(
+        &action,
+        "app_social_sources_page",
+        json!({"tool_alias":"drafts"}),
+    )
+    .unwrap();
+    let scan_cursor = scan["next_cursor"]
+        .as_str()
+        .expect("a bounded page leaves a cursor")
+        .to_owned();
+    records
+        .app_social_tool_receipt_attach(&context, "app-tool-backdated", 0.5, "social.source.posts")
+        .unwrap();
+    let stale = rpc(
+        &action,
+        "app_social_sources_page",
+        json!({"tool_alias":"drafts","cursor":scan_cursor}),
+    )
+    .expect_err("a moved library must refuse the old cursor");
+    assert_eq!(stale.code(), Some("stale_cursor"), "{stale}");
+    let restarted = rpc(
+        &action,
+        "app_social_sources_page",
+        json!({"tool_alias":"drafts"}),
+    )
+    .unwrap();
+    assert!(restarted["items"].as_array().is_some(), "{restarted}");
+
+    // A legacy freshness-only receipt is readable (page/get) but never backs a
+    // draft: the attachment requirement is the prior gate, not widened here.
+    records
+        .conn()
+        .execute(
+            "DELETE FROM app_social_tool_receipts WHERE install_id=? AND context_id=? AND receipt_id=?",
+            rusqlite::params![install, context, newer],
+        )
+        .unwrap();
+    let legacy = rpc(
+        &action,
+        "app_social_sources_get",
+        json!({"tool_alias":"drafts","receipt_id":newer,"post_id":"post-1"}),
+    )
+    .unwrap();
+    assert_eq!(
+        legacy["item"]["post"]["receipt_id"],
+        newer.as_str(),
+        "the exact read may resolve a freshness-only legacy receipt: {legacy}"
+    );
+    let refused = rpc(
+        &action,
+        "app_social_draft_create",
+        json!({"tool_alias":"drafts","request_id":"draft-55-legacy","caption":"A caption",
+            "source":{"kind":"tool_receipt","receipt_id":newer,"post_id":"post-1"}}),
+    )
+    .expect_err("a freshness-only receipt must not back a draft");
+    assert!(
+        refused.to_string().contains("not retained in this context"),
+        "{refused}"
+    );
+    // A sibling context mount (which supersedes the primary's action handle)
+    // still sees neither this context's receipt nor a draft from it.
+    let other_action = mount(&other, 2);
+    let foreign = rpc(
+        &other_action,
+        "app_social_sources_get",
+        json!({"tool_alias":"drafts","receipt_id":newer,"post_id":"post-1"}),
+    )
+    .unwrap();
+    assert!(foreign["item"].is_null(), "{foreign}");
+    let other_page = rpc(
+        &other_action,
+        "app_social_sources_page",
+        json!({"tool_alias":"drafts"}),
+    )
+    .unwrap();
+    assert!(
+        other_page["items"].as_array().unwrap().is_empty(),
+        "{other_page}"
+    );
+    let foreign = rpc(
+        &other_action,
+        "app_social_draft_create",
+        json!({"tool_alias":"drafts","request_id":"draft-55-foreign","caption":"A caption",
+            "source":{"kind":"tool_receipt","receipt_id":newer,"post_id":"post-1"}}),
+    )
+    .expect_err("another context's receipt must not back a draft");
+    assert!(
+        foreign.to_string().contains("not retained"),
+        "the refusal names the scope: {foreign}"
+    );
+    assert!(
+        crate::store::app_records::RecordStore::open(&state, &install)
+            .unwrap()
+            .app_social_draft_list(&other)
+            .unwrap()["drafts"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused source creates no draft"
+    );
     drop(stop);
 }
 
@@ -1471,12 +1765,4 @@ fn op_err(state: &std::path::Path, method: &str, params: Value) -> String {
     })
     .expect_err("must be refused")
     .to_string()
-}
-
-#[cfg(feature = "test-seam")]
-mod cad1405_app_lifecycle_acceptance {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/daemon/cad1405_app_lifecycle_acceptance.rs"
-    ));
 }

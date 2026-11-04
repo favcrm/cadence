@@ -58,6 +58,7 @@ pub mod ingest;
 pub mod revision;
 pub mod transfer;
 pub mod transfer_client;
+pub mod trash;
 pub mod upload;
 
 /// `if_rev` value meaning "the page does not exist yet" — a
@@ -335,9 +336,10 @@ pub fn normalize_dir(path: &str) -> Result<String> {
 }
 
 /// The vault this tracker serves — [`crate::home::vault_for`]:
-/// `<home>/vault` under `CADENCE_HOME`, the served tracker's `wiki/`
-/// under the legacy layout (the daemon's tracker is instance-bound,
-/// so the vault follows `pm.dir`, not the process env).
+/// `<home>/vault` under `CADENCE_HOME` or when the served tracker sits
+/// inside the home, the tracker's own `wiki/` otherwise (the daemon's
+/// tracker is instance-bound, so the vault follows `pm.dir`, not the
+/// process env).
 pub fn vault_dir(pm: &Pm) -> Result<PathBuf> {
     crate::home::vault_for(&pm.dir)
 }
@@ -1831,6 +1833,27 @@ pub fn mkdir(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     Ok(json!({"path": norm, "created": true}))
 }
 
+/// `rm`'s landing-directory grammar — `<millis>-<8 lowercase hex>`, the
+/// exact shape [`rm`] mints (and `trash`'s own selector parser accepts).
+/// `mv` validates the key on its own, never as the first segment of the
+/// logical path: the synthetic landing id must not spend the original
+/// path's [`DEPTH_CAP`]/[`PATH_CAP`] budget.
+const LANDING_STAMP_MAX: usize = 20;
+const LANDING_NONCE: usize = 8;
+
+fn valid_landing_key(key: &str) -> bool {
+    let Some((stamp, nonce)) = key.split_once('-') else {
+        return false;
+    };
+    !stamp.is_empty()
+        && stamp.len() <= LANDING_STAMP_MAX
+        && stamp.bytes().all(|b| b.is_ascii_digit())
+        && nonce.len() == LANDING_NONCE
+        && nonce
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// `wiki mv` — rename a page, dir or blob page. Both endpoints pass
 /// the write ACL; the destination must not exist. A `from` under
 /// `.trash/` restores — operator only (trash is operator-managed).
@@ -1842,44 +1865,72 @@ pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
     let segs_to: Vec<&str> = norm_to.split('/').collect();
     let vault = vault_dir(pm)?;
 
-    // A `.trash/<stamp>/<orig>` source is a restore: operator only.
+    // A `.trash/<key>/<orig>` source is a restore: operator only.
     // A trashed blob page keeps its `<orig>.blob` pointer name — the
     // logical name is what normalizes (the pointer suffix is the
     // store's own, never API-addressable elsewhere).
-    let restoring = from.starts_with(".trash/");
-    let (src_abs, from_label, src_is_pointer) = if restoring {
-        if !matches!(caller, Caller::Operator) {
-            return Err(Error::rejected(
-                "wiki mv refused: restoring from .trash/ is the operator's",
-            ));
-        }
-        let rel = from.trim_start_matches(".trash/");
-        let (src_rel, is_pointer) = match rel.strip_suffix(".blob") {
-            Some(base) => {
-                let n = normalize(base)?;
-                (format!("{n}.blob"), true)
+    let (src_abs, from_label, src_is_pointer) = match from.strip_prefix(".trash/") {
+        Some(rel) => {
+            if !matches!(caller, Caller::Operator) {
+                return Err(Error::rejected(
+                    "wiki mv refused: restoring from .trash/ is the operator's",
+                ));
             }
-            None => (normalize(rel)?, false),
-        };
-        if src_rel.trim_end_matches(".blob").is_empty() {
-            return Err(Error::rejected("wiki mv refused: empty trash path"));
+            // The landing id is validated on its own; the optional tail is
+            // the original logical path. Without a tail the legacy
+            // whole-landing form (`cadence wiki mv .trash/<key> <to>`)
+            // restores the landing root itself.
+            let (key, orig) = match rel.split_once('/') {
+                Some((key, orig)) => (key, Some(orig)),
+                None => (rel, None),
+            };
+            if !valid_landing_key(key) {
+                return Err(Error::rejected(format!(
+                    "wiki mv refused: '{key}' is not a trash landing id"
+                )));
+            }
+            // Only the ORIGINAL path is a logical path, so it keeps the
+            // full 32-segment / 2048-byte budget it had before `rm`.
+            let (src_rel, is_pointer) = match orig {
+                Some(orig) => {
+                    let (norm_orig, is_pointer) = match orig.strip_suffix(".blob") {
+                        Some(base) => (normalize(base)?, true),
+                        None => (normalize(orig)?, false),
+                    };
+                    if norm_orig.is_empty() {
+                        return Err(Error::rejected("wiki mv refused: empty trash path"));
+                    }
+                    if is_pointer {
+                        (format!("{norm_orig}.blob"), true)
+                    } else {
+                        (norm_orig, false)
+                    }
+                }
+                None => (String::new(), false),
+            };
+            let label = if src_rel.is_empty() {
+                format!(".trash/{key}")
+            } else {
+                format!(".trash/{key}/{src_rel}")
+            };
+            // CAD-2018: resolve the landing component by component with
+            // symlinks refused — a planted `.trash/<key>/x -> /etc` must
+            // never turn an ancestor into a source outside the vault. The
+            // same walk runs again under the write lock in `mv_real`.
+            (resolve(&vault, &label)?, label, is_pointer)
         }
-        (
-            trash_dir(&vault).join(&src_rel),
-            format!(".trash/{src_rel}"),
-            is_pointer,
-        )
-    } else {
-        let norm_from = normalize(from)?;
-        if norm_from.is_empty() {
-            return Err(Error::rejected("wiki mv refused: source is the root"));
+        None => {
+            let norm_from = normalize(from)?;
+            if norm_from.is_empty() {
+                return Err(Error::rejected("wiki mv refused: source is the root"));
+            }
+            let segs_from: Vec<&str> = norm_from.split('/').collect();
+            allowed(caller, Op::Remove, &segs_from)?;
+            if classify(&segs_from) != View::Real {
+                unreachable!()
+            }
+            (resolve(&vault, &norm_from)?, norm_from, false)
         }
-        let segs_from: Vec<&str> = norm_from.split('/').collect();
-        allowed(caller, Op::Remove, &segs_from)?;
-        if classify(&segs_from) != View::Real {
-            unreachable!()
-        }
-        (resolve(&vault, &norm_from)?, norm_from, false)
     };
     allowed(caller, Op::Write, &segs_to)?;
     if classify(&segs_to) != View::Real {
@@ -1968,6 +2019,39 @@ fn mv_real(
         return Err(Error::rejected(format!(
             "wiki mv '{from_label}' → '{to}' refused: destination exists"
         )));
+    }
+    if from_label.starts_with(".trash/") {
+        // CAD-2018: a restore is proved under THIS lock, so no wiki
+        // writer can swap the landing between the proof and the move.
+        // Every component from the vault down is a real entry (a
+        // symlinked ancestor could otherwise move a file outside the
+        // vault), and the landing itself holds no symlink, no
+        // non-logical name, and only blob pointers whose stored bytes
+        // are present at the recorded size. It does not claim custody
+        // against a privileged process changing the tree afterwards.
+        //
+        // The destination `to` is part of the proof: a directory's
+        // descendants inherit its depth and byte budget, so restoring to
+        // a root already at DEPTH_CAP or PATH_CAP would land children
+        // that `normalize` refuses — pages no read could ever address.
+        // A refusal here leaves the landing untouched.
+        let rel = src
+            .strip_prefix(&vault)
+            .ok()
+            .and_then(Path::to_str)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "wiki mv restore source {} is outside the vault",
+                    src.display()
+                ))
+            })?;
+        if resolve(&vault, rel)?.as_path() != src {
+            return Err(Error::internal(format!(
+                "wiki mv restore source {} did not resolve to itself",
+                src.display()
+            )));
+        }
+        trash::check_restore_destination(&vault, src, to)?;
     }
     let gitignore = ensure_layout(pm)?;
     if let Some(parent) = dst.parent() {

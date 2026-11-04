@@ -190,6 +190,10 @@ impl BoardHttp {
                 .parse()
                 .map_err(|_| Error::rejected("event credential is invalid"))?,
         );
+        request.headers_mut().insert(
+            CLIENT_FEATURES_HEADER,
+            tungstenite::http::HeaderValue::from_static(CLIENT_FEATURES),
+        );
         let mut config = tungstenite::protocol::WebSocketConfig::default();
         config.max_message_size = Some(16 * 1024);
         config.max_frame_size = Some(16 * 1024);
@@ -259,7 +263,11 @@ impl BoardHttp {
         });
         let response = match method {
             "GET" => {
-                let request = self.agent.get(url).header("Authorization", authorization);
+                let request = self
+                    .agent
+                    .get(url)
+                    .header("Authorization", authorization)
+                    .header(CLIENT_FEATURES_HEADER, CLIENT_FEATURES);
                 match timeout {
                     Some(timeout) => request
                         .config()
@@ -270,7 +278,11 @@ impl BoardHttp {
                 }
             }
             "POST" => {
-                let request = self.agent.post(url).header("Authorization", authorization);
+                let request = self
+                    .agent
+                    .post(url)
+                    .header("Authorization", authorization)
+                    .header(CLIENT_FEATURES_HEADER, CLIENT_FEATURES);
                 match timeout {
                     Some(timeout) => request
                         .config()

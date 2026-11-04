@@ -1211,13 +1211,4 @@ mod policy_tests {
 }
 
 #[cfg(test)]
-mod cad1179_acceptance;
-
-#[cfg(test)]
 mod aos274_policy_http;
-
-#[cfg(test)]
-mod cad1500_acceptance;
-
-#[cfg(test)]
-mod cad1500_policy_acceptance;

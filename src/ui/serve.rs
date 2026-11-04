@@ -756,6 +756,7 @@ pub(crate) fn agents_payload_typed(
             agents: vec![],
             totals: None,
             by_issue: BTreeMap::new(),
+            profiles: vec![],
         };
     };
     let task_map = jobs
@@ -957,6 +958,7 @@ pub(crate) fn agents_payload_typed(
         agents: out,
         totals: Some(totals),
         by_issue,
+        profiles: list["profiles"].as_array().cloned().unwrap_or_default(),
     }
 }
 
@@ -980,7 +982,8 @@ pub(crate) fn agent_detail(
         state_dir,
         "agent_show",
         json!({"alias": alias, "active_only": true,
-               "include_catalogue_instructions": operator, "include_stats": true}),
+               "include_catalogue_instructions": operator,
+               "include_profile_instructions": operator, "include_stats": true}),
     )
     .map_err(|e| e.to_string())?;
     let agent = &show["agent"];
@@ -2254,6 +2257,60 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 let mut segs = tail.split('/');
                 let key = segs.next().unwrap_or_default();
                 let sub = segs.next();
+                // `/api/projects/<key>/policy` (CAD-1950) — the recorded
+                // access policy the Settings section renders. Absent policy
+                // and workspace-visible are different records, so `recorded`
+                // says which this is; the page must not show one as the other.
+                if sub == Some("policy") && segs.next().is_none() {
+                    if !model::valid_key(key) {
+                        send(request, err_response(400, "bad project key"));
+                        return;
+                    }
+                    let actor = match read_admission
+                        .as_ref()
+                        .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                    {
+                        Some(Ok(actor)) => actor,
+                        Some(Err(resp)) => {
+                            send(request, resp);
+                            return;
+                        }
+                        None => {
+                            send(request, err_response(503, "read admission is missing"));
+                            return;
+                        }
+                    };
+                    match Pm::at(pm_dir) {
+                        Ok(pm) => match project::list(&pm.dir) {
+                            Ok(projects) => match projects.iter().find(|p| p.key == key) {
+                                Some(selected) => {
+                                    // AOS-274: a restricted project answers
+                                    // like an absent one, so the refusal does
+                                    // not name what it is hiding.
+                                    if super::project_policy::refused(&pm, &selected.key, &actor) {
+                                        send(request, err_response(404, "unknown project"));
+                                        return;
+                                    }
+                                    let policy = selected.policy.clone();
+                                    send(
+                                        request,
+                                        json_response(json!({
+                                            "project": selected.key,
+                                            "recorded": policy.is_some(),
+                                            "policy": policy,
+                                            "private_available":
+                                                crate::issue::write::private_available(),
+                                        })),
+                                    )
+                                }
+                                None => send(request, err_response(404, "unknown project")),
+                            },
+                            Err(error) => send(request, err_response(503, &error.to_string())),
+                        },
+                        Err(error) => send(request, err_response(503, &error.to_string())),
+                    }
+                    return;
+                }
                 if sub == Some("context") && segs.next().is_none() {
                     if !model::valid_key(key) {
                         send(request, err_response(400, "bad project key"));

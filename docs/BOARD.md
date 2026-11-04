@@ -5,8 +5,11 @@ one writer implementation (`src/issue/write.rs`) shared by the
 `cadence issue` CLI and the board's HTTP write API, and `cadence ui`
 serving a board + JSON API on loopback.
 
-- **Tracker dir:** `~/pm` (or `CADENCE_PM_DIR`). A private git repo —
-  never pushed anywhere public.
+- **Tracker dir:** `~/pm` (or `CADENCE_PM_DIR`) for an existing
+  installation; `<home>/tracker` (`~/.cadence/tracker`) for a first run
+  that has no earlier tracker, state dir or hosted config — see
+  [CLI.md](CLI.md#cadence-home-overrides-and-isolation-cad-1922). A
+  private git repo — never pushed anywhere public.
 - **Notes dir:** `/var/www/agent-notes` (`notes_dir` in `pm.yaml`) —
   kickoff/QA/verdict chains, read-only.
 - **Runtime:** the cadence daemon socket, read-only. The board and CLI
@@ -119,7 +122,7 @@ and does not activate Private projects or qualify assistant/filesystem isolation
 through the existing `cli.read` actor-envelope protocol. The native server derives
 the owner from the verified user actor and accepts no arguments. A local-org CLI
 invocation explains that a hosted org is required. Existing project, issue, setup,
-membership and local-agent commands remain their current interfaces; this feature
+membership and `agent connect` commands remain their current interfaces; this feature
 adds no setup/access screens, work-proof format or agent-execution dashboard.
 
 
@@ -182,9 +185,15 @@ created: 2026-09-17T16:01:23Z
 |---|---|
 | `status` | A container's status rolls up from its children; else a bound job's task states (`dispatched`/`running`/`revising` → `doing`, `review` and `verified` → `review`, `done` → `done`, `blocked` only flags `blocked_reason`); else a terminal file status (`done`/`dropped` — merge evidence or an explicit set, which no note can reopen); else the latest note carrying `Issue: <id>` (`-kickoff` → `doing`, `-qa` → `review`, `-verdict` → `review` — a verdict is a review outcome, pass or not; notes never derive `done` — on that side the file field carries it, set by reconcile/`mark_done_on_merge` on merge evidence or by hand); else the file. `verified` stays `review` until `job accept`. `status_source` says which: `rollup` \| `job` \| `notes` \| `file`. Draft tasks are unstarted templates and never drive the board. |
 | `blocks` / `duplicates` | Inverses of `blocked_by` / `duplicate_of`, computed at read time. |
-| `ready` | Leaf issue, status `ready`, nothing unfinished in `blocked_by`. |
-| `blocked` | Any `blocked_by` target not `done`. |
+| `ready` | Leaf issue with status `backlog` or `ready` that is not blocked. |
+| `blocked` | A `blocked_by` target is absent or is neither `done` nor `dropped`, or a task in the selected job is blocked. |
 | counts, activity, sessions | Comments/artifacts/refs lengths; merged notes+comments+git log; agents bound through `agent.tasks` × `jobs.issue_id` — exact, never a text scan. |
+
+When several jobs bind to an issue, the newest nonterminal job wins by numeric
+creation time; equal times use the job ID in descending order. If every job is
+terminal, the newest terminal job wins. If any job in the group has a
+nonnumeric creation time, the selector retains its previous string-and-ID
+ordering; this fallback does not establish that the job state is safe or current.
 
 Statuses: `backlog ready doing review done dropped`. Issues are never
 deleted — `dropped` is the end state. `dropped` issues don't render on
@@ -396,6 +405,30 @@ cadence project new reminders --repo ~/code/reminders [--prefix REM] \
                                             # different repo, key `agents`, a bad
                                             # key, a non-git path, the tracker or
                                             # the daemon state dir writes nothing
+cadence --org <slug> project new fav-bd --name "Fav BD" [--prefix FBD]
+                                            # CAD-1999, hosted org only: register
+                                            # an empty project in the org's own
+                                            # registry — no repo, no PROJECT.md.
+                                            # --name is the human label and is
+                                            # required; the same key, name and
+                                            # prefix is the same project. A key
+                                            # already registered (or already
+                                            # present only as its tickets'
+                                            # project) with a different name or
+                                            # prefix, or a prefix another project
+                                            # uses, refuses without writing. The
+                                            # live human workspace owner is the
+                                            # only caller the board admits.
+cadence --org <slug> issue project ls       # CAD-1999: the org's projects —
+                                            # registered ones plus the projects
+                                            # that exist only as their tickets'
+                                            # key (name = key for those).
+                                            # --sort/--limit/--fields are local
+                                            # transforms and refuse remotely
+cadence --org <slug> issue ls --project fav-bd
+                                            # CAD-1999: one project's tickets; an
+                                            # empty registered project reads as an
+                                            # empty list. One key per call.
 cadence issue new "title"                   # --project wins, else CADENCE_PROJECT,
                                             # else the cwd repo's remote/path; no
                                             # match fails closed. --parent, --priority,
@@ -949,12 +982,17 @@ business: no `--ready`, no forced claims; the output prints the queued
 message id and the worker's probe verdict so the operator knows
 whether it lands now or when the pane idles.
 
-**Task context delivery (CAD-1822, CAD-1846).** Plain dispatch, explicit
-`dispatch --job --spec`, and native issue-linked job task dispatch use the
+**Task context delivery (CAD-1822, CAD-1846, CAD-2001).** Plain dispatch,
+explicit `dispatch --job --spec`, and native issue-linked job task dispatch use the
 same project-source and current-policy lesson selection for the actual
 worker's role. They pin the task contract and the assigned project's tracked
 sources, but only when that project's tracked
-`docs/cadence/project-context.yaml` at HEAD sets `agent_delivery: true`.
+`docs/cadence/projects/<key>/project-context.yaml` — or, when that is not
+tracked, `docs/cadence/project-context.yaml` — at HEAD sets
+`agent_delivery: true`. One checkout can serve several projects, so the
+per-project path is preferred and lets each project keep its own opt-in;
+the shared default serves only the project its `project:` names, and a
+manifest naming another project is refused, never read as this project's.
 Absent or false leaves every existing dispatch path unchanged. A
 tracked manifest the daemon cannot read or parse cannot prove the
 opt-in, so delivery stays off and dispatch is unchanged; once
@@ -1800,7 +1838,8 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/issues/:id/activity` | the merged activity stream only |
 | `GET /api/issues/:id/history?limit=N` | parsed git history for the issue — same entries as `issue log` (default limit 50, `400` on a bad limit); an epic's stage move is a `stage` entry with `from`, `to` and `note`, a plan decision a `plan` entry (CAD-432) |
 | `GET /api/issues/:id/artifacts/:name` | one artifact file — inline for a small safe list (`text/plain` for md/txt/logs/code, images), **`Content-Disposition: attachment` for everything else, always for html/svg/xml/js/pdf**. Every artifact response carries `Content-Security-Policy: sandbox; default-src 'none'` and `Cache-Control: no-store`; names must satisfy the write grammar (no `/`, no leading dot); symlinks → `404` |
-| `GET /api/agents` | worker agent rows enriched with the exact task/issue binding (`agent.tasks` × `jobs.issue_id`) + running/queued/fenced/parked totals and `by_issue` for card strips; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down |
+| `GET /api/agents` | worker agent rows enriched with the exact task/issue binding (`agent.tasks` × `jobs.issue_id`) + running/queued/fenced/parked totals and `by_issue` for card strips; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down; `profiles` (CAD-1989) lists the Settings > Agents profiles as `{id, alias, role, team_role, catalogue, look, job, model, runtimes}` (`job` is the operator's: the board's shared payload always carries `null`, and the daemon returns it only to a proven operator), `runtimes` being the aliases registered with `--profile <id>` (empty means "Idle · no runtime") |
+| `POST /api/agent-profiles` | `{alias, catalogue, job?, model?}` — CAD-1989: a hire saves a Settings > Agents profile from the catalogue role and nothing else: no runtime row, no home directory, no launch. `job` is sent only when edited (else the role's instructions); `model` is `inherit` unless one registered model is chosen (an explicit model stays strict). Operator only over the daemon's `agent_profile_create`; `409 alias_taken` when a profile or a runtime has the alias. A runtime attaches later with `cadence join <group> <provider> --profile <id>` and `cadence agent context <id>` reads the profile (the operator, or the agent whose own runtime is registered against it; anyone else is refused). The alias grammar is lowercase letters, digits and dashes, starting with a letter or digit; a runtime cannot take an alias a profile holds. The job is readable by the operator and a runtime registered against the profile; a group-root agent that registers a member against a profile also reads it (its `join` needs it for the briefing) | `201 {profile}` |
 | `GET /api/agents/:alias` | the agent drawer: `agent_show` + last 20 events + `tasks`/`on` bindings + `recovery`/`resume` commands; `404` on unknown alias, `400` on alias grammar |
 | `GET /api/memories?project=&status=&type=&component=&path=` | memory cards from projects readable by the caller — same filters as `memory ls`; `memory_errors` includes load failures only for readable projects |
 | `GET /api/memories/:project/:slug` | one readable memory: frontmatter, body and evidence analysis; Wiki citations use the proven board caller's access. An unattributed or refused caller is refused rather than treated as anonymous; inaccessible and unknown memories share a generic `404`, `400` on grammar |

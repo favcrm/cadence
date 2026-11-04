@@ -11,7 +11,7 @@ const ui = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repo = resolve(ui, "..");
 const artifact = resolve(repo, "src/app_preview_export/producer.mjs");
 const baselinePath = resolve(repo, "src/app_preview_export/baseline.json");
-const contract = "app-screen-projection-fixtures/8";
+const contract = "app-screen-projection-fixtures/9";
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 const fail = message => { console.error(`app fixture drift: ${message}`); process.exitCode = 1; };
 
@@ -27,7 +27,8 @@ function eventBase() {
     if (name === "pull_request" || name === "pull_request_target") return event.pull_request?.base?.sha ?? null;
     if (name === "merge_group") return event.merge_group?.base_sha ?? null;
     if (name === "push" && event.before !== "0".repeat(40)) return event.before ?? null;
-    if (name === "workflow_dispatch" || name === "push") {
+    // A nightly run has no base in its payload either: it checks HEAD against its parent.
+    if (name === "workflow_dispatch" || name === "schedule" || name === "push") {
       const commit = git(["cat-file", "-p", "HEAD"]);
       const parentHeader = commit.split("\n").find(line => line.startsWith("parent "));
       if (!parentHeader) throw new Error(`${name} HEAD commit has no parent (root commit)`);

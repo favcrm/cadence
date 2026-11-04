@@ -14,7 +14,20 @@
 //! Worker, a tenant or any other host, and is never substituted here. An
 //! absent or malformed target refuses; a valid target that does not meet the
 //! package reports `compatible: false` with the per-requirement checks.
+//!
+//! `app.screen.integrity` runs the one screen declaration/integrity validator
+//! ([`crate::app_screen_decl`]) over a declaration and host-computed
+//! size/sha256 *facts*, so a non-native host answers exactly what the native
+//! install/mount guard answers without shipping asset bodies through the ABI.
+//! The caller also supplies the app's `screens/<tag>/` package count, checked
+//! against the same [`MAX_SCREENS`] the native bundle scan enforces before any
+//! declaration work. The facts and the count are the caller's own report: the
+//! op proves the declaration agrees with them, and the caller must hash the
+//! exact bytes it installed. It grants no install, mount, execution or effect
+//! authority.
+
 use crate::app_compat::{parse_requires, Compat, ContractStage, HostContracts, SemVer};
+use crate::app_screen_decl::{validate_facts, ScreenAssetFact, MAX_SCREENS};
 use crate::frontmatter::split_front;
 use crate::issue::{self, ReadinessInput, ReadinessValue, ValidateInput, ValidateValue};
 use schemars::JsonSchema;
@@ -45,7 +58,10 @@ const CONTRACT_MAJOR_MAX: u64 = 99;
 pub enum Code {
     /// The envelope is malformed, oversize, unversioned or names no known op.
     InvalidCommand,
-    /// The manifest is not a well-formed `app.md` with a valid `needs.requires`.
+    /// The manifest is not a well-formed `app.md` with a valid `needs.requires`,
+    /// or a screen package set is not well formed: its app-level screen count,
+    /// its declaration grammar and bounds, or its declared↔supplied size/sha256
+    /// facts disagree.
     InvalidManifest,
 }
 
@@ -80,6 +96,10 @@ pub enum Operation {
     /// Evaluate `needs.requires` against an explicit target profile.
     #[serde(rename = "app.requirements.evaluate")]
     AppRequirementsEvaluate(RequirementsInput),
+    /// Check one screen declaration against host-computed asset facts
+    /// (CAD-2008).
+    #[serde(rename = "app.screen.integrity")]
+    AppScreenIntegrity(ScreenIntegrityInput),
     /// Check an issue id, project key, tags, status and priority.
     #[serde(rename = "issue.validate")]
     IssueValidate(ValidateInput),
@@ -144,6 +164,37 @@ pub struct RequirementsInput {
     /// The host being asked. Required: there is no native, hosted or other
     /// default profile, and a missing one is refused, never assumed.
     pub target: TargetProfile,
+}
+
+/// Input of `app.screen.integrity`.
+///
+/// The declaration is the exact `screens.json` text of one `screens/<tag>/`
+/// package, and `assets` carries host-computed *facts* for the bytes that host
+/// installed — never bodies. `screen_count` is the app-level package count the
+/// same host verified, bounded by the one [`MAX_SCREENS`] the native bundle
+/// scan enforces. The whole envelope is bounded by [`MAX_INPUT_BYTES`] before
+/// any JSON work, and the declaration by the screen contract's own 32 KiB and
+/// 32-asset limits, so no multi-megabyte asset can be encoded through the ABI.
+///
+/// **Authority**: the facts and the count are the caller's report. A caller
+/// must compute `size`/`sha256` over the exact installed bytes and count the
+/// `screens/<tag>/` packages it actually installed; the op proves the
+/// declaration agrees with what it was told, and nothing here installs,
+/// mounts, executes or grants effect authority.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenIntegrityInput {
+    /// The exact screen declaration (`screens.json`) text.
+    pub manifest: String,
+    /// Flat asset name → the facts the host computed for that installed body.
+    pub assets: BTreeMap<String, ScreenAssetFact>,
+    /// How many `screens/<tag>/` packages the app declares, 1 to
+    /// [`MAX_SCREENS`]. Fixed-width so the same JSON is accepted or refused
+    /// identically on every target: a `usize` field would overflow on a 32-bit
+    /// host and turn one refusal into another. Checked before any declaration
+    /// work, so the hosted answer refuses an over-count app exactly as the
+    /// native bundle scan does.
+    pub screen_count: u64,
 }
 
 /// A host's own capability profile, supplied by the caller. This crate never
@@ -279,6 +330,21 @@ pub enum RequirementCheck {
     },
 }
 
+/// Success value of `app.screen.integrity`: the declared app tag of the one
+/// declaration that passed.
+///
+/// `ok: true` on the envelope only says the check ran; this value says the
+/// declaration and the supplied facts agreed under the native screen contract.
+/// It is integrity evidence, not install, mount, execution or effect authority,
+/// and it covers the facts the caller supplied — the caller must have hashed
+/// the exact bytes it installed.
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenIntegrityValue {
+    /// The declared app tag (`valid_tag` grammar).
+    pub app: String,
+}
+
 /// Success value of `delivery.requirements.evaluate`: the requirements the
 /// evaluator produced, beside the policy they were computed under. The value is
 /// emitted as produced; this type publishes its shape.
@@ -310,6 +376,10 @@ pub enum OpValue {
     #[serde(rename = "app.requirements.evaluate")]
     #[schemars(with = "RequirementsValue")]
     Requirements(Value),
+    /// The declared app tag of a screen declaration whose assets matched the
+    /// supplied facts (CAD-2008).
+    #[serde(rename = "app.screen.integrity")]
+    ScreenIntegrity(ScreenIntegrityValue),
     #[serde(rename = "issue.validate")]
     Validate(ValidateValue),
     #[serde(rename = "issue.readiness")]
@@ -547,6 +617,30 @@ fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
             // Emitted as produced: `RequirementsValue` publishes the shape.
             Ok(OpValue::Requirements(compat.report(&host)))
         }
+        Operation::AppScreenIntegrity(input) => {
+            // The app-level package count is checked first, against the same
+            // bound the native bundle scan applies, so an over-count app
+            // refuses before any declaration work on either host. The shared
+            // bound widens to the input's fixed width and the input is never
+            // narrowed, so the answer is identical on 32- and 64-bit hosts.
+            if !(1..=MAX_SCREENS as u64).contains(&input.screen_count) {
+                return Err(refuse(
+                    Code::InvalidManifest,
+                    format!(
+                        "screen_count {} — an app declares 1 to {MAX_SCREENS} screen packages",
+                        input.screen_count
+                    ),
+                ));
+            }
+            // The one shared screen validator: the declaration's grammar and
+            // bounds, then the declared↔supplied size/sha256 comparison. A
+            // refusal is a package-bytes refusal, not a command-shape one.
+            let checked = validate_facts(&input.manifest, &input.assets)
+                .map_err(|error| refuse(Code::InvalidManifest, error))?;
+            Ok(OpValue::ScreenIntegrity(ScreenIntegrityValue {
+                app: checked.app().to_string(),
+            }))
+        }
         Operation::DeliveryRequirementsEvaluate(input) => Ok(OpValue::DeliveryRequirements(
             delivery_requirements_value(&input)?,
         )),
@@ -775,6 +869,83 @@ mod tests {
                 response["value"]
             );
         }
+    }
+
+    /// The screen op quotes the one shared validator: matching facts return the
+    /// declared app tag, a wrong digest refuses as a package-bytes problem, an
+    /// app-level count outside the native bound refuses before declaration work,
+    /// and an asset body cannot ride the ABI at all.
+    #[test]
+    fn screen_integrity_op_quotes_the_shared_validator() {
+        use sha2::{Digest, Sha256};
+
+        let body = "console.log(1);\n";
+        let digest = format!("sha256:{:x}", Sha256::digest(body.as_bytes()));
+        let manifest = serde_json::json!({
+            "contract": "app-screens/v1",
+            "app": "demo",
+            "entry": "client.js",
+            "assets": [{
+                "name": "client.js",
+                "media_type": "text/javascript",
+                "sha256": digest,
+                "size": body.len(),
+            }],
+            "provenance": {
+                "source_digest": digest,
+                "sdk_digest": digest,
+                "toolchain_digest": digest,
+            },
+        })
+        .to_string();
+        let call = |screen_count: u64, assets: Value| -> Value {
+            let request = serde_json::json!({
+                "v": CONTRACT_VERSION,
+                "op": "app.screen.integrity",
+                "input": {
+                    "manifest": manifest,
+                    "assets": assets,
+                    "screen_count": screen_count,
+                },
+            });
+            serde_json::from_slice(&evaluate(&serde_json::to_vec(&request).unwrap())).unwrap()
+        };
+
+        let response = call(
+            1,
+            json!({ "client.js": { "size": body.len(), "sha256": digest } }),
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["op"], "app.screen.integrity");
+        assert_eq!(response["value"], json!({ "app": "demo" }));
+
+        // A wrong digest (same length) is a declaration/facts disagreement.
+        let response = call(
+            1,
+            json!({
+                "client.js": { "size": body.len(), "sha256": format!("sha256:{}", "0".repeat(64)) },
+            }),
+        );
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(response["code"], "invalid_manifest");
+
+        // The app-level count is bounded by the one native `MAX_SCREENS`.
+        for screen_count in [0, MAX_SCREENS as u64 + 1] {
+            let response = call(
+                screen_count,
+                json!({ "client.js": { "size": body.len(), "sha256": digest } }),
+            );
+            assert_eq!(response["ok"], false, "{response}");
+            assert_eq!(response["code"], "invalid_manifest", "{screen_count}");
+        }
+
+        // Facts carry no bytes: an extra body field refuses the command.
+        let response = call(
+            1,
+            json!({ "client.js": { "size": body.len(), "sha256": digest, "body": body } }),
+        );
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(response["code"], "invalid_command");
     }
 
     #[test]

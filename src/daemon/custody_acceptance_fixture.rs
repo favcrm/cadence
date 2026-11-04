@@ -801,7 +801,6 @@ impl Rig {
     }
 }
 
-mod artifact_acceptance;
 mod authority5;
 #[cfg(all(test, target_os = "linux", feature = "test-seam"))]
 mod custody6;

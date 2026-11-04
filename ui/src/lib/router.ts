@@ -41,10 +41,12 @@ import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } fr
  * routing is unit-tested in plain node (tests/router.test.ts).
  */
 
-export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows";
+export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows" | "settings";
 export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences";
-/** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
-export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
+/** The wiki's modes; `browse` opens a path by its kind (CAD-581). `trash`
+ *  is the operator's deleted-landing browser (CAD-2018); its selector is a
+ *  server-issued `.trash/…` value, never a logical wiki path. */
+export type WikiMode = "browse" | "edit" | "history" | "search" | "upload" | "trash";
 
 /**
  * CAD-1319: the Connections section's sub-pages. Absent = the index;
@@ -182,9 +184,10 @@ function pathFrom(parts: string[], from: number): string {
 }
 
 /**
- * The wiki's paths (CAD-581). `edit`, `history`, `upload` and `search` are
- * reserved first segments — the modes' homes; anything else is a path into
- * the store, which `browse` opens by its kind.
+ * The wiki's paths (CAD-581). `edit`, `history`, `upload`, `search` and
+ * `trash` are reserved first segments — the modes' homes; anything else is
+ * a path into the store, which `browse` opens by its kind. No fixed wiki
+ * root is named `trash`, so the reservation cannot shadow a real folder.
  */
 function matchWiki(parts: string[]): Route {
   const mode = parts[1];
@@ -195,6 +198,12 @@ function matchWiki(parts: string[]): Route {
   }
   if (mode === "edit" || mode === "history" || mode === "upload") {
     return { screen: "wiki", mode, path: pathFrom(parts, 2) || null, query: null };
+  }
+  // CAD-2018: the Trash screen is one operator screen. A landing's identity
+  // is the board's row, not a URL: `from` may be null, so a selector in the
+  // path would be a second, weaker identity.
+  if (mode === "trash") {
+    return { screen: "wiki", mode: "trash", path: null, query: null };
   }
   return { screen: "wiki", mode: "browse", path: pathFrom(parts, 1) || null, query: null };
 }
@@ -225,7 +234,7 @@ export function matchRoute(pathname: string): Route {
       if (!a) return { screen: "projects", slug: null, section: "overview" };
       const slug = segment(a);
       if (slug && !b) return { screen: "projects", slug, section: "overview" };
-      if (slug && (b === "overview" || b === "issues" || b === "context" || b === "epics" || b === "milestones" || b === "workflows")) {
+      if (slug && (b === "overview" || b === "issues" || b === "context" || b === "epics" || b === "milestones" || b === "workflows" || b === "settings")) {
         return { screen: "projects", slug, section: b };
       }
     }
@@ -359,6 +368,8 @@ export function routePath(route: Route): string {
       if (route.mode === "search") {
         return route.query ? `/wiki/search/${encodeURIComponent(route.query)}` : "/wiki/search";
       }
+      // CAD-2018: one Trash screen; no landing selector rides the URL.
+      if (route.mode === "trash") return "/wiki/trash";
       if (route.mode === "browse") return path ? `/wiki/${path}` : "/wiki";
       return path ? `/wiki/${route.mode}/${path}` : `/wiki/${route.mode}`;
     }

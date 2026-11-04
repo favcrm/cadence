@@ -8,8 +8,9 @@ import { attachMeta } from "../app-shell/chat/attach";
 import { askLabel } from "../canvas/askRefs";
 import HireProposalCard from "../agents/HireProposalCard";
 import ArtifactCard from "../canvas/ArtifactCard";
+import ImageBlock from "../canvas/ImageBlock";
 import { ThreadPermission } from "./PermissionCard";
-import { isArtifactPutCall, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
+import { isArtifactPutCall, isCardItem, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
 import { carriesSecret } from "../app-shell/chat/directive";
 
 /**
@@ -33,10 +34,14 @@ export function time(created: string | null | undefined): string {
  */
 /** The tool rows themselves, with no disclosure of their own (CAD-1881):
  *  standalone groups own the `steps-head`, a turn's trace lists them flat
- *  under its single 44px head. */
-function ToolRows({ entries }: { entries: ThreadEntry[] }) {
+ *  under its single head. A turn trace asks for newest-first so the row
+ *  under "Reasoning" is the latest call, not the one that opened the turn. */
+function ToolRows({ entries, newestFirst = false }: { entries: ThreadEntry[]; newestFirst?: boolean }) {
   const t = useTranslate();
-  const steps = useMemo(() => toolSteps(entries), [entries]);
+  const steps = useMemo(() => {
+    const paired = toolSteps(entries);
+    return newestFirst ? paired.slice().reverse() : paired;
+  }, [entries, newestFirst]);
   return (
     <ul className="steps-inner">
       {steps.map((s, i) => (
@@ -55,7 +60,7 @@ function ToolRows({ entries }: { entries: ThreadEntry[] }) {
           >
             {s.call.kind === "tool_result" ? "←" : !s.done ? "◌" : s.refused ? "⊘" : s.error ? "✕" : "✓"}
           </span>
-          <span className="num min-w-0 break-all flex-1">{s.summary}</span>
+          <span className="num min-w-0 flex-1 truncate" title={s.summary}>{s.summary}</span>
           {s.refused && <span className="step-tag text-warn shrink-0">{t("refused")}</span>}
           {s.error && !s.refused && <span className="step-tag text-fail shrink-0">{t("error")}</span>}
           {s.result && s.call.kind === "tool_call" && (
@@ -250,6 +255,8 @@ export function ThreadItemView({
       return <StepsGroup entries={item.entries} density={density} />;
     case "artifact":
       return <ArtifactCard entry={item.entry} />;
+    case "image":
+      return <ImageBlock entry={item.entry} />;
     case "hire":
       return <HireProposalCard entry={item.entry} reason={item.reason} />;
     case "answer": {
@@ -541,6 +548,60 @@ function traceElapsed(from: string | null | undefined, to: string | null | undef
   return `${Math.floor(secs / 60)}m ${secs % 60}s`;
 }
 
+/** A tool call's plain name for the closed trace: `catalog_search: website`
+ *  reads as `Catalog search`. Only the first word is kept, so an argument
+ *  cannot follow it in. Formats a known-shape string for reading; raw calls
+ *  and their arguments stay in the open trace. */
+function toolName(summary: string): string {
+  if (carriesSecret(summary)) return "";
+  const name = summary.trim().split(/[\s:]/, 1)[0].replaceAll("_", " ").replace(/\s+/g, " ").trim();
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+/** Plain names of a tool run's calls, newest first. A result whose call has
+ *  been paged out is not named: its summary is the tool's output. */
+function toolNames(entries: ThreadEntry[]): string[] {
+  const names: string[] = [];
+  for (const step of toolSteps(entries)) {
+    if (step.call.kind !== "tool_call") continue;
+    const name = toolName(step.summary);
+    if (name !== "") names.unshift(name);
+  }
+  return names;
+}
+
+/** The line after the trace title: up to three distinct tools the turn used,
+ *  newest first. Never note text and never arguments: both stay in the open
+ *  trace, because a closed summary is on screen for anyone to read. */
+function traceDigest(trace: ThreadItem[]): { summary: string; errors: number } {
+  let errors = 0;
+  const names: string[] = [];
+  for (const item of trace) {
+    if (item.type !== "tools") continue;
+    for (const step of toolSteps(item.entries)) {
+      if (step.error) errors += 1;
+    }
+    names.unshift(...toolNames(item.entries));
+  }
+  return { summary: [...new Set(names)].slice(0, 3).join(", "), errors };
+}
+
+/** The tool the turn is on right now, when the newest trace row is a tool.
+ *  A later reasoning note means the tool has finished, so the bubble goes
+ *  back to "Thinking…" instead of naming a call that already returned. */
+function runningTool(trace: ThreadItem[]): string {
+  for (let i = trace.length - 1; i >= 0; i--) {
+    const item = trace[i];
+    if (item.type === "tools") {
+      const [newest] = toolNames(item.entries);
+      if (newest !== undefined) return newest;
+      continue;
+    }
+    if (item.type === "thinking" || item.type === "commentary") return "";
+  }
+  return "";
+}
+
 /** The newest stored stamp in a turn — its head's time when it has no answer. */
 function lastCreated(items: ThreadItem[]): string | null {
   for (let i = items.length - 1; i >= 0; i--) {
@@ -556,13 +617,11 @@ function lastCreated(items: ThreadItem[]): string | null {
   return null;
 }
 
-/** Three typing dots: the only streaming affordance. The transport sends
- *  whole entries, never token deltas, so there is no skeleton and no
- *  fabricated answer body to show while a turn works. The row is not its
- *  own live region: it mounts inside the thread's `role="log"` list, which
- *  already announces the addition, so a second `role="status"` here would
- *  announce the same row twice. */
-function TypingDots() {
+/** Three typing dots plus the current step. The transport sends whole
+ *  entries, never token deltas, so there is no skeleton and no fabricated
+ *  answer body. The row is not its own live region: it mounts inside the
+ *  thread's `role="log"` list, which already announces the addition. */
+function TypingDots({ label }: { label: string }) {
   const t = useTranslate();
   const actor = useAssistantActor();
   return (
@@ -572,6 +631,7 @@ function TypingDots() {
         <i />
         <i />
       </span>
+      <span className="typing-step">{label}</span>
       <span className="sr-only">{`${displayName(actor.read, actor.scope, t)} ${t("is typing")}`}</span>
     </div>
   );
@@ -585,18 +645,35 @@ function TurnTrace({
   steps,
   running,
   summary,
+  errors,
   elapsed,
+  failed,
+  answered,
 }: {
   items: ThreadItem[];
   steps: number;
   running: boolean;
   summary: string;
+  errors: number;
   elapsed: string | null;
+  /** The turn ended on a failure rather than an answer. */
+  failed: boolean;
+  /** This segment holds the answer. An earlier segment of a split turn does
+   *  not, and may still be live, so it never claims to have finished. */
+  answered: boolean;
 }) {
   const t = useTranslate();
   const [open, setOpen] = useState(false);
   const id = useId();
-  const title = running ? t("Thinking…") : elapsed ? `${t("Thought for")} ${elapsed}` : t("Reasoning");
+  const title = running
+    ? t("Working")
+    : failed
+      ? t("Stopped")
+      : elapsed
+        ? `${t("Thought for")} ${elapsed}`
+        : answered
+          ? t("Finished")
+          : t("Reasoning");
   return (
     <div className="steps turntrace min-w-0" data-kind="turn-trace" data-open={open || undefined}>
       <button
@@ -610,19 +687,26 @@ function TurnTrace({
           ›
         </span>
         <span className="turntrace-title shrink-0">{title}</span>
-        {summary !== "" && <span className="turntrace-summary num truncate min-w-0">· {summary}</span>}
-        <span className="turntrace-count num shrink-0">
+        {summary !== "" && (
+          <span className="turntrace-summary truncate min-w-0" title={summary}>
+            · {summary}
+          </span>
+        )}
+        <span className="turntrace-count num shrink-0" data-warn={errors > 0 || undefined}>
           {steps} {steps === 1 ? t("step") : t("steps")}
+          {errors > 0 ? ` · ${errors} ${errors === 1 ? t("error") : t("errors")}` : ""}
         </span>
       </button>
       <div className="steps-body" id={id} inert={!open} aria-hidden={!open}>
         <div className="turntrace-wrap">
           <ol className="turntrace-list">
-            {items.map((item) => {
+            {/* Newest first. A long run used to open on the first call, so
+                the steps actually in progress sat below the fold. */}
+            {[...items].reverse().map((item) => {
               if (item.type === "tools") {
                 return (
                   <li key={item.key} className="turntrace-item" data-item-key={item.key}>
-                    <ToolRows entries={item.entries} />
+                    <ToolRows entries={item.entries} newestFirst />
                   </li>
                 );
               }
@@ -767,7 +851,6 @@ export function ThreadTurn({
   head = true,
   continued = false,
   copy = true,
-  answered,
 }: {
   items: ThreadItem[];
   running?: boolean;
@@ -781,15 +864,11 @@ export function ThreadTurn({
   after?: ReactNode;
   /** False for a continuation segment: one head per turn, on its first run. */
   head?: boolean;
-  /** True for an earlier segment of a turn whose answer lands later: it must
-   *  not claim the turn returned no answer. */
+  /** True for an earlier segment of a split turn; the answer lands on a later one. */
   continued?: boolean;
   /** False in a pane that copies from its header: refused directives stay
    *  inert, with no control in the row. */
   copy?: boolean;
-  /** A terminal answer exists even when it renders outside this body (a
-   *  declared card or frame), so the turn is not answerless. */
-  answered?: boolean;
 }) {
   const t = useTranslate();
   const actor = useAssistantActor();
@@ -797,12 +876,12 @@ export function ThreadTurn({
     (item) => item.type === "thinking" || item.type === "commentary" || item.type === "tools",
   );
   const answer = items.find((item) => item.type === "answer");
-  const artifacts = items.filter((item) => item.type === "artifact");
+  const artifacts = items.filter(isCardItem);
   // A transcript from before `turn_result` has no answer item: its last
   // worker note IS what the operator read as the reply. Only the LAST
   // non-artifact item can be that note — a note followed by tools is a
   // tool-turn step, not a reply, and must stay in the trace.
-  const lastNote = [...items].reverse().find((item) => item.type !== "artifact");
+  const lastNote = [...items].reverse().find((item) => !isCardItem(item));
   const legacy =
     allowLegacy && !answer && !running && lastNote?.type === "commentary" ? lastNote : null;
   const trace = legacy ? traceItems.filter((item) => item.key !== legacy.key) : traceItems;
@@ -810,9 +889,6 @@ export function ThreadTurn({
   // Streaming is a turn the host says is running AND that has no answer yet:
   // a turn whose answer already landed keeps its finished look.
   const streaming = running && shown === null;
-  const failure = shown ? turnFailure(shown.entry, t) : null;
-  const hasAnswer = answered ?? (shown !== null && (shown.entry.text.trim() !== "" || failure !== null));
-  const noAnswer = !streaming && !hasAnswer && !continued;
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,
@@ -820,10 +896,11 @@ export function ThreadTurn({
   const intro = trace.find((item) => item.type === "thinking") ?? trace[0];
   const introEntry =
     intro === undefined ? undefined : intro.type === "tools" ? intro.entries[0] : intro.entry;
-  const summary =
-    introEntry && !carriesSecret(introEntry.text) ? stepSummary(introEntry.text) : "";
+  const digest = traceDigest(trace);
   const elapsed = streaming ? null : traceElapsed(introEntry?.created, shown?.entry.created);
   const headAt = shown?.entry.created ?? lastCreated(items);
+  const tool = runningTool(trace);
+  const typingLabel = tool !== "" ? `${t("Running")} ${tool.charAt(0).toLowerCase()}${tool.slice(1)}` : t("Thinking…");
   return (
     <div className="turn min-w-0" data-kind="turn" data-turn-state={streaming ? "running" : "complete"} data-turn-continued={continued || undefined}>
       {head && (
@@ -834,35 +911,33 @@ export function ThreadTurn({
           {copy && shown && shown.entry.text.trim() !== "" && <CopyControl text={shown.entry.text} />}
         </div>
       )}
-      {/* The typing bubble is the loading state. It leads, so a running
-          turn is not a full-width "Thinking…" bar with the dots buried
-          under it. The trace stays a quiet disclosure beneath. */}
-      {streaming && <TypingDots />}
       {trace.length > 0 && (
         <TurnTrace
           items={trace}
           steps={steps}
           running={streaming}
-          summary={summary}
+          summary={digest.summary}
+          errors={digest.errors}
           elapsed={elapsed}
+          failed={shown != null && turnFailure(shown.entry, t) !== null}
+          answered={shown != null}
         />
       )}
+      {/* Dots, then the current step. Under the trace once steps exist,
+          so the disclosure names the turn and the bubble names what is
+          running now. */}
+      {streaming && <TypingDots label={typingLabel} />}
       {shown && (
         <div data-item-key={shown.key}>
           <AnswerSurface entry={shown.entry} density={density} onOpenIssue={onOpenIssue} earlier={legacy !== null} />
         </div>
       )}
-      {noAnswer && (
-        <div className="noanswer" data-kind="no-answer">
-          {t("No answer returned")}
-        </div>
-      )}
       {artifacts.length > 0 && (
         <div className="turn-artifacts">
           {artifacts.map((item) =>
-            item.type === "artifact" ? (
-              <div key={item.key} data-item-key={item.key}>
-                <ArtifactCard entry={item.entry} />
+            item.type === "artifact" || item.type === "image" ? (
+              <div key={item.key} data-item-key={item.key} className={item.type === "image" ? "turn-image" : undefined}>
+                {item.type === "image" ? <ImageBlock entry={item.entry} /> : <ArtifactCard entry={item.entry} />}
               </div>
             ) : null,
           )}

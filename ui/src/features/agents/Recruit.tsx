@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
-import type { Agent, AgentRole } from "../../lib/types";
+import type { AgentRole, HiredProfile } from "../../lib/types";
 import { HireGate, GhostCard, RoleCard } from "./RecruitCards";
 import { categoryLabel, matchesRole, onTeamCount, type RolesState } from "./agentRoles";
 
@@ -9,7 +9,7 @@ import { categoryLabel, matchesRole, onTeamCount, type RolesState } from "./agen
  *  Ask Master and Start blank. Hire goes through `onPick` (the sheet). */
 export default function Recruit({
   roles,
-  agents,
+  profiles,
   hireBlock,
   onBack,
   onPick,
@@ -17,7 +17,7 @@ export default function Recruit({
   onBlank,
 }: {
   roles: RolesState;
-  agents: Agent[];
+  profiles: HiredProfile[];
   hireBlock: string | null;
   onBack: () => void;
   onPick: (role: AgentRole) => void;
@@ -104,7 +104,7 @@ export default function Recruit({
                       key={role.id}
                       role={role}
                       payload={payload}
-                      onTeam={onTeamCount(role, agents)}
+                      onTeam={onTeamCount(role, profiles)}
                       onPick={onPick}
                     />
                   ))}

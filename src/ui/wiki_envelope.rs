@@ -123,19 +123,6 @@ fn peek_kid(env: &str) -> Result<String, HttpResp> {
 /// Process-wide JWKS cache (shared shape with `cli_route`).
 static CLI_JWKS: std::sync::Mutex<board_identity::JwksCache> =
     std::sync::Mutex::new(board_identity::JwksCache::new());
-
-/// CAD-1434 / AOS-243 test seam: prime the process-wide JWKS cache through the
-/// SAME `JwksCache::key` that `grant_of` calls, so the production `fetch_keys`
-/// fetch and parser populate it. There is no key setter: the only way a key
-/// enters the cache is the real issuer fetch. The native request thread does
-/// not inherit a thread-local TLS fixture, so the controller primes here on its
-/// own thread before any native call. Test builds only.
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) fn prime_jwks_for_test(issuer: &str, kid: &str, now: i64) -> crate::Result<()> {
-    let mut cache = CLI_JWKS.lock().unwrap_or_else(|e| e.into_inner());
-    cache.key(issuer, kid, now).map(|_| ())
-}
-
 /// `wikienv_` requests on `/api/wiki/<tail>`. Only the translated routes
 /// are served; a verified envelope whose scope or prefix does not cover
 /// the action is refused before the daemon sees it.

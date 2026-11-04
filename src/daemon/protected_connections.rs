@@ -2740,7 +2740,3 @@ fn done_verified() -> ValidatedOutcomeV1 {
 #[cfg(test)]
 #[path = "protected_connections_epoch_acceptance_20261027.rs"]
 mod protected_connections_epoch_acceptance_20261027;
-
-#[cfg(test)]
-#[path = "smtp_verification_result_acceptance.rs"]
-mod smtp_verification_result_acceptance;

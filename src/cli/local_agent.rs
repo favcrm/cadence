@@ -1,4 +1,4 @@
-//! CLI for hosted local-agent coordination (CAD-1460).
+//! Hosted local-assignment verbs behind `agent` (CAD-1460).
 //!
 //! These commands talk to
 //! `/__platform/hosted-cadence/:organizationId/local-assignments`.
@@ -12,9 +12,7 @@ use std::path::{Path, PathBuf};
 
 use cadence_agent::local_assignment::delivery::deliver_kickoff;
 #[cfg(test)]
-use cadence_agent::local_assignment::delivery::{
-    claimant_target, redact_secrets, require_context, write_note,
-};
+use cadence_agent::local_assignment::delivery::{redact_secrets, write_note};
 use cadence_agent::local_assignment::http::BoardHttp;
 use cadence_agent::local_assignment::{Coordinator, Kickoff};
 use cadence_agent::remote_cli::RemoteTarget;
@@ -238,7 +236,18 @@ pub(super) fn run(
             state,
             text,
             head,
-        } => coord.report(assignment, state, text.as_deref(), head.as_deref())?,
+        } => {
+            let value = coord.report(assignment, state, text.as_deref(), head.as_deref())?;
+            if *state == "result" {
+                // The assignment ends here; the ticket does not move on its own.
+                // Say the next step instead of leaving the session to infer it.
+                eprintln!(
+                    "cadence: assignment complete — close the ticket with \
+                     `cadence issue set <ID> status=done` once the work is accepted"
+                );
+            }
+            value
+        }
         LocalAgentAction::Reassign {
             assignment,
             to,
@@ -253,12 +262,14 @@ pub(super) fn dispatch(target: &RemoteTarget, issue: &str, to: &str) -> Result<i
     finish(&coordinator(target)?.dispatch(issue, Some(to))?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn start(
     target: &RemoteTarget,
     id: &str,
     repo: Option<&Path>,
     name: Option<&str>,
     profile: Option<&str>,
+    base: Option<&str>,
     wake_timeout: u64,
     local_state: Option<PathBuf>,
 ) -> Result<i32> {
@@ -271,7 +282,12 @@ pub(super) fn start(
         // CAD-1964: the caller is the actor, so this claims under the
         // profile's session id and opens the lane without a local alias,
         // a daemon handoff or any other waiting assignment.
-        return finish(&coordinator(target)?.start_session(id, repo, name, profile)?);
+        return finish(&coordinator(target)?.start_session(id, repo, name, profile, base)?);
+    }
+    if base.is_some() {
+        return Err(Error::usage(
+            "hosted issue start accepts --base only with --profile; the alias path uses the              project's own base. Nothing was sent",
+        ));
     }
     let mut deliver =
         |kickoff: &Kickoff| deliver_kickoff(target, local_state.clone(), kickoff, wake_timeout);
@@ -351,7 +367,3 @@ mod context_snapshots {
         assert!(!redacted.contains(&credential));
     }
 }
-
-#[cfg(test)]
-#[path = "local_agent_claimant_acceptance.rs"]
-mod claimant_acceptance;

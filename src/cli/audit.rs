@@ -14,15 +14,24 @@ pub(crate) enum AuditAction {
     /// scope at ticket time.
     Approve {
         /// PR number the approval covers.
-        #[arg(long, required_unless_present = "issue", conflicts_with = "issue")]
+        #[arg(long, required_unless_present = "issue")]
         pr: Option<u64>,
         /// Full 40-hex head SHA the approval names — an approval never
         /// carries over to a later head.
         #[arg(long, required_unless_present = "issue")]
         head: Option<String>,
-        /// The ticket whose scope `--action scope` pre-approves.
-        #[arg(long, requires = "action")]
+        /// The ticket this approval is about. With `--action scope` (local,
+        /// operator connection) it is the ticket whose scope is pre-approved.
+        /// With `--pr` it is the issue a hosted merge approval authorizes:
+        /// the project-scoped approval is unique per issue, so an approval
+        /// recorded for another ticket can never answer this one.
+        #[arg(long)]
         issue: Option<String>,
+        /// The issue's project (hosted orgs; required there). The approval is
+        /// that project's and no other's — it is never inferred from the repo
+        /// or the cwd.
+        #[arg(long)]
+        project: Option<String>,
         /// Record a delegated approval: the daemon checks every
         /// safeguard and records it under this pane's own agent.
         #[arg(long, conflicts_with_all = ["issue", "id"])]
@@ -56,6 +65,15 @@ pub(crate) enum AuditAction {
         /// Full 40-hex head SHA — an approval for another head never counts.
         #[arg(long)]
         head: String,
+        /// Tracker issue id the approval authorizes (hosted orgs; required
+        /// there). The issue is part of the approval's identity, so an
+        /// approval recorded for another ticket never answers this read.
+        #[arg(long)]
+        issue: Option<String>,
+        /// The issue's project (hosted orgs; required there). The read is that
+        /// project's and no other's — never inferred from the repo or the cwd.
+        #[arg(long)]
+        project: Option<String>,
         /// `owner/name` (default: the cwd checkout's github.com origin).
         #[arg(long)]
         repo: Option<String>,
@@ -68,11 +86,14 @@ pub(crate) enum AuditAction {
         #[arg(long)]
         issue: String,
     },
-    /// Read-only (CAD-959): the verdict notes of ISSUE that name PR `--pr`
-    /// and the full `--head`, parsed by the audit's own note parser, plus
-    /// a `skipped` list with the reason for every note of the issue that
-    /// does not bind. Reviewer identity is the FIRST whitespace token of
-    /// `From:`, lower-cased (the rest is prose). One JSON document.
+    /// Read-only (CAD-959): the verdicts of ISSUE that name PR `--pr` and the
+    /// full `--head`, plus a `skipped` list with the reason for every note of
+    /// the issue that does not bind. The org this invocation selects decides
+    /// the source, exactly as `--org`/`CADENCE_ORG` route every other verb: a
+    /// local org parses `--notes-dir` with the audit's own note parser, a
+    /// hosted org reads its own record and never this machine's notes.
+    /// Reviewer identity is the FIRST whitespace token of `From:`,
+    /// lower-cased (the rest is prose). One JSON document.
     Verdicts {
         /// Tracker issue id the notes belong to (`Issue:` header).
         #[arg(long)]
@@ -83,9 +104,92 @@ pub(crate) enum AuditAction {
         /// Full 40-hex head SHA the notes must pin.
         #[arg(long)]
         head: String,
-        /// Notes directory (default /var/www/agent-notes).
+        /// Notes directory (local orgs; default /var/www/agent-notes).
         #[arg(long)]
         notes_dir: Option<PathBuf>,
+        /// `owner/name` the hosted read binds and the answer must name
+        /// (default: the cwd checkout's github.com origin). Local notes are
+        /// not repo-scoped, so a local read refuses it.
+        #[arg(long)]
+        repo: Option<String>,
+        /// The issue's project (hosted orgs; required there). This is the
+        /// scope of the read: the org answers that project's evidence only,
+        /// and the project is never inferred from `--repo` or the cwd.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Record one reviewer's verdict for exactly this issue, PR and head
+    /// (hosted orgs). The board takes the reviewer from the authenticated
+    /// caller, never from an argument, and appends a correction rather than
+    /// rewriting an earlier row; a repeat of the same kind, head and body
+    /// returns the latest row with `duplicate: true`.
+    Verdict {
+        /// Tracker issue id the verdict names.
+        #[arg(long)]
+        issue: String,
+        /// PR number the verdict pins.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head SHA the verdict names — a new head voids it.
+        #[arg(long)]
+        head: String,
+        /// `standards`, `spec-security`, `combined` or `browser-qa` — the
+        /// kinds the merge gate counts. `spec` is retired.
+        #[arg(long)]
+        kind: String,
+        /// `pass` or `revise`.
+        #[arg(long)]
+        outcome: String,
+        /// The title's outcome; defaults to `--outcome`.
+        #[arg(long = "title-outcome")]
+        title_outcome: Option<String>,
+        /// The findings section outcome; defaults to `--outcome`.
+        #[arg(long = "section-outcome")]
+        section_outcome: Option<String>,
+        /// The risk line the note states (`auto`, or `human (…)`).
+        #[arg(long, default_value = "auto")]
+        risk: String,
+        /// Findings text; `-` reads stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "text")]
+        file: Option<PathBuf>,
+        /// Findings text inline.
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// `owner/name` the record names (default: the cwd checkout's
+        /// github.com origin). The org refuses a repo the project has not
+        /// declared and a caller it has not attested for that repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// The issue's project (hosted orgs; required). The row is recorded
+        /// in that project's evidence only; the project is never inferred
+        /// from `--repo` or the cwd.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Read-only (AOS-473, CAD-2001): one project's reviewer eligibility map
+    /// joined to the workspace owner's identity attestation — which principal
+    /// may review, and which GitHub login is that principal. The merge gate
+    /// counts hosted verdicts by principal and excludes the author by login,
+    /// so the join is the evidence. `--project` is required: a repo never
+    /// selects a project. A hosted verb: a local org has no attestations and
+    /// refuses rather than answering an empty list.
+    #[command(subcommand_negates_reqs = true)]
+    Reviewers {
+        /// Project key whose eligibility map is read. Required unless a
+        /// subcommand is given: `set` names its own (CAD-2005).
+        #[arg(long, required = true)]
+        project: Option<String>,
+        #[command(subcommand)]
+        action: Option<ReviewersAction>,
+    },
+    /// Read-only (CAD-2001): the workspace owner's principal→GitHub-login
+    /// attestation map. A code verdict needs both a project eligibility and an
+    /// attested login; this is where the login is bound, once for the whole
+    /// workspace. The tenant admits it for the live human owner only, so an
+    /// agent's call is a refusal, never an empty map.
+    Identities {
+        #[command(subcommand)]
+        action: Option<IdentitiesAction>,
     },
     /// Designate an agent to record delegated approvals for a project
     /// (operator only; `--revoke` withdraws the designation).
@@ -121,6 +225,47 @@ pub(crate) enum AuditAction {
     },
 }
 
+/// `cadence audit reviewers set` (AOS-473, CAD-2001): the owner's eligibility
+/// writer. The tenant checks the live owner and the `audit.approve` scope;
+/// this command sends only what it was given and refuses a row it can already
+/// see is unusable.
+#[derive(Subcommand)]
+pub(crate) enum ReviewersAction {
+    /// Replace this project's whole eligibility map with the given
+    /// principals. A reviewer left out of the list stops filing new verdicts
+    /// for this project; rows already filed keep their stored principal and
+    /// login and stay countable, because evidence is never erasable. No
+    /// `--reviewer` clears the map.
+    ///
+    /// Eligibility is a project fact and the GitHub login is a separate
+    /// workspace attestation, so this verb names principals only: bind the
+    /// logins once with `cadence audit identities set`.
+    Set {
+        /// Project key whose map is replaced.
+        #[arg(long)]
+        project: String,
+        /// Workspace principal id (`user_…`), repeatable; the project's whole
+        /// map. Omitted, it clears the map.
+        #[arg(long = "reviewer", value_name = "SUBJECT_ID")]
+        reviewer: Vec<String>,
+    },
+}
+
+/// `cadence audit identities set` (CAD-2001): the owner's workspace identity
+/// attestation. This is an attestation, never a claim of OAuth verification,
+/// and it grants no project eligibility by itself.
+#[derive(Subcommand)]
+pub(crate) enum IdentitiesAction {
+    /// Replace the workspace's whole principal→GitHub-login map. No
+    /// `--identity` clears it.
+    Set {
+        /// `<subject_id>=<github_login>`, repeatable; the workspace's whole
+        /// map.
+        #[arg(long = "identity", value_name = "SUBJECT=LOGIN")]
+        identity: Vec<String>,
+    },
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     state_dir: PathBuf,
@@ -135,18 +280,58 @@ pub(super) fn run(
     merge_report: Option<PathBuf>,
 ) -> Result<i32> {
     match action {
-        Some(AuditAction::Verdicts {
-            issue,
-            pr,
-            head,
-            notes_dir,
-        }) => verdicts(&issue, pr, &head, notes_dir.as_deref()),
+        // A verdict is a hosted record: the board owns the reviewer identity
+        // and the exact-head binding. The native path files note files under
+        // the notes dir instead, which this verb never fabricates.
+        Some(AuditAction::Verdict { .. }) => Err(Error::rejected(
+            "audit verdict records a verdict in the hosted org; select it with `--org <org>`.              Nothing was written",
+        )),
+        // Dispatched before the state dir resolved: `audit verdicts` routes
+        // through the org resolver there (CAD-1981), so a hosted selection
+        // never reaches this local-only reader.
+        Some(AuditAction::Verdicts { .. }) => {
+            unreachable!("audit verdicts is dispatched before state-dir")
+        }
+        // The attestations are the selected hosted workspace owner's record.
+        // A local org has none, and an empty list would read as "no reviewer
+        // is bound" instead of "this org cannot answer".
+        Some(AuditAction::Reviewers { .. }) => Err(Error::rejected(
+            "audit reviewers reads and writes the hosted workspace's reviewer \
+             attestations; select it with `--org <org>`. Nothing was sent",
+        )),
+        // CAD-2001: the workspace identity map is the hosted owner's
+        // attestation, admitted for the live human owner only.
+        Some(AuditAction::Identities { .. }) => Err(Error::rejected(
+            "audit identities reads and writes the hosted workspace's identity \
+             attestations; select it with `--org <org>`. Nothing was sent",
+        )),
         Some(AuditAction::Scope { issue }) => {
             let (v, code) = cadence_agent::audit::scope_check(&state_dir, issue.trim());
             print_json(&v);
             Ok(code)
         }
-        Some(AuditAction::Approval { pr, head, repo }) => {
+        Some(AuditAction::Approval {
+            pr,
+            head,
+            issue,
+            project,
+            repo,
+        }) => {
+            // The local store binds `{repo, pr, head}` and records no project
+            // or issue; accepting either would claim a scope it never checked.
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped read: a local \
+                     approval is repo-scoped, so this read cannot honour it. Nothing was read"
+                )));
+            }
+            if let Some(issue) = issue {
+                return Err(Error::usage(format!(
+                    "--issue {issue} binds the hosted project-scoped read: a local approval \
+                     is repo-scoped and names no ticket, so this read cannot honour it. \
+                     Nothing was read"
+                )));
+            }
             let head = full_head(&head)?;
             let repo = match repo {
                 Some(r) => r,
@@ -161,6 +346,36 @@ pub(super) fn run(
             let (v, code) = cadence_agent::audit::approval_check(&state_dir, &repo, pr, &head);
             print_json(&v);
             Ok(code)
+        }
+        Some(action @ AuditAction::Approve { .. }) => {
+            // CAD-2001: `--project` and `--issue` with `--pr` are the hosted
+            // project-scoped approval. A local approval is repo-scoped and
+            // records neither, so accepting them here would claim a binding
+            // nothing checked — and `--issue` alone is the scope pre-approval.
+            if let AuditAction::Approve {
+                project,
+                issue,
+                pr,
+                ..
+            } = &action
+            {
+                if let Some(project) = project {
+                    return Err(Error::usage(format!(
+                        "--project {project} binds the hosted project-scoped approval: a local \
+                         approval is repo-scoped, so this command cannot honour it. Nothing was \
+                         recorded"
+                    )));
+                }
+                if issue.is_some() && pr.is_some() {
+                    return Err(Error::usage(
+                        "--issue with --pr names the ticket a hosted merge approval authorizes; \
+                         a local approval is repo-scoped. Record a scope pre-approval with \
+                         `--issue <ID> --action scope`, or a merge approval with `--pr` alone. \
+                         Nothing was recorded",
+                    ));
+                }
+            }
+            run_audit_evidence(&state_dir, action)
         }
         Some(action) => run_audit_evidence(&state_dir, action),
         None => cadence_agent::audit::run(&cadence_agent::audit::AuditOptions {
@@ -178,14 +393,40 @@ pub(super) fn run(
     }
 }
 
-/// `cadence audit verdicts`: a pure parse of the notes directory. It
-/// needs no daemon, state dir or org, so every org runs it here (CAD-1946).
+/// `cadence audit verdicts` for a local selection: a pure parse of the
+/// notes directory. It needs no daemon, state dir or `HOME`, and the
+/// dispatcher reaches it before any of those resolve; a hosted selection
+/// never reaches here and answers through the org's own read (CAD-1946,
+/// CAD-1981).
+///
+/// The document carries `origin:"local"` (AOS-473): the merge gate applies
+/// the attested hosted rule only to a document that says it is hosted, so
+/// local notes keep today's counting exactly.
 pub(super) fn verdicts(
     issue: &str,
     pr: u64,
     head: &str,
+    repo: Option<&str>,
+    project: Option<&str>,
     notes_dir: Option<&std::path::Path>,
 ) -> Result<i32> {
+    // A note names no repository, so this read cannot bind one. Answering
+    // as if it had would let a caller believe the rows were repo-scoped.
+    if let Some(repo) = repo {
+        return Err(Error::usage(format!(
+            "--repo {repo} binds the hosted read: local verdict notes are not \
+             repo-scoped, so this read cannot honour it. Nothing was read"
+        )));
+    }
+    // CAD-2001: the same for the project. Local notes are the local org's own
+    // record and carry no project attribution; echoing the caller's project
+    // would claim a scope nothing checked.
+    if let Some(project) = project {
+        return Err(Error::usage(format!(
+            "--project {project} binds the hosted read: local verdict notes are not \
+             project-scoped, so this read cannot honour it. Nothing was read"
+        )));
+    }
     let head = full_head(head)?;
     print_json(&cadence_agent::audit::verdicts_check(
         notes_dir,
@@ -194,6 +435,88 @@ pub(super) fn verdicts(
         &head,
     )?);
     Ok(0)
+}
+
+/// Workspace principals for `audit reviewers set` (CAD-2001). Eligibility is a
+/// project fact, so each row is a bare `subject_id` — the GitHub login is a
+/// separate workspace attestation (`audit identities set`), and a row that
+/// still carries `login=subject` is refused with that two-step remedy rather
+/// than silently split. These checks only stop a call the tenant could never
+/// record from being sent.
+pub(super) fn reviewer_subjects(rows: &[String]) -> Result<Vec<String>> {
+    if rows.len() > 32 {
+        return Err(Error::usage(
+            "audit reviewers set takes at most 32 --reviewer rows; nothing was sent",
+        ));
+    }
+    let mut subjects: Vec<String> = Vec::new();
+    for row in rows {
+        let subject = row.trim();
+        if subject.contains('=') {
+            return Err(Error::usage(format!(
+                "--reviewer {row:?} carries a login: project eligibility names the \
+                 principal only. Bind the login once with `cadence audit identities set \
+                 --identity <subject_id>=<github_login>`, then list the principal here. \
+                 Nothing was sent"
+            )));
+        }
+        if subject.is_empty() || subject.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(Error::usage(format!(
+                "--reviewer {row:?} is not a workspace principal id; nothing was sent"
+            )));
+        }
+        if subjects.iter().any(|s| s == subject) {
+            return Err(Error::usage(format!(
+                "--reviewer names principal {subject} twice; one principal is one \
+                 reviewer. Nothing was sent"
+            )));
+        }
+        subjects.push(subject.to_string());
+    }
+    Ok(subjects)
+}
+
+/// `<subject_id>=<github_login>` rows for `audit identities set` (CAD-2001).
+/// The tenant validates the login grammar and that the principal exists; these
+/// checks only stop a call that could never be recorded from being sent.
+pub(super) fn identity_pairs(rows: &[String]) -> Result<Vec<(String, String)>> {
+    if rows.len() > 32 {
+        return Err(Error::usage(
+            "audit identities set takes at most 32 --identity rows; nothing was sent",
+        ));
+    }
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for row in rows {
+        let (subject, login) = row.split_once('=').ok_or_else(|| {
+            Error::usage(format!(
+                "--identity {row:?} is not <subject_id>=<github_login>; nothing was sent"
+            ))
+        })?;
+        let (subject, login) = (subject.trim(), login.trim());
+        if subject.is_empty()
+            || login.is_empty()
+            || login.contains('=')
+            || subject.chars().any(char::is_control)
+        {
+            return Err(Error::usage(format!(
+                "--identity {row:?} is not <subject_id>=<github_login>; nothing was sent"
+            )));
+        }
+        if pairs.iter().any(|(s, _)| s == subject) {
+            return Err(Error::usage(format!(
+                "--identity names principal {subject} twice; one principal binds one \
+                 login. Nothing was sent"
+            )));
+        }
+        if pairs.iter().any(|(_, l)| l.eq_ignore_ascii_case(login)) {
+            return Err(Error::usage(format!(
+                "--identity names login {login} twice; one login binds one principal. \
+                 Nothing was sent"
+            )));
+        }
+        pairs.push((subject.to_string(), login.to_string()));
+    }
+    Ok(pairs)
 }
 
 /// A pinned head is the full 40-hex SHA, lower-cased; anything shorter

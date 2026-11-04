@@ -5,18 +5,33 @@ use super::*;
 /// Locate an issue folder by id. The id's prefix must match the
 /// project's prefix — ids cannot smuggle across projects. Symlinks are
 /// never followed: a linked folder or issue.md does not exist as far
-/// as the writer is concerned.
+/// as the writer is concerned. An id found under two projects names no
+/// single project, so it is refused rather than taken from the first.
 pub(crate) fn issue_dir(pm: &Pm, id: &str) -> Result<(project::Project, PathBuf)> {
     model::check_id(id)?;
+    let mut found: Vec<(project::Project, PathBuf)> = Vec::new();
     for project in project::list(&pm.dir)? {
         let dir = pm.dir.join(&project.key).join(id);
         if board::is_real_dir(&dir) && board::is_real_file(&dir.join("issue.md")) {
-            return Ok((project, dir));
+            found.push((project, dir));
         }
     }
-    Err(Error::rejected(format!(
-        "Unknown issue '{id}' — `cadence issue ls` lists what exists"
-    )))
+    match found.len() {
+        0 => Err(Error::rejected(format!(
+            "Unknown issue '{id}' — `cadence issue ls` lists what exists"
+        ))),
+        1 => Ok(found.remove(0)),
+        _ => Err(Error::rejected(format!(
+            "Issue '{id}' exists in {} projects ({}) — refusing to pick one; \
+             remove the duplicate folder",
+            found.len(),
+            found
+                .iter()
+                .map(|(project, _)| project.key.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
 }
 
 pub(crate) fn load_front(dir: &Path) -> Result<(Front, String)> {
@@ -170,10 +185,23 @@ pub fn project_add(
             other.key
         )));
     }
-    let mut repo_entries = Vec::new();
+    let mut repo_entries: Vec<project::Repo> = Vec::new();
     for repo in repos {
         let path = project::expand_home(repo);
         let canonical = path.canonicalize().unwrap_or(path.clone());
+        // One row per repo: a second `--repo` naming the same checkout
+        // would make `repos[].base` and the cwd match ambiguous inside
+        // this project (CAD-2001). Another *project* registering it is
+        // fine — a repo may be shared.
+        if let Some(prior) = repo_entries.iter().find(|entry| {
+            let prior = project::expand_home(entry.path.as_deref().unwrap_or_default());
+            prior.canonicalize().unwrap_or(prior) == canonical
+        }) {
+            return Err(Error::rejected(format!(
+                "Repo {repo} is listed twice (also as {}) — one repos[] row per repo",
+                prior.path.as_deref().unwrap_or_default()
+            )));
+        }
         // Store the path as given (~/ keeps it portable); remote is
         // discovered from the repo's own config.
         let remote = crate::reaper::output(
@@ -234,11 +262,34 @@ pub fn project_add(
     Ok(out)
 }
 
+/// The one refusal sentence for private, shared by every writer so the CLI,
+/// the daemon and the board cannot describe the gate differently.
+pub const PRIVATE_UNAVAILABLE: &str =
+    "private projects are not available yet — the isolation gate \
+     has not passed; only workspace-visible can be recorded";
+
+/// May this build record `private` (CAD-1950, AOS-274 / SEC-006)?
+///
+/// The isolation gate stays closed until CAD-1950 records, per enforcement
+/// path, a test proving a non-granted caller is served nothing:
+/// `project_policy::readable` and `refused` for listings and single rows,
+/// `retain_overview` for the overview payload, and `reads_every_project`
+/// for the shared live stream (which is one un-filterable model, so a
+/// caller who cannot read every project is refused live updates rather
+/// than served filtered frames).
+///
+/// It is one function on purpose: `set_project_policy`, `project new` and
+/// the board's Settings page read the same answer, so flipping it is one
+/// place and the UI cannot offer a write the tracker will refuse.
+pub fn private_available() -> bool {
+    false
+}
+
 /// Replace a project's recorded access policy (AOS-274).
 ///
 /// Takes the tracker lock, re-reads the project, keeps its identity, bumps
 /// the policy version and commits `project.yaml` only. `Private` is refused
-/// until the isolation gate passes — `workspace-visible` is the only
+/// until [`private_available`] answers yes — `workspace-visible` is the only
 /// visibility this build may record.
 pub fn set_project_policy(
     pm: &Pm,
@@ -250,11 +301,8 @@ pub fn set_project_policy(
     // Validate before any join. A remote key is caller input; `../…` or a
     // slash must never become a path outside the tracker.
     let key = crate::issue::model::check_key(key)?;
-    if visibility == project::Visibility::Private {
-        return Err(Error::rejected(
-            "private projects are not available yet — the isolation gate has not passed; \
-             only workspace-visible can be recorded",
-        ));
+    if visibility == project::Visibility::Private && !private_available() {
+        return Err(Error::rejected(PRIVATE_UNAVAILABLE));
     }
     let dir = project_dir(pm, &key)?;
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
@@ -329,8 +377,9 @@ fn remotes_equal(a: &str, b: &str) -> bool {
 
 /// CAD-1870: update one registered `repos[].remote` after a transfer or
 /// rename. `--from` must uniquely match the current recorded remote;
-/// `--to` must not already belong to another project (or another row).
-/// A no-op (`--from` equals `--to` equals the record) writes nothing.
+/// `--to` must not already be on another row of *this* project (another
+/// project recording the same repo is a shared repo, CAD-2001). A no-op
+/// (`--from` equals `--to` equals the record) writes nothing.
 pub fn set_project_remote(pm: &Pm, key: &str, from: &str, to: &str, actor: &str) -> Result<Value> {
     let key = crate::issue::model::check_key(key)?;
     let from_norm = parse_remote(from)?;
@@ -377,21 +426,20 @@ pub fn set_project_remote(pm: &Pm, key: &str, from: &str, to: &str, actor: &str)
             "committed": false,
         }));
     }
-    let projects = project::list(&pm.dir)?;
-    if let Some(other) = projects.iter().find(|p| {
-        p.repos.iter().enumerate().any(|(i, r)| {
-            let Some(remote) = r.remote.as_deref() else {
-                return false;
-            };
-            if !remotes_equal(&project::normalize_remote(remote), &to_norm) {
-                return false;
-            }
-            !(p.key == key && i == idx)
-        })
+    // CAD-2001: several projects may register the same repo, so another
+    // project recording `to` is not a conflict — a shared repo must be
+    // able to follow a transfer. What still refuses is *this* project
+    // recording it twice: two rows for one repo make `repos[].base` and
+    // the cwd match ambiguous inside the project.
+    if project.repos.iter().enumerate().any(|(i, r)| {
+        i != idx
+            && r.remote
+                .as_deref()
+                .is_some_and(|remote| remotes_equal(&project::normalize_remote(remote), &to_norm))
     }) {
         return Err(Error::rejected(format!(
-            "{to_norm} is already project '{}' — one repo, one project",
-            other.key
+            "project '{key}' already records {to_norm} on another repos[] row — \
+             one row per repo per project"
         )));
     }
     project.repos[idx].remote = Some(to_norm.clone());

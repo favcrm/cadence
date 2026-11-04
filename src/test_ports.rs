@@ -1,10 +1,17 @@
 //! Test-only board ports (CAD-1712).
 //!
 //! Board fixtures used to pick a port by binding it, keep the listener as a
-//! reservation, then drop it so the real board could bind. Two tests in one
-//! process could pick the same port in that window and the second board would
-//! fail with `fixture BLOCKED: board could not bind` — which ejects PRs from the
-//! merge queue. One cursor per process removes the collision; the bind in
+//! reservation, then drop it so the real board could bind. Two tests could pick
+//! the same port in that window and the second board would fail with
+//! `fixture BLOCKED: board could not bind` — which ejects PRs from the merge
+//! queue.
+//!
+//! CAD-1970: a cursor that started at the bottom of the range for every process
+//! did not remove that collision, because nextest runs each test as its own
+//! process — so every test began at the first port and they raced each other in
+//! the drop→bind window regardless. The cursor now starts at a per-process
+//! offset derived from the process id and wraps within the range, so two tests
+//! running at once start in different places. The bind in
 //! [`reserve_board_port`] still proves the port is free of outside holders.
 
 use std::net::TcpListener;
@@ -17,17 +24,22 @@ const LAST: u16 = 3199;
 /// Ports another fixture reserves for its own purpose.
 const RESERVED: [u16; 2] = [3139, 3140];
 
-/// Saturating: once the range is spent the cursor stays spent, so even a
-/// caught panic can never wrap it back to a port that was already issued.
+/// Steps taken from this process's starting offset. Saturating: once the range
+/// is spent the cursor stays spent, so even a caught panic can never wrap it
+/// back to a port that was already issued.
 static CURSOR: AtomicU32 = AtomicU32::new(0);
+
+/// The last offset this cursor may reach. `RANGE` consecutive candidates cover
+/// every port exactly once, so a process never reissues one.
+const RANGE: u32 = (LAST - FIRST) as u32 + 1;
 
 /// The next board port this process has not handed out, bound as the caller's
 /// reservation. The caller drops the listener immediately before starting the
 /// board, exactly as the inline scan did.
 pub(crate) fn reserve_board_port() -> (u16, TcpListener) {
     loop {
-        // No wrap: a port this process has handed out is never offered again,
-        // even after its reservation is dropped. Exhaustion fails closed.
+        // RANGE steps cover every port once, so a port this process has
+        // handed out is not offered again before exhaustion fails closed.
         let offset = loop {
             let value = CURSOR.load(Ordering::Relaxed);
             if CURSOR
@@ -42,7 +54,11 @@ pub(crate) fn reserve_board_port() -> (u16, TcpListener) {
                 break value;
             }
         };
-        let port = match candidate(offset) {
+        // CAD-1970: nextest runs each test as its own process, so a cursor
+        // that always began at FIRST put every test on the same port. Each
+        // process now starts at its own offset and scans from there, wrapping
+        // inside the range; exhaustion still fails closed after RANGE steps.
+        let port = match candidate((start() + offset) % RANGE) {
             Candidate::Port(port) => port,
             // A reserved slot costs a cursor step, not the rest of the range.
             Candidate::Reserved => continue,
@@ -66,8 +82,14 @@ enum Candidate {
     Spent,
 }
 
+/// Where this process starts scanning: a stable per-process offset so tests in
+/// different processes rarely begin on the same port.
+fn start() -> u32 {
+    std::process::id().wrapping_mul(2_654_435_761) % RANGE
+}
+
 fn candidate(offset: u32) -> Candidate {
-    if offset > u32::from(LAST - FIRST) {
+    if offset >= RANGE {
         return Candidate::Spent;
     }
     let port = FIRST + offset as u16;

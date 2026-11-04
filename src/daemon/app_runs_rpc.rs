@@ -2104,18 +2104,7 @@ mod cad1156_tests;
 #[cfg(test)]
 mod cad1120_tests;
 #[cfg(test)]
-mod cad1123_acceptance;
-#[cfg(test)]
 mod cad1123_tests;
-#[cfg(test)]
-mod cad1230_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1887_bind_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1887_caller_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad792_acceptance;
-
 #[cfg(test)]
 mod cad742_tests {
     use super::*;

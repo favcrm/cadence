@@ -13,9 +13,6 @@ use crate::error::{Error, Result};
 
 pub(in crate::issue) struct Root(File);
 
-#[cfg(test)]
-mod cad1385_acceptance;
-
 fn name(bytes: &[u8]) -> std::io::Result<CString> {
     CString::new(bytes).map_err(|_| {
         std::io::Error::new(
@@ -125,13 +122,16 @@ impl Root {
             return Err(error.into());
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        #[cfg(test)]
-        cad1385_acceptance::after_open(path, &file);
         let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.nlink() > 1 || metadata.len() > cap {
+        if !metadata.is_file() || metadata.nlink() > 1 {
             return Err(Error::rejected(
                 "catalog requires a bounded regular file without hard links",
             ));
+        }
+        if metadata.len() > cap {
+            return Err(Error::rejected(format!(
+                "catalog file {path:?} exceeds its {cap}-byte limit"
+            )));
         }
         if metadata.nlink() == 0 {
             return Err(Error::invalid(
@@ -142,7 +142,9 @@ impl Root {
         let mut bytes = Vec::new();
         file.take(cap + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > cap {
-            return Err(Error::rejected("catalog file exceeds its limit"));
+            return Err(Error::rejected(format!(
+                "catalog file {path:?} exceeds its {cap}-byte limit"
+            )));
         }
         String::from_utf8(bytes)
             .map(Some)

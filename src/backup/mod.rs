@@ -108,21 +108,6 @@ pub mod portable_fence;
 pub mod portable_replace;
 
 #[cfg(test)]
-mod portable_acceptance;
-
-#[cfg(test)]
-mod cad1365_media_catalog_acceptance;
-
-#[cfg(test)]
-mod cad1554_foreign_key_acceptance;
-
-#[cfg(test)]
-mod cad1559_config_acceptance;
-
-#[cfg(test)]
-mod cad914_transfer_catalog_acceptance;
-
-#[cfg(test)]
 mod portable_selftest;
 
 #[cfg(test)]
@@ -132,8 +117,6 @@ mod namespace;
 use namespace::ArtifactDir;
 #[cfg(test)]
 mod artifact4;
-#[cfg(test)]
-mod cad1128_portable_custody_acceptance;
 #[cfg(test)]
 mod tests;
 

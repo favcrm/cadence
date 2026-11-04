@@ -8,8 +8,8 @@ use std::io::Read;
 use std::path::Path;
 
 use cadence_core::board_api::{
-    AgentRegisterReq, CardAgent, CommentReq, IssueDetail, LinkReq, NewIssueReq, PatchReq, RefReq,
-    ReportReq,
+    AgentProfileReq, AgentRegisterReq, CardAgent, CommentReq, IssueDetail, LinkReq, NewIssueReq,
+    PatchReq, RefReq, ReportReq,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -339,6 +339,34 @@ fn resolve_location(req: &AgentRegisterReq) -> std::result::Result<(String, Stri
     }
 }
 
+/// `POST /api/agent-profiles` (CAD-1989): a hire saves a profile and launches
+/// nothing. The operator gate ran in `admit`; the daemon proves it again.
+pub(crate) fn post_agent_profile(request: &mut Request, state_dir: &Path) -> HttpResp {
+    let bytes = match read_body(request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: AgentProfileReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let params = json!({
+        "alias": req.alias.trim(),
+        "catalogue": req.catalogue,
+        "job": req.job,
+        "model": req.model,
+    });
+    match client::rpc(state_dir, "agent_profile_create", params) {
+        Ok(profile) => {
+            let bytes = serde_json::to_vec_pretty(&json!({"profile": profile})).unwrap_or_default();
+            let mut resp = Response::from_data(bytes).with_status_code(StatusCode(201));
+            resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            resp
+        }
+        Err(err) => super::home::rpc_err(&err, "agent_profile_create"),
+    }
+}
+
 /// `POST /api/agents`: register one agent through the daemon's
 /// `agent_register` (`rpc_register`). The operator gate ran in `admit`;
 /// the daemon applies the same validation a CLI registration does.
@@ -351,49 +379,6 @@ pub(crate) fn post_agent(request: &mut Request, state_dir: &Path) -> HttpResp {
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    // CAD-1752: a catalogue hire is relayed without a runtime — the daemon
-    // takes provider and endpoint kind from the install and refuses a
-    // caller that names them; here the board refuses `location` as well.
-    if req.catalogue.is_some() {
-        if req.location.is_some() || req.provider.is_some() || req.endpoint_kind.is_some() {
-            return err_response(
-                400,
-                "a catalogue hire takes its runtime from the install - send no location, provider or endpoint kind",
-            );
-        }
-        let params = json!({
-            "alias": req.alias.trim(),
-            "catalogue": req.catalogue,
-            "look": req.look,
-            "role": req.role,
-            "team_role": req.team_role,
-            "model_policy": req.model_policy,
-            "cwd": req.cwd,
-            "sandbox": req.sandbox,
-            "instructions": req.instructions,
-            "params": req.params,
-        });
-        let instructions = match (&req.instructions, req.catalogue.as_deref()) {
-            (Some(text), _) => Some(text.clone()),
-            (None, Some(id)) => crate::agent_roles::find(id).map(|role| role.instructions()),
-            (None, None) => None,
-        };
-        return match client::rpc(state_dir, "agent_register", params) {
-            Ok(mut out) => {
-                crate::briefing::brief_registered(
-                    state_dir,
-                    req.alias.trim(),
-                    instructions.as_deref(),
-                    &mut out,
-                );
-                json_response(out)
-            }
-            Err(err) => super::home::rpc_err(&err, "agent_register"),
-        };
-    }
-    if req.look.is_some() {
-        return err_response(400, "look only applies to a catalogue hire");
-    }
     let (provider, endpoint_kind) = match resolve_location(&req) {
         Ok(pair) => pair,
         Err(message) => return err_response(400, &message),
@@ -445,6 +430,52 @@ pub(crate) fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Val
             id,
         ),
     ))
+}
+
+/// `POST /api/projects/<key>/policy` (CAD-1950): replace a project's
+/// recorded access policy.
+///
+/// The board is a second entry point, not a second writer: this calls the
+/// same [`issue_write::set_project_policy`] the CLI does, so the version
+/// bump, grant validation, the gate refusal and the tracker commit cannot
+/// diverge. The body is `{visibility, members}` in the recorded spelling;
+/// `members` is the full grant list and replaces what was there, exactly
+/// like `issue project policy --grant`.
+///
+/// `actor` is the admitted caller's own spelling: the tracker trailer names
+/// whoever pressed Save, and a named owner's write must not be attributed to
+/// the shared `operator` identity.
+fn project_policy_write(request: &mut Request, pm_dir: &Path, key: &str, actor: &str) -> HttpResp {
+    #[derive(Deserialize)]
+    struct PolicyReq {
+        visibility: String,
+        #[serde(default)]
+        members: Vec<String>,
+    }
+    let bytes = match read_body(request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: PolicyReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // An unknown spelling is a refusal, never the default visibility.
+    let visibility = match crate::issue::cli::PolicyVisibility::from_wire(&req.visibility) {
+        Some(v) => v.recorded(),
+        None => return err_response(400, "'visibility' must be workspace-visible or private"),
+    };
+    let pm = match Pm::at(pm_dir) {
+        Ok(pm) => pm,
+        Err(e) => return err_response(503, &e.to_string()),
+    };
+    match issue_write::set_project_policy(&pm, key, visibility, &req.members, actor) {
+        Ok(out) => json_response(out),
+        // A key with no project answers like an absent one, the same way the
+        // read arms do.
+        Err(Error::Rejected(m)) if m.starts_with("no project ") => err_response(404, &m),
+        Err(e) => write_err(&e),
+    }
 }
 
 /// Map a writer error to an HTTP status: unknown ids are 404, rejections
@@ -1236,6 +1267,19 @@ pub(crate) fn write_route(
                 None => err_response(500, "unadmitted write"),
             },
             RouteId::AgentRegister => post_agent(&mut request, state_dir),
+            RouteId::AgentProfileCreate => post_agent_profile(&mut request, state_dir),
+            // CAD-1950: the one writer for a project's access policy — the
+            // same `set_project_policy` the CLI calls, so version bumping,
+            // grant validation and the commit cannot diverge.
+            RouteId::ProjectPolicy => match caller.as_ref() {
+                Some(caller) => project_policy_write(
+                    &mut request,
+                    pm_dir,
+                    bound.get("key").unwrap_or_default(),
+                    caller.actor(),
+                ),
+                None => err_response(500, "unadmitted write"),
+            },
             RouteId::CatalogInstall => explorer_write(
                 &mut request,
                 state_dir,
@@ -1725,6 +1769,18 @@ pub(crate) fn write_route(
     // action token to `app_media_original` and streams the verified
     // bytes back. Closed body `{action_token, asset_id}`; a body
     // credential/ref/scope field is 400 before dispatch.
+    // CAD-1962: copy one retained image into the shared workspace
+    // library. Closed body `{action_token, receipt_id, request_id}`; a
+    // body credential/scope field is 400 before dispatch.
+    if app_media::import_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_media::media_import(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
     if app_media::original_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -2487,8 +2543,6 @@ mod agent_setup_tests {
             sandbox: None,
             instructions: None,
             params: None,
-            catalogue: None,
-            look: None,
         }
     }
 

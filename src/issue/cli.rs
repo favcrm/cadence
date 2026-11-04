@@ -15,7 +15,7 @@ use crate::issue::{
 
 mod epic;
 mod milestone;
-pub use epic::{run_epic, EpicAction};
+pub use epic::{decide_plan, propose_plan, run_epic, EpicAction};
 pub use milestone::{run_milestone, MilestoneAction};
 mod board_actions;
 mod checkout;
@@ -303,7 +303,8 @@ pub enum IssueAction {
         /// configured `base`, else the remote HEAD (`origin/HEAD`, else
         /// the remote's symbolic HEAD). A checkout with no `origin`
         /// uses its current branch. A resolved remote ref is never
-        /// replaced by the main checkout's current branch.
+        /// replaced by the main checkout's current branch. A branch
+        /// base that `origin` carries resolves to origin's current tip.
         #[arg(long)]
         base: Option<String>,
         /// Owner to record when the issue has none — default: the
@@ -586,6 +587,51 @@ pub enum IssueAction {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Leave a message for a role on a ticket (hosted orgs). It is stored for
+    /// whoever holds that role to read: nothing wakes a session or proves a read.
+    Say {
+        id: String,
+        /// The role it is for, such as `developer`.
+        #[arg(long)]
+        to: String,
+        /// The role you are writing as. A label only: the verified sender is
+        /// your login.
+        #[arg(long)]
+        from: Option<String>,
+        /// A stable id you choose: 1-64 lowercase letters, digits or hyphens,
+        /// never `sys-*`. Reuse it to retry this exact message.
+        #[arg(long)]
+        message: String,
+        /// The message.
+        #[arg(short = 'm', long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the message from a file (`-` is stdin).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Read a ticket's messages, one page at a time (hosted orgs).
+    Messages {
+        id: String,
+        /// Only this role's messages and unread count. Use it for your own
+        /// role: without it the unread map stops at 100 roles.
+        #[arg(long)]
+        to: Option<String>,
+        /// Start after this `seq`. Repeat with the last `seq` while `more` is true.
+        #[arg(long)]
+        after: Option<u64>,
+    },
+    /// Move a role's read point forward (hosted orgs). It never moves back, and
+    /// stops at the role's last message.
+    MessagesRead {
+        id: String,
+        /// The role whose read point moves. It is shared by everyone in that role.
+        #[arg(long)]
+        role: String,
+        /// The last `seq` you actually received: a larger value marks messages
+        /// you have not seen.
+        #[arg(long)]
+        through: u64,
+    },
     /// Several updates to one issue as ONE tracker commit: set, tag,
     /// link, ref, attach, acceptance and a comment. Every part is
     /// validated first — one bad part refuses the whole edit and writes
@@ -813,7 +859,9 @@ pub enum ProjectAction {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// List registered projects.
+    /// List registered projects. On a selected hosted org this reads the
+    /// org's own registry, including projects that exist only as their
+    /// tickets' key; `--sort`, `--limit` and `--fields` refuse there.
     #[command(after_long_help = crate::filter::GRAMMAR)]
     #[command(visible_alias = "list")]
     Ls {
@@ -893,17 +941,37 @@ pub enum ProjectAction {
 
 /// `--visibility` for `project policy`: the recorded vocabulary, before it
 /// is mapped to the project policy type.
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum PolicyVisibility {
     WorkspaceVisible,
     Private,
 }
 
 impl PolicyVisibility {
-    fn recorded(self) -> crate::issue::project::Visibility {
+    pub(crate) fn recorded(self) -> crate::issue::project::Visibility {
         match self {
             Self::WorkspaceVisible => crate::issue::project::Visibility::WorkspaceVisible,
             Self::Private => crate::issue::project::Visibility::Private,
+        }
+    }
+
+    /// The spelling on the wire and in `project.yaml`, so the CLI flag, the
+    /// daemon payload and the recorded enum cannot drift apart. `pub` because
+    /// the `cadence` binary builds the `project new` payload from it.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::WorkspaceVisible => "workspace-visible",
+            Self::Private => "private",
+        }
+    }
+
+    /// Parse the wire spelling. `None` for anything else — the daemon then
+    /// refuses rather than guessing a visibility.
+    pub(crate) fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "workspace-visible" => Some(Self::WorkspaceVisible),
+            "private" => Some(Self::Private),
+            _ => None,
         }
     }
 }
@@ -947,7 +1015,10 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         | IssueAction::Edit { .. }
         | IssueAction::Attach { .. }
         | IssueAction::Artifact { .. }
-        | IssueAction::Review { .. } => links::run(action, state_dir),
+        | IssueAction::Review { .. }
+        | IssueAction::Say { .. }
+        | IssueAction::Messages { .. }
+        | IssueAction::MessagesRead { .. } => links::run(action, state_dir),
         IssueAction::Lint { .. }
         | IssueAction::Reconcile { .. }
         | IssueAction::Sync { .. }
@@ -956,5 +1027,37 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         | IssueAction::Sprint { .. } => maintenance::run(action, state_dir),
         IssueAction::Epic { action } => run_epic(action, state_dir),
         IssueAction::Recover { action } => run_recover(action, state_dir),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CAD-1950: one spelling crosses the CLI/daemon boundary. The flag's
+    /// wire form and the daemon's parser are the same pair, so a change to
+    /// either that the other does not learn is a test failure, not a private
+    /// project silently created workspace-visible.
+    #[test]
+    fn the_visibility_wire_spelling_round_trips() {
+        for option in [
+            PolicyVisibility::WorkspaceVisible,
+            PolicyVisibility::Private,
+        ] {
+            assert_eq!(
+                PolicyVisibility::from_wire(option.wire()),
+                Some(option),
+                "{}",
+                option.wire()
+            );
+        }
+        assert_eq!(
+            PolicyVisibility::WorkspaceVisible.wire(),
+            "workspace-visible"
+        );
+        // Anything else is unknown, never a default.
+        for raw in ["", "workspace_visible", "Private", "public", "secret"] {
+            assert_eq!(PolicyVisibility::from_wire(raw), None, "{raw:?}");
+        }
     }
 }

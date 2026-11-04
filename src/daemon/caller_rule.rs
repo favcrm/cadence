@@ -107,9 +107,17 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
             "authorize_register: agent callers by CAD-149; an unattributed caller needs proven_operator (CAD-431)",
         ),
     ),
-    // CAD-1752: the static role catalogue plus the settings-derived model
-    // per role — a read, like `model_defaults_get`.
+    // CAD-1752: the static role catalogue - a read.
     ("agent_roles", Rule::Read),
+    // CAD-1989: a hire saves a profile; the operator only.
+    (
+        "agent_profile_create",
+        Rule::Handler("operator_connection_on_agent: the operator only; no agent (CAD-1989)"),
+    ),
+    (
+        "agent_profile_context",
+        Rule::Handler("operator, or the agent whose own runtime row is registered against that profile (CAD-1989)"),
+    ),
     (
         "agent_instructions_set",
         Rule::Handler("operator_connection_on_agent: the operator only; no agent, not even the target or its PM (CAD-1752)"),
@@ -705,6 +713,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_media_read", Rule::Handler("operator_connection + consumed live mount + declared media.read (CAD-1365)")),
     ("app_media_chat_attach", Rule::Handler("operator_connection + consumed live mount + declared media.chat.attach (CAD-1482)")),
     ("app_media_publish", Rule::Handler("operator_connection + consumed live mount + declared media.publish (CAD-1365)")),
+    ("app_media_import", Rule::Handler("operator_connection + consumed live mount + declared media.import (CAD-1962)")),
     // The frame-GET peer: authority is the burned one-use nonce, not a
     // connection class — the handler binds it to the consuming session.
     ("app_screen_consume", Rule::Handler("operator_connection + burned one-use frame capability + stored-session liveness (CAD-1006)")),
@@ -751,6 +760,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_social_draft_discard", Rule::Handler("operator_connection + live mount + context + draft slot (CAD-1303)")),
     ("app_social_draft_asset", Rule::Handler("operator_connection + live mount + context + attached draft asset (CAD-1177)")),
     ("app_social_sources_show", Rule::Handler("operator_connection + live mount + context + declared slot (CAD-1177)")),
+    ("app_social_sources_page", Rule::Handler("operator_connection + live mount + context + declared slot, bounded scoped page (SOC-55)")),
+    ("app_social_sources_get", Rule::Handler("operator_connection + live mount + context + declared slot, exact retained receipt (SOC-55)")),
     ("app_social_sources_save", Rule::Handler("operator_connection + live mount + context + draft slot (CAD-1177)")),
     ("app_tool_result", Rule::Handler("operator_connection (CAD-1177)")),
     ("app_tool_results", Rule::Handler("operator_connection (CAD-1177)")),
@@ -1577,6 +1588,17 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "wiki_index_refresh",
         Rule::Handler("operator_connection (CAD-719)"),
+    ),
+    // CAD-2018: the native trash browser. Operator-only and
+    // connection-bound like the index reads; no `wiki_as` and no
+    // identity field is accepted, so a relayed claim cannot enter.
+    (
+        "wiki_trash_list",
+        Rule::Handler("operator_connection; no wiki_as/identity field (CAD-2018)"),
+    ),
+    (
+        "wiki_trash_items",
+        Rule::Handler("operator_connection; no wiki_as/identity field (CAD-2018)"),
     ),
     // CAD-129: submitting a test run is a mutation attributed to the
     // caller. Reading a job, its log, or the queue is not.

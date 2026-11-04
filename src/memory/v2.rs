@@ -541,18 +541,6 @@ thread_local! {
     static FEEDBACK_AFTER_SAVE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
-
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) fn set_feedback_after_save_hook_for_test(hook: Option<Box<dyn FnOnce()>>) {
-    FEEDBACK_AFTER_SAVE_HOOK.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if hook.is_some() {
-            assert!(slot.is_none(), "feedback save hook is already installed");
-        }
-        *slot = hook;
-    });
-}
-
 #[cfg(all(test, feature = "test-seam"))]
 fn feedback_after_save_for_test() {
     let hook = FEEDBACK_AFTER_SAVE_HOOK.with(|slot| slot.borrow_mut().take());

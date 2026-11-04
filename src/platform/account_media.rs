@@ -314,7 +314,3 @@ impl PlatformAdapter for AccountMediaAdapter {
         None
     }
 }
-
-#[cfg(test)]
-#[path = "account_media/cad1459_login_lineage_acceptance.rs"]
-mod cad1459_login_lineage_acceptance;

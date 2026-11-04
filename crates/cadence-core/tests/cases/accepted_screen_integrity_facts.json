@@ -1,0 +1,23 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.screen.integrity",
+    "input": {
+      "manifest": "{\"contract\":\"app-screens/v1\",\"app\":\"demo\",\"entry\":\"client.js\",\"assets\":[{\"name\":\"client.js\",\"media_type\":\"text/javascript\",\"sha256\":\"sha256:b603d946eb2b396ca4ecf65c223daff659dbe6f1cfeac235b7c61d3ba6964cae\",\"size\":16}],\"provenance\":{\"source_digest\":\"sha256:b603d946eb2b396ca4ecf65c223daff659dbe6f1cfeac235b7c61d3ba6964cae\",\"sdk_digest\":\"sha256:b603d946eb2b396ca4ecf65c223daff659dbe6f1cfeac235b7c61d3ba6964cae\",\"toolchain_digest\":\"sha256:b603d946eb2b396ca4ecf65c223daff659dbe6f1cfeac235b7c61d3ba6964cae\"}}",
+      "assets": {
+        "client.js": {
+          "size": 16,
+          "sha256": "sha256:b603d946eb2b396ca4ecf65c223daff659dbe6f1cfeac235b7c61d3ba6964cae"
+        }
+      },
+      "screen_count": 1
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "app.screen.integrity",
+    "value": {
+      "app": "demo"
+    }
+  }
+}

@@ -424,38 +424,6 @@ pub(crate) mod test_fixture {
     /// is resolving. Other hosts stay on that fixture's TLS loopback. Drop
     /// removes the route. Existing fixtures that never call this are unchanged.
     /// The only caller is the test-seam membership acceptance.
-    #[cfg(feature = "test-seam")]
-    pub(crate) fn route_plain_http(
-        tls_loopback: SocketAddr,
-        host: &str,
-        plain: SocketAddr,
-    ) -> PlainRoute {
-        PLAIN_HTTP
-            .lock()
-            .unwrap()
-            .push((tls_loopback, host.to_string(), plain));
-        PlainRoute {
-            tls_loopback,
-            host: host.to_string(),
-        }
-    }
-
-    #[cfg(feature = "test-seam")]
-    pub(crate) struct PlainRoute {
-        tls_loopback: SocketAddr,
-        host: String,
-    }
-
-    #[cfg(feature = "test-seam")]
-    impl Drop for PlainRoute {
-        fn drop(&mut self) {
-            PLAIN_HTTP
-                .lock()
-                .unwrap()
-                .retain(|(tls, host, _)| !(*tls == self.tls_loopback && host == &self.host));
-        }
-    }
-
     fn plain_target(tls_loopback: SocketAddr, host: &str) -> Option<SocketAddr> {
         PLAIN_HTTP
             .lock()
@@ -479,20 +447,6 @@ pub(crate) mod test_fixture {
 
     fn plain_routes_present() -> bool {
         !PLAIN_HTTP.lock().unwrap().is_empty()
-    }
-
-    /// Install `fixture` on this thread until the guard drops.
-    pub(crate) fn install(fixture: Fixture) -> Guard {
-        FIXTURE.with(|slot| *slot.borrow_mut() = Some(fixture));
-        Guard
-    }
-
-    pub(crate) struct Guard;
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            FIXTURE.with(|slot| *slot.borrow_mut() = None);
-        }
     }
 
     /// A logical host the fixture resolves to loopback: the canonical board

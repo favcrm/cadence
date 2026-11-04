@@ -115,10 +115,20 @@ fn tools(platform_tools: &[PlatformTool]) -> Value {
         for tool in platform_tools {
             array.push(json!({
                 "name": tool.name,
-                "description": format!(
-                    "{} (platform {}, effect {}). Runs through the Cadence platform gate; the caller is this connection.",
-                    tool.description, tool.platform, tool.effect
-                ),
+                "description": if tool.connected_read {
+                    format!(
+                        "{} (platform {}, effect {}). Runs through the Cadence platform gate; \
+                         the caller is this connection. Requires `connection` (the provider's \
+                         connection id) and `max_charge` (USD micro-units you accept for this \
+                         read); every other property is the provider's own input.",
+                        tool.description, tool.platform, tool.effect
+                    )
+                } else {
+                    format!(
+                        "{} (platform {}, effect {}). Runs through the Cadence platform gate; the caller is this connection.",
+                        tool.description, tool.platform, tool.effect
+                    )
+                },
                 "inputSchema": {"type":"object","properties":{},"additionalProperties":true}
             }));
         }
@@ -135,6 +145,10 @@ struct PlatformTool {
     tool: String,
     description: String,
     effect: String,
+    /// CAD-1974: the call must state the connection it reads and the ceiling
+    /// it accepts. They travel as control arguments, never inside the
+    /// provider's own input object.
+    connected_read: bool,
 }
 
 const STATIC_TOOL_NAMES: [&str; 5] = [
@@ -172,7 +186,13 @@ fn platform_tools(state_dir: &Path) -> Vec<PlatformTool> {
     ) else {
         return Vec::new();
     };
-    let mut rows: Vec<(&str, &str, bool, &Value)> = Vec::new();
+    platform_tools_from(&listing)
+}
+
+/// The listing → advertised-tools projection, split out so the availability
+/// rule is testable without a daemon.
+fn platform_tools_from(listing: &Value) -> Vec<PlatformTool> {
+    let mut rows: Vec<(&str, &str, bool, bool, &Value)> = Vec::new();
     for platform in listing["platforms"].as_array().into_iter().flatten() {
         let Some(platform_name) = platform["platform"].as_str() else {
             continue;
@@ -181,10 +201,17 @@ fn platform_tools(state_dir: &Path) -> Vec<PlatformTool> {
             let Some(tool_name) = tool["tool"].as_str() else {
                 continue;
             };
+            // CAD-1974: an unavailable tool is not advertised. This surface
+            // cannot carry the enrollment step, so offering the name would
+            // promise a call the gate refuses.
+            if tool["available"].as_bool() == Some(false) {
+                continue;
+            }
             rows.push((
                 platform_name,
                 tool_name,
                 tool["direct"].as_bool() == Some(true),
+                tool["connected_read"].as_bool() == Some(true),
                 tool,
             ));
         }
@@ -192,13 +219,10 @@ fn platform_tools(state_dir: &Path) -> Vec<PlatformTool> {
     let mut out = Vec::new();
     for (name, platform, tool) in generated_tool_names(rows.iter().map(|row| (row.0, row.1, row.2)))
     {
-        let Some(row) = rows
-            .iter()
-            .find(|row| row.0 == platform && row.1 == tool)
-            .map(|row| row.3)
-        else {
+        let Some(entry) = rows.iter().find(|row| row.0 == platform && row.1 == tool) else {
             continue;
         };
+        let (_, connected_read, row) = (entry.2, entry.3, entry.4);
         out.push(PlatformTool {
             name,
             platform,
@@ -208,6 +232,7 @@ fn platform_tools(state_dir: &Path) -> Vec<PlatformTool> {
                 .unwrap_or("Cadence platform tool")
                 .to_string(),
             effect: row["effect"].as_str().unwrap_or("unknown").to_string(),
+            connected_read,
         });
     }
     out
@@ -320,16 +345,43 @@ fn command_args(name: &str, args: &Value, platform_tools: &[PlatformTool]) -> Re
         if !args.is_object() {
             return Err(Error::rejected("tool arguments must be an object"));
         }
-        return Ok(vec![
+        let mut out = vec![
             "platform".into(),
             "call".into(),
             tool.tool.clone(),
             "--platform".into(),
             tool.platform.clone(),
-            "--input".into(),
-            serde_json::to_string(args)
+        ];
+        let mut body = args.clone();
+        if tool.connected_read {
+            // The two controls the gate requires, taken out of the provider's
+            // own input: forwarding them inside it would be refused as unknown
+            // request fields by the platform.
+            let connection = body
+                .get("connection")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| Error::rejected("required string argument 'connection' is missing"))?
+                .to_string();
+            let max_charge = body
+                .get("max_charge")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| Error::usage("required integer argument 'max_charge' is missing"))?;
+            if let Some(object) = body.as_object_mut() {
+                object.remove("connection");
+                object.remove("max_charge");
+            }
+            out.push("--connection".into());
+            out.push(connection);
+            out.push("--max-charge".into());
+            out.push(max_charge.to_string());
+        }
+        out.push("--input".into());
+        out.push(
+            serde_json::to_string(&body)
                 .map_err(|_| Error::internal("platform tool arguments do not serialize"))?,
-        ]);
+        );
+        return Ok(out);
     }
     match name {
         "self" => {
@@ -533,6 +585,95 @@ mod tests {
         }
     }
 
+    /// CAD-1974: the two control values leave the provider's input and become
+    /// flags. Sending them inside `--input` would be refused by the platform as
+    /// unknown request fields, and omitting them would be refused by the gate.
+    #[test]
+    fn a_connected_read_marshals_its_controls_as_flags() {
+        let generated = [PlatformTool {
+            name: "agenticos-provider_search_console_report".into(),
+            platform: "agenticos-provider".into(),
+            tool: "search_console_report".into(),
+            description: "Report".into(),
+            effect: "read".into(),
+            connected_read: true,
+        }];
+        let argv = command_args(
+            "agenticos-provider_search_console_report",
+            &json!({"connection":"con_alpha","max_charge":25,"site_url":"sc-domain:x.test"}),
+            &generated,
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "platform",
+                "call",
+                "search_console_report",
+                "--platform",
+                "agenticos-provider",
+                "--connection",
+                "con_alpha",
+                "--max-charge",
+                "25",
+                "--input",
+                r#"{"site_url":"sc-domain:x.test"}"#,
+            ]
+        );
+        // Both controls are required: a call missing either never becomes argv.
+        assert!(command_args(
+            "agenticos-provider_search_console_report",
+            &json!({"max_charge":25}),
+            &generated
+        )
+        .is_err());
+        assert!(command_args(
+            "agenticos-provider_search_console_report",
+            &json!({"connection":"con_alpha"}),
+            &generated
+        )
+        .is_err());
+        let error = command_args(
+            "agenticos-provider_search_console_report",
+            &json!({"connection":"con_alpha","max_charge":"25"}),
+            &generated,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("max_charge"), "{error}");
+    }
+
+    /// CAD-1974: discovery never advertises a tool the gate would refuse for
+    /// want of an enrollment this surface cannot perform.
+    #[test]
+    fn an_unavailable_platform_tool_is_not_advertised() {
+        let listing = json!({"platforms": [
+            {"platform": "agenticos-provider",
+             "tools": [
+                {"tool":"search_console_report","effect":"read","direct":true,
+                 "connected_read":true,"available":true,"label":"Report"},
+                {"tool":"analytics_report","effect":"read","direct":true,
+                 "connected_read":true,"available":false,
+                 "unavailable":"no credential is enrolled for agenticos-provider — run ..."}]},
+            {"platform": "local",
+             "tools": [{"tool":"publish","effect":"send","direct":true,"available":true}]}
+        ]});
+        let tools = platform_tools_from(&listing);
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert!(
+            names.contains(&"agenticos-provider_search_console_report"),
+            "got {names:?}"
+        );
+        assert!(names.contains(&"local_publish"));
+        assert!(
+            !names.iter().any(|name| name.contains("analytics")),
+            "an unavailable tool must not be offered: {names:?}"
+        );
+        assert!(tools
+            .iter()
+            .find(|tool| tool.tool == "search_console_report")
+            .is_some_and(|tool| tool.connected_read));
+    }
+
     #[test]
     fn a_generated_platform_tool_marshals_its_arguments() {
         let generated = [PlatformTool {
@@ -541,6 +682,7 @@ mod tests {
             tool: "post_draft".into(),
             description: "Draft".into(),
             effect: "draft".into(),
+            connected_read: false,
         }];
         let argv = command_args(
             "agenticos_post_draft",

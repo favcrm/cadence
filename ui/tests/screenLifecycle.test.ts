@@ -153,4 +153,47 @@ check(JSON.stringify(parseDraftImageRef("draft-image:d1:instagram.read")) === JS
   "a dotted-alias draft image ref parses");
 check(parseDraftImageRef("draft-image:d1:instagram..read") === null && parseDraftImageRef("draft-image:d1:Bad.Alias") === null &&
   parseDraftImageRef("image:d1") === null, "a malformed draft image ref does not parse");
+// SOC-55: only the host-created drawer child reads its own open context;
+// a primary (or another mount) is refused, and the value is host-local.
+const ctxToken = "e".repeat(64);
+const drawerReceipt = { ...receipt, action_token: ctxToken };
+const drawerPush = { ...actingPush, v: 2 } as ScreenPush;
+const drawerHost = { ...toolHost, onScreenDrawer: () => {} } as unknown as ConstructorParameters<typeof ScreenChannel>[7];
+function contextMount(role: "primary" | "drawer", context: unknown) {
+  const source = {} as Window; const port = new Port();
+  const channel = new ScreenChannel(source, drawerReceipt, drawerPush, () => {}, () => {}, () => {}, undefined, drawerHost);
+  channel.surfaceRole = role;
+  channel.setDrawerContext(context);
+  channel.receive({ source, origin: "null", data: init, ports: [port as unknown as MessagePort] });
+  port.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-actions.v1", "screen-surfaces.v1"] });
+  return { channel, port };
+}
+const child = contextMount("drawer", { receipt_id: "app-tool-1", post_id: "post-1" });
+child.port.receive({ v: 2, op: "call", id: "ctx-1", verb: "screen.drawer.context", args: {} });
+const ctxReply = child.port.sent.find(m => (m as { id?: string }).id === "ctx-1") as { ok?: boolean; data?: { context?: unknown } } | undefined;
+check(ctxReply?.ok === true && JSON.stringify(ctxReply.data?.context) === JSON.stringify({ receipt_id: "app-tool-1", post_id: "post-1" }),
+  "the drawer child reads its own open context");
+check(!child.port.closed, "reading the context does not close the drawer");
+const primaryCtx = contextMount("primary", { secret: "x" });
+primaryCtx.port.receive({ v: 2, op: "call", id: "ctx-2", verb: "screen.drawer.context", args: {} });
+check(primaryCtx.port.closed, "only a drawer child may read the host context");
+const emptyCtx = contextMount("drawer", null);
+emptyCtx.port.receive({ v: 2, op: "call", id: "ctx-3", verb: "screen.drawer.context", args: {} });
+const emptyReply = emptyCtx.port.sent.find(m => (m as { id?: string }).id === "ctx-3") as { ok?: boolean; data?: { context?: unknown } } | undefined;
+check(emptyReply?.ok === true && emptyReply.data?.context === null, "an open without context reads null");
+// A presentation-only peer has no independently mounted child to receive a
+// context. Refuse the handoff rather than claiming it was delivered.
+const legacyDrawerCalls: unknown[] = [];
+const legacyDrawerSource = {} as Window;
+const legacyDrawerPort = new Port();
+const legacyDrawerHost = { ...toolHost, onScreenDrawer: (...args: unknown[]) => legacyDrawerCalls.push(args) } as unknown as ConstructorParameters<typeof ScreenChannel>[7];
+const legacyDrawer = new ScreenChannel(legacyDrawerSource, drawerReceipt, drawerPush, () => {}, () => {}, () => {}, undefined, legacyDrawerHost);
+legacyDrawer.receive({ source: legacyDrawerSource, origin: "null", data: init, ports: [legacyDrawerPort as unknown as MessagePort] });
+legacyDrawerPort.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-actions.v1", "screen-presentation.v1"] });
+legacyDrawerPort.receive({ v: 2, op: "call", id: "legacy-ctx", verb: "screen.drawer.open", args: { surface: "post-context-v1", context: { receipt_id: "app-tool-1", post_id: "post-1" } } });
+const refusedLegacy = legacyDrawerPort.sent.find(m => (m as { id?: string }).id === "legacy-ctx") as { ok?: boolean } | undefined;
+check(refusedLegacy?.ok === false && legacyDrawerCalls.length === 0, "presentation-only peers refuse context handoffs");
+legacyDrawerPort.receive({ v: 2, op: "call", id: "legacy-open", verb: "screen.drawer.open", args: { surface: "settings" } });
+const openedLegacy = legacyDrawerPort.sent.find(m => (m as { id?: string }).id === "legacy-open") as { ok?: boolean } | undefined;
+check(openedLegacy?.ok === true && legacyDrawerCalls.length === 1, "legacy context-free opens still work");
 console.log("screen lifecycle adversarial checks pass");

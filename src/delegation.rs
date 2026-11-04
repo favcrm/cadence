@@ -270,8 +270,11 @@ fn names_ident(text: &str, sym: &str) -> bool {
 /// reader `cadence audit verdicts` and `scripts/enqueue-reviewed` use
 /// (`audit::verdicts_in`: notes of this ticket and PR on exactly `head`,
 /// symlinks skipped, each with the outcome its title, section and inline
-/// line agree on). Two PASS notes from distinct reviewers who are neither
-/// an author nor the approver; a conflicted note refuses, and so does
+/// line agree on). Two PASS notes recorded under two different reviewer
+/// identities, neither an author's nor the approver's — a fresh session that
+/// is not the author is a valid reviewer (CAD-2058), and this check compares
+/// the identity each note records rather than proving freshness; a conflicted
+/// note refuses, and so does
 /// any note on this head whose Risk is not `auto` or `delegated`. With a
 /// scope pre-approval the chosen notes must name its id. Answers
 /// `(path, reviewer)` pairs.
@@ -321,8 +324,8 @@ pub(crate) fn pick_verdicts(
         let (issue, pr, head) = (text(rows, "issue"), &rows["pr"], text(rows, "head"));
         return Err(Error::rejected(format!(
             "a delegated approval needs two PASS verdict notes for {issue} PR #{pr} on head \
-             {head} from distinct reviewers who are neither the author nor the approver{}; \
-             found {}",
+             {head} under two different reviewer identities, neither the author's nor the \
+             approver's{}; found {}",
             if scope_id.is_some() {
                 ", each naming the scope pre-approval"
             } else {

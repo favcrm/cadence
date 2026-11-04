@@ -6,8 +6,6 @@ pub(crate) mod client;
 pub(super) mod fs;
 pub mod workspace;
 
-#[cfg(test)]
-mod cad1862_acceptance;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};

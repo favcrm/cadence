@@ -119,9 +119,6 @@ pub mod stdio;
 pub mod ws;
 
 // CAD-1526: the message-window acceptance for the pi turn guard.
-#[cfg(test)]
-mod pi_turn_guard_acceptance;
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 

@@ -227,6 +227,31 @@ export interface Project {
 
 export type ContextRole = "pm" | "dev" | "qa" | "devops";
 
+/**
+ * A project's recorded access policy (CAD-1950, AOS-274). The values are the
+ * tracker's own spelling — `workspace_visible` / `private` and grants such as
+ * `users/<handle>` — so the board cannot invent a second vocabulary.
+ */
+export interface ProjectPolicy {
+  version: number;
+  visibility: "workspace_visible" | "private";
+  /** Grants for a private project; absent when the list is empty. Ignored
+   *  while `workspace_visible` — stored, but it does not admit anyone. */
+  members?: string[];
+}
+
+/** `GET /api/projects/<key>/policy` — the policy, and whether one exists. */
+export interface ProjectPolicyPayload {
+  project: string;
+  /** False for a project that predates the policy contract: with no policy
+   *  recorded every caller keeps access (REQ-007). That is a different state
+   *  from workspace-visible and must not be shown as it. */
+  recorded: boolean;
+  policy: ProjectPolicy | null;
+  /** Whether this build may record `private` (the isolation gate). */
+  private_available: boolean;
+}
+
 export interface ProjectContextDocument {
   id: string;
   kind: string;
@@ -543,13 +568,9 @@ export interface UsageLimit {
  * `local` sends the existing provider and endpoint kind plus cwd. No
  * per-issue location exists.
  */
-/** CAD-1752: a hire from the built-in role catalogue sends `catalogue` and
- *  no location, provider or endpoint kind — the install picks the runtime. */
 export interface AgentRegisterBody {
   alias: string;
   location?: "local" | "cloud";
-  catalogue?: string;
-  look?: string;
   provider?: string;
   endpoint_kind?: string;
   role?: string;
@@ -561,7 +582,10 @@ export interface AgentRegisterBody {
   params?: string;
 }
 
-/** One role of `GET /api/agent-roles`. */
+/** CAD-1989: `POST /api/agent-profiles` body, generated from the Rust type. */
+export type AgentProfileBody = Api.AgentProfileReq;
+
+/** One role of `GET /api/agent-roles`. Roles carry no model. */
 export interface AgentRole {
   id: string;
   category: string;
@@ -576,8 +600,6 @@ export interface AgentRole {
   first_tasks: string[];
   /** The text a hire stores as the agent's instructions. */
   instructions: string;
-  /** The model a hire would launch on, or why none resolves. */
-  model: { id: string; source: string } | { error: string };
 }
 
 export interface AgentRolesPayload {
@@ -625,6 +647,10 @@ export type Agent = Omit<
 
 /** `GET /api/agents` (the roster beside its snapshot's freshness). */
 export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & { agents: Agent[] };
+
+/** One profile of `GET /api/agents` (CAD-1989): who an agent is, with the
+ *  aliases of the runtimes registered against it. */
+export type HiredProfile = Api.AgentProfile;
 
 /** Best-effort destination for a verified app-scoped master turn. This is
  * navigation metadata only; the app route proves its binding independently. */
@@ -692,6 +718,8 @@ export interface MasterCommandResult {
   command: string;
   ok: boolean;
   result?: unknown;
+  /** Queued messages the command withdrew: this surface offers them back. */
+  withdrawn?: string[];
 }
 
 /**

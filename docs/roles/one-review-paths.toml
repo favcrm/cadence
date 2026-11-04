@@ -1,4 +1,4 @@
-# CAD-957: the ALLOWLIST of paths whose PRs need ONE independent review
+# CAD-957: the ALLOWLIST of paths whose PRs need ONE fresh-session review
 # (standards + spec). Read by AGENTS.md "Review" and by scripts (CAD-959).
 # Changing this file is class `human` (risk-classes.md trigger 7).
 #
@@ -22,7 +22,7 @@
 # this list; CAD-1099 and CAD-1104 below supersede it with a wider list.
 #
 # CAD-1099 / CAD-1104 (operator decisions 2026-10-03, "simplify and make the
-# dev cycle more smooth and fast"): ONE independent review is the default for
+# dev cycle more smooth and fast"): ONE fresh-session review is the default for
 # code, docs, CI/workflows, scripts, rules, dependencies and rollout. Many of
 # those are `human` class, where the operator's approval is the second check
 # (scripts/enqueue-reviewed requires it independently of this list). Two

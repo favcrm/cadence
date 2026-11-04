@@ -15,6 +15,8 @@ import type {
   AgentAccess,
   AgentDetail,
   AgentRegisterBody,
+  AgentProfileBody,
+  HiredProfile,
   AgentRolesPayload,
   InstructionsResult,
   AgentsPayload,
@@ -53,6 +55,8 @@ import type {
   Overview,
   Project,
   ProjectContext,
+  ProjectPolicy,
+  ProjectPolicyPayload,
   ContextRole,
   ThreadRef,
   WorkflowPreview,
@@ -535,6 +539,21 @@ export const api = {
   myWork: (query: string, signal?: AbortSignal) => get<MyWorkPayload>(`/api/my-work?${query}`, signal),
   myWorkIssue: (id: string) => get<MyWorkMembership>(`/api/my-work/issues/${encodeURIComponent(id)}`),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
+  /** `GET /api/projects/<key>/policy` (CAD-1950) — the recorded access
+   *  policy, whether there is one, and whether this build may record
+   *  `private`. */
+  projectPolicy: (project: string) =>
+    get<ProjectPolicyPayload>(`/api/projects/${encodeURIComponent(project)}/policy`),
+  /** `POST /api/projects/<key>/policy` (CAD-1950) — the same writer the CLI
+   *  calls. `members` is the full grant list and replaces what was there. */
+  setProjectPolicy: (
+    project: string,
+    req: { visibility: "workspace-visible" | "private"; members: string[] },
+  ) =>
+    post<{ project: string; policy: ProjectPolicy; committed: boolean }>(
+      `/api/projects/${encodeURIComponent(project)}/policy`,
+      req,
+    ),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
     const query = new URLSearchParams({ role });
     if (expectedRevision) query.set("expected_revision", expectedRevision);
@@ -928,8 +947,11 @@ export const api = {
    * endpoint kind to `sandbox`.
    */
   registerAgent: (body: AgentRegisterBody) => post<Record<string, unknown>>("/api/agents", body),
-  /** `GET /api/agent-roles` (CAD-1752) — the role catalogue, the install's
-   *  runtime and the model each role would launch on. Any signed-in viewer. */
+  /** `POST /api/agent-profiles` (CAD-1989) - a hire saves a profile and
+   *  launches nothing. Operator only. */
+  createAgentProfile: (body: AgentProfileBody) =>
+    post<{ profile: HiredProfile }>("/api/agent-profiles", body),
+  /** `GET /api/agent-roles` (CAD-1752) — the role catalogue. Any signed-in viewer. */
   agentRoles: () => get<AgentRolesPayload>("/api/agent-roles"),
   /** `POST /api/agents/<alias>/instructions` (CAD-1752) — replace the
    *  agent's standing instructions. Operator only. */
@@ -1403,8 +1425,8 @@ export const api = {
     post<MasterIdentityUpdateResult>("/api/master/identity", body),
   /** `POST /api/master/command` — an allowlisted session verb (CAD-551);
    *  operator-only, 400 `unknown_command` outside the board's set. */
-  masterCommand: (command: string, arg?: string, wait?: number, message?: string) =>
-    post<MasterCommandResult>("/api/master/command", {
+  masterCommand: (command: string, arg?: string, wait?: number, message?: string, conversation?: string) =>
+    post<MasterCommandResult>(`/api/master/command${conversation ? `?conversation=${encodeURIComponent(conversation)}` : ""}`, {
       command,
       ...(arg ? { arg } : {}),
       ...(wait !== undefined ? { wait } : {}),

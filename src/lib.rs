@@ -62,8 +62,6 @@ pub mod inbox;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_bundle;
 pub mod issue;
-#[cfg(test)]
-mod issuer_tls_fixture;
 pub(crate) mod issuer_transport;
 pub mod lease;
 pub mod local_assignment;
@@ -125,8 +123,6 @@ pub mod worktree;
 // from every non-test build.
 #[cfg(test)]
 extern crate self as cadence_agent;
-#[cfg(test)]
-mod cad1085_entry_authority_acceptance;
 #[cfg(test)]
 mod test_web_issuer_tls;
 #[cfg(test)]

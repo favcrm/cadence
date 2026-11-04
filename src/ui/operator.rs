@@ -361,6 +361,16 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     ),
     route(
         "POST",
+        "/api/app-social-drafts/sources/page",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/sources/get",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
         "/api/app-social-drafts/sources/save",
         RouteClass::OperatorOnly,
     ),
@@ -481,6 +491,8 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // Setup: create one agent row through the daemon's `agent_register`
     // (`rpc_register`). Operator-only; the daemon's own gate still applies.
     route("POST", "/api/agents", RouteClass::OperatorOnly),
+    // CAD-1989: a hire saves a profile; no runtime row is written.
+    route("POST", "/api/agent-profiles", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/resume", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/unfence", RouteClass::OperatorOnly),
     route(
@@ -668,43 +680,58 @@ pub(super) fn admit(
         return admit_screen_caller(request, state_dir, opts, caller, &what).map(Some);
     }
     if class == RouteClass::OperatorOnly {
-        match &caller {
-            Caller::Agent(alias) => {
-                return Err(guard_fail(
-                    "operator_only",
-                    &format!(
-                        "{method} {path} is the operator's decision — this request comes \
-                         from agent '{alias}'; decide from the operator's browser"
-                    ),
-                ))
-            }
-            // A member reads/participates/requests but never decides:
-            // approvals, grants and operator methods are the owner's
-            // role (contract §2, CAD-526).
-            Caller::Named(named) if !named.operator => {
-                return Err(guard_fail(
-                    "member_role",
-                    &format!(
-                        "{method} {path} needs the board owner's role — this session is \
-                         {}'s, mapped `member`",
-                        named.actor
-                    ),
-                ))
-            }
-            // The verified `owner` role is the operator claim on the
-            // public surface — no loopback process proof applies to a
-            // request the platform relay delivered.
-            Caller::Named(_) => {}
-            Caller::Operator(_) => super::home::prove_operator_peer(
-                request,
-                state_dir,
-                opts,
-                &format!("{method} {path}"),
-                None,
-            )?,
-        }
+        admit_operator_class(
+            request,
+            state_dir,
+            opts,
+            &caller,
+            &format!("{method} {path}"),
+        )?;
     }
     Ok(Some(caller))
+}
+
+/// May this resolved caller perform an `OperatorOnly` route?
+///
+/// Extracted so the decision is directly callable (CAD-1950): reaching it
+/// through `admit` otherwise needs a board session and, for a member, the
+/// daemon that verifies one — a socket in the way of the rule being checked.
+/// `what` is the request line (`POST /api/projects/pay/policy`), so a refusal
+/// names the route the caller tried.
+fn admit_operator_class(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    caller: &Caller,
+    what: &str,
+) -> Result<(), HttpResp> {
+    match caller {
+        Caller::Agent(alias) => Err(guard_fail(
+            "operator_only",
+            &format!(
+                "{what} is the operator's decision — this request comes \
+                 from agent '{alias}'; decide from the operator's browser"
+            ),
+        )),
+        // A member reads/participates/requests but never decides:
+        // approvals, grants and operator methods are the owner's
+        // role (contract §2, CAD-526).
+        Caller::Named(named) if !named.operator => Err(guard_fail(
+            "member_role",
+            &format!(
+                "{what} needs the board owner's role — this session is \
+                 {}'s, mapped `member`",
+                named.actor
+            ),
+        )),
+        // The verified `owner` role is the operator claim on the
+        // public surface — no loopback process proof applies to a
+        // request the platform relay delivered.
+        Caller::Named(_) => Ok(()),
+        Caller::Operator(_) => {
+            super::home::prove_operator_peer(request, state_dir, opts, what, None)
+        }
+    }
 }
 
 /// Operator-only read of `/api/master/permissions`. The board relays
@@ -3341,5 +3368,79 @@ mod tests {
         assert!(p.contains("Secure") && p.contains("Path=/") && p.contains("HttpOnly"));
         assert!(p.contains("SameSite=Lax") && !p.contains("Domain"));
         assert!(p.contains("Max-Age=3600"), "{p}");
+    }
+
+    /// CAD-1950 acceptance.
+    ///
+    /// Changing a project's policy is the board owner's decision. The route is
+    /// declared operator-only in the endpoint table, and the rule `admit` runs
+    /// for that class refuses a signed-in `member` — while the owner's own role
+    /// passes the same call, so the refusal is the member rule and not a rule
+    /// that refuses everyone.
+    ///
+    /// Authored independently of the implementation: a separate agent was given
+    /// the requirement and the production seam (`admit_operator_class`), not the
+    /// diff. It was shown to bite by flipping the endpoint row's class to
+    /// `AgentAllowed`, observing this test fail on the class assertion, then
+    /// restoring it. That is not the merge verdict — reviews and the operator's
+    /// approval still decide this PR.
+    #[test]
+    fn a_member_cannot_change_a_project_policy() {
+        use crate::ui::endpoints;
+        use std::io::Read;
+
+        const METHOD: &str = "POST";
+        const PATH: &str = "/api/projects/pay/policy";
+        let what = format!("{METHOD} {PATH}");
+
+        // 1. The table declares the route operator-only — the class whose
+        //    rule the second half of this test drives.
+        assert_eq!(
+            endpoints::class_of(METHOD, PATH),
+            Some(RouteClass::OperatorOnly),
+            "{what} must be declared OperatorOnly: a member must not decide a project's policy"
+        );
+
+        // A member refusal returns before the request or the state dir are
+        // read, so an empty request and any path stand in for a real one.
+        let request: Request = tiny_http::TestRequest::new().into();
+        let state_dir = std::path::Path::new("/nonexistent/cad-1950");
+        let opts = ServeOpts::default();
+        let signed_in = |operator: bool| {
+            Caller::Named(Named {
+                actor: "Fable Chen <fable@example.com> (board)".into(),
+                author: "usr_fable".into(),
+                sub: "sub_fable".into(),
+                operator,
+            })
+        };
+
+        // 2. A signed-in member is refused on the member-role rule.
+        let refused = admit_operator_class(&request, state_dir, &opts, &signed_in(false), &what)
+            .expect_err("a member must not be admitted to an operator-only route");
+        assert_eq!(
+            refused.status_code().0,
+            403,
+            "{what} must refuse a member with 403"
+        );
+        let mut body = String::new();
+        refused
+            .into_reader()
+            .read_to_string(&mut body)
+            .expect("the refusal carries a readable body");
+        let refusal: Value = serde_json::from_str(&body).expect("the refusal is JSON");
+        assert_eq!(
+            refusal["check"], "member_role",
+            "{what} must refuse a member on the member-role rule, got {body}"
+        );
+
+        // 3. Control: the owner's role passes the same call.
+        match admit_operator_class(&request, state_dir, &opts, &signed_in(true), &what) {
+            Ok(()) => {}
+            Err(refusal) => panic!(
+                "{what} must admit the board owner's role, refused {}",
+                refusal.status_code().0
+            ),
+        }
     }
 }

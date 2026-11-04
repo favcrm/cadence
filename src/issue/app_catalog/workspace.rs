@@ -497,9 +497,10 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
         let text = required(root, &path, app::file_cap(&name))?;
         bytes += text.len();
         if bytes > app::MAX_APP_BYTES as usize {
-            return Err(Error::rejected(
-                "app bundle exceeds its aggregate byte limit",
-            ));
+            return Err(Error::rejected(format!(
+                "app bundle exceeds its {}-byte aggregate limit",
+                app::MAX_APP_BYTES
+            )));
         }
         files.insert(name, text);
         Ok(())
@@ -2726,14 +2727,7 @@ pub(crate) fn restore_guarded(
 }
 
 #[cfg(test)]
-mod cad1189_acceptance;
-#[cfg(test)]
-mod cad1254_acceptance;
-#[cfg(test)]
 mod cad1270_parity;
-#[cfg(test)]
-mod catalogue_acceptance;
-
 #[cfg(test)]
 mod tests {
     use super::*;

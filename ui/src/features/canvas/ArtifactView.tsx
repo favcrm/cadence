@@ -1,14 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslate } from "../../lib/locale";
-import Md from "../../ui/Md";
+import Md, { CodeSurface } from "../../ui/Md";
 import { artifactBytes } from "./artifactClient";
 import { CSV_MAX_COLS, CSV_MAX_ROWS, parseCsv } from "./csv";
 import type { ArtifactKind } from "./canvasStore";
+import ImageOverlay from "./ImageOverlay";
 
 export interface Loaded {
   bytes: ArrayBuffer;
   mime: string;
 }
+
+/** How an HTML artifact is shown: in its sandboxed frame, or its source. */
+export type HtmlView = "rendered" | "source";
 
 /** The sandboxed document an HTML artifact renders in: an opaque origin
  *  (`sandbox=""` on the frame — never allow-same-origin), plus a policy
@@ -25,6 +29,18 @@ export function downloadName(title: string, kind: ArtifactKind, mime: string): s
   const base = title.replace(/[^\w.\- ]+/g, "_").trim().slice(0, 80) || "artifact";
   const ext = kind === "image" ? (mime.split("/")[1]?.split("+")[0] ?? "png") : EXT[kind];
   return `${base}.${ext}`;
+}
+
+/** Hand bytes to the browser as a file. */
+export function saveBytes(bytes: ArrayBuffer, mime: string, filename: string): void {
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime.split(";")[0] }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 /** Fetch one version's bytes through the board (operator session), aborting
@@ -50,7 +66,7 @@ export function useArtifactBytes(conversation: string, id: string, version: numb
 
 /** A `data:` URL for an image: the board CSP allows `data:` images and not
  *  `blob:` ones. SVG only ever shows as an `<img>` source, never as a URL. */
-function imageDataUrl(data: Loaded): string {
+export function imageDataUrl(data: Loaded): string {
   let bin = "";
   const bytes = new Uint8Array(data.bytes);
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
@@ -121,11 +137,16 @@ export default function ArtifactView({
   title,
   data,
   contentRef,
+  htmlView = "rendered",
+  aspect,
 }: {
   kind: ArtifactKind;
   title: string;
   data: Loaded;
   contentRef: React.RefObject<HTMLDivElement | null>;
+  htmlView?: HtmlView;
+  /** A generated image's shape, for its overlay. */
+  aspect?: string;
 }) {
   const t = useTranslate();
   switch (kind) {
@@ -137,7 +158,18 @@ export default function ArtifactView({
       );
     case "csv":
       return <CsvView text={decode(data)} contentRef={contentRef} />;
-    case "html":
+    case "html": {
+      if (htmlView === "source") {
+        // ignoreBOM: the source shows every stored character, a leading BOM included.
+        const source = new TextDecoder("utf-8", { ignoreBOM: true }).decode(data.bytes);
+        return (
+          <div ref={contentRef} className="canvas-doc cv-source" data-artifact-view="html-source">
+            <CodeSurface label="html" code={source}>
+              <code>{source}</code>
+            </CodeSurface>
+          </div>
+        );
+      }
       return (
         <iframe
           className="canvas-frame"
@@ -148,10 +180,20 @@ export default function ArtifactView({
           srcDoc={htmlFrameDocument(decode(data))}
         />
       );
+    }
     case "image":
       return (
         <div className="canvas-doc" data-artifact-view="image">
-          <img className="canvas-image" src={imageDataUrl(data)} alt={title} />
+          <div className="imgshot" data-canvas-image>
+            <img className="canvas-image" src={imageDataUrl(data)} alt={title} />
+            <ImageOverlay
+              title={title}
+              aspect={aspect}
+              mime={data.mime}
+              bytes={data.bytes.byteLength}
+              onDownload={() => saveBytes(data.bytes, data.mime, downloadName(title, kind, data.mime))}
+            />
+          </div>
         </div>
       );
     case "pdf":

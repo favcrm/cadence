@@ -1,21 +1,21 @@
 ---
 name: cadence
-description: Work on a Cadence development team — identity, reporting, evidence-based delivery and reviewed learning. Use when CADENCE_ALIAS is set, when assigned as a Cadence worker/PM, or when asked to dispatch/report work via Cadence.
+description: Work on a Cadence project as a hosted or native agent, including direct coding or review sessions. Use for assignments, reporting, project delivery, or when CADENCE_ALIAS is set.
 ---
 
 # Cadence agent protocol
 
-Cadence is a local Rust controller coordinating coding agents through durable
-message queues and native provider terminals. If you were launched by cadence,
-your pane environment has `CADENCE_ALIAS` and `CADENCE_STATE_DIR` set.
+Cadence coordinates work through hosted workspaces and native agents. A
+native managed pane has `CADENCE_ALIAS` and `CADENCE_STATE_DIR`; an existing
+hosted coding or review session need not have either.
 
 ## Command map
 
 `cadence --help` lists the core verbs only, in groups:
 
 - Me: `self`, `inbox`
-- Work: `issue`, `plan`
-- Agents: `send`, `dispatch`, `join`, `agent`
+- Work: `issue` (`issue epic propose|approve|reject` is the plan write; `plan ls` and `plan show` remain)
+- Agents: `agent` (`agent join` adds a worker). `send` and `dispatch` still parse; `message send` is the canonical enqueue
 - Build: `build-slot`, `secret`
 - Fleet: `status`, `doctor`
 - Knowledge: `memory`, `wiki`
@@ -36,7 +36,32 @@ subcommands, and `cadence help <verb>` is one verb's own help.
 `proposed` stage; the operator approves it before its tickets dispatch.
 `job`, `delivery` and `monitor` are PM-internal.
 
+## Hosted profile session
+
+Use the selected hosted workspace for its issues and wiki. Read the named
+issue and the owning repository's rules before choosing a checkout, integration
+branch, review or release path. A profile supplies context, not an authenticated
+reviewer identity or approval:
+
+```bash
+cadence --org <org> agent profiles
+cadence --org <org> agent context <profile-id>
+cadence --org <org> issue show <issue-id>
+```
+
+For new software work, use `issue start --repo <checkout> --profile
+<profile-id> --base <integration-ref>` only when its worktree placement meets
+the repository's rules. Inspect the receipt's assignment, worktree, base and
+report guidance; a queued claim is not a running worker. Resume an existing
+claim rather than starting another. If the required placement or a hosted
+operation is unavailable, report the refusal to the PM or operator; do not
+switch to a local tracker or connect a runner to claim unrelated work. See
+Cadence's `docs/guides/hosted-workspace.md` for the supported paths.
+
 ## Who am I
+
+This section and the next apply to native managed turns. A direct hosted
+profile session follows its assignment receipt's reporting guidance instead.
 
 ```bash
 cadence self          # → {"alias": "...", "running": [{"id": msg, "turn_id": token, "task": task-or-null}]}
@@ -77,7 +102,7 @@ exactly that commit. Managed endpoints (codex/claude) never run
 a last line `SHA: <40-hex>` — the daemon reads the last such line as the
 reported revision.
 
-A ticket the master dispatched goes to independent review when you file
+A ticket the master dispatched goes to fresh-session review when you file
 its `done` report with the head and the PR (`sha: <40-hex>` and
 `pr: https://github.com/<owner>/<repo>/pull/<n>` in the frontmatter).
 A REVISE comes back to you as a message: fix it on the same branch, push,
@@ -439,6 +464,34 @@ Fresh joins get a `bootstrap-<alias>` kickoff plus the briefing file;
 group root when results should accumulate for a non-agent consumer —
 the queue is durable and `inbox --wait` blocks instead of polling.
 
+## Onboarding a person (invite, board, optional CLI)
+
+When someone new is joining a workspace, start from their goal, not from an
+install. Ask which they need:
+
+- **The shared board only** — open the invitation link, sign in with the
+  address that received it, choose **Join company**, then **Open app**. No
+  install, CLI credential or agent registration is involved.
+- **Cadence on their own computer** — install on that machine, then
+  `cadence login <slug>`. Consent picks what this connection may use; the saved
+  command default is separate and changes only with `--use`.
+- **A shared or bot machine** — say before any authorization that the
+  credential is stored on that machine and anyone with filesystem access may be
+  able to use it. Continue only if the user trusts that machine.
+
+Never ask for a password, one-time code, cookie, device code or token in chat,
+and never copy another person's credential or browser cookie. A workspace
+invitation, credential consent and `agent connect` registration are three separate
+actions; completing one does not perform the others. Do not offer `cadence
+setup` to a hosted user who only needs the board.
+
+When the user asks for something the deployed board does not support, check
+rather than assume: `cadence commands "<words>"`, `cadence schema <verb>` and
+`cadence --help` describe the installed build, and `cadence --org <slug> ...`
+tells you what the live workspace answers. Report an unavailable hosted
+operation as unavailable — do not substitute a local tracker or invent success.
+A login that works says nothing about a specific verb being supported.
+
 ## Business knowledge (company questions)
 
 For everyday company questions (policy, memos, procedures, meeting notes,
@@ -598,8 +651,8 @@ Before dispatch or resuming changed scope:
   one writer per area, reviewer/result route and proportionate validation.
   Include rollout/recovery and cleanup ownership when they are in scope. Link
   existing plans instead of copying them; revise the brief when scope changes.
-- **Kickoff:** state the known state (base as `origin/main` at dispatch, main
-  CI status, known flaky tests, PRs about to land) and require a fetch right
+- **Kickoff:** state the project's actual integration base at dispatch, its CI
+  status, known flaky tests and PRs about to land; require a fetch right
   before push. Give each rule's intent, not only its mechanics, so edge cases
   resolve without guessing. For each acceptance item name the component that
   produces the output, mark every number measured or aspirational, and list
@@ -626,11 +679,22 @@ During implementation and handoff:
   as an admitted gate. Reuse eligible evidence and avoid duplicate full suites.
 - Self-check before handoff, including a simplification pass over your own
   diff (dead code, duplication, abstractions the change does not need; your
-  changed lines only, no behaviour change); independent QA still reviews
-  the exact change against acceptance, regressions and applicable project
-  standards. Bind the verdict to the actual revision and list checks run,
-  skipped and limitations. QA tests the behavior and relevant failure
-  paths, not just the author's report.
+  changed lines only, no behaviour change). Obtain the review
+  the project's policy requires; bind its verdict to the actual revision and
+  list checks run, skipped and limitations. The standard is a fresh-session
+  review: a session that is not the author and inherits no conversation or
+  context from the work (a subagent qualifies; a fork or a resumed authoring
+  session does not). Brief it with the PR, the exact head and the ticket, not
+  your conclusions, and call it a fresh-session review, never independent
+  parties. In the Cadence repository the merge gate does not enforce this yet: hosted
+  verdicts count by attested principal (the author's is refused) and local notes by
+  their self-declared `From:` alias, so a same-login session must not file
+  one: hosted refuses it, and a local note's alias proves nothing. Post its
+  findings as a PR comment. In the Cadence
+  repository itself, merges use the temporary `--exception --advisory ...`
+  path (exact-head operator approval and two advisory links, plus browser-qa for a `ui/` change) until
+  `EXCEPTION_ENDS` (2026-11-10); it checks only that the links are separate https URLs.
+  A second attested human is not required.
 - Make review converge. First inspect the complete change against acceptance;
   verify each blocking finding with a concrete failure scenario and source
   evidence before sending it to the author. Report the class of bug and all
@@ -649,12 +713,11 @@ During implementation and handoff:
   head or changed integration tree needs evidence revalidation; passing CI
   does not itself authorize a merge, deployment, cleanup or message replay.
 
-When the increment merges, clean up before anything else: mark the ticket
-done with `cadence issue reconcile --project <key>` (say on the ticket why
-if it holds it), delete your scratch and stop the processes you started,
-and close any PR you abandoned with a link. Leave the worktree to a later
-reconcile sweep, which removes it once nothing stands in it; never
-`--force` `issue finish`.
+After the increment merges, follow the selected workspace's supported ticket
+reconciliation and the repository's completion rules; report an unavailable
+hosted operation rather than switching trackers or claiming completion. Delete
+your scratch, stop the processes you started and close abandoned PRs with a
+link. Leave worktrees to their authorized sweep; never force `issue finish`.
 
 At a completed increment, QA revision, incident or repeated blocker, append a
 compact reflection to the existing task: **expected outcome; observed evidence;
@@ -772,7 +835,7 @@ the failing iterations' output is the `stress-failures-*` artifact.
 5. Promote a lesson into a skill change only when it improves a recurring,
    broadly applicable decision. Keep project-specific design choices in scoped
    memory/ADRs. Change the smallest instruction, give it a realistic behavioral
-   check and independent review, and retain source/revision and supersession
+   check and fresh-session review, and retain source/revision and supersession
    evidence. A lesson cannot enlarge user scope or grant execution permissions.
 
 Curators consolidate at delivery/incident boundaries and batch accumulated

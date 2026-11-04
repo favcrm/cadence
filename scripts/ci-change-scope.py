@@ -22,15 +22,29 @@ UI_EXT = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".css", ".html", ".svg",
           ".png", ".jpg", ".jpeg", ".webp", ".woff", ".woff2", ".json"}
 
 
-def result(scope, reason, targets=()):
+# ci.yml's cross-build legs compile this one test target on the aarch64
+# runners. A change that reaches it must keep those legs, which is why it is
+# named here rather than inferred: an edit to this file is the one test-only
+# change a build gate actually observes.
+CROSS_TEST_TARGET = "tests/cad1425_client_update_refusal_acceptance.rs"
+
+
+def result(scope, reason, targets=(), narrow_cross=True):
     # rust covers the fmt/clippy/build gates; `tests` narrows only which
     # integration targets the `test` job runs, not whether rust gates run.
     out = dict(scope=scope,
                rust="false" if scope in {"docs", "ui"} else "true",
                ui="true" if scope in {"ui", "full"} else "false",
                reason=reason)
-    out["tests"] = "true" if scope in {"tests", "full"} else "false"
+    out["tests"] = "true" if scope in {"tests", "tests-only", "full"} else "false"
     out["targets"] = sorted(targets)
+    # CAD-1970: a change confined to tests/**.rs cannot alter the shipping
+    # binary, the ui bundle or another target's compilation, so those two
+    # gates are PR feedback that costs ~1100 runner-seconds to compile code
+    # the diff does not touch. They still run in the merge queue, on main and
+    # on any non-PR event, which `result()` never narrows.
+    out["build"] = "false" if scope == "tests-only" else "true"
+    out["cross"] = "false" if scope == "tests-only" and narrow_cross else "true"
     return out
 
 
@@ -155,10 +169,23 @@ def classify(repo, base, head, event):
         if categories == {"tests"}:
             # Only M-of-100644 edits to pre-existing top-level integration
             # targets, with the trusted-base ownership guard above.
+            #
+            # CAD-1970: when that guard refuses — this repository declares
+            # explicit [[test]] tables and funnels most acceptance files into
+            # the `suite` target, so it refuses every test edit — the diff is
+            # still provably confined to tests/**.rs. Nothing outside tests
+            # can change, so the full suite, clippy --all-targets and fmt are
+            # the entire meaningful signal; `build` and `cross-build` compile
+            # the shipping binary and another target, which this diff cannot
+            # reach. That is `tests-only`, and the merge queue is unchanged.
             targets = test_targets(repo, base, paths)
             if targets:
                 return result("tests", "independent test-only PR feedback scope; "
                                        "queue remains full", targets)
+            if all(re.fullmatch(r"tests/.+\.rs", p) for p in paths):
+                return result("tests-only", "tests-only PR feedback scope; "
+                                            "queue remains full",
+                              narrow_cross=CROSS_TEST_TARGET not in paths)
             return result("full", "test selection is new, deleted, shared or ambiguous")
         if len(categories) == 1 and "full" not in categories:
             return result(categories.pop(), "isolated PR feedback scope; queue remains full")

@@ -1,7 +1,11 @@
 import type { Api, Model, Provider } from "@earendil-works/pi-ai";
 import { CLOUDFLARE_AI_API, CLOUDFLARE_PROVIDER_ID } from "agents/models/pi-ai";
 import type { GenerationIdentity } from "./contract.ts";
-import { MAX_IMAGE_BASE64_CHARS, MAX_IMAGE_PARTS } from "./image-limits.ts";
+import {
+  IMAGE_INPUT_UNAVAILABLE,
+  MAX_IMAGE_BASE64_CHARS,
+  MAX_IMAGE_PARTS,
+} from "./image-limits.ts";
 
 /**
  * Model transport for one hosted conversation.
@@ -238,6 +242,39 @@ function boundImageHistory(
 }
 
 /**
+ * Gateway refusal codes the runtime may name. Anything else stays private: the
+ * engine reports a generic failure rather than provider or gateway text.
+ */
+const PUBLIC_MODEL_REFUSALS: ReadonlySet<string> = new Set([
+  IMAGE_INPUT_UNAVAILABLE,
+]);
+
+/**
+ * Carry an allowlisted refusal code into the engine's private error text, so
+ * the transcript reads the code rather than classifying the gateway's prose.
+ * A response without a recognized code passes through unread by the caller.
+ */
+async function withPublicRefusal(response: Response): Promise<Response> {
+  if (response.ok) return response;
+  let code: unknown;
+  try {
+    const body: unknown = await response.clone().json();
+    code =
+      typeof body === "object" && body !== null && "error" in body
+        ? (body.error as { code?: unknown } | null)?.code
+        : undefined;
+  } catch {
+    return response;
+  }
+  if (typeof code !== "string" || !PUBLIC_MODEL_REFUSALS.has(code))
+    return response;
+  return Response.json(
+    { error: { code, message: code } },
+    { status: response.status },
+  );
+}
+
+/**
  * The private model endpoint.
  *
  * `identity` reads the engine's current durable generation checkpoint and must
@@ -274,10 +311,12 @@ export function meteredBinding(
           { status: 409 },
         );
       }
-      const response = await transport.requestModel(
-        boundImageHistory(input, maxImagesPerRequest),
-        current,
-        options?.signal,
+      const response = await withPublicRefusal(
+        await transport.requestModel(
+          boundImageHistory(input, maxImagesPerRequest),
+          current,
+          options?.signal,
+        ),
       );
       const metered = onModelResolved ? captureResolvedModel(response, onModelResolved) : response;
       if (options?.returnRawResponse !== false) return metered;

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useTranslate } from "../../lib/locale";
 import { IconClose } from "../../ui/icons";
 import { setComposerRefs } from "../app-shell/chat/composerStore";
-import ArtifactView, { downloadName, useArtifactBytes } from "./ArtifactView";
+import ArtifactView, { downloadName, saveBytes, useArtifactBytes, type HtmlView } from "./ArtifactView";
 import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
 import {
@@ -32,6 +32,12 @@ const FOOT: Record<string, string[]> = {
   image: ["inline image"],
   csv: ["table · first 2,000 rows · 50 columns"],
 };
+
+const HTML_SOURCE_FOOT = ["source", "read-only"];
+const HTML_VIEWS: readonly [HtmlView, string][] = [
+  ["rendered", "Rendered"],
+  ["source", "HTML"],
+];
 
 function useViewport(): number {
   const [w, setW] = useState(() => window.innerWidth);
@@ -105,7 +111,7 @@ function focusComposer(): void {
   box?.focus();
 }
 
-function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpand }: {
+function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpand, htmlView, onHtmlView }: {
   conversation: string;
   tab: CanvasTab;
   composerKey: string | null;
@@ -113,6 +119,8 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
   sheet: boolean;
   expanded: boolean;
   onExpand: () => void;
+  htmlView: HtmlView;
+  onHtmlView: (view: HtmlView) => void;
 }) {
   const t = useTranslate();
   const state = useArtifactBytes(conversation, tab.id, tab.selected);
@@ -133,14 +141,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
 
   const download = () => {
     if (state.status !== "ready") return;
-    const url = URL.createObjectURL(new Blob([state.data.bytes], { type: state.data.mime.split(";")[0] }));
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = downloadName(tab.title, tab.kind, state.data.mime);
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    saveBytes(state.data.bytes, state.data.mime, downloadName(tab.title, tab.kind, state.data.mime));
   };
 
   // Ask to change: a reference chip in the composer, never a send. On a phone
@@ -156,6 +157,11 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
   const first = Math.max(1, tab.latest - KEPT_VERSIONS + 1);
   const versions: number[] = [];
   for (let v = first; v <= tab.latest; v++) versions.push(v);
+  // An image is asked about in the chat and downloaded from its own overlay,
+  // so its header keeps no Ask to change or Download, its footer no hash, and
+  // its version picker only a choice between versions.
+  const image = tab.kind === "image";
+  const showTools = !image || versions.length > 1;
   return (
     <>
       <header className="cv-head">
@@ -193,15 +199,33 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
             </button>
           </>
         ) : null}
+        {showTools ? (
         <span className="cv-tools">
-          <span className="vers" role="group" aria-label={t("Version")}>
-            {versions.map((v) => (
-              <button key={v} type="button" aria-pressed={v === tab.selected} onClick={() => selectVersion(tab.id, v)}>
-                v{v}
-              </button>
-            ))}
+          <span className="cv-pick">
+            <span className="vers" role="group" aria-label={t("Version")}>
+              {versions.map((v) => (
+                <button key={v} type="button" aria-pressed={v === tab.selected} onClick={() => selectVersion(tab.id, v)}>
+                  v{v}
+                </button>
+              ))}
+            </span>
+            {tab.kind === "html" ? (
+              <span className="vers cv-view" role="group" aria-label={t("View")}>
+                {HTML_VIEWS.map(([view, label]) => (
+                  <button
+                    key={view}
+                    type="button"
+                    aria-pressed={view === htmlView}
+                    disabled={state.status !== "ready"}
+                    onClick={() => onHtmlView(view)}
+                  >
+                    {t(label)}
+                  </button>
+                ))}
+              </span>
+            ) : null}
           </span>
-          {!sheet ? (
+          {!sheet && !image ? (
             <>
               <button type="button" className="btn btn-ghost" disabled={!composerKey || !!working} onClick={askToChange}>
                 {t("Ask to change")}
@@ -212,7 +236,8 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
             </>
           ) : null}
         </span>
-        {sheet ? (
+        ) : null}
+        {sheet && !image ? (
           <span className="cv-tools">
             <button type="button" className="btn btn-ghost" disabled={!composerKey || !!working} onClick={askToChange}>
               {t("Ask to change")}
@@ -228,18 +253,20 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
         {state.status === "loading" ? <p className="text-label text-ink-500 p-3">{t("Loading…")}</p> : null}
         {state.status === "failed" ? <p className="text-label text-fail p-3" role="alert">{state.error}</p> : null}
         {state.status === "ready" ? (
-          <ArtifactView kind={tab.kind} title={tab.title} data={state.data} contentRef={contentRef} />
+          <ArtifactView kind={tab.kind} title={tab.title} data={state.data} contentRef={contentRef} htmlView={htmlView} aspect={tab.aspect} />
         ) : null}
       </div>
+      {image ? null : (
       <footer className="cv-foot">
         <span>
           v{tab.selected} · {sizeLabel(info?.bytes ?? tab.bytes)}
           {info?.digest ? ` · sha256:${info.digest.slice(0, 6)}…${info.digest.slice(-3)}` : ""}
         </span>
-        {(FOOT[tab.kind] ?? []).map((f) => (
+        {(tab.kind === "html" && htmlView === "source" ? HTML_SOURCE_FOOT : (FOOT[tab.kind] ?? [])).map((f) => (
           <span key={f}>{f}</span>
         ))}
       </footer>
+      )}
     </>
   );
 }
@@ -257,6 +284,8 @@ export default function CanvasDrawer() {
   // The width the operator dragged to wins; until then each kind has its own.
   const [dragged, setDragged] = useState(readWidth);
   const [expanded, setExpanded] = useState(false);
+  // Per artifact, held here because Body remounts when the version changes.
+  const [htmlViews, setHtmlViews] = useState<Record<string, HtmlView>>({});
   const open = canvas.open && canvas.tabs.length > 0 && canvas.conversation !== null;
   const tab = canvas.tabs.find((x) => x.id === canvas.active) ?? canvas.tabs[0] ?? null;
   const want = dragged !== null ? clampWidth(dragged, viewport) : defaultWidthFor(tab?.kind ?? "md", viewport);
@@ -392,6 +421,8 @@ export default function CanvasDrawer() {
         sheet={sheet}
         expanded={expanded}
         onExpand={() => setExpanded((x) => !x)}
+        htmlView={htmlViews[tab.id] ?? "rendered"}
+        onHtmlView={(view) => setHtmlViews((views) => ({ ...views, [tab.id]: view }))}
       />
     </aside>
   );

@@ -2234,7 +2234,7 @@ fn preflight(
     let base = start::resolve_base(
         &root,
         args.base.as_deref(),
-        start::configured_integration(&project, &root),
+        start::configured_integration(&project, &root)?,
     )?;
     let base_sha = base.sha.clone();
     let (wt_dir, branch) = start::resolve_lane(&front, args.name.as_deref(), &root)?;

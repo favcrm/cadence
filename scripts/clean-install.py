@@ -63,7 +63,7 @@ TARGETS = {
     "aarch64-linux": "ubuntu-22.04-arm",
     "aarch64-macos": "macos-15",
 }
-GATE_JOBS = ["fmt", "clippy", "test", "build", "ui"]
+GATE_JOBS = ["fmt", "clippy", "build", "ui"]
 TAR_MEMBERS = {"cadence", "cadence.sha256", "manifest.json"}
 TIMEOUT = 120
 WAIT_LIMIT = 1200

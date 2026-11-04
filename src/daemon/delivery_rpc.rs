@@ -43,10 +43,6 @@ use crate::store;
 /// Longest decline reason.
 const REASON_MAX: usize = 2_000;
 
-#[cfg(all(test, feature = "test-seam"))]
-#[path = "cad622_acceptance.rs"]
-mod cad622_acceptance;
-
 fn now() -> i64 {
     crate::issue::time::now_epoch()
 }
@@ -107,13 +103,6 @@ fn apply_routine_ready_observation(
         rec.enter(State::Enqueued, now);
     }
 }
-
-#[cfg(test)]
-#[path = "cad1298_observer_acceptance.rs"]
-mod observer_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-#[path = "cad1298_security_acceptance.rs"]
-mod security_acceptance;
 
 fn hash(text: &str) -> String {
     Sha256::digest(text.as_bytes())

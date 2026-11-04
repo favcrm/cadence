@@ -84,7 +84,11 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
             // Never keep the holder in the environment, even if the
             // parent shell exported it. Panes inherit the daemon's env.
             std::env::remove_var("CADENCE_ROLLOUT_AS");
-            std::fs::create_dir_all(&state_dir)?;
+            // CAD-1922: a state dir inside the consolidated home is
+            // created 0700 along with the home root; elsewhere this is
+            // the same create_dir_all. The mode check below stays: an
+            // existing state dir is tightened, never left wide.
+            cadence_agent::home::create_home_dir(&state_dir)?;
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;

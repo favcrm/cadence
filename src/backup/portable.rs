@@ -35,11 +35,6 @@ use crate::rollout::db_file;
 use crate::secret::Allowlist;
 
 mod capture;
-#[cfg(test)]
-mod capture_acceptance;
-#[cfg(test)]
-mod hook_capture_acceptance;
-
 pub const PORTABLE_FORMAT: &str = "cadence.portable/1";
 pub const INACTIVE_MARKER: &str = "portable-restore.json";
 const PKG_DB: &str = "cadence.sqlite3";
@@ -241,6 +236,30 @@ const CATALOG: &[(&str, &[&str])] = &[
     (
         "app_install_requests",
         &["id", "catalog_id", "requested_by", "at", "state"],
+    ),
+    (
+        "app_media_import_requests",
+        &[
+            "request_id",
+            "asset_id",
+            "source_receipt_id",
+            "sha256",
+            "result",
+            "created",
+        ],
+    ),
+    (
+        "app_media_imports",
+        &[
+            "asset_id",
+            "context_id",
+            "source_receipt_id",
+            "media_type",
+            "sha256",
+            "size_bytes",
+            "bytes",
+            "created",
+        ],
     ),
     ("app_media_asset_origins", &["asset_id", "receipt_id"]),
     (

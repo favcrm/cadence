@@ -22,23 +22,31 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    emergency path). For a bug fix, show the failing case once, then fixed.
    Add checks only under AGENTS.md's behavior-first and gates/security rules;
    do not restore retired tests or routinely repeat suites. `--tests` is a
-   focused diagnostic, not a blanket pre-review prerequisite; required CI and
-   full merge-group regression remain unchanged.
-4. Under strict requirements, one independent reviewer; two for auth, identity,
-   secrets, the daemon trees and UI paths (`docs/roles/one-review-paths.toml`
-   lists what gets one).
+   focused diagnostic, not a blanket pre-review prerequisite; required CI
+   (fmt, clippy, build, ui, delivery-gate required; cross-build runs but is
+   not yet required) is unchanged, and the suite runs in
+   `tests.yml` on a schedule and on demand (CAD-1970).
+4. Under strict requirements, one fresh-session review; two separate passes
+   (Standards and Spec/security) for auth, identity, secrets, the daemon trees
+   and UI paths (`docs/roles/one-review-paths.toml` lists what gets one). A
+   fresh-session review is a non-author session with no inherited context,
+   including a subagent (AGENTS.md "Review standard"). The merge gate does not
+   enforce that yet; merges use the temporary `--exception` (exact-head operator approval and two
+   advisory links, standards and spec-security, plus browser-qa for a `ui/`
+   change) until `EXCEPTION_ENDS`
+   (2026-11-10).
 5. The version-one delivery tiers apply to clean default-equivalent policies
    by default after the reviewed implementation is installed; the introducing
    PR must still satisfy the current trusted-base gates. Routine changes need
    green exact-head CI and genuine
    ticket-outcome evidence, with no mandatory review; consequential changes
-   need one independent combined standards/spec review. Sensitive changes
+   need one fresh-session combined standards/spec review. Sensitive changes
    keep the existing strict review, operator, Browser QA and full-check
    requirements. Unknown, incomplete, protected-mode, deletion and mixed
    sensitive cases retain strict legacy floors. Explicitly approved custom
    policies remain in force and strict; malformed or unapproved policy changes
    fail closed. Approved version-one profiles remain readable for compatibility.
-   Mandatory protection checks, full merge-group regression, credential
+   Mandatory protection checks, required CI (the suite runs in `tests.yml`, CAD-1970), credential
    isolation and operator-owned deployment remain unchanged. No fabricated
    verdict/readiness counts as review or outcome evidence; dry-run is read-only
    and requirements must be freshly bound before queueing.
@@ -91,7 +99,7 @@ One bounded author simplification pass precedes review. Stop when acceptance
 and required verification are complete; do not add planning documents,
 reviewers, repeated checks or handoffs merely to make the process look thorough.
 Reuse unchanged-head evidence and reviewer context as described below. Never
-trade away approval, independent review required by the effective policy,
+trade away approval, fresh-session review required by the effective policy,
 isolation or fail-closed guards to save time.
 
 For a slow cycle, inspect existing `cadence issue retro <ID> --json` evidence
@@ -358,13 +366,19 @@ Do not force-push a branch with auto-merge enabled; disable it first.
 
 ## One final operator handoff
 
-Finish independent review and CI, post the ticket evidence, then request a
+Finish fresh-session review and CI, post the ticket evidence, then request a
 merge approval on the **literal full SHA** just reviewed. Example syntax
 (the example SHA must be replaced with the actual reviewed head before use):
 
 ```sh
-cadence audit approve --repo favcrm/cadence --pr <PR> --head <FULL_REVIEWED_SHA> --source "Operator in chat: approves the reviewed green PR head."
+cadence audit approve --project <key> --issue <ID> --pr <PR> --head <FULL_REVIEWED_SHA> --source "Operator in chat: approves the reviewed green PR head."
 ```
+
+On a hosted org the approval is project-scoped and names the ticket it
+authorizes, hence `--project <key> --issue <ID>` (CAD-2001); a hosted approval
+without them is refused rather than inferred from the repo. A local approval
+stays repo-scoped: a local operator drops `--project` and `--issue`, and
+`--repo favcrm/cadence` is optional (docs/AUDIT.md).
 
 Provide the operator a concrete paste-ready version with no placeholders,
 `read`, guessed SHA, or source over 200 characters. The agent never executes
@@ -374,6 +388,15 @@ the approval itself. Record the returned approval id on the ticket, then:
 scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA> --dry-run
 scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA>
 ```
+
+Temporary path (CAD-1946; remove this note when it ends): while the hosted
+reviewer attestation cannot be produced, add `--exception --advisory
+standards=<url> --advisory spec-security=<url>` (plus `--advisory
+browser-qa=<url>` for a `ui/` change) to the enqueue. It waives only the
+missing reviewer attestation and, on a hosted routine PR, the readiness proof
+hosted cannot yet produce; the evidence names both. The advisory reviews are PR comments posted by
+separately assigned sessions, and the operator approves each exact head. The
+path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10).
 
 The helper enforces exact-head checks, verdicts, evidence and approval. Queue
 position is not merge evidence: watch the merge-group run and verify the
@@ -391,9 +414,9 @@ number of operator/reviewer handoffs as well as CI elapsed/runner minutes.
 Review count follows AGENTS.md "Review" and the effective delivery policy:
 eligible routine changes need no mandatory review, consequential changes one
 combined review, and sensitive/unknown cases retain strict floors. Under the
-strict path, use one independent review by default, two for excluded paths in
-`docs/roles/one-review-paths.toml` (subject to the documented solo-operator
-rule), and operator approval for human risk. Automating evidence collection,
+strict path, use one fresh-session review by default, two separate passes for excluded
+paths in `docs/roles/one-review-paths.toml`, and operator approval for human
+risk. Automating evidence collection,
 reviewer state, head-drift notifications or an operator decision UI is a separate reviewed
 implementation—not a license to self-approve. Likewise, consolidating required
 build/UI checks or changing branch protection requires baseline measurements

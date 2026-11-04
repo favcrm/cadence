@@ -211,13 +211,6 @@ pub(crate) fn run_in(
 }
 
 #[cfg(test)]
-mod cad1751_call_cap_refusal_acceptance;
-#[cfg(test)]
-mod cad1759_guard_hardening_refusal_acceptance;
-#[cfg(test)]
-mod cad1759_pause_race_refusal_acceptance;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

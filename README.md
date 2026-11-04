@@ -53,6 +53,11 @@ see the release record for advanced source overrides and verification requiremen
 
 ## Quick start
 
+Joining someone else's workspace? You do not need this install to use the
+board: accept the invitation in the browser, sign in with the address that
+received it, and choose **Open app**. The steps below are for the machine that
+will run Cadence itself.
+
 ```bash
 cadence setup                  # idempotent first run: state dir, tracker,
                                #  skill, daemon and board; reports provider CLIs
@@ -125,7 +130,7 @@ history before explicitly retrying an uncertain send.
 sends it automatically, and does not resolve the item.
 
 An issue's **Overview** brings its current result, next action, output links
-and verification together. A worker report is not independent review,
+and verification together. A worker report is not a fresh-session review,
 merge or deployment evidence. Activity, Conversation, Pull request and
 Evidence remain the detailed views; feedback uses the existing conversation.
 
@@ -158,7 +163,8 @@ of this flow.
   stream-json, Pi rpc via `join <pm> pi`); sessions resume by their
   native ids.
 - **A git-backed tracker** — issues are Markdown files in a private repo
-  (`~/pm`); every write is one commit, `issue log`/`blame` work from git alone.
+  (`~/.cadence/tracker` on a fresh install, `~/pm` on an existing one);
+  every write is one commit, `issue log`/`blame` work from git alone.
 - **Verified delivery** — workers report with `sha:`; reviewers bind a verdict
   to that exact head; `cadence audit` flags merges with no passing verdict.
 - **A board** — read/write SPA + JSON API on loopback; one writer
@@ -188,15 +194,17 @@ docs/       working docs — the context-manifest set stays tracked
 
 For proposals, quotations, reports and letters, give the drafting agent
 [`skills/company-outputs/SKILL.md`](skills/company-outputs/SKILL.md).
-It confirms the proposed solution before authoring, then applies one exact
-Cadence template version: guidelines and reference files for an authoring
-pack, or the existing quotation/invoice DOCX, calculation and export path.
+It finds the company's standard, asks only for what it cannot look up, confirms
+a plan when the stakes need it, and applies one exact Cadence template version:
+guidelines and reference files for an authoring pack, or the quotation/invoice
+calculation and export path. It also covers saving a good result as a template.
 There is no parallel company-profile registry. When a deliverable has a
 visual standard, the skill conditionally loads shared document-design
 guidance: inspect an authoring pack's actual references, keep a short style
-guide in that pack's guidelines, and compare the authored output. A
-quotation or invoice keeps the approved DOCX as its presentation
-standard; a reference pack may inform review only. That guidance
+guide in that pack's guidelines, and compare the authored output. An
+issuable quotation or invoice keeps its approved template as the presentation
+standard, with an HTML view allowed for drafts; a reference pack may inform
+review only. That guidance
 adds no renderer and no PDF service. An authoring pack has no
 DOCX source, prices or PDF export; the user prints or exports the final PDF.
 `cadence skill install` installs

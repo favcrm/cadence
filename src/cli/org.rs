@@ -83,22 +83,17 @@ struct RegistryFile {
 
 impl RegistryFile {
     fn path() -> Result<PathBuf> {
-        let base = match std::env::var_os("XDG_CONFIG_HOME") {
-            Some(path) => PathBuf::from(path),
-            None => PathBuf::from(
-                std::env::var_os("HOME").ok_or_else(|| Error::rejected("HOME is not set"))?,
-            )
-            .join(".config"),
-        };
-        absolute(&base)?;
-        Ok(base.join("cadence").join("orgs.json"))
+        // The same hosted config root as the credentials: `<home>/config`
+        // for a first run, `$XDG_CONFIG_HOME/cadence` (else
+        // `~/.config/cadence`) for an existing installation.
+        Ok(cadence_agent::home::config_dir()?.join("orgs.json"))
     }
     /// Exclusive flock: every read-modify-write is one locked snapshot, so a
     /// `login` racing a `switch` cannot interleave a stale default.
     fn open() -> Result<Self> {
         let path = Self::path()?;
         let dir = path.parent().expect("registry parent");
-        std::fs::create_dir_all(dir)?;
+        cadence_agent::home::create_home_dir(dir)?;
         let lock = OpenOptions::new()
             .write(true)
             .create(true)
@@ -363,20 +358,28 @@ fn view(c: &Connection, selected: bool) -> Value {
     out
 }
 
+/// Avoid accidental default changes in an inherited managed session.
+/// Environment markers are not authentication or a security boundary.
+pub(super) fn refuse_managed_default_change() -> Result<()> {
+    if std::env::var_os("CADENCE_ALIAS").is_some()
+        || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
+    {
+        return Err(Error::rejected(
+            "a managed session must not change the saved workspace default; \
+             use --org <workspace> for this command or ask the operator to change the default",
+        ));
+    }
+    Ok(())
+}
+
 /// `cadence org …` — no operator proof: a preference, never authority.
 pub(super) fn run(action: OrgAction) -> Result<i32> {
-    // A managed caller may read but never change the saved default — a UX
-    // guard, not a security claim.
-    let alias_bound = std::env::var_os("CADENCE_ALIAS").is_some();
+    if matches!(&action, OrgAction::Switch { .. }) {
+        refuse_managed_default_change()?;
+    }
     // `switch local` materializes the first-class connection before the
     // shared read, so `ensure_local`'s write lock never nests under this one.
     if matches!(&action, OrgAction::Switch { name } if name == LOCAL_ORG) {
-        if alias_bound {
-            return Err(Error::rejected(
-                "a managed caller cannot change the saved org default — \
-                 run `cadence org switch` from the operator's shell",
-            ));
-        }
         ensure_local(
             &cadence_agent::client::state_dir()?,
             &cadence_agent::issue::default_dir()?,
@@ -402,12 +405,6 @@ pub(super) fn run(action: OrgAction) -> Result<i32> {
             view(&c, registry.selected.as_ref() == Some(&c.selection))
         }
         OrgAction::Switch { name } => {
-            if alias_bound {
-                return Err(Error::rejected(
-                    "a managed caller cannot change the saved org default — \
-                     run `cadence org switch` from the operator's shell",
-                ));
-            }
             let c = select(&registry, Some(&name))?.expect("explicit org");
             registry.selected = Some(c.selection.clone());
             file.write(&registry)?;
@@ -548,6 +545,44 @@ pub(super) enum Resolved {
     Remote(cadence_agent::remote_cli::RemoteTarget),
 }
 
+/// The destination alone, for a verb whose local arm needs no state dir:
+/// `audit verdicts` parses a notes directory and must answer with no `HOME`,
+/// no daemon and no registry write. Precedence, pins, the managed binding and
+/// every refusal are [`settle`]'s, so this never disagrees with [`resolve`].
+#[derive(Debug)]
+pub(super) enum Routed {
+    Local,
+    Remote(cadence_agent::remote_cli::RemoteTarget),
+}
+
+/// [`settle`]'s answer before projection. `Local` carries only an explicit
+/// pin — the ambient state dir is materialized by [`resolve`], never by a
+/// caller that does not need one.
+enum Selected {
+    Local {
+        root: Option<PathBuf>,
+    },
+    /// A registry `local` connection: its pair is already explicit, and
+    /// selecting it exports state + tracker (CAD-657).
+    LocalConnection {
+        org: String,
+        state_dir: PathBuf,
+        tracker_dir: PathBuf,
+    },
+    Remote(cadence_agent::remote_cli::RemoteTarget),
+}
+
+/// How a settlement reads the org registry. `Locked` takes the exclusive lock
+/// (creating the directory and `orgs.lock` when the registry is there), which
+/// is what a verb that may write, or that must serialize against one, has
+/// always done. `ReadOnly` shares the same shape checks through
+/// [`read_registry_raw`] and creates nothing, so a pure read works on a
+/// read-only config directory and leaves no lock file behind.
+enum RegistryMode {
+    Locked,
+    ReadOnly,
+}
+
 fn managed_org_refused() -> Error {
     Error::rejected("managed callers cannot override their destination with --org")
 }
@@ -624,16 +659,13 @@ fn hosted_assignment_target(
     Ok(target)
 }
 
-fn resolve_managed(
+fn settle_managed(
     org: Option<&str>,
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
-) -> Result<Resolved> {
+) -> Result<Selected> {
     let Some(selector) = org else {
-        return state
-            .map(Resolved::Local)
-            .map(Ok)
-            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
+        return Ok(Selected::Local { root: state });
     };
     if state.is_some() || tracker_pin_conflicts(tracker.as_deref()) {
         return Err(pin_conflict());
@@ -645,32 +677,7 @@ fn resolve_managed(
     let state_dir = cadence_agent::client::state_dir()?;
     let target = hosted_assignment_target(&state_dir, &alias, selector)?;
     eprintln!("cadence org={} remote={}", target.org, target.endpoint);
-    Ok(Resolved::Remote(target))
-}
-
-/// Resolve this invocation's destination once. `org` is `--org`. A
-/// managed caller keeps its inherited local daemon and never consults
-/// the registry. `--org` is accepted only when the live daemon reports
-/// exactly one running message whose kickoff binding names that org and
-/// whose original member and issuer still match the saved login;
-/// endpoint and organization id come from that binding. A binding with
-/// no member pin stays unavailable. An explicit
-/// `--state-dir`, or a tracker path other than the inherited
-/// `CADENCE_PM_DIR`, still conflicts. For every other caller,
-/// `state`/`tracker` are pins — either wins over the registry and
-/// refuses `--org`. Returns [`Resolved`]; a local-org selection also
-/// exports `CADENCE_PM_DIR` so the tracker lands on the org's root.
-/// Never resolves the tracker for a managed, pinned or ambient caller —
-/// those never needed it (the CAD-313 `ui login` residual runs with no
-/// `HOME`).
-/// Whether the selected org is this machine's local state, or no org is
-/// registered at all. A hosted selection is never local — not even when it is
-/// unreachable, because "unreachable" is not "read the notes folder instead".
-pub(super) fn selected_is_local() -> Result<bool> {
-    Ok(match selected_org_readonly()? {
-        None => true,
-        Some(org) => org == LOCAL_ORG,
-    })
+    Ok(Selected::Remote(target))
 }
 
 /// The saved login's bearer for the selected remote org, or `None` when this
@@ -709,47 +716,59 @@ pub(super) fn saved_login_token(auth_dir: Option<&Path>) -> Result<Option<String
         .map(|material| material.access_token))
 }
 
-pub(super) fn resolve(
+/// Whether this shell is bound to a local Cadence installation. The login
+/// handover uses the same pin check as routing for its next command.
+pub(super) fn inherited_local_pin() -> bool {
+    [
+        "CADENCE_STATE_DIR",
+        "CADENCE_PM_DIR",
+        "CADENCE_HOME",
+        "CADENCE_PROFILE",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
+}
+
+/// Settle this invocation's destination once — the shared body of [`resolve`]
+/// and [`route`], so the two can never disagree. `org` is `--org`. A
+/// managed caller keeps its inherited local daemon and never consults
+/// the registry. `--org` is accepted only when the live daemon reports
+/// exactly one running message whose kickoff binding names that org and
+/// whose original member and issuer still match the saved login;
+/// endpoint and organization id come from that binding. A binding with
+/// no member pin stays unavailable. An explicit
+/// `--state-dir`, or a tracker path other than the inherited
+/// `CADENCE_PM_DIR`, still conflicts. For every other caller,
+/// `state`/`tracker` are pins — either wins over the registry and
+/// refuses `--org`. Never resolves the tracker for a managed, pinned or
+/// ambient caller — those never needed it (the CAD-313 `ui login`
+/// residual runs with no `HOME`).
+fn settle(
     org: Option<&str>,
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
-) -> Result<Resolved> {
+    mode: RegistryMode,
+) -> Result<Selected> {
     if std::env::var_os("CADENCE_ALIAS").is_some() {
-        return resolve_managed(org, state, tracker);
+        return settle_managed(org, state, tracker);
     }
     // An explicit flag or inherited binding is a pin; it conflicts with
     // `--org` rather than mixing roots.
-    let pinned = state.is_some()
-        || tracker.is_some()
-        || [
-            "CADENCE_STATE_DIR",
-            "CADENCE_PM_DIR",
-            "CADENCE_HOME",
-            "CADENCE_PROFILE",
-        ]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some());
+    let pinned = state.is_some() || tracker.is_some() || inherited_local_pin();
     if pinned {
         if org.is_some() {
             return Err(pin_conflict());
         }
-        return state
-            .map(Resolved::Local)
-            .map(Ok)
-            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
+        return Ok(Selected::Local { root: state });
     }
     let org_env = std::env::var("CADENCE_ORG").ok();
     let org = org.or(org_env.as_deref());
     // No org anywhere and no registry → ambient local; the registry never
     // has to exist for standalone local use.
-    let file = match RegistryFile::path() {
-        Ok(p) if p.exists() => Some(RegistryFile::open()?),
-        _ => None,
-    };
-    let selection = match (&file, org) {
+    let registry = read_selection_registry(mode)?;
+    let selection = match (&registry, org) {
         (None, Some(name)) if name != LOCAL_ORG => return Err(unknown_org(name, false)),
-        (Some(file), _) => {
-            let registry = file.read()?;
+        (Some(registry), _) => {
             if org == Some(LOCAL_ORG) {
                 registry
                     .connections
@@ -757,25 +776,29 @@ pub(super) fn resolve(
                     .find(|c| c.selection.org == LOCAL_ORG)
                     .cloned()
             } else {
-                select(&registry, org)?
+                select(registry, org)?
             }
         }
         _ => None,
     };
     let Some(conn) = selection else {
-        return cadence_agent::client::state_dir().map(Resolved::Local);
+        return Ok(Selected::Local { root: None });
     };
     match conn.destination {
         Destination::Local {
             state_dir,
             tracker_dir,
-        } => local_resolved(&conn.selection.org, state_dir, tracker_dir),
+        } => Ok(Selected::LocalConnection {
+            org: conn.selection.org,
+            state_dir,
+            tracker_dir,
+        }),
         Destination::Remote { endpoint, org_id } => {
             // The destination is the issuer-verified endpoint recorded at
             // login — `remote_cli` refuses to send this org's credential
             // anywhere else, and there is no local fallback.
             eprintln!("cadence org={} remote={}", conn.selection.org, endpoint);
-            Ok(Resolved::Remote(cadence_agent::remote_cli::RemoteTarget {
+            Ok(Selected::Remote(cadence_agent::remote_cli::RemoteTarget {
                 identity: None,
                 org: conn.selection.org,
                 endpoint,
@@ -783,6 +806,99 @@ pub(super) fn resolve(
             }))
         }
     }
+}
+
+/// The registry a settlement reads. `Locked` keeps the exclusive-lock read
+/// every other verb uses. `ReadOnly` answers a pure read through the same shape
+/// checks without taking or creating `orgs.lock`, and fails closed: that read
+/// opens `O_NOFOLLOW`, so a dangling symlink, a permission error and a non-file
+/// all refuse — only a genuine `NotFound` is "no registry". A config root this
+/// process declared but cannot use (a relative `XDG_CONFIG_HOME`, a `HOME` that
+/// is not absolute) is a broken selection, not an absent one, so it refuses
+/// too; with neither `HOME` nor `XDG_CONFIG_HOME` set there is nowhere a
+/// registry could be kept, and a local read still answers.
+fn read_selection_registry(mode: RegistryMode) -> Result<Option<Registry>> {
+    let resolved = RegistryFile::path();
+    match mode {
+        // Unchanged for every other verb: an unplaceable registry path is "no
+        // registry", and so is one `exists()` does not report; opening it
+        // takes the write lock.
+        RegistryMode::Locked => {
+            if !resolved.as_ref().is_ok_and(|path| path.exists()) {
+                return Ok(None);
+            }
+            RegistryFile::open()?.read().map(Some)
+        }
+        // `raw` is `Some` on every successful read, so its presence is exactly
+        // "a registry exists" — no second stat, no stat/open race.
+        RegistryMode::ReadOnly => {
+            let path = match resolved {
+                Ok(path) => path,
+                Err(_) if !config_root_declared() => return Ok(None),
+                Err(e) => {
+                    return Err(Error::rejected(format!(
+                        "cannot locate the org registry: {e}"
+                    )))
+                }
+            };
+            let (registry, raw) = read_registry_raw(&path)?;
+            Ok(raw.map(|_| registry))
+        }
+    }
+}
+
+/// Whether this process said where its config lives — `XDG_CONFIG_HOME`, else
+/// `HOME`. A registry path that cannot be built from a declared root is a
+/// broken selection; with neither set there is nowhere to keep one.
+fn config_root_declared() -> bool {
+    ["XDG_CONFIG_HOME", "HOME"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+}
+
+/// The local state dir a caller that needs one materializes: an explicit pin,
+/// else the ambient `CADENCE_STATE_DIR`/home default. [`route`] never calls
+/// this, so a local read never needs `HOME`.
+fn local_root(root: Option<PathBuf>) -> Result<PathBuf> {
+    root.map(Ok)
+        .unwrap_or_else(cadence_agent::client::state_dir)
+}
+
+/// Resolve this invocation's destination once, materializing the local state
+/// dir and exporting a local connection's state + tracker pair. Precedence,
+/// pins and refusals are [`settle`]'s.
+pub(super) fn resolve(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    match settle(org, state, tracker, RegistryMode::Locked)? {
+        Selected::Local { root } => local_root(root).map(Resolved::Local),
+        Selected::LocalConnection {
+            org,
+            state_dir,
+            tracker_dir,
+        } => local_resolved(&org, state_dir, tracker_dir),
+        Selected::Remote(target) => Ok(Resolved::Remote(target)),
+    }
+}
+
+/// [`resolve`]'s destination only, for a verb whose local arm needs no state
+/// dir: `audit verdicts` parses a notes directory and must answer with no
+/// `HOME`, no daemon, and no write — the registry is read without taking or
+/// creating `orgs.lock`, so the config directory is left untouched. An
+/// explicit unknown org, a pin conflict and a managed override still refuse
+/// exactly as [`resolve`] does, and a hosted selection is still the org's own
+/// destination — never a local fallback.
+pub(super) fn route(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Routed> {
+    Ok(match settle(org, state, tracker, RegistryMode::ReadOnly)? {
+        Selected::Local { .. } | Selected::LocalConnection { .. } => Routed::Local,
+        Selected::Remote(target) => Routed::Remote(target),
+    })
 }
 
 /// Shared `Destination::Local` routing: export the pair so state and
@@ -795,11 +911,13 @@ fn local_resolved(org: &str, state_dir: PathBuf, tracker_dir: PathBuf) -> Result
 }
 
 /// Which local-maintenance command is resolving, so a remote selector can
-/// name that command. Not a mode framework: only `update` and `dev`.
+/// name that command.
 #[derive(Clone, Copy)]
 enum LocalMaintenance {
     Update,
     Dev,
+    Setup,
+    SkillRead,
 }
 
 impl LocalMaintenance {
@@ -816,15 +934,23 @@ impl LocalMaintenance {
                  is remote. A saved remote org does not select it. Omit the remote \
                  `--org`/`CADENCE_ORG`, or choose local (for example `CADENCE_ORG=local`)."
             )),
+            Self::Setup => Error::rejected(format!(
+                "`cadence setup` installs on this machine only — org '{name}' is \
+                 remote. Its hosted routes are its own `--hosted`/`--register` flags; \
+                 omit the remote `--org`/`CADENCE_ORG`, or choose local."
+            )),
+            Self::SkillRead => Error::rejected(format!(
+                "`cadence skill status` and `cadence skill show` inspect this machine's \
+                 guidance, not remote org '{name}'. Omit the remote `--org`/`CADENCE_ORG`."
+            )),
         }
     }
 
     /// `update` keeps its pin arm: an explicit root wins and `CADENCE_ORG`
-    /// is not consulted. `dev` still keeps that root, but a remote
-    /// `CADENCE_ORG` beside it is a deliberate selection and must refuse
-    /// instead of being dropped on the floor.
+    /// is not consulted. For `dev`, `setup`, and skill reads, a remote
+    /// `CADENCE_ORG` beside that root is deliberate and must not be discarded.
     fn refuse_remote_env_beside_pins(self) -> bool {
-        matches!(self, Self::Dev)
+        matches!(self, Self::Dev | Self::Setup | Self::SkillRead)
     }
 }
 
@@ -886,6 +1012,18 @@ pub(super) fn resolve_update(
     resolve_local_maintenance(LocalMaintenance::Update, org, state, tracker)
 }
 
+/// `cadence setup` installs on this machine. It shares the local-maintenance
+/// selector, so a saved *local* connection keeps its state and tracker, a
+/// saved remote default never routes it over the allowlist, and a remote
+/// `--org`/`CADENCE_ORG` is refused rather than silently ignored.
+pub(super) fn resolve_setup(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    resolve_local_maintenance(LocalMaintenance::Setup, org, state, tracker)
+}
+
 /// `cadence dev` (`sandbox` alias) is local maintenance of a disposable
 /// Cadence. Same selector rules as [`resolve_update`], plus: a remote
 /// `CADENCE_ORG` is refused even when a local pin or managed inherited
@@ -898,6 +1036,17 @@ pub(super) fn resolve_dev(
     tracker: Option<PathBuf>,
 ) -> Result<Resolved> {
     resolve_local_maintenance(LocalMaintenance::Dev, org, state, tracker)
+}
+
+/// Read-only skill discovery is local to the installation. Like `dev`, a
+/// saved remote default does not select it, but a deliberate remote
+/// selector is refused rather than silently discarded.
+pub(super) fn resolve_skill_read(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    resolve_local_maintenance(LocalMaintenance::SkillRead, org, state, tracker)
 }
 
 fn resolve_local_maintenance(
@@ -1041,6 +1190,13 @@ mod tests {
             std::env::set_var("HOME", home.path());
             std::env::set_var("XDG_CONFIG_HOME", home.path().join("config"));
             std::env::set_var("XDG_STATE_HOME", home.path().join("xdg-state"));
+            // CAD-1922: a `HOME`/XDG-only environment with nothing in it
+            // is a first run, which resolves `~/.cadence`. This fixture
+            // models an EXISTING installation (ambient local state under
+            // `XDG_STATE_HOME`), so it presents that installation's own
+            // roots before anything resolves.
+            std::fs::create_dir_all(home.path().join("xdg-state").join("cadence")).unwrap();
+            std::fs::create_dir_all(home.path().join("config").join("cadence")).unwrap();
             Self { home, saved }
         }
         fn expected_state(&self) -> PathBuf {

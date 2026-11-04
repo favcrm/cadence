@@ -344,6 +344,11 @@ pub(crate) fn repo_identity(cwd: &Path) -> Option<(PathBuf, Option<String>)> {
 }
 
 /// Load every `<pm>/<key>/project.yaml`, sorted by key.
+///
+/// An unreadable tracker answers an empty list, and an entry whose type
+/// cannot be read is skipped. That is right for callers that only render what
+/// they could read, and **wrong for access decisions**: an empty list reads as
+/// "nothing is restricted". Authorization uses [`list_checked`].
 pub fn list(pm_dir: &Path) -> Result<Vec<Project>> {
     let mut projects = Vec::new();
     let Ok(entries) = std::fs::read_dir(pm_dir) else {
@@ -355,6 +360,69 @@ pub fn list(pm_dir: &Path) -> Result<Vec<Project>> {
         let dir_ok = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let file = entry.path().join("project.yaml");
         if dir_ok && crate::issue::board::is_real_file(&file) {
+            projects.push(load(&file)?);
+        }
+    }
+    projects.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(projects)
+}
+
+/// [`list`] for an access decision (CAD-1950).
+///
+/// Identical rows, but an answer that cannot be trusted is an error rather
+/// than an empty list: an unreadable tracker directory, or an entry whose type
+/// cannot be read, might be hiding a restricted project. A tracker that does
+/// not exist is `Ok(empty)` — nothing is there to hide — so a fresh checkout
+/// behaves as before. Callers that must fail closed map the error to "no
+/// projects", which refuses every project rather than admitting all of them.
+pub fn list_checked(pm_dir: &Path) -> Result<Vec<Project>> {
+    let entries = match std::fs::read_dir(pm_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(Error::internal(format!(
+                "cannot read the tracker {}: {e}",
+                pm_dir.display()
+            )))
+        }
+    };
+    let mut projects = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            Error::internal(format!(
+                "cannot read an entry of the tracker {}: {e}",
+                pm_dir.display()
+            ))
+        })?;
+        // lstat-style, as `list`: a symlinked project dir or project.yaml is
+        // not a project.
+        let kind = entry.file_type().map_err(|e| {
+            Error::internal(format!(
+                "cannot classify {} in the tracker: {e}",
+                entry.path().display()
+            ))
+        })?;
+        let file = entry.path().join("project.yaml");
+        if !kind.is_dir() {
+            continue;
+        }
+        // `is_real_file` answers false for *any* metadata error, so a project
+        // directory that cannot be searched is silently omitted — the same
+        // fail-open this listing exists to close, one level down. Distinguish
+        // "no project.yaml here" (not a project) from "cannot tell".
+        let meta = match std::fs::symlink_metadata(&file) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(Error::internal(format!(
+                    "cannot inspect {}: {e}",
+                    file.display()
+                )))
+            }
+        };
+        // lstat-style, as `list`: a symlinked or non-regular project.yaml is
+        // not a project.
+        if meta.is_file() && !meta.file_type().is_symlink() {
             projects.push(load(&file)?);
         }
     }
@@ -377,58 +445,112 @@ pub fn load(file: &Path) -> Result<Project> {
     Ok(project)
 }
 
-/// The project key a cwd's repo identity resolves to — remote first,
-/// then checkout path, same as [`resolve`]'s cwd arm — or `None` when
-/// nothing matches. Read-only; `agent list --project` maps each row's
-/// `cwd` through this.
-pub fn key_for_cwd(pm_dir: &Path, cwd: &Path) -> Option<String> {
-    let (root, remote) = repo_identity(cwd)?;
-    let projects = list(pm_dir).ok()?;
-    if let Some(remote) = &remote {
-        if let Some(p) = projects.iter().find(|p| {
+/// Every project whose `repos` claim this checkout — a `repos[].remote`
+/// equal to the checkout's origin, then a `repos[].path` equal to its
+/// root — sorted by key. A repo registered by several projects lists
+/// every claimant: resolution must never pick the first one (CAD-2001).
+fn claimants<'a>(projects: &'a [Project], root: &Path, remote: Option<&str>) -> Vec<&'a Project> {
+    let mut hits: Vec<&Project> = Vec::new();
+    if let Some(remote) = remote {
+        hits.extend(projects.iter().filter(|p| {
             p.repos.iter().any(|r| {
                 r.remote
                     .as_deref()
-                    .map(|rr| normalize_remote(rr) == *remote)
-                    .unwrap_or(false)
+                    .is_some_and(|rr| normalize_remote(rr) == remote)
             })
-        }) {
-            return Some(p.key.clone());
+        }));
+    }
+    for project in projects {
+        if hits.iter().any(|hit| hit.key == project.key) {
+            continue;
+        }
+        let claims = project.repos.iter().any(|r| {
+            r.path.as_ref().is_some_and(|path| {
+                let path = expand_home(path);
+                path.canonicalize().unwrap_or(path) == root
+            })
+        });
+        if claims {
+            hits.push(project);
         }
     }
-    projects
-        .iter()
-        .find(|p| {
-            p.repos.iter().any(|r| {
-                r.path.as_ref().is_some_and(|path| {
-                    let path = expand_home(path);
-                    path.canonicalize().unwrap_or(path) == root
-                })
-            })
-        })
+    hits.sort_by(|a, b| a.key.cmp(&b.key));
+    hits
+}
+
+/// The project keys claiming a cwd's checkout, in key order. Empty when
+/// the cwd is not a git checkout or no project claims it. Read-only and
+/// best-effort: an unreadable tracker claims nothing.
+pub fn claimants_for_cwd(pm_dir: &Path, cwd: &Path) -> Vec<String> {
+    let Ok(projects) = list(pm_dir) else {
+        return Vec::new();
+    };
+    claimants_for(&projects, cwd)
+}
+
+/// [`claimants_for_cwd`] against an already-loaded project list — a
+/// caller that read the tracker once does not re-read it per agent.
+pub fn claimants_for(projects: &[Project], cwd: &Path) -> Vec<String> {
+    let Some((root, remote)) = repo_identity(cwd) else {
+        return Vec::new();
+    };
+    claimants(projects, &root, remote.as_deref())
+        .into_iter()
         .map(|p| p.key.clone())
+        .collect()
+}
+
+/// The project key a cwd's repo identity resolves to — remote first,
+/// then checkout path — or `None` when nothing claims it **or more than
+/// one project does**. A repo registered by several projects is
+/// ambiguous, and this signature cannot report that: a caller that must
+/// explain the refusal uses [`resolve`] or [`claimants_for_cwd`].
+/// Read-only; `agent list --project` maps each row's `cwd` through this.
+pub fn key_for_cwd(pm_dir: &Path, cwd: &Path) -> Option<String> {
+    match claimants_for_cwd(pm_dir, cwd).as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
 }
 
 /// The project key owning an issue id, by its `<PREFIX>-<n>` prefix.
-/// `None` for a malformed id or an unknown prefix.
+/// `None` for a malformed id, an unknown prefix, or a prefix two
+/// projects share — the id then names no single project.
 pub fn key_for_issue(pm_dir: &Path, issue_id: &str) -> Option<String> {
     let (prefix, _) = issue_id.rsplit_once('-')?;
-    list(pm_dir)
+    let mut keys = list(pm_dir)
         .ok()?
         .into_iter()
-        .find(|p| p.prefix == prefix)
-        .map(|p| p.key)
+        .filter(|p| p.prefix == prefix)
+        .map(|p| p.key);
+    let first = keys.next()?;
+    keys.next().is_none().then_some(first)
 }
 
 /// Resolve the project an issue command files into: `--project` flag,
 /// then `CADENCE_PROJECT`, then the cwd's git identity against every
-/// project.yaml (remote first, then checkout path). No match fails
+/// project.yaml (remote first, then checkout path). A named project is
+/// authoritative even when its repo is shared. A cwd claimed by several
+/// projects is refused by name — never first-match. No match fails
 /// closed with the known project list.
 pub fn resolve(pm_dir: &Path, flag: Option<&str>, cwd: &Path) -> Result<Project> {
+    let env = std::env::var("CADENCE_PROJECT").ok();
+    resolve_with(pm_dir, flag, env.as_deref(), cwd)
+}
+
+/// [`resolve`] with the ambient `CADENCE_PROJECT` passed in, so the
+/// precedence order is one testable place: flag, then `named_env`, then
+/// the cwd.
+fn resolve_with(
+    pm_dir: &Path,
+    flag: Option<&str>,
+    named_env: Option<&str>,
+    cwd: &Path,
+) -> Result<Project> {
     let projects = list(pm_dir)?;
     let named = flag
         .map(str::to_string)
-        .or_else(|| std::env::var("CADENCE_PROJECT").ok())
+        .or_else(|| named_env.map(str::to_string))
         .filter(|s| !s.is_empty());
     if let Some(name) = named {
         return projects
@@ -439,39 +561,36 @@ pub fn resolve(pm_dir: &Path, flag: Option<&str>, cwd: &Path) -> Result<Project>
     let Some((root, remote)) = repo_identity(cwd) else {
         return Err(unknown_project("(no git repo at cwd)", pm_dir));
     };
-    if let Some(remote) = &remote {
-        for project in &projects {
-            if project.repos.iter().any(|r| {
-                r.remote
-                    .as_deref()
-                    .map(|p| normalize_remote(p) == *remote)
-                    .unwrap_or(false)
-            }) {
-                return Ok(project.clone());
-            }
-        }
+    match claimants(&projects, &root, remote.as_deref()).as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err(unknown_project(
+            &format!("(cwd repo {} matched nothing)", root.display()),
+            pm_dir,
+        )),
+        many => Err(ambiguous_project(
+            &root,
+            &many.iter().map(|p| p.key.as_str()).collect::<Vec<_>>(),
+        )),
     }
-    for project in &projects {
-        for repo in &project.repos {
-            if let Some(path) = &repo.path {
-                let path = expand_home(path)
-                    .canonicalize()
-                    .unwrap_or_else(|_| expand_home(path));
-                if path == root {
-                    return Ok(project.clone());
-                }
-            }
-        }
-    }
-    Err(unknown_project(
-        &format!("(cwd repo {} matched nothing)", root.display()),
-        pm_dir,
+}
+
+/// A cwd its projects cannot answer for: refuse by name rather than
+/// pick a first claimant, and point at the explicit selectors.
+fn ambiguous_project(root: &Path, keys: &[&str]) -> Error {
+    Error::rejected(format!(
+        "{} is registered by {} projects ({}) — pass --project <key> or set \
+         CADENCE_PROJECT; a repo shared by several projects has no single project",
+        root.display(),
+        keys.len(),
+        keys.join(", ")
     ))
 }
 
 /// Read-only project scope for setup. Never creates a git repo, a
 /// tracker, or a project registration. `named` is `CADENCE_PROJECT`
-/// when the caller has one.
+/// when the caller has one. A cwd claimed by several projects is
+/// reported as `ambiguous: true` with its `candidates`, never resolved
+/// to the first claimant.
 pub fn observe(pm_dir: &Path, cwd: &Path, named: Option<&str>) -> Value {
     let register = "cadence issue project add <key> --prefix <P> --repo <path>";
     if let Some(name) = named.map(str::trim).filter(|name| !name.is_empty()) {
@@ -500,24 +619,47 @@ pub fn observe(pm_dir: &Path, cwd: &Path, named: Option<&str>) -> Value {
             "register": register,
         });
     };
-    if let Some(key) = key_for_cwd(pm_dir, cwd) {
-        return json!({
+    let projects = list(pm_dir).unwrap_or_default();
+    match claimants(&projects, &root, remote.as_deref()).as_slice() {
+        [one] => json!({
             "resolved": true,
             "source": "cwd",
-            "key": key,
+            "key": one.key,
             "repo": root,
             "remote": remote,
             "register": Value::Null,
-        });
+        }),
+        [] => json!({
+            "resolved": false,
+            "source": "cwd",
+            "repo": root,
+            "remote": remote,
+            "detail": "cwd git identity matched no registered project",
+            "register": register,
+        }),
+        // CAD-2001: a shared repo names no single project. Report the
+        // claimants instead of resolving to the first one, and offer the
+        // explicit selector rather than a registration this checkout
+        // does not need.
+        many => json!({
+            "resolved": false,
+            "source": "cwd",
+            "ambiguous": true,
+            "candidates": many.iter().map(|p| p.key.clone()).collect::<Vec<_>>(),
+            "repo": root,
+            "remote": remote,
+            "detail": format!(
+                "cwd git identity is registered by {} projects ({}) — set \
+                 CADENCE_PROJECT or pass --project; refusing to pick one",
+                many.len(),
+                many.iter()
+                    .map(|p| p.key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "register": Value::Null,
+        }),
     }
-    json!({
-        "resolved": false,
-        "source": "cwd",
-        "repo": root,
-        "remote": remote,
-        "detail": "cwd git identity matched no registered project",
-        "register": register,
-    })
 }
 
 pub(crate) fn unknown_project(name: &str, pm_dir: &Path) -> Error {
@@ -586,6 +728,127 @@ mod tests {
         let file = dir.path().join("project.yaml");
         std::fs::write(&file, format!("key: x\nprefix: X\n{body}")).unwrap();
         file
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// A tracker with `alpha` and `beta` both registering one checkout,
+    /// plus a checkout no project claims.
+    fn shared_tracker() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pm_dir = dir.path().join("pm");
+        let repo = dir.path().join("repo");
+        let loose = dir.path().join("loose");
+        for path in [&pm_dir, &repo, &loose] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        git(&repo, &["init", "-q", "-b", "main"]);
+        let repo = repo.canonicalize().unwrap();
+        for (key, prefix) in [("alpha", "ALP"), ("beta", "BET")] {
+            let project = Project {
+                key: key.to_string(),
+                prefix: prefix.to_string(),
+                repos: vec![Repo {
+                    path: Some(repo.to_string_lossy().to_string()),
+                    remote: None,
+                    base: None,
+                }],
+                components: Vec::new(),
+                tags: Vec::new(),
+                default_owner: None,
+                build: None,
+                memory: None,
+                intake: None,
+                id: Some(new_id()),
+                policy: Some(ProjectPolicy::workspace_visible()),
+            };
+            let project_dir = pm_dir.join(key);
+            std::fs::create_dir_all(&project_dir).unwrap();
+            std::fs::write(
+                project_dir.join("project.yaml"),
+                serde_yaml::to_string(&project).unwrap(),
+            )
+            .unwrap();
+        }
+        (dir, pm_dir, repo, loose)
+    }
+
+    /// CAD-2001: one repo, two projects. The explicit selectors stay
+    /// authoritative; a cwd-only resolution names both claimants and
+    /// refuses instead of taking the first.
+    #[test]
+    fn a_shared_repo_never_resolves_a_cwd_to_the_first_project() {
+        let (_dir, pm_dir, repo, loose) = shared_tracker();
+
+        assert_eq!(claimants_for_cwd(&pm_dir, &repo), ["alpha", "beta"]);
+        assert_eq!(key_for_cwd(&pm_dir, &repo), None);
+
+        for key in ["alpha", "beta"] {
+            let picked = resolve_with(&pm_dir, Some(key), None, &repo).unwrap();
+            assert_eq!(picked.key, key);
+            // CADENCE_PROJECT is authoritative too, flag absent.
+            let picked = resolve_with(&pm_dir, None, Some(key), &repo).unwrap();
+            assert_eq!(picked.key, key);
+        }
+
+        let refused = resolve_with(&pm_dir, None, None, &repo)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("registered by 2 projects"), "{refused}");
+        assert!(refused.contains("alpha, beta"), "{refused}");
+        assert!(refused.contains("--project"), "{refused}");
+
+        let scope = observe(&pm_dir, &repo, None);
+        assert_eq!(scope["resolved"], false);
+        assert_eq!(scope["ambiguous"], true);
+        assert_eq!(scope["candidates"], serde_json::json!(["alpha", "beta"]));
+        assert_eq!(scope["register"], serde_json::Value::Null);
+
+        // No claimant is not an ambiguity: the old message stands.
+        let unknown = resolve_with(&pm_dir, None, None, &loose)
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("no git repo at cwd"), "{unknown}");
+        let scope = observe(&pm_dir, &loose, None);
+        assert_eq!(scope["resolved"], false);
+        assert_eq!(scope["ambiguous"], serde_json::Value::Null);
+
+        // The old non-ambiguous behavior survives: one claimant, no
+        // selector, resolves as before.
+        std::fs::remove_dir_all(pm_dir.join("beta")).unwrap();
+        assert_eq!(claimants_for_cwd(&pm_dir, &repo), ["alpha"]);
+        assert_eq!(key_for_cwd(&pm_dir, &repo).as_deref(), Some("alpha"));
+        assert_eq!(
+            resolve_with(&pm_dir, None, None, &repo).unwrap().key,
+            "alpha"
+        );
+        assert_eq!(observe(&pm_dir, &repo, None)["key"], "alpha");
+    }
+
+    /// CAD-1950: the checked listing agrees with `list` for a real tracker,
+    /// and a tracker that is simply not there is empty rather than an error —
+    /// there is nothing to hide. Only an unreadable *existing* tracker refuses.
+    #[test]
+    fn the_checked_listing_matches_list_and_tolerates_a_missing_tracker() {
+        let tracker = tempfile::TempDir::new().unwrap();
+        let project = tracker.path().join("x");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("project.yaml"), "key: x\nprefix: X\n").unwrap();
+
+        assert_eq!(list_checked(tracker.path()).unwrap().len(), 1);
+        assert_eq!(list(tracker.path()).unwrap().len(), 1);
+        assert_eq!(list_checked(tracker.path()).unwrap()[0].key, "x");
+        assert!(list_checked(&tracker.path().join("absent"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -28,8 +28,8 @@ path does not require `provider.draft`. The optional legacy external-adapter
 and publisher setup commands below request separate financial consent:
 
 ```sh
-cadence --org <slug> local-agent tool --lane provider.draft
-cadence --org <slug> local-agent tool --lane publish.send
+cadence --org <slug> agent tool --lane provider.draft
+cadence --org <slug> agent tool --lane publish.send
 ```
 
 These use the existing device consent endpoints, not a new token issuer.
@@ -86,11 +86,27 @@ printed on errors.
 
 Credentials use an explicit permission-restricted file fallback, not an OS
 keychain: `$XDG_CONFIG_HOME/cadence/remote-auth/credential.json` (otherwise
-`~/.config/cadence/remote-auth/credential.json`). Directory permissions are 0700
-and file permissions 0600; symlinks and unsafe ownership/permissions are refused.
-Concurrent saves are serialized. Use an absolute `--auth-dir` for isolated
-development or a separate connection. A different issuer/organization cannot
-replace an existing credential; org switching is separate CAD-657 work.
+`~/.config/cadence/remote-auth/credential.json`). A first run — no existing
+tracker, state directory or hosted config — keeps them in its consolidated
+home instead: `<CADENCE_HOME>/config/remote-auth/credential.json`, which is
+`~/.cadence/config/remote-auth/credential.json` by default (CAD-1922), even
+when `XDG_CONFIG_HOME` is exported (writing them there would make the next run
+see two layouts). A run given an explicit `CADENCE_HOME` with
+`XDG_CONFIG_HOME` exported uses `$XDG_CONFIG_HOME/cadence` instead; one given
+`CADENCE_HOME` without it reads a legacy root that already holds something and
+otherwise uses `<CADENCE_HOME>/config`. An installation that already has
+credentials never has them relocated by simply adding a `CADENCE_HOME`: the
+resolver reads the default roots and the named home, not a previous
+consolidated home. Directory permissions are 0700 and file permissions 0600;
+inside the consolidated home a symlinked home root, config root, credential
+directory or credential file is refused rather than followed — legacy config
+roots outside that home are not inspected that way. Concurrent saves are
+serialized. Use an absolute `--auth-dir` for isolated development or a
+separate connection. A different issuer/organization cannot replace an
+existing credential; org switching is separate CAD-657 work.
+
+For a fresh installation the same file lives under the consolidated home:
+`<CADENCE_HOME>/config/remote-auth/cli-<workspace>.json`.
 
 `cadence auth logout` removes the local credential only. Revoke the server
 credential using AgenticOS connected devices. Logout does not clear an environment
@@ -114,6 +130,14 @@ the new workspace as the saved default, `--no-open` to print the
 registration URL instead of opening a browser, and `--json` for
 machine-readable success or failure state.
 
+In a session inheriting `CADENCE_ALIAS` or `CADENCE_GRANT_TOKEN`, hosted portal
+login and registration refuse `--use` before starting consent. `org switch`
+refuses before changing the registry. The operator can choose a default in
+their own shell; agents should target their assigned workspace explicitly. This
+is an accidental-change guard, not caller authentication: environment variables
+can be removed or changed, and filesystem permissions govern shared credentials
+and preferences.
+
 To preselect a workspace, use `cadence login <slug>`; the issuer verifies
 that selection and returns the authoritative workspace ID and slug. The
 CLI validates the returned slug and canonical audience before recording
@@ -128,6 +152,17 @@ remove an org binding; a verified re-login replaces it. Use
 `cadence login <slug> --use`) to make it the saved default; without
 `--use`, the current default is unchanged. `--no-open` prints the approval
 URL and code without opening a browser.
+
+After an unmanaged caller's successful browser login or human-readable
+registration, the CLI reports whether that workspace is the saved default.
+Without `--auth-dir`, it gives an explicit `cadence --org <slug> status` next
+step. With `--auth-dir`, it explains that hosted commands use the default
+credential directory; if the directories differ, sign in without `--auth-dir`
+before using those commands.
+Changing the saved default remains a separate choice. If the shell is bound to
+a local Cadence installation, use a shell without that binding for hosted
+commands. A managed agent uses its assignment's workspace binding rather than
+the saved default.
 
 An owner or current member can approve ordinary collaboration. Both the portal
 and explicit org login request `cli.read`, `cli.write`, `wiki.read` and
@@ -196,7 +231,7 @@ verb. `verb` is one of a fixed allowlist — `status`, `agent_list`,
 `agent_show`, `issue_ls`, `issue_show`, `issue_history`, `message_read`,
 `message_inbox`, `team_list`, `team_invites`, `issue_new`, `issue_comment`,
 `issue_set`, `team_invite`, `team_revoke_invite`, `team_set_role`,
-`team_remove`, `project_policy`, `message_send` — and
+`team_remove`, `project_policy`, `project_ls`, `project_new`, `message_send` — and
 `arguments` is a strict per-verb payload. Any
 other command is refused locally and never sent.
 
@@ -357,8 +392,15 @@ Refusals happen locally, before a byte is sent: `issue new` without
 `--id`/`--status`; `issue comment` with `--author` or `--kind`; `issue
 set` without `--if-rev`, with an empty revision, with `--force`, or
 naming more than one ticket. `--file` bodies are read client-side (`-` = stdin) and
-bounded by the 32 KB cap — never remote paths. `issue
-edit/attach`, provider verbs and operator verbs are not on the wire.
+bounded by the 32 KB cap — never remote paths. `issue edit`, provider verbs
+and operator verbs are not on the wire.
+
+When this build rejects a command locally as unavailable for a hosted org,
+the refusal names the command and confirms that no request was sent. Check the
+hosted CLI documentation for alternatives on that workspace. Switching to a
+local org selects a different tracker; it does not complete the hosted task.
+Authorization refusals and uncertain outcomes after dispatch retain their
+separate semantics.
 
 `issue set` is compare-and-swap: send the `rev` from `issue show`
 (`--if-rev`); a stale revision answers the conflict payload (HTTP 409
@@ -379,6 +421,47 @@ Each collaborating writer enrolls independently: a separate
 `XDG_CONFIG_HOME` (or separate account/machine) per identity, its own
 `cadence login` grant — credentials are never copied between homes.
 
+### Remote projects (CAD-1999)
+
+A hosted org keeps its own project registry, so a project can exist before
+any ticket does. `cadence project new` registers one; `cadence issue project
+ls` reads the registry, and `cadence issue ls --project <key>` reads its
+tickets (an empty registered project is an empty list).
+
+```sh
+cadence --org acme project new ops --name "Operations" [--prefix OPS]
+cadence --org acme issue project ls
+cadence --org acme issue ls --project ops
+```
+
+`project_new` arguments are exactly `{key, name, prefix?}`. `key` is 1-32
+lowercase letters, digits or hyphens; `name` is the required human label
+(1-200 bytes) and stays distinct from the key; `prefix` is the issue-id
+prefix (1-16 letters/digits starting with a letter, upper-cased, derived
+from the key when absent — letters/digits, up to 16, starting with a
+letter, else `ISSUE`; a local project keeps its own 1-8 character default
+of the key's first three letters/digits). The answer is
+`{project:{key,name,prefix,issues}, duplicate}`. The same key, name and
+prefix is the same project (`duplicate: true`); a key already registered —
+or already present only as its tickets' project — with a different name or
+prefix is `409 project_exists`; a prefix another project already uses is
+`409 prefix_conflict`. `project_ls` also reports the ticket-only projects,
+whose `name` is their key.
+
+Only a live human workspace owner is admitted to `project_new` (`cli.write`);
+`project_ls` is `cli.read`. A managed caller never spends the stored owner
+login for it: `--repo`, `--goal`, `--agent` and `--issue` refuse (a hosted
+org has no checkout or PROJECT.md), `--name` is required, `issue project ls`
+refuses `--sort`/`--limit`/`--fields`, and `issue ls` filters one `--project`
+per call. Nothing is renamed or deleted remotely. A `project_new` answer
+that is lost, unparsable (empty, 204, non-JSON), missing the requested
+project (a `null`, `{ok:true}` or foreign body), carrying a missing, invalid
+or different issue-id prefix, or a 5xx naming no pre-forward state is
+`outcome_unknown`: reconcile with `issue project ls` before repeating,
+since the same key, name and prefix is the same project.
+A board that predates CAD-1999 refuses the two registry verbs as an unknown
+verb — the command ends there, with no local fallback.
+
 ### Remote message send (CAD-1568)
 
 `cadence send` (and its `message send` form) enqueue a durable coordination
@@ -392,7 +475,7 @@ The selected row's UID is checked inside the enqueue transaction; removing
 or replacing that recipient before enqueue refuses the send rather than
 allowing a later generic lookup to redirect it.
 Personal assistants require separate assistant authority and local workers
-use the `local-agent`/local-assignment plane; neither is a remote-send recipient.
+use the local-assignment plane (`agent connect` and the other hosted `agent` verbs); neither is a remote-send recipient.
 Generic member-to-member `send` and the local-worker follow-up journey remain
 refused on this transport. Explicit directory-addressed FYIs use the separate
 [`agent notify` flow](guides/hosted-workspace.md#a-teammates-own-agent-collaboration-flow);

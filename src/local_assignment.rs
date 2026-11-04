@@ -76,9 +76,14 @@ struct Assignment {
     target: Option<String>,
     created_by_subject_id: String,
     client_agent_id: Option<String>,
+    /// The profile the board recorded for this claim, when it recorded one.
+    profile_id: Option<String>,
     guidance: Option<Value>,
     reported_head_sha: Option<String>,
     text: Option<String>,
+    /// The board's work kind when it is not dev work. Still parsed, listed and
+    /// fenced; only `claim_with_profile` and `pickup_rows` refuse to start it.
+    unsupported_kind: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -123,7 +128,11 @@ struct Attempt {
     /// CAD-1964: the hosted profile this session claimed under. There is no
     /// local actor and therefore no kickoff; the claim itself is the only
     /// authority a report may name.
-    #[serde(default)]
+    ///
+    /// Omitted when unset: this struct refuses unknown fields, so writing a
+    /// null here would make a shared ledger unreadable to an older client
+    /// that has never heard of the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     session_profile: Option<String>,
 }
 
@@ -333,7 +342,7 @@ fn alias_name(alias: &str) -> Result<String> {
 
 impl Assignment {
     fn to_json(&self) -> Value {
-        json!({
+        let mut row = json!({
             "version": VERSION,
             "assignment_id": self.assignment_id,
             "organization_id": self.organization_id,
@@ -346,9 +355,26 @@ impl Assignment {
             "target": self.target,
             "created_by_subject_id": self.created_by_subject_id,
             "client_agent_id": self.client_agent_id,
+            "profile_id": self.profile_id,
             "guidance": self.guidance,
             "reported_head_sha": self.reported_head_sha,
             "text": self.text,
+        });
+        if let Some(kind) = &self.unsupported_kind {
+            row["kind"] = json!(kind);
+        }
+        row
+    }
+
+    fn work_kind_refusal(&self) -> Option<Error> {
+        self.unsupported_kind.as_ref().map(|kind| {
+            Error::invalid(
+                "unsupported_work_kind",
+                format!(
+                    "{} is {kind} work, which this client cannot run; nothing local was started",
+                    self.issue_id
+                ),
+            )
         })
     }
 }
@@ -396,6 +422,16 @@ fn parse_references(value: &Value, issue: &str) -> Result<()> {
     }
 }
 
+/// What this client tolerates, announced on every assignment-plane request
+/// (CAD-2060).
+/// A header, because the board's request bodies and queries refuse unknown
+/// fields: an older board ignores a header and would reject anything else.
+const CLIENT_FEATURES_HEADER: &str = "X-Cadence-Client-Features";
+///
+/// It does not announce work kinds, so a board must not send this client a
+/// non-dev row. `unsupported_kind` is the defence if one arrives anyway.
+const CLIENT_FEATURES: &str = "assignment-unknown-keys,event-unknown-types";
+
 fn parse_assignment(value: &Value) -> Result<Assignment> {
     if forbidden_path_key(value) {
         return Err(Error::rejected(
@@ -419,15 +455,31 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
         "reported_head_sha",
         "text",
     ];
+    // An unknown key is ignored so a newer board can add one. Required keys,
+    // their values and the forbidden path check above stay strict.
     let object = value
         .as_object()
-        .filter(|object| {
-            required.iter().all(|key| object.contains_key(*key))
-                && object
-                    .keys()
-                    .all(|key| required.contains(&key.as_str()) || key == "references")
-        })
+        .filter(|object| required.iter().all(|key| object.contains_key(*key)))
         .ok_or_else(|| Error::rejected("coordination response is not the assignment contract"))?;
+    // Ignoring a work kind would run review or research as dev work. Refusing
+    // the row here would stop every later event, snapshot and list, so it is
+    // kept and refused where work would start.
+    let unsupported_kind = match object.get("kind") {
+        None => None,
+        Some(kind) if kind == "dev" => None,
+        // Board text reaches messages, so only a plain bounded token is shown.
+        Some(kind) => Some(
+            kind.as_str()
+                .filter(|kind| {
+                    kind.len() <= 32
+                        && kind
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_')
+                })
+                .unwrap_or("unrecognized")
+                .to_string(),
+        ),
+    };
     if object.get("version").and_then(Value::as_str) != Some(VERSION) {
         return Err(Error::rejected(
             "coordination response is not the assignment contract",
@@ -461,6 +513,16 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
             "coordination response has an invalid assignment",
         ));
     }
+    if let Some(profile) = object.get("profile_id") {
+        let valid = profile
+            .as_str()
+            .is_some_and(|value| prefixed_id(value, "ap_"));
+        if !valid {
+            return Err(Error::rejected(
+                "coordination response has an invalid profile id",
+            ));
+        }
+    }
     if object["execution"].as_str() != Some("local") {
         return Err(Error::invalid(
             "hosted_execution_unavailable",
@@ -491,6 +553,15 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
             "a blocked assignment has no claim to resume",
         ));
     }
+    let profile_id = match value.get("profile_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if prefixed_id(id, "ap_") => Some(id.clone()),
+        _ => {
+            return Err(Error::rejected(
+                "coordination response has an invalid profile id",
+            ))
+        }
+    };
     let reported_head_sha = match value.get("reported_head_sha") {
         Some(Value::Null) => None,
         Some(Value::String(sha)) if head_sha(sha) => Some(sha.clone()),
@@ -501,6 +572,7 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
         }
     };
     Ok(Assignment {
+        unsupported_kind,
         assignment_id: assignment_id.to_string(),
         organization_id: organization_id.to_string(),
         issue_id: issue_id.to_string(),
@@ -512,6 +584,7 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
         target,
         created_by_subject_id: created_by.to_string(),
         client_agent_id,
+        profile_id,
         guidance: parse_guidance(value)?,
         reported_head_sha,
         text: optional_text(value, "text")?,
@@ -680,19 +753,6 @@ impl<H: CoordHttp> Coordinator<H> {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn pause_after_delivery_check(
-        &mut self,
-        wait: std::sync::Arc<dyn Fn() + Send + Sync>,
-    ) {
-        self.before_reservation = Some(wait);
-    }
-
-    #[cfg(test)]
-    fn set_subject(&mut self, subject: &str) {
-        self.subject_id = Some(subject.to_string());
-    }
-
     fn with_ledger<T>(&self, body: impl FnOnce(&mut Ledger) -> Result<T>) -> Result<T> {
         let _lock = remote_cli::private_lock(
             &self.ledger,
@@ -733,6 +793,10 @@ impl<H: CoordHttp> Coordinator<H> {
             200 | 201 => Ok(reply.body),
             401 | 403 => Err(Error::rejected(
                 "the hosted org refused this session — run `cadence login` again; nothing ran locally",
+            )),
+            400 => Err(Error::invalid(
+                "invalid_request",
+                "the board refused this request body as invalid; a field it does not know is the usual cause, and nothing was recorded",
             )),
             404 => Err(Error::invalid(
                 "api_missing",
@@ -871,11 +935,6 @@ impl<H: CoordHttp> Coordinator<H> {
             .get("assignments")
             .and_then(Value::as_array)
             .ok_or_else(|| Error::rejected("assignment list is missing"))?;
-        if value.as_object().is_none_or(|object| object.len() != 2) {
-            return Err(Error::rejected(
-                "assignment list is not the assignment contract",
-            ));
-        }
         rows.iter().map(|row| self.parse_owned(row)).collect()
     }
     /// Exhaust recovery before adopting its watermark. The ledger's original
@@ -966,19 +1025,73 @@ impl<H: CoordHttp> Coordinator<H> {
     /// profile, so the board can tell the two apart and refuse a report from
     /// the wrong holder.
     fn claim_as(&mut self, assignment: &Assignment, client_agent_id: &str) -> Result<Assignment> {
+        self.claim_with_profile(assignment, client_agent_id, None)
+    }
+
+    /// Claim naming the profile the session runs under. The profile is
+    /// descriptive: the board still authorizes the human subject, the target
+    /// and this generation, and a claim made without one keeps the existing
+    /// registered-agent rule.
+    fn claim_with_profile(
+        &mut self,
+        assignment: &Assignment,
+        client_agent_id: &str,
+        profile: Option<&str>,
+    ) -> Result<Assignment> {
+        if let Some(refusal) = assignment.work_kind_refusal() {
+            return Err(refusal);
+        }
         self.remember_discovered(assignment)?;
-        let body = json!({
+        let mut body = json!({
             "version": VERSION,
             "organization_id": self.org_id,
             "expected_generation": assignment.generation,
             "client_agent_id": client_agent_id,
         });
-        let value = self.exchange(
+        let mut expected_profile = profile.is_some();
+        if let Some(profile) = profile {
+            body["profile_id"] = json!(profile);
+        }
+        let value = match self.exchange(
             "POST",
             &format!("{}/{}/claim", self.base(), assignment.assignment_id),
             Some(&body),
-        )?;
+        ) {
+            Ok(value) => value,
+            // A board that predates profile claims refuses the extra field as
+            // an invalid body before any effect. The profile is descriptive,
+            // never authority, so claiming without it is the same claim under
+            // the same client id — say so, and keep the fence.
+            Err(error) if profile.is_some() && error.code() == Some("invalid_request") => {
+                eprintln!(
+                    "cadence: this board does not accept a profile on a claim; claiming without \
+                     it — the profile is not recorded here"
+                );
+                expected_profile = false;
+                let retry = json!({
+                    "version": VERSION,
+                    "organization_id": self.org_id,
+                    "expected_generation": assignment.generation,
+                    "client_agent_id": client_agent_id,
+                });
+                self.exchange(
+                    "POST",
+                    &format!("{}/{}/claim", self.base(), assignment.assignment_id),
+                    Some(&retry),
+                )?
+            }
+            Err(error) => return Err(error),
+        };
         let claimed = self.parse_owned(&value)?;
+        if expected_profile
+            && profile.is_some_and(|profile| {
+                value.get("profile_id").and_then(Value::as_str) != Some(profile)
+            })
+        {
+            return Err(Error::rejected(
+                "claim response did not record the profile this claim named",
+            ));
+        }
         if claimed.assignment_id != assignment.assignment_id
             || claimed.generation != assignment.generation
             || claimed.issue_id != assignment.issue_id
@@ -988,6 +1101,11 @@ impl<H: CoordHttp> Coordinator<H> {
             return Err(Error::rejected(
                 "claim response named a different assignment",
             ));
+        }
+        // The board's answer is the row this client would run, so its work kind
+        // is authoritative here — not only the observation that was claimed.
+        if let Some(refusal) = claimed.work_kind_refusal() {
+            return Err(refusal);
         }
         self.with_ledger(|ledger| {
             let mut found = false;
@@ -1499,8 +1617,8 @@ impl<H: CoordHttp> Coordinator<H> {
         })?;
         let opened = match pinned {
             Some(path) => worktree::main_root(Path::new(&path))
-                .and_then(|original_root| ensure_lane(&original_root, &lane)),
-            None => ensure_lane(root, &lane),
+                .and_then(|original_root| ensure_lane(&original_root, &lane, None)),
+            None => ensure_lane(root, &lane, None),
         };
         let dir = match opened {
             Ok(dir) => dir,
@@ -1645,6 +1763,11 @@ impl<H: CoordHttp> Coordinator<H> {
                         "report response named a different assignment",
                     ));
                 }
+                // A resume report replaces the row this client will run, so a
+                // kind it cannot serve must stop it before any worktree.
+                if let Some(refusal) = reported.work_kind_refusal() {
+                    return Err(refusal);
+                }
                 self.with_ledger(|ledger| {
                     for attempt in ledger.attempts.values_mut() {
                         if attempt.assignment_id.as_deref() != Some(reported.assignment_id.as_str())
@@ -1740,6 +1863,10 @@ impl<H: CoordHttp> Coordinator<H> {
     /// Waiting work this user created is reassigned to them. Another
     /// member's target is refused before a worktree exists.
     fn prepare_owned(&mut self, row: Assignment, subject: &str) -> Result<Assignment> {
+        // Before any reassign, and for rows already held, which skip the claim.
+        if let Some(refusal) = row.work_kind_refusal() {
+            return Err(refusal);
+        }
         if row.state == "waiting" && row.target.is_none() {
             if row.created_by_subject_id != subject {
                 return Err(Error::invalid(
@@ -1785,7 +1912,7 @@ impl<H: CoordHttp> Coordinator<H> {
             value["actor"] = Value::Null;
             value["guidance"] = json!({
                 "code": "connect_local_agent",
-                "text": "This assignment is waiting for your local agent. Run `cadence local-agent connect --alias <alias> --repo <checkout>`. It was not sent to a hosted runner.",
+                "text": "This assignment is waiting for your local agent. Run `cadence agent connect --alias <alias> --repo <checkout>`. It was not sent to a hosted runner.",
             });
             return Ok(value);
         };
@@ -1818,6 +1945,7 @@ impl<H: CoordHttp> Coordinator<H> {
         repo: &Path,
         name: Option<&str>,
         profile: &str,
+        base_ref: Option<&str>,
     ) -> Result<Value> {
         self.ensure_active()?;
         if !prefixed_id(profile, "ap_") {
@@ -1850,7 +1978,7 @@ impl<H: CoordHttp> Coordinator<H> {
             }
             ready.clone()
         } else {
-            self.claim_as(&ready, &client)?
+            self.claim_with_profile(&ready, &client, Some(profile))?
         };
         if self.claim_already_ended(&claimed)? {
             return Err(Error::invalid(
@@ -1875,7 +2003,7 @@ impl<H: CoordHttp> Coordinator<H> {
             Ok(())
         })?;
         let lane = self.lane_for(&claimed, name)?;
-        let dir = ensure_lane(&root, &lane)?;
+        let dir = ensure_lane(&root, &lane, base_ref)?;
         let path = dir.display().to_string();
         self.with_ledger(|ledger| {
             for attempt in ledger.attempts.values_mut() {
@@ -1887,7 +2015,7 @@ impl<H: CoordHttp> Coordinator<H> {
             }
             Ok(())
         })?;
-        Ok(json!({
+        let mut receipt = json!({
             "version": VERSION,
             "assignment_id": claimed.assignment_id,
             "issue_id": claimed.issue_id,
@@ -1897,14 +2025,21 @@ impl<H: CoordHttp> Coordinator<H> {
             "generation": claimed.generation,
             "client_agent_id": client,
             "profile": profile,
+            "profile_recorded": claimed.profile_id.is_some(),
             "lane": lane,
             "worktree": path,
+            "branch": git_line(Path::new(&path), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "head": git_line(Path::new(&path), &["rev-parse", "HEAD"]),
             "actor": "external_session",
             "guidance": {
                 "code": "report_from_this_session",
-                "text": "This session holds the claim. Report with `cadence local-agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
+                "text": "This session holds the claim. Report with `cadence agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
             },
-        }))
+        });
+        if let Some(base) = base_ref {
+            receipt["base"] = json!(base);
+        }
+        Ok(receipt)
     }
 
     pub fn connect<F>(
@@ -2005,6 +2140,14 @@ impl<H: CoordHttp> Coordinator<H> {
         let mut claimed = Vec::new();
         let mut refused = Vec::new();
         for row in rows {
+            if let Some(refusal) = row.work_kind_refusal() {
+                refused.push(json!({
+                    "assignment_id": row.assignment_id,
+                    "error": refusal.to_string(),
+                    "code": refusal.code(),
+                }));
+                continue;
+            }
             if row.state == "blocked" && !resume_blocked {
                 continue;
             }
@@ -2202,6 +2345,10 @@ impl<H: CoordHttp> Coordinator<H> {
                 "reassign response named a different assignment",
             ));
         }
+        // Reassignment hands this client the row it will start.
+        if let Some(refusal) = updated.work_kind_refusal() {
+            return Err(refusal);
+        }
         self.with_ledger(|ledger| {
             for attempt in ledger.attempts.values_mut() {
                 if attempt.assignment_id.as_deref() != Some(assignment) {
@@ -2322,7 +2469,19 @@ fn explain_409(body: &Value) -> Error {
     }
 }
 
-fn ensure_lane(root: &Path, lane: &str) -> Result<PathBuf> {
+/// One line of `git -C <dir> <args>`, or an empty string when git refuses.
+fn git_line(dir: &Path, args: &[&str]) -> String {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args);
+    match crate::reaper::output(&mut command) {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+fn ensure_lane(root: &Path, lane: &str, base_ref: Option<&str>) -> Result<PathBuf> {
     let dir = layout::worktree_dir(root, lane);
     if fs::symlink_metadata(&dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(Error::rejected(
@@ -2345,7 +2504,7 @@ fn ensure_lane(root: &Path, lane: &str) -> Result<PathBuf> {
             "a local lane directory exists on a different branch; no second checkout was created",
         ));
     }
-    match worktree::create_worktree(root, lane) {
+    match worktree::create_worktree_on(root, lane, base_ref) {
         Ok(dir) => Ok(dir),
         Err(error) => {
             if dir.is_dir() {
@@ -2367,5 +2526,241 @@ fn ensure_lane(root: &Path, lane: &str) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
-#[path = "local_assignment_acceptance.rs"]
-mod acceptance;
+mod assignment_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row() -> Value {
+        json!({
+            "version": VERSION,
+            "assignment_id": "hla_00000000-0000-4000-8000-000000000001",
+            "organization_id": "ws_1",
+            "issue_id": "CAD-1",
+            "action": "start",
+            "execution": "local",
+            "state": "waiting",
+            "generation": 1,
+            "claim_id": null,
+            "target": null,
+            "created_by_subject_id": "usr_1",
+            "client_agent_id": null,
+            "guidance": null,
+            "reported_head_sha": null,
+            "text": null,
+        })
+    }
+
+    #[test]
+    fn the_baseline_row_parses() {
+        assert!(parse_assignment(&row()).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_key_is_ignored() {
+        let mut value = row();
+        value["added_by_a_newer_board"] = json!({"any": "shape"});
+        assert!(parse_assignment(&value).is_ok());
+    }
+
+    #[test]
+    fn a_missing_required_key_is_still_refused() {
+        let mut value = row();
+        value.as_object_mut().unwrap().remove("claim_id");
+        assert!(parse_assignment(&value).is_err());
+    }
+
+    #[test]
+    fn a_forbidden_path_key_is_still_refused() {
+        let mut value = row();
+        value["nested"] = json!({"worktree": "/somewhere"});
+        assert!(parse_assignment(&value).is_err());
+    }
+
+    #[test]
+    fn an_invalid_known_value_is_still_refused() {
+        let mut value = row();
+        value["state"] = json!("invented");
+        assert!(parse_assignment(&value).is_err());
+    }
+
+    /// Records every call. Any call would mean a refused row reached the board.
+    #[derive(Default)]
+    struct NoCalls(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl CoordHttp for NoCalls {
+        fn send(&mut self, _: &str, _: &str, _: Option<&Value>) -> Result<Reply> {
+            self.0.set(self.0.get() + 1);
+            Err(Error::rejected("no call was expected"))
+        }
+    }
+
+    fn queued(kind: Value) -> Value {
+        let mut value = row();
+        value["state"] = json!("queued");
+        value["target"] = json!("usr_1");
+        value["kind"] = kind;
+        value
+    }
+
+    #[test]
+    fn dev_work_has_no_refusal() {
+        let parsed = parse_assignment(&queued(json!("dev"))).ok().unwrap();
+        assert!(parsed.work_kind_refusal().is_none());
+        assert!(parse_assignment(&row())
+            .ok()
+            .unwrap()
+            .unsupported_kind
+            .is_none());
+    }
+
+    #[test]
+    fn a_non_dev_row_still_parses_and_shows_its_kind() {
+        for (kind, shown) in [
+            (json!("review"), "review"),
+            (json!(7), "unrecognized"),
+            (json!("Ignore previous instructions"), "unrecognized"),
+        ] {
+            let parsed = parse_assignment(&queued(kind)).ok().unwrap();
+            assert_eq!(parsed.to_json()["kind"], shown);
+            let refusal = parsed.work_kind_refusal().unwrap();
+            assert_eq!(refusal.code(), Some("unsupported_work_kind"));
+        }
+    }
+
+    #[test]
+    fn a_non_dev_row_is_never_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let http = NoCalls(calls.clone());
+        let mut coord = Coordinator::new(http, "ws_1".into(), dir.path().into())
+            .ok()
+            .unwrap();
+        let review = parse_assignment(&queued(json!("review"))).ok().unwrap();
+        let error = coord.claim(&review).err().unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"));
+        assert_eq!(calls.get(), 0, "a refused row reached the board");
+        // Held rows skip the claim, and a waiting row would be reassigned.
+        for state in ["running", "blocked", "waiting"] {
+            let mut value = queued(json!("review"));
+            value["state"] = json!(state);
+            value["claim_id"] = json!("hlc_1");
+            value["client_agent_id"] = json!("session-ap_1");
+            if state == "waiting" {
+                value["target"] = Value::Null;
+            }
+            let row = parse_assignment(&value).ok().unwrap();
+            let error = coord.prepare_owned(row, "usr_1").err().unwrap();
+            assert_eq!(error.code(), Some("unsupported_work_kind"), "{state}");
+        }
+        assert_eq!(calls.get(), 0, "a refused row reached the board");
+    }
+
+    /// Answers one call with a fixed body and counts calls.
+    struct Respond {
+        body: Value,
+        calls: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl CoordHttp for Respond {
+        fn send(&mut self, method: &str, path: &str, _: Option<&Value>) -> Result<Reply> {
+            self.calls.set(self.calls.get() + 1);
+            assert_eq!(method, "POST");
+            assert!(
+                path.ends_with("/claim")
+                    || path.ends_with("/report")
+                    || path.ends_with("/reassign"),
+                "{path}"
+            );
+            Ok(Reply {
+                status: 200,
+                body: self.body.clone(),
+            })
+        }
+    }
+
+    fn running(kind: Value) -> Value {
+        let mut value = row();
+        value["state"] = json!("running");
+        value["target"] = json!("usr_1");
+        value["client_agent_id"] = json!("worker");
+        value["claim_id"] = json!("hlc_00000000-0000-4000-8000-000000000001");
+        value["kind"] = kind;
+        value
+    }
+
+    fn coord_with(
+        body: Value,
+    ) -> (
+        Coordinator<Respond>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let http = Respond {
+            body,
+            calls: calls.clone(),
+        };
+        let coord = Coordinator::new(http, "ws_1".into(), dir.path().into())
+            .ok()
+            .unwrap();
+        (coord, calls, dir)
+    }
+
+    #[test]
+    fn a_non_dev_claim_response_is_refused() {
+        let (mut coord, calls, _state) = coord_with(running(json!("review")));
+        let input = parse_assignment(&queued(json!("dev"))).ok().unwrap();
+        let error = coord
+            .claim_with_profile(&input, "worker", None)
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"));
+        assert_eq!(calls.get(), 1, "the claim was sent before the refusal");
+    }
+
+    #[test]
+    fn a_non_dev_report_response_is_refused() {
+        let (mut coord, calls, _state) = coord_with(running(json!("research")));
+        let error = coord
+            .report_claimed(
+                "hla_00000000-0000-4000-8000-000000000001",
+                "hlc_00000000-0000-4000-8000-000000000001",
+                1,
+                "running",
+                None,
+                None,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"));
+        assert_eq!(calls.get(), 1, "the report was sent before the refusal");
+    }
+
+    #[test]
+    fn a_non_dev_reassign_response_is_refused() {
+        let (mut coord, calls, _state) = coord_with(running(json!("review")));
+        let input = parse_assignment(&queued(json!("dev"))).ok().unwrap();
+        coord.remember_discovered(&input).unwrap();
+        let error = coord
+            .reassign_owned(
+                "hla_00000000-0000-4000-8000-000000000001",
+                Some("usr_1"),
+                false,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"));
+        assert_eq!(calls.get(), 1, "the reassign was sent before the refusal");
+    }
+}

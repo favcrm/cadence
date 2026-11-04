@@ -5,7 +5,7 @@ import { rememberContext } from "../contextSelection";
 import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type PublishDestination, type WorkspaceRun } from "../workspaceApps";
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
 import { accountLabel, connectReturnTo, destinationBindings, isPublishToolkit, sendSlot, bindingToUse } from "../socialConnect";
-import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
+import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaImportArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
 import type { ScreenActions } from "./screenLifecycle";
 import type { Planner, SlotPlan } from "./screenSlot";
 
@@ -75,7 +75,16 @@ export function plainRefusal(error: unknown): ActionRefusal {
   if (error.code === "draft_in_use") return { code: "draft_in_use", text: "This draft is approved or published, so it can't be discarded." };
   if (error.code === "stale_revision") return { code: "stale_revision", text: "That changed somewhere else. Reload and try again." };
   if (error.code === "draft_not_found") return { code: "draft_not_found", text: "That draft is no longer here." };
+  // SOC-54: the host keeps every retained read, so the remaining refusal is a
+  // profile that left Settings. `stale_source` stays mapped for an older daemon
+  // that still applies the latest-fetch-only rule.
+  if (error.code === "source_not_saved") return { code: "source_not_saved", text: "That profile is no longer a saved source. Re-add it in Settings." };
   if (error.code === "stale_source") return { code: "stale_source", text: "That post was fetched again since; clone it as a new post." };
+  // SOC-55: a paged source scan is a snapshot. A cursor the host rejects (or
+  // one whose library moved) must reach the app as its own code so it can
+  // restart the scan without discarding cards it already showed.
+  if (error.code === "invalid_cursor" || error.code === "stale_cursor")
+    return { code: error.code, text: "The source list changed while loading. Reload it to continue." };
   const text = error.message.toLowerCase();
   if (text.includes("320 pixels")) return { code: "image_too_small", text: "Use a photo at least 320 pixels on each side." };
   if (text.includes("4:5 to 1.91:1")) return { code: "image_aspect", text: "Use a photo between 4:5 and 1.91:1." };
@@ -154,6 +163,26 @@ async function mediaPublish(args: Record<string, unknown>, ui: { actionToken?: s
   } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
 }
 
+/** CAD-1962 — `media.import`: promote ONE retained image this
+ *  installation owns into the shared workspace library, as a draft. The
+ *  daemon re-proves the mount, the declared `media.import` permission and
+ *  the custody before copying, so the frame only names the receipt and a
+ *  request id. */
+async function mediaImport(args: Record<string, unknown>, ui: { actionToken?: string }): Promise<ActionResult> {
+  const checked = mediaImportArgs(args);
+  const actionToken = ui.actionToken;
+  if (!checked || typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken))
+    return refuse("bad_args", "That request is not valid.");
+  try {
+    const out = await workspaceApps.mediaImport({
+      action_token: actionToken,
+      receipt_id: checked.receipt_id as string,
+      request_id: checked.request_id as string,
+    });
+    return { ok: true, data: out };
+  } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+}
+
 async function readRun(ctx: ActionContext, args: Record<string, unknown>): Promise<ActionResult> {
   if (!exact(args, ["run_id"]) || typeof args.run_id !== "string") return refuse("bad_args", "That request is not valid.");
   const run = ctx.runs.find(value => value.id === args.run_id && value.install_id === ctx.installId &&
@@ -226,7 +255,7 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
   const alias=verb==="social.drafts.discard"?"social.draft":args.alias;
   if(typeof actionToken!=="string" || !/^[a-f0-9]{64}$/.test(actionToken) || typeof alias!=="string") return refuse("denied","That draft action is unavailable.");
   const common={action_token:actionToken,alias};
-  let operation:"create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage";
+  let operation:"create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/page"|"sources/get"|"sources/save"|"effect-stage";
   let fields:Record<string,unknown>;
   switch(verb){
     case "social.drafts.list": operation="list"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
@@ -237,6 +266,12 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
     // CAD-1939: `destination_id` optionally names which of the context's destinations this effect posts to.
     case "social.drafts.publish.stage": operation="effect-stage"; if((!exact(args,["alias","draft_id","revision","request_id"])&&!exact(args,["alias","draft_id","revision","request_id","destination_id"]))||typeof args.draft_id!=="string"||!Number.isSafeInteger(args.revision)||typeof args.request_id!=="string"||("destination_id" in args&&(typeof args.destination_id!=="string"||args.destination_id.length===0))) return refuse("bad_args","That request is not valid."); fields={proof:{kind:"social_draft",draft_id:args.draft_id,revision:args.revision},request_id:args.request_id,...("destination_id" in args?{destination_id:args.destination_id}:{})}; break;
     case "social.sources.show": operation="sources/show"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
+    // SOC-55: one bounded page of the retained library, then its opaque
+    // cursor. A cursor that is not a string or is oversized never leaves the
+    // frame; the daemon re-validates it against the mounted scope anyway.
+    case "social.sources.page": operation="sources/page"; if(!exact(args,["alias"])&&!exact(args,["alias","cursor"])) return refuse("bad_args","That request is not valid."); if("cursor" in args&&(typeof args.cursor!=="string"||args.cursor.length===0||args.cursor.length>2048)) return refuse("bad_args","That request is not valid."); fields={...("cursor" in args?{cursor:args.cursor}:{})}; break;
+    // SOC-55: exact receipt/post resolution for an older draft — never a scan.
+    case "social.sources.get": operation="sources/get"; if(!exact(args,["alias","receipt_id","post_id"])||typeof args.receipt_id!=="string"||typeof args.post_id!=="string"||args.receipt_id.length===0||args.receipt_id.length>128||args.post_id.length===0||args.post_id.length>100) return refuse("bad_args","That request is not valid."); fields={receipt_id:args.receipt_id,post_id:args.post_id}; break;
     case "social.sources.save": operation="sources/save"; if(!exact(args,["alias","request_id","expected_revision","handles"])) return refuse("bad_args","That request is not valid."); fields={request_id:args.request_id,expected_revision:args.expected_revision,handles:args.handles}; break;
     default: return refuse("bad_args","That request is not valid.");
   }
@@ -253,6 +288,7 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
 function openScreenDrawer(args: Record<string, unknown>, ui: Parameters<ScreenActions["call"]>[2]): ActionResult {
   const request = parseScreenDrawerCall(SCREEN_DRAWER_OPEN, args);
   if (!request || request.mode !== "drawer") return refuse("bad_args", "That request is not valid.");
+  if ("context" in request) return refuse("unavailable", "This app cannot pass context to a drawer here.");
   if (!ui.openScreenDrawer) return refuse("unavailable", "This app cannot open a board drawer here.");
   ui.openScreenDrawer(request.surface);
   return { ok: true, data: request };
@@ -456,6 +492,7 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "open-link": () => connectOrOpen(ctx, args, ui),
     "screen.drawer.open": () => openScreenDrawer(args, ui),
     "screen.drawer.close": () => closeScreenDrawer(args, ui),
+    "screen.drawer.context": () => refuse("forbidden", "That drawer context is only readable by its drawer."),
     "social.destinations.list": () => listDestinations(args, ctx),
     "social.drafts.list": () => socialDraftCall(verb,args,ui),
     "social.drafts.show": () => socialDraftCall(verb,args,ui),
@@ -464,6 +501,8 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "social.drafts.discard": () => socialDraftCall(verb,args,ui),
     "social.drafts.publish.stage": () => socialDraftCall(verb,args,ui),
     "social.sources.show": () => socialDraftCall(verb,args,ui),
+    "social.sources.page": () => socialDraftCall(verb,args,ui),
+    "social.sources.get": () => socialDraftCall(verb,args,ui),
     "social.sources.save": () => socialDraftCall(verb,args,ui),
     "publish.destination.use": async () => runPlan(await planUseDestination(ctx, args)),
     "publish.destination.remove": async () => runPlan(await planRemoveDestination(ctx, args)),
@@ -475,6 +514,7 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "media.read": () => mediaRead(args, ui),
     "media.chat.attach": () => mediaChatAttach(args, ui),
     "media.publish": () => mediaPublish(args, ui),
+    "media.import": () => mediaImport(args, ui),
   };
   return Promise.resolve().then(table[verb as (typeof CALL_VERBS)[number]]).catch((error: unknown): ActionResult => ({ ok: false, refusal: plainRefusal(error) }));
 }

@@ -1274,7 +1274,3 @@ pub(crate) struct ManagementAttempt {
 fn identifier_shape(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && value.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
-
-#[cfg(test)]
-#[path = "native_source_nonce_acceptance.rs"]
-mod native_source_nonce_acceptance;

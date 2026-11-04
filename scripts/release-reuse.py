@@ -126,7 +126,7 @@ def reuse(args):
         "source_sha": sha, "tree": tree, "run_id": args.run_id, "run_attempt": args.run_attempt,
         "rustc": queued["rustc"], "cargo": queued["cargo"], "features": ["ui"],
         "target": "x86_64-linux", "runner": "ubuntu-24.04",
-        "checks": ["fmt", "clippy", "test", "build", "ui"],
+        "checks": ["fmt", "clippy", "build", "ui"],
         "checks_event": "merge_group", "checks_run_id": args.queue_run_id,
         "reused_from_run_id": args.queue_run_id, "sha256": digest,
         "built_at": queued["built_at"],

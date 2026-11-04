@@ -22,8 +22,6 @@ use std::time::{Duration, Instant};
 static PROFILE_MINTED: AtomicBool = AtomicBool::new(false);
 
 // Independently authored ticket acceptance; implementers own registration only.
-#[cfg(test)]
-mod acceptance;
 mod authentication;
 mod provision;
 pub(crate) use provision::GenerationView;

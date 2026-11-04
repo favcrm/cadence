@@ -552,10 +552,32 @@ are not sufficient capability or compatibility notes.
 Release publication, installing a build, migrating organization state and
 rolling out a production daemon are separate operations with separate evidence.
 
+### Hosted review evidence: tenant first, then client (CAD-2001)
+
+A hosted workspace's merge gate reads and operator approval are
+project-scoped (`audit verdicts --project`, `audit approval --project
+--issue`, `audit approve --project --issue`, and the owner's `audit
+reviewers`/`audit identities` attestations). The tenant server serves those
+verbs; this client sends them and never falls back to the older repo-scoped
+reads when the project is known. So the order is fixed:
+
+1. Roll out the tenant server that serves the project-scoped verbs.
+2. Then install this Cadence client (and the matching
+   `scripts/enqueue-reviewed`).
+
+A client that predates the tenant's verbs keeps reading the repo-scoped
+evidence, which the tenant still serves for old clients. A client that is
+newer than its tenant is refused: the tenant answers `501 not_implemented`
+(or `400 invalid_request`, `409 container_required`, `503
+capability_unavailable`) and the client reports it as a release-order problem
+— "update the tenant server first, then this Cadence client" — and records
+nothing. That refusal is a refusal: never read it as "no verdicts were filed"
+and never work around it by pointing the gate at a repo-scoped read.
+
 ## Dev-to-release flow (CAD-1400)
 
 One ticket, one PR. The lane worktree passes `scripts/pre-push` locally, then
-exact-head CI and independent review on the PR; operator scope or per-head
+exact-head CI and fresh-session review on the PR; operator scope or per-head
 approval (recorded via `cadence audit approve`) precedes
 `scripts/enqueue-reviewed` into the merge queue, which retests on newest
 main. The merged head is the only release candidate: a `v*` tag matching

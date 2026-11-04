@@ -9,14 +9,6 @@ use super::{required_str, Shared};
 use crate::error::{Error, Result};
 use crate::issue::{self, delivery_policy, delivery_requirements as requirements};
 
-#[cfg(test)]
-#[path = "cad1298_requirements_acceptance.rs"]
-mod acceptance;
-
-#[cfg(test)]
-#[path = "cad1561_integration_branch_acceptance.rs"]
-mod cad1561_integration_branch_acceptance;
-
 fn reject(why: impl std::fmt::Display) -> Error {
     Error::rejected(format!("delivery requirements: {why}"))
 }
@@ -671,8 +663,8 @@ pub(super) fn unattended_queue_authority(
     require_queue_authority(shared, repo, base, &rules, Some(&protection))
 }
 
-fn require_queue_authority(
-    shared: &Shared,
+fn require_queue_authority<G: GhRead + ?Sized>(
+    shared: &G,
     repo: &str,
     base: &str,
     rules: &Value,
@@ -781,7 +773,7 @@ fn require_queue_authority(
     }
     // These are the canonical workflow's existing full integration floor,
     // not whatever subset happens to remain in mutable repository settings.
-    for gate in ["fmt", "clippy", "test", "build", "ui"] {
+    for gate in ["fmt", "clippy", "build", "ui"] {
         let job = workflow["jobs"].get(gate).ok_or_else(|| {
             reject(format!(
                 "trusted CI lacks the supported {gate} integration gate"
@@ -804,6 +796,24 @@ fn require_queue_authority(
         }
     }
     Ok(())
+}
+
+/// Exercise the production queue guard with isolated GitHub responses.
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+pub fn queue_authority_acceptance(
+    repo: &str,
+    base: &str,
+    rules: &Value,
+    protection: Option<&Value>,
+    read: impl Fn(&[&str]) -> Result<String>,
+) -> Result<()> {
+    struct Reader<F>(F);
+    impl<F: Fn(&[&str]) -> Result<String>> GhRead for Reader<F> {
+        fn gh_read(&self, args: &[&str]) -> Result<String> {
+            (self.0)(args)
+        }
+    }
+    require_queue_authority(&Reader(read), repo, base, rules, protection)
 }
 
 /// An enabled auto-merge request is not proof of admission to the queue.

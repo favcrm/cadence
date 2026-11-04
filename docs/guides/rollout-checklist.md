@@ -75,6 +75,19 @@ policy and re-approves it through an operator connection using
 `cadence issue project approve-work <key>`. This is separate from source merge
 approval and is never performed by the source change itself.
 
+### Hosted review evidence is project-scoped (CAD-2001)
+
+Roll out the tenant server that serves the project-scoped review verbs
+(`audit_verdicts_project`, `audit_approval_project`, `audit_approve_project`,
+`audit_reviewers_project(_set)`, `audit_identities(_set)`) **before** the
+client that sends them, then install the matching `scripts/enqueue-reviewed`.
+A client newer than its tenant is refused by name and says so; it never falls
+back to the older repo-scoped evidence, and the gate reports that refusal as a
+refusal rather than as "no verdicts were filed". The owner records the
+workspace identity map (`cadence audit identities set`) and each project's
+review set (`cadence audit reviewers set --project <key>`) before a hosted
+verdict can count.
+
 Verify read-only requirements report the intended `base_ref`, and run the
 guarded enqueue dry-run against the exact head; all remaining review, CI and
 approval requirements still apply. Do not change the repository default or

@@ -69,7 +69,7 @@ the code you just wrote.
 - The evidence is what the computed class requires. `routine` needs the
   required base CI on the exact head and genuine ticket-outcome evidence
   — no mandatory review, and no fabricated PASS to stand in for one.
-  `consequential` and `strict` add one or two independent reviews of
+  `consequential` and `strict` add one or two fresh-session reviews of
   the code against the ticket, as the class states. Do not add routine
   unit tests, snapshot or fixture tests, stress runs, sandbox demos or
   evidence ledgers unless the ticket asks for one. For a bug fix, show
@@ -95,12 +95,12 @@ the code you just wrote.
   on another. The evaluator returns three classes:
   - `routine` — required base CI plus genuine ticket-outcome evidence;
     zero mandatory reviews; no fabricated PASS.
-  - `consequential` — one independent combined review and the full check
+  - `consequential` — one fresh-session combined review and the full check
     floor; no operator approval.
   - `strict` — the floor the evaluator falls back to: any activation other
     than the default lean policy — a malformed section, a custom section
     that is not operator-approved or was removed after approval, or a
-    policy that is not the default once its solo-operator and
+    policy that is not the default once its `solo_operator` and
     integration-branch fields are cleared — path lists that cannot be
     read, incomplete or unsafe diff evidence, a delete, rename, type or
     mode change, a path or change shape outside the known one-review
@@ -109,14 +109,39 @@ the code you just wrote.
     fewer: one combined review on the one-review list, else two (Standards
     and Spec/security), and the operator floor on human-class paths and
     over 1500 changed lines.
-- One independent review by default, covering standards and spec, when
+- **Review standard (operator decision 2026-11-03, CAD-1946).** A review is
+  valid when a fresh-context session that is not the author does it; a
+  subagent qualifies. Fresh means it inherits no conversation or context from
+  the work: a forked subagent or a resumed authoring session does not count,
+  and its brief points at the change (PR, exact head, ticket) without the
+  author's conclusions. A second model vendor is optional. A separate human or
+  account is not required. Records say "fresh-session review" and never claim
+  independent parties. Standards and Spec/security stay two separate passes
+  where two are required, each by its own fresh session. Owner approval of the
+  exact head still applies on `human`-class paths; this decision changes no
+  approval rule for send, publish, spend or deploy.
+- **What the gate enforces today.** Not this standard. `scripts/enqueue-reviewed`
+  counts hosted verdicts by attested principal and, since CAD-2049, refuses the
+  author's principal; local notes count by their self-declared `From:` alias,
+  which is not attested. It cannot tell a fresh session from the author when
+  both act under one login. Until it can, merge through the
+  temporary exception (`--exception --advisory standards=<url> --advisory
+  spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
+  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10). Of the advisory
+  links, it checks only that they are separate https URLs; it proves
+  neither head binding nor that Browser QA ran. A verdict filed under the
+  author's identity still refuses under the exception, so a same-login
+  session posts its findings as a PR comment and files no verdict. A second
+  attested human is not required. A workflow-issued reviewer identity is a proposal, not shipped.
+- One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
-  two reviews — Standards and Spec/security — from different reviewers. No
-  reviewer may be the author; prefer a different model vendor.
+  two reviews, Standards and Spec/security, as separate passes by two fresh
+  sessions. No reviewer
+  may be the author.
 - A reviewer who sees auth, identity, credential, signature, secret or
   confinement logic in a one-review PR returns REVISE, names the trigger in
-  `Risk:`, and asks for the second reviewer. When unsure, two.
+  `Risk:`, and asks for the second pass. When unsure, two.
 - Notes never block. REVISE only for a correctness, security or
   ticket-requirement gap. Everything else — wording, docs, comments, style,
   extra tests — is a note: PASS with notes, and the author files one
@@ -126,16 +151,14 @@ the code you just wrote.
 - A reviewer of a PR that changes or deletes a check states that no gate
   check and no isolation or fail-closed default was weakened, naming what
   was checked.
-- A `human` trigger needs the operator as the second check. One reviewer
-  plus the operator is enough only outside triggers 1 and 3; inside them
-  two independent reviewers are required and the operator's approval does
-  not stand in for the second reviewer. On a project whose `delivery:`
-  policy declares a solo-operator lane, one independent registered-identity
-  reviewer (never the author) may cover both axes when the operator
-  approves that head. The operator's approval substitutes for the second
-  reviewer, never for independence, and never lowers Browser QA, the
-  `qa-verdict` status or the risk class itself. Browser QA at desktop and
-  narrow widths when the PR changes `ui/**`.
+- A `human` trigger needs the operator as the second check. One fresh-session
+  review plus the operator is enough only outside triggers 1 and 3; inside
+  them two separate passes by two fresh sessions (Standards and Spec/security)
+  are required and the
+  operator's approval does not stand in for the second pass. The operator's
+  approval of the exact head never lowers Browser QA, the `qa-verdict`
+  status or the risk class itself. Browser QA at desktop and narrow widths
+  when the PR changes `ui/**`.
 - Bot reviews (Devin Review, CodeRabbit and similar) are advisory: before a
   PASS, the reviewer blocks on or refutes each severe bug and each critical
   security finding. Never make a bot's check a required check, and never
@@ -181,6 +204,46 @@ the code you just wrote.
   relays, so run the same operator proof on the HTTP peer.
 - Restrict actors with allowlists, not denylists.
 
+### Testing principles
+
+CI does not run tests. `ci.yml` proves the code compiles for the shipping
+features and both targets, lints it, and proves the release seam on the merge
+queue and main; the suite runs on a schedule and on demand (`tests.yml`), where
+a red test finds its owner instead of blocking an unrelated push. Per-module
+acceptance suites, integration targets and contract tests for the CI scripts
+themselves are retired. Write a test only when it earns its place, and
+then to these rules:
+
+- **Direct functions, not processes.** Business logic is tested by calling it.
+  If a test needs a daemon, a board, a socket or a spawned CLI to reach the
+  logic, the logic is in the wrong place: move it into a function the test can
+  call.
+- **Event-driven, never a sleep.** Wait on the thing that must happen — a
+  sender's channel, a barrier, a condition variable, a frame that must arrive —
+  and keep a timeout only as a bounded failure safeguard that fails loudly. A
+  fixed `sleep` that passes on a loaded machine proves the machine was fast,
+  not that the code is correct.
+- **No external services.** Local fixtures only, on loopback. A test that needs
+  a provider, a registry or the network is not a test; it is an outage waiting
+  to happen.
+- **Test the behaviour, not the copy.** A test that restates the implementation
+  agrees with itself. Assert the observable contract — the refusal, the status,
+  the bytes the caller sees.
+- **One real check beats ten unit tests of it.** A rule the daemon or a route
+  enforces still ships its acceptance: one check that drives the real guard and
+  shows the bad case refused, written by someone other than the implementer.
+- **CI machinery is proved by running it.** Do not add unit or contract tests
+  for `scripts/` or `.github/workflows/`. A workflow that cannot load, a
+  required check that never reports, or a gate that passes on `cancelled` all
+  surface on the next real run, and a test that re-implements the gate proves
+  only the re-implementation. Prefer making the machinery cheaper — fewer
+  steps, fewer jobs, less duplicated work — over covering it.
+
+The failure worth guarding is a **gate that silently checks nothing**. If
+deleting a gate's wiring would leave a green run, that is worth one check. The
+cost of a wrong gate is not its own code; it is every green run after it stopped
+looking.
+
 ### Paid platform calls: no spending limit
 
 - A paid platform call (tool, model, media) runs and is charged as long as
@@ -197,17 +260,43 @@ the code you just wrote.
 - Use the selected hosted workspace for shared issues and wiki; do not fall
   back to a local tracker when a hosted operation is unavailable. See
   `docs/guides/hosted-workspace.md` for supported paths and identity boundaries.
-- `issue start` on a hosted org can return a waiting assignment rather than a
-  worktree or running agent. Inspect the assignment and actual result; a queue
-  receipt, a selected alias, or a status change is not proof of execution.
+- `issue start <ID> --repo <checkout> --profile <ap_…> [--base <ref>]` starts an
+  issue for the calling session: it claims only that issue, opens the lane from
+  `<ref>`, and needs no local alias or daemon. The receipt names the request and
+  the outcome separately — `base` and `profile` are what you asked for; `head`,
+  `branch` and `profile_recorded` are what happened. A queued or waiting
+  assignment has not created a lane and is not proof of execution.
+- A lane minted by `issue start` carries the repository's pre-push hook. A
+  hand-made worktree does not: its push runs no gate, so run
+  `scripts/boat-build --receipt -- scripts/pre-push --base origin/main` yourself
+  and say so. Do not report a gate result you did not run.
 - A local connected agent has its own native daemon; hosted board access does
   not require that daemon. Do not connect a runner blindly when it might claim
   unrelated waiting work. Agent identity is established by the supported
   authenticated path, not by supplying an alias or borrowing a human login.
-- Hosted project work and local software delivery are distinct. Until the
-  hosted gate is available, its refusal is a delivery limitation, not a pass;
-  any exception remains operator-controlled and does not grant an agent merge
-  or approval authority.
+- Review evidence binds to the exact head and, on a hosted workspace, to the
+  issue's project (CAD-2001): the merge gate counts distinct attested principals, refuses
+  the author's own, and voids every verdict when the head moves. Read it back
+  with `cadence audit verdicts --project <key>` and confirm a verdict counts
+  before treating a review as landed; in-chat findings are not automatically
+  gate evidence. The project is explicit — never derived from the repository or
+  the cwd. A hosted verdict counts only when the workspace owner has attested
+  its principal's GitHub login (`cadence audit identities`) and admitted that
+  principal to the project (`cadence audit reviewers --project <key>`); the
+  gate counts principals, excludes the author by the attested login, and
+  refuses an unattested, contradictory or ambiguous note — see
+  `docs/guides/hosted-workspace.md` ("Reviewing software changes"; AOS-473,
+  CAD-2001).
+- When more than one Cadence build is on the host, `CADENCE_BIN` selects the one
+  the gate invokes. A hosted-verb refusal can come from the client, the deployed
+  service or an operation the tenant does not support: confirm the capability,
+  report the exact refusal, and do not assume a stale client or bypass the gate.
+  A tenant that predates the project-scoped review verbs is refused by name —
+  the release order is the tenant server first, then this client — and that
+  refusal is never a pass.
+- Hosted project work and local software delivery are distinct. If the merge gate
+  refuses, report its exact refusal; an exception remains operator-controlled and
+  does not grant an agent merge or approval authority.
 
 ### Before you start, and before every push
 
@@ -242,7 +331,10 @@ Do not substitute a comment or another identity for the required proof.
 - The operator records a `human` approval from an operator connection (not
   an agent pane or endpoint): `cadence audit approve --pr <n> --head
   <full-sha> --source "<who decided, where>"`. A note or ticket comment is
-  not approval evidence (`docs/AUDIT.md`).
+  not approval evidence (`docs/AUDIT.md`). On a hosted org that form is
+  refused; the hosted form names the project and ticket: `cadence audit
+  approve --project <key> --issue <ID> --pr <n> --head <full-sha> --source
+  "<who>"` (see `docs/AUDIT.md`, CAD-2001).
 - Approve once per ticket: the operator may run `cadence audit approve
   --issue <ID> --action scope` once, and `scripts/enqueue-reviewed` then
   accepts it for every in-scope PR of that ticket. Traps: the ticket body
@@ -280,6 +372,16 @@ limitation; only an authorized operator can decide an exception.
   favcrm/cadence --disable-auto`; re-enable it, pinned to the new head, only
   after that head passes review.
 - `--admin` only in a declared emergency, never as routine.
+- Temporary path (CAD-1946, remove this note when it ends): while the hosted
+  reviewer attestation cannot be produced, `scripts/enqueue-reviewed <pr>
+  --head <sha> --exception --advisory standards=<url> --advisory
+  spec-security=<url>` (plus `--advisory browser-qa=<url>` for a `ui/` change)
+  waives only the missing reviewer attestation and, on a hosted routine PR, the
+  readiness proof hosted cannot yet produce; the evidence names both. The advisory reviews are PR
+  comments from fresh-session reviews (see the review standard above); the gate
+  cannot prove freshness, and the operator accepts that and approves each
+  exact head. The path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`
+  (2026-11-10).
 
 ### Checks: trust exit codes, not filtered text
 
@@ -304,7 +406,8 @@ limitation; only an authorized operator can decide an exception.
   back to a local build. `CADENCE_PRE_PUSH_LOCAL=1` is the explicit
   emergency path and runs the same plan on this host. `scripts/pre-push
   --tests` is a focused diagnostic, not a prerequisite before review;
-  required CI and the merge-group regression floor are unchanged. Review
+  required CI (fmt, clippy, build, ui, delivery-gate required; cross-build runs but is not yet required) is unchanged, and the
+  suite runs in `tests.yml` on a schedule and on demand (CAD-1970). Review
   and operator approval stay authoritative. Neither a remote run nor a
   green suite proves the ticket's outcome. The split
   manifests are retired; do not run `split-map-sync` until a reviewed
@@ -369,7 +472,7 @@ Cadence's setting is the source of truth; this file names no model.
   substitute another. If the requested model is not in `config.models`, or
   its scope does not cover the role that would run it, or its
   authentication is unavailable, stop and report it. This never waives
-  independent review, head-pinned verdicts, Browser QA, operator approval or
+  fresh-session review, head-pinned verdicts, Browser QA, operator approval or
   production-safety rules.
 - Scope is the rule: a `master`-scoped model is master-only, a
   `worker`-scoped model serves workers and reviewers. Never route a worker

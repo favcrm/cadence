@@ -44,7 +44,10 @@ pub(crate) use plan::{check_structure, create_granted_plan, granted_semantics, G
 pub use plan::{create_plan, decide_plan};
 use projects::check_component;
 pub(crate) use projects::{check_tags, issue_dir, load_front, save_front, split_tags};
-pub use projects::{project_add, set_acceptance, set_project_policy, set_project_remote};
+pub use projects::{
+    private_available, project_add, set_acceptance, set_project_policy, set_project_remote,
+    PRIVATE_UNAVAILABLE,
+};
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
 pub(crate) use rev::blocked_warnings;
 use rev::check_rev;
@@ -58,9 +61,6 @@ pub(crate) use ticket::confirm_committed_selected_issue;
 pub use ticket::materialize_app_run_ticket;
 // The bind acceptance test is the only caller, and it compiles only with
 // the test seam. A plain library build must not carry the re-export.
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) use ticket::{app_ticket_body, app_ticket_title};
-
 #[cfg(test)]
 use new::lock_for_new_issue_rounds;
 
@@ -613,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn set_project_remote_refuses_stale_conflict_malformed_and_is_idempotent() {
+    fn set_project_remote_refuses_stale_ambiguous_malformed_and_is_idempotent() {
         let (_dir, pm) = tracker();
         let _a = add_with_remote(
             &pm,
@@ -637,16 +637,19 @@ mod tests {
         .to_string();
         assert!(stale.contains("no registered remote"), "{stale}");
 
-        let conflict = set_project_remote(
+        // CAD-2001: another project recording the target remote is a
+        // shared repo, not a conflict — a shared repo must be able to
+        // follow a transfer. It is exercised at the end of this test.
+        let bad_to = set_project_remote(
             &pm,
             "mkt",
             "github.com/favcrm/marketing-v2",
-            "github.com/acme/widgets",
+            "github.com/acme/widgets/extra",
             "",
         )
         .unwrap_err()
         .to_string();
-        assert!(conflict.contains("already project 'other'"), "{conflict}");
+        assert!(bad_to.contains("malformed"), "{bad_to}");
 
         for bad in [
             "",
@@ -724,6 +727,30 @@ mod tests {
                 .to_string();
         assert!(ambiguous.contains("more than one"), "{ambiguous}");
         assert_eq!(std::fs::read(&yaml).unwrap(), before);
+
+        // CAD-2001: `other` already records github.com/acme/widgets. mkt
+        // may adopt the same remote — a repo may be registered by
+        // several projects — and only mkt's own record changes.
+        let other_yaml = std::fs::read(pm.dir.join("other").join("project.yaml")).unwrap();
+        let shared = set_project_remote(
+            &pm,
+            "mkt",
+            "github.com/favcrm/marketing-v2",
+            "github.com/acme/widgets",
+            "",
+        )
+        .unwrap();
+        assert_eq!(shared["changed"], true, "{shared}");
+        assert_eq!(shared["to"], "github.com/acme/widgets");
+        assert_eq!(
+            project::load(&yaml).unwrap().repos[0].remote.as_deref(),
+            Some("github.com/acme/widgets")
+        );
+        assert_eq!(
+            std::fs::read(pm.dir.join("other").join("project.yaml")).unwrap(),
+            other_yaml,
+            "the other project's record changed"
+        );
     }
 
     #[test]

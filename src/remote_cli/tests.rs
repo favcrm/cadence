@@ -1,7 +1,5 @@
 #[cfg(feature = "test-seam")]
-mod native_chain_acceptance {
-    include!("../remote_cli_native_chain_acceptance.rs");
-}
+mod native_chain_acceptance {}
 
 use super::*;
 use serde_json::json;
@@ -42,6 +40,337 @@ fn store_credential_at(dir: &Path, org: &str, org_id: &str, endpoint: &str, expi
 }
 fn store_credential(dir: &Path, endpoint: &str) {
     store_credential_at(dir, ORG, ORG_ID, endpoint, now().unwrap() + 300);
+}
+
+#[test]
+fn audit_verdict_is_a_registered_mutating_write() {
+    use super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb, REMOTE_VERBS};
+
+    assert!(REMOTE_VERBS.contains(&"audit_verdict"));
+    assert_eq!(cli_requested_scopes("audit_verdict"), &["cli.write"]);
+    assert!(mutating_cli_verb("audit_verdict"));
+    assert!(
+        lost_mutation_note("audit_verdict").contains("audit verdicts"),
+        "a lost verdict write must send the caller back to the read, not a blind retry"
+    );
+}
+
+#[test]
+fn the_project_scoped_gate_verbs_are_registered_with_their_scopes() {
+    // CAD-2001: the review evidence is project-scoped, so this build sends the
+    // project verbs — and only those — for the gate and the operator.
+    use super::{
+        cli_requested_scopes, lost_mutation_note, mutating_cli_verb, PROJECT_SCOPED_GATE_VERBS,
+        REMOTE_VERBS,
+    };
+
+    for verb in [
+        "audit_approval_project",
+        "audit_verdicts_project",
+        "audit_verdict_project",
+        "audit_approve_project",
+        "audit_reviewers_project",
+        "audit_reviewers_project_set",
+        "audit_identities",
+        "audit_identities_set",
+    ] {
+        assert!(REMOTE_VERBS.contains(&verb), "{verb}");
+        assert!(PROJECT_SCOPED_GATE_VERBS.contains(&verb), "{verb}");
+    }
+    for verb in [
+        "audit_approval_project",
+        "audit_verdicts_project",
+        "audit_reviewers_project",
+        "audit_identities",
+    ] {
+        assert_eq!(cli_requested_scopes(verb), &["cli.read"], "{verb}");
+        assert!(!mutating_cli_verb(verb), "{verb}");
+    }
+    assert_eq!(
+        cli_requested_scopes("audit_verdict_project"),
+        &["cli.write"]
+    );
+    for verb in [
+        "audit_approve_project",
+        "audit_reviewers_project_set",
+        "audit_identities_set",
+    ] {
+        assert_eq!(
+            cli_requested_scopes(verb),
+            &["cli.write", "audit.approve"],
+            "{verb}"
+        );
+        assert!(mutating_cli_verb(verb), "{verb}");
+    }
+    // A lost write sends the caller back to the matching project read.
+    assert!(lost_mutation_note("audit_reviewers_project_set").contains("same project"));
+    assert!(lost_mutation_note("audit_identities_set").contains("audit identities"));
+    assert!(lost_mutation_note("audit_verdict_project").contains("audit verdicts"));
+}
+
+#[test]
+fn a_tenant_that_cannot_serve_a_project_verb_names_the_release_order() {
+    // An older tenant refuses the name (501 / 400 / 409 / 503) rather than
+    // answering, and the client must say so — never read it as "no evidence"
+    // and never fall back to the repo-scoped verbs.
+    use super::{tenant_cannot_serve, PROJECT_SCOPED_GATE_VERBS};
+
+    for verb in PROJECT_SCOPED_GATE_VERBS {
+        for (status, body) in [
+            (
+                501u16,
+                json!({"ok": false, "error": {"code": "not_implemented"}}),
+            ),
+            (
+                400,
+                json!({"ok": false, "error": {"code": "invalid_request"}}),
+            ),
+            (
+                409,
+                json!({"ok": false, "error": {"code": "container_required"}}),
+            ),
+            (
+                503,
+                json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+            ),
+        ] {
+            let why = tenant_cannot_serve(verb, status, Some(&body)).expect("a version signal");
+            assert!(why.contains("tenant"), "{why}");
+            assert!(why.contains("first"), "{why}");
+            assert!(why.contains("repo-scoped"), "{why}");
+            assert!(why.contains(verb), "{why}");
+        }
+        // A waking reply is the retry loop's, not a version problem.
+        assert!(tenant_cannot_serve(verb, 503, Some(&json!({"state": "waking"}))).is_none());
+        // A bare availability failure keeps its own decoder.
+        assert!(
+            tenant_cannot_serve(verb, 503, Some(&json!({"state": "board_unreachable"}))).is_none()
+        );
+        // An unrelated refusal is not blamed on the release order.
+        assert!(tenant_cannot_serve(
+            verb,
+            403,
+            Some(&json!({"ok": false, "error": {"code": "not_permitted"}}))
+        )
+        .is_none());
+    }
+    // A project with no proven policy is a real refusal with its own remedy.
+    let why = tenant_cannot_serve(
+        "audit_verdicts_project",
+        409,
+        Some(&json!({"ok": false, "error": {"code": "project_policy_unavailable"}})),
+    )
+    .expect("a refusal");
+    assert!(why.contains("access policy"), "{why}");
+    assert!(!why.contains("Release order"), "{why}");
+}
+
+#[test]
+fn audit_reviewers_set_is_a_registered_owner_write() {
+    // AOS-473: the attestation is the owner's own act, so its write asks for
+    // the same `audit.approve` scope as the merge approval — never a plain
+    // `cli.write` that an agent's login could carry.
+    use super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb, REMOTE_VERBS};
+
+    assert!(REMOTE_VERBS.contains(&"audit_reviewers"));
+    assert!(REMOTE_VERBS.contains(&"audit_reviewers_set"));
+    assert_eq!(cli_requested_scopes("audit_reviewers"), &["cli.read"]);
+    assert_eq!(
+        cli_requested_scopes("audit_reviewers_set"),
+        &["cli.write", "audit.approve"]
+    );
+    assert!(mutating_cli_verb("audit_reviewers_set"));
+    assert!(!mutating_cli_verb("audit_reviewers"));
+    assert!(
+        lost_mutation_note("audit_reviewers_set").contains("audit reviewers"),
+        "a lost attestation write must send the caller back to the read, not a blind retry"
+    );
+}
+
+#[test]
+fn project_verbs_are_a_registered_read_and_owner_write() {
+    // CAD-1999: the client refuses a verb missing from REMOTE_VERBS before a
+    // request exists, so the registry read and the owner write must both be
+    // registered — and the write must ask only for cli.write, while a lost
+    // answer reconciles with the read instead of a blind retry.
+    use super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb, REMOTE_VERBS};
+
+    assert!(REMOTE_VERBS.contains(&"project_ls"));
+    assert!(REMOTE_VERBS.contains(&"project_new"));
+    assert_eq!(cli_requested_scopes("project_ls"), &["cli.read"]);
+    assert_eq!(cli_requested_scopes("project_new"), &["cli.write"]);
+    assert!(!mutating_cli_verb("project_ls"));
+    assert!(mutating_cli_verb("project_new"));
+    assert!(
+        lost_mutation_note("project_new").contains("issue project ls"),
+        "a lost project create must send the caller back to the registry read"
+    );
+}
+
+#[test]
+fn project_new_without_a_correlated_receipt_is_unknown_and_not_retried() {
+    // CAD-1999: a 2xx proves the create only as the requested project echoed
+    // back — key, name and a valid prefix that matches the requested
+    // `--prefix`. A `null`, `{ok:true}`, foreign or unrelated body, or a
+    // missing/invalid/different prefix cannot establish that THIS create
+    // landed under the intended namespace — unknown, reconciled by the
+    // registry read, never a rejection and never a replay. The
+    // empty/204/non-JSON answer is the same check on a `None` body.
+    let args = || {
+        json!({"key": "ops", "name": "Operations", "prefix": "OPS"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    let derived_args = || {
+        json!({"key": "ops", "name": "Operations"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    for (receipt, arguments) in [
+        (Value::Null, args()),
+        (json!({"ok": true}), args()),
+        (
+            json!({"project": {"key": "other", "name": "Operations", "prefix": "OPS"}}),
+            args(),
+        ),
+        (
+            json!({"project": {"key": "ops", "name": "Other", "prefix": "OPS"}}),
+            args(),
+        ),
+        (json!({"project": "ops"}), args()),
+        // The stored prefix is missing entirely.
+        (
+            json!({"project": {"key": "ops", "name": "Operations"}}),
+            args(),
+        ),
+        // The stored prefix is another project's namespace.
+        (
+            json!({"project": {"key": "ops", "name": "Operations", "prefix": "OTHER"}}),
+            args(),
+        ),
+        // The stored prefix is not a valid hosted prefix (starts with a digit).
+        (
+            json!({"project": {"key": "ops", "name": "Operations", "prefix": "9X"}}),
+            args(),
+        ),
+        // No requested prefix, but the receipt still must carry a real one.
+        (
+            json!({"project": {"key": "ops", "name": "Operations"}}),
+            derived_args(),
+        ),
+    ] {
+        let (out, requests) = run(vec![(200, "", receipt)], "project_new", arguments, 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("issue project ls"), "{text}");
+        assert!(!text.contains("retry later"), "{text}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a project create was replayed"
+        );
+    }
+
+    // The requested prefix echoed as stored (upper case) is the same project.
+    let (out, _) = run(
+        vec![(
+            200,
+            "",
+            json!({"project": {"key": "ops", "name": "Operations", "prefix": "OPS"},
+                "duplicate": false}),
+        )],
+        "project_new",
+        args(),
+        10,
+    );
+    assert!(out.is_ok(), "{:?}", out.err().map(|e| e.to_string()));
+
+    // A caller-typed lower-case --prefix matches the stored upper-case one.
+    let lower = || {
+        json!({"key": "ops", "name": "Operations", "prefix": "ops"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    let (out, _) = run(
+        vec![(
+            200,
+            "",
+            json!({"project": {"key": "ops", "name": "Operations", "prefix": "OPS"}}),
+        )],
+        "project_new",
+        lower(),
+        10,
+    );
+    assert!(out.is_ok(), "{:?}", out.err().map(|e| e.to_string()));
+
+    // No --prefix: the board derives it, so any valid stored prefix is
+    // accepted rather than duplicating the board's derivation client-side.
+    let (out, _) = run(
+        vec![(
+            200,
+            "",
+            json!({"project": {"key": "ops", "name": "Operations", "prefix": "OPS"}}),
+        )],
+        "project_new",
+        derived_args(),
+        10,
+    );
+    assert!(out.is_ok(), "{:?}", out.err().map(|e| e.to_string()));
+}
+
+#[test]
+fn project_new_ambiguous_5xx_is_unknown_but_pre_forward_5xx_stays_definite() {
+    // CAD-1999: a 5xx naming no pre-forward worker `state` may follow a
+    // committed create. A 5xx that names one, and a board gate refusal
+    // (`hop: board`), are decided before the verb ran and stay definite.
+    let args = || {
+        json!({"key": "ops", "name": "Operations"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    for status in [500u16, 503] {
+        let (out, requests) = run(
+            vec![(status, "", json!({"ok": false}))],
+            "project_new",
+            args(),
+            1,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{status}: {err}");
+        let text = err.to_string();
+        assert!(text.contains("issue project ls"), "{status}: {text}");
+        assert!(!text.contains("retry later"), "{status}: {text}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "{status}: a project create was replayed"
+        );
+    }
+
+    let (out, _) = run(
+        vec![(500, "", json!({"state": "unavailable"}))],
+        "project_new",
+        args(),
+        1,
+    );
+    assert_eq!(out.unwrap_err().kind(), "rejected");
+
+    let (out, _) = run(
+        vec![(
+            500,
+            "",
+            json!({"ok": false, "error": {"code": "runtime_unavailable", "hop": "board"}}),
+        )],
+        "project_new",
+        args(),
+        1,
+    );
+    assert_eq!(out.unwrap_err().kind(), "rejected");
 }
 
 #[test]
@@ -300,7 +629,10 @@ fn fake_worker(
                     302 => "302 Found",
                     401 => "401 Unauthorized",
                     403 => "403 Forbidden",
+                    404 => "404 Not Found",
                     409 => "409 Conflict",
+                    500 => "500 Internal Server Error",
+                    501 => "501 Not Implemented",
                     503 => "503 Service Unavailable",
                     _ => "400 Bad Request",
                 };
@@ -961,6 +1293,88 @@ fn cli_message_refusals_map_bounded_codes_never_server_text() {
 }
 
 #[test]
+fn ticket_message_verbs_name_each_refusal_and_never_retry_it() {
+    let refusal =
+        |code: &str| json!({"ok": false, "error": {"code": code, "message": "server-text"}});
+    for (verb, status, code) in [
+        ("issue_message_send", 409u16, "message_id_conflict"),
+        ("issue_message_send", 404, "not_found"),
+        ("issue_messages", 404, "not_found"),
+        ("issue_messages_read", 404, "not_found"),
+        ("issue_message_send", 400, "invalid_request"),
+        ("issue_messages", 400, "invalid_request"),
+        ("issue_messages_read", 400, "invalid_request"),
+        // A tenant that predates the verbs must not read as an outage.
+        ("issue_message_send", 501, "not_implemented"),
+        ("issue_messages", 501, "not_implemented"),
+        ("issue_messages_read", 501, "not_implemented"),
+    ] {
+        let (out, requests) = run(vec![(status, "", refusal(code))], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.code(), Some(code), "{verb} {status}: {err}");
+        assert_ne!(err.kind(), "unknown", "{verb} {status}");
+        assert!(!err.to_string().contains("server-text"), "{verb}: {err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb} retried");
+    }
+}
+
+#[test]
+fn a_lost_ticket_message_answer_is_unknown_and_says_how_to_retry() {
+    for (verb, note) in [
+        ("issue_message_send", "same --message"),
+        ("issue_messages_read", "only moves forward"),
+    ] {
+        let (out, requests) = run(vec![(500, "", json!({}))], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{verb}: {err}");
+        assert!(err.to_string().contains(note), "{verb}: {err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb} retried");
+    }
+}
+
+#[test]
+fn a_ticket_message_receipt_passes_through_as_stored() {
+    let receipt = json!({
+        "message": "tm-1", "id": "CAD-1", "to": "developer", "from": null,
+        "sender_subject": "usr_1", "sender": "member", "text": "hi", "seq": 3,
+        "created_at": 1, "duplicate": false, "state": "stored",
+    });
+    let sent = json!({"id": "CAD-1", "to": "developer", "message": "tm-1", "text": "hi"});
+    let (out, _) = run(
+        vec![(200, "", receipt.clone())],
+        "issue_message_send",
+        sent.as_object().unwrap().clone(),
+        10,
+    );
+    assert_eq!(out.unwrap(), receipt);
+}
+
+#[test]
+fn a_verb_a_hosted_workspace_cannot_serve_is_named_plainly() {
+    // CAD-2063: these once read as an unrecognized refusal, like a fault.
+    for verb in ["agent_show", "message_inbox"] {
+        let body = json!({"ok": false, "error": {"code": "container_required"}});
+        let (out, requests) = run(vec![(409, "", body)], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.code(), Some("container_required"), "{verb}");
+        assert!(err.to_string().contains("cannot serve"), "{verb}: {err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb} retried");
+    }
+    // These two need settings.read before a call is made, so test the mapping.
+    for verb in ["master_status", "settings_agents"] {
+        let code = Some("container_required");
+        let err = message_family_refusal(verb, 409, code, reject("generic"));
+        assert_eq!(err.code(), code, "{verb}");
+        assert!(err.to_string().contains("cannot serve"), "{verb}: {err}");
+    }
+    // Any other verb keeps the generic refusal.
+    let body = json!({"ok": false, "error": {"code": "container_required"}});
+    let (out, _) = run(vec![(409, "", body)], "issue_ls", Map::new(), 10);
+    let shown = out.unwrap_err().to_string();
+    assert!(!shown.contains("cannot serve"), "{shown}");
+}
+
+#[test]
 fn a_checked_conflict_rides_up_as_the_conflict_answer() {
     // A 409 `{conflict, current_rev, card}` is the remote's checked
     // "not written" verdict — the body must reach the caller (the
@@ -1428,6 +1842,168 @@ fn a_bare_5xx_to_a_team_mutation_is_unknown_not_availability() {
     let text = err.to_string();
     assert!(text.contains("team list"), "{text}");
     assert!(!text.contains("retry later"), "{text}");
+}
+
+// Independently authored from CAD-1678's lost-outcome requirement.
+#[test]
+fn hosted_platform_call_ambiguous_replies_require_same_key_reconciliation() {
+    let args = json!({
+        "operation": "call",
+        "tool": "generate_image",
+        "body": {"prompt": "synthetic acceptance input"},
+        "key": "cad1678-acceptance-run-1"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+
+    for (status, body) in [
+        // The tenant relay can return this after the capability request was
+        // dispatched and its response was lost. It proves no non-execution.
+        (
+            503,
+            json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+        ),
+        // A syntactically valid JSON null is not a usable success envelope.
+        // This distinct malformed-2xx case uses the existing JSON-only fake.
+        (200, Value::Null),
+    ] {
+        let (out, requests) = run(vec![(status, "", body)], "platform_call", args.clone(), 10);
+        let err = out.expect_err("an ambiguous paid call must not become a successful receipt");
+        assert_eq!(err.kind(), "unknown", "HTTP {status}: {err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("charg"),
+            "possible charge must be disclosed: {text}"
+        );
+        assert!(
+            text.contains("same"),
+            "reconcile the same invocation: {text}"
+        );
+        assert!(
+            text.contains("key") || text.contains("request"),
+            "reconciliation must retain the existing replay handle: {text}"
+        );
+        assert!(
+            text.contains("replay") || text.contains("retry"),
+            "the user needs same-handle reconciliation guidance: {text}"
+        );
+        assert!(
+            !text.contains("team list"),
+            "wrong operation's remedy: {text}"
+        );
+        assert!(
+            !text.contains("team invites"),
+            "wrong operation's remedy: {text}"
+        );
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "an ambiguous platform call must not be automatically replayed"
+        );
+    }
+
+    let (out, requests) = run(
+        vec![(
+            503,
+            "",
+            json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+        )],
+        "platform_call",
+        json!({"operation": "tools"}).as_object().cloned().unwrap(),
+        10,
+    );
+    let err = out.unwrap_err();
+    assert_eq!(err.kind(), "rejected", "listing cannot have charged: {err}");
+    assert!(err.to_string().contains("availability"), "{err}");
+    assert!(
+        !err.to_string().contains("charg"),
+        "listing is not a paid call: {err}"
+    );
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+// Independently authored from the capability door's explicit uncertainty contract.
+#[test]
+fn hosted_platform_explicit_uncertainty_preserves_same_key_reconciliation() {
+    let args = json!({
+        "operation": "call",
+        "tool": "generate_image",
+        "body": {"prompt": "synthetic acceptance input"},
+        "key": "test-key"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+
+    let (out, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"ok": false, "error": {"code": "uncertain"}}),
+        )],
+        "platform_call",
+        args.clone(),
+        10,
+    );
+    let err = out.expect_err("explicit provider uncertainty cannot be a successful receipt");
+    assert_eq!(err.kind(), "unknown", "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("charg"),
+        "possible charge must be disclosed: {text}"
+    );
+    assert!(
+        text.contains("same"),
+        "reconcile the same invocation: {text}"
+    );
+    assert!(
+        text.contains("key") || text.contains("request"),
+        "reconciliation must retain the existing replay handle: {text}"
+    );
+    assert!(
+        text.contains("replay") || text.contains("retry"),
+        "the user needs same-handle reconciliation guidance: {text}"
+    );
+    assert!(
+        !text.contains("team list"),
+        "wrong operation's remedy: {text}"
+    );
+    assert!(
+        !text.contains("team invites"),
+        "wrong operation's remedy: {text}"
+    );
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "an uncertain platform call must not be automatically replayed"
+    );
+
+    let (out, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"ok": false, "error": {"code": "key_conflict"}}),
+        )],
+        "platform_call",
+        args,
+        10,
+    );
+    // The existing key-conflict response is a definite refusal, unlike a
+    // revision-conflict response carrying a resynchronization document.
+    let err = out.expect_err("a conflicting key must remain a definite refusal");
+    assert_eq!(err.kind(), "rejected", "{err}");
+    let text = err.to_string();
+    assert!(text.contains("key_conflict"), "{text}");
+    assert!(
+        !text.contains("charg"),
+        "a definite refusal must not claim possible execution: {text}"
+    );
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "a conflicting key must not be automatically replayed"
+    );
 }
 
 /// The board's own gate refusal is decided before the verb ran, so it
@@ -2535,4 +3111,493 @@ fn transfer_ops_stay_on_write_or_job_status_and_refuse_authority() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("not allowed"), "{err}");
+}
+
+#[test]
+fn hosted_platform_in_progress_replay_preserves_same_key_reconciliation() {
+    let args = json!({
+        "operation": "call",
+        "tool": "generate_image",
+        "body": {"prompt": "synthetic in-progress acceptance input"},
+        "key": "cad1678-in-progress-acceptance-1"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    // The door can answer this while another attempt with this key still
+    // owns the funded dispatch. It does not prove the operation was rejected.
+    let body = json!({
+        "ok": false,
+        "error": {"code": "idempotency_in_progress"}
+    });
+    let (listener, requests, _server) = fake_worker(vec![(409, "", body)]);
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+
+    let out = call_verb_in(
+        &target,
+        "platform_call",
+        args.clone(),
+        10,
+        &dir,
+        |_| {},
+        |_| panic!("an in-progress replay must not be automatically retried"),
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "an in-progress replay must make exactly one forwarding attempt"
+    );
+
+    let err = out.expect_err("in-progress funding is not a completed receipt");
+    assert_eq!(
+        err.kind(),
+        "unknown",
+        "the original call can still complete and charge; it is not rejected: {err}"
+    );
+    let text = err.to_string().to_ascii_lowercase();
+    assert!(
+        text.contains("charg"),
+        "the possible charge must be disclosed: {text}"
+    );
+    assert!(
+        text.contains("same"),
+        "reconciliation must preserve the same invocation: {text}"
+    );
+    assert!(
+        text.contains("key") || text.contains("request"),
+        "reconciliation must retain the original replay handle: {text}"
+    );
+    assert!(
+        text.contains("replay") || text.contains("retry"),
+        "the user needs same-handle replay guidance: {text}"
+    );
+    assert!(
+        !text.contains("the remote refused the request"),
+        "a possible funded dispatch must not be described as definitely refused: {text}"
+    );
+    assert!(
+        !text.contains("team list") && !text.contains("team invites"),
+        "the remedy must reconcile this tool call, not an unrelated team mutation: {text}"
+    );
+}
+
+#[test]
+fn hosted_platform_catalog_in_progress_reply_remains_a_read_refusal() {
+    let args = json!({"operation": "tools"}).as_object().cloned().unwrap();
+    let body = json!({
+        "ok": false,
+        "error": {"code": "idempotency_in_progress"}
+    });
+    let (listener, requests, _server) = fake_worker(vec![(409, "", body)]);
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+
+    let out = call_verb_in(
+        &target,
+        "platform_call",
+        args.clone(),
+        10,
+        &dir,
+        |_| {},
+        |_| panic!("a catalog refusal must not be automatically retried"),
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "the refused catalog read must make exactly one forwarding attempt"
+    );
+
+    let err = out.expect_err("HTTP 409 is not a successful catalog response");
+    assert_eq!(
+        err.kind(),
+        "rejected",
+        "listing cannot dispatch a paid tool, even with the same error code: {err}"
+    );
+    let text = err.to_string().to_ascii_lowercase();
+    assert!(
+        text.contains("idempotency_in_progress"),
+        "the read refusal must preserve the safe server code: {text}"
+    );
+    assert!(
+        !text.contains("charg"),
+        "a catalog read must not claim a possible paid dispatch: {text}"
+    );
+}
+
+#[test]
+fn artifact_verbs_are_reads_and_a_store_refusal_is_named() {
+    use super::{artifact_refusal, artifact_tenant_too_old, mutating_cli_verb, REMOTE_VERBS};
+    for verb in ["artifact_find", "artifact_show", "artifact_read"] {
+        assert!(REMOTE_VERBS.contains(&verb), "{verb}");
+        assert!(!mutating_cli_verb(verb), "{verb}");
+    }
+    let refused = artifact_refusal(
+        400,
+        Some(&serde_json::json!({"error": {"code": "invalid_request", "message": "not a pdf"}})),
+    );
+    assert!(refused.to_string().contains("not a pdf"));
+    // Only the store's own codes are echoed; any other body goes through the safe decoder.
+    let other = artifact_refusal(
+        403,
+        Some(&serde_json::json!({"error": {"code": "secret", "message": "leak-me"}})),
+    );
+    assert!(!other.to_string().contains("leak-me"));
+    // A success that does not name these bytes is not a proven success.
+    use super::artifact_receipt;
+    let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let good = serde_json::json!({"file": {"id": "art-1", "version": 1, "digest": digest}});
+    assert!(artifact_receipt(good, b"abc").is_ok());
+    for bad in [
+        serde_json::json!({}),
+        serde_json::json!({"file": {"id": "art-1", "version": 1, "digest": "00"}}),
+    ] {
+        assert_eq!(artifact_receipt(bad, b"abc").unwrap_err().kind(), "unknown");
+    }
+    let old = artifact_tenant_too_old("artifact_find", 501, "read");
+    assert!(old.contains("update the tenant server first"));
+    assert!(!old.contains("unavailable"));
+}
+
+// CAD-2083 acceptance, written from the ticket by the reviewer rather than the
+// implementer. It drives the real client path (`call_verb_in`, or the real local
+// dispatch) with the statuses and bodies the tenant's `tenantCliCall` answers.
+mod cad2083_acceptance {
+    use super::*;
+
+    fn tenant_refusal(code: &str) -> Value {
+        json!({"ok": false, "error": {"code": code, "message": "Tenant remote call refused."}})
+    }
+
+    fn arguments(value: Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    fn say() -> Map<String, Value> {
+        arguments(json!({"id": "CAD-1", "to": "developer", "message": "tm-1", "text": "hi"}))
+    }
+
+    fn mark() -> Map<String, Value> {
+        arguments(json!({"id": "CAD-1", "role": "developer", "through": 7}))
+    }
+
+    fn list() -> Map<String, Value> {
+        arguments(json!({"id": "CAD-1", "to": "developer"}))
+    }
+
+    fn call_body(requests: &[Value]) -> Value {
+        let calls: Vec<_> = requests
+            .iter()
+            .filter(|r| r["path"] == json!("/__platform/cli/call"))
+            .collect();
+        assert_eq!(calls.len(), 1, "exactly one call, never a retry");
+        calls[0]["body"].clone()
+    }
+
+    fn minted_scopes(requests: &[Value]) -> Vec<String> {
+        requests
+            .iter()
+            .find(|r| r["path"] == json!("/__platform/cli/authorize"))
+            .unwrap()["body"]["requested_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn each_verb_reaches_the_tenant_and_its_answer_is_printed_as_sent() {
+        let stored = json!({
+            "message": "tm-1", "id": "CAD-1", "to": "developer", "from": null,
+            "sender_subject": "usr_1", "sender": "member", "text": "hi", "seq": 3,
+            "created_at": 1, "duplicate": true, "state": "stored",
+        });
+        // `read_through` is what the tenant returned, not the `through` asked for.
+        let marked = json!({"id": "CAD-1", "role": "developer", "read_through": 3});
+        let page = json!({
+            "id": "CAD-1", "messages": [], "more": true,
+            "unread": {"developer": 2}, "unread_more": true,
+        });
+        for (verb, args, answer, scope) in [
+            ("issue_message_send", say(), stored, "cli.write"),
+            ("issue_messages_read", mark(), marked, "cli.write"),
+            ("issue_messages", list(), page, "cli.read"),
+        ] {
+            let (out, requests) = run(vec![(200, "", answer.clone())], verb, args.clone(), 10);
+            assert_eq!(out.unwrap(), answer, "{verb}: the answer was changed");
+            let body = call_body(&requests);
+            assert_eq!(body["verb"], json!(verb));
+            assert_eq!(body["arguments"], Value::Object(args), "{verb}");
+            // The tenant admits a verb only inside its required scope.
+            assert!(
+                minted_scopes(&requests).iter().any(|s| s == scope),
+                "{verb} never asked for {scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_refusal_is_named_and_is_never_retried() {
+        for (verb, args, status, code) in [
+            ("issue_message_send", say(), 409u16, "message_id_conflict"),
+            ("issue_message_send", say(), 404, "not_found"),
+            ("issue_messages", list(), 404, "not_found"),
+            ("issue_messages_read", mark(), 404, "not_found"),
+            ("issue_message_send", say(), 403, "insufficient_scope"),
+            ("issue_messages_read", mark(), 403, "insufficient_scope"),
+            // What a relay that predates the verbs answers.
+            ("issue_message_send", say(), 400, "invalid_request"),
+            ("issue_messages", list(), 400, "invalid_request"),
+            ("issue_messages_read", mark(), 400, "invalid_request"),
+        ] {
+            let (out, requests) = run(vec![(status, "", tenant_refusal(code))], verb, args, 10);
+            let err = out.unwrap_err();
+            assert_eq!(err.code(), Some(code), "{verb} {status}: {err}");
+            assert_eq!(err.kind(), "rejected", "{verb} {status}: {err}");
+            call_body(&requests);
+        }
+    }
+
+    #[test]
+    fn a_tenant_that_predates_the_verbs_is_named_and_is_not_an_outage() {
+        for (verb, args) in [
+            ("issue_message_send", say()),
+            ("issue_messages", list()),
+            ("issue_messages_read", mark()),
+        ] {
+            let (out, requests) = run(
+                vec![(501, "", tenant_refusal("not_implemented"))],
+                verb,
+                args,
+                10,
+            );
+            let err = out.unwrap_err();
+            assert_eq!(err.code(), Some("not_implemented"), "{verb}: {err}");
+            assert_eq!(err.kind(), "rejected", "{verb}: {err}");
+            let shown = err.to_string();
+            for outage in ["unavailable", "retry", "coordination"] {
+                assert!(
+                    !shown.contains(outage),
+                    "{verb} reads as an outage: {shown}"
+                );
+            }
+            call_body(&requests);
+        }
+    }
+
+    #[test]
+    fn a_lost_write_answer_is_unknown_and_is_never_retried() {
+        for (verb, args) in [
+            ("issue_message_send", say()),
+            ("issue_messages_read", mark()),
+        ] {
+            let (out, requests) = run(vec![(500, "", json!({}))], verb, args.clone(), 10);
+            let err = out.unwrap_err();
+            assert_eq!(err.kind(), "unknown", "{verb} 500: {err}");
+            call_body(&requests);
+            let (kind, calls) = dropped_call_answer(verb, args);
+            assert_eq!(kind, "unknown", "{verb}: a dropped connection");
+            assert_eq!(calls, 1, "{verb}: a dropped connection was retried");
+        }
+    }
+
+    /// A worker that mints an envelope, then hangs up instead of answering.
+    fn dropped_call_answer(verb: &str, args: Map<String, Value>) -> (&'static str, usize) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.try_clone().unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let seen = calls.clone();
+        thread::spawn(move || loop {
+            let Ok((socket, _)) = server.accept() else {
+                return;
+            };
+            let (socket, req) = read_request(socket);
+            if req.path == "/__platform/cli/authorize" {
+                answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                );
+            } else {
+                *seen.lock().unwrap() += 1;
+                drop(socket);
+            }
+        });
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        store_credential(&dir, &target.endpoint);
+        let err = call_verb_in(&target, verb, args, 10, &dir, |_| {}, |_| {}).unwrap_err();
+        let calls = *calls.lock().unwrap();
+        (err.kind(), calls)
+    }
+
+    #[test]
+    fn a_refusal_decided_before_the_verb_ran_never_reads_as_unknown() {
+        let board_gate = json!({"ok": false, "error": {
+            "code": "board_unreachable", "hop": "board",
+            "request_id": "00000000-0000-4000-8000-000000000000",
+        }});
+        for (verb, args) in [
+            ("issue_message_send", say()),
+            ("issue_messages_read", mark()),
+        ] {
+            for (status, body) in [
+                // The board's own gate.
+                (503u16, board_gate.clone()),
+                // The worker's pre-forward state.
+                (503, json!({"state": "wake_failed", "code": "wake_failed"})),
+                // A read-only login over the real relay: the mint narrows the
+                // envelope to `cli.read`, then the call answers a bare 401.
+                (401, tenant_refusal("unauthorized")),
+            ] {
+                let (out, requests) = run(vec![(status, "", body)], verb, args.clone(), 10);
+                let err = out.unwrap_err();
+                assert_ne!(err.kind(), "unknown", "{verb} {status}: {err}");
+                call_body(&requests);
+            }
+        }
+        // A read changes nothing, so its lost answer is never a possible write.
+        let (out, requests) = run(vec![(500, "", json!({}))], "issue_messages", list(), 10);
+        assert_ne!(out.unwrap_err().kind(), "unknown");
+        call_body(&requests);
+    }
+
+    /// The real relay, for what the shared fake cannot show: the mint narrows the
+    /// requested scopes to the live grant (403 `forbidden` when none is left), and
+    /// the call answers `reply` byte for byte.
+    fn relay_answer(
+        verb: &str,
+        args: Map<String, Value>,
+        grant: &'static [&'static str],
+        status: &'static str,
+        reply: &'static str,
+    ) -> Result<RemoteAnswer> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.try_clone().unwrap();
+        thread::spawn(move || loop {
+            let Ok((socket, _)) = server.accept() else {
+                return;
+            };
+            let (mut socket, req) = read_request(socket);
+            if req.path == "/__platform/cli/authorize" {
+                let scope: Vec<_> = req.body["requested_scopes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| grant.iter().any(|g| s.as_str() == Some(g)))
+                    .cloned()
+                    .collect();
+                if scope.is_empty() {
+                    answer(socket, "403 Forbidden", "", &tenant_refusal("forbidden"));
+                } else {
+                    answer(
+                        socket,
+                        "200 OK",
+                        "",
+                        &json!({"version": CLI_VERSION, "envelope": "h.e.1", "scope": scope}),
+                    );
+                }
+            } else {
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+        });
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        store_credential(&dir, &target.endpoint);
+        call_verb_in(&target, verb, args, 10, &dir, |_| {}, |_| {})
+    }
+
+    #[test]
+    fn a_read_only_login_is_named_over_the_real_relay() {
+        for (verb, args) in [
+            ("issue_message_send", say()),
+            ("issue_messages_read", mark()),
+        ] {
+            let err = relay_answer(
+                verb,
+                args,
+                &["cli.read"],
+                "401 Unauthorized",
+                r#"{"ok":false,"error":{"code":"unauthorized","message":"refused"}}"#,
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), Some("insufficient_scope"), "{verb}: {err}");
+            assert!(!err.to_string().contains("expired"), "{verb}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_write_answer_without_its_receipt_is_unknown_never_a_refusal_or_a_success() {
+        for (verb, args) in [
+            ("issue_message_send", say()),
+            ("issue_messages_read", mark()),
+        ] {
+            for reply in ["", "<html>ok</html>", "{}"] {
+                let kind = relay_answer(
+                    verb,
+                    args.clone(),
+                    &["cli.read", "cli.write"],
+                    "200 OK",
+                    reply,
+                )
+                .err()
+                .map(|e| e.kind());
+                assert_eq!(kind, Some("unknown"), "{verb} answered {reply:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_org_refuses_all_three_verbs_and_touches_nothing() {
+        use crate::issue::cli::{run as issue_run, IssueAction};
+        for action in [
+            IssueAction::Say {
+                id: "CAD-1".into(),
+                to: "developer".into(),
+                from: None,
+                message: "tm-1".into(),
+                text: Some("hi".into()),
+                file: None,
+            },
+            IssueAction::Messages {
+                id: "CAD-1".into(),
+                to: None,
+                after: None,
+            },
+            IssueAction::MessagesRead {
+                id: "CAD-1".into(),
+                role: "developer".into(),
+                through: 1,
+            },
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let err = issue_run(&action, state.path()).unwrap_err();
+            assert_eq!(err.kind(), "rejected", "{err}");
+            assert!(err.to_string().contains("hosted"), "{err}");
+            assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+        }
+    }
 }

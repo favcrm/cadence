@@ -69,14 +69,19 @@ export default function MasterChips({
   master,
   row,
   readOnly,
+  canPickModel = true,
 }: {
   master: MasterState | null | undefined;
   row?: Agent;
   readOnly: boolean;
+  /** False when this board has no model list to pick from: no chip at all. */
+  canPickModel?: boolean;
 }) {
   const t = useTranslate();
-  const model =
-    master?.model_label ?? master?.model ?? row?.model ?? row?.model_reported ?? row?.model_configured;
+  // The id, for the tooltip and the catalogue; a hosted board's label is the id too.
+  const modelId = master?.model ?? row?.model ?? row?.model_reported ?? row?.model_configured;
+  // Without a list to pick from, the id means nothing here: the model is in About.
+  const model = canPickModel ? (master?.model_label ?? modelId) : undefined;
   const effort = master?.effort ?? row?.effort ?? row?.effort_reported;
   const pct = master?.context?.percent;
   const live = master?.live === true;
@@ -87,6 +92,17 @@ export default function MasterChips({
   const [error, setError] = useState<string | null>(null);
   /** The pick still being applied — `kind`+`id`; clears when state agrees. */
   const [pending, setPending] = useState<{ kind: "model" | "effort"; id: string } | null>(null);
+
+  // The chip's friendly name comes from the catalogue. A failed read keeps
+  // the raw id rather than raising an error nobody asked to see.
+  const [catalogue, setCatalogue] = useState<MasterModelsView | null>(null);
+  useEffect(() => {
+    if (!model) return;
+    let current = true;
+    api.masterModels().then((m) => { if (current) setCatalogue(masterModelsOptions(m)); }).catch(() => undefined);
+    return () => { current = false; };
+  }, [model]);
+  const modelLabel = (view ?? catalogue)?.models.find((m) => m.id === modelId)?.label ?? model;
 
   // The picker's read: fetched on each open so the list never serves a
   // stale session; the last good payload stays rendered while it loads.
@@ -150,16 +166,16 @@ export default function MasterChips({
           <button
             type="button"
             key={`m:${model}`}
-            className="chip chip-in bg-ink-800 text-ink-300 chip-btn"
-            title={
+            className="chip chip-sans chip-in bg-ink-800 text-ink-300 chip-btn"
+            title={`${modelId ?? model} — ${
               live ? t("Reported by the live provider session — pick a model") : t("Configured model — pick a model")
-            }
+            }`}
             aria-expanded={open === "model"}
             disabled={disabled}
             onClick={() => toggle("model")}
           >
             {live && <span className="livedot" aria-hidden />}
-            {pending?.kind === "model" ? `${pending.id}…` : model}
+            {pending?.kind === "model" ? `${pending.id}…` : modelLabel}
             <span aria-hidden> ▾</span>
           </button>
           {open === "model" && (

@@ -58,6 +58,10 @@ fn roster() -> Value {
          "tasks": [], "params": null, "board": {"unknown": 1, "messages": []}},
         {"alias": "bare", "provider": "fake", "endpoint_kind": "fake",
          "state": "idle", "params": null}
+    ], "profiles": [
+        {"id": "dev-1", "alias": "dev-1", "role": "Developer", "team_role": "dev",
+         "catalogue": "developer", "look": "builder", "model": "inherit",
+         "job": "private standing instructions", "runtimes": ["lead"]}
     ]}"#,
     )
 }

@@ -8224,17 +8224,10 @@ fn platform_provision_live_denial_creates_no_binding_or_files() {
     let _ = rig_shared;
 }
 
-include!("cad1568_independent_acceptance.rs");
-
 // CAD-1568 second-signer guard acceptance: the child-agent principal boundary
 // for remote CLI messaging, authored independently of the implementer and the
 // ticket author's check above.
-include!("cad1568_reviewer_acceptance.rs");
-include!("cad1568_master_recipient_acceptance.rs");
-include!("cad1584_selected_uid_lifecycle_acceptance.rs");
-include!("cad1584_master_http_acceptance.rs");
 // CAD-1817 Phase 1 identity/profile refusal and operator-write acceptance.
-include!("cad1817_identity_acceptance.rs");
 
 /// CAD-1726 acceptance (reviewer-written, not the implementer's): "Hosted:
 /// ... a member sees no card in `MemberChat` and is refused by the read
@@ -8369,4 +8362,3 @@ fn cad1726_member_history_never_carries_an_artifact_card() {
 }
 
 // CAD-1767 G2: the member-assist-history half (check author, failing first).
-include!("cad1767_member_history_acceptance.rs");

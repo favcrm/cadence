@@ -179,21 +179,55 @@ pub(crate) enum Commands {
     /// tracker, skill, daemon, board — and report provider CLIs (version
     /// and sign-in), the master agent (CAD-339) and the operator login
     /// (CAD-313). Anything already present is reported `ok` and left
-    /// untouched. Exit 1 when any check failed.
+    /// untouched. Exit 1 when any check failed, and when a requested
+    /// browser approval did not complete.
+    ///
+    /// On a real first run it first asks where the work lives — from a
+    /// terminal or a pipe: Enter signs in to hosted AgenticOS, `1` stays
+    /// on this machine, `2` creates a hosted workspace — at most one
+    /// browser approval, never a second device grant. That one approval
+    /// also requests the optional owner-only `billing.read` (never
+    /// `billing.cancel`); declining it, or a member who cannot consent it,
+    /// still completes the sign-in with the narrowed grant. A verified
+    /// hosted sign-in shows the server-authored plan, price, trial and
+    /// Checkout state; this terminal never opens a Checkout, cancels one
+    /// or takes a card, and the paid action stays an explicit browser
+    /// action. A hosted run, and a run whose approval did not complete,
+    /// reports the daemon and board without starting either. The run ends
+    /// with four facts — scope, sign-in, plan and board URL — and exactly
+    /// one next command.
     Setup {
         /// One JSON object per check, one per line:
         /// `{check, status, detail, fix}`; status is ok, created,
-        /// missing, failed or unknown; fix is a copy-paste command.
+        /// missing, failed or unknown; fix is a copy-paste command. The
+        /// last line is the `scope` record, which also carries the
+        /// `handover` facts. Never prompts, never signs in and never
+        /// calls the billing API; `--hosted`/`--register` are refused
+        /// with it.
         #[arg(long)]
         json: bool,
         /// Board port [default: the persisted `ui.json` port, else 3010].
         #[arg(long)]
         port: Option<u16>,
-        /// Do not open a browser. Setup never opens one yet — it prints
-        /// the board URL; accepted so `install.sh` and INSTALL-AGENT can
-        /// pass it today.
+        /// Do not open a browser: a hosted sign-in prints its URL and
+        /// code instead.
         #[arg(long)]
         no_open: bool,
+        /// Stay on this machine: no hosted sign-in, no browser and no
+        /// checkout. Also the answer for a pipe that sends no line, and
+        /// the one value that never waits on stdin.
+        #[arg(long, conflicts_with_all = ["hosted", "register"])]
+        local: bool,
+        /// Sign in to an existing hosted workspace with one browser
+        /// approval — the same device grant as `cadence login`. A hosted
+        /// run starts no local daemon or board. Refused with `--json`.
+        #[arg(long, conflicts_with_all = ["register", "json"])]
+        hosted: bool,
+        /// Create a hosted workspace in the browser, then approve this
+        /// CLI with the same single device grant as `cadence register`.
+        /// Refused with `--json`.
+        #[arg(long, conflicts_with = "json")]
+        register: bool,
     },
     /// Manage the persistent controller.
     Daemon {
@@ -745,7 +779,8 @@ pub(crate) enum Commands {
     },
     /// Enqueue a durable message to an agent — the hot-path alias for
     /// `message send`. Returns once the message is durable; delivery and
-    /// reporting continue asynchronously.
+    /// reporting continue asynchronously. Off the default help;
+    /// `message send` is the canonical path.
     ///
     /// `cadence send <ALIAS> --text <body>`: the recipient is the
     /// positional alias (or `--to <ALIAS>`, exactly one of the two) and
@@ -810,13 +845,6 @@ pub(crate) enum Commands {
               conflicts_with_all = ["nudge", "priority", "supersedes"])]
         wait: Option<u64>,
     },
-    /// Hosted coordination for this user's local agent (CAD-1460).
-    /// Requires a selected remote org. It does not run in the container.
-    #[command(hide = true)]
-    LocalAgent {
-        #[command(subcommand)]
-        action: local_agent::LocalAgentAction,
-    },
     /// Administer people on the selected hosted workspace.
     /// Owner and member can list the directory. Invitations, role
     /// changes and removal are owner-only and use the hosted CLI call.
@@ -829,7 +857,8 @@ pub(crate) enum Commands {
     /// One-step issue dispatch: `issue start` (idempotent, owner =
     /// the worker) then exactly one templated kickoff message, a
     /// tracker comment and a `message` ref on the issue. With `--job`
-    /// the kickoff goes through `job dispatch` instead.
+    /// the kickoff goes through `job dispatch` instead. Off the
+    /// default help; the root spelling stays callable.
     Dispatch {
         /// Issue id (e.g. CAD-55).
         issue: String,
@@ -892,7 +921,8 @@ pub(crate) enum Commands {
     /// session; `--cloud-params` is the same semicolon-separated
     /// `key=value` list as `cadence devin --cloud-params`. From inside
     /// an agent's pane only a group root (no upstream) may join, and
-    /// only into its own group (CAD-149).
+    /// only into its own group (CAD-149). Off the default help;
+    /// `agent join` is the canonical path and this spelling still parses.
     Join {
         /// Group handle — the PM agent's alias or native session id.
         group: String,
@@ -1276,17 +1306,19 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: PlatformAction,
     },
-    /// Plans (CAD-359/360): a proposed epic with its tickets. `propose`
-    /// writes it from a Markdown file; the operator `approve`s or
-    /// `reject`s it (operator connection only); until approved none of
-    /// its tickets dispatch. `show` prints state, tickets and
-    /// size-weighted progress.
     /// Idea pipeline (CAD-139): research and a plan can run, then the
     /// operator decides. Nothing is created until that decision.
     Idea {
         #[command(subcommand)]
         action: IdeaAction,
     },
+    /// Plans (CAD-359/360): a proposed epic with its tickets. `propose`
+    /// writes it from a Markdown file; the operator `approve`s or
+    /// `reject`s it (operator connection only); until approved none of
+    /// its tickets dispatch. `show` prints plan state, tickets and
+    /// size-weighted progress. Off the default help. Propose, approve
+    /// and reject are `issue epic`; `plan ls` and `plan show` stay
+    /// until they match `issue epic ls` and `issue epic show`.
     Plan {
         #[command(subcommand)]
         action: PlanAction,
