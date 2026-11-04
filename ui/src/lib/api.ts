@@ -65,9 +65,10 @@ import type {
   AvatarLook,
 } from "./types";
 
-/** The daemon-minted retained-file row `POST /api/chat/upload` answers
- *  (CAD-1168): the id is the only handle; metadata is server-derived. */
-export interface ChatFileRow {
+/** The native daemon-minted retained-file row `POST /api/chat/upload` answers
+ *  (CAD-1168): the id is the only handle; metadata is server-derived. A hosted
+ *  board answers `HostedChatFileReceipt` instead. */
+export interface NativeChatFileRow {
   id: string;
   sha256: string;
   size: number;
@@ -82,14 +83,35 @@ export interface ChatFileRow {
   created: number;
 }
 
-/** Validate the daemon's ChatFile::to_json receipt before a row can become
+/** The hosted tenant board's `POST /api/chat/upload` receipt (AOS-510,
+ *  agenticos-v2 `upload-routes.ts`): no native scope/user/thread proofs
+ *  exist there, only the `chf-` id, the content hash and the conversation
+ *  the file was stored under. A send names it by `attachments: [{id}]`. */
+export interface HostedChatFileReceipt {
+  id: string;
+  sha256: string;
+  size: number;
+  mime: string;
+  name: string;
+  conversation: string;
+  created: number;
+}
+
+/** A send carries only `{id}`; the composer store also keeps `name` and `mime`, which both receipts carry. */
+export type ChatFileRow = NativeChatFileRow | HostedChatFileReceipt;
+
+/** Validate the upload receipt (native ChatFile::to_json or the hosted receipt) before a row can become
  *  ready. This checks the wire shape only; native scope proofs remain the
  *  authority for upload and later reads. */
-function decodeChatFileRow(value: unknown): ChatFileRow {
+export function decodeChatFileRow(value: unknown): ChatFileRow {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
   }
   const row = value as Record<string, unknown>;
+  // The two receipts are told apart by `conversation`, which no native row
+  // carries. A row naming it is held to the hosted shape alone and may not
+  // also carry native identity fields; neither shape borrows the other's.
+  if ("conversation" in row) return decodeHostedReceipt(row);
   if (
     typeof row.id !== "string" || !/^chf-[0-9a-f]{32}$/.test(row.id) ||
     typeof row.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.sha256) ||
@@ -106,7 +128,23 @@ function decodeChatFileRow(value: unknown): ChatFileRow {
   ) {
     throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
   }
-  return row as unknown as ChatFileRow;
+  return row as unknown as NativeChatFileRow;
+}
+
+function decodeHostedReceipt(row: Record<string, unknown>): HostedChatFileReceipt {
+  if (
+    typeof row.id !== "string" || !/^chf-[0-9a-f]{32}$/.test(row.id) ||
+    typeof row.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.sha256) ||
+    typeof row.size !== "number" || !Number.isSafeInteger(row.size) || row.size <= 0 ||
+    typeof row.mime !== "string" || row.mime.length === 0 ||
+    typeof row.name !== "string" || row.name.trim().length === 0 ||
+    typeof row.conversation !== "string" || row.conversation.length === 0 ||
+    typeof row.created !== "number" || !Number.isFinite(row.created) ||
+    ["scope", "context_id", "uploader", "user_id", "thread_id", "location_version"].some((k) => k in row)
+  ) {
+    throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
+  }
+  return row as unknown as HostedChatFileReceipt;
 }
 
 /** Immutable native selector for a retained file. Home may carry its
@@ -750,7 +788,7 @@ export const api = {
       operation,
     ),
   /** `POST /api/chat/upload` — one retained chat attachment (CAD-1168).
-   *  Operator-only multipart; returns the daemon-minted row. `signal`
+   *  Operator-only multipart; returns the native daemon row or the hosted receipt. `signal`
    *  aborts only this upload's transport (a canceled row's late answer
    *  is ignored by its caller); it never deletes a retained blob. */
   chatFileUpload: (

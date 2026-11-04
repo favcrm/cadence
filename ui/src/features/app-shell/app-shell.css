@@ -509,7 +509,7 @@
 }
 
 /* A failed chip is a compact card, not a pill: the warning badge, a
-   two-line column (name/meta above, reason below) and a trailing Remove.
+   name/reason column (name/meta above, reason below) and a trailing Remove.
    The pill radius stays for the single-line states. */
 .app-chat-filerow.failed {
   height: auto;
@@ -568,17 +568,15 @@
   flex-shrink: 0;
 }
 
-/* The refusal reason: the failure colour at the meta size, one truncated
-   line under the name (the full text stays on the row's title). */
+/* The refusal reason: the failure colour at the meta size, wrapped under
+   the name so the remedy is readable (the full text is also the reason's title). */
 .app-chat-filerow .app-chat-upload-error {
   display: block;
   min-width: 0;
   font-size: var(--text-micro);
   line-height: 1.3;
   color: var(--color-fail);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 /* CAD-1419/CAD-1462: one icon slot per draft chip. Rest shows the
