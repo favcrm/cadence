@@ -437,6 +437,7 @@ fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
         INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('kept-run','kept-install',1,'digest','{}','digest','grant-worker','kept-request','succeeded',1,1);
         INSERT INTO platform_effects(effect_id,request,agent,platform,account,tool,input,input_summary,preview,scopes,state,staged_at,updated_at) VALUES('kept-effect','kept-effect-request','grant-worker','fixture','old-account','widgets.publish','{}','kept input','kept preview','[\"widgets:publish\"]','verified',1,1);
         DROP TABLE IF EXISTS connection_metadata;
+        DROP TRIGGER IF EXISTS app_capability_results_source_scope;
         DROP INDEX app_runs_context;
         ALTER TABLE app_runs DROP COLUMN context_id;
         DROP TABLE app_contexts;
