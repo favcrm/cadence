@@ -455,7 +455,8 @@ that standard yet: it counts hosted verdicts by attested principal and refuses
 the author's principal (local notes count by their self-declared `From:`
 alias, which is not attested), so a profile or separate session alone does not make a
 gate-counted verdict, and in-chat findings are not one either. Until the gate
-can tell a fresh session from the author, merges use the temporary
+can tell a fresh session from the author (the workflow-issued reviews of
+CAD-2081, not shipped yet; AGENTS.md "Review"), merges use the temporary
 `--exception --advisory ...` path (exact-head operator approval and two
 advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change; ends at `EXCEPTION_ENDS` in
@@ -492,7 +493,10 @@ head. The merge gate also runs whichever `cadence` you point it at: set
 `CADENCE_BIN` when more than one build is on the host, or a stale client's
 missing hosted verb will read like a gate refusal.
 
-A hosted verdict counts only on the owner's attestations (AOS-473, CAD-2001):
+A hosted verdict counts only on the owner's attestations (AOS-473, CAD-2001),
+except a workflow-issued row (CAD-2081; the workflows are not shipped yet), which
+has no login and counts only for a principal in
+`docs/roles/review-workflow-principals.toml` at main's tip (AGENTS.md "Review"):
 the workspace owner binds each principal's GitHub login once for the workspace,
 then admits principals to a project's review set. A code verdict needs both,
 because the gate counts a hosted document by principal and excludes the author

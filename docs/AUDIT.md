@@ -71,19 +71,24 @@ The review standard is a fresh-session review (AGENTS.md "Review", operator
 decision 2026-11-03): a non-author session with no inherited context, including
 a subagent. These verbs do not enforce it. The gate counts hosted verdicts by
 attested principal and refuses the author's principal, while local notes count
-by their self-declared `From:` alias, which is not attested; it cannot tell a
-fresh session from the author under one login; until it can, merges use the temporary
-`--exception --advisory ...` path (exact-head operator approval and two
-advisory links, standards and spec-security, plus browser-qa for a `ui/`
-change; ends at `EXCEPTION_ENDS` in
-`scripts/delivery-gate`, 2026-11-10).
+by their self-declared `From:` alias, which is not attested. Until the review
+workflows ship (CAD-2081 stage 3) merges use the temporary `--exception
+--advisory ...` path (ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`,
+2026-11-10).
+
+CAD-2081 row shape: a hosted row with `identity_source: "workflow-oidc"` has no
+`github_login` and carries `run_id`, `run_attempt`, `workflow_sha`, `jti` and
+`base_sha`, all strings. The tenant writes it (`projectVerdictEntry`) and
+`verdict_entry` in `src/delivery/hosted_gate.rs` is the one reader. What the gate
+counts, and what that does and does not prove, is in AGENTS.md "Review".
 
 The document says where it came from (AOS-473): `origin` is `local` for the
 note parse and `hosted` for the org's record, and the merge gate applies the
 attested rule only to `hosted`. A hosted read takes `--project` and `--repo`
 (the default repo is the cwd checkout's github.com origin), sends both, and
 refuses an answer naming another project or repository; each hosted entry
-carries `repo`, `reviewer_id` and `github_login`. A local read refuses
+carries `repo`, `reviewer_id` and `github_login`, except a workflow-issued row
+(CAD-2081), which has no `github_login`. A local read refuses
 `--repo` and `--project`, because notes are neither repo- nor project-scoped.
 The binding itself is the workspace owner's record — the GitHub login once for
 the workspace, and the project's review set as principals:

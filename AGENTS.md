@@ -120,11 +120,13 @@ the code you just wrote.
   where two are required, each by its own fresh session. Owner approval of the
   exact head still applies on `human`-class paths; this decision changes no
   approval rule for send, publish, spend or deploy.
-- **What the gate enforces today.** Not this standard. `scripts/enqueue-reviewed`
-  counts hosted verdicts by attested principal and, since CAD-2049, refuses the
-  author's principal; local notes count by their self-declared `From:` alias,
-  which is not attested. It cannot tell a fresh session from the author when
-  both act under one login. Until it can, merge through the
+- **What the gate enforces today.** Not this standard directly.
+  `scripts/enqueue-reviewed` counts hosted verdicts by attested principal and,
+  since CAD-2049, refuses the author's principal; local notes count by their
+  self-declared `From:` alias, which is not attested. It cannot tell a fresh
+  session from the author when both act under one login. Two routes exist.
+  Workflow-issued reviews (below) are the intended one but their workflows are
+  not shipped yet (CAD-2081 stage 3). Until they are, merge through the
   temporary exception (`--exception --advisory standards=<url> --advisory
   spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
   at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10). Of the advisory
@@ -132,7 +134,61 @@ the code you just wrote.
   neither head binding nor that Browser QA ran. A verdict filed under the
   author's identity still refuses under the exception, so a same-login
   session posts its findings as a PR comment and files no verdict. A second
-  attested human is not required. A workflow-issued reviewer identity is a proposal, not shipped.
+  attested human is not required.
+- **The changed set is anchored to main's live tip.** GitHub's PR base SHA can stay
+  older than the real merge base after main is merged into the branch, so a PR
+  that merges main and restores an old file diffs as docs-only against it.
+  `scripts/enqueue-reviewed` therefore diffs a main-based PR from the merge base
+  with main's live tip (the changed files, line count and every path class read
+  from that diff) and refuses if the tip cannot be read. A PR on another base keeps
+  the PR's base.
+- **Workflow-issued reviews (CAD-2081; the workflows are not shipped yet).** The
+  gate counts a hosted row whose `identity_source` is `workflow-oidc` only when
+  all of these hold, each read at gate time: its principal is in
+  `docs/roles/review-workflow-principals.toml` at the live tip of `main` (not the
+  PR's base, which can lag; the tip never holds an unmerged PR, so a PR cannot add
+  its own reviewer) and the row's kind is the one kind that principal may fill;
+  the PR's current base is `main`; the row carries a `base_sha` (a presence and
+  format check only, it proves nothing about the base); and the
+  principal's workflow file at the row's `workflow_sha` is a regular file
+  byte-identical to the same file at main's tip. A re-run keeps the original
+  commit's workflow for up to 30 days, so the comparison keeps a since-fixed
+  workflow from still filing a pass. It covers the workflow file itself, not the
+  actions it calls. An unlisted principal, a wrong kind, an unreadable tip or
+  allowlist, a retargeted PR or a non-pass row refuses and counts for nothing, and
+  under `--exception` too. An owner-attested row that names a listed workflow
+  principal also counts for nothing; the list loads whenever a hosted document has
+  a row, and if it cannot be read only a workflow row or a `svc_*` owner row
+  refuses.
+  Such a row has no login, so the author-login checks do not apply. Standards plus
+  Spec/security from the two workflow principals satisfy the two-review
+  requirement. The `consequential` class (an active delivery profile and an
+  ordinary one-review path) wants one combined review; two counted workflow
+  reviews, Standards plus Spec/security from distinct principals, are stricter and
+  satisfy it, so that class does not lose its route when the exception ends.
+  What this proves: a fresh GitHub-hosted job ran workflow code from `main`,
+  filed for a head live at filing. It does not prove good judgement. A workflow
+  row may carry `risk: auto`, and a prompt-injected model can write it: a PR that
+  fools both models skips the operator unless a human path or size trigger
+    applies. The gate therefore inverts the rule: a PR with any workflow-issued
+  row needs the operator's approval unless EVERY changed path matches
+  `docs/roles/workflow-auto-paths.toml`, read at main's live tip, and every
+  change is a plain add or modify (mode 100644). That list is EMPTY (`paths =
+  []`) and the reader and rules stay, so today the operator approves every
+  merge, and workflow rows only satisfy the two reviews. Enabling a path later
+  is one reviewed line and a later, deliberate decision, made only after reading
+  what the path holds. Whatever the list says, a path with a segment starting
+  with `.` or a basename starting `agents.`, `claude.` or `gemini.` is never
+  eligible. `cadence delivery requirements` does not report this rule; the
+  script adds it. Rule-7 paths, the size trigger and a non-`auto` `Risk:` also
+  force the operator. A workflow row that is not a pass refuses in every class.
+  The tenant stops re-filing, not re-rolling: a run can be cancelled and
+  re-dispatched, or an empty commit pushed, for a new head and a new verdict. A
+  session holding admin can still rewrite the workflow or sign directly until
+  agents lose admin. There is no Browser QA workflow: a `ui/` PR still needs a
+  Browser QA verdict from a session, and refuses without it. `--exception` is
+  otherwise unchanged, but a workflow row that does not hold refuses under it
+  too.
 - One fresh-session review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
@@ -284,7 +340,9 @@ looking.
   its principal's GitHub login (`cadence audit identities`) and admitted that
   principal to the project (`cadence audit reviewers --project <key>`); the
   gate counts principals, excludes the author by the attested login, and
-  refuses an unattested, contradictory or ambiguous note — see
+  refuses an unattested, contradictory or ambiguous note. The one exception is a
+  workflow-issued row (CAD-2081, "Review" above), which has no login and counts
+  only under its own rules — see
   `docs/guides/hosted-workspace.md` ("Reviewing software changes"; AOS-473,
   CAD-2001).
 - When more than one Cadence build is on the host, `CADENCE_BIN` selects the one
