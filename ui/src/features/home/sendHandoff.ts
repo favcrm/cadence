@@ -18,10 +18,12 @@ export function useSendHandoff(
 ): string | null {
   const sent = useRef(new Set<string>());
   const landed = useRef(new Map<string, number>());
+  // Once answered, stays answered: a later read must not bring the row back.
+  const answered = useRef<string | null>(null);
   for (const row of pending) if (row.state !== "failed") sent.current.add(row.message);
   const index = entries.findLastIndex((e) => e.role === "operator" && e.kind === "message");
   const message = entries[index]?.message;
-  if (!message || !sent.current.has(message)) return null;
+  if (!message || !sent.current.has(message) || answered.current === message) return null;
   // By position: hosted agent rows often carry no message id.
   if (entries.slice(index + 1).some((e) => e.kind === "turn_result")) return null;
   let at = landed.current.get(message);
@@ -29,6 +31,7 @@ export function useSendHandoff(
     at = Date.now();
     landed.current.set(message, at);
   }
-  const answered = !state.inFlight && (state.error !== null || (state.asOf !== null && state.asOf > at));
-  return answered ? null : message;
+  if (state.inFlight || (state.error === null && (state.asOf === null || state.asOf <= at))) return message;
+  answered.current = message;
+  return null;
 }

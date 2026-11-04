@@ -1066,9 +1066,9 @@ function MasterHome({
   // A read already out may predate the stored send, so ask for one after it.
   // Before the refresh below, which would otherwise join this one. A turn the
   // state already names needs no read.
-  const handoffUnread = handoff !== null && !master.data?.turn;
+  const handoffUnread = master.data?.turn ? null : handoff;
   useEffect(() => {
-    if (handoffUnread) void resources.masterState.invalidate();
+    if (handoffUnread !== null) void resources.masterState.invalidate();
   }, [handoffUnread]);
   // Turn boundaries land on the thread stream before the agents row
   // moves — a `turn_result` or a queued `message` tail revalidates the

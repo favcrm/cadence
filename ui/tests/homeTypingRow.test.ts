@@ -144,6 +144,11 @@ async function main() {
   assert(typing().length === 1, "held while the read is out");
   await letGo(stateWith(null));
   assert(typing().length === 0, "a later read with no turn clears the row");
+  hold();
+  await React.act(async () => { void resources.masterState.refresh(); });
+  await settle();
+  assert(typing().length === 0 && chip() === "Available", "the next read does not bring the row back");
+  await letGo(stateWith(null));
 
   // Another visit did not send it: an unanswered stored message shows no typing.
   await React.act(async () => { root.unmount(); });
