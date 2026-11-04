@@ -16,8 +16,11 @@ pub mod app_guard;
 pub mod app_listing;
 // CAD-2008: the screen declaration/integrity rules live in `cadence-core`, so
 // the native install/mount guard (`validate_map`) and the hosted
-// `app.screen.integrity` operation run one implementation. This re-export keeps
-// every existing `crate::issue::app_screen_decl` path working unchanged.
+// `app.screen.integrity` operation run one implementation. CAD-2118 keeps
+// `validate_map` strict and adds `app.screen.asset-integrity`
+// (`validate_facts_asset_integrity`) for hosts that own the operation
+// vocabulary themselves. This re-export keeps every existing
+// `crate::issue::app_screen_decl` path working unchanged.
 pub use cadence_core::app_screen_decl;
 pub mod app_screen_pkg;
 pub mod app_source;
