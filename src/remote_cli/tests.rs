@@ -6231,3 +6231,514 @@ fn hosted_doctor_due_renewal_with_an_unreadable_success_is_not_called_healthy() 
     assert_eq!(probe::exit_code(&checks), 1);
     assert_eq!(check(&checks, "auth").status, probe::Status::Unknown);
 }
+
+// CAD-2127: `platform status` and `platform artifact` are read-only lookups of
+// a request the workspace already holds. A lost read proves nothing ran, so an
+// availability failure must stay a definite refusal; a tool call (`call`)
+// remains a possible mutation and keeps its "may have been charged" unknown.
+#[test]
+fn cad2127_platform_status_and_artifact_are_read_only_effects() {
+    for operation in ["status", "artifact"] {
+        let arguments = json!({"operation": operation, "key": "cad2127-run-1"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let effect = call_effect(Surface::Cli, "platform_call", &arguments);
+        assert!(
+            matches!(effect, Effect::Read),
+            "`platform {operation}` must not be treated as a mutation"
+        );
+        assert!(!effect.is_mutation(), "{operation}");
+        assert!(
+            effect.reconciliation().is_none(),
+            "a read has no effect to reconcile"
+        );
+    }
+
+    // A paid tool call stays a mutation, and an operation outside the known
+    // read set fails closed as a possible mutation.
+    for operation in ["call", "unmapped_operation"] {
+        let arguments = json!({"operation": operation, "tool": "generate_image"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        assert!(
+            call_effect(Surface::Cli, "platform_call", &arguments).is_mutation(),
+            "`platform {operation}` must stay a possible mutation"
+        );
+    }
+}
+
+// CAD-2127: a 503 to a read cannot have started or billed anything, so it is
+// `rejected` availability — never the paid-call unknown that says the caller
+// may have been charged.
+#[test]
+fn cad2127_platform_read_503_is_rejected_availability_not_charged_unknown() {
+    for operation in ["status", "artifact"] {
+        let arguments = json!({"operation": operation, "key": "cad2127-run-1"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let (out, requests) = run(
+            vec![(
+                503,
+                "",
+                json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+            )],
+            "platform_call",
+            arguments,
+            10,
+        );
+        let error = out.expect_err("a refused read is not a successful lookup");
+        assert_eq!(error.kind(), "rejected", "{operation}: {error}");
+        assert_eq!(
+            crate::error::exit_code_for_kind(error.kind()),
+            3,
+            "{operation}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("availability"), "{operation}: {text}");
+        assert!(
+            !text.contains("charg"),
+            "{operation}: a read cannot be charged: {text}"
+        );
+        assert!(
+            !text.contains("may already have"),
+            "{operation}: a read must not claim a lost mutation: {text}"
+        );
+        assert!(!text.contains("outcome_unknown"), "{operation}: {text}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "{operation}: an availability refusal is not replayed"
+        );
+    }
+}
+
+// CAD-2127: a 200 `status` lookup is usable only when it proves one of the
+// three outcome states. Anything else cannot be read as `recorded`, so it is
+// refused rather than reported as a confirmed call.
+#[test]
+fn cad2127_platform_status_requires_a_known_outcome() {
+    let arguments = || {
+        json!({"operation": "status", "key": "cad2127-run-1"})
+            .as_object()
+            .cloned()
+            .unwrap()
+    };
+
+    for outcome in ["recorded", "unrecorded", "unknown"] {
+        let (out, _) = run(
+            vec![(
+                200,
+                "",
+                json!({"ok": true, "data": {"outcome": outcome, "key": "cad2127-run-1"}}),
+            )],
+            "platform_call",
+            arguments(),
+            10,
+        );
+        let body = out.unwrap_or_else(|error| panic!("{outcome}: {error}"));
+        assert_eq!(body["data"]["outcome"], json!(outcome), "{outcome}");
+    }
+
+    for body in [
+        json!({"ok": true, "data": {}}),
+        json!({"ok": true, "data": {"outcome": "pending"}}),
+        json!({"ok": true, "data": {"outcome": "RECORDED"}}),
+        json!({"ok": true, "data": {"outcome": null}}),
+        json!({"ok": false, "data": {"outcome": "recorded"}}),
+        json!({"ok": true}),
+        json!({"ok": true, "data": []}),
+        Value::Null,
+    ] {
+        let (out, requests) = run(
+            vec![(200, "", body.clone())],
+            "platform_call",
+            arguments(),
+            10,
+        );
+        let error = out.expect_err("an uncorrelated status answer is not a lookup result");
+        assert_eq!(error.kind(), "rejected", "{body}: {error}");
+        let text = error.to_string();
+        assert!(text.contains("status lookup"), "{body}: {text}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "{body}: the read is not retried"
+        );
+    }
+
+    // The artifact window has its own usable shape: `ok` plus an object `data`.
+    let artifact = || {
+        json!({"operation": "artifact", "ref": format!("med_job-1.{}", "a".repeat(64)), "offset": 0})
+            .as_object()
+            .cloned()
+            .unwrap()
+    };
+    let (out, _) = run(
+        vec![(
+            200,
+            "",
+            json!({"ok": true, "data": {"ref": format!("med_job-1.{}", "a".repeat(64)), "offset": 0}}),
+        )],
+        "platform_call",
+        artifact(),
+        10,
+    );
+    assert!(out.is_ok(), "{:?}", out.err().map(|e| e.to_string()));
+    let (out, _) = run(
+        vec![(200, "", json!({"ok": true}))],
+        "platform_call",
+        artifact(),
+        10,
+    );
+    let error = out.expect_err("an artifact reply without a data window is unusable");
+    assert_eq!(error.kind(), "rejected", "{error}");
+    assert!(error.to_string().contains("artifact read"), "{error}");
+}
+
+// CAD-2127: a tenant older than `operation: status|artifact` must be reported
+// as a release-order problem, not as a retryable availability blip and not as
+// "the request was never made".
+#[test]
+fn cad2127_older_tenant_refuses_platform_status_and_artifact_by_release_order() {
+    for operation in ["status", "artifact"] {
+        for (status, code) in [
+            (501u16, "not_implemented"),
+            (400, "invalid_request"),
+            (400, "unknown_verb"),
+        ] {
+            let arguments = json!({"operation": operation, "key": "cad2127-run-1"})
+                .as_object()
+                .cloned()
+                .unwrap();
+            let (out, requests) = run(
+                vec![(status, "", json!({"ok": false, "error": {"code": code}}))],
+                "platform_call",
+                arguments,
+                10,
+            );
+            let error = out.expect_err("an old tenant cannot serve the read");
+            assert_eq!(
+                error.kind(),
+                "rejected",
+                "{operation} {status} {code}: {error}"
+            );
+            assert_eq!(
+                crate::error::exit_code_for_kind(error.kind()),
+                3,
+                "{operation} {status} {code}"
+            );
+            let text = error.to_string();
+            assert!(
+                text.contains("update the tenant server first"),
+                "{operation} {status} {code}: {text}"
+            );
+            assert!(
+                text.contains(&format!("platform {operation}")),
+                "{operation} {status} {code}: {text}"
+            );
+            assert!(
+                text.contains("nothing was started or billed"),
+                "{operation} {status} {code}: {text}"
+            );
+            assert!(
+                !text.contains("retry later"),
+                "{operation} {status} {code}: {text}"
+            );
+            assert_eq!(
+                hits(&requests, "/__platform/cli/call"),
+                1,
+                "{operation} {status} {code}: no replay"
+            );
+        }
+    }
+}
+
+// CAD-2127: an ambiguous paid call keeps the server's own proof (`code`,
+// `stage`, `recorded`) and points at the read-only lookup before a repeat that
+// could start and charge a second call.
+#[test]
+fn cad2127_platform_call_maintenance_preserves_proof_and_reconciliation() {
+    let arguments = json!({
+        "operation": "call",
+        "tool": "generate_image",
+        "key": "cad2127-acceptance-run-1",
+        "body": {"prompt": "synthetic acceptance input"},
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    let (out, requests) = run(
+        vec![(
+            503,
+            "",
+            json!({"ok": false, "error": {
+                "code": "maintenance",
+                "stage": "delivery_admission",
+                "recorded": false,
+                "message": "do-not-print-server-text",
+            }}),
+        )],
+        "platform_call",
+        arguments,
+        10,
+    );
+    let error = out.expect_err("an ambiguous paid call is never a success receipt");
+    assert_eq!(error.kind(), "unknown", "{error}");
+    assert_eq!(crate::error::exit_code_for_kind(error.kind()), 1, "{error}");
+    let text = error.to_string();
+    assert!(text.contains("HTTP 503"), "{text}");
+    assert!(text.contains("code maintenance"), "{text}");
+    assert!(text.contains("stage delivery_admission"), "{text}");
+    assert!(text.contains("recorded=false"), "{text}");
+    assert!(
+        text.contains("platform status"),
+        "the caller must reconcile read-only first: {text}"
+    );
+    assert!(text.contains("--request"), "{text}");
+    assert!(
+        text.contains("start and charge a new call"),
+        "a replay can charge a new call: {text}"
+    );
+    assert!(text.contains("unrecorded"), "{text}");
+    assert!(
+        text.contains("get_media_job"),
+        "polling the existing job is the alternative to replaying: {text}"
+    );
+    assert!(!text.contains("retry later"), "{text}");
+    assert!(
+        !text.contains("do-not-print-server-text"),
+        "only bounded diagnostics may be echoed: {text}"
+    );
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "an ambiguous paid call is not automatically replayed"
+    );
+}
+
+// CAD-2127 follow-up (independent security review): a 200 `status` answer is
+// evidence only for the selector this call sent. The media lookup contract
+// (`GET /capabilities/media/lookup`, apps/api/src/media/routes.ts) echoes the
+// row's caller key as `data.key` and its job as `data.job` (`jobView.id`); a
+// job-scoped lookup always answers a job, and an unrecorded/unknown key
+// answer keeps the key with no job. An answer that drops or substitutes a
+// requested selector cannot reconcile this request.
+#[test]
+fn cad2127_platform_status_correlates_a_requested_key() {
+    let arguments = json!({"operation": "status", "key": "cad2127-run-1"})
+        .as_object()
+        .cloned()
+        .unwrap();
+
+    // The requested key is echoed. Its job may be present (a recorded row),
+    // absent (unrecorded) or null (a multi-namespace unknown) — none of those
+    // may be read as a different request.
+    for data in [
+        json!({
+            "outcome": "recorded",
+            "recorded": true,
+            "key": "cad2127-run-1",
+            "job": {"id": "med_job-a", "status": "succeeded"},
+            "billing": {"state": "settled", "chargeMinor": 123_456},
+        }),
+        json!({
+            "outcome": "unrecorded",
+            "recorded": false,
+            "key": "cad2127-run-1",
+            "job": null,
+            "billing": null,
+        }),
+        json!({
+            "outcome": "unknown",
+            "recorded": false,
+            "key": "cad2127-run-1",
+            "job": null,
+            "billing": null,
+            "note": "The key is present or uncertain in multiple tool namespaces.",
+        }),
+    ] {
+        let body = json!({"ok": true, "data": data.clone()});
+        let (out, requests) = run(
+            vec![(200, "", body.clone())],
+            "platform_call",
+            arguments.clone(),
+            10,
+        );
+        let answered = out.unwrap_or_else(|error| panic!("{body}: {error}"));
+        assert_eq!(answered["data"]["key"], json!("cad2127-run-1"), "{body}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "{body}: the read is not retried"
+        );
+    }
+
+    for data in [
+        // The key is missing entirely: nothing ties the answer to this request.
+        json!({"outcome": "recorded"}),
+        json!({"outcome": "recorded", "key": null}),
+        json!({"outcome": "unrecorded", "key": null, "job": null}),
+        // Another request's key: the row is real, but it is not this lookup.
+        json!({
+            "outcome": "recorded",
+            "key": "key-b",
+            "job": {"id": "med_job-b", "status": "succeeded"},
+        }),
+        // A non-string key is not the requested handle.
+        json!({"outcome": "recorded", "key": 7, "job": null}),
+    ] {
+        let body = json!({"ok": true, "data": data.clone()});
+        let (out, requests) = run(
+            vec![(200, "", body.clone())],
+            "platform_call",
+            arguments.clone(),
+            10,
+        );
+        let error = out.expect_err("an uncorrelated key answer is not evidence");
+        assert_eq!(error.kind(), "rejected", "{body}: {error}");
+        assert_eq!(crate::error::exit_code_for_kind(error.kind()), 3, "{body}");
+        let text = error.to_string();
+        assert!(text.contains("status"), "{body}: {text}");
+        assert!(
+            !text.contains("may already have"),
+            "{body}: a read never reports a lost mutation: {text}"
+        );
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "{body}: no replay"
+        );
+    }
+}
+
+#[test]
+fn cad2127_platform_status_correlates_a_requested_job() {
+    let arguments = json!({"operation": "status", "jobId": "med_job-1"})
+        .as_object()
+        .cloned()
+        .unwrap();
+
+    // A job lookup answers the requested job. The row's caller key is not a
+    // selector here, so it may be any key the workspace stored.
+    for data in [
+        json!({
+            "outcome": "recorded",
+            "recorded": true,
+            "key": "another-caller-key",
+            "job": {"id": "med_job-1", "status": "succeeded"},
+            "billing": {"state": "settled", "chargeMinor": 60_000},
+        }),
+        json!({
+            "outcome": "unknown",
+            "recorded": true,
+            "key": "another-caller-key",
+            "job": {"id": "med_job-1", "status": "uncertain"},
+            "billing": {"state": "uncertain"},
+        }),
+    ] {
+        let body = json!({"ok": true, "data": data.clone()});
+        let (out, requests) = run(
+            vec![(200, "", body.clone())],
+            "platform_call",
+            arguments.clone(),
+            10,
+        );
+        let answered = out.unwrap_or_else(|error| panic!("{body}: {error}"));
+        assert_eq!(answered["data"]["job"]["id"], json!("med_job-1"), "{body}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{body}");
+    }
+
+    for data in [
+        // No job at all: a key-shaped answer cannot reconcile a job lookup.
+        json!({"outcome": "recorded", "key": "another-caller-key"}),
+        json!({"outcome": "unrecorded", "key": "another-caller-key", "job": null}),
+        // A job row without the id it was asked for.
+        json!({"outcome": "recorded", "key": "another-caller-key", "job": {"status": "succeeded"}}),
+        // Another job's row.
+        json!({"outcome": "recorded", "key": "another-caller-key", "job": {"id": "med_job-2"}}),
+        // A job that is not a row object cannot carry the selector.
+        json!({"outcome": "recorded", "key": "another-caller-key", "job": "med_job-1"}),
+    ] {
+        let body = json!({"ok": true, "data": data.clone()});
+        let (out, requests) = run(
+            vec![(200, "", body.clone())],
+            "platform_call",
+            arguments.clone(),
+            10,
+        );
+        let error = out.expect_err("an uncorrelated job answer is not evidence");
+        assert_eq!(error.kind(), "rejected", "{body}: {error}");
+        let text = error.to_string();
+        assert!(text.contains("status"), "{body}: {text}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "{body}: no replay"
+        );
+    }
+}
+
+#[test]
+fn cad2127_platform_status_correlates_both_selectors() {
+    let arguments = json!({
+        "operation": "status",
+        "key": "cad2127-run-1",
+        "jobId": "med_job-1",
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+
+    // With both selectors, both must be echoed: the media door only answers
+    // 200 when the key owns that job (a mismatch is 409 key_conflict).
+    let matched = json!({"ok": true, "data": {
+        "outcome": "recorded",
+        "recorded": true,
+        "key": "cad2127-run-1",
+        "job": {"id": "med_job-1", "status": "succeeded"},
+        "billing": {"state": "settled", "chargeMinor": 123_456},
+    }});
+    let (out, requests) = run(
+        vec![(200, "", matched.clone())],
+        "platform_call",
+        arguments.clone(),
+        10,
+    );
+    let answered = out.unwrap_or_else(|error| panic!("{matched}: {error}"));
+    assert_eq!(answered["data"]["key"], json!("cad2127-run-1"));
+    assert_eq!(answered["data"]["job"]["id"], json!("med_job-1"));
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+
+    for data in [
+        // Job matches, key is beyond the request.
+        json!({"outcome": "recorded", "key": "cad2127-run-1", "job": {"id": "med_job-2"}}),
+        // Key matches, job is beyond the request.
+        json!({"outcome": "recorded", "key": "key-b", "job": {"id": "med_job-1"}}),
+        // One selector missing each way.
+        json!({"outcome": "recorded", "key": "cad2127-run-1"}),
+        json!({"outcome": "recorded", "key": "cad2127-run-1", "job": null}),
+        json!({"outcome": "recorded", "job": {"id": "med_job-1"}}),
+        // Neither selector echoed.
+        json!({"outcome": "unrecorded"}),
+    ] {
+        let body = json!({"ok": true, "data": data.clone()});
+        let (out, requests) = run(
+            vec![(200, "", body.clone())],
+            "platform_call",
+            arguments.clone(),
+            10,
+        );
+        let error = out.expect_err("both selectors are required when both were sent");
+        assert_eq!(error.kind(), "rejected", "{body}: {error}");
+        let text = error.to_string();
+        assert!(text.contains("status"), "{body}: {text}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "{body}: no replay"
+        );
+    }
+}

@@ -316,7 +316,7 @@ const RECONCILE_PROJECT_POLICY: &str = "the recorded policy may or may not have 
 const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been registered — read `issue project ls` with the same explicit --org before repeating it; the same key, name and prefix is the same project";
 const RECONCILE_PROFILE_CREATE: &str = "the profile may or may not have been saved — read `agent profiles` with the same explicit --org before repeating it; the same alias is refused as taken if it landed";
 const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
-const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have run and been charged — replay the same command; the relayed key returns the door's recorded outcome instead of running it a second time";
+const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
 const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
 const RECONCILE_TEAM: &str =
     "the team change may or may not have been applied — inspect `team list` or \
@@ -442,7 +442,10 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
         }
         Surface::Cli
             if verb == "platform_call"
-                && arguments.get("operation").and_then(Value::as_str) == Some("tools") =>
+                && matches!(
+                    arguments.get("operation").and_then(Value::as_str),
+                    Some("tools" | "status" | "artifact")
+                ) =>
         {
             Effect::Read
         }
@@ -3830,6 +3833,35 @@ fn refusal_fields(body: Option<&Value>) -> (Option<&str>, Option<&str>) {
     (safe(code), safe(reason))
 }
 
+/// Bounded diagnostic fields a failed `platform_call` may carry: the safe
+/// `error.code`, an allowlisted `error.stage`, and whether the server proved
+/// the request was not recorded (`error.recorded`). Never echoes free-text
+/// messages, keys, prompts, credentials or URLs.
+fn platform_error_details(body: Option<&Value>) -> String {
+    fn safe_token(v: Option<&str>) -> Option<&str> {
+        v.filter(|c| {
+            !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        })
+    }
+    let error = body.and_then(|b| b.get("error"));
+    let code = refusal_fields(body).0;
+    let stage = safe_token(error.and_then(|e| e.get("stage")).and_then(Value::as_str));
+    let recorded = error
+        .and_then(|e| e.get("recorded"))
+        .and_then(Value::as_bool);
+    let mut out = String::new();
+    if let Some(code) = code {
+        out.push_str(&format!(", code {code}"));
+    }
+    if let Some(stage) = stage {
+        out.push_str(&format!(", stage {stage}"));
+    }
+    if let Some(recorded) = recorded {
+        out.push_str(&format!(", recorded={recorded}"));
+    }
+    out
+}
+
 /// CAD-1434 / AOS-243: the correlation a refusal carries, read only when it is
 /// safe to show. `hop` is an allowlisted name (today only the board names a
 /// hop) and `request_id` must be a bounded UUID. Anything else is dropped, so
@@ -5240,6 +5272,36 @@ fn call_verb_until_retry(
                         effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                     )));
                 }
+                Some("status")
+                    if !body.as_ref().is_some_and(|answer| {
+                        answer.get("ok").and_then(Value::as_bool) == Some(true)
+                            && answer.get("data").is_some_and(Value::is_object)
+                            && matches!(
+                                answer.pointer("/data/outcome").and_then(Value::as_str),
+                                Some("recorded" | "unrecorded" | "unknown")
+                            )
+                            && arguments
+                                .get("key")
+                                .is_none_or(|key| answer.pointer("/data/key") == Some(key))
+                            && arguments
+                                .get("jobId")
+                                .is_none_or(|job| answer.pointer("/data/job/id") == Some(job))
+                    }) =>
+                {
+                    return Err(reject(
+                        "the remote platform status lookup returned no usable answer",
+                    ));
+                }
+                Some("artifact")
+                    if !body.as_ref().is_some_and(|answer| {
+                        answer.get("ok").and_then(Value::as_bool) == Some(true)
+                            && answer.get("data").is_some_and(Value::is_object)
+                    }) =>
+                {
+                    return Err(reject(
+                        "the remote platform artifact read returned no usable window",
+                    ));
+                }
                 Some("tools")
                     if !body
                         .as_ref()
@@ -5412,6 +5474,11 @@ fn call_verb_until_retry(
         if let Some(error) = profile_board_too_old(verb, status) {
             return Err(error);
         }
+        let platform_details = if platform_outcome_unknown {
+            platform_error_details(body.as_ref())
+        } else {
+            String::new()
+        };
         // CAD-2001: a project-scoped gate verb the tenant cannot serve is a
         // release-order problem, not an availability blip and not "no
         // evidence". Report it before the generic decoder can call it
@@ -5453,10 +5520,29 @@ fn call_verb_until_retry(
                 }
             }
         }
+        if matches!(platform_operation, Some("status" | "artifact"))
+            && (status == 501
+                || (status == 400
+                    && matches!(
+                        refusal_code.as_deref(),
+                        Some("invalid_request" | "unknown_verb")
+                    )
+                    && arguments.get("body").is_none()
+                    && arguments.get("query").is_none()))
+        {
+            let op_name = platform_operation.unwrap_or("status");
+            return Err(reject(format!(
+                "the tenant could not serve `platform {op_name}` (HTTP {status}{}) — update the \
+                 tenant server first, then this Cadence client; nothing was started or billed",
+                refusal_code
+                    .as_deref()
+                    .map_or(String::new(), |c| format!(", {c}"))
+            )));
+        }
         match classify(status, retry_after, body) {
             Verdict::Done(Err(_e)) if platform_outcome_unknown => {
                 return Err(Error::unknown(format!(
-                    "remote platform call returned HTTP {status} — {}",
+                    "remote platform call returned HTTP {status}{platform_details} — {}",
                     effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                 )));
             }

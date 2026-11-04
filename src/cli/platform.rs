@@ -165,7 +165,9 @@ pub(crate) enum PlatformAction {
         /// outcome of the same handle instead of charging twice. A local
         /// connected read creates a fresh handle when omitted and reports it
         /// if its outcome is unknown. Other hosted calls derive an omitted
-        /// handle from the tool and input.
+        /// handle from the tool and input. Inspect `platform status` before
+        /// repeating an uncertain call: an unrecorded retry can start and
+        /// charge new work. Use a fresh handle for a deliberate new call.
         #[arg(long)]
         request: Option<String>,
         /// Disambiguate when several adapters declare the same tool.
@@ -188,6 +190,38 @@ pub(crate) enum PlatformAction {
         /// before anything runs. Forwarded unchanged — no conversion here.
         #[arg(long)]
         max_charge: Option<u64>,
+    },
+    /// Read-only lookup of a hosted platform call or media job by request handle
+    /// or job id. Never dispatches, reserves, settles or polls a provider.
+    Status {
+        /// Stable request handle (`--request` or derived `pcli_…` key).
+        #[arg(long, required_unless_present_any = ["job", "tool"])]
+        request: Option<String>,
+        /// Hosted media job id (`med_…`).
+        #[arg(long)]
+        job: Option<String>,
+        /// Tool name to derive the request key from (with `--input`/`--query`)
+        /// or verify same-key payload compatibility.
+        #[arg(long)]
+        tool: Option<String>,
+        /// Tool request body JSON (inline, `@file`, path, or `-`) used to derive
+        /// or verify the request key.
+        #[arg(long)]
+        input: Option<String>,
+        /// Hosted tool query JSON (inline, `@file`, path, or `-`) used to derive
+        /// or verify the request key.
+        #[arg(long)]
+        query: Option<String>,
+    },
+    /// Download a completed hosted media artifact (`med_<jobId>.<sha256>`) to a
+    /// local file, verifying its SHA-256 digest and byte length before writing.
+    Artifact {
+        /// Durable media artifact reference (`med_<jobId>.<sha256>`).
+        #[arg(value_name = "REF")]
+        reference: String,
+        /// Local destination file path to create (refuses if the file already exists).
+        #[arg(long)]
+        out: PathBuf,
     },
     /// List the per-project default platform accounts.
     Defaults,
@@ -474,6 +508,17 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
                 print_json(&rpc("platform_call", params)?);
             }
         }
+        PlatformAction::Status { .. } => {
+            return Err(Error::rejected(
+                "`platform status` reconciles a hosted workspace call — pass `--org <workspace>`, \
+                 or use `cadence platform effects` for local staged effects",
+            ));
+        }
+        PlatformAction::Artifact { .. } => {
+            return Err(Error::rejected(
+                "`platform artifact` downloads a hosted workspace media artifact — pass `--org <workspace>`",
+            ));
+        }
         PlatformAction::Defaults => {
             print_json(&rpc("platform_defaults", json!({}))?);
         }
@@ -646,6 +691,103 @@ pub(super) fn parse_platform_input(raw: &str) -> Result<Value> {
         ));
     }
     Ok(input)
+}
+
+/// Format scale-6 USD micro-units (1 USD = 1,000,000 units) unambiguously as
+/// `USD <whole>.<6-digits>` (e.g., `123456` -> `"USD 0.123456"`).
+pub(super) fn format_scale6_usd(charge_minor: u64) -> String {
+    format!(
+        "USD {}.{:06}",
+        charge_minor / 1_000_000,
+        charge_minor % 1_000_000
+    )
+}
+
+/// Human-facing price and outcome lines for a hosted platform response,
+/// preserving raw machine-readable JSON on stdout while stating scale-6 USD
+/// amounts and distinguishing informational provider credits.
+pub(super) fn platform_human_summary(body: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for entry in tools {
+            let name = entry
+                .get("tool")
+                .or_else(|| entry.get("slug"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(minor) = entry.pointer("/price/chargeMinor").and_then(Value::as_u64) {
+                lines.push(format!(
+                    "cadence platform price tool={name} {} (chargeMinor={minor}, scale=6 USD micro-units)",
+                    format_scale6_usd(minor)
+                ));
+            } else if let Some(amount) = entry.pointer("/price/amount").and_then(Value::as_str) {
+                let currency = entry
+                    .pointer("/price/currency")
+                    .and_then(Value::as_str)
+                    .unwrap_or("USD");
+                let unit = entry.pointer("/unitPrice/amount").and_then(Value::as_str);
+                let unit_currency = entry.pointer("/unitPrice/currency").and_then(Value::as_str);
+                let mut line = format!(
+                    "cadence platform price tool={name} per_call={currency} {amount} (scale=6)"
+                );
+                if let (Some(unit_amount), Some(unit_currency)) = (unit, unit_currency) {
+                    line.push_str(&format!(
+                        " per_unit={unit_currency} {unit_amount} (scale=6)"
+                    ));
+                }
+                lines.push(line);
+            }
+        }
+    }
+    let data = body.get("data").unwrap_or(body);
+    if let Some(outcome) = data.get("outcome").and_then(Value::as_str) {
+        let key = data.get("key").and_then(Value::as_str).unwrap_or("-");
+        let job_status = data
+            .pointer("/job/status")
+            .or_else(|| data.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        lines.push(format!(
+            "cadence platform status outcome={outcome} request={key} job_status={job_status}"
+        ));
+    }
+    if let Some(minor) = data
+        .pointer("/job/price/chargeMinor")
+        .or_else(|| data.pointer("/billing/chargeMinor"))
+        .and_then(Value::as_u64)
+    {
+        let billing = data
+            .pointer("/job/billing")
+            .or_else(|| data.pointer("/billing/state"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut line = format!(
+            "cadence platform charge: {} (chargeMinor={minor}, scale=6 USD micro-units, billing={billing})",
+            format_scale6_usd(minor)
+        );
+        if let Some(credits) = data
+            .pointer("/job/usage/providerCredits")
+            .or_else(|| data.pointer("/billing/providerCredits"))
+            .and_then(Value::as_f64)
+        {
+            line.push_str(&format!(
+                "; providerCredits={credits} (informational provider credits, not USD customer charge)"
+            ));
+        }
+        lines.push(line);
+    } else if let Some(amount) = data.pointer("/price/amount").and_then(Value::as_str) {
+        let currency = data
+            .pointer("/price/currency")
+            .and_then(Value::as_str)
+            .unwrap_or("USD");
+        lines.push(format!(
+            "cadence platform charge: {currency} {amount} (scale=6)"
+        ));
+    }
+    lines
 }
 
 fn print_platform_tools(listing: &Value) {
@@ -908,5 +1050,154 @@ mod tests {
             "a".repeat(64 * 1024 - prefix.len() - suffix.len() + 1)
         );
         assert!(parse_platform_input(&over).is_err());
+    }
+
+    // CAD-2127: `chargeMinor` is scale-6 USD (micro-units), so it must never
+    // print as whole dollars or as cents. Independently authored from the
+    // ticket's money-units requirement.
+    #[test]
+    fn platform_charge_minor_formats_as_scale6_usd() {
+        assert_eq!(format_scale6_usd(123_456), "USD 0.123456");
+        assert_eq!(format_scale6_usd(60_000), "USD 0.060000");
+        assert_eq!(format_scale6_usd(0), "USD 0.000000");
+        assert_eq!(format_scale6_usd(1_250_000), "USD 1.250000");
+        // Above one dollar the whole part is not truncated to zero.
+        assert_eq!(format_scale6_usd(1_000_001), "USD 1.000001");
+    }
+
+    // CAD-2127: the human summary states the scale-6 USD charge next to the
+    // raw micro-units, and never lets informational provider credits stand in
+    // for the customer's USD charge.
+    #[test]
+    fn platform_human_summary_separates_usd_charge_from_provider_credits() {
+        let body = json!({
+            "ok": true,
+            "tools": [
+                {"tool": "generate_image", "price": {"chargeMinor": 60_000}},
+            ],
+            "data": {
+                "outcome": "recorded",
+                "key": "pcli_0123456789abcdef",
+                "job": {
+                    "status": "succeeded",
+                    "price": {"chargeMinor": 123_456},
+                    "billing": "settled",
+                    "usage": {"providerCredits": 2.5},
+                },
+            },
+        });
+        let lines = platform_human_summary(&body);
+        let text = lines.join("\n");
+
+        // The listed price is scale-6 USD, with the raw unit kept alongside.
+        assert!(text.contains("tool=generate_image USD 0.060000"), "{text}");
+        assert!(text.contains("chargeMinor=60000"), "{text}");
+
+        // The outcome line names the request handle and the job status.
+        assert!(text.contains("outcome=recorded"), "{text}");
+        assert!(text.contains("request=pcli_0123456789abcdef"), "{text}");
+        assert!(text.contains("job_status=succeeded"), "{text}");
+
+        // The charge itself is the chargeMinor, formatted from micro-units,
+        // and the billing state is stated with it.
+        let charge = lines
+            .iter()
+            .find(|line| line.contains("cadence platform charge:"))
+            .unwrap_or_else(|| panic!("no charge line in {text}"));
+        assert!(charge.contains("USD 0.123456"), "{charge}");
+        assert!(charge.contains("chargeMinor=123456"), "{charge}");
+        assert!(charge.contains("billing=settled"), "{charge}");
+
+        // providerCredits is labelled as informational provider credit, and
+        // is not printed as USD money or as the charge amount.
+        let credits = lines
+            .iter()
+            .find(|line| line.contains("providerCredits"))
+            .unwrap_or_else(|| panic!("no provider-credit line in {text}"));
+        assert!(credits.contains("providerCredits=2.5"), "{credits}");
+        assert!(credits.contains("informational"), "{credits}");
+        assert!(credits.contains("not USD customer charge"), "{credits}");
+        assert!(
+            !credits.contains("USD 2") && !credits.contains("chargeMinor=2"),
+            "provider credits must not be formatted as the USD charge: {credits}"
+        );
+        assert!(
+            charge.contains("providerCredits"),
+            "the informational credit belongs to the charge line, not a separate price: {charge}"
+        );
+
+        // A bare charge with no credits still states scale-6 USD and never
+        // invents a provider-credit figure.
+        let bare = platform_human_summary(
+            &json!({"data": {"job": {"price": {"chargeMinor": 1_250_000}}}}),
+        );
+        let bare_text = bare.join("\n");
+        assert!(bare_text.contains("USD 1.250000"), "{bare_text}");
+        assert!(!bare_text.contains("providerCredits"), "{bare_text}");
+    }
+
+    // CAD-2127 follow-up (independent security review): the runtime catalog
+    // publishes a zero base for a per-unit-priced tool (`price.amount`
+    // "0.000000") beside the real `unitPrice`. A human line showing only the
+    // base reads as a free invocation, so both rates must be labelled, kept
+    // distinct, and never collapsed into one "price".
+    #[test]
+    fn a_zero_call_price_with_a_unit_price_never_reads_as_free() {
+        let listing = json!({"tools": [{
+            "tool": "generate_video",
+            "effect": "draft",
+            "price": {"currency": "USD", "scale": 6, "amount": "0.000000"},
+            "unitPrice": {"currency": "USD", "scale": 6, "amount": "0.123456"},
+        }]});
+        let lines = platform_human_summary(&listing);
+        let price = lines
+            .iter()
+            .find(|line| line.contains("cadence platform price"))
+            .unwrap_or_else(|| panic!("no price line in {lines:?}"));
+
+        // Both rates are shown, each under its own label.
+        assert!(price.contains("per_call=USD 0.000000"), "{price}");
+        assert!(price.contains("per_unit=USD 0.123456"), "{price}");
+        // Neither label carries the other's amount.
+        assert!(!price.contains("per_call=USD 0.123456"), "{price}");
+        assert!(!price.contains("per_unit=USD 0.000000"), "{price}");
+        assert_eq!(price.matches("per_call=").count(), 1, "{price}");
+        assert_eq!(price.matches("per_unit=").count(), 1, "{price}");
+        // The zero base appears once, and only as the per-call part, so it can
+        // never be the whole price a caller reads.
+        assert_eq!(price.matches("0.000000").count(), 1, "{price}");
+        assert_eq!(price.matches("0.123456").count(), 1, "{price}");
+        // A catalog listing is not a charge line: nothing claims a $0 charge.
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("cadence platform charge")),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 1, "one catalog tool, one line: {lines:?}");
+    }
+
+    // CAD-2127 follow-up: a tool name no catalog declares — including one
+    // whose newline could forge a correlation line — refuses while the call is
+    // still being resolved, before any daemon request exists.
+    #[test]
+    fn an_undeclared_or_unsafe_tool_name_refuses_before_a_platform_call() {
+        let list = listing();
+        for tool in [
+            "generate_image\nforged request=pcli_0000",
+            "Publish",
+            "publish post",
+            "-publish",
+            "",
+        ] {
+            let error = resolve_platform_tool(&list, tool, None)
+                .expect_err("a name no platform declares must refuse");
+            let message = error.to_string();
+            assert_eq!(error.kind(), "rejected", "{tool:?}: {message}");
+            assert!(message.contains("platform tools"), "{tool:?}: {message}");
+        }
+        // The declared name still resolves, so the refusal is about the name,
+        // not about every call.
+        assert!(resolve_platform_tool(&list, "publish", None).is_ok());
     }
 }

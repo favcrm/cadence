@@ -357,29 +357,56 @@ cadence --org acme platform tools
 cadence --org acme platform call generate_image --input '{"prompt":"A blue circle"}'
 ```
 
-An eligible call can charge the workspace balance. The tool's own effect and
-authorization checks still apply. An absent tool returns not found; an
-unavailable catalog is reported as unavailable rather than as an empty list.
-Hosted calls refuse `--platform`, `--account` and `--project` instead of
-silently changing the selected workspace.
+An eligible call can charge the workspace balance. Pass `--org <workspace>`
+explicitly when targeting a hosted workspace: if `--org` is omitted and a
+remote workspace is saved as `selected` in `orgs.json`, the command routes to
+that saved default workspace. Before any network or billing side effect, the
+CLI prints the resolved `org`, operation, tool and stable `request` handle on
+stderr (`cadence platform org=<org> operation=<op> ... request=<handle>`).
+Human-facing price lines state the scale-6 decimal USD amount alongside raw
+`chargeMinor` micro-units (`1 USD = 1,000,000` units, so `123456` is
+`USD 0.123456`) and distinguish informational `providerCredits` from the
+customer USD charge.
 
-The CLI derives a replay key from the tool and input. If the first call was
-recorded, repeating the command recovers that outcome instead of charging
-twice; a call never recorded may start on retry.
-To deliberately run the same input again, pass a fresh `--request <handle>`;
-keep that handle and the same input when reconciling an uncertain outcome.
-Use `--query <json>` for query fields and `--input <json>` for a body; pass both
-when the tool needs both. The replay key includes both fields.
+The tool's own effect and authorization checks still apply. An absent tool
+returns not found; an unavailable catalog is reported as unavailable rather
+than as an empty list. Hosted calls refuse `--platform`, `--account` and
+`--project` instead of silently changing the selected workspace.
+
+The CLI derives a replay key (`pcli_<sha256>`) from the tool, `--query` and
+`--input`, or accepts an explicit `--request <handle>`. If a call fails with a
+timeout, 5xx or uncertain outcome, inspect its recorded state read-only before
+retrying:
+
+```sh
+cadence --org acme platform status --request <handle>
+# or derive the handle from the same tool and input:
+cadence --org acme platform status --tool generate_image --input '{"prompt":"A blue circle"}'
+```
+
+`platform status` uses `cli.read` (or `cli.write`) and never dispatches,
+reserves, settles or polls a provider. It reports `recorded` (with the stored
+job/usage and scale-6 USD billing state), `unknown` (when a job or delivery
+intent is in progress or awaiting reconciliation), or `unrecorded` (when no
+record exists for that key in the workspace). An `unrecorded` lookup does not
+by itself prove that no upstream work occurred if a fault prevented
+persistence, and **replaying `platform call` will start and charge a new call
+when the original request was not recorded**. To deliberately run the same
+input again after a recorded call, pass a fresh `--request <handle>`.
 
 An image submission may return a queued job. Poll its returned `data.job.id`
-with the same workspace and `cli.write` grant:
+with the same workspace and `cli.write` grant, then download a succeeded job's
+retained artifact (`data.job.artifacts[].ref`) to a new local file:
 
 ```sh
 cadence --org acme platform call get_media_job --query '{"jobId":"med_job_from_submit"}'
+cadence --org acme platform artifact med_job_from_submit.<64-hex-sha256> --out ./circle.png
 ```
 
-Polling can complete and settle the existing job. A succeeded job includes
-retained artifact references; this CLI does not download the image bytes.
+`get_media_job` is a live GET of the existing job (it can advance and settle
+that job, never starting a second generation). `platform artifact` streams the
+workspace's retained image bytes, verifies the SHA-256 digest and byte length
+in a private spool, and writes `<out>` only after verification succeeds.
 
 ## A teammate's own-agent collaboration flow
 
