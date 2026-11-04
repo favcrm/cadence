@@ -190,6 +190,11 @@ const HUMAN_EXACT: &[&str] = &[
     "src/delegation.rs",
     "src/issue/delivery_policy.rs",
     "src/issue/delivery_requirements.rs",
+    // The classifier itself (CAD-2117): `src/issue/delivery_requirements.rs`
+    // is now a re-export shim, so name the files that hold the rules.
+    "crates/cadence-core/src/delivery_requirements.rs",
+    "crates/cadence-core/src/delivery_rules.rs",
+    "src/daemon/delivery_requirements_rpc.rs",
     "docs/AUDIT.md",
     "tests/safety_floor.rs",
 ];
@@ -217,7 +222,8 @@ const SENSITIVE_TABLES: &[&str] = &[
     "schema", "trigger1", "trigger3", "trigger4", "trigger6", "trigger7",
 ];
 
-/// The parsed trusted-base lists. `None` anywhere refuses the parse —
+/// The parsed trusted lists (read at the diff's anchor: main's live tip for a
+/// main-based PR, else the PR's base). `None` anywhere refuses the parse —
 /// a partial list is never matched as if complete.
 struct Lists {
     /// `risk-paths.toml` [`SENSITIVE_TABLES`] globs (matched with
@@ -456,7 +462,7 @@ fn strict_requirements(
     let qualifies = lists.is_some_and(|l| one_review_qualifies(changes, l));
     if lists.is_none() {
         reasons.push(
-            "the trusted-base lists are unreadable — two reviews and the operator floor hold"
+            "the trusted lists are unreadable — two reviews and the operator floor hold"
                 .to_string(),
         );
     }
@@ -500,7 +506,7 @@ fn strict_requirements(
 
 /// The evaluator — see the module header. `resolved` is the effective
 /// policy (approved or defaulted, with its digest); `changes`+`lines`
-/// are the trusted diff evidence; `lists` the trusted-base list texts.
+/// are the trusted diff evidence; `lists` the trusted list texts.
 /// No input carries a class: the evidence alone decides.
 pub fn classify(
     resolved: &Resolved,
@@ -529,7 +535,7 @@ pub fn classify(
     reasons.push("default lean delivery policy in force".to_string());
 
     let Some(lists) = parsed else {
-        reasons.push("the trusted-base lists could not be read or parsed".to_string());
+        reasons.push("the trusted lists could not be read or parsed".to_string());
         return strict_requirements(
             resolved,
             activation,
