@@ -147,6 +147,16 @@ the code you just wrote.
   author's identity still refuses under the exception, so a same-login
   session posts its findings as a PR comment and files no verdict. A second
   attested human is not required.
+- **Post findings as a PR comment; file no verdict.** Do not file a hosted
+  verdict (`cadence audit verdict`) unless you are a distinct attested principal
+  from the PR author. A verdict filed under the author's own person, or under a
+  login attested to that person, is permanent (no verb retracts it) and
+  head-pinned: the gate refuses it, `--exception` included, and only moving the
+  head clears it, which voids every other row. The exception is a
+  workflow-issued row (`identity_source: workflow-oidc`), which carries no
+  login or person; it is a first pass on gate, security, schema and release PRs,
+  not a replacement for a real review, and `--exception --advisory` remains a
+  route that merges today.
 - **The changed set is anchored to main's live tip.** GitHub's PR base SHA can stay
   older than the real merge base after main is merged into the branch, so a PR
   that merges main and restores an old file diffs as docs-only against it.

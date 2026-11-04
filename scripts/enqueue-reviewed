@@ -119,14 +119,17 @@ WORKFLOW_KINDS = ("standards", "spec-security")
 # the temporary exception and the standard.
 # A filed row by the author is refused even under --exception, and an advisory link does not clear it.
 AUTHOR_ROW_HINT = (" (a filed row under the author's identity still refuses under --exception, and an "
-                   "advisory link does not clear it. The author's own review can never be an advisory; "
-                   "only a fresh non-author session's review can)")
+                   "advisory link does not clear it. It is permanent and head-pinned, and only moving the "
+                   "head clears it. Post findings as a PR comment and file no verdict unless you are a "
+                   "distinct attested principal)")
 REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a non-author session, "
-                        "and this gate cannot yet tell one from the author under one login: use "
-                        "--exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate "
-                        "(workflow-issued reviews, CAD-2081/CAD-2088, are not live yet). "
-                        "A verdict filed under the author's identity still refuses under the exception, "
-                        "so a same-login session posts its findings as a PR comment and files no verdict)")
+                        "and this gate cannot yet tell one from the author under one login: "
+                        "post findings as a PR comment and file no verdict unless you are a distinct "
+                        "attested principal, because a verdict filed under the author's identity is "
+                        "permanent, head-pinned and still refuses under the exception. Routes: a "
+                        "workflow-issued row (identity_source workflow-oidc; a first pass on gate, security, "
+                        "schema and release PRs, not a replacement for a real review), or "
+                        "--exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate)")
 
 # Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
 # AGENTS.md list. A verdict note's `Risk: human` also makes a diff human.
