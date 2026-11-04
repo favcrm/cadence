@@ -31,6 +31,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
   const t = useTranslate();
   const [inst, setInst] = useState<Installation | null>(null);
   const [home, setHome] = useState<HomeInstallation | null>(null);
+  const [homeUnavailable, setHomeUnavailable] = useState(false);
   const [preview, setPreview] = useState<RemovePreview | null>(null);
   const [removeOpen, setRemoveOpen] = useState(false);
   const [removing, setRemoving] = useState(false);
@@ -70,15 +71,24 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
     if (!isOp) return;
     const controller = new AbortController();
     setError(null);
+    setHome(null);
+    setHomeUnavailable(false);
     void workspaceApps.detail(installId, controller.signal)
       .then((d) => { if (!controller.signal.aborted) setInst(d); })
       .catch((e: unknown) => { if (!controller.signal.aborted) setError(appLoadErrorCopy(e, "Could not load the app. Try again in a moment.")); });
     void appExplorer.home(controller.signal)
       .then((h) => {
         if (controller.signal.aborted) return;
-        setHome(h.installations.find((i) => i.install_id === installId) ?? null);
+        const row = Array.isArray(h.installations)
+          ? h.installations.find((i) => i.install_id === installId)
+          : undefined;
+        if (!row || typeof row.attention?.state !== "string") {
+          setHomeUnavailable(true);
+          return;
+        }
+        setHome(row);
       })
-      .catch(() => {});
+      .catch(() => { if (!controller.signal.aborted) setHomeUnavailable(true); });
     return () => controller.abort();
   }, [installId, reread, isOp]);
 
@@ -165,6 +175,17 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
   const restorable = inst.restore_after == null || Date.now() / 1000 <= inst.restore_after;
   const off = !removed && (home?.attention.state === "off" || inst.approved === false);
   const updateReady = home?.attention.state === "update";
+  const catalogue = inst.catalogue;
+  const catalogueId = catalogue && typeof catalogue.id === "string"
+    && /^[A-Za-z0-9._-]{1,64}$/.test(catalogue.id)
+    && !catalogue.id.startsWith(".") && !catalogue.id.includes("..")
+    && typeof inst.version === "string" && inst.version.length > 0
+    && typeof inst.digest === "string" && /^sha256:[0-9a-f]{64}$/.test(inst.digest)
+    && catalogue.version === inst.version && catalogue.digest === inst.digest
+    ? catalogue.id : null;
+  const catalogueHref = catalogueId === null
+    ? "/apps/explore"
+    : `/apps/catalog/${encodeURIComponent(catalogueId)}?${new URLSearchParams({ installation: inst.install_id })}`;
 
   const openRemove = () => {
     void appExplorer.removePreview(installId)
@@ -353,8 +374,18 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
               onClick={toggleAutomatic}
             />
           </div>
-          <p className="mt-3">{updateReady ? t("An update is ready to review.") : t("No update is currently flagged.")}</p>
+          <p className="mt-3">{home === null
+            ? t(homeUnavailable ? "Update status unavailable." : "Checking update status…")
+            : updateReady ? t("An update is ready to review.")
+            : t(catalogueId === null ? "No update is currently flagged." : "Check the catalogue for published updates.")}</p>
           <p className="mt-1">{t("Installed version {version}.").replace("{version}", () => inst.version)}</p>
+          {!removed && (
+            <div className="mt-3">
+              <Link className="btn btn-sm" href={catalogueHref}>
+                {t(catalogueId === null ? "Browse published apps" : "Review published versions")}
+              </Link>
+            </div>
+          )}
           {inst.source?.kind === "builtin" && (
             <p className="hint mt-2">{t("This install came from the retired built-in catalog — name the app's detached repository (a path or Git URL) to update it.")}</p>
           )}
