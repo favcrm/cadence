@@ -62,11 +62,11 @@ fresh-context session that is not the author, a subagent included (AGENTS.md
 "Review"). This gate does not enforce that: hosted verdicts count by attested
 principal and the author's is refused, local notes count by their self-declared
 `From:` alias (not attested), so it cannot tell a fresh session from the author
-under one login. CAD-2081 adds workflow-issued rows (see AGENTS.md "Review"), but
-their workflows (CAD-2088) are live, a first pass on gate, security, schema and
-release PRs under the operator's working rule, not enforced by the gate; the
-temporary exception below runs to 2026-12-31 and `routine` and `ui/**` PRs have no
-route without it.
+under one login. CAD-2081 adds workflow-issued rows (see AGENTS.md "Review"); their
+workflows (CAD-2088) are live, a cheap first pass beside fresh-session reviews on
+gate, security, schema and release PRs, and two of them satisfy other PRs. On
+hosted today `routine` and `ui/**` PRs still need the temporary exception below,
+which runs to 2026-12-31.
 
 CAD-1946 temporary exception: `--exception --advisory standards=<url> --advisory
 spec-security=<url>` (and `browser-qa=<url>` for a `ui/` change) waives only the
@@ -121,17 +121,22 @@ WORKFLOW_KINDS = ("standards", "spec-security")
 # the temporary exception and the standard.
 # A filed row by the author is refused even under --exception, and an advisory link does not clear it.
 AUTHOR_ROW_HINT = (" (a filed row under the author's identity still refuses under --exception, and an "
-                   "advisory link does not clear it. It is permanent and head-pinned, and only moving the "
-                   "head clears it. Post findings as a PR comment and file no verdict unless you are a "
-                   "distinct attested principal)")
+                   "advisory link does not clear it. The author's own review can never be an advisory; "
+                   "only a fresh non-author session's review can. A hosted verdict is permanent and "
+                   "head-pinned, and only moving the head clears it: post findings as a PR comment and "
+                   "file no hosted verdict unless you are a distinct attested principal; an attestation "
+                   "on another login of the author's own person is not distinct)")
+# Local notes are not hosted rows: no permanence claim.
+LOCAL_AUTHOR_ROW_HINT = (" (a note under the author's identity still refuses under --exception, and an "
+                         "advisory link does not clear it. The author's own review can never be an advisory; "
+                         "only a fresh non-author session's review can)")
 REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a non-author session, "
                         "and this gate cannot yet tell one from the author under one login: "
-                        "post findings as a PR comment and file no verdict unless you are a distinct "
-                        "attested principal, because a verdict filed under the author's identity is "
-                        "permanent, head-pinned and still refuses under the exception. Routes: a "
-                        "workflow-issued row (identity_source workflow-oidc; a first pass on gate, security, "
-                        "schema and release PRs, not a replacement for a real review), or "
-                        "--exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate)")
+                        "post findings as a PR comment rather than file a hosted verdict as the author's "
+                        "person, which is permanent and head-pinned (AGENTS.md \"Review\"). Routes: "
+                        "workflow-issued rows (dispatch review-standards.yml and review-spec.yml; a first "
+                        "pass on gate, security, schema and release PRs, not a replacement for a real "
+                        "review), or --exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate)")
 
 # Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
 # AGENTS.md list. A verdict note's `Risk: human` also makes a diff human.
@@ -1086,7 +1091,8 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
                 reasons.append(
                     f"verdict {n['name']} cannot be proven independent: the PR author "
                     f"{hosted.get('author_login') or '(unknown login)'} has no attested principal "
-                    "(`cadence audit identities set --identity <subject>=<login>`)")
+                    "(`cadence audit identities set --identity <subject>=<login>`)"
+                    f"{AUTHOR_ROW_HINT}")
             elif (n.get("reviewer_id") or "").strip() == hosted["author_principal"]:
                 reasons.append(
                     f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
@@ -1094,7 +1100,7 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
             else:
                 counted.append(n)
         elif who in authors:
-            reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']}){AUTHOR_ROW_HINT}")
+            reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']}){LOCAL_AUTHOR_ROW_HINT}")
         else:
             counted.append(n)
     if hosted is not None:

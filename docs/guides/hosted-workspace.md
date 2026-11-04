@@ -606,7 +606,9 @@ the author's principal (local notes count by their self-declared `From:`
 alias, which is not attested), so a profile or separate session alone does not make a
 gate-counted verdict, and in-chat findings are not one either. Until the gate
 can tell a fresh session from the author (the workflow-issued reviews of
-CAD-2081 are live as a first pass on gate, security, schema and release PRs, not enforced by the gate; AGENTS.md "Review"), merges use the temporary
+CAD-2081 are live as a cheap first pass beside fresh-session reviews on gate, security,
+schema and release PRs, and two of them satisfy other PRs; AGENTS.md "Review"), a hosted
+`routine` or `ui/**` PR still merges with the temporary
 `--exception --advisory ...` path (exact-head operator approval and two
 advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change, even where the board asks for fewer or no approval. A hosted `routine`

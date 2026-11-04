@@ -136,29 +136,30 @@ the code you just wrote.
   since CAD-2049, refuses the author's principal; local notes count by their
   self-declared `From:` alias, which is not attested. It cannot tell a fresh
   session from the author when both act under one login. Two routes exist.
-  Workflow-issued reviews (below) are live (CAD-2088; the `cadence-review`
-  environment and keys are set up, and they ran end to end on 2026-11-04): a
-  first pass on gate, security, schema and release PRs under the operator's
-  working rule, not enforced by the gate. `routine` and `ui/**` PRs have no
-  route without the temporary exception
-  (`--exception --advisory
-  standards=<url> --advisory spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
-  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31). Of the advisory
-  links, it checks only that they are separate https URLs; it proves
-  neither head binding nor that Browser QA ran. A verdict filed under the
-  author's identity still refuses under the exception, so a same-login
-  session posts its findings as a PR comment and files no verdict. A second
-  attested human is not required.
-- **Post findings as a PR comment; file no verdict.** Do not file a hosted
-  verdict (`cadence audit verdict`) unless you are a distinct attested principal
-  from the PR author. A verdict filed under the author's own person, or under a
-  login attested to that person, is permanent (no verb retracts it) and
-  head-pinned: the gate refuses it, `--exception` included, and only moving the
-  head clears it, which voids every other row. The exception is a
-  workflow-issued row (`identity_source: workflow-oidc`), which carries no
-  login or person; it is a first pass on gate, security, schema and release PRs,
-  not a replacement for a real review, and `--exception --advisory` remains a
-  route that merges today.
+  Workflow-issued reviews (below, CAD-2088) are live: dispatch
+  `review-standards.yml` and `review-spec.yml`. The operator's working rule is
+  that gate, security, schema and release PRs keep fresh-session Opus reviews and
+  the workflow rows are a cheap first pass; on other PRs two workflow rows
+  satisfy the requirement. On hosted today `routine` and `ui/**` PRs still need
+  the temporary exception (`--exception --advisory standards=<url> --advisory
+  spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
+  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31); `ui/**` also
+  needs a Browser QA verdict from a session. Of the advisory links, it checks
+  only that they are separate https URLs; it proves neither head binding nor
+  that Browser QA ran. A second attested human is not required.
+- **Post findings as a PR comment; file no hosted verdict.** Do not file a
+  hosted verdict (`cadence audit verdict`) unless you are a distinct attested
+  principal from the PR author. `favcrm-dev` and `cc-syntax` are one person:
+  being attested on a different login does not make you distinct. While the PR
+  author's login has no attested principal, the gate refuses every
+  owner-attested row, so no owner-attested route is open; do not attest the
+  author to another principal to get around it, which would make a same-person
+  row count. A hosted verdict has no retraction verb and is head-pinned: the
+  gate refuses a same-person row, `--exception` included, and only moving the
+  head clears it, which voids every other row. Local notes are not hosted
+  rows. The distinct route is a workflow-issued row
+  (`identity_source: workflow-oidc`), which carries no login or person; it is a
+  first pass, not a replacement for a real review.
 - **The changed set is anchored to main's live tip.** GitHub's PR base SHA can stay
   older than the real merge base after main is merged into the branch, so a PR
   that merges main and restores an old file diffs as docs-only against it.
@@ -177,7 +178,7 @@ the code you just wrote.
   evidence comment's `Base:` stays the PR's recorded base commit; `Merge base
   judged:` and `Main tip:` record what was judged. A PR on another base keeps the
   PR's base.
-- **Workflow-issued reviews (CAD-2081; workflows in CAD-2088, live).** The
+- **Workflow-issued reviews (CAD-2081; workflows in CAD-2088).** The
   gate counts a hosted row whose `identity_source` is `workflow-oidc` only when
   all of these hold, each read at gate time: its principal is in
   `docs/roles/review-workflow-principals.toml` at the live tip of `main` (not the
