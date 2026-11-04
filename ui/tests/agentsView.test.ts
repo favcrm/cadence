@@ -570,7 +570,9 @@ async function main() {
   assert(box()?.value === "An unsaved draft", "a draft survives a trip through another section");
   assert(Array.from(host.querySelectorAll("#ap-panel button")).some((b) => b.textContent === "Save"), "the kept draft can still be saved");
   await type("Synthetic instructions");
-  assert(!host.querySelector("#ap-panel button"), "text back at what is saved is no longer a change");
+  // Edit, Preview and Context are always there; Save and Discard are the change.
+  const writes = () => Array.from(host.querySelectorAll("#ap-panel button")).filter((b) => ["Save", "Discard", "Reset to role"].includes(b.textContent ?? ""));
+  assert(writes().length === 0, "text back at what is saved is no longer a change");
   const gearButton = host.querySelector<HTMLButtonElement>("button[aria-label='Agent settings']");
   assert(gearButton, "the gear is on the page");
   await React.act(() => gearButton.click());
@@ -583,7 +585,7 @@ async function main() {
   state = { ...state, status: "stale", error: "Refresh unavailable" };
   await render();
   assert(box()?.value === "Synthetic instructions" && box()!.readOnly, "a stale board keeps the text and takes no edit");
-  assert(!host.querySelector("#ap-panel button"), "a stale board offers no write action");
+  assert(writes().length === 0, "a stale board offers no write action");
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
   viewerIsOperator = false;
   open = "dev";
