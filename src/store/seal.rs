@@ -88,9 +88,10 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// `app_update_preferences`, the operator's per-install automatic-update
 /// choice. v59 (CAD-1887) adds the operator disposition and selected-ticket
 /// tables; v60 (CAD-1085) adds the connection-dispatch ledger tables; v61
-/// (CAD-1962) adds the imported-media custody tables. None changes a latch or
-/// witness table, so the bound extends to 61.
-pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 61;
+/// (CAD-1962) adds the imported-media custody tables; v62 (CAD-2042) adds the
+/// retained-source scope columns and page index plus a migration-progress
+/// table. None changes a latch or witness table, so the bound extends to 62.
+pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 62;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must

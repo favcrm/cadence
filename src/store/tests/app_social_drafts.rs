@@ -1106,10 +1106,10 @@ fn soc55_run_source_receipts_page_with_their_run_ids() {
             .unwrap();
         db
             .execute(
-                "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,2)",
+                "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema,install_id,context_id,source_post_read) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,2,?,?,1)",
                 params![receipt, run, "s1", "m1", "t1", "source", format!("req-{run}"), "b", "i",
                     json!({"kind":"social.source.posts","handle":"brandhk","posts":[{"id":"post-1","caption":"Same","permalink":"https://www.instagram.com/p/AbCd123/","published_at_unix":1790467200,"media_kind":"image"}]}).to_string(),
-                    "digest", created],
+                    "digest", created, "install-run", "ctx-run"],
             )
             .unwrap();
     };

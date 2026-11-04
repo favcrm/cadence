@@ -1816,3 +1816,260 @@ fn cad1887_human_receipt_keeps_the_caller_request_id() {
         assert_eq!(payload["human"]["sub"], "operator-1", "{kind}");
     }
 }
+
+/// CAD-2042: the retained-source page is an ordered scoped index range, not a
+/// join plus temp-B-tree sort over the whole scoped history. Recording a
+/// source read denormalizes its owning run's installation/context and the
+/// source marker in the same transaction, and the page query reads the page
+/// from `app_capability_results_source`.
+#[test]
+fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
+    let (_dir, s, _run) = runtime_fixture();
+    let install = "install-1";
+    let config = crate::store::app_contexts::ContextConfig::new(
+        "Synthetic source context",
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let context = s
+        .app_context_create(install, &config, "cad2042-context")
+        .unwrap();
+    let context_id = context["context"]["id"].as_str().unwrap().to_string();
+    let (_config, proof) = s.app_context_proof(install, &context_id).unwrap();
+
+    let text = "---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
+    let inputs = std::collections::BTreeMap::new();
+    let workflow = crate::store::app_runs::LocalWorkflow::parse(text, &inputs).unwrap();
+    let run = s
+        .app_run_create_with_context(
+            crate::store::app_runs::LocalRunRequest {
+                install_id: install,
+                bundle_digest: "sha256:bundle",
+                workflow: &workflow,
+                inputs: &inputs,
+                request_id: "cad2042-run",
+                owner_pm: Some("lead"),
+                project_link: None,
+            },
+            Some(&proof),
+        )
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_string();
+    s.app_run_decide(
+        &run_id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    let dispatched = s.app_run_dispatch(&run_id, "sha256:bundle").unwrap();
+    let writer = start_local_step(&s, &dispatched, 0, "writer");
+    let turn = writer.turn_id.as_deref().unwrap();
+    let input_digest = crate::store::app_runs::material_digest(&json!({"handle":"client_a"}));
+    s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
+        run: &run_id,
+        step: "s1",
+        message: &writer.id,
+        turn,
+        slot: "source",
+        request: "cad2042-request",
+        binding_digest: "binding-a",
+        input_digest: &input_digest,
+        call_id: "cad2042-receipt",
+    })
+    .unwrap();
+    let result = json!({
+        "schema": 1,
+        "kind": "social.source.posts",
+        "handle": "client_a",
+        "posts": [{"id": "p1", "permalink": "https://www.instagram.com/p/AbC/", "published_at_unix": 1}],
+    });
+    s.app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
+        id: "cad2042-receipt",
+        run: &run_id,
+        step: "s1",
+        message: &writer.id,
+        turn,
+        slot: "source",
+        request: "cad2042-request",
+        binding_digest: "binding-a",
+        input_digest: &input_digest,
+        result: &result,
+        asset: None,
+    })
+    .unwrap();
+
+    let (flag, receipt_install, receipt_context): (i64, Option<String>, Option<String>) = s
+        .conn()
+        .query_row(
+            "SELECT source_post_read,install_id,context_id FROM app_capability_results WHERE id=?",
+            ["cad2042-receipt"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        flag, 1,
+        "a source read is marked in the recording transaction"
+    );
+    assert_eq!(receipt_install.as_deref(), Some(install));
+    assert_eq!(receipt_context.as_deref(), Some(context_id.as_str()));
+
+    let fence = s.app_source_run_watermark().unwrap();
+    let page = s
+        .app_source_run_candidates(install, &context_id, None, fence, 5)
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+        vec!["cad2042-receipt"],
+        "the recorded source read is pageable in its own scope"
+    );
+
+    let plan: Vec<String> = s
+        .conn()
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::store::app_capabilities::SOURCE_PAGE_AFTER_SQL
+        ))
+        .unwrap()
+        .query_map(
+            params![install, &context_id, fence, 0.0f64, "zzzz", 5i64],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let plan_text = plan.join("\n");
+    assert!(
+        plan_text.contains("app_capability_results_source"),
+        "the page must use its scoped ordered index: {plan_text}"
+    );
+    assert!(
+        !plan_text.contains("TEMP B-TREE"),
+        "the page must not sort scoped history before LIMIT: {plan_text}"
+    );
+    assert!(
+        plan_text.contains("(created,id)<(?,?)"),
+        "the cursor must be one composite index bound: {plan_text}"
+    );
+}
+
+/// CAD-2042: the batched backfill resumes from its durable cursor after an
+/// interruption. Simulates a crash between batches: rows before the cursor
+/// were committed, rows after it were not, and the index/version never
+/// committed.
+#[test]
+fn cad2042_interrupted_backfill_resumes_and_converges() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("resume.sqlite3");
+    drop(Store::open(&path).unwrap());
+    {
+        // A plain connection: the store's own authorizer refuses fixture DDL.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        for i in 0..2 {
+            conn.execute(
+                "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated,context_id)
+                 VALUES(?1,'install-resume',1,'sha256:bundle','{}','sha256:snap','lead',?2,'succeeded',1.0,1.0,'ctx-resume')",
+                rusqlite::params![format!("r-resume-{i}"), format!("req-resume-{i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema)
+                 VALUES(?1,?2,'s1','','','source',?3,'sha256:b','sha256:i','{\"kind\":\"social.source.posts\"}','sha256:d',1.0,2)",
+                rusqlite::params![format!("c-resume-{i}"), format!("r-resume-{i}"), format!("cr-resume-{i}")],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS app_capability_results_source;
+             UPDATE app_capability_results
+                SET source_post_read=1, install_id='install-resume', context_id='ctx-resume'
+              WHERE id='c-resume-0';
+             UPDATE app_capability_results
+                SET source_post_read=0, install_id=NULL, context_id=NULL
+              WHERE id='c-resume-1';
+             INSERT OR REPLACE INTO app_schema_progress(name,cursor)
+               SELECT 'cad2042-source-scope', rowid FROM app_capability_results WHERE id='c-resume-0';
+             UPDATE schema_version SET version=61;",
+        )
+        .unwrap();
+    }
+
+    // No rollout lease in a fixture: the schema-test constructor skips the
+    // operator gate while still running the real migration blocks.
+    let reopened = Store::open_for_schema_tests(&path).unwrap();
+    let conn = reopened.conn();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 62, "the resumed upgrade finishes");
+    let rows: Vec<(String, i64, Option<String>, Option<String>)> = conn
+        .prepare("SELECT id,source_post_read,install_id,context_id FROM app_capability_results ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (id, flag, install, context) in &rows {
+        assert_eq!(*flag, 1, "{id} is flagged after the resume");
+        assert_eq!(install.as_deref(), Some("install-resume"), "{id}");
+        assert_eq!(context.as_deref(), Some("ctx-resume"), "{id}");
+    }
+    let progress: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM app_schema_progress WHERE name='cad2042-source-scope'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(progress, 0, "the progress row is cleared on completion");
+    let indexes: Vec<String> = conn
+        .prepare("PRAGMA index_list(app_capability_results)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "app_capability_results_source"),
+        "the page index is recreated: {indexes:?}"
+    );
+}
+
+/// CAD-2042: a connection from a pre-v62 binary inserts through the old column
+/// list. The v62 trigger must mark that row from its own run, or the page
+/// would silently omit history written after the upgrade.
+#[test]
+fn cad2042_pre_v62_writer_still_produces_a_pageable_receipt() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("oldwriter.sqlite3");
+    drop(Store::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+    conn.execute(
+        "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated,context_id)
+         VALUES('r-old','install-old',1,'sha256:bundle','{}','sha256:snap','lead','req-old','succeeded',1.0,1.0,'ctx-old')",
+        [],
+    )
+    .unwrap();
+    // Exactly the pre-v62 column list: no install/context/marker columns.
+    conn.execute(
+        "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema)
+         VALUES('c-old','r-old','s1','','','source','cr-old','sha256:b','sha256:i','{\"kind\":\"social.source.posts\"}','sha256:d',1.0,2)",
+        [],
+    )
+    .unwrap();
+    let row: (i64, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT source_post_read,install_id,context_id FROM app_capability_results WHERE id='c-old'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, 1, "the trigger marks a source read");
+    assert_eq!(row.1.as_deref(), Some("install-old"));
+    assert_eq!(row.2.as_deref(), Some("ctx-old"));
+}

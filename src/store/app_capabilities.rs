@@ -133,6 +133,23 @@ pub(crate) struct AppCapabilityClaim<'a> {
     pub call_id: &'a str,
 }
 
+/// CAD-2042: the first page of run-bound source reads. The order matches the
+/// partial index, so `LIMIT` stops the index walk.
+pub(crate) const SOURCE_PAGE_FIRST_SQL: &str = "SELECT id,created,run_id
+   FROM app_capability_results
+  WHERE install_id=? AND context_id=? AND source_post_read=1
+    AND rowid<=?
+  ORDER BY created DESC,id DESC LIMIT ?";
+
+/// CAD-2042: the continuation page. The cursor is one composite row value so
+/// that `(created,id)<(?,?)` is an index range start, not a disjunction
+/// evaluated while walking the scope from its newest entry.
+pub(crate) const SOURCE_PAGE_AFTER_SQL: &str = "SELECT id,created,run_id
+   FROM app_capability_results
+  WHERE install_id=? AND context_id=? AND source_post_read=1
+    AND rowid<=? AND (created,id)<(?,?)
+  ORDER BY created DESC,id DESC LIMIT ?";
+
 impl Store {
     /// Reserve the one paid operation for this run slot before provider I/O.
     /// A failed/uncertain result can only retry the same operation and key.
@@ -433,6 +450,20 @@ impl Store {
                             now()
                         ],
                     )?;
+                    // CAD-2042: a source read carries its owning run's
+                    // installation/context and the source marker in the same
+                    // transaction, so the page index and the receipt can
+                    // never disagree about what is a pageable source read.
+                    if result["kind"].as_str() == Some("social.source.posts") {
+                        tx.execute(
+                            "UPDATE app_capability_results
+                             SET source_post_read=1,
+                                 install_id=(SELECT install_id FROM app_runs WHERE id=?2),
+                                 context_id=(SELECT context_id FROM app_runs WHERE id=?2)
+                             WHERE id=?1",
+                            params![id, run],
+                        )?;
+                    }
                     // CAD-1365: an eligible media.generated.image
                     // receipt atomically catalogs its one draft asset
                     // plus the private origin link, inside THIS tx —
@@ -518,6 +549,12 @@ impl Store {
         )?)
     }
 
+    /// CAD-2042: one page of run-bound source reads for this install/context,
+    /// newest first. The partial source index carries every scoped key and
+    /// the receipt order, so this is an ordered index range with LIMIT — it
+    /// reads the page, not the scoped history. `fence` is the scan-start
+    /// rowid: receipts recorded after the scan began are skipped, which costs
+    /// only the rows written during that scan.
     pub(crate) fn app_source_run_candidates(
         &self,
         install: &str,
@@ -530,28 +567,14 @@ impl Store {
             return Ok(Vec::new());
         }
         let conn = self.conn();
-        let sql = match after {
-            Some(_) => {
-                "SELECT r.id,r.created,r.run_id FROM app_capability_results r
-                  JOIN app_runs a ON a.id=r.run_id
-                  WHERE a.install_id=? AND a.context_id=? AND r.rowid<=?
-                    AND json_extract(r.result,'$.kind')='social.source.posts'
-                    AND (r.created<? OR (r.created=? AND r.id<?))
-                  ORDER BY r.created DESC,r.id DESC LIMIT ?"
-            }
-            None => {
-                "SELECT r.id,r.created,r.run_id FROM app_capability_results r
-                  JOIN app_runs a ON a.id=r.run_id
-                  WHERE a.install_id=? AND a.context_id=? AND r.rowid<=?
-                    AND json_extract(r.result,'$.kind')='social.source.posts'
-                  ORDER BY r.created DESC,r.id DESC LIMIT ?"
-            }
-        };
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(match after {
+            Some(_) => SOURCE_PAGE_AFTER_SQL,
+            None => SOURCE_PAGE_FIRST_SQL,
+        })?;
         let rows = match after {
             Some((at, id)) => stmt
                 .query_map(
-                    params![install, context, fence, at, at, id, limit as i64],
+                    params![install, context, fence, at, id, limit as i64],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?,

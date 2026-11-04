@@ -181,7 +181,16 @@ const CATALOG: &[(&str, &[&str])] = &[
             "asset",
             "created",
             "receipt_schema",
+            "install_id",
+            "context_id",
+            "source_post_read",
         ],
+    ),
+    (
+        // CAD-2042: v62 backfill cursor. Empty once the upgrade finishes;
+        // exported so a store is never refused for carrying its own table.
+        "app_schema_progress",
+        &["name", "cursor"],
     ),
     (
         "app_contexts",
