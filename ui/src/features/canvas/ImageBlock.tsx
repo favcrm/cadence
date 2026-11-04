@@ -12,7 +12,7 @@ import ImageOverlay from "./ImageOverlay";
 /** How often a running job is read while the page is visible. */
 export const POLL_MS = 5000;
 /** The longest wait between retries after a failed read. */
-const BACKOFF_MAX_MS = 60_000;
+export const BACKOFF_MAX_MS = 60_000;
 /** PROVISIONAL: the point at which "Taking longer than usual" appears. Real
  *  job durations are not known yet (the accepted design mocks about 3
  *  minutes); set it from measured durations once there are some. */
@@ -147,7 +147,7 @@ function useImageJob(jobId: string, conversation: string | null, near: boolean, 
 }
 
 /** Seconds since the entry was stored, or null when it carries no usable time. */
-function useElapsed(created: string | null | undefined, active: boolean): number | null {
+export function useElapsed(created: string | null | undefined, active: boolean): number | null {
   const start = typeof created === "string" ? Date.parse(created) : NaN;
   const valid = !Number.isNaN(start);
   const [now, setNow] = useState(() => Date.now());
@@ -172,7 +172,7 @@ function dataUrlBytes(url: string): ArrayBuffer {
   return out.buffer;
 }
 
-const clock = (ms: number): string => {
+export const clock = (ms: number): string => {
   const s = Math.floor(ms / 1000);
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 };
@@ -212,7 +212,7 @@ function useImageBytes(artifact: ArtifactRef | undefined, conversation: string |
 }
 
 /** True once `ref` has come within `NEAR_MARGIN` of the viewport. */
-function useNear(ref: React.RefObject<HTMLElement | null>): boolean {
+export function useNear(ref: React.RefObject<HTMLElement | null>): boolean {
   const [near, setNear] = useState(false);
   useEffect(() => {
     if (near) return;
@@ -233,7 +233,7 @@ function useNear(ref: React.RefObject<HTMLElement | null>): boolean {
   return near;
 }
 
-function Waiting({ label, sub, elapsed }: { label?: string; sub?: string; elapsed?: number | null }) {
+export function Waiting({ label, sub, elapsed }: { label?: string; sub?: string; elapsed?: number | null }) {
   return (
     <div className="imgwait">
       <span className="imgdots" aria-hidden>

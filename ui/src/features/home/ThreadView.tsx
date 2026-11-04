@@ -9,6 +9,7 @@ import { askLabel } from "../canvas/askRefs";
 import HireProposalCard from "../agents/HireProposalCard";
 import ArtifactCard from "../canvas/ArtifactCard";
 import ImageBlock from "../canvas/ImageBlock";
+import VideoBlock from "../canvas/VideoBlock";
 import { ThreadPermission } from "./PermissionCard";
 import { isArtifactPutCall, isCardItem, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
 import { carriesSecret } from "../app-shell/chat/directive";
@@ -257,6 +258,8 @@ export function ThreadItemView({
       return <ArtifactCard entry={item.entry} />;
     case "image":
       return <ImageBlock entry={item.entry} />;
+    case "video":
+      return <VideoBlock entry={item.entry} />;
     case "hire":
       return <HireProposalCard entry={item.entry} reason={item.reason} />;
     case "answer": {
@@ -935,9 +938,9 @@ export function ThreadTurn({
       {artifacts.length > 0 && (
         <div className="turn-artifacts">
           {artifacts.map((item) =>
-            item.type === "artifact" || item.type === "image" ? (
-              <div key={item.key} data-item-key={item.key} className={item.type === "image" ? "turn-image" : undefined}>
-                {item.type === "image" ? <ImageBlock entry={item.entry} /> : <ArtifactCard entry={item.entry} />}
+            item.type === "artifact" || item.type === "image" || item.type === "video" ? (
+              <div key={item.key} data-item-key={item.key} className={item.type === "artifact" ? undefined : "turn-image"}>
+                {item.type === "image" ? <ImageBlock entry={item.entry} /> : item.type === "video" ? <VideoBlock entry={item.entry} /> : <ArtifactCard entry={item.entry} />}
               </div>
             ) : null,
           )}
