@@ -178,10 +178,10 @@ fn check_dir(dir: &Path) -> Result<()> {
     }
     if md.mode() & 0o077 != 0 {
         return Err(refuse(format!(
-            "{} has mode {:03o}; it must be private — run `chmod 700 {}`",
+            "{} has mode {:03o}; it must be private — run {}",
             dir.display(),
             md.mode() & 0o777,
-            dir.display()
+            crate::printed_command::with_path("chmod 700", dir, "")
         )));
     }
     Ok(())
@@ -260,10 +260,10 @@ pub fn read_secret(state_dir: &Path) -> Result<String> {
     if md.mode() & 0o077 != 0 {
         return Err(refuse(format!(
             "{} has mode {:03o}; it must be readable by this user only — run \
-             `chmod 600 {}`, then `cadence ui login --rotate` (another user may have read it)",
+             {}, then `cadence ui login --rotate` (another user may have read it)",
             path.display(),
             md.mode() & 0o777,
-            path.display()
+            crate::printed_command::with_path("chmod 600", &path, "")
         )));
     }
     let mut raw = String::new();
@@ -383,10 +383,10 @@ pub fn read_private(state_dir: &Path, name: &str) -> Result<Vec<u8>> {
         return Err(Error::invalid(
             "capability_unavailable",
             format!(
-                "{} has mode {:03o}; it must be private — run `chmod 600 {}`",
+                "{} has mode {:03o}; it must be private — run {}",
                 path.display(),
                 md.mode() & 0o777,
-                path.display()
+                crate::printed_command::with_path("chmod 600", &path, "")
             ),
         ));
     }
@@ -1778,6 +1778,28 @@ mod tests {
         let first = read_secret(s.path()).unwrap();
         assert!(!ensure_secret(s.path()).unwrap());
         assert_eq!(read_secret(s.path()).unwrap(), first);
+    }
+
+    /// These paths used to print unquoted, so a crafted name ran as a command even
+    /// from the decoded message.
+    #[test]
+    fn a_loose_dir_prints_chmod_only_for_a_path_safe_to_paste() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("has;semi colon");
+        fs::create_dir(&state).unwrap();
+        ensure_secret(&state).unwrap();
+        chmod(&dir(&state), 0o755);
+        let shown = read_secret(&state).unwrap_err().to_string();
+        let quoted = format!("`chmod 700 '{}'`", dir(&state).display());
+        assert!(shown.contains(&quoted), "{shown}");
+
+        let state = root.path().join("it's");
+        fs::create_dir(&state).unwrap();
+        ensure_secret(&state).unwrap();
+        chmod(&dir(&state), 0o755);
+        let shown = read_secret(&state).unwrap_err().to_string();
+        assert!(shown.contains("`chmod 700 VALUE_1`"), "{shown}");
+        assert!(shown.contains("cannot be printed"), "{shown}");
     }
 
     /// S2: every loose shape is refused and never repaired — the mode is

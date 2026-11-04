@@ -1495,9 +1495,10 @@ fn run_inner(
             })?;
             restore_board(host, &binary, &previous, board_before)?;
             let restore = backup["backup"]["manifest"].as_str().map(|manifest| {
+                use crate::printed_command::{command, Part};
                 format!(
-                    "if the schema changed, restore the pre-update backup: \
-                     `cadence restore {manifest}`"
+                    "if the schema changed, restore the pre-update backup: {}",
+                    command(&[Part::Fixed("cadence restore "), Part::Value(manifest)])
                 )
             });
             progress(

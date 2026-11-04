@@ -1625,6 +1625,18 @@ fn production_port_gate(profile: Option<&str>, port: u16) -> Result<()> {
 
 // ---------- verbs ----------
 
+/// The command that stops a sandbox's persisted tailnet share under the grant.
+fn share_stop_command(sb: &Sandbox) -> String {
+    use crate::printed_command::{command, Part};
+    let state_dir = sb.state_dir();
+    command(&[
+        Part::Fixed(ALLOW_GLOBAL_ENV),
+        Part::Fixed("=1 cadence --state-dir "),
+        Part::Path(&state_dir),
+        Part::Fixed(" ui tailscale stop"),
+    ])
+}
+
 /// Single-quoted for `sh`.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -1922,10 +1934,9 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
             "sandbox '{}' still has a persisted tailnet share — an \
              ungranted `up` would refuse it at `ui start` with the \
              daemon already running. Stop sharing under the grant first: \
-             `{ALLOW_GLOBAL_ENV}=1 cadence --state-dir {} ui tailscale \
-             stop`, or `cadence dev reset {}` starts over",
+             {}, or `cadence dev reset {}` starts over",
             sb.name,
-            sb.state_dir().display(),
+            share_stop_command(sb),
             sb.name
         )));
     }
@@ -2195,10 +2206,9 @@ fn reload(state_dir: &Path, name: Option<&str>, build: Option<&Path>) -> Result<
             "sandbox '{}' still has a persisted tailnet share but its marker records no \
              {ALLOW_GLOBAL_ENV} grant — `dev reload` would restart the daemon and then \
              refuse the board. Nothing was stopped or started. Stop sharing under the \
-             grant first: `{ALLOW_GLOBAL_ENV}=1 cadence --state-dir {} ui tailscale stop`, \
-             or `cadence dev reset {}` starts over",
+             grant first: {}, or `cadence dev reset {}` starts over",
             sb.name,
-            sb.state_dir().display(),
+            share_stop_command(&sb),
             sb.name
         )));
     }
@@ -2327,10 +2337,9 @@ fn reset(sb: &Sandbox) -> Result<Value> {
             return Err(Error::rejected(format!(
                 "sandbox '{}' still has a persisted tailnet share — reset \
                  would orphan the live mapping. Stop it under the opt-in \
-                 first: `{ALLOW_GLOBAL_ENV}=1 cadence --state-dir {} ui \
-                 tailscale stop`, or re-run reset with `{ALLOW_GLOBAL_ENV}=1`",
+                 first: {}, or re-run reset with `{ALLOW_GLOBAL_ENV}=1`",
                 sb.name,
-                sb.state_dir().display()
+                share_stop_command(sb)
             )));
         }
         let exe = std::env::current_exe()?;

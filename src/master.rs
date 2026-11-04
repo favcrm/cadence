@@ -60,7 +60,7 @@
 //! session. By default (operator decision, 2026-09-24) the master has
 //! its own, separate login: `master start` copies nothing, reports
 //! `login: none` and prints [`login_command`]
-//! (`CLAUDE_CONFIG_DIR=<state>/master/claude claude auth login`), and
+//! (`CLAUDE_CONFIG_DIR='<state>/master/claude' claude auth login`), and
 //! Needs-you shows that command while the dir holds no login. `master
 //! start --copy-login` is the opt-in copy ([`copy_login`]), with its
 //! token-rotation risk. Residue: the master's tree can read its own
@@ -892,10 +892,17 @@ impl Login {
 /// The command that gives the master its own Claude login (operator
 /// decision, 2026-09-24: a separate login is the default).
 pub fn login_command(state_dir: &Path) -> String {
-    format!(
-        "CLAUDE_CONFIG_DIR={} claude auth login",
-        claude_config_dir(state_dir).display()
-    )
+    use crate::printed_command::{bare_command, Part};
+    bare_command(&[
+        Part::Fixed("CLAUDE_CONFIG_DIR="),
+        Part::Path(&claude_config_dir(state_dir)),
+        Part::Fixed(" claude auth login"),
+    ])
+    .unwrap_or_else(|| {
+        "Set CLAUDE_CONFIG_DIR to the master claude directory under the state dir, whose path \
+         cannot be printed as a safe command, then run claude auth login"
+            .to_string()
+    })
 }
 
 /// Does the master's config dir hold a login?
@@ -944,10 +951,19 @@ pub fn has_login_for(provider: &str, state_dir: &Path) -> bool {
 /// against the master's config dir and types `/login`.
 pub fn login_command_for(provider: &str, state_dir: &Path) -> String {
     match provider {
-        "pi" => format!(
-            "PI_CODING_AGENT_DIR={} pi  # then type /login",
-            provider_config_dir("pi", state_dir).display()
-        ),
+        "pi" => {
+            use crate::printed_command::{bare_command, Part};
+            bare_command(&[
+                Part::Fixed("PI_CODING_AGENT_DIR="),
+                Part::Path(&provider_config_dir("pi", state_dir)),
+                Part::Fixed(" pi  # then type /login"),
+            ])
+            .unwrap_or_else(|| {
+                "Set PI_CODING_AGENT_DIR to the master pi directory under the state dir, whose \
+                 path cannot be printed as a safe command, then run pi and type /login"
+                    .to_string()
+            })
+        }
         _ => login_command(state_dir),
     }
 }
@@ -1922,6 +1938,35 @@ pub fn compose(files: &[(String, String)]) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    /// `setup` documents this as a command to copy and paste, and it used to print
+    /// the state dir raw.
+    #[test]
+    fn a_crafted_state_dir_cannot_run_from_the_login_command() {
+        for (provider, program) in [("claude", "claude auth login"), ("pi", "pi  # then")] {
+            let shown = super::login_command_for(provider, Path::new("/a;touch owned;b"));
+            assert!(shown.contains("'/a;touch owned;b/"), "{shown}");
+            assert!(shown.contains(program), "{shown}");
+
+            for dir in [
+                "/a'; touch owned; '",
+                "/x;touch owned;#'",
+                "/x\\y; touch owned; #",
+                "/a\ntouch owned\nb",
+            ] {
+                let shown = super::login_command_for(provider, Path::new(dir));
+                assert!(!shown.contains("touch owned"), "{shown:?}");
+                assert!(shown.contains("cannot be printed"), "{shown:?}");
+
+                // As a person would paste it: nothing runs but a harmless missing command.
+                let root = tempfile::tempdir().unwrap();
+                let mut shell = std::process::Command::new("sh");
+                shell.arg("-c").arg(&shown).current_dir(root.path());
+                crate::reaper::output(&mut shell).unwrap();
+                assert!(!root.path().join("owned").exists(), "{shown:?}");
+            }
+        }
+    }
+
     #[test]
     fn resolver_grant_only_for_systemd_resolved_targets() {
         let dir = Some(PathBuf::from("/run/systemd/resolve"));
@@ -2414,7 +2459,7 @@ mod tests {
         assert!(!has_login(&state));
         assert_eq!(
             login_command(&state),
-            format!("CLAUDE_CONFIG_DIR={} claude auth login", dir.display())
+            format!("CLAUDE_CONFIG_DIR='{}' claude auth login", dir.display())
         );
         std::fs::write(dir.join(".credentials.json"), "{}").unwrap();
         assert_eq!(ensure_config_dir(&state).unwrap(), Login::Own);

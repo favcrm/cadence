@@ -971,8 +971,8 @@ fn read_credential_file(path: &Path) -> Result<DeviceCredential> {
         use std::os::unix::fs::MetadataExt;
         if meta.mode() & 0o077 != 0 {
             return Err(Error::rejected(format!(
-                "publish send credential file must be mode 0600 (run: chmod 0600 {})",
-                path.display()
+                "publish send credential file must be mode 0600 (run: {})",
+                crate::printed_command::with_path("chmod 0600", path, "")
             )));
         }
     }
