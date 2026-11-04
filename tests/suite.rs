@@ -7470,6 +7470,101 @@ mod cad2100_classifier_merge_base {
         let result = daemon.classify(&case, json!({"changed_files": 3}));
         refused_with(&result, "differs from the PR file count");
     }
+
+    // CAD-2117 acceptance: the gate gaps that item 1, 2 and 3 of the ticket name, driven
+    // through the real script and the real daemon classifier. Nested so it can use the
+    // module's stub, repository and daemon helpers, which are private to it.
+    mod cad2117_gate_gaps {
+        use super::*;
+
+        const CLASSIFIER: [&str; 3] = [
+            "crates/cadence-core/src/delivery_requirements.rs",
+            "crates/cadence-core/src/delivery_rules.rs",
+            "src/daemon/delivery_requirements_rpc.rs",
+        ];
+
+        // 1. Each classifier file is human-class by path: the script and the classifier
+        // both ask for the operator, with a stale lean answer and with no list naming it.
+        #[test]
+        fn a_change_to_a_classifier_file_requires_the_operator_in_both_halves() {
+            let repo = Repo::new();
+            let daemon = Daemon::start();
+            for (i, file) in CLASSIFIER.iter().enumerate() {
+                let head = repo.touching(&format!("cls{i}"), &repo.tip, &[file]);
+                let run = gate(&repo, &head).unapproved().run();
+                run.refused(&[HUMAN, NO_APPROVAL]);
+                assert!(
+                    run.stdout.contains(&format!("class: human ({file}")),
+                    "{}",
+                    run.show()
+                );
+                let case = repo.scenario(&head, "main", &repo.base, &repo.tip);
+                let (code, answer, stderr) = daemon.classify(&case, json!({}));
+                assert_eq!(code, 0, "{file}: {stderr}\n{}", daemon.log());
+                assert_eq!(paths_of(&answer), [*file], "{answer}");
+                assert_eq!(
+                    answer["requirements"]["operator_approval"],
+                    json!(true),
+                    "{file}: {answer}"
+                );
+            }
+        }
+
+        // 2. A head with two merge bases against main's tip: a criss-cross, with the tip a
+        // merge commit. Restoring `src/peer.rs` is hidden from one of the bases, and the stub
+        // still says `consequential` (one review). The script refuses rather than pick one.
+        #[test]
+        fn a_head_with_several_merge_bases_is_refused_by_the_script() {
+            let repo = Repo::new();
+            let d = repo.work();
+            let fix = repo.branch("fix", &repo.base, |d| put(d, "src/peer.rs", "fixed\n"));
+            let side = repo.branch("side", &repo.base, |d| put(d, "docs/side.md", "x\n"));
+            git(&d, &["checkout", "-q", "-B", "tip", &fix]);
+            git(&d, &["merge", "-q", "--no-ff", "--no-edit", &side]);
+            let tip = git(&d, &["rev-parse", "HEAD"]);
+            git(&d, &["checkout", "-q", "-B", "head", &side]);
+            git(&d, &["merge", "-q", "--no-ff", "--no-edit", &fix]);
+            git(&d, &["checkout", &repo.base, "--", "src/peer.rs"]);
+            put(&d, "docs/y.md", "x\n");
+            let head = commit(&d, "restore peer");
+            git(&d, &["checkout", "-q", "main"]);
+            assert_eq!(
+                git(&d, &["merge-base", "--all", &tip, &head])
+                    .lines()
+                    .count(),
+                2
+            );
+            let run = gate(&repo, &head).main_at(&tip).run();
+            run.refused(&["2 merge bases"]);
+        }
+
+        // 3. A rename out of a human path is judged on both ends by the classifier.
+        #[test]
+        fn the_classifier_judges_a_rename_out_of_a_human_path_on_both_ends() {
+            let repo = Repo::new();
+            let daemon = Daemon::start();
+            let main = repo.branch("with-tool", &repo.tip, |d| {
+                put(d, "scripts/tool.sh", "echo\n")
+            });
+            let head = repo.merged("moved", &main, |d| {
+                std::fs::create_dir_all(d.join("tools")).unwrap();
+                std::fs::rename(d.join("scripts/tool.sh"), d.join("tools/tool.sh")).unwrap()
+            });
+            let case = repo.scenario(&head, "main", &repo.base, &main);
+            let (code, answer, stderr) = daemon.classify(&case, json!({}));
+            assert_eq!(code, 0, "{stderr}\n{}", daemon.log());
+            assert_eq!(
+                paths_of(&answer),
+                ["scripts/tool.sh", "tools/tool.sh"],
+                "{answer}"
+            );
+            assert_eq!(
+                answer["requirements"]["operator_approval"],
+                json!(true),
+                "{answer}"
+            );
+        }
+    }
 }
 
 // CAD-2088 acceptance, written from the ticket by someone other than the
