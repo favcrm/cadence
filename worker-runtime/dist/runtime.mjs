@@ -55850,7 +55850,30 @@ async function withToolAuthority(name, authority, context, execute) {
   return execute();
 }
 
+// src/image-limits.ts
+var MAX_IMAGE_BASE64_CHARS = 192 * 1024;
+var MAX_IMAGE_PARTS = 4;
+var IMAGE_INPUT_UNAVAILABLE = "image_input_unavailable";
+
 // src/engine.ts
+var BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
+function outputError(output, acceptsImages) {
+  let count = 0;
+  let bytes = 0;
+  for (const part of output) {
+    if (part.type === "text" && typeof part.text === "string")
+      continue;
+    if (part.type !== "image")
+      return "Tool output is invalid.";
+    if (!acceptsImages)
+      return "Image input is unavailable for this session.";
+    count += 1;
+    bytes += typeof part.data === "string" ? part.data.length : 0;
+    if (count > MAX_IMAGE_PARTS || bytes > MAX_IMAGE_BASE64_CHARS || part.mimeType !== "image/png" && part.mimeType !== "image/jpeg" && part.mimeType !== "image/webp" || typeof part.data !== "string" || part.data.length === 0 || part.data.length % 4 !== 0 || !BASE64.test(part.data))
+      return "Image output is invalid or too large.";
+  }
+  return;
+}
 function invocation(api, app) {
   return {
     conversationId: api.conversationId,
@@ -55859,7 +55882,7 @@ function invocation(api, app) {
     ...app === null ? {} : { app }
   };
 }
-function registration(tool, authority, resolveApp) {
+function registration(tool, authority, resolveApp, acceptsImages) {
   return {
     name: tool.name,
     description: tool.description,
@@ -55869,12 +55892,19 @@ function registration(tool, authority, resolveApp) {
       const run = async () => {
         const app = resolveApp === undefined ? null : await resolveApp(api, context);
         const result = await tool.execute(input, invocation(api, app), { abortSignal: context.abortSignal });
+        const error = result.output && outputError(result.output, acceptsImages);
+        if (error)
+          return {
+            output: [{ type: "text", text: error }],
+            isError: true
+          };
         return {
           ...result.output ? {
-            output: result.output.map((part) => ({
-              type: "text",
-              text: part.text
-            }))
+            output: result.output.map((part) => part.type === "text" ? { type: "text", text: part.text } : {
+              type: "image",
+              data: part.data,
+              mimeType: part.mimeType
+            })
           } : {},
           ...result.isError ? { isError: true } : {}
         };
@@ -55885,11 +55915,11 @@ function registration(tool, authority, resolveApp) {
     }
   };
 }
-function runtimeExtension(group, authority, resolveApp) {
+function runtimeExtension(group, authority, resolveApp, acceptsImages = false) {
   return {
     name: group.name,
     ...group.tools ? {
-      tools: group.tools.map((tool) => registration(tool, authority, resolveApp))
+      tools: group.tools.map((tool) => registration(tool, authority, resolveApp, acceptsImages))
     } : {}
   };
 }
@@ -56206,39 +56236,34 @@ function masterState(model, status, conversationId, metadata) {
 // src/model.ts
 var MODEL_CONTEXT_WINDOW = 128000;
 var MODEL_MAX_OUTPUT_TOKENS = 8192;
-var LEGACY_MODEL_IDS = [
-  "@cf/zai-org/glm-5.3-flash",
-  "z-ai/glm-5.3-flash"
-];
-function defaultModel(alias) {
+var LEGACY_MODEL_IDS = ["@cf/zai-org/glm-5.3-flash", "z-ai/glm-5.3-flash"];
+function defaultModel(alias, acceptsImages = false) {
   return {
     id: alias,
     name: "Platform default",
     api: CLOUDFLARE_AI_API,
     provider: CLOUDFLARE_PROVIDER_ID,
     baseUrl: "",
-    input: ["text"],
+    input: acceptsImages ? ["text", "image"] : ["text"],
     cost: { cacheRead: 0, cacheWrite: 0, input: 0, output: 0 },
     reasoning: false,
     contextWindow: MODEL_CONTEXT_WINDOW,
     maxTokens: MODEL_MAX_OUTPUT_TOKENS
   };
 }
-function legacyModels() {
+function legacyModels(model) {
   return LEGACY_MODEL_IDS.map((id) => ({
-    ...defaultModel(id),
+    ...model,
+    id,
     name: "Legacy tenant model"
   }));
 }
 function withDefaultModel(provider, model) {
-  const models = [model, ...legacyModels()];
+  const models = [model, ...legacyModels(model)];
   return {
     ...provider,
     getModels: () => [...provider.getModels(), ...models],
-    getAllModels: () => [
-      ...provider.getAllModels?.() ?? provider.getModels(),
-      ...models
-    ]
+    getAllModels: () => [...provider.getAllModels?.() ?? provider.getModels(), ...models]
   };
 }
 var MAX_MODEL_SCAN_BYTES = 64 * 1024;
@@ -56287,7 +56312,81 @@ function captureResolvedModel(response, onModelResolved) {
     headers: response.headers
   });
 }
-function meteredBinding(transport, identity, onModelResolved) {
+function boundImageHistory(input, maxImages, notice = "[An image was omitted from this request to fit the image limit.]") {
+  if (!Array.isArray(input.messages))
+    return input;
+  const omitted = new Map;
+  let count = 0;
+  let bytes = 0;
+  for (let i = input.messages.length - 1;i >= 0; i--) {
+    const message = input.messages[i];
+    if (typeof message !== "object" || message === null || !("role" in message) || message.role !== "user" || !("content" in message) || !Array.isArray(message.content))
+      continue;
+    for (let j = message.content.length - 1;j >= 0; j--) {
+      const part = message.content[j];
+      if (typeof part !== "object" || part === null || !("type" in part) || part.type !== "image_url" || !("image_url" in part) || typeof part.image_url !== "object" || part.image_url === null || !("url" in part.image_url))
+        continue;
+      const url = part.image_url.url;
+      if (typeof url !== "string" || !/^data:image\/(?:png|jpeg|webp);base64,/.test(url))
+        continue;
+      const size = url.length - url.indexOf(",") - 1;
+      if (count >= maxImages || bytes + size > MAX_IMAGE_BASE64_CHARS) {
+        const indexes = omitted.get(i) ?? new Set;
+        indexes.add(j);
+        omitted.set(i, indexes);
+      } else {
+        count++;
+        bytes += size;
+      }
+    }
+  }
+  if (omitted.size === 0)
+    return input;
+  return {
+    ...input,
+    messages: input.messages.map((message, messageIndex) => {
+      const indexes = omitted.get(messageIndex);
+      if (!indexes || typeof message !== "object" || message === null || !("content" in message) || !Array.isArray(message.content))
+        return message;
+      return {
+        ...message,
+        content: message.content.map((part, partIndex) => indexes.has(partIndex) ? { type: "text", text: notice } : part)
+      };
+    })
+  };
+}
+var IMAGE_REFUSED_NOTICE = "[An image was omitted because the selected model cannot read images.]";
+var PUBLIC_MODEL_REFUSALS = new Set([
+  IMAGE_INPUT_UNAVAILABLE
+]);
+async function publicRefusal(response) {
+  if (response.ok || !response.headers.get("content-type")?.includes("json"))
+    return null;
+  try {
+    const body = await response.clone().json();
+    const code = typeof body === "object" && body !== null && "error" in body ? body.error?.code : undefined;
+    return typeof code === "string" && PUBLIC_MODEL_REFUSALS.has(code) ? code : null;
+  } catch {
+    return null;
+  }
+}
+function withRefusalCode(response, code) {
+  if (code === null)
+    return response;
+  return Response.json({ error: { code, message: code } }, { status: response.status });
+}
+function hasImage(content) {
+  return Array.isArray(content) && content.some((part) => typeof part === "object" && part !== null && ("type" in part) && part.type === "image_url");
+}
+function imagesOnlyInHistory(input) {
+  if (!Array.isArray(input.messages))
+    return false;
+  const messages = input.messages;
+  return !hasImage(messages.at(-1)?.content) && messages.some((message) => hasImage(message?.content));
+}
+function meteredBinding(transport, identity, onModelResolved, maxImagesPerRequest = 1) {
+  if (!Number.isSafeInteger(maxImagesPerRequest) || maxImagesPerRequest < 1 || maxImagesPerRequest > MAX_IMAGE_PARTS)
+    throw new Error("Invalid model image limit.");
   return {
     async run(_model, input, options) {
       const current = identity();
@@ -56300,7 +56399,14 @@ function meteredBinding(transport, identity, onModelResolved) {
           }
         }, { status: 409 });
       }
-      const response = await transport.requestModel(input, current, options?.signal);
+      const bounded = boundImageHistory(input, maxImagesPerRequest);
+      let response = await transport.requestModel(bounded, current, options?.signal);
+      let refusal = await publicRefusal(response);
+      if (refusal === IMAGE_INPUT_UNAVAILABLE && imagesOnlyInHistory(bounded)) {
+        response = await transport.requestModel(boundImageHistory(bounded, 0, IMAGE_REFUSED_NOTICE), current, options?.signal);
+        refusal = await publicRefusal(response);
+      }
+      response = withRefusalCode(response, refusal);
       const metered = onModelResolved ? captureResolvedModel(response, onModelResolved) : response;
       if (options?.returnRawResponse !== false)
         return metered;
@@ -56905,6 +57011,24 @@ var runtimeHealthSkills = skillSource({
 });
 
 // src/session-stream.ts
+function rawSessionFrame(event) {
+  const json = JSON.stringify(event, (_key, value) => {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      return value;
+    const part = value;
+    if (part.type === "image" && typeof part.data === "string") {
+      return {
+        type: "image",
+        ...typeof part.mimeType === "string" ? { mimeType: part.mimeType } : {},
+        redacted: true
+      };
+    }
+    return value;
+  });
+  return `data: ${json}
+
+`;
+}
 function sessionEventResponse(watch, format) {
   const encoder = new TextEncoder;
   let closed = false;
@@ -56968,6 +57092,8 @@ function failedTurnReason(errorMessage) {
   const raw = errorMessage ?? "";
   if (raw.includes("billing_unavailable"))
     return "billing_unavailable";
+  if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
+    return "The selected model cannot read images.";
   if (TIMEOUT.test(raw))
     return "The model request timed out.";
   if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
@@ -57154,13 +57280,14 @@ class HostedSession extends DurableObject {
     if (!ctx.id.name)
       throw new Error("HostedSession requires a named conversation");
     this.operationScopes = new OperationScopes(ctx.storage.sql);
-    const model = defaultModel(options.modelAlias);
+    const acceptsImages = options.acceptsToolImages === true;
+    const model = defaultModel(options.modelAlias, acceptsImages);
     const authority = {
       toolRefusal: (name) => options.toolRefusal(name),
       authorizeTool: (name) => options.authorizeTool(name)
     };
     const ai = createAI({
-      binding: meteredBinding(options, () => this.generationIdentity(), (served) => this.recordResolvedModel(served))
+      binding: meteredBinding(options, () => this.generationIdentity(), (served) => this.recordResolvedModel(served), options.maxImagesPerRequest)
     });
     this.models.setProvider(withDefaultModel(ai.provider, model));
     this.registry.install(intentGuard(options.toolRefusal));
@@ -57175,7 +57302,7 @@ class HostedSession extends DurableObject {
     this.registry.install(operationContextExtension((root) => this.operationAppScope(root), operationMessages));
     guardOperationRequests(this.models, operationMessages);
     for (const group of options.tools) {
-      this.registry.install(runtimeExtension(group, authority, this.toolAppScope));
+      this.registry.install(runtimeExtension(group, authority, this.toolAppScope, acceptsImages));
     }
     this.harness = new PiHarness({
       harness: async ({ storage, context, onWake }) => {
@@ -57255,15 +57382,11 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
     const stream = await this.harness.session().events();
     return sessionEventResponse(stream, {
       snapshot: (send) => {
-        send(`data: ${JSON.stringify({ type: "snapshot", snapshot: stream.snapshot })}
-
-`);
+        send(rawSessionFrame({ type: "snapshot", snapshot: stream.snapshot }));
       },
       events: async (events, send) => {
         for (const event of events)
-          send(`data: ${JSON.stringify(event)}
-
-`);
+          send(rawSessionFrame(event));
       }
     });
   }

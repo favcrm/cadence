@@ -6,6 +6,7 @@ import {
   type ThreadEntry,
   type ThreadProjection,
 } from "./contract.ts";
+import { IMAGE_INPUT_UNAVAILABLE } from "./image-limits.ts";
 import { appPayload, parseEntryAppScope } from "./operation-scope.ts";
 
 /** The private engine's default retry.maxRetries: attempts 1..3 retry. */
@@ -26,6 +27,8 @@ const REFUSED_STATUS = word("401|402|403");
 function failedTurnReason(errorMessage: string | undefined): string {
   const raw = errorMessage ?? "";
   if (raw.includes("billing_unavailable")) return "billing_unavailable";
+  if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
+    return "The selected model cannot read images.";
   if (TIMEOUT.test(raw)) return "The model request timed out.";
   if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
     return "The model service could not be reached.";

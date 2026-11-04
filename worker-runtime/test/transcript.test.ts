@@ -431,6 +431,9 @@ describe("board transcript identity", () => {
 
     it("passes our billing code through and classifies the rest", () => {
       expect(reason("403 billing_unavailable")).toBe("billing_unavailable");
+      expect(reason("404 image_input_unavailable")).toBe(
+        "The selected model cannot read images.",
+      );
       expect(reason("request timed out")).toBe("The model request timed out.");
       expect(reason("429 too many requests")).toBe(
         "The model is busy right now.",

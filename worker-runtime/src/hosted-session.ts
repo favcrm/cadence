@@ -65,7 +65,7 @@ import {
   runtimeHealthSkills,
   runtimeProfile,
 } from "./profile.ts";
-import { sessionEventResponse } from "./session-stream.ts";
+import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
 import { projectedThreadEntries, readAllRecords } from "./transcript.ts";
@@ -131,7 +131,8 @@ export class HostedSession<
     this.operationScopes = new OperationScopes(
       ctx.storage.sql as unknown as OperationScopeSql,
     );
-    const model = defaultModel(options.modelAlias);
+    const acceptsImages = options.acceptsToolImages === true;
+    const model = defaultModel(options.modelAlias, acceptsImages);
     const authority: ToolAuthority = {
       toolRefusal: (name) => options.toolRefusal(name),
       authorizeTool: (name) => options.authorizeTool(name),
@@ -141,6 +142,7 @@ export class HostedSession<
         options,
         () => this.generationIdentity(),
         (served) => this.recordResolvedModel(served),
+        options.maxImagesPerRequest,
       ) as unknown as Ai,
     });
     this.models.setProvider(withDefaultModel(ai.provider, model));
@@ -180,7 +182,7 @@ export class HostedSession<
     guardOperationRequests(this.models, operationMessages);
     for (const group of options.tools) {
       this.registry.install(
-        runtimeExtension(group, authority, this.toolAppScope),
+        runtimeExtension(group, authority, this.toolAppScope, acceptsImages),
       );
     }
     this.harness = new PiHarness({
@@ -313,12 +315,10 @@ export class HostedSession<
     const stream = await this.harness.session().events();
     return sessionEventResponse(stream, {
       snapshot: (send) => {
-        send(
-          `data: ${JSON.stringify({ type: "snapshot", snapshot: stream.snapshot })}\n\n`,
-        );
+        send(rawSessionFrame({ type: "snapshot", snapshot: stream.snapshot }));
       },
       events: async (events, send) => {
-        for (const event of events) send(`data: ${JSON.stringify(event)}\n\n`);
+        for (const event of events) send(rawSessionFrame(event));
       },
     });
   }
