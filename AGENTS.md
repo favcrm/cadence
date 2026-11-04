@@ -20,7 +20,8 @@ prose and an authoritative source disagree, the source wins.
   `src/issue/delivery_requirements.rs` turns the resolved delivery policy
   and the PR's diff into the requirements; read them with
   `cadence delivery requirements --issue <ID> --pr <url> --head <sha>`.
-  The evaluator reads the path lists at the PR's base, so a PR can never
+  The evaluator reads the changed set and the path lists at the PR's anchor
+  (main's live tip for a main-based PR, else the PR's base), so a PR can never
   classify itself under rules it edited.
 - The local merge gate is `scripts/enqueue-reviewed <pr> --head <sha>`
   (`--dry-run` enqueues nothing). It cannot supply a missing hosted evaluator
@@ -140,8 +141,19 @@ the code you just wrote.
   that merges main and restores an old file diffs as docs-only against it.
   `scripts/enqueue-reviewed` therefore diffs a main-based PR from the merge base
   with main's live tip (the changed files, line count and every path class read
-  from that diff) and refuses if the tip cannot be read. A PR on another base keeps
-  the PR's base.
+  from that diff) and refuses if the tip cannot be read. `risk-paths.toml` and
+  `one-review-paths.toml` are read at that same tip, and `cadence delivery
+  requirements` classifies from the same merge base and lists (CAD-2100; it
+  refuses a file list the merge-base and head trees do not confirm, since GitHub's
+  `changedFiles` counts from its own, possibly stale, base). The tip is resolved
+  once per evaluation. A PR that edits the lists is judged by main's copy, not its
+  own, and `docs/roles/` is human-class, so the operator approves it. The gate also
+  refuses a `routine` or `consequential` class its own diff does not support (not on
+  the one-review list, human-class by path or size, or for `routine` not plain
+  markdown docs), because the classifier on a host can be an older build. The
+  evidence comment's `Base:` stays the PR's recorded base commit; `Merge base
+  judged:` and `Main tip:` record what was judged. A PR on another base keeps the
+  PR's base.
 - **Workflow-issued reviews (CAD-2081; the workflows are not shipped yet).** The
   gate counts a hosted row whose `identity_source` is `workflow-oidc` only when
   all of these hold, each read at gate time: its principal is in

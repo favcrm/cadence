@@ -161,7 +161,8 @@ fn title_names_issue(title: &str, issue: &str) -> bool {
         .is_some_and(|token| token.as_str() == issue)
 }
 
-type TreeEntry = (String, String);
+/// `(mode, type, sha)` of one tree entry.
+type TreeEntry = (String, String, String);
 
 fn tree_modes<G: GhRead + ?Sized>(
     shared: &G,
@@ -200,8 +201,15 @@ fn tree_modes<G: GhRead + ?Sized>(
                 "tree entry {path} has invalid type/mode {kind}/{mode}"
             )));
         }
+        let sha = entry["sha"]
+            .as_str()
+            .filter(|s| valid_sha(s))
+            .ok_or_else(|| reject(format!("tree entry {path} has no valid sha")))?;
         if modes
-            .insert(path.to_string(), (mode.to_string(), kind.to_string()))
+            .insert(
+                path.to_string(),
+                (mode.to_string(), kind.to_string(), sha.to_string()),
+            )
             .is_some()
         {
             return Err(reject(format!("GitHub tree repeats path {path}")));
@@ -211,13 +219,69 @@ fn tree_modes<G: GhRead + ?Sized>(
 }
 
 fn changed_mode(tree: &HashMap<String, TreeEntry>, path: &str) -> Result<String> {
-    let (mode, kind) = tree
+    let (mode, kind, _) = tree
         .get(path)
         .ok_or_else(|| reject(format!("tree mode unavailable for {path}")))?;
     if kind == "tree" {
         return Err(reject(format!("changed path {path} resolves to a tree")));
     }
     Ok(mode.clone())
+}
+
+/// The tip commit of `branch`, read once per evaluation. An unreadable or
+/// malformed answer refuses, so the merge-base anchor is never empty.
+fn branch_tip<G: GhRead + ?Sized>(shared: &G, repo: &str, branch: &str) -> Result<String> {
+    let name = branch
+        .split('/')
+        .map(branch_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    let reference = api(shared, &format!("repos/{repo}/git/ref/heads/{name}"))?;
+    reference["object"]["sha"]
+        .as_str()
+        .filter(|s| valid_sha(s))
+        .map(str::to_string)
+        .ok_or_else(|| reject(format!("cannot read the live tip of {branch:?}")))
+}
+
+/// Proof that a compare file list is the whole change between two trees:
+/// the paths whose entry differs (or exists on one side only) must be exactly
+/// the listed filenames plus the old names of renames. GitHub's `changedFiles`
+/// counts from its own, possibly stale, base and cannot vouch for a set taken
+/// from a different merge base.
+fn changed_set_matches_trees(
+    base: &HashMap<String, TreeEntry>,
+    head: &HashMap<String, TreeEntry>,
+    files: &[Value],
+) -> bool {
+    use std::collections::BTreeSet;
+    let blobs = |tree: &HashMap<String, TreeEntry>| -> HashMap<String, TreeEntry> {
+        tree.iter()
+            .filter(|(_, (_, kind, _))| kind != "tree")
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect()
+    };
+    let (base, head) = (blobs(base), blobs(head));
+    let differs: BTreeSet<&str> = base
+        .keys()
+        .chain(head.keys())
+        .filter(|path| base.get(*path) != head.get(*path))
+        .map(String::as_str)
+        .collect();
+    let mut listed = BTreeSet::new();
+    for file in files {
+        let Some(path) = file["filename"].as_str() else {
+            return false;
+        };
+        listed.insert(path);
+        if file["status"].as_str() == Some("renamed") {
+            match file["previous_filename"].as_str() {
+                Some(old) => listed.insert(old),
+                None => return false,
+            };
+        }
+    }
+    differs == listed
 }
 
 fn content_at_base<G: GhRead + ?Sized>(
@@ -292,7 +356,7 @@ pub(super) fn classify_with_policy(
 }
 
 /// The requirements classification over any [`RequirementInputs`]: the
-/// request binding, the project/remote check, the live PR and base-pinned
+/// request binding, the project/remote check, the live PR and anchor-pinned
 /// trusted lists, [`requirements::classify`], and the drift re-read.
 pub(crate) fn classify_from<I: RequirementInputs + ?Sized>(
     shared: &I,
@@ -348,7 +412,18 @@ pub(crate) fn classify_from<I: RequirementInputs + ?Sized>(
         .as_u64()
         .ok_or_else(|| reject("PR view has no changed-file count"))?;
 
-    let comparison = api(shared, &format!("repos/{repo}/compare/{base}...{head}"))?;
+    // CAD-2100: GitHub's `baseRefOid` can stay older than the real merge base
+    // after the default branch is merged into the PR, so a main-based PR is
+    // read from the merge base with the default branch's live tip, resolved
+    // once here and used for the compare and the path lists alike. Any other
+    // base keeps the PR's base exactly.
+    let main_based = base_ref == default;
+    let anchor = if main_based {
+        branch_tip(shared, &repo, &default)?
+    } else {
+        base.clone()
+    };
+    let comparison = api(shared, &format!("repos/{repo}/compare/{anchor}...{head}"))?;
     let merge_base = comparison["merge_base_commit"]["sha"]
         .as_str()
         .filter(|s| valid_sha(s))
@@ -357,13 +432,18 @@ pub(crate) fn classify_from<I: RequirementInputs + ?Sized>(
     let files = comparison["files"]
         .as_array()
         .ok_or_else(|| reject("comparison has no complete file list"))?;
-    if files.len() >= 300 || files.len() as u64 != changed_files {
+    if files.len() >= 300 || (!main_based && files.len() as u64 != changed_files) {
         return Err(reject(
             "GitHub comparison file list is truncated or differs from the PR file count",
         ));
     }
     let base_modes = tree_modes(shared, &repo, &merge_base)?;
     let head_modes = tree_modes(shared, &repo, head)?;
+    if main_based && !changed_set_matches_trees(&base_modes, &head_modes, files) {
+        return Err(reject(
+            "GitHub comparison file list does not match the trees of the merge base and the head",
+        ));
+    }
     let mut changes = Vec::with_capacity(files.len());
     let mut lines = 0u64;
     for file in files {
@@ -407,8 +487,9 @@ pub(crate) fn classify_from<I: RequirementInputs + ?Sized>(
         changes.push(requirements::change(status, &old_mode, &new_mode, path));
     }
 
-    let risk_paths = content_at_base(shared, &repo, "docs/roles/risk-paths.toml", &base);
-    let one_review = content_at_base(shared, &repo, "docs/roles/one-review-paths.toml", &base);
+    // The path lists move with the diff: read at the same anchor.
+    let risk_paths = content_at_base(shared, &repo, "docs/roles/risk-paths.toml", &anchor);
+    let one_review = content_at_base(shared, &repo, "docs/roles/one-review-paths.toml", &anchor);
     let lists = requirements::TrustedLists {
         risk_paths: risk_paths.as_deref(),
         one_review: one_review.as_deref(),
@@ -1137,5 +1218,54 @@ impl Shared {
         };
         answer["readiness"] = json!(readiness);
         Ok(answer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree(entries: &[(&str, char)]) -> HashMap<String, TreeEntry> {
+        entries
+            .iter()
+            .map(|(path, sha)| {
+                (
+                    path.to_string(),
+                    ("100644".into(), "blob".into(), sha.to_string().repeat(40)),
+                )
+            })
+            .collect()
+    }
+
+    // CAD-2100: the file list from the merge base with main's tip is proven
+    // complete by the two trees, not by GitHub's count from its own base.
+    #[test]
+    fn a_file_list_must_be_exactly_what_differs_between_the_trees() {
+        let base = tree(&[("a.rs", 'a'), ("b.rs", 'b'), ("old.rs", 'c')]);
+        let head = tree(&[("a.rs", 'a'), ("b.rs", 'd'), ("new.rs", 'c')]);
+        let modified = json!({"filename": "b.rs", "status": "modified"});
+        let renamed =
+            json!({"filename": "new.rs", "status": "renamed", "previous_filename": "old.rs"});
+        assert!(changed_set_matches_trees(
+            &base,
+            &head,
+            &[modified.clone(), renamed.clone()]
+        ));
+        // a missing entry (a revert the list hides) and an extra one both refuse
+        assert!(!changed_set_matches_trees(&base, &head, &[renamed.clone()]));
+        let extra = json!({"filename": "a.rs", "status": "modified"});
+        assert!(!changed_set_matches_trees(
+            &base,
+            &head,
+            &[modified, renamed, extra]
+        ));
+    }
+
+    #[test]
+    fn a_rename_without_its_old_name_refuses() {
+        let base = tree(&[("old.rs", 'c')]);
+        let head = tree(&[("new.rs", 'c')]);
+        let renamed = json!({"filename": "new.rs", "status": "renamed"});
+        assert!(!changed_set_matches_trees(&base, &head, &[renamed]));
     }
 }
