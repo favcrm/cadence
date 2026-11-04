@@ -377,6 +377,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
           <p className="mt-3">{home === null
             ? t(homeUnavailable ? "Update status unavailable." : "Checking update status…")
             : updateReady ? t("An update is ready to review.")
+            : removed ? t("Removed — restore it to review published updates.")
             : t(catalogueId === null ? "No update is currently flagged." : "Check the catalogue for published updates.")}</p>
           <p className="mt-1">{t("Installed version {version}.").replace("{version}", () => inst.version)}</p>
           {!removed && (
