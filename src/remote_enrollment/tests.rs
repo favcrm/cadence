@@ -822,7 +822,7 @@ fn browser_continuity_bind_classifies_issuer_refusals_without_losing_pending_key
             "503 Service Unavailable",
             "authority_unavailable",
             "",
-            "uncertain",
+            "binding is unknown",
         ),
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1017,7 +1017,10 @@ fn browser_continuity_bind_never_claims_success_after_local_save_failure() {
         );
     });
     let error = bind_browser(&dir).unwrap_err();
-    assert!(format!("{error}").contains("uncertain"), "{error}");
+    assert_eq!(error.kind(), "unknown", "{error}");
+    let shown = format!("{error}");
+    assert!(shown.contains("binding is unknown"), "{shown}");
+    assert!(shown.contains("bind-continuity"), "{shown}");
     server.join().unwrap();
     assert!(bound_browser(&dir).is_err());
     fs::set_permissions(
@@ -1117,7 +1120,10 @@ fn browser_continuity_bind_metadata_recovers_only_the_same_pending_key() {
     child.service_token = None;
     save(&dir, &child).unwrap();
     let error = bind_browser(&dir).unwrap_err();
-    assert!(format!("{error}").contains("uncertain"), "{error}");
+    assert_eq!(error.kind(), "unknown", "{error}");
+    let shown = format!("{error}");
+    assert!(shown.contains("binding is unknown"), "{shown}");
+    assert!(shown.contains("bind-continuity"), "{shown}");
     assert!(
         bound_browser(&dir).is_err(),
         "pending key claimed a lineage"
