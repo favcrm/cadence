@@ -195,7 +195,19 @@ describe("fresh start", () => {
   });
 
   it("numbers a reconnect the same as a page read", async () => {
-    mock.module("cloudflare:workers", () => ({ DurableObject: class {} }));
+    // `mock.module` is process-wide and `hosted-session.ts` is cached after its
+    // first import, so whichever file loads it first fixes the base class for
+    // every file. Keep this stub identical to the one in
+    // app-scope.acceptance.test.ts (it must carry `ctx`), or the later file's
+    // constructed sessions fail depending on the runner's file order.
+    mock.module("cloudflare:workers", () => ({
+      DurableObject: class {
+        constructor(
+          readonly ctx: unknown,
+          readonly env: unknown,
+        ) {}
+      },
+    }));
     const { HostedSession } = await import("../src/hosted-session.ts");
     const harness = await Harness.open(
       new MemoryStorage(),

@@ -1263,6 +1263,11 @@
         let conn=Connection::open(&db).unwrap();
         conn.execute_batch("ALTER TABLE app_run_reviews DROP COLUMN asset_receipt_id;
             ALTER TABLE app_run_reviews DROP COLUMN asset_digest;
+            DROP TRIGGER IF EXISTS app_capability_results_source_scope;
+            DROP INDEX IF EXISTS app_capability_results_source;
+            ALTER TABLE app_capability_results DROP COLUMN source_post_read;
+            ALTER TABLE app_capability_results DROP COLUMN install_id;
+            ALTER TABLE app_capability_results DROP COLUMN context_id;
             ALTER TABLE app_capability_results DROP COLUMN receipt_schema;
             UPDATE schema_version SET version=24;
             CREATE TRIGGER fail_v25 BEFORE UPDATE ON schema_version
