@@ -116,13 +116,19 @@ pub(crate) fn refuse_managed_write(action: &ProfileAction, pinned_identity: bool
 
 /// A profile command that resolved to a hosted org the command line did not
 /// name (a saved default, or `CADENCE_ORG`) is refused, reads included.
-pub(crate) fn require_named_org(command: &Commands, resolved_org: &str) -> Result<()> {
-    if matches!(
-        command,
-        Commands::Agent {
-            action: AgentAction::Profile { .. }
-        }
-    ) {
+pub(crate) fn require_named_org(
+    org_flag: Option<&str>,
+    command: &Commands,
+    resolved_org: &str,
+) -> Result<()> {
+    if org_flag.is_none()
+        && matches!(
+            command,
+            Commands::Agent {
+                action: AgentAction::Profile { .. }
+            }
+        )
+    {
         return Err(Error::invalid(
             "org_not_named",
             format!(
@@ -634,6 +640,24 @@ mod tests {
         let err = super::action_dispatch::run_cli(cli).unwrap_err();
         assert_eq!(err.code(), Some("org_not_named"), "{err}");
         std::env::remove_var("CADENCE_ORG");
+    }
+
+    #[test]
+    fn a_client_only_install_refuses_an_unnamed_org_too() {
+        use crate::cli::org::tests::{remote_registry, EnvGuard, EP_A, RESOLVE_ENV};
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
+        let go = || {
+            let cli = Cli::try_parse_from(["cadence", "agent", "profile", "get", "ap_x"]).unwrap();
+            super::client_update::route_client_only(cli)
+        };
+        let err = go().unwrap_err();
+        assert_eq!(err.code(), Some("org_not_named"), "{err}");
+        std::env::set_var("CADENCE_ORG", "acme");
+        let err = go().unwrap_err();
+        std::env::remove_var("CADENCE_ORG");
+        assert_eq!(err.code(), Some("org_not_named"), "{err}");
     }
 
     #[test]

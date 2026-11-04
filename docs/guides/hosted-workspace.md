@@ -458,7 +458,8 @@ is clean or merged; leave it intact for reconciliation.
 The owner can do from the CLI what the agent page does for a profile. Name the
 org with `--org` on every call. A saved default org or `CADENCE_ORG` does not
 count: a profile command that would use one is refused before any request
-(`org_not_named`), reads included. The echoed `org=` line is the destination.
+(`org_not_named`), reads included, on a full install and a client-only one
+alike. The echoed `org=` line is the destination.
 
 ```sh
 cadence --org acme agent profile get ap_<profile-id>
@@ -473,7 +474,8 @@ cadence --org acme agent profile archive ap_<profile-id> --latest
   the profile at the revision you give and leaves the rest as stored.
 - Field names are the board's. `--set FIELD=VALUE` sends text, `--set-json
   FIELD=JSON` sends a value that is not text (`skills` is an array), and
-  `--file FIELD=PATH|-` sends a file's or stdin's text unchanged, and a hosted board trims it when it saves, so a final newline doesn't survive. The client
+  `--file FIELD=PATH|-` sends a file's or stdin's text unchanged. A hosted
+  board trims it when it saves, so a final newline doesn't survive. The client
   holds no field list and no limits: the board refuses an unknown field or a
   value that is too long, with its own code (`invalid_request`).
 - `edit` and `archive` need `--expect-rev N` or `--latest`. `--latest` reads the
