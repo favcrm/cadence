@@ -11340,3 +11340,385 @@ if (mode === 'keys') {
         }
     }
 }
+
+/// CAD-2108: the real `scripts/enqueue-reviewed` against a real git repository with a
+/// real `origin/main` ref. `gh` and `cadence` are logging stubs that fail, so a call
+/// in the log proves the run got past the gate-copy check and an empty log proves it
+/// signed and read nothing.
+mod cad2108_gate_copy {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn run(dir: &Path, program: &str, args: &[&str]) {
+        let out = cadence_agent::reaper::output(
+            Command::new(program)
+                .args(args)
+                .current_dir(dir)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1"),
+        )
+        .unwrap();
+        assert!(out.status.success(), "{program} {args:?}");
+    }
+
+    fn commit(dir: &Path, message: &str) {
+        run(dir, "git", &["add", "-A"]);
+        let args = [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+        ];
+        run(dir, "git", &[&args[..], &[message]].concat());
+    }
+
+    fn script(name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join(name);
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    struct Fixture {
+        root: tempfile::TempDir,
+    }
+
+    struct Out {
+        code: i32,
+        stdout: String,
+        stderr: String,
+        calls: String,
+        trace: String,
+    }
+
+    impl Fixture {
+        /// `repo` holds main's gate, committed and published as `origin/main`
+        /// (unless `with_ref` is false); `bin` holds the logging stubs.
+        fn new(with_ref: bool) -> Fixture {
+            let root = tempfile::Builder::new()
+                .prefix("c2108")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let (repo, bin) = (root.path().join("repo"), root.path().join("bin"));
+            std::fs::create_dir_all(repo.join("scripts")).unwrap();
+            std::fs::create_dir(&bin).unwrap();
+            for name in ["enqueue-reviewed", "delivery-gate"] {
+                std::fs::write(repo.join("scripts").join(name), script(name)).unwrap();
+            }
+            run(&repo, "git", &["init", "-q", "-b", "main"]);
+            run(
+                &repo,
+                "git",
+                &["remote", "add", "origin", "/nonexistent/o.git"],
+            );
+            commit(&repo, "lane base");
+            // main moves on an unrelated commit; the lane stays cut before it.
+            run(&repo, "git", &["checkout", "-q", "-b", "lane"]);
+            run(&repo, "git", &["checkout", "-q", "main"]);
+            std::fs::write(repo.join("other.txt"), "x\n").unwrap();
+            commit(&repo, "main moves");
+            if with_ref {
+                run(
+                    &repo,
+                    "git",
+                    &["update-ref", "refs/remotes/origin/main", "HEAD"],
+                );
+            }
+            run(&repo, "git", &["checkout", "-q", "lane"]);
+            for name in ["gh", "cadence"] {
+                let stub = bin.join(name);
+                std::fs::write(&stub, "#!/bin/sh\necho \"$0 $*\" >> \"$CALLS\"\nexit 1\n").unwrap();
+                std::fs::set_permissions(&stub, PermissionsExt::from_mode(0o755)).unwrap();
+            }
+            Fixture { root }
+        }
+
+        fn repo(&self) -> PathBuf {
+            self.root.path().join("repo")
+        }
+
+        /// Both gate files copied to a scratch directory outside the repo; `edit` may
+        /// change one of them. Returns the copied `enqueue-reviewed`.
+        fn copy(&self, edit: Option<&str>) -> PathBuf {
+            let dir = self.root.path().join("scratch");
+            std::fs::create_dir_all(&dir).unwrap();
+            for name in ["enqueue-reviewed", "delivery-gate"] {
+                let mut text = script(name);
+                if edit == Some(name) {
+                    text.push_str("\n# local edit\n");
+                }
+                std::fs::write(dir.join(name), text).unwrap();
+                std::fs::set_permissions(dir.join(name), PermissionsExt::from_mode(0o755)).unwrap();
+            }
+            dir.join("enqueue-reviewed")
+        }
+
+        fn enqueue(&self, copy: &Path, cwd: &Path, dry_run: bool) -> Out {
+            self.enqueue_with(copy, cwd, dry_run, false)
+        }
+
+        /// `merged` puts stderr on the stdout pipe, in the order it was written.
+        fn enqueue_with(&self, copy: &Path, cwd: &Path, dry_run: bool, merged: bool) -> Out {
+            let calls = self.root.path().join("calls");
+            let trace = self.root.path().join("trace");
+            let _ = std::fs::remove_file(&calls);
+            let _ = std::fs::remove_file(&trace);
+            let mut cmd = Command::new(if merged { "sh" } else { "python3" });
+            if merged {
+                cmd.args(["-c", "exec python3 \"$@\" 2>&1", "sh"]);
+            }
+            cmd.arg(copy)
+                .args(["7", "--head", HEAD, "--repo", "favcrm/cadence"])
+                .args([
+                    "--notes-dir",
+                    "/nonexistent",
+                    "--gate-key",
+                    "/nonexistent/key",
+                ]);
+            if dry_run {
+                cmd.arg("--dry-run");
+            }
+            let bin = self.root.path().join("bin");
+            let out = cadence_agent::reaper::output(
+                cmd.current_dir(cwd)
+                    .env_clear()
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env("HOME", self.root.path())
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("CADENCE_BIN", bin.join("cadence"))
+                    .env("CALLS", &calls)
+                    .env("GIT_TRACE", &trace),
+            )
+            .unwrap();
+            Out {
+                code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                calls: std::fs::read_to_string(calls).unwrap_or_default(),
+                trace: std::fs::read_to_string(trace).unwrap_or_default(),
+            }
+        }
+    }
+
+    impl Out {
+        fn show(&self) -> String {
+            format!("stdout: {}\nstderr: {}", self.stdout, self.stderr)
+        }
+
+        /// Refused before anything was read or signed, naming `file` and the recovery.
+        fn refused_for(&self, file: &str) {
+            assert_eq!(self.code, 1, "{}", self.show());
+            let line = format!("{file} differs from origin/main:scripts/{file}");
+            assert!(self.stderr.contains(&line), "{}", self.show());
+            let recover = "git show refs/remotes/origin/main:scripts/";
+            assert!(self.stderr.contains(recover), "{}", self.show());
+            assert!(
+                self.calls.is_empty(),
+                "signed or read: {}\n{}",
+                self.calls,
+                self.show()
+            );
+        }
+
+        /// The 12-hex content hash on the first stdout line.
+        fn hash(&self) -> String {
+            let first = self.stdout.lines().next().unwrap_or_default();
+            let rest = first
+                .strip_prefix("enqueue-reviewed: gate ")
+                .unwrap_or_default();
+            let hash = rest.split_whitespace().next().unwrap_or_default();
+            assert!(
+                hash.len() == 12 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{}",
+                self.show()
+            );
+            hash.to_string()
+        }
+
+        /// Git ran locally (the trace is not empty) and never reached for the network.
+        fn no_network(&self) {
+            assert!(
+                self.trace.contains("rev-parse"),
+                "no trace\n{}",
+                self.show()
+            );
+            for net in ["fetch", "ls-remote", "git-remote", "pull"] {
+                assert!(!self.trace.contains(net), "{net} in:\n{}", self.trace);
+            }
+        }
+
+        /// Got past the check and on to reading the PR (the stubs then fail it).
+        fn went_on(&self) {
+            assert!(
+                !self.calls.is_empty(),
+                "stopped at the gate\n{}",
+                self.show()
+            );
+        }
+    }
+
+    #[test]
+    fn a_differing_script_copy_refuses_a_real_enqueue() {
+        let fx = Fixture::new(true);
+        let out = fx.enqueue(&fx.copy(Some("enqueue-reviewed")), &fx.repo(), false);
+        out.refused_for("enqueue-reviewed");
+        out.no_network();
+    }
+
+    #[test]
+    fn a_differing_sibling_delivery_gate_refuses_a_real_enqueue() {
+        let fx = Fixture::new(true);
+        let out = fx.enqueue(&fx.copy(Some("delivery-gate")), &fx.repo(), false);
+        out.refused_for("delivery-gate");
+    }
+
+    #[test]
+    fn matching_copies_run_from_outside_the_repo_and_name_the_gate_hash_first() {
+        let fx = Fixture::new(true);
+        let out = fx.enqueue(&fx.copy(None), &fx.repo(), false);
+        out.went_on();
+        assert!(!out.stderr.contains("differs"), "{}", out.show());
+        out.hash();
+    }
+
+    #[test]
+    fn a_dry_run_on_a_differing_copy_warns_and_continues() {
+        let fx = Fixture::new(true);
+        let out = fx.enqueue(&fx.copy(Some("enqueue-reviewed")), &fx.repo(), true);
+        out.went_on();
+        assert!(
+            out.stderr
+                .contains("warning: enqueue-reviewed differs from origin/main"),
+            "{}",
+            out.show()
+        );
+        assert!(
+            !out.stderr.contains("refused: enqueue-reviewed differs"),
+            "{}",
+            out.show()
+        );
+    }
+
+    // Ticket: "`origin/main` absent, or current directory not a repo: no opinion, one
+    // line on stderr, runs unchanged." That covers a real enqueue, so a differing copy
+    // proceeds here with exactly one line saying it was not compared.
+    #[test]
+    fn without_origin_main_a_real_enqueue_says_so_once_and_runs() {
+        let fx = Fixture::new(false);
+        let elsewhere = tempfile::Builder::new()
+            .prefix("c2108n")
+            .tempdir_in("/tmp")
+            .unwrap();
+        for cwd in [fx.repo(), elsewhere.path().to_path_buf()] {
+            let out = fx.enqueue(&fx.copy(Some("enqueue-reviewed")), &cwd, false);
+            out.went_on();
+            let said = out
+                .stderr
+                .lines()
+                .filter(|l| l.contains("not compared with origin/main"))
+                .count();
+            assert_eq!(said, 1, "{}", out.show());
+            assert!(!out.stderr.contains("differs"), "{}", out.show());
+        }
+    }
+
+    #[test]
+    fn a_lane_behind_main_runs_its_own_scripts_unchanged() {
+        let fx = Fixture::new(true);
+        let own = fx.repo().join("scripts/enqueue-reviewed");
+        let out = fx.enqueue(&own, &fx.repo(), false);
+        out.went_on();
+        assert!(
+            out.stdout.contains("(same as origin/main)"),
+            "{}",
+            out.show()
+        );
+    }
+
+    #[test]
+    fn a_pr_editing_the_gate_is_refused_from_its_lane_and_runs_from_mains_copy() {
+        let fx = Fixture::new(true);
+        let lane = fx.repo();
+        let gate = lane.join("scripts/delivery-gate");
+        std::fs::write(
+            &gate,
+            format!("{}\n# the PR's edit\n", script("delivery-gate")),
+        )
+        .unwrap();
+        commit(&lane, "edit the gate");
+        let own = lane.join("scripts/enqueue-reviewed");
+        fx.enqueue(&own, &lane, false).refused_for("delivery-gate");
+        let out = fx.enqueue(&fx.copy(None), &lane, false);
+        out.went_on();
+        assert!(
+            out.stdout.contains("(same as origin/main)"),
+            "{}",
+            out.show()
+        );
+    }
+
+    #[test]
+    fn the_hash_line_comes_first_on_a_refusal_and_follows_the_content() {
+        let fx = Fixture::new(true);
+        let edited = fx.enqueue_with(&fx.copy(Some("delivery-gate")), &fx.repo(), false, true);
+        assert_eq!(edited.code, 1, "{}", edited.show());
+        let first = edited.stdout.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with("enqueue-reviewed: gate "),
+            "{}",
+            edited.show()
+        );
+        let same = fx.enqueue(&fx.copy(None), &fx.repo(), false);
+        assert_ne!(edited.hash(), same.hash(), "the hash ignores the content");
+    }
+
+    #[test]
+    fn a_local_branch_named_origin_main_does_not_shadow_the_remote_ref() {
+        let fx = Fixture::new(true);
+        let repo = fx.repo();
+        run(&repo, "git", &["checkout", "-q", "-b", "shadow"]);
+        std::fs::write(repo.join("scripts/enqueue-reviewed"), "# not the gate\n").unwrap();
+        commit(&repo, "decoy");
+        run(&repo, "git", &["branch", "origin/main"]);
+        run(&repo, "git", &["checkout", "-q", "lane"]);
+        let out = fx.enqueue(&fx.copy(None), &repo, false);
+        out.went_on();
+        assert!(
+            out.stdout.contains("(same as origin/main)"),
+            "{}",
+            out.show()
+        );
+    }
+
+    #[test]
+    fn a_main_without_the_sibling_gate_refuses_a_real_enqueue() {
+        let fx = Fixture::new(true);
+        let repo = fx.repo();
+        run(&repo, "git", &["checkout", "-q", "main"]);
+        run(&repo, "git", &["rm", "-q", "scripts/delivery-gate"]);
+        commit(&repo, "main drops the sibling");
+        run(
+            &repo,
+            "git",
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        run(&repo, "git", &["checkout", "-q", "lane"]);
+        let out = fx.enqueue(&fx.copy(None), &repo, false);
+        assert_eq!(out.code, 1, "{}", out.show());
+        assert!(
+            out.stderr
+                .contains("scripts/delivery-gate cannot be read from origin/main"),
+            "{}",
+            out.show()
+        );
+        assert!(out.calls.is_empty(), "{}", out.show());
+    }
+}

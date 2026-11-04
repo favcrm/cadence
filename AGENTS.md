@@ -27,6 +27,16 @@ prose and an authoritative source disagree, the source wins.
   (`--dry-run` enqueues nothing). It cannot supply a missing hosted evaluator
   or approval store. If it is unavailable, report the refusal; do not infer
   a pass or authorize a bypass. Hosted delivery is tracked by CAD-1946.
+- The gate must be main's. It compares its own bytes and the sibling
+  `scripts/delivery-gate` with `origin/main:scripts/<name>` (local git, current
+  directory, no network, CAD-2108). A real enqueue from a differing copy refuses
+  and names the file; `--dry-run` warns and runs. A lane merely behind main passes
+  while the gate files match. To run main's copy, write both files from
+  `git show origin/main:scripts/<name>` into one scratch directory and run it from
+  inside the repo (`git fetch origin main` first: a stale ref is not detected). A PR
+  editing the gate is judged by main's copy, never its own. No `origin/main` here
+  means no check; with `origin/main` present, a gate file missing or unreadable
+  on either side refuses. It guards accidents, not an adversary.
 - Risk classes, triggers, who approves what: `docs/roles/risk-classes.md`.
 - Path lists: `docs/roles/one-review-paths.toml` (review count),
   `docs/roles/risk-paths.toml` (triggers; the daemon compiles it in).
