@@ -152,15 +152,23 @@ pub(crate) enum Commands {
     /// WAL growth, per-user pipe pressure, orphaned processes from
     /// deleted worktrees, leaked temp dirs and stale worktrees, and the
     /// tailnet sign-in proof with its whole remedy chain — with exit
-    /// 0 ok, 1 warn, 2 fail.
+    /// 0 ok, 1 warn, 2 fail. With a hosted org selected, plain doctor
+    /// instead checks that connection from this machine, on any
+    /// installation: saved login, live sign-in, a read, the wiki and what
+    /// this login can do, with the same exit codes.
     Doctor {
         /// Run the host watchdog checks instead of the environment probe.
         #[arg(long)]
         host: bool,
-        /// With --host, print the JSON report instead of text lines
-        /// (plain doctor already prints JSON, so this is a no-op there).
+        /// With --host or a hosted org, print the JSON report instead of
+        /// text lines (the local environment probe already prints JSON, so
+        /// this is a no-op there).
         #[arg(long)]
         json: bool,
+        /// On a hosted org, run only the local checks and send nothing. The
+        /// local environment probe is already offline.
+        #[arg(long, conflicts_with = "host")]
+        offline: bool,
         /// With --host, list what could be freed — stale worktrees,
         /// per-lane target dirs, the shared cargo cache — with sizes
         /// and the command. Never deletes anything.

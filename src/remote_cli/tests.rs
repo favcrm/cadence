@@ -5662,3 +5662,257 @@ fn cad2009_profile_sync_postdispatch_503_is_unknown_but_invalid_request_is_defin
         assert_eq!(requests[1]["body"]["arguments"], json!(arguments));
     }
 }
+
+/// CAD-2111: answer each hosted doctor request by its path.
+fn doctor_worker(
+    n: usize,
+    answer: impl Fn(&str) -> (&'static str, Value) + Send + 'static,
+) -> (
+    TcpListener,
+    std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
+    thread::JoinHandle<()>,
+) {
+    finite_worker(n, move |_, socket, req| {
+        let (status, body) = answer(&req.path);
+        write_answer(socket, status, "", &body);
+    })
+}
+
+fn doctor_envelope(version: &str) -> Value {
+    json!({"version": version, "envelope": "aa.SECRETENVELOPE.cc", "scope": ["cli.read"]})
+}
+
+fn with_scopes(dir: &Path, scopes: &[&str]) {
+    let path = dir.join(format!("cli-{ORG}.json"));
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    saved["capabilities"] = json!(scopes);
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+}
+
+fn check<'a>(checks: &'a [probe::Check], id: &str) -> &'a probe::Check {
+    checks.iter().find(|c| c.id == id).unwrap()
+}
+
+const DEFAULT_SCOPES: &[&str] = &["cli.read", "cli.write", "wiki.read", "wiki.write"];
+
+fn doctor_healthy(path: &str) -> (&'static str, Value) {
+    match path {
+        "/__platform/cli/authorize" => ("200 OK", doctor_envelope(CLI_VERSION)),
+        "/__platform/wiki/authorize" => ("200 OK", doctor_envelope(WIKI_VERSION)),
+        "/__platform/cli/call" => ("200 OK", json!({"projects": []})),
+        other => panic!("doctor sent an unexpected request: {other}"),
+    }
+}
+
+#[test]
+fn hosted_doctor_passes_a_working_login_with_only_reads() {
+    let (listener, seen, handle) = doctor_worker(3, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, DEFAULT_SCOPES);
+    let checks = probe::checks_at(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 0, "{checks:?}");
+    for id in ["credential", "auth", "read", "wiki", "scopes"] {
+        assert_eq!(check(&checks, id).status, probe::Status::Ok, "{id}");
+    }
+    // Optional access a default login never asked for is listed, not a fault.
+    let scopes = &check(&checks, "scopes").summary;
+    assert!(
+        scopes.contains("--settings") && scopes.contains("--audit-approve"),
+        "{scopes}"
+    );
+
+    let seen = seen.lock().unwrap();
+    let paths: Vec<&str> = seen.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/__platform/cli/authorize",
+            "/__platform/cli/call",
+            "/__platform/wiki/authorize"
+        ]
+    );
+    assert_eq!(seen[0].body["requested_scopes"], json!(["cli.read"]));
+    assert_eq!(seen[1].body["verb"], "project_ls");
+}
+
+#[test]
+fn hosted_doctor_never_prints_a_credential_or_envelope() {
+    let (listener, _seen, handle) = doctor_worker(3, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, DEFAULT_SCOPES);
+    let checks = probe::checks_at(&dir, &target, false);
+    handle.join().unwrap();
+    let printed = format!(
+        "{}{}",
+        probe::report_text(&target, &checks),
+        probe::report_json(&target, &checks)
+    );
+    assert!(!printed.contains(BRIDGE), "{printed}");
+    assert!(!printed.contains("SECRETENVELOPE"), "{printed}");
+}
+
+#[test]
+fn hosted_doctor_names_login_only_for_a_proven_ended_session() {
+    let (listener, _seen, handle) = doctor_worker(1, |_| {
+        (
+            "401 Unauthorized",
+            json!({"ok": false, "error": {"code": "session_revoked"}}),
+        )
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let checks = probe::checks_at(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert_eq!(auth.status, probe::Status::Fail);
+    assert!(
+        auth.remedy
+            .as_deref()
+            .unwrap()
+            .contains("cadence login acme"),
+        "{auth:?}"
+    );
+    assert_eq!(check(&checks, "read").status, probe::Status::Skipped);
+}
+
+#[test]
+fn hosted_doctor_does_not_call_a_bare_401_an_expired_login() {
+    let (listener, _seen, handle) = doctor_worker(1, |_| {
+        (
+            "401 Unauthorized",
+            json!({"ok": false, "error": {"code": "unauthorized"}}),
+        )
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let checks = probe::checks_at(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary.contains("does not prove it expired"),
+        "{auth:?}"
+    );
+    assert!(
+        auth.remedy
+            .as_deref()
+            .unwrap()
+            .contains("cadence login acme"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_says_a_server_fault_is_not_the_login() {
+    let (listener, _seen, handle) = doctor_worker(1, |_| {
+        (
+            "503 Service Unavailable",
+            json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+        )
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let checks = probe::checks_at(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary.contains("your login is not the problem"),
+        "{auth:?}"
+    );
+    assert!(
+        !auth.remedy.as_deref().unwrap().contains("cadence login"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_reports_an_unreachable_workspace_without_blaming_the_login() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (target, _root, dir) = credentialed(&listener);
+    drop(listener);
+    let checks = probe::checks_at(&dir, &target, false);
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary.contains("says nothing about your login"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_warns_on_a_login_that_cannot_write() {
+    let (listener, _seen, handle) = doctor_worker(3, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, &["cli.read", "wiki.read", "wiki.write"]);
+    let checks = probe::checks_at(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 1);
+    let scopes = check(&checks, "scopes");
+    assert_eq!(scopes.status, probe::Status::Warn);
+    assert!(
+        scopes
+            .remedy
+            .as_deref()
+            .unwrap()
+            .contains("cadence login acme"),
+        "{scopes:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_skips_the_wiki_for_a_login_without_it() {
+    let (listener, seen, handle) = doctor_worker(2, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, &["cli.read", "cli.write"]);
+    let checks = probe::checks_at(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 0, "{checks:?}");
+    assert_eq!(check(&checks, "wiki").status, probe::Status::Skipped);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn hosted_doctor_offline_sends_nothing() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, DEFAULT_SCOPES);
+    let checks = probe::checks_at(&dir, &target, true);
+
+    assert_eq!(probe::exit_code(&checks), 0);
+    for id in ["auth", "read", "wiki"] {
+        assert_eq!(check(&checks, id).status, probe::Status::Skipped, "{id}");
+    }
+    assert_eq!(
+        listener.accept().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn hosted_doctor_without_a_login_stops_before_the_network() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let checks = probe::checks_at(root.path(), &target, false);
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    assert!(check(&checks, "credential")
+        .remedy
+        .as_deref()
+        .unwrap()
+        .contains("cadence login acme"));
+    assert_eq!(check(&checks, "auth").status, probe::Status::Skipped);
+    assert_eq!(
+        listener.accept().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}

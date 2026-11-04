@@ -813,7 +813,8 @@ grant Cadence operator privileges, and no board cookie/assertion guard is weaken
 ### Read-only diagnosis before repeated login (CAD-1434)
 
 Diagnose a hosted refusal in this order. Each step is read-only and none
-requires another login:
+requires another login. `cadence --org <org> doctor` runs the live part of this
+for you (CAD-2111); the steps below remain the detail behind its answer:
 
 1. `cadence org inspect <org>`: read `credential.state`, the scopes, the access
    expiry and the session idle/absolute expiry. `no_credential` or

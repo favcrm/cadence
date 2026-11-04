@@ -275,6 +275,30 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         return discovery::run(&cli.command);
     }
     let client_only = client_update::client_only_mode()?;
+    // CAD-2111: plain doctor on a hosted org checks that connection from this
+    // machine, on any installation, before any local state exists. `route`
+    // reads the registry without a lock or a state dir, and its refusals (an
+    // unknown org, a pin conflict) stand: there is no local fallback. A local
+    // selection falls through to the environment probe unchanged.
+    if let Commands::Doctor {
+        host: false,
+        json,
+        offline,
+        ..
+    } = &cli.command
+    {
+        if let org::Routed::Remote(target) =
+            org::route(cli.org.as_deref(), cli.state_dir.clone(), tracker_pin()?)?
+        {
+            return Ok(doctor::run_remote(
+                &target,
+                *json,
+                *offline,
+                cli.org.is_some(),
+                client_only,
+            ));
+        }
+    }
     // CAD-1437: a valid client-only receipt selects the public updater before
     // any org, credential, tracker or state work. Native-only options refuse.
     if let Commands::Update {
