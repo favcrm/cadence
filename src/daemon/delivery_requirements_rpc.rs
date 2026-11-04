@@ -284,7 +284,7 @@ fn changed_set_matches_trees(
     differs == listed
 }
 
-fn content_at_base<G: GhRead + ?Sized>(
+fn content_at_ref<G: GhRead + ?Sized>(
     shared: &G,
     repo: &str,
     path: &str,
@@ -424,6 +424,11 @@ pub(crate) fn classify_from<I: RequirementInputs + ?Sized>(
         base.clone()
     };
     let comparison = api(shared, &format!("repos/{repo}/compare/{anchor}...{head}"))?;
+    // CAD-2117: GitHub's compare answers ONE merge base. When the two commits
+    // have several (a criss-cross merge) that answer is not provably the right
+    // one and the API cannot enumerate the rest, so this path does not claim to
+    // detect it. `scripts/enqueue-reviewed` runs `git merge-base --all` and
+    // refuses on more than one, and it is the gate every merge passes through.
     let merge_base = comparison["merge_base_commit"]["sha"]
         .as_str()
         .filter(|s| valid_sha(s))
@@ -432,9 +437,14 @@ pub(crate) fn classify_from<I: RequirementInputs + ?Sized>(
     let files = comparison["files"]
         .as_array()
         .ok_or_else(|| reject("comparison has no complete file list"))?;
-    if files.len() >= 300 || (!main_based && files.len() as u64 != changed_files) {
+    // A main-based PR is not compared with GitHub's count (it counts from its
+    // own, possibly stale, base); its list is proven against the trees below.
+    if files.len() >= 300 {
+        return Err(reject("GitHub comparison file list is truncated"));
+    }
+    if !main_based && files.len() as u64 != changed_files {
         return Err(reject(
-            "GitHub comparison file list is truncated or differs from the PR file count",
+            "GitHub comparison file list differs from the PR file count",
         ));
     }
     let base_modes = tree_modes(shared, &repo, &merge_base)?;
@@ -484,12 +494,21 @@ pub(crate) fn classify_from<I: RequirementInputs + ?Sized>(
         lines = lines
             .saturating_add(file["additions"].as_u64().unwrap())
             .saturating_add(file["deletions"].as_u64().unwrap());
-        changes.push(requirements::change(status, &old_mode, &new_mode, path));
+        if status == "R" {
+            // CAD-2117: a rename is a delete of the old path plus an add of the
+            // new one (as `git diff --no-renames` reports it, which the script
+            // uses), so the path classes see BOTH ends. Recording only the new
+            // path let `scripts/x` renamed out of `scripts/` read as outside it.
+            changes.push(requirements::change("D", &old_mode, "000000", old_path));
+            changes.push(requirements::change("A", "000000", &new_mode, path));
+        } else {
+            changes.push(requirements::change(status, &old_mode, &new_mode, path));
+        }
     }
 
     // The path lists move with the diff: read at the same anchor.
-    let risk_paths = content_at_base(shared, &repo, "docs/roles/risk-paths.toml", &anchor);
-    let one_review = content_at_base(shared, &repo, "docs/roles/one-review-paths.toml", &anchor);
+    let risk_paths = content_at_ref(shared, &repo, "docs/roles/risk-paths.toml", &anchor);
+    let one_review = content_at_ref(shared, &repo, "docs/roles/one-review-paths.toml", &anchor);
     let lists = requirements::TrustedLists {
         risk_paths: risk_paths.as_deref(),
         one_review: one_review.as_deref(),
@@ -836,7 +855,7 @@ fn require_queue_authority<G: GhRead + ?Sized>(
             }
         }
     }
-    let raw = content_at_base(shared, repo, ".github/workflows/ci.yml", base)
+    let raw = content_at_ref(shared, repo, ".github/workflows/ci.yml", base)
         .ok_or_else(|| reject("trusted integration workflow is unavailable"))?;
     let workflow: serde_yaml::Value = serde_yaml::from_str(&raw)
         .map_err(|_| reject("trusted integration workflow is malformed"))?;

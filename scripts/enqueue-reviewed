@@ -136,7 +136,8 @@ REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a no
 HUMAN_PREFIXES = (".github/", "scripts/", "docs/roles/", ".config/", ".cargo/",
                   "src/audit/", "src/delegation/", "src/delivery/", "tests/common/", "config/")
 # Every [schema]/[trigger4]/[trigger6]/[trigger7] glob in this file, read at the
-# PR's base, is human too (CAD-1104). Unreadable means human (fail closed).
+# diff's anchor (main's live tip for a main-based PR), is human too (CAD-1104).
+# Unreadable means human (fail closed).
 RISK_PATHS_FILE = "docs/roles/risk-paths.toml"
 RISK_HUMAN_TABLES = ("schema", "trigger4", "trigger6", "trigger7")
 # CAD-2081: a PR with a workflow-issued review needs the operator unless EVERY
@@ -160,6 +161,12 @@ HUMAN_EXACT = {
     # trigger 7: approval and delivery rules (CAD-1104)
     "src/delegation.rs", "src/issue/delivery_policy.rs",
     "src/issue/delivery_requirements.rs",
+    # CAD-2117: the classifier's own files (the one above is now a re-export
+    # shim). Keep in agreement with HUMAN_EXACT in cadence-core's
+    # delivery_requirements.rs.
+    "crates/cadence-core/src/delivery_requirements.rs",
+    "crates/cadence-core/src/delivery_rules.rs",
+    "src/daemon/delivery_requirements_rpc.rs",
     "docs/AUDIT.md", "tests/safety_floor.rs",
 }
 
@@ -317,10 +324,17 @@ def pr_changes(pr, head, base, base_oid, main_tip=None):
     for sha in (head, base_oid, anchor):
         if not have(sha):
             raise RuntimeError(f"commit {sha} is not in this checkout (run from a checkout of the repo)")
-    rc, mb, err = run(["git", "merge-base", anchor, head])
-    if rc != 0 or not FULL_SHA.fullmatch(mb.strip()):
+    # CAD-2117: `git merge-base` alone picks one of several best common ancestors
+    # (a criss-cross merge), and the diff from the wrong one can hide a restored
+    # file. More than one is refused: nothing here can say which is the right base.
+    rc, mbs, err = run(["git", "merge-base", "--all", anchor, head])
+    bases = mbs.split()
+    if rc != 0 or not bases or not all(FULL_SHA.fullmatch(b) for b in bases):
         raise RuntimeError(f"no merge base of {anchor} and {head}: {err.strip()}")
-    mb = mb.strip()
+    if len(bases) > 1:
+        raise RuntimeError(f"{anchor} and {head} have {len(bases)} merge bases ({', '.join(b[:12] for b in bases)}), "
+                           "so the changed set is ambiguous (fail closed)")
+    mb = bases[0]
     rc, out, err = run(["git", "diff", "--raw", "-z", "--no-renames", "--no-abbrev", mb, head])
     if rc != 0:
         raise RuntimeError(f"git diff failed: {err.strip()}")
@@ -1345,13 +1359,13 @@ PATH_TRIGGER_TABLES = (("schema", 2), ("trigger4", 4), ("trigger6", 6), ("trigge
 
 def path_triggers(paths, risk_text):
     """(triggers hit, [unmapped human paths]) from the risk-paths tables read
-    at the base, or (None, reason) when a table is unreadable. A human-class
+    at the diff's anchor, or (None, reason) when a table is unreadable. A human-class
     path (is_human_path) in no table is unmapped: it needs a per-head approval."""
     tables = []
     for t, n in PATH_TRIGGER_TABLES:
         g = glob_list(risk_text, (t, "paths"))
         if g is None:
-            return None, f"cannot read the [{t}] list of {RISK_PATHS_FILE} at the base"
+            return None, f"cannot read the [{t}] list of {RISK_PATHS_FILE} at the diff's anchor"
         tables.append((n, g))
     hit, unmapped = set(), []
     for p in paths:
@@ -1376,7 +1390,7 @@ def scope_reasons(issue, title, branch, ticket, paths, risk_text, one_text, verd
     t13 = [g for t in ("trigger1", "trigger3") for g in (glob_list(risk_text, (t, "paths")) or [None])]
     exc = glob_list(one_text, ("one_review_exclude",))
     if None in t13 or exc is None:
-        why.append(f"cannot read the trigger 1/3 lists ({RISK_PATHS_FILE}, {ONE_REVIEW_FILE}) at the base")
+        why.append(f"cannot read the trigger 1/3 lists ({RISK_PATHS_FILE}, {ONE_REVIEW_FILE}) at the diff's anchor")
     else:
         hit = [p for p in paths if any(glob_match(g, p) for g in t13 + exc)]
         if hit:
@@ -1536,7 +1550,9 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         changes, lines, merge_base = [], 0, ""
     # The commit the path lists are read at: main's live tip for a main-based PR (a PR
     # cannot edit the lists it is judged by: the tip holds no unmerged PR), else the
-    # PR's base commit. Never empty: an empty ref would read the default branch.
+    # PR's base commit. Empty when that commit could not be read (main's tip or
+    # `baseRefOid`); the conditions below then read nothing rather than let an empty
+    # ref read the default branch, and a failed diff has already refused.
     lists_ref = live_tip if base == "main" else base_oid
     paths = sorted({c[3] for c in changes})
     if not changes and not any("cannot list the changed files" in r for r in reasons):
