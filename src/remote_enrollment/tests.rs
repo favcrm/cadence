@@ -805,23 +805,63 @@ fn browser_continuity_bind_refuses_expired_challenge_before_proof() {
 
 #[test]
 fn browser_continuity_bind_classifies_issuer_refusals_without_losing_pending_key() {
-    for (status, code, reason, expected) in [
-        ("401 Unauthorized", "lineage_terminal", "", "fresh consent"),
-        ("409 Conflict", "parked", "session_expired", "fresh consent"),
-        ("409 Conflict", "parked", "session_uncertain", "parked"),
-        ("401 Unauthorized", "unauthorized", "", "authorization"),
-        ("403 Forbidden", "forbidden", "", "authorization"),
+    // A refusal proves the bind did not commit, so it is definite. An
+    // `authority_unavailable` answer may follow a commit attempt, so it is not.
+    for (status, code, reason, kind, expected) in [
+        (
+            "401 Unauthorized",
+            "lineage_terminal",
+            "",
+            "rejected",
+            "fresh consent",
+        ),
+        (
+            "409 Conflict",
+            "parked",
+            "session_expired",
+            "rejected",
+            "fresh consent",
+        ),
+        (
+            "409 Conflict",
+            "parked",
+            "session_uncertain",
+            "rejected",
+            "parked",
+        ),
+        (
+            "401 Unauthorized",
+            "unauthorized",
+            "",
+            "rejected",
+            "authorization",
+        ),
+        (
+            "403 Forbidden",
+            "forbidden",
+            "",
+            "rejected",
+            "authorization",
+        ),
         (
             "401 Unauthorized",
             "other_issuer_refusal",
             "",
+            "rejected",
             "authorization",
         ),
-        ("403 Forbidden", "other_issuer_refusal", "", "authorization"),
+        (
+            "403 Forbidden",
+            "other_issuer_refusal",
+            "",
+            "rejected",
+            "authorization",
+        ),
         (
             "503 Service Unavailable",
             "authority_unavailable",
             "",
+            "unknown",
             "binding is unknown",
         ),
     ] {
@@ -864,6 +904,7 @@ fn browser_continuity_bind_classifies_issuer_refusals_without_losing_pending_key
         child.service_token = None;
         save(&dir, &child).unwrap();
         let error = bind_browser(&dir).unwrap_err();
+        assert_eq!(error.kind(), kind, "{status} {code}/{reason}: {error}");
         assert!(
             format!("{error}").contains(expected),
             "{status} {code}/{reason}: {error}"
