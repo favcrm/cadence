@@ -140,6 +140,9 @@ const threadReads: string[] = [];
 let threadExtra: Record<string, unknown> = {};
 let viewerIsOperator: boolean | null = true;
 let viewerHosted = false;
+let rolesPayload: unknown = null;
+let rolesGate: Promise<void> | null = null;
+let accessPayload: unknown = null;
 globalThis.fetch = async (input, init) => {
   if (init?.method && init.method !== "GET")
     throw new Error("Agents must not write");
@@ -151,6 +154,17 @@ globalThis.fetch = async (input, init) => {
     });
   }
   reads.push(path);
+  if (path === "/api/agent-roles") {
+    if (rolesGate) await rolesGate;
+    return rolesPayload
+      ? new Response(JSON.stringify(rolesPayload), { headers: { "Content-Type": "application/json" } })
+      : new Response(JSON.stringify({ error: "Roles unavailable" }), { status: 503 });
+  }
+  if (path.endsWith("/access") && !detailNotServed) {
+    return accessPayload
+      ? new Response(JSON.stringify(accessPayload), { headers: { "Content-Type": "application/json" } })
+      : new Response(JSON.stringify({ error: "Access unavailable" }), { status: 503 });
+  }
   if (holdDetail)
     await new Promise<void>((resolve) => {
       releaseDetail = resolve;
@@ -541,6 +555,31 @@ async function main() {
   await flush();
   const box = () => host.querySelector<HTMLTextAreaElement>("#ap-panel textarea");
   assert(box()?.value === "Synthetic instructions" && !box()!.readOnly, "an operator can edit instructions on a live board");
+  const type = async (text: string) => {
+    const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(box()!), "value")!.set!;
+    await React.act(async () => {
+      setter.call(box()!, text);
+      box()!.dispatchEvent(new window.Event("input", { bubbles: true }));
+    });
+  };
+  await type("An unsaved draft");
+  tab = "skills";
+  await render();
+  tab = "instructions";
+  await render();
+  assert(box()?.value === "An unsaved draft", "a draft survives a trip through another section");
+  assert(Array.from(host.querySelectorAll("#ap-panel button")).some((b) => b.textContent === "Save"), "the kept draft can still be saved");
+  await type("Synthetic instructions");
+  assert(!host.querySelector("#ap-panel button"), "text back at what is saved is no longer a change");
+  const gearButton = host.querySelector<HTMLButtonElement>("button[aria-label='Agent settings']");
+  assert(gearButton, "the gear is on the page");
+  await React.act(() => gearButton.click());
+  assert(host.querySelector("[data-drawer='agent-settings']"), "the gear opens its drawer");
+  tab = "overview";
+  await render();
+  tab = "instructions";
+  await render();
+  assert(!host.querySelector("[data-drawer='agent-settings']"), "the chat closes the gear, so coming back doesn't reopen it");
   state = { ...state, status: "stale", error: "Refresh unavailable" };
   await render();
   assert(box()?.value === "Synthetic instructions" && box()!.readOnly, "a stale board keeps the text and takes no edit");
@@ -660,12 +699,12 @@ async function main() {
   const servedHost = document.createElement("div");
   document.body.append(servedHost);
   const servedRoot = createRoot(servedHost);
-  const mountServed = async (alias: string, section: typeof tab, roster: typeof state) => {
+  const mountServed = async (alias: string, section: typeof tab, roster: typeof state, operator = true) => {
     await React.act(() =>
       servedRoot.render(
         React.createElement(LocaleProvider, null, React.createElement(Agents, {
-          key: `${alias}:${section}`,
-          operator: true,
+          key: `${alias}:${section}:${roster.status}:${operator}`,
+          operator,
           onRetryAccess: () => {},
           hostedBoard: true,
           state: roster,
@@ -782,6 +821,61 @@ async function main() {
   for (const claim of [...unsettled, "Nothing right now", "Nothing queued", "Nothing needs attention"])
     assert(!pendingPanel.includes(claim), `work, roster pending: claims nothing yet: ${claim}`);
   detailNotServed = false;
+  const clickRetry = async (scope: Element | null) => {
+    const retry = Array.from(scope?.querySelectorAll("button") ?? []).find((b) => b.textContent?.trim() === "Retry");
+    assert(retry, "a failed read offers a Retry");
+    await React.act(() => retry.click());
+    await flush();
+    await flush();
+  };
+  // CAD-2090 review: an unread role is neither "no skills" nor a dead end.
+  const sellerRole = { id: "sales", title: "Sales", category: "ops", kind: "apps", instructions: "Sell", skills: ["pipeline"], tools: ["crm"], first_tasks: ["Call the first lead"] };
+  rolesPayload = null;
+  const seller = { id: "ap_3", alias: "Seller", role: "worker", team_role: "worker", catalogue: "sales", look: null, job: "Sell", model: "inherit", runtimes: [] };
+  const withSeller = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [seller] }) as unknown as typeof state;
+  let openRoles = () => {};
+  rolesGate = new Promise<void>((resolve) => {
+    openRoles = resolve;
+  });
+  await mountServed("Seller", "skills", withSeller);
+  const skillsPanel = () => servedHost.querySelector("#ap-panel")?.textContent ?? "";
+  assert(skillsPanel().includes("Loading…") && !skillsPanel().includes("No skills are recorded"), "a role still being read claims no empty skills");
+  openRoles();
+  rolesGate = null;
+  await flush();
+  await flush();
+  assert(skillsPanel().includes("couldn’t be read") && !skillsPanel().includes("No skills are recorded"), "a failed role read is not an empty list");
+  rolesPayload = { roles: [sellerRole], categories: [], install: { hosted: true } };
+  await clickRetry(servedHost.querySelector("#ap-panel"));
+  assert(skillsPanel().includes("pipeline") && !skillsPanel().includes("couldn’t be read"), "Retry brings the role's skills back");
+  // First-job chips open a composer, so they follow the same write rule.
+  const runner = { ...seller, runtimes: ["stopped"] };
+  const withRunner = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [runner] }) as unknown as typeof state;
+  const chipsFor = async (roster: typeof state, operator: boolean) => {
+    await mountServed("stopped", "overview", roster, operator);
+    const details = Array.from(servedHost.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Details");
+    if (details && !servedHost.querySelector(".ag-chat-panel")?.textContent?.includes("Doing now")) await React.act(() => details.click());
+    await flush();
+    return servedHost.querySelector(".ag-chat-panel")?.textContent ?? "";
+  };
+  assert((await chipsFor(withRunner, true)).includes("Call the first lead"), "an operator on a live board gets first-job chips");
+  assert(!(await chipsFor(withRunner, false)).includes("Call the first lead"), "a member gets no first-job chips");
+  assert(!(await chipsFor({ ...withRunner, status: "stale", error: "Refresh unavailable" }, true)).includes("Call the first lead"), "a stale board offers no first-job chips");
+  rolesPayload = null;
+  // A failed read inside the gear drawer recovers there: the page's Retry is behind its scrim.
+  const gearDrawer = () => servedHost.querySelector("[data-drawer='agent-settings']");
+  await mountServed("dev", "settings", liveRoster);
+  assert(gearDrawer()?.textContent?.includes("Access unavailable"), "a failed access read says so");
+  accessPayload = { grants: [], connections: [], custody: null };
+  await clickRetry(gearDrawer());
+  assert(gearDrawer()?.textContent?.includes("holds no connection grants"), "Retry re-reads connection access");
+  failDetail = true;
+  await mountServed("stopped", "settings", liveRoster);
+  assert(!gearDrawer()?.textContent?.includes("No callable capability"), "a failed detail read is not an empty capability list");
+  failDetail = false;
+  await clickRetry(gearDrawer());
+  assert(gearDrawer()?.textContent?.includes("session-stopped"), "Retry in the drawer re-reads the agent's details");
+  accessPayload = null;
   await React.act(() => servedRoot.unmount());
   console.log("agents view checks passed");
 }

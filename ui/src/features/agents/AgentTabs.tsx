@@ -1,4 +1,4 @@
-import { useContext, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { fmtTime } from "../../lib/fmt";
@@ -8,7 +8,6 @@ import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import type { ToastMsg } from "../../ui/Toast";
 import DrawerShell from "../app-shell/shared/DrawerShell";
-import { WriteGate } from "../auth/WriteGate";
 import type { Agent, AgentAccess, AgentDetail, AgentRole, HiredProfile } from "../../lib/types";
 import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref, detailTasksNotOnRoster, partitionActiveTasks } from "./AgentBlocks";
 import Link from "../../ui/Link";
@@ -45,6 +44,13 @@ export interface TabContext {
   /** This board answers the read with 501: it keeps no such details. That is
    *  permanent, so it reads as neither a failure to retry nor an empty record. */
   detailNotServed: boolean;
+  retryDetail: () => void;
+  /** Whether the role is known yet. A profile that names none has nothing to wait for. */
+  roleRead: "read" | "reading" | "failed";
+  retryRole: () => void;
+  /** The unsaved Instructions text. It outlives the section, so a tab trip keeps it. */
+  draft: string | null;
+  setDraft: (text: string) => void;
 }
 
 const NOT_RECORDED = "This board doesn’t record agent history.";
@@ -123,11 +129,30 @@ function Note({ children }: { children: React.ReactNode }) {
   return <p className="rc-note">{children}</p>;
 }
 
+function Failed({ text, onRetry }: { text: string; onRetry: () => void }) {
+  const t = useTranslate();
+  return (
+    <p className="rc-note" role="alert">
+      {t(text)}{" "}
+      <button type="button" className="lnk" onClick={onRetry}>
+        {t("Retry")}
+      </button>
+    </p>
+  );
+}
+
+/** A role still unread says nothing about what it names. */
+function RoleRead({ c }: { c: TabContext }) {
+  const t = useTranslate();
+  if (c.roleRead === "read") return null;
+  if (c.roleRead === "reading") return <Note>{t("Loading…")}</Note>;
+  return <Failed text="This agent’s role couldn’t be read." onRetry={c.retryRole} />;
+}
+
 /** First-job chips: open the agent's thread with the text in the composer.
  *  Nothing is sent; the operator reviews it first. */
 export function FirstJobs({ alias, tasks }: { alias: string; tasks: string[] }) {
   const t = useTranslate();
-  const writeBlock = useContext(WriteGate);
   return (
     <div className="rc-sugs" style={{ marginTop: "0.5rem" }}>
       {tasks.map((task) => (
@@ -135,8 +160,7 @@ export function FirstJobs({ alias, tasks }: { alias: string; tasks: string[] }) 
           key={task}
           type="button"
           className="rc-sug"
-          disabled={writeBlock !== null}
-          title={writeBlock ?? t("Opens the thread with this text ready to send")}
+          title={t("Opens the thread with this text ready to send")}
           onClick={() => {
             setComposerDraft(`threads:${alias}`, task);
             navigate(`/threads?dm=${encodeURIComponent(alias)}`);
@@ -191,7 +215,7 @@ function NowCard({ c, onlyDoing = false }: { c: TabContext; onlyDoing?: boolean 
   return (
     <div className="ap-now">
       <b>{t("Nothing right now")}</b>
-      {c.role && c.role.first_tasks.length > 0 && (
+      {c.writable && c.role && c.role.first_tasks.length > 0 && (
         <>
           <small>{t("Give it a job:")}</small>
           <FirstJobs alias={c.alias} tasks={c.role.first_tasks} />
@@ -402,13 +426,13 @@ function Instructions({ c }: { c: TabContext }) {
   const t = useTranslate();
   // The board serves the saved text to the operator only.
   const served = c.detail?.agent.instructions ?? null;
-  const [text, setText] = useState(served ?? "");
+  const text = c.draft ?? served ?? "";
   const [saving, setSaving] = useState(false);
   if (c.hired) {
     return c.hired.job ? (
       <p className="rc-profile-job">{c.hired.job}</p>
     ) : (
-      <Note>{t("Only the operator can read this agent’s instructions.")}</Note>
+      <Note>{t("There are no instructions to show for this agent.")}</Note>
     );
   }
   const save = async () => {
@@ -450,7 +474,7 @@ function Instructions({ c }: { c: TabContext }) {
         aria-label={t("Instructions")}
         value={text}
         readOnly={!c.writable}
-        onChange={(event) => setText(event.target.value)}
+        onChange={(event) => c.setDraft(event.target.value)}
       />
       {c.writable && (
         <div className="rc-sugs">
@@ -460,7 +484,7 @@ function Instructions({ c }: { c: TabContext }) {
             </Button>
           )}
           {c.role && text !== c.role.instructions && (
-            <Button size="sm" onClick={() => setText(c.role!.instructions)}>
+            <Button size="sm" onClick={() => c.setDraft(c.role!.instructions)}>
               {t("Reset to role")}
             </Button>
           )}
@@ -480,14 +504,17 @@ function Skills({ c }: { c: TabContext }) {
   const names = [...bundled, ...named.filter((name) => !bundled.includes(name))];
   const line = (name: string) =>
     BUNDLED_SKILLS.find((skill) => skill.name === name)?.line ?? "Named by its role";
-  if (names.length === 0) return <Note>{t("No skills are recorded for this agent.")}</Note>;
+  if (names.length === 0 && c.roleRead === "read") return <Note>{t("No skills are recorded for this agent.")}</Note>;
   return (
     <div className="ap-body">
-      <Rows>
-        {names.map((name) => (
-          <ManageRow key={name} id={`skill-${name}`} name={name} line={t(line(name))} onOpen={() => setOpen(name)} />
-        ))}
-      </Rows>
+      {names.length > 0 && (
+        <Rows>
+          {names.map((name) => (
+            <ManageRow key={name} id={`skill-${name}`} name={name} line={t(line(name))} onOpen={() => setOpen(name)} />
+          ))}
+        </Rows>
+      )}
+      <RoleRead c={c} />
       {open && (
         <ItemDrawer title={open} onClose={() => setOpen(null)}>
           <p className="ap-drawer-lead">{t(line(open))}</p>
@@ -517,6 +544,7 @@ function Tools({ c }: { c: TabContext }) {
           <ManageRow key={name} id={`tool-${name}`} name={name} line={t(line(name))} onOpen={() => setOpen(name)} />
         ))}
       </Rows>
+      <RoleRead c={c} />
       {open && (
         <ItemDrawer title={open} onClose={() => setOpen(null)}>
           <p className="ap-drawer-lead">{t(line(open))}</p>
@@ -601,7 +629,7 @@ function RuntimeSection({ c }: { c: TabContext }) {
       ) : c.detailNotServed ? (
         <Note>{t("This board doesn’t report runtime details.")}</Note>
       ) : c.detailFailed ? (
-        <Note>{t("Agent details are unavailable.")}</Note>
+        <Failed text="Agent details are unavailable." onRetry={c.retryDetail} />
       ) : (
         <Note>{t("Loading agent details…")}</Note>
       )}
@@ -683,10 +711,12 @@ function Access({ c }: { c: TabContext }) {
   const [access, setAccess] = useState<AgentAccess | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [notServed, setNotServed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     let live = true;
     setAccess(null);
     setFailure(null);
+    setNotServed(false);
     api
       .agentAccess(c.alias)
       .then((data) => {
@@ -700,7 +730,7 @@ function Access({ c }: { c: TabContext }) {
     return () => {
       live = false;
     };
-  }, [c.alias]);
+  }, [c.alias, attempt]);
   const capabilities = c.detail?.agent.capabilities ?? null;
   const capabilityNames = capabilities ? Object.keys(capabilities).sort() : [];
   const custody = access?.custody ?? null;
@@ -717,6 +747,10 @@ function Access({ c }: { c: TabContext }) {
               <li key={name} className="num break-words">{name}</li>
             ))}
           </ul>
+        ) : c.detailFailed && !c.detail ? (
+          <p className="text-label text-ink-500">{t("Agent details are unavailable.")}</p>
+        ) : reading(c) ? (
+          <p className="text-label text-ink-500">{t("Loading agent details…")}</p>
         ) : (
           <p className="text-label text-ink-500">
             {t("No callable capability inventory is reported for this agent yet.")}
@@ -731,7 +765,12 @@ function Access({ c }: { c: TabContext }) {
         {notServed ? (
           <p className="text-label text-ink-500">{t("This board doesn’t record connection access.")}</p>
         ) : failure ? (
-          <p className="text-label text-warn" role="alert">{t(failure)}</p>
+          <p className="text-label text-warn" role="alert">
+            {t(failure)}{" "}
+            <button type="button" className="lnk" onClick={() => setAttempt((n) => n + 1)}>
+              {t("Retry")}
+            </button>
+          </p>
         ) : access === null ? (
           <p className="text-label text-ink-500">{t("Reading connection access…")}</p>
         ) : access.grants.length === 0 ? (

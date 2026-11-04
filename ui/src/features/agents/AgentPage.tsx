@@ -116,9 +116,14 @@ export default function AgentPage({
 
   // The gear opens over the current section; `?tab=settings` opens over Instructions.
   const [gear, setGear] = useState(false);
+  const [draft, setDraft] = useState<string | null>(null);
   const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
   const chat = tab === "overview";
   const leave = chat ? onBack : () => onTab("overview");
+  // Leaving for the chat closes the gear, so coming back doesn't reopen it.
+  useEffect(() => {
+    if (chat) setGear(false);
+  }, [chat]);
   useEffect(() => {
     // A runtime-less profile is not a registered agent: there is nothing to read.
     // Once the roster has answered, or failed, so a failed read still says so.
@@ -162,6 +167,11 @@ export default function AgentPage({
   }, [leave]);
 
   const a = detail?.agent;
+  // A saved draft is the served text now, so it stops being a draft.
+  const served = a?.instructions ?? null;
+  useEffect(() => {
+    if (draft !== null && draft === served) setDraft(null);
+  }, [draft, served]);
   // A collection observation keeps evidence available during loading/failure.
   // Detail carries provider evidence, but not selection provenance or grouping.
   const profile: Agent | undefined = a
@@ -219,6 +229,10 @@ export default function AgentPage({
         ];
 
   const unread = err !== null || (notServed && observed === undefined);
+  const retryDetail = () => {
+    setRetry((r) => r + 1);
+    if (!observed) onRetryRoster();
+  };
   const ctx: TabContext = {
     alias,
     profile,
@@ -237,6 +251,11 @@ export default function AgentPage({
     // the failure it is: the board's "not recorded" is only about a known agent.
     detailFailed: unread,
     detailNotServed: notServed && observed !== undefined,
+    retryDetail,
+    roleRead: roles.data || (hired && !hired.catalogue) ? "read" : roles.error ? "failed" : "reading",
+    retryRole: roles.retry,
+    draft,
+    setDraft,
   };
 
   const cloudCards = (
@@ -302,14 +321,7 @@ export default function AgentPage({
       {unread && (
         <p role="status" className="text-label text-ink-500 mb-3">
           {t("Some details aren’t available on this board.")}{" "}
-          <button
-            type="button"
-            className="lnk"
-            onClick={() => {
-              setRetry((r) => r + 1);
-              if (!observed) onRetryRoster();
-            }}
-          >
+          <button type="button" className="lnk" onClick={retryDetail}>
             {t("Retry")}
           </button>
         </p>
@@ -523,7 +535,7 @@ export default function AgentPage({
             ))}
           </nav>
           <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${section}`}>
-            <AgentTabBody key={`${alias}:${section}:${detail ? "d" : "n"}`} tab={section} c={ctx} />
+            <AgentTabBody key={`${alias}:${section}`} tab={section} c={ctx} />
           </div>
           {(gear || tab === "settings") && (
             <SettingsDrawer
