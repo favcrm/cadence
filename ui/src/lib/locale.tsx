@@ -1840,5 +1840,5 @@ Object.assign(zhTW, {
   "A person has had control of this session. The assistant will only read the current page, not move to others.": "此工作階段曾有人操控，助理只會閱讀目前的頁面，不會前往其他頁面。",
   "Anything signed in to this session is lost.": "在此工作階段登入的內容將會失去。",
   "Last page the assistant read": "助理最後閱讀的頁面",
-  "Written by the assistant from what it read. It can be wrong or shaped by the page. The address shown is the last page the assistant read: check the address in the live view itself before you type anything.": "由助理根據所讀內容撰寫，可能有誤，亦可能受頁面影響。所示位址只是助理最後閱讀的頁面：輸入任何內容前，請先在即時檢視本身核對位址。",
+  "Written by the assistant from what it read. It can be wrong or shaped by the page. The address shown is the last page the assistant read, not necessarily the page in the live view: check where you are before you type anything.": "由助理根據所讀內容撰寫，可能有誤，亦可能受頁面影響。所示位址只是助理最後閱讀的頁面，未必是即時檢視中的頁面：輸入任何內容前，請先確認自己所在的位置。",
 });

@@ -255,6 +255,10 @@
 .bz-viewer-bar b { color: var(--color-ink-300); font-weight: 500; }
 .bz-viewer iframe { flex: 1 1 14rem; min-height: 14rem; width: 100%; border: 0; background: var(--color-ink-100); }
 
+/* The card's host: its own line, wrapped, and clipped from the START (the last
+   lines stay visible), so the registrable end is always readable. */
+.bz-card-host { display: flex; flex-direction: column-reverse; max-height: 2.9em; overflow: hidden; white-space: normal; overflow-wrap: anywhere; color: var(--color-ink-200); }
+.bz-says[data-compact] .bz-says-addr code { max-height: 3.4rem; }
 .bz-card-wrap { padding: 4px 0; }
 .bz-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; width: 100%; max-width: min(100%, 26rem); padding: 9px 10px; text-align: left; }
 .bz-card:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }

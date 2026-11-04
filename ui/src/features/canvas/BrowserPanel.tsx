@@ -8,6 +8,7 @@ import {
   cancelStop,
   confirmStop,
   openBrowser,
+  browserSnapshot,
   refreshBrowser,
   requestStop,
   tabVisible,
@@ -93,12 +94,6 @@ function displayAddress(address: string): string {
   return p ? `${p.scheme}${p.host}${p.rest}` : address;
 }
 
-/** A host short enough for a one-line card, keeping its END: the registrable
- *  domain is the part that matters. The full host is the card's title. */
-function tailHost(host: string, max = 34): string {
-  return host.length <= max ? host : `…${host.slice(host.length - (max - 1))}`;
-}
-
 function AddressRow({ b }: { b: BrowserTabState }) {
   const t = useTranslate();
   const live = b.session && (b.session.state === "active" || b.session.state === "handoff");
@@ -118,7 +113,10 @@ function AddressRow({ b }: { b: BrowserTabState }) {
           <span>{empty}</span>
         )}
       </div>
-      {live && b.session?.signedIn ? (
+      {/* Only once a takeover is over: the server marks a session as hand-used
+          when the takeover is REQUESTED, so during a first handoff this would
+          be untrue. */}
+      {b.session?.state === "active" && b.session.signedIn ? (
         <span className="bz-signed" title={t("A person has had control of this session. The assistant only reads the current page.")}>
           {t("You had control")}
           <span className="sr-only">. {t("A person has had control of this session. The assistant only reads the current page.")}</span>
@@ -137,7 +135,7 @@ function Says({ b, compact }: { b: BrowserTabState; compact: boolean }) {
   const long = text.length > LONG_INSTRUCTIONS;
   const parts = b.session?.url ? addressParts(b.session.url) : null;
   return (
-    <section className="bz-says" aria-labelledby="bz-says-h">
+    <section className="bz-says" aria-labelledby="bz-says-h" data-compact={compact || undefined}>
       <div className="bz-says-h" id="bz-says-h">{t("Your assistant is asking you to take over")}</div>
       <p className="bz-says-t" id="bz-says-t" data-clamp={long && clamp ? (compact ? "compact" : "full") : undefined}>{text}</p>
       {long ? (
@@ -145,8 +143,8 @@ function Says({ b, compact }: { b: BrowserTabState; compact: boolean }) {
           {clamp ? t("Show all") : t("Show less")}
         </button>
       ) : null}
-      <p className="bz-says-f">{t("Written by the assistant from what it read. It can be wrong or shaped by the page. The address shown is the last page the assistant read: check the address in the live view itself before you type anything.")}</p>
-      {!compact && parts ? (
+      <p className="bz-says-f">{t("Written by the assistant from what it read. It can be wrong or shaped by the page. The address shown is the last page the assistant read, not necessarily the page in the live view: check where you are before you type anything.")}</p>
+      {parts ? (
         <p className="bz-says-addr">
           <small>{t("Last page the assistant read")}</small>
           <code>
@@ -338,7 +336,15 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
         return;
       }
       setViewer({ phase: "loading", url: r.url, n: ++frames.current });
-      focusSoon("[data-bz-frame]");
+      // Into the frame only if the person is still where they clicked (the
+      // button, or nowhere) and nothing else has been opened since: a stop
+      // confirm or the chat draft keeps the keystrokes.
+      requestAnimationFrame(() => {
+        const at = document.activeElement;
+        if (at !== document.body && at?.getAttribute("data-bz-act") !== "view") return;
+        if (browserSnapshot().stop !== "idle") return;
+        root.current?.querySelector<HTMLElement>("[data-bz-frame]")?.focus();
+      });
     } catch {
       if (mine !== attempt.current) return;
       setFetching(false);
@@ -375,7 +381,6 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
     <button key="stop" type="button" className="btn btn-danger" data-bz-act="stop" onClick={b.stop === "failed" ? stop : ask}>{label}</button>
   );
 
-  const frameHost = addressParts(b.session?.url ?? "")?.host ?? "";
   const sessionBody = (): React.ReactNode => {
     if (phase === "none") {
       return <EmptyState title={t("No browser session")}>{t("Ask your assistant to look something up on the web. A session it opens appears here and keeps running if you close this panel.")}</EmptyState>;
@@ -428,7 +433,6 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
     return (
       <div className="bz-viewer" data-phase={viewer.phase} inert={stopping || undefined}>
         <div className="bz-viewer-bar">
-          <span>{frameHost}</span>
           <b>{stopping ? t("Stopping…") : viewer.phase === "open" ? t("Live view") : t("Connecting…")}</b>
         </div>
         <iframe
@@ -589,20 +593,22 @@ export function BrowserCard() {
   const st = browserStatus(b, t);
   const shown = ((canvas.open && canvas.tabs.length > 0) || b.open) && b.focused && tabVisible(b);
   // Only the real host, never the raw address (a look-alike can hide behind
-  // userinfo), and the END of a long one.
-  const host = b.session?.url ? (addressParts(b.session.url)?.host ?? "") : "";
+  // userinfo), on a line of its own and never preceded by words that could push
+  // its end out of the box: when it is too long, the START is what is clipped.
+  const host = (phase === "active" || phase === "handoff") && b.session?.url ? (addressParts(b.session.url)?.host ?? "") : "";
   const sub =
     b.loadError ? t("Can't load the browser state")
-    : phase === "handoff" ? `${t("Waiting for you")}${host ? ` · ${tailHost(host)}` : ""}`
+    : phase === "handoff" ? t("Waiting for you")
     : phase === "ended" ? t("Session ended")
-    : (host ? tailHost(host) : st.text);
+    : st.text;
   return (
     <div className="bz-card-wrap">
     <button type="button" className="artcard bz-card" data-kind="session" data-open={shown || undefined} aria-label={`${t("Open")} ${t("Browser")}`} onClick={openBrowser}>
       <span className="arttype"><GlobeIcon size={16} /></span>
       <span className="arttext">
         <b>{t("Browser")}</b>
-        <span className="artmeta" title={host || undefined}>{sub}</span>
+        <span className="artmeta">{sub}</span>
+        {host ? <span className="artmeta bz-card-host" title={host}><span>{host}</span></span> : null}
       </span>
       {shown ? <span className="artbadge">{t("in canvas")}</span> : <span className="artopen">{t("Open")}</span>}
     </button>

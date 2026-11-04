@@ -600,11 +600,11 @@ for (const mode of ["404", "unavailable"] as const) {
   await settle();
   await click(tab(m)!);
   assert(el(m.host, "#bz-says-t")!.getAttribute("data-clamp") === "full", "a long instruction is clamped, with Show all");
-  assert(text(panel(m)).includes("check the address in the live view itself"), "and the caution is outside the clamp");
+  assert(text(panel(m)).includes("check where you are"), "and the caution is outside the clamp");
   assert(text(panel(m)).includes("Last page the assistant read") && !text(panel(m)).includes("You will be on this page"), "the address is the last page the assistant read, not a promise of where the person will be");
   await click(btn(m, "view")!);
   assert(el(m.host, "#bz-says-t")!.getAttribute("data-clamp") === "compact", "in the live view the clamp is compact");
-  assert(text(panel(m)).includes("check the address in the live view itself"), "and the caution is still shown there");
+  assert(text(panel(m)).includes("check where you are"), "and the caution is still shown there");
   await m.unmount();
 }
 {
@@ -884,9 +884,10 @@ for (const mode of ["404", "unavailable"] as const) {
   assert(text(card).includes("evil.example.test"), "it shows the host the page is really on");
   await React.act(async () => { board.body = { state: "handoff", signedIn: false, url: `https://${"a".repeat(60)}.example.test/x`, instructions: "Sign in." }; await store.refreshBrowser(); });
   await settle();
-  const long = text(el(m.host, ".bz-card .artmeta"));
-  assert(long.includes("…") && long.endsWith("example.test"), `a long host keeps its end: ${long}`);
-  equal(el(m.host, ".bz-card .artmeta")!.getAttribute("title"), `${"a".repeat(60)}.example.test`, "and the full host is its title");
+  const hostEl = el(m.host, ".bz-card .bz-card-host")!;
+  equal(text(hostEl), `${"a".repeat(60)}.example.test`, "the card carries the whole host, on a line of its own");
+  equal(hostEl.getAttribute("title"), `${"a".repeat(60)}.example.test`, "with the full host as its title");
+  assert(!text(el(m.host, ".bz-card .artmeta")!).includes("example"), "and the words before it never share its line (a real browser checks the width)");
   await openTab(m);
   assert(!text(panel(m)).includes("google"), "nor does the panel");
   await m.unmount();
@@ -1220,10 +1221,72 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
   const m = await start({ state: "handoff", signedIn: true, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
   await openTab(m);
   assert(!/signed in/i.test(text(el(m.host, ".bz-addr"))), "a handoff does not claim the person signed in");
-  assert(text(el(m.host, ".bz-addr")).includes("You had control"), "it says a person had control");
+  assert(!text(el(m.host, ".bz-addr")).includes("You had control"), "nor that a person had control: the server sets that when the takeover is requested");
   await click(btn(m, "stop")!);
   const words = text(el(m.host, "[data-bz-dock]"));
   assert(!/signed in here/.test(words) && words.includes("Anything signed in to this session is lost"), `the confirm says what is true: ${words}`);
+  await click(btn(m, "keep")!);
+  board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  await advance(2000);
+  assert(text(el(m.host, ".bz-addr")).includes("You had control"), "after the handback, with the person's control recorded, it says so");
+  await m.unmount();
+}
+
+// ===== the viewer bar names no site; the last-read address and the caution stay with the frame =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://stale-page.example.test/orders", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  const bar = text(el(m.host, ".bz-viewer-bar"));
+  assert(!bar.includes("stale-page"), `the bar does not name the (possibly stale) host: ${bar}`);
+  assert(text(panel(m)).includes("Last page the assistant read") && text(panel(m)).includes("check where you are"), "the label and the caution are still on screen while the frame is open");
+  assert(!/live view itself/.test(text(panel(m))), "and the caution does not assume the viewer has its own address bar");
+  await m.unmount();
+}
+
+// ===== a late URL with the stop confirm open takes no focus =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  board.viewHold = true;
+  await React.act(async () => { btn(m, "view")!.focus(); });
+  await click(btn(m, "view")!);
+  await click(btn(m, "stop")!);
+  equal(store.browserSnapshot().stop, "confirm", "the stop confirm is up");
+  await raf();
+  // Even with focus nowhere (the page), an open confirm keeps it from the frame.
+  await React.act(async () => { (document.activeElement as HTMLElement).blur(); });
+  assert(document.activeElement === document.body, "focus is on the page");
+  await React.act(async () => { board.releaseView!(); });
+  await settle();
+  await raf();
+  assert(el(m.host, "iframe[data-bz-frame]"), "the live view opened behind it");
+  assert(document.activeElement !== el(m.host, "iframe[data-bz-frame]"), "focus did not jump into the provider's page");
+  await m.unmount();
+}
+
+// ===== closing the last artifact with no session hands focus to the composer =====
+{
+  const m = await start({ state: "none" });
+  const composer = document.createElement("textarea");
+  composer.id = "app-shell-chat-box";
+  document.body.append(composer);
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
+  await settle();
+  const closeBtn = el(m.host, ".cv-tab-close")!;
+  await React.act(async () => { closeBtn.focus(); });
+  await click(closeBtn);
+  await raf();
+  assert(!drawer(m), "the drawer closed");
+  assert(document.activeElement === composer, "and focus went to the composer, not the page");
+  // Esc and the header close, from inside the drawer, do the same.
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
+  await settle();
+  await React.act(async () => { (el(m.host, '[aria-label="Close canvas"]') as HTMLElement).focus(); });
+  await click(el(m.host, '[aria-label="Close canvas"]')!);
+  await raf();
+  assert(document.activeElement === composer, "the header close too");
+  composer.remove();
   await m.unmount();
 }
 

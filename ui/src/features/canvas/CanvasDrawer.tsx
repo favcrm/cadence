@@ -297,14 +297,29 @@ export default function CanvasDrawer() {
   const open = conversation !== null && ((canvas.open && canvas.tabs.length > 0) || (browser.open && hasBrowser));
   const tab = canvas.tabs.find((x) => x.id === canvas.active) ?? canvas.tabs[0] ?? null;
   const showBrowser = hasBrowser && (browser.focused || tab === null);
+  const rootRef = useRef<HTMLElement | null>(null);
+  // Where focus goes when a control inside the drawer goes away (a closed or
+  // hidden tab, or the drawer itself): the next tab, else the drawer; if the
+  // drawer is gone, the composer. Only if focus was in the drawer or nowhere:
+  // a person who is somewhere else keeps it.
+  const handFocusOn = useCallback(() => {
+    const at = document.activeElement;
+    const mine = at === document.body || !!rootRef.current?.contains(at);
+    requestAnimationFrame(() => {
+      if (!mine) return;
+      const root = rootRef.current;
+      if (!root) return focusComposer();
+      (root.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]') ?? root).focus();
+    });
+  }, []);
   const closeAll = useCallback(() => {
+    handFocusOn();
     closeDrawer();
     closeBrowserDrawer();
-  }, []);
+  }, [handFocusOn]);
   const want = dragged !== null ? clampWidth(dragged, viewport) : defaultWidthFor(tab?.kind ?? "md", viewport);
   const [layout, setLayout] = useState<DrawerLayout>({ mode: "push", width: want });
   const pushed = useRef(0);
-  const rootRef = useRef<HTMLElement | null>(null);
 
   // The layout is measured from the page (the chat pane's edge), so it is
   // recomputed after every render that could move it.
@@ -422,12 +437,8 @@ export default function CanvasDrawer() {
                   {x.title}
                 </button>
                 <button type="button" className="cv-tab-close" aria-label={`${t("Close")} ${x.title}`} onClick={() => {
+                    handFocusOn();
                     closeTab(x.id);
-                    // The tab that held focus is gone: the next one, or the drawer, takes it.
-                    requestAnimationFrame(() => {
-                      const next = rootRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
-                      (next ?? rootRef.current)?.focus();
-                    });
                   }}>
                   <IconClose size={10} />
                 </button>
@@ -445,13 +456,8 @@ export default function CanvasDrawer() {
                 aria-label={t("Hide Browser tab. The session keeps running.")}
                 title={t("Hide Browser tab. The session keeps running.")}
                 onClick={() => {
+                  handFocusOn();
                   hideBrowser();
-                  // The tab that held focus is gone: the next one takes it.
-                  // With no strip left the drawer itself takes it.
-                  requestAnimationFrame(() => {
-                    const next = rootRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
-                    (next ?? rootRef.current)?.focus();
-                  });
                 }}
               >
                 <IconClose size={10} />
