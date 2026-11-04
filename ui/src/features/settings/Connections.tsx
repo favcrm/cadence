@@ -33,7 +33,7 @@ import {
   verificationSupport,
   type VerificationOutcome,
 } from "./connectionsView";
-import { PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
+import { connectErrorText, PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
 import { errorCopy, openTrustedEntry } from "../connections/credentialRequestView";
 import { useProtectedEntry } from "../connections/useProtectedEntry";
 import { RecentCredentialRequestList } from "../connections/CredentialRequestCard";
@@ -1220,7 +1220,7 @@ export function ConnectionDetail({
         <p className="text-micro text-ink-500 mt-2">{t("Updating credentials and disconnecting are the operator's on an editable board.")}</p>
       )}
       {managed && rotating && (hostedBoard || !entryRequired) && (
-        <RotateForm row={row} onDone={onChanged} onClose={() => setRotating(false)} />
+        <RotateForm row={row} hostedBoard={hostedBoard} onDone={onChanged} onClose={() => setRotating(false)} />
       )}
       {managed && revoking && (
         <RevokeConfirm row={row} onDone={onRevoked} onClose={() => setRevoking(false)} />
@@ -1237,7 +1237,10 @@ export function RotateForm({
   row,
   onDone,
   onClose,
+  hostedBoard = false,
 }: {
+  /** A hosted board replaces the settings whole, so a blank field must send the live value. */
+  hostedBoard?: boolean;
   row: Connection;
   onDone: () => void;
   onClose: () => void;
@@ -1298,7 +1301,18 @@ export function RotateForm({
       const bad = smtpPortTlsError(effHost, String(effPort), effTls);
       if (bad) { setError(bad); return; }
     }
-    const body = isSmtp
+    const senderName = smtp.sender_name.trim() || row.smtp?.sender_name?.trim() || "";
+    const body = isSmtp && hostedBoard
+      ? {
+          secret: token.trim(),
+          host: effHost,
+          port: effPort,
+          tls_mode: effTls,
+          username: smtp.username.trim() || (row.smtp?.username ?? ""),
+          sender: smtp.sender.trim() || (row.smtp?.sender ?? ""),
+          ...(senderName ? { sender_name: senderName } : {}),
+        }
+      : isSmtp
       ? {
           ...base,
           secret: token.trim(),
@@ -1324,7 +1338,7 @@ export function RotateForm({
       })
       // CAD-1013: rotate also carries the fresh SMTP password — same
       // typed-code safe reason, never the raw downstream message.
-      .catch((e: ApiError) => setError(enrollErrorMessage(e)))
+      .catch((e: ApiError) => setError(hostedBoard ? connectErrorText(e) : enrollErrorMessage(e)))
       .finally(() => {
         // The credential crossed this one request into daemon custody.
         // It must not survive in the form, whatever the outcome.

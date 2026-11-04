@@ -600,6 +600,50 @@ async function main() {
     assert(!text6().includes("secure entry"), "no secure entry on a hosted board");
   });
 
+  // A hosted board replaces the settings whole and requires every field, so a
+  // password-only update sends the live values, including the sender name.
+  {
+    const hostR = document.createElement("div");
+    document.body.appendChild(hostR);
+    const rootR = createRoot(hostR);
+    const liveRow = { ...smtpRow, smtp: { ...smtpRow.smtp, sender_name: "Example Owner" } };
+    act(() => {
+      rootR.render(React.createElement(RotateForm, {
+        row: liveRow, hostedBoard: true, onDone: () => {}, onClose: () => {},
+      }));
+    });
+    const password = hostR.querySelector('input[type="password"]') as HTMLInputElement;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!.call(password, "hosted-secret");
+      password.dispatchEvent(new window.Event("input", { bubbles: true }) as unknown as Event);
+    });
+    const hostedPosts: any[] = [];
+    const earlierFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (init?.method === "POST" && String(input).includes("/rotate")) {
+        hostedPosts.push(JSON.parse(String(init.body)));
+        return new Response(JSON.stringify({ connection: { id: "c-1", revision: 2 } }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      return earlierFetch(input as RequestInfo | URL, init);
+    }) as typeof fetch;
+    await act(async () => {
+      hostR.querySelector("form")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }) as unknown as Event);
+    });
+    await settle(() => assert(hostedPosts.length === 1, "the hosted update posted"), 30000);
+    globalThis.fetch = earlierFetch;
+    const sent = hostedPosts[0];
+    equal(sent.secret, "hosted-secret", "hosted update sends the new password");
+    equal(sent.host, liveRow.smtp.host, "hosted update keeps the live host");
+    equal(sent.port, liveRow.smtp.port, "hosted update keeps the live port");
+    equal(sent.tls_mode, liveRow.smtp.tls_mode, "hosted update keeps the live security");
+    equal(sent.username, liveRow.smtp.username, "hosted update keeps the live username");
+    equal(sent.sender, liveRow.smtp.sender, "hosted update keeps the live sender");
+    equal(sent.sender_name, "Example Owner", "hosted update keeps the sender name");
+    await act(async () => rootR.unmount());
+  }
+
   // The built-in Local outbox detail has NO edit/disconnect actions.
   act(() => {
     root6.render(React.createElement(ConnectionsPage, {

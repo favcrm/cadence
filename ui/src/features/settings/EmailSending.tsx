@@ -341,6 +341,7 @@ function SenderCard({
   const [pending, setPending] = useState(false);
   const [note, setNote] = useState<SendNote | null>(null);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -355,7 +356,7 @@ function SenderCard({
       },
     );
     return () => controller.abort();
-  }, [target.scope.installId, target.scope.contextId]);
+  }, [target.scope.installId, target.scope.contextId, attempt]);
 
   const { usable, unusable } = senderChoices(rows);
   const choice = usable.find((r) => r.id === picked) ?? usable.find((r) => binding && r.id === binding.connectionId) ?? usable[0];
@@ -398,7 +399,10 @@ function SenderCard({
       )}
       {error && (
         <p className="text-label text-fail break-words" role="alert">
-          {error}
+          {error}{" "}
+          {binding === undefined && (
+            <Button size="sm" onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</Button>
+          )}
         </p>
       )}
       {note && (
@@ -526,9 +530,11 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
     setInput(receipt.stored ? receipt.unsubscribeOrigin ?? "" : "");
     return receipt;
   };
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
+    setError(null);
     sendClient.sendOriginShow().then(apply, (e: unknown) => setError(friendlySendError(e)));
-  }, []);
+  }, [attempt]);
 
   const save = (value: string | null) => {
     setPending(true);
@@ -567,7 +573,10 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
       )}
       {error && (
         <p className="text-label text-fail break-words" role="alert">
-          {error}
+          {error}{" "}
+          {origin === undefined && (
+            <Button size="sm" onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</Button>
+          )}
         </p>
       )}
       {note && (

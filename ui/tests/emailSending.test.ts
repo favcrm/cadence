@@ -25,6 +25,7 @@ interface World {
   origin: { unsubscribe_origin: string | null; stored: boolean };
   posts: { path: string; body: any }[];
   failConnectionsOnce?: boolean;
+  failShowOnce?: boolean;
 }
 
 const smtpRow = (id: string, over: any = {}) => ({
@@ -86,6 +87,10 @@ async function mount(world: World, viewer = { operator: true, readOnly: false },
         }
         return json({ connections: world.connections });
       case "POST /api/crm-smtp/show": {
+        if (world.failShowOnce) {
+          world.failShowOnce = false;
+          return json({ error: "the sender is unavailable" }, 503);
+        }
         const found = world.bindings && Object.hasOwn(world.bindings, body.context_id)
           ? world.bindings[body.context_id]
           : world.binding;
@@ -326,6 +331,19 @@ async function main() {
     await m.settle(() => assert(m.button("Retry"), "a failed read offers Retry"));
     await m.click(m.button("Retry"));
     await m.settle(() => assert(m.rowFor("CRM · Acme"), "Retry loads the page"));
+    await m.unmount();
+  }
+  // A failed sender read inside the drawer offers Retry too.
+  {
+    const a = smtpRow("conn-a");
+    const world = fresh({ connections: [a], binding: bindingFor(a) });
+    const m = await mount(world);
+    await m.settle(() => assert(m.rowFor("CRM · Acme")?.textContent?.includes("conn-a@example.com"), "row read"));
+    world.failShowOnce = true;
+    await m.open("CRM · Acme");
+    await m.settle(() => assert(m.button("Retry"), "the drawer offers Retry"));
+    await m.click(m.button("Retry"));
+    await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "Retry recovers"));
     await m.unmount();
   }
   // A hosted board's links always use its own address: there is no setting to show.
