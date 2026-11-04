@@ -505,23 +505,29 @@ fn explicit_mutation_uncertainty(body: Option<&Value>) -> Option<&str> {
     }
 }
 
-/// Only the documented 503 waking response proves a worker has not forwarded
-/// the call. Other state strings and statuses do not establish that boundary.
+/// Only the documented 503 waking response authorizes a wake retry.
 fn worker_waking(status: u16, body: Option<&Value>) -> bool {
     status == 503
         && body.and_then(|b| b["state"].as_str()) == Some("waking")
         && explicit_mutation_uncertainty(body).is_none()
 }
 
+/// The legacy CLI relay also reports a failed wake before forwarding.
+/// This state is not proof for separate upload endpoints.
+fn cli_wake_failed(status: u16, body: Option<&Value>) -> bool {
+    status == 503 && body.and_then(|b| b["state"].as_str()) == Some("wake_failed")
+}
+
 /// A 5xx after a possible commit is unknown unless the response proves it
-/// preceded the write. The native CLI tracker's refusal is such proof only
-/// for the CLI route, not for the separate wiki upload endpoint.
+/// preceded the write. CLI wake failure and the native tracker's refusal are
+/// such proof only for the CLI route, not for separate upload endpoints.
 fn post_forward_failure(status: u16, body: Option<&Value>, cli_route: bool) -> bool {
     status >= 500
         && status != 501
         && !worker_waking(status, body)
         && !board_gate_refused(body)
-        && !(cli_route && tracker_unavailable_before_verb(status, body))
+        && !(cli_route
+            && (cli_wake_failed(status, body) || tracker_unavailable_before_verb(status, body)))
         && explicit_mutation_uncertainty(body).is_none()
 }
 

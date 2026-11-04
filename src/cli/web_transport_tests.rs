@@ -241,10 +241,14 @@ fn prepare_handler(missing: Vec<&'static str>) -> Handler {
                     "expiresAt": "2030-01-01T00:00:00.000Z"}}),
                 )
             }
-            ("PUT", p) if p.starts_with("/v1/web-sites/uploads/upl_22222222/files/") => (
-                200,
-                json!({"ok": true, "data": {"path": "x", "verified": true}}),
-            ),
+            ("PUT", p) if p.starts_with("/v1/web-sites/uploads/upl_22222222/files/") => {
+                let encoded = &p["/v1/web-sites/uploads/upl_22222222/files/".len()..];
+                let path = crate::web_publish::decode_artifact_segment(encoded).unwrap();
+                (
+                    200,
+                    json!({"ok": true, "data": {"path": path, "verified": true}}),
+                )
+            }
             ("POST", "/v1/web-sites/uploads/upl_22222222/finalize") => (
                 200,
                 json!({"ok": true, "data": {

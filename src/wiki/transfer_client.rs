@@ -497,11 +497,19 @@ fn import_local(
         }
     }
 
-    let finished = channel.transfer(
-        &root,
-        json!({"op": "finish", "job_id": job_id, "root": root}),
-        true,
-    )?;
+    let finished = channel
+        .transfer(
+            &root,
+            json!({"op": "finish", "job_id": job_id, "root": root}),
+            true,
+        )
+        .map_err(|error| {
+            let message = format!(
+                "wiki cp job {job_id} finish was not confirmed: {error} — reconcile the \
+                 same job with `--resume {job_id}` before repeating anything"
+            );
+            write_outcome(error, message)
+        })?;
     if identity(&finished, "job_id") != Some(job_id)
         || identity(&finished, "digest") != Some(expected_digest.as_str())
         || identity(&finished, "root") != Some(root.as_str())
