@@ -30,6 +30,7 @@ import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
 import MasterPermissions from "./features/settings/MasterPermissions";
 import CanvasDrawer from "./features/canvas/CanvasDrawer";
+import { onBrowserAlert } from "./features/canvas/browserStore";
 import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
@@ -652,6 +653,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 4200);
   }, []);
+  // CAD-2103: the Browser tab's failures reach the person here.
+  useEffect(() => onBrowserAlert((text) => say("err", t(text))), [say, t]);
 
   const ackMonitor = useCallback(
     (monitor: string, seq: number) => {

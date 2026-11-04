@@ -24,6 +24,8 @@ import {
   type TurnState,
 } from "./master";
 import { useCanvasFeed } from "../canvas/feed";
+import { BrowserCard } from "../canvas/BrowserPanel";
+import { useBrowserFeed } from "../canvas/browserStore";
 import { ImageConversation } from "../canvas/imageConversation";
 import Composer from "./Composer";
 import {
@@ -697,6 +699,7 @@ const ThreadList = memo(function ThreadList({
           ) : null
         }
       />
+      <BrowserCard />
     </>
   );
 });
@@ -1001,6 +1004,10 @@ function MasterHome({
     // The turn must be this conversation's own: an app-origin turn is not.
     running: turn.kind === "working" && turnOrigin === null ? turn.message : null,
   });
+  // CAD-2103: the browser is a hosted board's. A native board never feeds it,
+  // so it never reads /api/browser. The operator's Home is the same
+  // conversation the canvas is fed, so the card and tab follow it.
+  useBrowserFeed(hosted === true ? (homeConversation ?? null) : null, activeTurn && turnOrigin === null, lastSeq(thread.data) ?? null);
   // The running turn's name-row activity anchors to this turn's own
   // message id — the item holding its newest stored entry (a pending
   // row has no stored entry yet, so its row is the anchor while it
