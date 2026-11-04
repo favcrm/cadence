@@ -88,6 +88,10 @@ const board = {
   viewUrl: VIEWER,
   stopHold: false,
   release: null as null | (() => void),
+  getHold: false,
+  releaseGet: null as null | (() => void),
+  viewHold: false,
+  releaseView: null as null | (() => void),
   conversation: "c1",
 };
 globalThis.fetch = (async (input: unknown, init?: { method?: string }) => {
@@ -96,6 +100,13 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string }) => {
   if (url.pathname === "/api/browser" && method === "GET") {
     board.gets++;
     equal(url.searchParams.get("conversation"), board.conversation, "the read names the conversation in view");
+    if (board.getHold) {
+      // The answer is what the board said when it was asked, however late it lands.
+      const snap = JSON.stringify(board.body);
+      board.getHold = false;
+      await new Promise<void>((resolve) => { board.releaseGet = resolve; });
+      return new Response(snap, { status: 200 });
+    }
     if (board.mode === "404") return new Response("{}", { status: 404 });
     if (board.mode === "network") throw new TypeError("network down");
     if (board.mode === "malformed") return new Response(JSON.stringify({ state: "weird" }), { status: 200 });
@@ -104,6 +115,7 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string }) => {
   }
   if (url.pathname === "/api/browser/view" && method === "POST") {
     board.views++;
+    if (board.viewHold) await new Promise<void>((resolve) => { board.releaseView = resolve; });
     if (board.viewStatus === 409) return new Response(JSON.stringify({ error: "not_in_handoff" }), { status: 409 });
     return new Response(JSON.stringify({ url: board.viewUrl }), { status: board.viewStatus });
   }
@@ -137,7 +149,7 @@ async function mount() {
 }
 function reset(over: Partial<typeof board> = {}) {
   timers.clear();
-  Object.assign(board, { mode: "ok", body: { state: "none", signedIn: false, url: null, instructions: null }, gets: 0, views: 0, stops: 0, stopStatus: 200, stopHold: false, release: null, viewStatus: 200, viewUrl: VIEWER, conversation: "c1" }, over);
+  Object.assign(board, { mode: "ok", body: { state: "none", signedIn: false, url: null, instructions: null }, gets: 0, views: 0, stops: 0, stopStatus: 200, stopHold: false, release: null, getHold: false, releaseGet: null, viewHold: false, releaseView: null, viewStatus: 200, viewUrl: VIEWER, conversation: "c1" }, over);
   store.resetBrowser();
   canvasStore.resetCanvas("c1", "home", "home");
   (win as any).innerWidth = 1600;
@@ -239,7 +251,9 @@ for (const [state, words] of [["none", "No browser session"], ["ended", "Session
   assert(frame && frame.getAttribute("src") === VIEWER, "the live view frames exactly the URL the board returned");
   await React.act(async () => { frame.dispatchEvent(new win.Event("load")); });
   await settle();
-  assert(text(panel(m)).includes("You are in control"), "loaded: you are in control");
+  assert(!text(panel(m)).includes("in control"), "a loaded cross-origin frame proves nothing about control, and the panel does not claim it");
+  assert(text(el(m.host, ".bz-viewer-bar")).includes("Live view"), "it says Live view");
+  assert(btn(m, "view") && text(btn(m, "view")).includes("Open live view again"), "and Open live view again stays available while a frame shows");
   board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
   await advance(2000);
   assert(!el(m.host, "iframe"), "when the board sees the takeover over, the frame is torn down");
@@ -399,6 +413,200 @@ for (const bad of ["javascript:alert(1)", "http://live.test/x", "data:text/html,
   equal(host.tagName, "B", "the host is bold");
   equal(host.textContent, "xn--80ak6aa92e.test", "and is the real host, punycode as it is");
   assert(!text(panel(m)).includes("Warning") && !el(m.host, ".bz-warn"), "no warning chip: that is the board's judgement, not the UI's");
+  await m.unmount();
+}
+
+
+// ===== a frame the board's CSP refuses is an error now, and the retry is fresh =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  assert(el(m.host, "iframe[data-bz-frame]"), "the frame is up, still loading");
+  await React.act(async () => {
+    const ev = new win.Event("securitypolicyviolation", { bubbles: true }) as any;
+    Object.defineProperty(ev, "effectiveDirective", { value: "frame-src" });
+    document.dispatchEvent(ev);
+  });
+  await settle();
+  assert(!el(m.host, "iframe"), "a frame-src violation tears the frame down without waiting for a load");
+  assert(text(panel(m)).includes("Couldn't open the live view"), "and says so");
+  assert(btn(m, "view") && text(btn(m, "view")).includes("Open live view again"), "with a retry");
+  await click(btn(m, "view")!);
+  equal(board.views, 2, "the retry fetches a fresh URL; the refused one is not reused");
+  await m.unmount();
+}
+
+// ===== a failed read during a takeover keeps the frame, and nothing remounts it =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  const frame = el(m.host, "iframe[data-bz-frame]")!;
+  board.mode = "network";
+  await advance(2000);
+  assert(el(m.host, "iframe[data-bz-frame]") === frame, "one failed poll leaves the very same frame in place");
+  assert(text(panel(m)).includes("Couldn't load the browser state"), "and shows the read error as a note");
+  assert(btn(m, "stop"), "Stop is still there");
+  board.mode = "ok";
+  await advance(2000);
+  assert(el(m.host, "iframe[data-bz-frame]") === frame, "recovery does not remount it either");
+  equal(board.views, 1, "no second viewer URL was fetched without a click");
+  assert(!text(panel(m)).includes("Couldn't load the browser state"), "the note clears");
+  await m.unmount();
+}
+
+// ===== once a session has been live, unavailable and 404 are failed reads =====
+for (const mode of ["404", "unavailable"] as const) {
+  const m = await start({ state: "active", signedIn: true, url: "https://portal.example.test/orders" });
+  await openTab(m);
+  board.mode = mode;
+  await advance(3000);
+  assert(store.tabVisible(store.browserSnapshot()), `${mode} after a live session: the tab stays`);
+  assert(btn(m, "stop"), `${mode}: so does Stop`);
+  assert(text(panel(m)).includes("Couldn't load the browser state"), `${mode}: with a retry note`);
+  const reads = board.gets;
+  await advance(6000);
+  assert(board.gets > reads, `${mode}: and polling carries on`);
+  board.mode = "ok";
+  await advance(3000);
+  assert(!text(panel(m)).includes("Couldn't load"), `${mode}: recovers`);
+  await m.unmount();
+}
+
+// ===== a 503 on Stop during a takeover keeps the normal actions, and clears with the phase =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  board.stopStatus = 503;
+  await click(btn(m, "stop")!);
+  await click(btn(m, "go")!);
+  const dock = el(m.host, "[data-bz-dock]")!;
+  assert(text(dock).includes("Couldn't stop the session"), "the failure is shown");
+  assert(btn(m, "view"), "above Open live view, which is still offered");
+  assert(el(m.host, "iframe[data-bz-frame]"), "and the live view was not destroyed by the failed stop");
+  assert(text(btn(m, "stop")).includes("Try stopping again"), "with a way to try again");
+  board.body = { state: "active", signedIn: false, url: "https://portal.example.test/orders", instructions: null };
+  await advance(2000);
+  assert(!text(el(m.host, "[data-bz-dock]")).includes("Couldn't stop"), "a phase change clears the old failure");
+  await m.unmount();
+}
+
+// ===== a read that was already in flight cannot undo a confirmed stop =====
+{
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await openTab(m);
+  board.getHold = true;
+  await advance(3000); // the poll asks; the board answers "active", late
+  board.stopHold = true;
+  await click(btn(m, "stop")!);
+  board.body = { state: "ended", signedIn: false, url: null, instructions: null };
+  await React.act(async () => { board.release!(); });
+  await settle();
+  assert(text(panel(m)).includes("Session ended"), "the stop landed");
+  await React.act(async () => { board.releaseGet!(); });
+  await settle();
+  assert(text(panel(m)).includes("Session ended") && !btn(m, "stop"), "the late 'active' answer does not bring the session or Stop back");
+  await m.unmount();
+}
+// ... nor can an answer for the conversation that was just left.
+{
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  board.getHold = true;
+  await advance(3000);
+  board.conversation = "c2";
+  board.body = { state: "none", signedIn: false, url: null, instructions: null };
+  await React.act(async () => { store.feedBrowser("c2"); });
+  await settle();
+  await React.act(async () => { board.releaseGet!(); });
+  await settle();
+  equal(store.browserSnapshot().session?.state, "none", "the old conversation's late answer is dropped");
+  await m.unmount();
+}
+
+// ===== a view request overtaken by the end of the takeover opens nothing =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  board.viewHold = true;
+  await click(btn(m, "view")!);
+  board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  await advance(2000);
+  // ... and a second takeover begins before the old request answers.
+  board.body = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/again", instructions: "Again." };
+  await advance(3000);
+  equal(store.browserSnapshot().session?.state, "handoff", "the board is asking again");
+  await React.act(async () => { board.releaseView!(); });
+  await settle();
+  assert(!el(m.host, "iframe[data-bz-frame]"), "the URL that arrives after its takeover ended is never framed, even into the next one");
+  await m.unmount();
+}
+
+// ===== hiding the tab does not close the drawer over an artifact =====
+{
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); canvasStore.closeDrawer(); });
+  await settle();
+  await React.act(async () => { store.openBrowser(); });
+  await settle();
+  assert(drawer(m) && !canvasStore.canvasSnapshot().open, "the Browser tab alone opened the drawer");
+  await click(el(m.host, '[aria-label="Hide Browser tab. The session keeps running."]')!);
+  assert(drawer(m), "hiding it leaves the artifact on screen");
+  await m.unmount();
+}
+
+// ===== focus goes to the tab after a stop, and a long instruction keeps its caution =====
+{
+  const long = "Please sign in. ".repeat(40);
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: long });
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
+  await settle();
+  await click(tab(m)!);
+  assert(el(m.host, "#bz-says-t")!.getAttribute("data-clamp") === "full", "a long instruction is clamped, with Show all");
+  assert(text(panel(m)).includes("Check the address before you type anything"), "and the caution is outside the clamp");
+  await click(btn(m, "view")!);
+  assert(el(m.host, "#bz-says-t")!.getAttribute("data-clamp") === "compact", "in the live view the clamp is compact");
+  assert(text(panel(m)).includes("Check the address before you type anything"), "and the caution is still shown there");
+  await m.unmount();
+}
+{
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
+  await settle();
+  await click(tab(m)!);
+  board.stopHold = true;
+  const stopBtn = btn(m, "stop")!;
+  await React.act(async () => { stopBtn.focus(); });
+  await click(stopBtn);
+  await React.act(async () => { board.release!(); });
+  await settle();
+  equal(document.activeElement?.id, "bz-tab", "after a stop the focus is on the tab, not the page");
+  await m.unmount();
+}
+
+// ===== the frame is never the board's own origin =====
+{
+  const real = (globalThis as any).location;
+  Object.defineProperty(globalThis, "location", { value: { origin: "https://board.test" }, configurable: true, writable: true });
+  board.viewUrl = "https://board.test/anything";
+  let refused = false;
+  try { await client.viewBrowser("c1"); } catch { refused = true; }
+  Object.defineProperty(globalThis, "location", { value: real, configurable: true, writable: true });
+  board.viewUrl = VIEWER;
+  assert(refused, "a viewer URL on the board's own origin is refused");
+}
+
+// ===== a confirmed identity change drops the tabs and the session =====
+{
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Private title", bytes: 12 }); });
+  await settle();
+  const { resetPrivateSession, allowPrivateReads } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
+  await React.act(async () => { resetPrivateSession(); allowPrivateReads(); });
+  await settle();
+  equal(canvasStore.canvasSnapshot().tabs.length, 0, "artifact tabs and their titles are gone");
+  equal(store.browserSnapshot().conversation, null, "and the Browser tab's conversation");
   await m.unmount();
 }
 

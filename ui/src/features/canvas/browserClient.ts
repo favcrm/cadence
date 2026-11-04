@@ -81,12 +81,16 @@ export function stopBrowser(conversation: string): Promise<void> {
 
 export type ViewRead = { kind: "url"; url: string } | { kind: "not_in_handoff" };
 
-/** An `https:` URL, or null. A frame must never be pointed at `javascript:`,
- *  `data:` or a plain-http page, whatever the board answered. */
+/** An `https:` URL on another origin, or null. A frame must never be pointed at
+ *  `javascript:`, `data:` or a plain-http page, nor at the board's own origin:
+ *  the frame is allowed scripts and its own origin, which for the board's would
+ *  be the board. Whatever the answer said. */
 function httpsUrl(value: unknown): string | null {
   if (typeof value !== "string") return null;
   try {
-    return new URL(value).protocol === "https:" ? value : null;
+    const url = new URL(value);
+    if (typeof location !== "undefined" && url.origin === location.origin) return null;
+    return url.protocol === "https:" ? value : null;
   } catch {
     return null;
   }

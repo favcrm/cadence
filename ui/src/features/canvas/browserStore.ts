@@ -8,13 +8,16 @@
  *   predates the routes) offers no tab at all; `none` and `ended` keep it;
  * - the tab's x hides it and the session keeps running; closing the drawer
  *   never stops anything; only Stop does;
+ * - once this client has seen a session live, a later `unavailable` or 404 is
+ *   a failed read, not an absent browser: the tab, Stop and polling stay;
  * - poll `GET /api/browser` only while a session is live (`active`,
  *   `handoff`) or being stopped: a takeover ends in the live view's own Done
  *   control, and this is how the board notices;
  * - no viewer URL is ever held here (see browserClient.viewBrowser).
  */
 import { useSyncExternalStore } from "react";
-import { onArtifactFocus } from "./canvasStore";
+import { canvasSnapshot, onArtifactFocus, showDrawer } from "./canvasStore";
+import { onPrivateSessionReset } from "../../lib/privateSession";
 import { readBrowser, stopBrowser, type BrowserSession } from "./browserClient";
 
 export type StopPhase = "idle" | "confirm" | "stopping" | "failed";
@@ -27,6 +30,8 @@ export interface BrowserTabState {
   session: BrowserSession | null;
   /** The last read failed (the session, if any, is unaffected). */
   loadError: boolean;
+  /** A session has been seen live (active or handoff) in this conversation. */
+  everLive: boolean;
   /** The tab's x was used: no tab, session still running. */
   hidden: boolean;
   /** The drawer was opened on the Browser tab (artifact tabs open it too). */
@@ -39,7 +44,7 @@ export interface BrowserTabState {
   handedBack: boolean;
 }
 
-const POLL = { active: 3000, handoff: 2000 };
+const POLL = { active: 3000, handoff: 2000 } as const;
 const listeners = new Set<() => void>();
 let state: BrowserTabState = empty(null);
 /** Bumped on every conversation change and read, so a stale answer is dropped. */
@@ -53,6 +58,7 @@ function empty(conversation: string | null): BrowserTabState {
     availability: "unknown",
     session: null,
     loadError: false,
+    everLive: false,
     hidden: false,
     open: false,
     focused: false,
@@ -97,12 +103,6 @@ export function pollDelay(s: BrowserTabState): number | null {
   return null;
 }
 
-/** Tests only: shorten the poll interval. */
-export function setBrowserPollMs(active: number, handoff: number): void {
-  POLL.active = active;
-  POLL.handoff = handoff;
-}
-
 function schedule(): void {
   const delay = pollDelay(state);
   if (delay === null) {
@@ -121,6 +121,12 @@ function schedule(): void {
 
 function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
   if (read.kind === "unavailable") {
+    // A board that answered with a live session does not lose its browser: this
+    // is a failed read, so the tab, Stop and polling stay.
+    if (state.everLive) {
+      if (!state.loadError) set({ ...state, loadError: true });
+      return;
+    }
     set({ ...state, availability: "unavailable", session: null, loadError: false, open: false, focused: false, stop: "idle" });
     return;
   }
@@ -135,14 +141,17 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
     availability: "available",
     session: next,
     loadError: false,
+    everLive: state.everLive || next.state === "active" || next.state === "handoff",
     hidden: asked ? false : state.hidden,
-    stop: over ? "idle" : state.stop,
+    // A failed stop is about the phase it failed in.
+    stop: over || (state.stop === "failed" && prev !== next.state) ? "idle" : state.stop,
     stopStartedAt: over ? null : state.stopStartedAt,
     handedBack,
   });
 }
 
-/** Read the session now. One read at a time; a stale answer is dropped. */
+/** Read the session now. One read at a time; an answer from before a
+ *  conversation change or a confirmed stop is dropped (see `epoch`). */
 export async function refreshBrowser(): Promise<void> {
   const conversation = state.conversation;
   if (conversation === null || reading) return;
@@ -179,6 +188,8 @@ export function resetBrowser(): void {
   feedBrowser(null);
 }
 
+onPrivateSessionReset(resetBrowser);
+
 export function openBrowser(): void {
   if (state.availability !== "available") return;
   set({ ...state, hidden: false, open: true, focused: true });
@@ -188,9 +199,13 @@ export function focusBrowser(): void {
   if (tabVisible(state) && !state.focused) set({ ...state, focused: true });
 }
 
-/** The tab's x: hide it. The session keeps running. */
+/** The tab's x: hide it. The session keeps running. A drawer this tab alone
+ *  opened hands its open state to the artifact tabs it holds, so hiding the
+ *  tab never closes the drawer over an artifact. */
 export function hideBrowser(): void {
-  if (!state.hidden) set({ ...state, hidden: true, focused: false, open: false });
+  if (state.hidden) return;
+  if (state.open && canvasSnapshot().tabs.length > 0) showDrawer();
+  set({ ...state, hidden: true, focused: false, open: false });
 }
 
 /** The drawer closed. Nothing about the session changes. */
@@ -233,6 +248,10 @@ export async function confirmStop(): Promise<void> {
     return;
   }
   if (mine !== epoch) return;
+  // A read already in flight may carry the session as it was before the stop:
+  // drop it, so it cannot bring `active` and Stop back.
+  epoch++;
+  reading = false;
   const prior = state.session;
   set({
     ...state,

@@ -436,7 +436,11 @@ export default function CanvasDrawer() {
                 className="cv-tab-close"
                 aria-label={t("Hide Browser tab. The session keeps running.")}
                 title={t("Hide Browser tab. The session keeps running.")}
-                onClick={hideBrowser}
+                onClick={() => {
+                  hideBrowser();
+                  // The tab that held focus is gone: the next one takes it.
+                  requestAnimationFrame(() => rootRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus());
+                }}
               >
                 <IconClose size={10} />
               </button>
@@ -465,8 +469,8 @@ export default function CanvasDrawer() {
       ) : null}
       {hasBrowser ? (
         <BrowserPanel
-          key={conversation}
-          conversation={conversation}
+          key={browser.conversation}
+          conversation={browser.conversation ?? conversation}
           active={showBrowser}
           sheet={sheet}
           expanded={expanded}

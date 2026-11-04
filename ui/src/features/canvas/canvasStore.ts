@@ -12,6 +12,7 @@
  *   tab selects a neighbour; closing the last collapses the drawer.
  */
 import { useSyncExternalStore } from "react";
+import { onPrivateSessionReset } from "../../lib/privateSession";
 
 export type ArtifactKind = "md" | "pdf" | "html" | "image" | "csv";
 export const ARTIFACT_KINDS: readonly ArtifactKind[] = ["md", "pdf", "html", "image", "csv"];
@@ -294,6 +295,16 @@ export function closeDrawer(): void {
   closeDrawerFor(currentTurn);
   set({ ...state, open: false });
 }
+
+/** Show the drawer again over the tabs it already holds (the Browser tab
+ *  was hiding itself out of a drawer that it alone had opened). */
+export function showDrawer(): void {
+  if (state.tabs.length > 0 && !state.open) set({ ...state, open: true });
+}
+
+// A confirmed identity change drops this conversation's tabs: titles and
+// versions belong to the person who was signed in.
+onPrivateSessionReset(() => resetCanvas());
 
 export function selectVersion(id: string, version: number): void {
   set({
