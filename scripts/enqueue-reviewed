@@ -23,8 +23,9 @@ unless ALL of these hold for the pinned head:
     required count of PASS verdicts pinned to this exact head from distinct
     reviewers, none of them the PR author: two (Standards plus Spec/security),
     or one (`Review (standards+spec)`) when every change is on the one-review
-    list (docs/roles/one-review-paths.toml, CAD-957, read at the PR's base
-    commit so a PR cannot widen its own list). A `ui/` change also needs a
+    list (docs/roles/one-review-paths.toml, CAD-957, read with the diff's anchor:
+    main's live tip for a PR based on main, else the PR's base commit, so a PR
+    cannot widen its own list). A `ui/` change also needs a
     Browser QA pass. AOS-473: a document whose `origin` is `hosted` is counted
     by the owner's attestation instead — the row must name this repo and carry
     a reviewer_id and a github_login (except a CAD-2081 workflow-issued row,
@@ -284,7 +285,7 @@ def parse_raw_diff(raw):
 
 
 def pr_changes(pr, head, base, base_oid, main_tip=None):
-    """(changes, changed_lines) of the PR, from git in the current checkout:
+    """(changes, changed_lines, merge_base) of the PR, from git in the current checkout:
     fetch the base and the PR head when either commit is absent, then diff the
     merge base to the pinned head with no rename detection (a rename is a
     delete plus an add, so both ends are seen). Raises on any failure.
@@ -324,7 +325,7 @@ def pr_changes(pr, head, base, base_oid, main_tip=None):
     for row in num.splitlines():
         added, deleted = row.split("\t")[:2]
         lines += (int(added) if added.isdigit() else 0) + (int(deleted) if deleted.isdigit() else 0)
-    return parse_raw_diff(out), lines
+    return parse_raw_diff(out), lines, mb
 
 
 def risk_globs(toml_text):
@@ -373,6 +374,33 @@ def workflow_auto_reasons(changes, toml_text):
         out.append(f"{path} ({why})")
     return ([f"a workflow review cannot stand in for the operator: {'; '.join(out[:5])}"]
             if out else [])
+
+
+ROUTINE_EXACT = ("README.md", "CONTRIBUTING.md")  # as in cadence-core's routine allowlist
+
+
+def lean_class_reasons(klass, changes, one, human_paths, lines):
+    """Why a routine or consequential class understates this script's own diff (CAD-2100).
+
+    `consequential` is checked as one combined review and `routine` as none, so a class
+    the evaluator gave from a different diff must not stand when this script's diff needs
+    more: not wholly on the one-review list (two reviews), human-class by path or size,
+    or, for routine, not plain regular-file markdown docs. Any other class is not lean."""
+    if klass not in ("routine", "consequential"):
+        return []
+    out = []
+    if not one:
+        out.append("this PR's own diff is not on the one-review list, so it needs two reviews")
+    if human_paths or lines > HUMAN_LINES:
+        out.append("this PR's own diff is human-class by path or size")
+    if klass == "routine" and not all(
+            s in ("A", "M") and new == "100644" and (old == new or s == "A") and path.endswith(".md")
+            and (path.startswith("docs/") or path in ROUTINE_EXACT)
+            for s, old, new, path in changes):
+        out.append("this PR's own diff is not plain ordinary markdown documentation")
+    return ([f"the evaluator's {klass} class does not hold for this script's diff against "
+             f"main's live tip: {'; '.join(out)} (an older classifier build can be stale; "
+             "refusing rather than merging on fewer reviews)"] if out else [])
 
 
 def is_human_path(path, risk=()):
@@ -1491,22 +1519,29 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             except RuntimeError as e:
                 reasons.append(str(e))
 
-    # Changed paths (modes included) and size, straight from git.
+    # Changed paths (modes included) and size, straight from git. CAD-2100: for a PR
+    # based on main, main's tip is resolved once here; the diff and both path lists
+    # below are read with it, so they cannot disagree within one evaluation.
     live_tip = live_main_tip(repo) if base == "main" else ""
     try:
-        changes, lines = pr_changes(pr, head, base, base_oid, live_tip)
+        changes, lines, merge_base = pr_changes(pr, head, base, base_oid, live_tip)
     except RuntimeError as e:
         reasons.append(f"cannot list the changed files of PR #{pr}: {e}")
-        changes, lines = [], 0
+        changes, lines, merge_base = [], 0, ""
+    # The commit the path lists are read at: main's live tip for a main-based PR (a PR
+    # cannot edit the lists it is judged by: the tip holds no unmerged PR), else the
+    # PR's base commit. Never empty: an empty ref would read the default branch.
+    lists_ref = live_tip if base == "main" else base_oid
     paths = sorted({c[3] for c in changes})
     if not changes and not any("cannot list the changed files" in r for r in reasons):
         reasons.append(f"PR #{pr} has an empty diff against {base}")
 
-    # One-review list, read at the PR's base commit.
-    rc, toml_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
-                            f"repos/{repo}/contents/{ONE_REVIEW_FILE}?ref={base_oid}"])
-    one_text = toml_text if rc == 0 and base_oid else None
-    one = rc == 0 and bool(base_oid) and one_review_qualifies(changes, toml_text)
+    # One-review list, read with the diff's anchor.
+    rc, toml_text, _ = (run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                             f"repos/{repo}/contents/{ONE_REVIEW_FILE}?ref={lists_ref}"])
+                        if lists_ref else (1, "", ""))
+    one_text = toml_text if rc == 0 and lists_ref else None
+    one = rc == 0 and bool(lists_ref) and one_review_qualifies(changes, toml_text)
     report.append("reviews required: " + ("one (diff is on the one-review list)" if one else "two (Standards and Spec/security)"))
     need_qa = any(p.startswith("ui/") for p in paths)
 
@@ -1696,14 +1731,20 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     # or (CAD-2081) a workflow-issued review on any change outside the workflow
     # auto-paths allowlist. `cadence delivery requirements` does not report that last
     # rule; this script adds it.
-    rc, risk_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
-                            f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={base_oid}"])
-    risk_text = risk_text if rc == 0 and base_oid else None
+    rc, risk_text, _ = (run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                             f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={lists_ref}"])
+                        if lists_ref else (1, "", ""))
+    risk_text = risk_text if rc == 0 and lists_ref else None
     risk = risk_globs(risk_text)
-    why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the base (fail closed)"]
+    why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the diff's anchor (fail closed)"]
     why += [p for p in paths if is_human_path(p, risk or ())][:5]
     if lines > HUMAN_LINES:
         why.append(f"{lines} changed lines")
+    # CAD-2100: a lean class (routine, consequential) cannot hide what this script's
+    # own diff found. The classifier may be an older build than this script.
+    if authority is not None and authority["requirements"]["activation"] == "active":
+        reasons += lean_class_reasons(authority["requirements"]["class"], changes, one,
+                                      [p for p in paths if is_human_path(p, risk or ())], lines)
     if has_workflow:
         auto_text = None
         if main_tip:
@@ -1748,6 +1789,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         evidence.update(issue=issue, repo=repo, pr=pr, head=head, base=base_oid, base_ref=base,
                         notes=sorted({n["name"] for n in counted}),
                         checks=sorted(names), comments=ticket.get("comments") or [],
+                        merge_base=merge_base, main_tip=live_tip,
                         binding=authority["binding"] if authority else None,
                         requirements=authority["requirements"] if authority else None,
                         readiness=authority["readiness"] if authority else None)
@@ -1780,6 +1822,13 @@ def evidence_body(evidence):
              f"Base branch: {evidence['base_ref']}",
              f"Green CI run: {evidence['ci_run']}",
              "Required checks: " + ", ".join(evidence["checks"])]
+    # CAD-2100: `Base:` is the PR's recorded base commit, which the final head check
+    # compares with GitHub's. These record what the classification judged. Not required
+    # by check_comment, so an evidence comment without them still counts.
+    if evidence.get("merge_base"):
+        lines.append(f"Merge base judged: {evidence['merge_base']}")
+    if evidence.get("main_tip"):
+        lines.append(f"Main tip: {evidence['main_tip']}")
     for name in sorted(evidence.get("ci_proofs") or {}):
         url = evidence["ci_proofs"][name]
         if url != evidence["ci_run"]:

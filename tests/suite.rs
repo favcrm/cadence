@@ -1522,13 +1522,18 @@ mod cad2081_workflow_verdicts {
     #[test]
     fn the_consequential_class_takes_two_distinct_workflow_reviews_but_not_one() {
         let f = Fixture::new();
+        // CAD-2100: the diff must truly qualify for the lean class (an ordinary file on the
+        // one-review list), or the gate refuses the class itself before it counts reviews.
+        let head = f.touch("docs/x.md");
         let mut case = scenario(vec![f.std(), f.spec()]);
         case.class = "consequential";
+        case.head = Some(head.clone());
         let (code, stdout, stderr) = f.gate(&case);
         assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
         for one in [f.std(), f.spec()] {
             let mut case = scenario(vec![one]);
             case.class = "consequential";
+            case.head = Some(head.clone());
             refused(&f, case, "no pass verdict for CAD-1 pinned to this head");
         }
         // One principal cannot be both reviews.
@@ -1540,6 +1545,7 @@ mod cad2081_workflow_verdicts {
         );
         let mut case = scenario(vec![f.std(), both]);
         case.class = "consequential";
+        case.head = Some(head);
         refused(&f, case, "may file only standards");
     }
 
@@ -1969,8 +1975,11 @@ mod cad2081_workflow_verdicts {
         let mut revise = f.std();
         revise["outcome"] = json!("revise");
         revise["section_outcome"] = json!("revise");
+        // CAD-2100: a diff that truly qualifies for routine (plain markdown under docs/).
+        let head = f.touch("docs/x.md");
         let mut case = scenario(vec![revise, f.spec()]);
         case.class = "routine";
+        case.head = Some(head.clone());
         refused(
             &f,
             case,
@@ -1979,6 +1988,7 @@ mod cad2081_workflow_verdicts {
         // Passing workflow rows under routine are fine with the approval the empty list needs.
         let mut case = scenario(vec![f.std(), f.spec()]);
         case.class = "routine";
+        case.head = Some(head.clone());
         let (code, stdout, stderr) = f.gate(&case);
         assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
         // An owner row that is not a pass behaves as it does on main: routine reads no reviews.
@@ -1993,6 +2003,7 @@ mod cad2081_workflow_verdicts {
         owner["section_outcome"] = json!("revise");
         let mut case = scenario(vec![owner]);
         case.class = "routine";
+        case.head = Some(head);
         let (code, stdout, stderr) = f.gate(&case);
         assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     }
@@ -6410,5 +6421,1048 @@ mod cad2009_hosted_app_acceptance {
             error["error"].as_str().unwrap().contains("issuer"),
             "wrong local refusal: {error}"
         );
+    }
+}
+
+// CAD-2100 acceptance, authored from the ticket by someone other than the implementer;
+// the implementer must not edit or weaken it. The script half drives the real
+// `scripts/enqueue-reviewed --dry-run` against a stub classifier; the classifier half
+// drives the real daemon binary against a `gh` that answers from a real git repository.
+mod cad2100_classifier_merge_base {
+    use serde_json::{json, Map, Value};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+
+    const STUB: &str = include_str!("fixtures/cad2100_gate_stub.py");
+    const REPO: &str = "favcrm/cadence";
+    const PR_URL: &str = "https://github.com/favcrm/cadence/pull/7";
+    const RISK_PATHS: &str = "docs/roles/risk-paths.toml";
+    const ONE_REVIEW: &str = "docs/roles/one-review-paths.toml";
+    const NO_APPROVAL: &str = "no operator approval recorded";
+    const LEAN: &str = "class does not hold for this script's diff against main's live tip";
+    const NOT_ONE: &str = "not on the one-review list";
+    const NOT_DOC: &str = "not plain ordinary markdown documentation";
+    const HUMAN: &str = "human-class by path or size";
+    const LOOSE_ONE: &str = "one_review_include = [\"**\"]\none_review_exclude = []\n";
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = cadence_agent::reaper::output(
+            Command::new("git")
+                .current_dir(dir)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args),
+        )
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn put(dir: &Path, path: &str, text: &str) {
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, text).unwrap();
+    }
+
+    fn commit(dir: &Path, message: &str) -> String {
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "--allow-empty", "-m", message]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    fn real(path: &str) -> String {
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
+    }
+
+    fn install_stub(bin: &Path, names: &[&str]) {
+        std::fs::create_dir_all(bin).unwrap();
+        for name in names {
+            let path = bin.join(name);
+            std::fs::write(&path, STUB).unwrap();
+            std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// One repository with main moving on after the PR's recorded base:
+    /// `base` (what GitHub keeps saying), `mid`, then `tip` (main's live tip). The tip fixes
+    /// `src/peer.rs` (two reviews), `src/review.rs` (human-class) and `src/area/lib.rs`
+    /// (ordinary one-review code).
+    struct Repo {
+        dir: tempfile::TempDir,
+        base: String,
+        mid: String,
+        tip: String,
+    }
+
+    impl Repo {
+        fn new() -> Repo {
+            let dir = tempfile::Builder::new()
+                .prefix("c2100")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let work = dir.path().join("work");
+            std::fs::create_dir(&work).unwrap();
+            let d = work.as_path();
+            git(d, &["init", "-q", "-b", "main"]);
+            put(
+                d,
+                ".github/workflows/ci.yml",
+                "jobs:\n  ci:\n    runs-on: x\n",
+            );
+            put(d, RISK_PATHS, &real(RISK_PATHS));
+            put(d, ONE_REVIEW, &real(ONE_REVIEW));
+            put(d, "docs/guide.md", "guide\n");
+            for file in [
+                "src/peer.rs",
+                "src/review.rs",
+                "src/area/lib.rs",
+                "src/zone/lib.rs",
+            ] {
+                put(d, file, "old\n");
+            }
+            let base = commit(d, "base");
+            put(d, "src/area/lib.rs", "mid\n");
+            let mid = commit(d, "main moves");
+            for file in ["src/peer.rs", "src/review.rs", "src/area/lib.rs"] {
+                put(d, file, "fixed\n");
+            }
+            let tip = commit(d, "main fixes the trust boundary");
+            Repo {
+                dir,
+                base,
+                mid,
+                tip,
+            }
+        }
+
+        fn work(&self) -> PathBuf {
+            self.dir.path().join("work")
+        }
+
+        /// A commit on `from` made by `edit`; the work tree goes back to main.
+        fn branch(&self, name: &str, from: &str, edit: impl FnOnce(&Path)) -> String {
+            let d = self.work();
+            git(&d, &["checkout", "-q", "-B", name, from]);
+            edit(&d);
+            let sha = commit(&d, name);
+            git(&d, &["checkout", "-q", "main"]);
+            sha
+        }
+
+        /// A PR branch cut at the recorded base that merged `main` and then made `edit`.
+        fn merged(&self, name: &str, main: &str, edit: impl FnOnce(&Path)) -> String {
+            let d = self.work();
+            git(&d, &["checkout", "-q", "-B", name, &self.base]);
+            git(&d, &["merge", "-q", "--no-ff", "--no-edit", main]);
+            edit(&d);
+            let sha = commit(&d, name);
+            git(&d, &["checkout", "-q", "main"]);
+            sha
+        }
+
+        /// Merged main's tip, put `path` back to its old copy and added `extra`.
+        fn restoring(&self, name: &str, path: &str, extra: &str) -> String {
+            self.merged(name, &self.tip, |d| {
+                git(d, &["checkout", &self.base, "--", path]);
+                put(d, extra, "x\n");
+            })
+        }
+
+        /// Merged main's tip and added or changed `files`.
+        fn touching(&self, name: &str, main: &str, files: &[&str]) -> String {
+            self.merged(name, main, |d| {
+                for file in files {
+                    put(d, file, "x\n");
+                }
+            })
+        }
+
+        /// A newer main that changed `file` from `find` to `with`.
+        fn main_with(&self, name: &str, file: &str, find: &str, with: &str) -> String {
+            self.branch(name, &self.tip, |d| {
+                let text = std::fs::read_to_string(d.join(file)).unwrap();
+                assert!(text.contains(find), "{file} has no {find:?}");
+                put(d, file, &text.replacen(find, with, 1));
+            })
+        }
+
+        /// Main after it tightened the one-review list around `src/zone/`.
+        fn main_excluding_zone(&self) -> String {
+            self.main_with(
+                "tight-one",
+                ONE_REVIEW,
+                "one_review_exclude = [\n",
+                "one_review_exclude = [\n  \"src/zone/**\",\n",
+            )
+        }
+
+        /// Main after it tightened the risk list around `src/zone/`.
+        fn main_risking_zone(&self) -> String {
+            self.main_with(
+                "tight-risk",
+                RISK_PATHS,
+                "[trigger4]\npaths = [",
+                "[trigger4]\npaths = [\"src/zone/**\", ",
+            )
+        }
+
+        /// Main after it dropped `file`.
+        fn main_without(&self, name: &str, file: &str) -> String {
+            self.branch(name, &self.tip, |d| {
+                std::fs::remove_file(d.join(file)).unwrap()
+            })
+        }
+
+        fn changed_files(&self, base: &str, head: &str) -> u64 {
+            git(
+                &self.work(),
+                &["diff", "--name-only", "--no-renames", base, head],
+            )
+            .lines()
+            .count() as u64
+        }
+
+        /// The scenario both halves share; callers add their own knobs.
+        fn scenario(
+            &self,
+            head: &str,
+            base_ref: &str,
+            base_oid: &str,
+            tip: &str,
+        ) -> Map<String, Value> {
+            let Value::Object(map) = json!({
+                "repo": REPO, "pr": 7, "title": "CAD-1: add the thing", "head": head,
+                "base": base_ref, "base_oid": base_oid, "tip": tip,
+                "repo_dir": self.work(),
+                "changed_files": self.changed_files(base_oid, head),
+            }) else {
+                unreachable!()
+            };
+            map
+        }
+    }
+
+    fn owner(name: &str, stamp: &str, id: &str, login: &str, kind: &str) -> Value {
+        json!({"name": name, "stamp": stamp, "reviewer": login, "reviewer_id": id,
+               "github_login": login, "repo": REPO, "kind": kind, "outcome": "pass",
+               "title_outcome": "pass", "section_outcome": "pass", "risk": "auto",
+               "identity_source": "owner-attested"})
+    }
+
+    fn combined() -> Value {
+        owner(
+            "20261103-000100-c.md",
+            "20261103-000100",
+            "usr_alice",
+            "alice",
+            "combined",
+        )
+    }
+
+    fn owner_pair() -> Vec<Value> {
+        vec![
+            owner(
+                "20261103-000100-a.md",
+                "20261103-000100",
+                "usr_alice",
+                "alice",
+                "standards",
+            ),
+            owner(
+                "20261103-000200-b.md",
+                "20261103-000200",
+                "usr_bob",
+                "bob",
+                "spec-security",
+            ),
+        ]
+    }
+
+    /// `scripts/enqueue-reviewed` against the stub classifier, which answers `class`
+    /// whatever the diff is: the "classifier is an older build" case.
+    struct Gate<'a> {
+        repo: &'a Repo,
+        head: String,
+        class: &'static str,
+        rows: Vec<Value>,
+        approved: bool,
+        base_ref: String,
+        base_oid: String,
+        tip: String,
+        knobs: Map<String, Value>,
+        args: Vec<String>,
+        dry_run: bool,
+    }
+
+    struct Run {
+        code: i32,
+        stdout: String,
+        stderr: String,
+        comment: Option<String>,
+    }
+
+    fn gate<'a>(repo: &'a Repo, head: &str) -> Gate<'a> {
+        Gate {
+            repo,
+            head: head.to_string(),
+            class: "consequential",
+            rows: vec![combined()],
+            approved: true,
+            base_ref: "main".into(),
+            base_oid: repo.base.clone(),
+            tip: repo.tip.clone(),
+            knobs: Map::new(),
+            args: vec![],
+            dry_run: true,
+        }
+    }
+
+    impl Gate<'_> {
+        fn class(mut self, class: &'static str, rows: Vec<Value>) -> Self {
+            self.class = class;
+            self.rows = rows;
+            self
+        }
+
+        fn unapproved(mut self) -> Self {
+            self.approved = false;
+            self
+        }
+
+        fn main_at(mut self, tip: &str) -> Self {
+            self.tip = tip.to_string();
+            self
+        }
+
+        fn knob(mut self, key: &str, value: Value) -> Self {
+            self.knobs.insert(key.into(), value);
+            self
+        }
+
+        /// Serve `text` for `path` at commit `at`, whatever the repository holds there.
+        fn serve(self, at: &str, path: &str, text: &str) -> Self {
+            self.knob("ref_overrides", json!({ at: { path: text } }))
+        }
+
+        fn run(&self) -> Run {
+            let root = self.repo.dir.path();
+            let bin = root.join(".stubs");
+            install_stub(&bin, &["gh", "cadence"]);
+            let comment = root.join(".comment");
+            let _ = std::fs::remove_file(&comment);
+            let mut scenario =
+                self.repo
+                    .scenario(&self.head, &self.base_ref, &self.base_oid, &self.tip);
+            scenario.extend(self.knobs.clone());
+            scenario.insert("verdicts".into(), json!(self.rows));
+            scenario.insert("class".into(), json!(self.class));
+            scenario.insert("approved".into(), json!(self.approved));
+            scenario.insert("comment_out".into(), json!(comment));
+            scenario.insert(
+                "identities".into(),
+                json!([{"github_login": "authorlogin", "subject_id": "usr_author"},
+                       {"github_login": "alice", "subject_id": "usr_alice"},
+                       {"github_login": "bob", "subject_id": "usr_bob"}]),
+            );
+            let scenario_path = root.join(".scenario.json");
+            std::fs::write(&scenario_path, serde_json::to_vec(&scenario).unwrap()).unwrap();
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/enqueue-reviewed");
+            let mut cmd = Command::new("python3");
+            cmd.arg(script)
+                .args(["7", "--head", &self.head, "--repo", REPO])
+                .args(["--notes-dir", "/nonexistent"])
+                .args(["--gate-key", "/nonexistent/key"])
+                .args(&self.args);
+            if self.dry_run {
+                cmd.arg("--dry-run");
+            }
+            let out = cadence_agent::reaper::output(
+                cmd.current_dir(self.repo.work())
+                    .env_clear()
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env("HOME", root)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("CADENCE_BIN", bin.join("cadence"))
+                    .env("CAD2100_SCENARIO", &scenario_path),
+            )
+            .unwrap();
+            Run {
+                code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                comment: std::fs::read_to_string(comment).ok(),
+            }
+        }
+    }
+
+    impl Run {
+        fn show(&self) -> String {
+            format!("stdout: {}\nstderr: {}", self.stdout, self.stderr)
+        }
+
+        fn said(&self) -> String {
+            format!("{}{}", self.stdout, self.stderr)
+        }
+
+        fn passes(&self) {
+            assert_eq!(self.code, 0, "{}", self.show());
+            assert!(self.stdout.contains("every rule holds"), "{}", self.show());
+        }
+
+        fn refused(&self, whys: &[&str]) {
+            assert_eq!(self.code, 1, "expected a refusal {whys:?}\n{}", self.show());
+            for why in whys {
+                assert!(self.said().contains(why), "no {why:?}\n{}", self.show());
+            }
+            assert!(!self.stdout.contains("every rule holds"), "{}", self.show());
+        }
+
+        /// Refused, and by something other than the lean-class check.
+        fn refused_other(&self, whys: &[&str]) {
+            self.refused(whys);
+            assert!(!self.stderr.contains(LEAN), "{}", self.show());
+        }
+    }
+
+    // 1. The ticket's measured hole: a stale `consequential` answer, and a diff that
+    // restores a trust-boundary file after merging main. It used to exit 0 on one review.
+    #[test]
+    fn a_stale_consequential_answer_cannot_hide_a_restored_trust_boundary_file() {
+        let repo = Repo::new();
+        let head = repo.restoring("restore-peer", "src/peer.rs", "docs/y.md");
+        // The operator approval is on file, so the only thing left to refuse is the review
+        // count the stale class understates.
+        let run = gate(&repo, &head).run();
+        run.refused(&[LEAN, NOT_ONE, "reviews required: two"]);
+        assert!(!run.stderr.contains(HUMAN), "{}", run.show());
+        // The strict class already asked for two reviews: one combined row is not enough.
+        gate(&repo, &head)
+            .class("strict1", vec![combined()])
+            .run()
+            .refused_other(&["reviews required: two", "no pass Standards verdict"]);
+        // Two reviews from distinct reviewers satisfy a strict class on that diff.
+        gate(&repo, &head)
+            .class("strict", owner_pair())
+            .run()
+            .passes();
+        // A human-class file restored the same way: refused for what it is, and for the
+        // operator's approval when none is on file.
+        let head = repo.restoring("restore-review", "src/review.rs", "docs/y.md");
+        gate(&repo, &head).run().refused(&[LEAN, HUMAN]);
+        gate(&repo, &head)
+            .unapproved()
+            .run()
+            .refused(&[LEAN, HUMAN, NO_APPROVAL]);
+    }
+
+    // 2. A stale `routine` answer ("no reviews") and a diff that is more than plain docs.
+    #[test]
+    fn a_stale_routine_answer_cannot_hide_a_path_that_is_not_plain_documentation() {
+        let repo = Repo::new();
+        // One-review code that is neither human nor a document: only the docs clause fires.
+        let code = repo.restoring("code", "src/area/lib.rs", "docs/y.md");
+        let run = gate(&repo, &code).class("routine", vec![]).run();
+        run.refused(&[LEAN, NOT_DOC]);
+        assert!(!run.stderr.contains(NOT_ONE), "{}", run.show());
+        assert!(!run.stderr.contains(HUMAN), "{}", run.show());
+        // A non-markdown file under docs/, and an executable markdown file.
+        let text = repo.touching("text", &repo.tip, &["docs/y.txt"]);
+        gate(&repo, &text)
+            .class("routine", vec![])
+            .run()
+            .refused(&[LEAN, NOT_DOC]);
+        let exec = repo.merged("exec", &repo.tip, |d| {
+            put(d, "docs/run.md", "x\n");
+            std::fs::set_permissions(d.join("docs/run.md"), PermissionsExt::from_mode(0o755))
+                .unwrap();
+        });
+        gate(&repo, &exec)
+            .class("routine", vec![])
+            .run()
+            .refused(&[LEAN, NOT_DOC]);
+        // Two-review and human-class files under a routine answer trip the other clauses.
+        let peer = repo.restoring("peer", "src/peer.rs", "docs/y.md");
+        gate(&repo, &peer)
+            .class("routine", vec![])
+            .run()
+            .refused(&[LEAN, NOT_ONE, NOT_DOC]);
+        let review = repo.restoring("review", "src/review.rs", "docs/y.md");
+        gate(&repo, &review)
+            .class("routine", vec![])
+            .run()
+            .refused(&[LEAN, HUMAN, NOT_DOC]);
+    }
+
+    // 3. The refusal is not blanket: a lean class on a diff that truly qualifies passes, and
+    // still needs the reviews its class names.
+    #[test]
+    fn a_lean_class_whose_diff_qualifies_still_passes_for_the_right_reviews() {
+        let repo = Repo::new();
+        let doc = repo.touching("doc", &repo.tip, &["docs/y.md"]);
+        gate(&repo, &doc)
+            .class("routine", vec![])
+            .unapproved()
+            .run()
+            .passes();
+        let run = gate(&repo, &doc).run();
+        run.passes();
+        assert!(
+            run.stdout.contains("reviews required: one"),
+            "{}",
+            run.show()
+        );
+        assert!(run.stdout.contains("class: auto"), "{}", run.show());
+        // Ordinary one-review code is consequential, not routine, and passes as such.
+        let code = repo.touching("code", &repo.tip, &["src/area/new.rs"]);
+        gate(&repo, &code).run().passes();
+        gate(&repo, &code)
+            .class("routine", vec![])
+            .run()
+            .refused(&[LEAN, NOT_DOC]);
+        // The consequential class still needs its one combined review.
+        gate(&repo, &doc)
+            .class("consequential", vec![])
+            .run()
+            .refused_other(&["refused:"]);
+        let mut standards = owner_pair();
+        standards.truncate(1);
+        gate(&repo, &doc)
+            .class("consequential", standards)
+            .run()
+            .refused_other(&["requires exactly one independent combined review"]);
+    }
+
+    // 4. The lists move with the diff: main's tip, not the PR's recorded base.
+    #[test]
+    fn a_branch_that_merged_main_after_it_tightened_the_lists_is_judged_by_mains_lists() {
+        let repo = Repo::new();
+        // Control: with main's lists unchanged, a stale answer on a zone edit is right.
+        let plain = repo.touching("plain", &repo.tip, &["src/zone/lib.rs"]);
+        gate(&repo, &plain).run().passes();
+        gate(&repo, &plain)
+            .class("strict1", vec![combined()])
+            .run()
+            .passes();
+        // Main tightened one-review-paths.toml: the same edit now needs two reviews.
+        let tight = repo.main_excluding_zone();
+        let head = repo.touching("zone-one", &tight, &["src/zone/lib.rs"]);
+        let run = gate(&repo, &head).main_at(&tight).run();
+        run.refused(&[LEAN, NOT_ONE, "reviews required: two"]);
+        assert!(!run.stderr.contains(HUMAN), "{}", run.show());
+        // ...and a class that already asks for one review is raised to two.
+        gate(&repo, &head)
+            .main_at(&tight)
+            .class("strict1", vec![combined()])
+            .run()
+            .refused_other(&["reviews required: two", "no pass Standards verdict"]);
+        gate(&repo, &head)
+            .main_at(&tight)
+            .class("strict", owner_pair())
+            .run()
+            .passes();
+        // Main tightened risk-paths.toml: the same edit is now human-class.
+        let risky = repo.main_risking_zone();
+        let head = repo.touching("zone-risk", &risky, &["src/zone/lib.rs"]);
+        let run = gate(&repo, &head).main_at(&risky).run();
+        run.refused(&[LEAN, HUMAN]);
+        assert!(!run.stderr.contains(NOT_ONE), "{}", run.show());
+        let run = gate(&repo, &head)
+            .main_at(&risky)
+            .class("strict1", vec![combined()])
+            .unapproved()
+            .run();
+        run.refused(&[NO_APPROVAL]);
+        assert!(
+            run.stdout.contains("class: human (src/zone/lib.rs"),
+            "{}",
+            run.show()
+        );
+        // A list that was looser at the PR's recorded base does not outvote main's tip.
+        let head = repo.restoring("restore-peer", "src/peer.rs", "docs/y.md");
+        gate(&repo, &head)
+            .serve(&repo.base, ONE_REVIEW, LOOSE_ONE)
+            .run()
+            .refused(&[LEAN, NOT_ONE]);
+    }
+
+    // 5. A PR cannot loosen the lists it is judged by.
+    #[test]
+    fn a_pr_that_loosens_a_list_in_its_own_head_is_judged_by_mains_copy() {
+        let repo = Repo::new();
+        let head = repo.restoring("restore-peer", "src/peer.rs", "docs/y.md");
+        gate(&repo, &head)
+            .serve(&head, ONE_REVIEW, LOOSE_ONE)
+            .run()
+            .refused(&[LEAN, NOT_ONE]);
+        let risky = repo.main_risking_zone();
+        let head = repo.touching("zone-risk", &risky, &["src/zone/lib.rs"]);
+        gate(&repo, &head)
+            .main_at(&risky)
+            .serve(&head, RISK_PATHS, &real(RISK_PATHS))
+            .run()
+            .refused(&[LEAN, HUMAN]);
+    }
+
+    // 6. GitHub's recorded base can be far behind main without anything being wrong.
+    #[test]
+    fn a_merely_stale_recorded_base_is_not_refused() {
+        let repo = Repo::new();
+        let merged = repo.touching("merged", &repo.tip, &["docs/y.md"]);
+        // Cut after `mid` and never updated: main's later commits are not the PR's change.
+        let behind = repo.branch("behind", &repo.mid, |d| put(d, "docs/y.md", "x\n"));
+        for head in [&merged, &behind] {
+            gate(&repo, head).run().passes();
+            gate(&repo, head).class("routine", vec![]).run().passes();
+            gate(&repo, head)
+                .class("strict", owner_pair())
+                .unapproved()
+                .run()
+                .passes();
+        }
+    }
+
+    // 7. Without main's tip nothing can be anchored: refuse, for a lean class and a strict one.
+    #[test]
+    fn an_unreadable_or_empty_tip_or_list_refuses_a_pr_based_on_main() {
+        let repo = Repo::new();
+        let head = repo.touching("doc", &repo.tip, &["docs/y.md"]);
+        let cannot = "cannot list the changed files";
+        let broken = [
+            ("tip_fails", json!(true)),
+            ("tip_sha", json!("")),
+            ("tip_sha", json!("abc1234")),
+            ("tip_sha", json!("d".repeat(40))),
+        ];
+        for (key, value) in broken {
+            for class in ["consequential", "strict"] {
+                let rows = if class == "strict" {
+                    owner_pair()
+                } else {
+                    vec![combined()]
+                };
+                gate(&repo, &head)
+                    .class(class, rows)
+                    .knob(key, value.clone())
+                    .run()
+                    .refused(&[cannot]);
+            }
+        }
+        // A list missing at the tip is unreadable, not "nothing to restrict".
+        let no_risk = repo.main_without("no-risk", RISK_PATHS);
+        let head = repo.touching("doc2", &no_risk, &["docs/y.md"]);
+        gate(&repo, &head)
+            .main_at(&no_risk)
+            .unapproved()
+            .run()
+            .refused(&[
+                "cannot read docs/roles/risk-paths.toml at the diff's anchor",
+                NO_APPROVAL,
+            ]);
+        let no_one = repo.main_without("no-one", ONE_REVIEW);
+        let head = repo.touching("doc3", &no_one, &["docs/y.md"]);
+        gate(&repo, &head)
+            .main_at(&no_one)
+            .run()
+            .refused(&[LEAN, NOT_ONE]);
+    }
+
+    // 8. A PR on another base keeps today's behaviour: the PR's base is the anchor and
+    // main's tip is never asked for.
+    #[test]
+    fn a_pr_on_another_base_keeps_its_own_anchor_and_lists() {
+        let repo = Repo::new();
+        let staging = |head: &str| {
+            let mut case = gate(&repo, head);
+            case.base_ref = "staging".into();
+            case
+        };
+        // The zone edit on a branch cut from the base, with no tip anywhere: passes.
+        let head = repo.branch("zone", &repo.base, |d| put(d, "src/zone/lib.rs", "x\n"));
+        staging(&head).knob("tip_fails", json!(true)).run().passes();
+        // Its lists are read at the PR's base: tightened there, the edit needs two reviews.
+        let tight_list = real(ONE_REVIEW).replacen(
+            "one_review_exclude = [\n",
+            "one_review_exclude = [\n  \"src/zone/**\",\n",
+            1,
+        );
+        staging(&head)
+            .serve(&repo.base, ONE_REVIEW, &tight_list)
+            .run()
+            .refused(&[LEAN, NOT_ONE]);
+        // What main brought in counts as this branch's own change against its base.
+        let merged = repo.touching("merged", &repo.tip, &["docs/y.md"]);
+        staging(&merged).run().refused(&[LEAN, HUMAN, NOT_ONE]);
+    }
+
+    // 9. The evidence comment: `Base:` stays the recorded base; what was judged is added.
+    #[test]
+    fn the_evidence_records_the_recorded_base_beside_the_merge_base_and_tip_judged() {
+        let repo = Repo::new();
+        // Cut at `mid`, so the merge base with main's tip is neither the base nor the tip.
+        let head = repo.branch("behind", &repo.mid, |d| put(d, "docs/y.md", "x\n"));
+        let mut case = gate(&repo, &head);
+        case.dry_run = false;
+        let run = case.run();
+        let comment = run
+            .comment
+            .clone()
+            .unwrap_or_else(|| panic!("no evidence comment was posted\n{}", run.show()));
+        let lines: Vec<&str> = comment.lines().collect();
+        assert!(
+            lines.contains(&format!("Base: {}", repo.base).as_str()),
+            "{comment}"
+        );
+        assert!(
+            lines.contains(&format!("Merge base judged: {}", repo.mid).as_str()),
+            "{comment}"
+        );
+        assert!(
+            lines.contains(&format!("Main tip: {}", repo.tip).as_str()),
+            "{comment}"
+        );
+        // The comment it posted satisfies the gate's own re-read: only the signature, which
+        // this fixture has no key for, is left.
+        assert!(
+            run.stderr.contains("delivery-gate signature failed"),
+            "{}",
+            run.show()
+        );
+        // A comment written before these lines existed still counts (the stub's own does not
+        // have them), and the exception path is unchanged.
+        gate(&repo, &head).run().passes();
+        let mut case = gate(&repo, &head).class("strict", owner_pair());
+        case.args = [
+            "--exception",
+            "--advisory",
+            "standards=https://example.invalid/a",
+            "--advisory",
+            "spec-security=https://example.invalid/b",
+        ]
+        .map(String::from)
+        .to_vec();
+        let run = case.run();
+        assert!(
+            run.stdout.contains("review EXCEPTION until"),
+            "{}",
+            run.show()
+        );
+        assert!(!run.stderr.contains(LEAN), "{}", run.show());
+    }
+
+    /// A hermetic environment for the daemon and its client: its own state, tracker and
+    /// home, and a `gh` on PATH that answers from the scenario.
+    fn daemon_env(r: &Path, cmd: &mut Command) {
+        cmd.env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", r.join("bin").display()))
+            .env("HOME", r.join("h"))
+            .env("TMPDIR", "/tmp")
+            .env("CADENCE_STATE_DIR", r.join("s"))
+            .env("CADENCE_PM_DIR", r.join("pm"))
+            .env("CAD2100_SCENARIO", r.join("scenario.json"));
+    }
+
+    /// The real daemon binary with a `gh` on its PATH that answers from the repository.
+    struct Daemon {
+        child: Child,
+        root: tempfile::TempDir,
+    }
+
+    impl Daemon {
+        fn start() -> Daemon {
+            let root = tempfile::Builder::new()
+                .prefix("c2100d")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let r = root.path();
+            for dir in ["s", "h", "pm/cadence/CAD-1/reports"] {
+                std::fs::create_dir_all(r.join(dir)).unwrap();
+            }
+            install_stub(&r.join("bin"), &["gh"]);
+            cadence_agent::issue::Pm::init(&r.join("pm")).unwrap();
+            std::fs::write(
+                r.join("pm/cadence/project.yaml"),
+                "key: cadence\nprefix: CAD\nrepos:\n- remote: https://github.com/favcrm/cadence.git\n",
+            )
+            .unwrap();
+            std::fs::write(
+                r.join("pm/cadence/CAD-1/issue.md"),
+                "---\nid: CAD-1\ntitle: the thing\nstatus: doing\npriority: P2\n\
+                 created: 2026-01-01T00:00:00Z\n---\n\nacceptance:\n- works\n",
+            )
+            .unwrap();
+            std::fs::write(r.join("scenario.json"), "{}").unwrap();
+            let log = std::fs::File::create(r.join("daemon.log")).unwrap();
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+            daemon_env(r, &mut cmd);
+            let child = cadence_agent::reaper::spawn(
+                cmd.args(["daemon", "run"])
+                    .stdin(Stdio::null())
+                    .stdout(log.try_clone().unwrap())
+                    .stderr(log),
+            )
+            .unwrap();
+            let mut daemon = Daemon { child, root };
+            let socket = daemon.root.path().join("s/cadence.sock");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+                if let Some(status) = daemon.child.try_wait().unwrap() {
+                    panic!("daemon exited early ({status}): {}", daemon.log());
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "daemon never listened: {}",
+                    daemon.log()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            daemon
+        }
+
+        fn log(&self) -> String {
+            std::fs::read_to_string(self.root.path().join("daemon.log")).unwrap_or_default()
+        }
+
+        fn cli(&self, args: &[&str]) -> (i32, String, String) {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+            daemon_env(self.root.path(), &mut cmd);
+            let out = cadence_agent::reaper::output(cmd.args(args)).unwrap();
+            (
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        }
+
+        /// `cadence delivery requirements` for `scenario`'s head, as the daemon answers it.
+        fn classify(&self, scenario: &Map<String, Value>, knobs: Value) -> (i32, Value, String) {
+            let mut scenario = scenario.clone();
+            if let Value::Object(knobs) = knobs {
+                scenario.extend(knobs);
+            }
+            let head = scenario["head"].as_str().unwrap().to_string();
+            std::fs::write(
+                self.root.path().join("scenario.json"),
+                serde_json::to_vec(&scenario).unwrap(),
+            )
+            .unwrap();
+            let (code, stdout, stderr) = self.cli(&[
+                "delivery",
+                "requirements",
+                "--issue",
+                "CAD-1",
+                "--pr",
+                PR_URL,
+                "--head",
+                &head,
+                "--json",
+            ]);
+            let said = format!("{stdout}{stderr}");
+            let answer = serde_json::from_str(&stdout).unwrap_or(Value::Null);
+            assert!(
+                code != 0 || answer["requirements"].is_object(),
+                "exit 0 without an answer: {said}"
+            );
+            (code, answer, stderr)
+        }
+    }
+
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn class_of(answer: &Value) -> &str {
+        answer["requirements"]["class"].as_str().unwrap_or("")
+    }
+
+    fn paths_of(answer: &Value) -> Vec<String> {
+        let mut paths: Vec<String> = answer["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["path"].as_str().unwrap().to_string())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    fn refused_with(result: &(i32, Value, String), why: &str) {
+        let (code, answer, stderr) = result;
+        assert_ne!(*code, 0, "expected a refusal containing {why:?}: {answer}");
+        assert!(stderr.contains(why), "no {why:?} in: {stderr}");
+    }
+
+    // The classifier: a main-based PR is read from the merge base with main's tip.
+    #[test]
+    fn the_classifier_judges_a_main_based_pr_by_what_would_land() {
+        let repo = Repo::new();
+        let daemon = Daemon::start();
+        let scenario = |head: &str, tip: &str| repo.scenario(head, "main", &repo.base, tip);
+        // Merged main and put the trust-boundary file back: that revert is what lands. Against
+        // the recorded base the same PR is docs plus ordinary code, a lean class.
+        let head = repo.restoring("restore", "src/peer.rs", "docs/y.md");
+        let (code, answer, stderr) = daemon.classify(&scenario(&head, &repo.tip), json!({}));
+        assert_eq!(code, 0, "{stderr}\n{}", daemon.log());
+        assert_eq!(class_of(&answer), "strict", "{answer}");
+        assert_eq!(paths_of(&answer), ["docs/y.md", "src/peer.rs"], "{answer}");
+        assert_eq!(answer["merge_base"], json!(repo.tip), "{answer}");
+        assert_eq!(
+            answer["base"],
+            json!(repo.base),
+            "the recorded base is reported as is"
+        );
+        // A clean update of the branch, with GitHub still counting from the old base, is not
+        // refused over the count.
+        let head = repo.touching("clean", &repo.tip, &["docs/y.md"]);
+        let case = scenario(&head, &repo.tip);
+        assert_ne!(
+            case["changed_files"],
+            json!(1),
+            "the stale count must differ"
+        );
+        let (code, answer, stderr) = daemon.classify(&case, json!({}));
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(class_of(&answer), "routine", "{answer}");
+        assert_eq!(paths_of(&answer), ["docs/y.md"], "{answer}");
+        // A branch cut after `mid` and never updated is judged by its own change only.
+        let head = repo.branch("behind", &repo.mid, |d| put(d, "docs/y.md", "x\n"));
+        let (code, answer, stderr) = daemon.classify(&scenario(&head, &repo.tip), json!({}));
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(paths_of(&answer), ["docs/y.md"], "{answer}");
+        assert_eq!(answer["merge_base"], json!(repo.mid), "{answer}");
+        // A rename is two ends of one change: it classifies, and as strict.
+        let head = repo.merged("rename", &repo.tip, |d| {
+            std::fs::rename(d.join("docs/guide.md"), d.join("docs/guide2.md")).unwrap()
+        });
+        let (code, answer, stderr) = daemon.classify(&scenario(&head, &repo.tip), json!({}));
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(class_of(&answer), "strict", "{answer}");
+        let renamed: Vec<&Value> = answer["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["status"] == "R")
+            .collect();
+        assert_eq!(renamed.len(), 1, "{answer}");
+        assert_eq!(renamed[0]["path"], json!("docs/guide2.md"), "{answer}");
+        // Both lists are read at main's tip. Tightened there, an ordinary edit is sensitive;
+        // the PR's own copy of a list changes nothing.
+        let zone = |main: &str, name: &str| repo.touching(name, main, &["src/zone/lib.rs"]);
+        let head = zone(&repo.tip, "zone");
+        let (code, answer, stderr) = daemon.classify(&scenario(&head, &repo.tip), json!({}));
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(class_of(&answer), "consequential", "{answer}");
+        for (tip, name) in [
+            (repo.main_excluding_zone(), "zone-one"),
+            (repo.main_risking_zone(), "zone-risk"),
+        ] {
+            let head = zone(&tip, name);
+            let loose = json!({"ref_overrides": {
+                head.clone(): {ONE_REVIEW: LOOSE_ONE, RISK_PATHS: real(RISK_PATHS)},
+                repo.base.clone(): {ONE_REVIEW: LOOSE_ONE, RISK_PATHS: real(RISK_PATHS)},
+            }});
+            let (code, answer, stderr) = daemon.classify(&scenario(&head, &tip), loose);
+            assert_eq!(code, 0, "{name}: {stderr}");
+            assert_eq!(class_of(&answer), "strict", "{name}: {answer}");
+        }
+    }
+
+    #[test]
+    fn the_classifier_refuses_a_file_list_or_tip_it_cannot_prove() {
+        let repo = Repo::new();
+        let daemon = Daemon::start();
+        let head = repo.restoring("restore", "src/peer.rs", "docs/y.md");
+        let case = repo.scenario(&head, "main", &repo.base, &repo.tip);
+        // The control: undamaged, it classifies.
+        let (code, answer, stderr) = daemon.classify(&case, json!({}));
+        assert_eq!(code, 0, "{stderr}\n{}", daemon.log());
+        assert_eq!(class_of(&answer), "strict", "{answer}");
+        // 300 files or more is never a complete list.
+        let result = daemon.classify(&case, json!({"compare_pad": 300}));
+        refused_with(&result, "truncated or differs");
+        // A list that omits the very file the trees show changed, or names one they do not.
+        let result = daemon.classify(&case, json!({"compare_drop": ["src/peer.rs"]}));
+        refused_with(&result, "does not match the trees");
+        let extra = json!({"filename": "docs/guide.md", "status": "modified",
+                           "additions": 1, "deletions": 0});
+        let result = daemon.classify(&case, json!({"compare_extra": [extra]}));
+        refused_with(&result, "does not match the trees");
+        // A truncated tree proves nothing either.
+        let result = daemon.classify(&case, json!({"trees_truncated": true}));
+        refused_with(&result, "truncated");
+        // A rename the list reports without its old name.
+        let head = repo.merged("rename", &repo.tip, |d| {
+            std::fs::rename(d.join("docs/guide.md"), d.join("docs/guide2.md")).unwrap()
+        });
+        let case = repo.scenario(&head, "main", &repo.base, &repo.tip);
+        let result = daemon.classify(&case, json!({"compare_strip_previous": true}));
+        refused_with(&result, "does not match the trees");
+        // Main's tip unreadable, empty, malformed or unknown to GitHub.
+        for knob in [
+            json!({"tip_fails": true}),
+            json!({"tip_sha": ""}),
+            json!({"tip_sha": "abc1234"}),
+            json!({"tip_sha": "d".repeat(40)}),
+        ] {
+            let result = daemon.classify(&case, knob.clone());
+            assert_ne!(result.0, 0, "{knob}: {}", result.1);
+            assert!(!result.2.is_empty(), "{knob}: refused without saying why");
+        }
+        let result = daemon.classify(&case, json!({"tip_sha": ""}));
+        refused_with(&result, "cannot read the live tip");
+    }
+
+    #[test]
+    fn a_non_default_base_keeps_the_prs_own_base_and_its_file_count() {
+        let repo = Repo::new();
+        let daemon = Daemon::start();
+        // `staging` is admitted the only way it can be: a policy that names it, approved.
+        std::fs::write(
+            daemon.root.path().join("pm/cadence/PROJECT.md"),
+            "---\ndelivery:\n  integration_branch: staging\n  \
+             reviews: {review: {kind: agent, focus: general}}\n  \
+             risk: [{require: [review]}]\n---\n",
+        )
+        .unwrap();
+        let (code, stdout, stderr) = daemon.cli(&["issue", "project", "approve-work", "cadence"]);
+        assert_eq!(code, 0, "{stdout}{stderr}\n{}", daemon.log());
+        // What main brought in counts as the branch's own change against its base, as before.
+        let head = repo.touching("merged", &repo.tip, &["docs/y.md"]);
+        let case = repo.scenario(&head, "staging", &repo.base, &repo.tip);
+        assert_eq!(case["changed_files"], json!(4));
+        let (code, answer, stderr) = daemon.classify(&case, json!({"tip_fails": true}));
+        assert_eq!(code, 0, "{stderr}\n{}", daemon.log());
+        assert_eq!(class_of(&answer), "strict", "{answer}");
+        assert_eq!(answer["merge_base"], json!(repo.base), "{answer}");
+        assert_eq!(
+            paths_of(&answer),
+            [
+                "docs/y.md",
+                "src/area/lib.rs",
+                "src/peer.rs",
+                "src/review.rs"
+            ],
+            "{answer}"
+        );
+        // And GitHub's file count is still checked against the list for it.
+        let result = daemon.classify(&case, json!({"changed_files": 3}));
+        refused_with(&result, "truncated or differs");
     }
 }
