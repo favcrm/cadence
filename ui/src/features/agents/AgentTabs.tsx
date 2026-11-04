@@ -36,6 +36,8 @@ export interface TabContext {
   onOpenIssue: (id: string) => void;
   /** Set when this page is a profile with no runtime: nothing to read but itself. */
   hired: HiredProfile | undefined;
+  /** The viewer is the operator. A member's events carry no actor, so "not recorded" is only said to the operator. */
+  operator: boolean;
   /** This viewer may save, and the board can take the write now. */
   writable: boolean;
   toast: (kind: ToastMsg["kind"], text: string) => void;
@@ -390,7 +392,7 @@ function History({ c }: { c: TabContext }) {
       key: `e-${e.seq}`,
       name: edit ? t("Instructions edited") : e.kind,
       line: [
-        edit ? (edit.by ? t("By {actor}").replace("{actor}", () => edit.by as string) : t("Who isn’t recorded")) : (e.task_id ?? e.job_id),
+        edit ? (edit.by ? t("By {actor}").replace("{actor}", () => edit.by as string) : c.operator ? t("Who isn’t recorded") : null) : (e.task_id ?? e.job_id),
         fmtTime(e.at),
       ]
         .filter(Boolean)
@@ -400,7 +402,7 @@ function History({ c }: { c: TabContext }) {
         ["Event", `#${e.seq}`],
         ["Task", e.task_id],
         ["Job", e.job_id],
-        ["By", edit?.by],
+        ["Changed by", edit?.by],
         ["When", fmtTime(e.at)],
       ] as Fact[],
     };

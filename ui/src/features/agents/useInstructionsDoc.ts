@@ -164,7 +164,7 @@ export function useInstructionsDoc(opts: {
           if (out.text != null && out.text !== served) {
             setNativeSaved(out.text);
             onSaved();
-            toast("warn", "The board holds a different version, now shown. Your draft is kept.");
+            toast("warn", "The board holds a different version. Your draft is kept. Discard shows theirs; Save replaces it.");
           } else toast("warn", "It did not save. Your draft is kept.");
           return;
         case "refused":

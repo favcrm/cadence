@@ -260,6 +260,7 @@ export default function AgentPage({
     resume,
     onOpenIssue,
     hired,
+    operator: operator === true,
     writable: operator === true && boardBlock === null && !rosterStale,
     toast: onToast,
     stats,

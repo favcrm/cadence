@@ -38,31 +38,41 @@ async function main() {
   const { createRoot } = require("react-dom/client") as typeof ReactDomClient;
   const Body = (require("../src/features/agents/AgentTabs") as { default: typeof AgentTabBodyType }).default;
 
-  const render = async (c: Partial<TabContext>) => {
+  const render = async (c: Partial<TabContext>, open = false) => {
     const host = document.createElement("div");
     document.body.appendChild(host);
     const root = createRoot(host);
     await React.act(async () => { root.render(React.createElement(Body, { tab: "history", c: c as TabContext })); });
-    const text = host.textContent ?? "";
+    if (open) {
+      const row = host.querySelector<HTMLButtonElement>("[data-record-id]");
+      await React.act(async () => { row?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    }
+    const text = open ? (document.body.textContent ?? "") : (host.textContent ?? "");
     await React.act(async () => { root.unmount(); });
     return text;
   };
 
-  const native = await render({
+  const withEvents = (operator: boolean, by: boolean): Partial<TabContext> => ({
+    operator,
     detailNotServed: false,
     detailFailed: false,
     detail: {
       agent: { alias: "a", provider: "claude", endpoint_kind: "tmux", state: "idle", enabled: true },
       queued: 0, unknown: 0, running: [], fenced: false,
       events: [
-        { seq: 2, alias: "a", kind: "instructions_updated", payload: { by: "operator" }, at: "2026-11-02T10:00:00Z" },
-        { seq: 1, alias: "a", kind: "instructions_updated", at: "2026-11-01T10:00:00Z" },
+        { seq: 2, alias: "a", kind: "instructions_updated", payload: by ? { by: "operator" } : undefined, at: "2026-11-02T10:00:00Z" },
       ],
     } as never,
   });
+  const native = await render(withEvents(true, true));
   assert(/Instructions edited/.test(native) && /By operator/.test(native), "native shows who edited the instructions");
-  assert(/Who isn’t recorded/.test(native), "an event with no actor says so");
   assert(/Recent events only/.test(native), "the recent-events note is always there, not only at 20 rows");
+  const drawer = await render(withEvents(true, true), true);
+  assert(/Changed by/.test(drawer) && !/\bBy\b(?! operator)/.test(drawer.replace(/By operator/g, "")), "the item drawer labels the actor with its own key");
+  const unrecorded = await render(withEvents(true, false));
+  assert(/Who isn’t recorded/.test(unrecorded), "the operator is told when an event has no actor");
+  const member = await render(withEvents(false, false));
+  assert(/Instructions edited/.test(member) && !/Who isn’t recorded/.test(member), "a member's events withhold the actor, so nothing says it isn't recorded");
 
   const hosted = await render({
     hired: { id: "ap_1", alias: "a" } as never,

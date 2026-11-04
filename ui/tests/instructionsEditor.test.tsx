@@ -262,6 +262,10 @@ async function main() {
   await flush();
   nativeFails = null;
   nativeStored = "native text";
+  reloads = 0;
+  await type("saved ok");
+  await click("Save");
+  assert(reloads === 1 && nativeStored === "saved ok" && !button("Save"), "a native save reloads the page's stored text");
   await type("lost A");
   nativeFails = () => new TypeError("Failed to fetch");
   await click("Save");
@@ -269,7 +273,7 @@ async function main() {
   reloads = 0;
   toasts.length = 0;
   await click("Check now");
-  assert(toasts.some(([, text]) => /different version, now shown/.test(text)) && !toasts.some(([, text]) => text.startsWith("It did not save")), "native Check reports someone else's text");
+  assert(toasts.some(([, text]) => /different version\. Your draft is kept\. Discard shows theirs/.test(text)) && !toasts.some(([, text]) => text.startsWith("It did not save")), "native Check says the draft is kept and theirs is a Discard away");
   assert(reloads === 1 && area().value === "lost A", "and reloads the page's stored text, keeping the draft");
   await click("Discard");
   nativeFails = () => new TypeError("Failed to fetch");

@@ -230,6 +230,8 @@ async function main() {
   // zh-TW: the History line has its own key; "By" stays "deleted by".
   const by = translateUiText("By {actor}", "zh-TW");
   check(by !== "By {actor}" && !by.includes("刪除") && by.includes("{actor}"), "History 'By' has its own zh-TW key");
+  const changedBy = translateUiText("Changed by", "zh-TW");
+  check(changedBy !== "Changed by" && !changedBy.includes("刪除"), "the History drawer label has its own zh-TW key");
   check(translateUiText("By", "zh-TW") === "刪除者", "the existing 'By' is left alone");
   check(translateUiText("About {n} tokens (estimate)", "zh-TW") !== "About {n} tokens (estimate)", "the estimate translates");
   console.log("instructionsDoc checks passed");
