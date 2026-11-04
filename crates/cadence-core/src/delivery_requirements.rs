@@ -201,6 +201,12 @@ const HUMAN_EXACT: &[&str] = &[
     "crates/cadence-core/src/lib.rs",
     "crates/cadence-core/src/evaluate.rs",
     "src/daemon/unattended_landing.rs",
+    // Module roots that can redirect `delivery_requirements`, the hosted
+    // wrapper of `evaluate`, and the approve route. A floor, not a complete list.
+    "src/issue/mod.rs",
+    "src/lib.rs",
+    "crates/cadence-core/src/wasm.rs",
+    "src/daemon/delivery_rpc.rs",
     "docs/AUDIT.md",
     "tests/safety_floor.rs",
 ];
