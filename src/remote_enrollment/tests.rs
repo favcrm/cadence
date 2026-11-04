@@ -805,8 +805,10 @@ fn browser_continuity_bind_refuses_expired_challenge_before_proof() {
 
 #[test]
 fn browser_continuity_bind_classifies_issuer_refusals_without_losing_pending_key() {
-    // A refusal proves the bind did not commit, so it is definite. An
-    // `authority_unavailable` answer may follow a commit attempt, so it is not.
+    // A refusal is definite for the request it answers. It says nothing about an
+    // earlier attempt whose reply was lost, so no message claims the key is
+    // unbound. An `authority_unavailable` answer may follow a commit attempt on
+    // this request, so it is unknown.
     for (status, code, reason, kind, expected) in [
         (
             "401 Unauthorized",
@@ -982,11 +984,12 @@ fn continuity_post_refuses_redirect_without_forwarding_child_bearer() {
 }
 
 #[test]
-fn continuity_post_bounds_errors_and_parks_lost_replies_as_uncertain() {
+fn continuity_challenge_post_bounds_errors_and_parks_lost_replies_as_uncertain() {
+    const CHALLENGE: &str = "/v1/hosted-cadence/continuity/challenge";
     let oversized = TcpListener::bind("127.0.0.1:0").unwrap();
     let issuer = format!("http://{}", oversized.local_addr().unwrap());
     let server = thread::spawn(move || {
-        let (mut request, _) = continuity_request(&oversized, "/continuity/bind");
+        let (mut request, _) = continuity_request(&oversized, CHALLENGE);
         let body = "X".repeat(MAX_RESPONSE as usize + 1);
         write!(
             request,
@@ -996,19 +999,138 @@ fn continuity_post_bounds_errors_and_parks_lost_replies_as_uncertain() {
         .unwrap();
         request.write_all(body.as_bytes()).unwrap();
     });
-    let error = post_continuity(&issuer, "/continuity/bind", CHILD, json!({})).unwrap_err();
+    let error = post_continuity(&issuer, CHALLENGE, CHILD, json!({})).unwrap_err();
+    assert_eq!(error.kind(), "rejected", "{error}");
     assert!(format!("{error}").contains("Invalid"));
     server.join().unwrap();
 
     let lost = TcpListener::bind("127.0.0.1:0").unwrap();
     let issuer = format!("http://{}", lost.local_addr().unwrap());
     let server = thread::spawn(move || {
-        let (request, _) = continuity_request(&lost, "/continuity/bind");
+        let (request, _) = continuity_request(&lost, CHALLENGE);
         drop(request);
     });
-    let error = post_continuity(&issuer, "/continuity/bind", CHILD, json!({})).unwrap_err();
+    let error = post_continuity(&issuer, CHALLENGE, CHILD, json!({})).unwrap_err();
+    assert_eq!(error.kind(), "rejected", "{error}");
     assert!(format!("{error}").contains("uncertain"));
     server.join().unwrap();
+}
+
+/// A changed enrollment is seen only after `bind_browser` returned, so the bind
+/// may have committed. Every identity field counts, and none reads as refused.
+#[test]
+fn a_changed_enrollment_after_a_bind_is_unknown_never_refused() {
+    let enrolled = || EnrollmentInfo {
+        organization_id: "ws_real".into(),
+        audience: "https://real.board.example.test".into(),
+        subject_id: "hsp_subject".into(),
+        agent_id: "hca_agent".into(),
+        expires_at: 0,
+    };
+    let bound = || ContinuityInfo {
+        lineage_id: LINEAGE.into(),
+        organization_id: "ws_real".into(),
+        audience: "https://real.board.example.test".into(),
+        subject_id: "hsp_subject".into(),
+        agent_id: "hca_agent".into(),
+        generation: 1,
+    };
+    let dir = Path::new("/private/enroll");
+    assert!(require_bound_enrollment(&enrolled(), &bound(), dir).is_ok());
+    let changes: [fn(&mut ContinuityInfo); 4] = [
+        |b| b.organization_id = "ws_other".into(),
+        |b| b.audience = "https://other.board.example.test".into(),
+        |b| b.subject_id = "hsp_other".into(),
+        |b| b.agent_id = "hca_other".into(),
+    ];
+    for change in changes {
+        let mut changed = bound();
+        change(&mut changed);
+        let error = require_bound_enrollment(&enrolled(), &changed, dir).unwrap_err();
+        assert_eq!(error.kind(), "unknown", "{error}");
+        assert!(format!("{error}").contains("/private/enroll"), "{error}");
+    }
+}
+
+/// The order that reaches the check through the real flow: the caller reads one
+/// enrollment, a re-enroll replaces it, and the bind then commits for the
+/// replacement. The caller is told the outcome is unknown, never refused, and a
+/// retry settles it from the saved binding without another request.
+#[test]
+fn a_reenroll_before_a_committed_bind_is_unknown_and_a_retry_settles_it() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let at = now().unwrap();
+    let server = thread::spawn(move || {
+        let (mut challenge, _) =
+            continuity_request(&listener, "/v1/hosted-cadence/continuity/challenge");
+        respond(
+            &mut challenge,
+            &json!({
+                "version":"hosted-cadence-continuity.v1",
+                "challengeId":format!("ch_{}", "A".repeat(43)),
+                "operationId":format!("op_{}", "B".repeat(43)),
+                "nonce":"C".repeat(43), "registryEpoch":"D".repeat(43),
+                "issuedAtMs":at*1000,"expiresAtMs":at*1000+30_000
+            }),
+        );
+        let (mut bind, _) = continuity_request(&listener, "/v1/hosted-cadence/continuity/bind");
+        respond(
+            &mut bind,
+            &json!({
+                "version":"hosted-cadence-continuity.v1", "delivery":"bound",
+                "lineageId":LINEAGE, "keyId":format!("key_{}", "E".repeat(43)),
+                "generation":1, "organizationId":"ws_real",
+                "audience":"https://real.board.example.test", "subjectId":"hsp_subject",
+                "bridgeId":"hcb_bridge", "agentId":"hca_replacement", "credentialKind":"child"
+            }),
+        );
+    });
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("enroll");
+    trust(&dir, &issuer);
+    let browser_child = || {
+        let mut child = record(at + 120);
+        child.issuer = issuer.clone();
+        child.source = EnrollmentSource::Browser;
+        child.service_token = None;
+        child
+    };
+    save(&dir, &browser_child()).unwrap();
+    let enrolled = current(&dir).unwrap();
+
+    let mut replacement = browser_child();
+    replacement.agent_id = "hca_replacement".into();
+    save(&dir, &replacement).unwrap();
+
+    let bound = bind_browser(&dir).unwrap();
+    server.join().unwrap();
+    let error = require_bound_enrollment(&enrolled, &bound, &dir).unwrap_err();
+    assert_eq!(error.kind(), "unknown", "{error}");
+    assert!(matches!(
+        read_continuity_locked(&dir).unwrap().state,
+        ContinuityState::Bound
+    ));
+
+    // The listener is gone, so a retry that sent any request would fail.
+    let retried = bind_browser(&dir).unwrap();
+    assert!(require_bound_enrollment(&current(&dir).unwrap(), &retried, &dir).is_ok());
+}
+
+/// The recovery command stays pasteable, and the message states when it stops
+/// working and what to do then.
+#[test]
+fn the_unknown_bind_message_quotes_its_command_and_states_the_limit() {
+    let shown = continuity_unknown(Path::new("/private/has space")).to_string();
+    assert!(
+        shown.contains("bind-continuity --enrollment-dir '/private/has space'`"),
+        "{shown}"
+    );
+    assert!(shown.contains("five minutes"), "{shown}");
+    assert!(
+        shown.contains("new private enrollment directory"),
+        "{shown}"
+    );
 }
 
 #[test]

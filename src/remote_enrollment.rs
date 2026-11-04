@@ -334,7 +334,7 @@ impl ContinuityRecord {
             }
         {
             return Err(reject(
-                "Hosted continuity record does not match browser enrollment",
+                "Hosted continuity record does not match browser enrollment; use a new private enrollment directory",
             ));
         }
         let seed = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -484,12 +484,36 @@ struct ContinuityBindReply {
 }
 
 fn continuity_unknown(dir: &Path) -> Error {
+    let shown = dir.display().to_string();
     Error::unknown(format!(
-        "hosted continuity binding is unknown; retain the pending key in {} and reconcile \
-         with `cadence remote enrollment bind-continuity --enrollment-dir {}`",
-        dir.display(),
-        dir.display()
+        "hosted continuity binding is unknown; retain the pending key in {shown} and reconcile \
+         with `cadence remote enrollment bind-continuity --enrollment-dir {}` before this \
+         enrollment expires, five minutes at most after it was issued. After that this directory \
+         cannot finish: repeat `browser` with owner consent in a new private enrollment directory",
+        shell_quote(&shown)
     ))
+}
+
+/// The enrollment read before a bind must still be the one the bind answered
+/// for. By then `bind_browser` has returned and the binding may be committed, so
+/// a mismatch is never a definite refusal: the caller inspects before repeating.
+pub fn require_bound_enrollment(
+    enrolled: &EnrollmentInfo,
+    bound: &ContinuityInfo,
+    dir: &Path,
+) -> Result<()> {
+    if bound.organization_id() != enrolled.organization_id()
+        || bound.audience() != enrolled.audience()
+        || bound.subject_id() != enrolled.subject_id()
+        || bound.agent_id() != enrolled.agent_id()
+    {
+        return Err(Error::unknown(format!(
+            "Browser enrollment changed during continuity binding; inspect the original \
+             enrollment directory {} before retrying",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Bind a browser child while its short-lived bearer and original owner consent

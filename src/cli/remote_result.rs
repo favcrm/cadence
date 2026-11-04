@@ -266,16 +266,7 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                             Error::rejected(message)
                         }
                     })?;
-                    if bound.organization_id() != enrolled.organization_id()
-                        || bound.audience() != enrolled.audience()
-                        || bound.subject_id() != enrolled.subject_id()
-                        || bound.agent_id() != enrolled.agent_id()
-                    {
-                        return Err(Error::unknown(format!(
-                            "Browser enrollment changed after continuity binding; inspect the original enrollment directory {} before retrying",
-                            enrollment_dir.display()
-                        )));
-                    }
+                    remote_enrollment::require_bound_enrollment(&enrolled, &bound, enrollment_dir)?;
                     continuity = Some(json!({"lineage":bound.lineage_id(),
                         "generation":bound.generation(),"state":"locally_bound",
                         "remoteAuthority":"unverified"}));
@@ -285,15 +276,7 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
             EnrollmentAction::BindContinuity { enrollment_dir } => {
                 let enrolled = remote_enrollment::current(enrollment_dir)?;
                 let bound = remote_enrollment::bind_browser(enrollment_dir)?;
-                if bound.organization_id() != enrolled.organization_id()
-                    || bound.audience() != enrolled.audience()
-                    || bound.subject_id() != enrolled.subject_id()
-                    || bound.agent_id() != enrolled.agent_id()
-                {
-                    return Err(Error::rejected(
-                        "Browser enrollment changed before continuity bind",
-                    ));
-                }
+                remote_enrollment::require_bound_enrollment(&enrolled, &bound, enrollment_dir)?;
                 continuity = Some(json!({"lineage":bound.lineage_id(),
                     "generation":bound.generation(),"state":"locally_bound",
                     "remoteAuthority":"unverified"}));
