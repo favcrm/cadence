@@ -63,21 +63,33 @@ jobs:
             echo "tag $TAG is not a published GitHub Release" >&2
             exit 1
           fi
-          # CAD-2110: only the tag's own run counts: it ran for this tag
-          # (head_branch), at this commit, in this repository and not a
-          # fork's (both run repository ids equal the repository's id).
+          # CAD-2110: only a run of the tag counts: head_branch is the tag,
+          # head_sha the tag commit, and the run belongs to this repository
+          # (not a fork's). Then, newest first, the first run that is a push
+          # of .github/workflows/ci.yml: a same-named branch's pull_request
+          # run reports the same head_branch/head_sha, but ci.yml pushes
+          # cover only main and v* tags. The conclusion is deliberately not
+          # checked: a tag whose run ended in failure after publishing is
+          # exactly what this workflow retries.
           repo_id=$(gh api "repos/$GH_REPO" --jq .id)
-          artifact=$(gh api "repos/$GH_REPO/actions/artifacts?name=release-bundles-$TAG&per_page=100" \
-            | jq -c --arg sha "$sha" --arg tag "$TAG" --argjson repo "$repo_id" '
+          candidates=$(gh api "repos/$GH_REPO/actions/artifacts?name=release-bundles-$TAG&per_page=100" \
+            | jq -r --arg sha "$sha" --arg tag "$TAG" --argjson repo "$repo_id" '
                 [.artifacts[] | select(.expired == false
                   and .workflow_run.head_sha == $sha
                   and .workflow_run.head_branch == $tag
                   and .workflow_run.repository_id == $repo
                   and .workflow_run.head_repository_id == $repo)]
-                | sort_by(.id) | last // empty')
-          run_id=$(printf '%s' "$artifact" | jq -r '.workflow_run.id // empty')
-          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
-            echo "no release-bundles artifact for $TAG at $sha" >&2
+                | sort_by(.id) | reverse | .[].workflow_run.id')
+          run_id=""
+          for candidate in $candidates; do
+            if gh api "repos/$GH_REPO/actions/runs/$candidate" \
+                | jq -e '.event == "push" and .path == ".github/workflows/ci.yml"' >/dev/null; then
+              run_id=$candidate
+              break
+            fi
+          done
+          if [ -z "$run_id" ]; then
+            echo "no release-bundles artifact from a ci.yml push run for $TAG at $sha" >&2
             exit 1
           fi
           {
@@ -131,12 +143,16 @@ jobs:
           if [ -f dist/bundles/bundles/build-attestation-x86_64-linux.jsonl ]; then
             mv dist/bundles/bundles/*.jsonl dist/bundles/
           fi
-          # CAD-2110: the publication receipt is attested by the tag's own
-          # approved run. Compare its tag, repository, source, release date
-          # and archive digests with the bytes about to be written, and
-          # refuse before the publisher makes any storage call. The receipt
-          # names exactly the three archives; their `.sha256` files were
-          # already checked against the archives in the download step.
+          # CAD-2110: before the publisher makes any storage call, compare
+          # what is about to be written with what the tag's run recorded.
+          # Checked here: the three archives against publication-receipt.json
+          # (tag, repo, source, release date, exactly these archives and
+          # digests, no other top-level key), and each .sha256 file byte for
+          # byte against the canonical line for its archive. NOT checked
+          # here: the receipt's own attestation, the three build
+          # attestations and publication-attestation.jsonl. They are neither
+          # verified nor content-checked; they are trusted through the run
+          # selection above, and clients verify them offline.
           test -f dist/bundles/publication-receipt.json
           expected=$(for target in x86_64-linux aarch64-linux aarch64-macos; do
             asset="cadence-$TAG-$target.tar.gz"
@@ -145,11 +161,19 @@ jobs:
           done | jq -s 'from_entries')
           jq -e --arg tag "$TAG" --arg repo "$GH_REPO" --arg source "$SOURCE_SHA" \
               --arg published_at "$PUBLISHED_AT" --argjson archives "$expected" '
-            .schema == 1 and .tag == $tag and .repo == $repo
+            (keys | sort) == ["archives", "published_at", "repo", "schema", "source_sha", "tag"]
+            and .schema == 1 and .tag == $tag and .repo == $repo
             and .source_sha == $source and .published_at == $published_at
             and .archives == $archives' dist/bundles/publication-receipt.json >/dev/null || {
             echo "publication-receipt.json does not match tag $TAG, source $SOURCE_SHA and the downloaded archives" >&2
             exit 1; }
+          for target in x86_64-linux aarch64-linux aarch64-macos; do
+            asset="cadence-$TAG-$target.tar.gz"
+            printf '%s  %s\n' "$(sha256sum "dist/$asset" | cut -d' ' -f1)" "$asset" \
+              | cmp -s - "dist/$asset.sha256" || {
+              echo "$asset.sha256 is not the canonical checksum line for $asset" >&2
+              exit 1; }
+          done
           args=()
           for target in x86_64-linux aarch64-linux aarch64-macos; do
             asset="cadence-$TAG-$target.tar.gz"
