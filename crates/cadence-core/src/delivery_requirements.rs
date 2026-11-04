@@ -13,7 +13,8 @@
 //! input is evidence the caller retrieved itself (the daemon's own read
 //! or the enqueue script's git/gh reads). Trusted-base lists
 //! (`docs/roles/risk-paths.toml`, `docs/roles/one-review-paths.toml`)
-//! arrive as texts read at the PR's base, so a PR can never classify
+//! arrive as texts read at the PR's anchor (the default branch's live tip for
+//! a PR based on it, else the PR's base), so a PR can never classify
 //! itself under rules it edited.
 //!
 //! `classify` returns one of three classes:
@@ -57,9 +58,9 @@ pub struct Change {
     pub path: String,
 }
 
-/// The trusted-base list texts, read at the PR's base commit (the same
+/// The trusted list texts, read at the PR's anchor commit (the same
 /// reads `scripts/enqueue-reviewed` makes through
-/// `gh api repos/<repo>/contents/<file>?ref=<base>`). `None` means
+/// `gh api repos/<repo>/contents/<file>?ref=<anchor>`). `None` means
 /// unreadable — which fails closed, never to a weaker requirement.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrustedLists<'a> {
