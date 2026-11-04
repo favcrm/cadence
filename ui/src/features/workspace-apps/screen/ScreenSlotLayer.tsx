@@ -8,7 +8,7 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
   const [input, setInput] = useState(card.input?.value ?? "");
   const pressed = useRef(0);
   const titles: Record<string, string> = {
-    "records.csv.import": "Import this CSV plan?", "records.csv.confirm": "Confirm this CSV plan?", "content.approve": "Approve this content revision?",
+    "records.csv.import": "Import this CSV plan?", "records.csv.confirm": "Confirm this CSV plan?", "content.approve": "Approve this email?",
     "smtp.manage": "Open email sending settings?", "smtp.bind": "Bind this SMTP connection?", "smtp.rebind": "Replace this SMTP binding?", "smtp.revoke": "Revoke this SMTP binding?",
     "smtp.test-send": "Send one test email?", "sends.approve": "Approve this frozen send?", "sends.resolve": "Resolve this uncertain delivery?",
     "origin.manage": "Change the daemon-global unsubscribe origin?", "chat.campaign.open": "Open this campaign's assistant?", "chat.campaign.brief": "Send this campaign brief?", "chat.whatsapp.brief": "Ask the assistant to draft this reply?",
@@ -19,10 +19,13 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
   };
   const field = card.input;
   const invalid = field?.choices ? !field.choices.some(c => c.value === input) : field?.field === "to_email" ? !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) : false;
-  return <WorkspaceDialog title={titles[card.operation] ?? "Confirm app action?"} className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
+  return <WorkspaceDialog title={card.title ?? titles[card.operation] ?? "Confirm app action?"} className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
     <div className="wa-stack" data-host-confirm={view.token.slice(0, 8)}>
-      <p>This is a Cadence host confirmation. Facts below came from the current server receipt, not the app frame.</p>
-      <dl>{card.facts.map((fact, i) => <div key={i}><dt>{fact.label}</dt><dd style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{fact.value}</dd></div>)}</dl>
+      {card.note ? <p>{card.note}</p> : <p>This is a Cadence host confirmation. Facts below came from the current server receipt, not the app frame.</p>}
+      <dl>{card.facts.map((fact, i) => <div key={i}><dt>{fact.label}</dt><dd style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{fact.strong ? <strong style={{ fontSize: "1.25em" }}>{fact.value}</strong> : fact.value}</dd></div>)}</dl>
+      {!!card.details?.length && <details><summary>Technical details</summary>
+        <dl>{card.details.map((fact, i) => <div key={i}><dt>{fact.label}</dt><dd className="num" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{fact.value}</dd></div>)}</dl>
+      </details>}
       {field && <label className="wa-stack">{field.label}
         {field.choices ? <select value={input} onChange={e => setInput(e.target.value)} disabled={view.pending}><option value="">Select…</option>{field.choices.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}</select>
           : field.field === "brief" ? <textarea value={input} readOnly rows={6} />

@@ -119,7 +119,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
         const card = recordCard(operation, facts, object(raw.card.live) ? raw.card.live : undefined);
         let used = false;
         const expires = Date.now() + 60000;
-        return { label: "Confirm", records: true, recordCard: card, run: async input => {
+        return { label: card.confirm ?? "Confirm", records: true, recordCard: card, run: async input => {
           if (used || !current() || Date.now() >= expires) return { ok: false, refusal: { code: "expired", text: "This confirmation has expired." } };
           used = true; // Never retry a confirmation, including an uncertain network outcome.
           try {
@@ -154,6 +154,46 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
   };
 }
 
+/** The subject as an owner reads it: the merge tag shows as "{first name}", never its fallback. */
+const plainSubject = (subject: string) => subject.replace(/\{\{\s*first_name\s*(?:\|[^}]*)?\}\}/g, "{first name}");
+
+/**
+ * CAD-2146: send approval, content approval and test send in plain words, the
+ * values an owner decides on first and the ids, digests and revisions collapsed.
+ * Native and hosted prepare replies carry different facts, so every row is
+ * optional except what recordCard already requires; a missing fact is omitted.
+ */
+function plainCard(operation: "sends.approve" | "content.approve" | "smtp.test-send", facts: ActionArgs, content: ActionArgs, freeze: ActionArgs | null): RecordCard {
+  const facts_: RecordCard["facts"] = [], details: NonNullable<RecordCard["details"]> = [];
+  const add = (rows: { label: string; value: string }[], label: string, value: unknown) => { if (value !== undefined && value !== null && value !== "") rows.push({ label, value: typeof value === "object" ? JSON.stringify(value) : String(value) }); };
+  const subject = typeof facts.subject === "string" ? facts.subject : typeof content.subject === "string" ? content.subject : undefined;
+  const outer = object(facts.binding) ? facts.binding : null;
+  const binding = outer && object(outer.binding) ? outer.binding : outer;
+  const sender = binding && object(binding.sender) ? binding.sender : object(facts.sender) ? facts.sender : null;
+  const address = sender && typeof sender.address === "string" ? sender.address : undefined;
+  const from = address ? (typeof sender?.name === "string" && sender.name ? `${sender.name} <${address}>` : address) : undefined;
+  const bindingDetails = () => { if (binding) for (const [label, key] of [["SMTP connection", "connection_id"], ["Binding revision", "link_revision"], ["Binding state", "state"], ["Binding digest", "digest"]]) add(details, label, binding[key]); };
+  if (subject !== undefined) add(facts_, operation === "content.approve" ? "Subject" : "Email", plainSubject(subject));
+  if (operation === "content.approve") {
+    add(facts_, "Version", content.revision ?? facts.revision);
+    add(details, "Campaign", content.campaign_id ?? facts.campaign_id); add(details, "Name", content.name); add(details, "Content digest", content.content_digest ?? facts.content_digest);
+    return { operation, title: "Approve this email?", note: "Nothing is sent yet.", confirm: "Approve", facts: facts_, details };
+  }
+  if (operation === "smtp.test-send") {
+    add(facts_, "From", from);
+    add(details, "Campaign", content.campaign_id ?? facts.campaign_id); bindingDetails();
+    return { operation, title: "Send one test email?", note: "Sends this email to one address.", confirm: "Send test", facts: facts_, details, input: { field: "to_email", label: "Send to" } };
+  }
+  const count = Number(freeze?.final_count), people = `${count.toLocaleString("en")} ${count === 1 ? "person" : "people"}`;
+  const base = freeze && object(freeze.base) ? freeze.base : null;
+  const audience = base?.mode === "all" ? "Everyone" : base?.mode === "segment" && typeof base.segment_id === "string" ? `Segment ${base.segment_id}` : base?.mode === "custom" && Array.isArray(base.customer_ids) ? `${base.customer_ids.length} selected contacts` : freeze?.freeze_id;
+  add(facts_, "Audience", audience); facts_.push({ label: "Recipients", value: count.toLocaleString("en"), strong: true }); add(facts_, "From", from);
+  add(details, "Send", facts.send_id); add(details, "Campaign", facts.campaign_id); add(details, "Content version", facts.content_revision); add(details, "Content digest", facts.content_digest);
+  add(details, "Send digest", facts.send_digest); add(details, "Audience id", freeze?.freeze_id); add(details, "Audience digest", freeze?.digest); add(details, "Recipient limit", freeze?.max_recipients);
+  bindingDetails(); add(details, "Unsubscribe origin", facts.unsubscribe_origin);
+  return { operation, title: `Send to ${people}?`, note: "This can't be undone.", confirm: `Send to ${people}`, facts: facts_, details };
+}
+
 function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionArgs): RecordCard {
   const rows: RecordCard["facts"] = [];
   const show = (label: string, value: unknown) => { if (value !== undefined && value !== null) rows.push({ label, value: typeof value === "object" ? JSON.stringify(value) : String(value) }); };
@@ -166,6 +206,7 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
   const freeze = audience && object(audience.freeze) ? audience.freeze : null;
   if (freeze) { show("Audience", freeze.freeze_id); show("Recipients", freeze.final_count); show("Recipient ceiling", freeze.max_recipients); show("Audience digest", freeze.digest); }
   if (operation === "sends.approve" && (!freeze || !Number.isSafeInteger(freeze.final_count) || typeof facts.content_revision !== "number" || typeof facts.send_digest !== "string")) throw new ApiError("Incomplete frozen send facts", 502);
+  if (operation === "sends.approve" || operation === "content.approve" || operation === "smtp.test-send") return plainCard(operation, facts, content, freeze);
   show("Frozen send digest", facts.send_digest);
   const outer = object(facts.binding) ? facts.binding : null;
   const binding = outer && object(outer.binding) ? outer.binding : outer;
@@ -243,7 +284,6 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
   const card: RecordCard = { operation, facts: rows };
   if (operation === "works.review") card.input = { field: "choice", label: "Your decision on this exact revision", choices: [{ value: "approve", label: "Approve this revision" }, { value: "changes", label: "Request changes" }] };
   if (operation === "works.export") card.input = { field: "choice", label: "Export format for this approved revision", choices: [{ value: "html", label: "HTML" }, { value: "markdown", label: "Markdown" }] };
-  if (operation === "smtp.test-send") card.input = { field: "to_email", label: "Test recipient (one email address)" };
   if (operation === "sends.resolve") card.input = { field: "resolution", label: "Resolve uncertain outcome — this does not resend", choices: [{ value: "accepted", label: "Accepted by the server" }, { value: "failed", label: "Failed" }] };
   if (operation === "origin.manage") card.input = { field: "unsubscribe_origin", label: "Daemon-global unsubscribe origin (blank clears it)", value: typeof facts.unsubscribe_origin === "string" ? facts.unsubscribe_origin : "" };
   if (operation === "chat.campaign.brief") { show("Effect", facts.effect); card.input = { field: "brief", label: "Send this brief to the assistant", value: typeof facts.brief === "string" ? facts.brief : "" }; }
