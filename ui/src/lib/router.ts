@@ -28,6 +28,7 @@ import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } fr
  *   /wiki/search[/<query>]     full-text search
  *   /setup                     first-run setup
  *   /settings[/memory|update|account|permissions|connections]  model defaults, memory, update, account, master permissions, connections
+ *   /settings/members                       hosted only: the workspace's people (CAD-2115)
  *   /settings/connections/new[/<provider>]   the add-connection chooser and one pinned service's setup
  *   /settings/connections/account/<id>       one connection's detail page
  *   /login                     a `cadence ui login` link lands here
@@ -42,7 +43,11 @@ import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } fr
  */
 
 export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows" | "settings";
-export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences" | "general" | "custody";
+/** `members` is hosted-only (CAD-2115): a native board serves no tenant member
+ *  list, so nothing links there. `matchRoute` still parses the URL — dropping
+ *  it would turn a stale link into "nothing lives here"; `settingsRedirect`
+ *  moves it off a board whose `/api/meta` does not name it. */
+export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences" | "general" | "custody" | "members";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). `trash`
  *  is the operator's deleted-landing browser (CAD-2018); its selector is a
  *  server-issued `.trash/…` value, never a logical wiki path. */
@@ -298,6 +303,7 @@ export function matchRoute(pathname: string): Route {
       if (a === "permissions") return { screen: "settings", section: "permissions" };
       if (a === "email") return { screen: "settings", section: "email" };
       if (a === "general") return { screen: "settings", section: "general" };
+      if (a === "members") return { screen: "settings", section: "members" };
       if (a === "custody") return { screen: "settings", section: "custody" };
       if (a === "templates") return { screen: "settings", section: "templates" };
       if (a === "connections") {
@@ -407,6 +413,7 @@ export function routePath(route: Route): string {
       }
       if (route.section === "email") return "/settings/email";
       if (route.section === "general") return "/settings/general";
+      if (route.section === "members") return "/settings/members";
       if (route.section === "custody") return "/settings/custody";
       if (route.section === "templates") return "/settings/templates";
       return "/settings";

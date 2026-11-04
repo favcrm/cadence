@@ -17,10 +17,10 @@ const MEMBER = { settings_sections: ["preferences", "members"] };
 
 equal(
   flat(OWNER),
-  ["Preferences", "Connections", "Email sending", "General", "Status"],
+  ["Preferences", "Members", "Connections", "Email sending", "General", "Status"],
   "a hosted owner sees only what the board serves",
 );
-equal(flat(MEMBER), ["Preferences"], "a member sees less, and nothing this build has no page for");
+equal(flat(MEMBER), ["Preferences", "Members"], "a member can reach the read-only directory");
 for (const absent of ["Agents", "Memory", "Master permissions", "Advanced custody"])
   if (flat(OWNER).includes(absent)) throw new Error(`${absent} must be hidden on a hosted board`);
 equal(
@@ -33,10 +33,12 @@ equal(
   true,
   "Account keeps its own flag",
 );
-equal(settingsRedirect("models", OWNER), "connections", "bare /settings opens on a working page");
-equal(settingsRedirect("permissions", OWNER), "connections", "a direct link to a hidden section moves");
+equal(settingsRedirect("models", OWNER), "members", "bare /settings opens on a working page");
+equal(settingsRedirect("permissions", OWNER), "members", "a direct link to a hidden section moves");
 equal(settingsRedirect("connections", OWNER), null, "a served section stays");
-equal(settingsRedirect("models", MEMBER), "preferences", "a member lands on a page they have");
+equal(settingsRedirect("models", MEMBER), "members", "a member lands on a page they have");
 equal(settingsRedirect("models", null), null, "nothing moves before the board has answered");
 equal(settingsRedirect("permissions", {}), null, "a board that states nothing keeps every route");
+equal(settingsRedirect("members", {}), "models", "a native board does not expose hosted members");
+equal(settingsRedirect("members", { settings_sections: ["preferences"] }), "preferences", "a board without the capability refuses the direct link");
 equal(settingsLabel("update"), "Status", "the crumb names the section");

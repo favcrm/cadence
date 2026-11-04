@@ -31,6 +31,7 @@ import Milestones from "./features/projects/Milestones";
 import MasterPermissions from "./features/settings/MasterPermissions";
 import CanvasDrawer from "./features/canvas/CanvasDrawer";
 import Memory from "./features/settings/Memory";
+import Members from "./features/settings/Members";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
 import Connections from "./features/settings/Connections";
@@ -1497,6 +1498,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               <Memory project={project} projects={projects} projectHref={filterHref} onError={writeError} />
             )}
             {route.section === "models" && <ModelDefaults />}
+            {/* CAD-2115: Members is hosted-only. The board names it in
+                `settings_sections` when it serves the page, and a native board
+                never does — so a direct link here mounts nothing, and
+                `settingsRedirect` has already moved the URL off. */}
+            {route.section === "members" && meta?.settings_sections?.includes("members") && (
+              <Members viewer={viewer} />
+            )}
             {route.section === "connections" && (
               <Connections viewer={viewer} page={route.page} hostedBoard={Boolean(meta?.settings_sections)} />
             )}
