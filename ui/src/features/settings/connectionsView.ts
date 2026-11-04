@@ -39,6 +39,15 @@ export function pinWord(status: Pick<Connection["status"], "manifest_status">): 
   }
 }
 
+/**
+ * Does the owner have something to fix? Only when the account itself can't be
+ * used. A contract pin that differs is a fact about the deployed provider, not
+ * the account, and nothing the owner does changes it, so it raises no flag.
+ */
+export function connectionsNeedingAttention(rows: readonly Connection[]): number {
+  return rows.filter((row) => row.kind === "enrolled" && !isAvailable(row)).length;
+}
+
 /** The connection's readiness in one plain line. */
 export function readinessText(row: Connection): string {
   if (isLocalOutbox(row)) return "Built-in — always present, no credential to manage.";

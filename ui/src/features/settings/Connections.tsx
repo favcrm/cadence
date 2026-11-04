@@ -30,7 +30,6 @@ import {
   smtpUnreadable,
   smtpErrorMessage,
   verificationSupport,
-  type ServiceGroup,
   type VerificationOutcome,
 } from "./connectionsView";
 import { PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
@@ -38,7 +37,7 @@ import { errorCopy, openTrustedEntry } from "../connections/credentialRequestVie
 import { useProtectedEntry } from "../connections/useProtectedEntry";
 import { RecentCredentialRequestList } from "../connections/CredentialRequestCard";
 import SmtpAccountForm from "./SmtpAccountForm";
-import ProtectedManagement from "./ProtectedManagement";
+import SettingsDrawer from "./SettingsDrawer";
 import { connectionLabel } from "../../lib/connections";
 import "./connections.css";
 import { useTranslate } from "../../lib/locale";
@@ -221,7 +220,7 @@ export default function Connections({
  */
 /** The daemon's own custody facts, stated as reported — never inferred from
  *  a stored flag and never presented as protection when isolation is absent. */
-function CustodyStatusPanel({ canWrite }: { canWrite: boolean }) {
+export function CustodyStatusPanel({ canWrite }: { canWrite: boolean }) {
   const t = useTranslate();
   const [custody, setCustody] = useState<{
     configured: boolean;
@@ -326,6 +325,8 @@ function ConnectionsIndex({
     if (providersRes) void providersRes.revalidate();
   };
   const groups = serviceGroups(providers, rows);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const open = rows.find((row) => row.id === openId) ?? null;
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-title">
@@ -335,17 +336,11 @@ function ConnectionsIndex({
           <p className="text-label text-ink-400 mt-1 break-words">{t("The accounts your apps use. Credentials stay here; each app chooses how it uses them.")}</p>
         </div>
         {viewer.operator && (
-          <div className="flex flex-wrap gap-2 shrink-0 items-center">
+          <div className="flex flex-wrap gap-1 shrink-0 items-center">
             <StaleChip state={listState ?? emptyGate} />
             <StaleChip state={providersState ?? emptyGate} />
-            <Button
-              variant="ghost"
-              icon={<IconRefresh />}
-              loading={Boolean(listState?.inFlight || providersState?.inFlight)}
-              onClick={refresh}
-            >{t("Refresh")}</Button>
             {canWrite && (
-              <Button variant="primary" href={connectionAddHref()}>{t("Add connection")}</Button>
+              <Link href={connectionAddHref()} className="settings-quiet">{t("+ Add")}</Link>
             )}
           </div>
         )}
@@ -368,8 +363,7 @@ function ConnectionsIndex({
         <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
       ) : (
         <>
-          <div className="space-y-3 mb-3">
-            <CustodyStatusPanel canWrite={canWrite} />
+          <div className="mb-3">
             <RecentCredentialRequestList />
           </div>
           <ResourceGate
@@ -392,126 +386,53 @@ function ConnectionsIndex({
           )}
           {listState?.data && (
             <div className="space-y-3 min-w-0">
-              {groups.length === 0 ? (
-                <section className="card px-4 py-3.5 min-w-0" aria-label={t("connections")}>
-                  <p className="text-label text-ink-500">{t("No services are registered and no accounts are connected.")}</p>
-                  {canWrite && (
-                    <p className="text-label mt-2">
-                      <Link href={connectionAddHref()} className="lnk">{t("Add a connection")}</Link>
-                    </p>
-                  )}
+              {rows.length === 0 ? (
+                <section className="settings-rows px-4 py-6 text-center" aria-label={t("connections")}>
+                  <p className="text-secondary text-ink-300">{t("No accounts connected")}</p>
+                  <p className="text-label text-ink-500 mt-1">{t("Connect an account so your apps can post or send email.")}</p>
                 </section>
               ) : (
-                groups.map((group) => (
-                  <ServiceSection
-                    key={group.provider}
-                    group={group}
-                    canWrite={canWrite}
-                  />
-                ))
+                <ul className="settings-rows" aria-label={t("connections")}>
+                  {rows.map((row) => {
+                    const flagged = row.kind === "enrolled" && !isAvailable(row);
+                    const service = groups.find((group) => group.provider === row.provider)?.label ?? row.provider;
+                    return (
+                      <li key={row.id}>
+                        <button type="button" className="settings-row" data-record-id={row.id} onClick={() => setOpenId(row.id)}>
+                          <span className="settings-row-text">
+                            <b>{service.charAt(0).toUpperCase() + service.slice(1)}</b>
+                            <small>{isSmtpSender(row) && row.smtp?.sender ? row.smtp.sender : row.account}</small>
+                          </span>
+                          {flagged && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
               )}
             </div>
           )}
-          <div className="mt-3">
-            <ProtectedManagement canWrite={canWrite} />
-          </div>
+          {open && (
+            <SettingsDrawer
+              title={isSmtpSender(open) && open.smtp?.sender ? open.smtp.sender : open.account}
+              onClose={() => setOpenId(null)}
+            >
+              <ConnectionDetail
+                row={open}
+                provider={providers.find((item) => item.provider === open.provider) ?? null}
+                capabilities={connectionCapabilities(providers, open.provider)}
+                canWrite={canWrite}
+                standalone
+                providerMetaPending={providersState?.status !== "ok" && !catalogUnavailable}
+                onChanged={refresh}
+                onRevoked={() => {
+                  setOpenId(null);
+                  refresh();
+                }}
+              />
+            </SettingsDrawer>
+          )}
         </>
-      )}
-    </section>
-  );
-}
-
-/**
- * One service group on the index: the provider heading, its account
- * links and a setup action when the service offers a reviewed
- * enrollment. Never silently drops an unavailable provider or an
- * orphaned account.
- */
-function ServiceSection({
-  group,
-  canWrite,
-}: {
-  group: ServiceGroup;
-  canWrite: boolean;
-}) {
-  const t = useTranslate();
-  const support = enrollmentSupport(group.info);
-  return (
-    <section
-      className="card px-4 py-3.5 min-w-0"
-      aria-label={t("{label} connections").replace("{label}", () => String(group.label ?? ""))}
-    >
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-2">
-        <h2 className="slabel">{group.label}</h2>
-        <span className="text-micro text-ink-500">
-          {group.connections.length === 0
-            ? t("nothing connected")
-            : t("{count} connected").replace("{count}", String(group.connections.length))}
-        </span>
-        {group.builtin && (
-          <span className="chip bg-ink-800 text-ink-300">{t("built-in")}</span>
-        )}
-        {!group.builtin && canWrite && support.shapes.length > 0 && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="ml-auto"
-            href={connectionAddProviderHref(group.provider)}
-          >
-            {t("Set up {label}").replace("{label}", () => String(group.label ?? ""))}</Button>
-        )}
-        {!group.builtin && canWrite && group.provider === "smtp" && group.info === null && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="ml-auto"
-            href={connectionAddProviderHref("smtp")}
-          >
-            {group.connections.length === 0 ? t("Add email account") : t("Replace email account")}</Button>
-        )}
-      </div>
-      {group.connections.length === 0 ? (
-        <p className="text-label text-ink-500 break-words">
-          {group.builtin
-            ? t("No built-in accounts.")
-            : support.shapes.length === 0
-              ? support.reason
-              : t("No {label} account connected yet.").replace("{label}", () => String(group.label ?? ""))}
-        </p>
-      ) : (
-        <ul className="space-y-1.5">
-          {group.connections.map((row) => (
-            <li key={row.id}>
-              <Link
-                href={connectionDetailHref(row.id)}
-                className="conn-row"
-              >
-                <span className="conn-row-main">
-                  <span className="text-label font-medium text-ink-100 min-w-0 break-words">
-                    {isSmtpSender(row) && row.smtp?.sender ? row.smtp.sender : connectionLabel(row)}
-                  </span>
-                  <span
-                    className={`chip ${row.kind === "builtin" ? "bg-ink-800 text-ink-300" : "bg-accent/15 text-accent"}`}
-                  >
-                    {row.kind === "builtin" ? t("built-in") : t("enrolled")}
-                  </span>
-                  {!isAvailable(row) && (
-                    <span className="chip bg-warn/10 text-warn">{t("unavailable")}</span>
-                  )}
-                </span>
-                <span className="conn-row-sub text-micro text-ink-500 break-words">
-                  {readinessText(row)}
-                </span>
-              </Link>
-            </li>
-          ))}
-        </ul>
-      )}
-      {group.builtin && (
-        <p className="text-micro text-ink-500 mt-2 break-words">{t("Built-in accounts are always present — they carry no credential and cannot be edited or disconnected here.")}</p>
-      )}
-      {!group.builtin && !group.info && group.provider !== "smtp" && (
-        <p className="text-micro text-ink-500 mt-2 break-words">{t("This provider's service metadata could not be loaded — the account stays under its recorded name. Refresh services; a failed load is not proof the provider was removed.")}</p>
       )}
     </section>
   );

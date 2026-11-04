@@ -3,7 +3,7 @@ import { useLocale } from "../../lib/locale";
 import { setThemePref, type ThemePref } from "../../lib/theme";
 import Select from "../../ui/Select";
 
-export default function Preferences() {
+export default function Preferences({ organizationDefault = true }: { organizationDefault?: boolean }) {
   const id = useId();
   const { userLocale, organizationLocale, isHostedUser, canSetOrganizationLocale, t, setPreference } = useLocale();
   const [theme, setTheme] = useState<ThemePref>(() => {
@@ -65,7 +65,7 @@ export default function Preferences() {
           </div>
         </div>
       </section>
-      {canSetOrganizationLocale && <section className="border-t border-ink-700" aria-labelledby={`${id}-org-heading`}>
+      {organizationDefault && canSetOrganizationLocale && <section className="border-t border-ink-700" aria-labelledby={`${id}-org-heading`}>
         <div className="grid gap-3 py-5 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,16rem)] sm:items-start sm:gap-8">
           <div>
             <h2 id={`${id}-org-heading`} className="text-cardtitle font-medium text-ink-100">{t("Organization default")}</h2>

@@ -134,12 +134,24 @@ async function mount(world: World, viewer = { operator: true, readOnly: false })
   const button = (label: string) =>
     Array.from(host.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === label) as HTMLButtonElement | undefined;
   await React.act(async () => { root.render(React.createElement(EmailSending, { viewer })); });
+  // A row is a name and one line; everything else is in the drawer it opens.
+  const open = async (name: string) => {
+    await settle(() => assert(rowFor(name), `row ${name}`));
+    await click(rowFor(name));
+  };
+  const rowFor = (name: string) =>
+    Array.from(host.querySelectorAll("button.settings-row")).find((b) => b.querySelector("b")?.textContent === name);
+  const closeDrawer = async () => {
+    await click(Array.from(host.querySelectorAll("button")).find((b) => /close/i.test(b.getAttribute("aria-label") ?? b.textContent ?? "")));
+    await sleep(320);
+    await flush();
+  };
   const mainText = () => {
     const clone = host.cloneNode(true) as HTMLElement;
     clone.querySelectorAll("details").forEach((d) => d.remove());
     return clone.textContent ?? "";
   };
-  return { host, settle, click, button, sleep, flush, React, mainText, unmount: () => React.act(async () => root.unmount()) };
+  return { host, settle, click, button, open, rowFor, closeDrawer, sleep, flush, React, mainText, unmount: () => React.act(async () => root.unmount()) };
 }
 
 const fresh = (over: Partial<World> = {}): World => ({
@@ -153,6 +165,7 @@ async function main() {
   {
     const world = fresh();
     const m = await mount(world);
+    await m.open("CRM · Acme");
     await m.settle(() => assert(m.button("Use this sender"), "bind button"));
     await m.click(m.button("Use this sender"));
     await m.settle(() => assert(m.host.querySelector("[data-state=live]")?.textContent?.includes("Sending from conn-a@example.com"), "live status"));
@@ -174,15 +187,16 @@ async function main() {
     });
     const m = await mount(world);
     await m.settle(() => {
-      assert(m.host.textContent!.includes("Acme") && m.host.textContent!.includes("Billing"), "both contexts render");
-      assert(m.host.querySelectorAll("[data-state=live]").length === 1, "only the bound context is live");
-      assert(m.host.querySelectorAll("[data-state=unbound]").length === 1, "the other context is unbound");
+      assert(m.rowFor("CRM · Acme")?.textContent?.includes("conn-a@example.com"), "the bound context names its sender");
+      assert(m.rowFor("CRM · Billing")?.textContent?.includes("No sender chosen"), "the other context is unbound");
     });
     assert(!m.host.querySelector("#email-sending-target"), "no single-target selector");
     assert(!m.host.querySelector("[data-section=connect-email]"), "no duplicate SMTP account form");
     assert(!m.host.querySelector("input[type=password]"), "no password field on the policy page");
+    await m.open("CRM · Billing");
+    await m.settle(() => assert(m.button("Use this sender"), "bind button"));
     await m.click(m.button("Use this sender"));
-    await m.settle(() => assert(m.host.querySelectorAll("[data-state=live]").length === 2, "the second context binds"));
+    await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "the second context binds"));
     const bind = world.posts.find((p) => p.path === "/api/crm-smtp/bind")!;
     equal(bind.body.context_id, "ctx-b", "the bind carries the second context");
     await m.unmount();
@@ -199,8 +213,8 @@ async function main() {
     });
     const m = await mount(world);
     await m.settle(() => {
-      assert(m.host.querySelector("[data-state=live]"), "active sender renders with a disabled SMTP install");
-      assert(m.host.querySelector("#email-origin"), "workspace policy renders with a disabled SMTP install");
+      assert(m.rowFor("CRM · Acme")?.textContent?.includes("conn-a@example.com"), "active sender renders with a disabled SMTP install");
+      assert(m.rowFor("Unsubscribe links"), "workspace policy renders with a disabled SMTP install");
       assert(!(m.host.textContent ?? "").includes("Unknown installation"), "disabled install is not read");
     });
     await m.unmount();
@@ -210,6 +224,7 @@ async function main() {
     const row = hostedRow();
     const world = fresh({ connections: [row], binding: bindingFor(row) });
     const m = await mount(world);
+    await m.open("CRM · Acme");
     await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "live status"));
     assert(m.host.querySelector("[data-state=live]")!.textContent!.includes("acme@cadencecloud.app"), "hosted sender address shown");
     const main = m.mainText();
@@ -223,6 +238,7 @@ async function main() {
   {
     const bad = smtpRow("conn-bad", { smtp: null, smtp_error: "withheld_leak" });
     const m = await mount(fresh({ connections: [bad] }));
+    await m.open("CRM · Acme");
     await m.settle(() => assert(m.host.querySelector("[data-state=sender-unusable]"), "unusable row"));
     const li = m.host.querySelector("[data-state=sender-unusable]")!;
     assert(li.textContent!.includes("password shares characters"), "typed smtp_error reason");
@@ -235,7 +251,9 @@ async function main() {
     const a = smtpRow("conn-a"), b = smtpRow("conn-b");
     const world = fresh({ connections: [a, b], binding: bindingFor(a) });
     const m = await mount(world);
+    await m.open("CRM · Acme");
     await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "bound"));
+    assert(m.button("Current sender") === undefined, "the current sender is a statement, not a button");
     await m.click(m.host.querySelector('[role="combobox"]'));
     await m.click(Array.from(document.querySelectorAll('[role="option"]')).find((o) => (o.textContent ?? "").includes("conn-b@example.com")));
     await m.click(m.button("Switch to this sender"));
@@ -253,6 +271,8 @@ async function main() {
     const a = smtpRow("conn-a");
     const world = fresh({ connections: [a], binding: bindingFor(a, { state: "stale" }) });
     const m = await mount(world);
+    await m.settle(() => assert(m.rowFor("CRM · Acme")?.textContent?.includes("Needs attention"), "the row flags it"));
+    await m.open("CRM · Acme");
     await m.settle(() => assert(m.host.querySelector("[data-state=stale]"), "stale notice"));
     assert(m.host.querySelector("[data-state=live]") === null, "no sending claim on a stale binding");
     await m.unmount();
@@ -261,6 +281,7 @@ async function main() {
   {
     const world = fresh();
     const m = await mount(world);
+    await m.open("Unsubscribe links");
     await m.settle(() => assert(m.host.querySelector("#email-origin"), "origin field"));
     const input = m.host.querySelector("#email-origin") as HTMLInputElement;
     await m.React.act(async () => {
@@ -278,8 +299,13 @@ async function main() {
     const a = smtpRow("conn-a");
     const world = fresh({ connections: [a], binding: bindingFor(a) });
     const m = await mount(world, { operator: true, readOnly: true });
+    await m.open("CRM · Acme");
     await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "status visible"));
-    assert(!m.button("Stop using") && !m.button("Save") && !m.host.querySelector("#email-origin"), "no write controls");
+    assert(!m.button("Stop using"), "no sender write controls");
+    await m.closeDrawer();
+    await m.open("Unsubscribe links");
+    await m.settle(() => assert(m.host.textContent!.includes("Every email"), "origin visible"));
+    assert(!m.button("Save") && !m.host.querySelector("#email-origin"), "no origin write controls");
     await m.unmount();
   }
   console.log("email sending checks passed");

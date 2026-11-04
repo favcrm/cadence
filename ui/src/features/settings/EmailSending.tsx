@@ -7,6 +7,7 @@ import Select from "../../ui/Select";
 import PageState from "../../ui/PageState";
 import type { Viewer } from "../projects/work";
 import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
+import SettingsDrawer from "./SettingsDrawer";
 import { newAudienceId } from "../app-shell/segmentGrammar";
 import {
   friendlySendError,
@@ -64,7 +65,7 @@ async function loadTargets(signal: AbortSignal): Promise<Target[]> {
     for (const ctx of contexts.filter((c) => c.state === "active")) {
       out.push({
         scope: { installId: install.install_id, contextId: ctx.id },
-        label: `${install.title || install.name} · ${ctx.config.label || ctx.id}`,
+        label: appContextLabel(install.title || install.name, ctx.config.label || ctx.id),
       });
     }
   }
@@ -79,9 +80,14 @@ function renderNote(note: SendNote | null, t: (english: string) => string): stri
     case "chosen": return t("Sender chosen.");
     case "changed": return t("Sender changed.");
     case "removed": return t("Sender removed.");
-    case "origin-cleared": return t("Unsubscribe address cleared — sends refuse until one is set.");
+    case "origin-cleared": return t("Your own address was cleared.");
     case "origin-set": return t("Unsubscribe links now use {origin}.").replace("{origin}", () => note.value ?? "");
   }
+}
+
+/** "CRM · CRM" says nothing twice; the second part earns its place only by differing. */
+function appContextLabel(app: string, context: string): string {
+  return app === context ? app : `${app} · ${context}`;
 }
 
 export default function EmailSending({ viewer }: { viewer: Viewer }) {
@@ -140,30 +146,102 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
         <div className="grid gap-3 min-w-0">
           <WorkspaceAccountCard rows={rows} hostedSmtp={hostedSmtp} />
           {targets.length === 0 ? (
-            <p className="text-label text-ink-400" data-state="no-apps">{t("No installed app sends email, so there is nothing to set up yet.")}</p>
-          ) : (
-            <section className="card px-4 py-4 grid gap-3 min-w-0" aria-labelledby="email-apps-title">
-              <div>
-                <h2 id="email-apps-title" className="text-cardtitle font-medium text-ink-100">{t("Apps that send email")}</h2>
-                <p className="text-label text-ink-400 mt-1 break-words">{t("Each app can use the workspace account or a sender of its own. An app appears here when its screens declare email sending.")}</p>
-              </div>
-              <div className="grid gap-2 min-w-0">
-                {targets.map((target) => (
-                  <SenderCard
-                    key={`${target.scope.installId}:${target.scope.contextId}`}
-                    target={target}
-                    rows={rows}
-                    hostedSmtp={hostedSmtp}
-                    viewer={viewer}
-                  />
-                ))}
-              </div>
-            </section>
-          )}
-          <OriginCard viewer={viewer} />
+            <p className="text-label text-ink-400" data-state="no-apps">{t("No installed app sends email, so there is nothing to choose yet.")}</p>
+          ) : null}
+          <div className="settings-rows" aria-label={t("Apps that send email")}>
+            {targets.map((target) => (
+              <SenderRow
+                key={`${target.scope.installId}:${target.scope.contextId}`}
+                target={target}
+                rows={rows}
+                hostedSmtp={hostedSmtp}
+                viewer={viewer}
+              />
+            ))}
+            <OriginRow viewer={viewer} />
+          </div>
         </div>
       )}
     </section>
+  );
+}
+
+/** One app: which account it sends from. The choice lives in the drawer. */
+function SenderRow({ target, rows, hostedSmtp, viewer }: {
+  target: Target;
+  rows: Connection[];
+  hostedSmtp: boolean;
+  viewer: Viewer;
+}) {
+  const t = useTranslate();
+  const [open, setOpen] = useState(false);
+  const [binding, setBinding] = useState<SmtpBinding | null | undefined>(undefined);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    readSmtpBinding(target.scope).then(
+      (bound) => {
+        if (!controller.signal.aborted) setBinding(bound);
+      },
+      () => {
+        if (!controller.signal.aborted) setFailed(true);
+      },
+    );
+    return () => controller.abort();
+  }, [target.scope.installId, target.scope.contextId, open]);
+  const live = sendingFrom(binding);
+  const line = failed
+    ? t("Couldn't read the sender")
+    : binding === undefined
+      ? t("Reading…")
+      : binding === null
+        ? t("No sender chosen")
+        : live ?? t("The chosen sender needs re-checking");
+  return (
+    <>
+      <button type="button" className="settings-row" onClick={() => setOpen(true)}>
+        <span className="settings-row-text">
+          <b>{target.label}</b>
+          <small>{line}</small>
+        </span>
+        {binding && live === null && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
+      </button>
+      {open && (
+        <SettingsDrawer title={target.label} onClose={() => setOpen(false)}>
+          <SenderCard target={target} rows={rows} hostedSmtp={hostedSmtp} viewer={viewer} />
+        </SettingsDrawer>
+      )}
+    </>
+  );
+}
+
+/** Where unsubscribe links point. Set here only to override the default. */
+function OriginRow({ viewer }: { viewer: Viewer }) {
+  const t = useTranslate();
+  const [open, setOpen] = useState(false);
+  const [origin, setOrigin] = useState<string | null | undefined>(undefined);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    sendClient.sendOriginShow().then(
+      (value: unknown) => setOrigin(parseOriginReceipt(value).unsubscribeOrigin),
+      () => setFailed(true),
+    );
+  }, [open]);
+  return (
+    <>
+      <button type="button" className="settings-row" onClick={() => setOpen(true)}>
+        <span className="settings-row-text">
+          <b>{t("Unsubscribe links")}</b>
+          <small>{failed ? t("Couldn't read the address") : origin === undefined ? t("Reading…") : origin ?? t("Not set")}</small>
+        </span>
+        {origin === null && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
+      </button>
+      {open && (
+        <SettingsDrawer title={t("Unsubscribe links")} onClose={() => setOpen(false)}>
+          <OriginCard viewer={viewer} />
+        </SettingsDrawer>
+      )}
+    </>
   );
 }
 
@@ -264,21 +342,6 @@ function SenderCard({
   const live = sendingFrom(binding);
   return (
     <article className="border-t border-ink-700 first:border-t-0 pt-3 first:pt-0 grid gap-2 min-w-0" aria-label={target.label}>
-      <div className="flex flex-wrap items-start gap-x-3 gap-y-1">
-        <div className="min-w-0 flex-1">
-          <h3 className="text-body font-medium text-ink-100 break-words">{target.label}</h3>
-          <p className="text-micro text-ink-500 break-words">{target.scope.installId} · {target.scope.contextId}</p>
-        </div>
-        {binding === undefined && error === null ? (
-          <span className="chip bg-ink-800 text-ink-300">{t("Reading…")}</span>
-        ) : binding && live !== null ? (
-          <span className="chip bg-ok/10 text-ok">{t("Connected")}</span>
-        ) : binding && live === null ? (
-          <span className="chip bg-warn/10 text-warn">{t("Needs re-check")}</span>
-        ) : (
-          <span className="chip bg-ink-800 text-ink-300">{t("Not configured")}</span>
-        )}
-      </div>
       {binding === undefined && error === null && (
         <p className="text-label text-ink-400" role="status">{t("Reading the sender…")}</p>
       )}
@@ -354,6 +417,7 @@ function SenderCard({
             ) : (
               binding && (
                 <>
+                  {(live === null || chosenId !== binding.connectionId) && (
                   <Button
                     size="sm"
                     variant="primary"
@@ -366,8 +430,9 @@ function SenderCard({
                       )
                     }
                   >
-                    {live === null || chosenId !== binding.connectionId ? t("Switch to this sender") : t("Current sender")}
+                    {t("Switch to this sender")}
                   </Button>
+                  )}
                   <Button size="sm" variant="danger" disabled={pending} onClick={() => setConfirmRevoke(true)}>{t("Stop using")}</Button>
                 </>
               )
@@ -422,7 +487,8 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
     const receipt = parseOriginReceipt(value);
     setOrigin(receipt.unsubscribeOrigin);
     setStored(receipt.stored);
-    setInput(receipt.unsubscribeOrigin ?? "");
+    // The field holds only your own override: saving the default would pin it.
+    setInput(receipt.stored ? receipt.unsubscribeOrigin ?? "" : "");
     return receipt;
   };
   useEffect(() => {
@@ -438,7 +504,7 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
       .then((value2) => {
         const receipt = apply(value2);
         setNote(
-          receipt.unsubscribeOrigin === null
+          !receipt.stored || receipt.unsubscribeOrigin === null
             ? { key: "origin-cleared" }
             : { key: "origin-set", value: receipt.unsubscribeOrigin },
         );
@@ -449,7 +515,7 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
 
   return (
     <section aria-label={t("Unsubscribe origin")} className="card px-4 py-4 grid gap-3 min-w-0">
-      <h2 className="text-cardtitle font-medium text-ink-100">{t("Unsubscribe address")}</h2>
+      
       {origin === undefined && error === null ? (
         <p className="text-label text-ink-400" role="status">{t("Reading…")}</p>
       ) : (
@@ -478,7 +544,7 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
           }}
         >
           <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="email-origin">{t("Origin (https; http on a loopback host)")}</label>
+            <label className="text-label text-ink-300" htmlFor="email-origin">{t("Use a different address (optional)")}</label>
             <input
               id="email-origin"
               className="field"

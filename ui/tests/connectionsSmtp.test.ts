@@ -501,8 +501,7 @@ async function main() {
   const host5 = document.createElement("div");
   document.body.appendChild(host5);
   const root5 = createRoot(host5);
-  const sections = () => Array.from(host5.querySelectorAll('section[aria-label$=" connections"]'));
-  const groupLabel = (el: Element) => el.getAttribute("aria-label") ?? "";
+  const accountRows = () => Array.from(host5.querySelectorAll("button.settings-row"));
 
   act(() => {
     root5.render(withLocale(React.createElement(ConnectionsPage, { viewer: { operator: true, readOnly: false } })));
@@ -512,55 +511,34 @@ async function main() {
     await Promise.all([resources.connections.refresh(), resources.connectionProviders.refresh()]);
   });
   await settle(() => {
-    const labels = sections().map(groupLabel);
-    assert(labels.includes("Email (SMTP) connections"), "smtp service group renders under its friendly label");
-    assert(labels.includes("AgenticOS connections"), "token service group renders under AgenticOS");
-    assert(labels.includes("Local outbox connections"), "built-in Local outbox group renders");
-    assert(labels.includes("empty_svc connections"), "registered-but-empty provider keeps a group");
-    assert(labels.includes("ghost_provider connections"), "unregistered provider keeps its own group");
+    const names = accountRows().map((row) => row.querySelector("b")?.textContent);
+    assert(names.includes("Email (SMTP)"), "an smtp account is named by its service");
+    assert(names.includes("Ghost_provider"), "an unregistered provider's account is never dropped");
   }, 30000);
 
   const text5 = () => host5.textContent ?? "";
-  // CAD-1319: the index is compact links and routed setup actions — no
-  // in-place expansion, no credential form. Contextual setup lands on
-  // enrollable services only; the empty/built-in ones carry the explicit
-  // unsupported reason; an unregistered account is never dropped.
-  assert(byTextIn(host5, "a", "Set up Email (SMTP)"), "smtp service links to its pinned setup");
-  assert(byTextIn(host5, "a", "Set up AgenticOS"), "token service links to its pinned setup");
-  assert(
-    (byTextIn(host5, "a", "Set up Email (SMTP)") as HTMLAnchorElement)?.getAttribute("href") ===
-      "/settings/connections/new/smtp",
-    "smtp setup href is the pinned new/<provider> route",
-  );
-  assert(text5().includes("No empty_svc account connected yet"), "empty provider names its setup state");
-  assert(
-    text5().includes("could not be loaded") || text5().includes("not proof") || text5().includes("may be stale") || text5().includes("not registered"),
-    "unregistered provider is honest — metadata-missing is not deregistration",
-  );
+  // A row is a name and one line: no custody panel, no expanded detail, no form.
+  assert(!text5().includes("Credential custody"), "custody is not on the index");
   assert(!text5().includes("Check configuration"), "index carries no expanded detail");
   assert(!host5.querySelector('section[aria-label="add connection"]'), "index carries no credential form");
+  assert(!text5().includes("reviewed contract"), "the pin fact stays out of the row");
+  assert(
+    (byTextIn(host5, "a", "+ Add") as HTMLAnchorElement)?.getAttribute("href") === "/settings/connections/new",
+    "add goes to the chooser",
+  );
 
-  // CAD-1810: the group count is translated, not a raw template string.
-  window.localStorage.setItem("cadence-locale", "zh-TW");
-  const host7 = document.createElement("div");
-  document.body.appendChild(host7);
-  const root7 = createRoot(host7);
-  act(() => {
-    root7.render(withLocale(React.createElement(ConnectionsPage, { viewer: { operator: true, readOnly: false } })));
-  });
+  // A row opens one drawer holding the account's details and actions, and Esc
+  // gives focus back to the row. The /account/<id> page stays for old links.
+  const smtpAccountRow = accountRows().find((row) => (row.textContent ?? "").includes("news")) as HTMLButtonElement;
+  assert(smtpAccountRow, "smtp account row renders as a button");
+  await act(async () => { smtpAccountRow.focus(); smtpAccountRow.click(); });
   await settle(() => {
-    const text7 = host7.textContent ?? "";
-    assert(text7.includes("已連接 1 個"), "Chinese Connections count is translated");
-    assert(!text7.includes("1 connected"), "Chinese view does not leak the English count");
-  }, 30000);
-  await act(async () => root7.unmount());
-  window.localStorage.removeItem("cadence-locale");
-
-  // Account rows are links to their own detail pages — the smtp row
-  // names its exact /account/<id> URL.
-  const smtpRowLink = Array.from(host5.querySelectorAll("a")).find((a) => (a.textContent ?? "").includes("news")) as HTMLAnchorElement | undefined;
-  assert(smtpRowLink, "smtp account row renders as a link");
-  equal(smtpRowLink!.getAttribute("href"), "/settings/connections/account/c-smtp", "smtp row links to its detail route");
+    assert(text5().includes("Check configuration"), "the drawer has the local check action");
+    assert(text5().includes("Disconnect"), "the drawer offers disconnect");
+  });
+  await act(async () => {
+    document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }) as unknown as Event);
+  });
 
   // The dedicated detail page mounts the exact row — check, update and
   // disconnect in place; the honest unsupported remote-verification line

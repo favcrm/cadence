@@ -38,6 +38,10 @@ import CredentialEntry from "./features/connections/CredentialEntry";
 import CredentialAuthorize from "./features/connections/CredentialAuthorize";
 import EmailSending from "./features/settings/EmailSending";
 import SettingsLayout from "./features/settings/SettingsLayout";
+import General from "./features/settings/General";
+import HostedStatus from "./features/settings/HostedStatus";
+import AdvancedCustody from "./features/settings/AdvancedCustody";
+import { settingsLabel, settingsNavGroups, settingsRedirect } from "./features/settings/settingsNav";
 import Preferences from "./features/settings/Preferences";
 import Templates from "./features/templates/Templates";
 import Update from "./features/settings/Update";
@@ -136,6 +140,8 @@ function update(fn: (current: AppLocation) => AppLocation, opts?: { replace?: bo
   const next = fn(current);
   navigate(locationHref(next, contextNavigationSearch(current.route, next.route, location.search), current.route), opts);
 }
+
+const settingsHomeRoute: Route = { screen: "settings", section: "models" };
 
 const SCREEN_LABEL: Record<Screen, string> = {
   home: "home",
@@ -321,6 +327,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // organisation — the label stays the neutral "Cadence", never a
   // hostname, user or project name. One nonblocking read per page load;
   // a failure or missing name leaves the fallback.
+  // A board that says what Settings it serves never shows a page it doesn't.
+  const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
+  useEffect(() => {
+    if (settingsTarget) navigate(hrefFor({ screen: "settings", section: settingsTarget }), { replace: true });
+  }, [settingsTarget]);
   const [orgName, setOrgName] = useState("Cadence");
   useEffect(() => {
     if (meta === null) return;
@@ -1061,6 +1072,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
                 <span className="truncate text-ink-100" title={route.slug}>{route.slug}</span>
               </>
+            ) : route.screen === "settings" && settingsLabel(route.section) ? (
+              <>
+                <Link href={hrefFor(settingsHomeRoute)} className="hidden sm:inline truncate text-ink-400">{t("Settings")}</Link>
+                <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
+                <span className="truncate text-ink-100">{t(settingsLabel(route.section) ?? "")}</span>
+              </>
             ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : t(SCREEN_LABEL[screen])}</span>}
           </nav>
 
@@ -1464,26 +1481,18 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
         {route.screen === "settings" && (
           <SettingsLayout
-            groups={[
-              {
-                label: "Workspace",
-                items: [
-                  { label: "Agents", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
-                  { label: "Connections", href: hrefFor({ screen: "settings", section: "connections" }), on: route.section === "connections" },
-                  { label: "Email sending", href: hrefFor({ screen: "settings", section: "email" }), on: route.section === "email" },
-                  { label: "Preferences", href: hrefFor({ screen: "settings", section: "preferences" }), on: route.section === "preferences" },
-                ],
-              },
-              {
-                label: "System",
-                items: [
-                  { label: "Status", href: hrefFor({ screen: "settings", section: "update" }), on: route.section === "update" },
-                  ...(meta?.platform_account_configured ? [{ label: "Account", href: hrefFor({ screen: "settings", section: "account" }), on: route.section === "account" }] : []),
-                  { label: "Master permissions", href: hrefFor({ screen: "settings", section: "permissions" }), on: route.section === "permissions" },
-                ],
-              },
-            ]}
+            groups={settingsNavGroups(meta).map((group) => ({
+              label: group.label,
+              items: group.items.map((item) => ({
+                label: item.label,
+                icon: item.icon,
+                href: hrefFor({ screen: "settings", section: item.section }),
+                on: route.section === item.section,
+              })),
+            }))}
           >
+            {/* Mount nothing that's about to redirect: its failed read would flash first. */}
+            {!settingsTarget && !(route.section === "models" && meta === null) && (<>
             {route.section === "memory" && (
               <Memory project={project} projects={projects} projectHref={filterHref} onError={writeError} />
             )}
@@ -1493,10 +1502,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             )}
             {route.section === "email" && <EmailSending viewer={viewer} />}
             {route.section === "templates" && <Templates />}
-            {route.section === "preferences" && <Preferences />}
+            {route.section === "preferences" && <Preferences organizationDefault={!meta?.settings_sections} />}
+            {route.section === "general" && <General />}
             {route.section === "account" && <PlatformAccount />}
-            {route.section === "update" && <Update viewer={viewer} health={health} />}
+            {route.section === "update" && (meta?.settings_sections
+              ? <HostedStatus meta={meta} canReadConnections={viewer.operator === true} />
+              : <Update viewer={viewer} health={health} />)}
+            {route.section === "custody" && <AdvancedCustody viewer={viewer} />}
             {route.section === "permissions" && <MasterPermissions viewer={{ ...viewer, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
+            </>)}
           </SettingsLayout>
         )}
         {screen === "notFound" && (

@@ -829,6 +829,8 @@ export interface AgentDetail {
 export type Meta = Api.MetaResponse & {
   /** A hosted board sets this when its Worker serves /api/wiki. */
   wiki?: boolean;
+  /** The Settings sections this board serves for this viewer. Absent: not stated. */
+  settings_sections?: readonly string[];
 };
 
 export interface Health {
