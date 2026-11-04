@@ -181,6 +181,28 @@
   .imgshot .imgtool { pointer-events: auto; }
 }
 
+/* A generated video in the thread. It shares the image block's box, wait and
+   cards; a finished one is a poster with a play button, played inline. */
+.vidblock[data-shape="auto"] { max-width: 30rem; }
+.vidblock[data-shape="auto"] .imgbox:not([data-compact]) { aspect-ratio: 16 / 9; }
+.vidbox { background: #000; }
+.vidbox[data-compact], .vidbox:has(.imgquiet), .vidbox:has(.imgwait) { background: var(--color-ink-850); }
+.vidopen { position: absolute; inset: 0; display: grid; place-items: center; width: 100%; height: 100%; padding: 0; border: 0; background: linear-gradient(135deg, var(--color-ink-800), var(--color-ink-900, #000)); color: #fff; cursor: pointer; }
+.vidopen:disabled { cursor: progress; }
+.vidopen:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.vidplay { display: grid; place-items: center; width: 3.25rem; height: 3.25rem; border-radius: 9999px; background: rgb(0 0 0 / 0.55); transition: background 0.12s; }
+.vidopen:hover .vidplay { background: rgb(0 0 0 / 0.75); }
+.viddur { position: absolute; right: 8px; bottom: 8px; padding: 2px 6px; border-radius: 6px; background: rgb(0 0 0 / 0.6); color: #fff; font-size: var(--text-micro); line-height: 1.3; }
+.vidplayer { position: absolute; inset: 0; display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
+/* The caption is at the top, clear of the native controls along the bottom. */
+.vidover { position: absolute; left: 0; right: 0; top: 0; display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px 28px; background: linear-gradient(to bottom, rgb(0 0 0 / 0.68), rgb(0 0 0 / 0.4) 55%, transparent); color: #fff; opacity: 0; pointer-events: none; transition: opacity 0.12s; }
+.vidbox:hover .vidover, .vidbox:focus-within .vidover { opacity: 1; }
+.vidover .imgtool { pointer-events: auto; }
+.vidretry { position: absolute; left: 8px; right: 8px; bottom: 8px; margin: 0; padding: 4px 8px; border-radius: 6px; background: rgb(0 0 0 / 0.7); color: #fff; font-size: var(--text-micro); text-align: center; }
+@media (hover: none) {
+  .vidover { opacity: 1; }
+}
+
 /* The same picture in the canvas: contained, never cropped. */
 .canvas-doc[data-artifact-view="image"] { display: flex; flex: 1; align-items: center; justify-content: center; min-height: 0; }
 .imgshot { position: relative; display: block; max-width: 100%; overflow: hidden; border-radius: 8px; }
@@ -190,5 +212,5 @@
   .imgwait, .imgdots i, .imgopen img { animation: none; }
   .imgwait { background: none; }
   .imgdots i { opacity: 0.7; }
-  .imgover { transition: none; }
+  .imgover, .vidover, .vidplay { transition: none; }
 }

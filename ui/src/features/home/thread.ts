@@ -16,7 +16,7 @@ import type { SseEvent } from "../../lib/sse";
  */
 
 export type ThreadRole = "operator" | "agent" | "system";
-export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "hire_proposal";
+export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "video_job" | "hire_proposal";
 
 /** One stored entry (`thread_read` / the stream's `entry` frame). */
 export interface ThreadEntry {
@@ -328,10 +328,15 @@ export type ThreadItem =
   | { type: "answer"; key: string; entry: ThreadEntry }
   | { type: "artifact"; key: string; entry: ThreadEntry }
   | { type: "image"; key: string; entry: ThreadEntry }
+  | { type: "video"; key: string; entry: ThreadEntry }
   | { type: "hire"; key: string; entry: ThreadEntry; reason: string | null }
   | { type: "pending"; key: string; pending: PendingMessage };
 
 const TOOL_KINDS = new Set(["tool_call", "tool_result"]);
+
+/** The item type of an entry kind that is a card in a turn; null otherwise. */
+const cardType = (kind: string): "artifact" | "image" | "video" | null =>
+  kind === "artifact" ? "artifact" : kind === "image_job" ? "image" : kind === "video_job" ? "video" : null;
 
 /**
  * Entries by kind: the operator's message, `assistant_text` as
@@ -351,8 +356,9 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
   };
   for (const entry of state?.entries ?? []) {
     const key = `e${entry.seq}`;
-    if ((entry.kind === "artifact" || entry.kind === "image_job") && items[items.length - 1]?.type === "tools") {
-      held.push({ type: entry.kind === "artifact" ? "artifact" : "image", key, entry });
+    const card = cardType(entry.kind);
+    if (card && items[items.length - 1]?.type === "tools") {
+      held.push({ type: card, key, entry });
       continue;
     }
     if (!TOOL_KINDS.has(entry.kind)) flush();
@@ -381,6 +387,9 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
     } else if (entry.kind === "image_job") {
       // A generated image's block: a job id and a shape, never the picture.
       items.push({ type: "image", key, entry });
+    } else if (entry.kind === "video_job") {
+      // A generated video's block: a job id and a shape, never the video.
+      items.push({ type: "video", key, entry });
     } else if (entry.role === "operator") {
       items.push({ type: "operator", key, entry });
     } else {
@@ -395,10 +404,11 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
 }
 
 /** Item types that belong to an assistant turn. */
-const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "image", "hire"]);
+const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "image", "video", "hire"]);
 
 /** A card that follows its turn's answer without ending or starting a turn. */
-export const isCardItem = (item: { type: string }): boolean => item.type === "artifact" || item.type === "image";
+export const isCardItem = (item: { type: string }): boolean =>
+  item.type === "artifact" || item.type === "image" || item.type === "video";
 
 /** One render run: an assistant turn (its flat items), or one item that is
  *  not part of a turn. The items themselves stay flat — `threadItems` is
