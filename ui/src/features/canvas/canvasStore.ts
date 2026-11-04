@@ -130,14 +130,22 @@ function emptyState(
   return { conversation, surface, composerKey, open: false, tabs: [], active: null, working: null };
 }
 
-/** An artifact took the active tab (card, tab click or auto-open). The
- *  session tab (browserStore.ts) is not modelled here; it listens instead. */
-const artifactFocusListeners = new Set<() => void>();
-export function onArtifactFocus(listener: () => void): void {
+/** An artifact took the active tab: "user" for a card or tab click, "auto"
+ *  for the feed's one auto-open per turn. The session tab (browserStore.ts) is
+ *  not modelled here; it listens instead. */
+export type FocusSource = "user" | "auto";
+const artifactFocusListeners = new Set<(source: FocusSource) => void>();
+export function onArtifactFocus(listener: (source: FocusSource) => void): void {
   artifactFocusListeners.add(listener);
 }
-function artifactFocused(): void {
-  for (const l of [...artifactFocusListeners]) l();
+function artifactFocused(source: FocusSource): void {
+  for (const l of [...artifactFocusListeners]) l(source);
+}
+/** The last artifact tab closed. A listener answers true to keep the drawer
+ *  open on something else it shows (the Browser tab). */
+const emptiedListeners = new Set<() => boolean>();
+export function onArtifactsEmptied(listener: () => boolean): void {
+  emptiedListeners.add(listener);
 }
 
 function set(next: CanvasState): void {
@@ -238,7 +246,7 @@ export function feedCanvas(input: FeedInput): void {
   } else if (active === null || !tabs.some((t) => t.id === active)) {
     active = tabs[0].id;
   }
-  if (focused) artifactFocused();
+  if (focused) artifactFocused("auto");
   const composerKey = input.composerKey;
   const working = sameWorking(input.working, state.working) ? state.working : input.working;
   if (
@@ -263,13 +271,13 @@ export function openArtifact(ref: ArtifactRef): void {
       )
     : [...state.tabs, newTab(ref, null)];
   set({ ...state, tabs, active: ref.id, open: true });
-  artifactFocused();
+  artifactFocused("user");
 }
 
 export function focusTab(id: string): void {
   if (!state.tabs.some((t) => t.id === id)) return;
   if (state.active !== id) set({ ...state, active: id });
-  artifactFocused();
+  artifactFocused("user");
 }
 
 export function closeTab(id: string): void {
@@ -277,7 +285,8 @@ export function closeTab(id: string): void {
   if (index < 0) return;
   const tabs = state.tabs.filter((t) => t.id !== id);
   if (tabs.length === 0) {
-    closeDrawerFor(currentTurn);
+    const kept = [...emptiedListeners].some((l) => l());
+    if (!kept) closeDrawerFor(currentTurn);
     set({ ...state, tabs, active: null, open: false });
     return;
   }

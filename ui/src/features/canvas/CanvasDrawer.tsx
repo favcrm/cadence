@@ -392,6 +392,7 @@ export default function CanvasDrawer() {
       data-canvas-drawer
       data-mode={layout.mode}
       aria-label={t("Canvas")}
+      tabIndex={-1}
       style={sheet ? undefined : { width: layout.width }}
     >
       {!sheet && !expanded ? (
@@ -439,7 +440,11 @@ export default function CanvasDrawer() {
                 onClick={() => {
                   hideBrowser();
                   // The tab that held focus is gone: the next one takes it.
-                  requestAnimationFrame(() => rootRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus());
+                  // With no strip left the drawer itself takes it.
+                  requestAnimationFrame(() => {
+                    const next = rootRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+                    (next ?? rootRef.current)?.focus();
+                  });
                 }}
               >
                 <IconClose size={10} />

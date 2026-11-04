@@ -1825,7 +1825,6 @@ Object.assign(zhTW, {
   "Try stopping again": "再次嘗試停止",
   "Waiting for the browser to close. A page that isn't responding can take a while.": "正在等待瀏覽器關閉。沒有回應的頁面可能需要較長時間。",
   "Waiting for you": "等待您",
-  "When you are finished, use Done in the live view. Your assistant carries on reading. Stop ends the whole session.": "完成後，請使用即時檢視中的「完成」，助理便會繼續閱讀。「停止」則會結束整個工作階段。",
   "Written by the assistant from what it read. It can be wrong or shaped by the page. Check the address before you type anything.": "由助理根據所讀內容撰寫，可能有誤，亦可能受頁面影響。輸入任何內容前，請先核對位址。",
   "You are signed in here, and that is lost.": "您已在此登入，停止後登入狀態將會失去。",
   "You can leave this tab; it keeps stopping. Nothing else is needed from you.": "您可離開此分頁，停止程序會繼續進行，毋須再作任何操作。",
@@ -1840,4 +1839,7 @@ Object.assign(zhTW, {
   "session-backed": "工作階段支援",
   "state and address only": "僅顯示狀態與位址",
   "Hide Browser tab. The session keeps running.": "隱藏瀏覽器分頁。工作階段會繼續執行。",
+  "If it stays blank, open it again. Stop ends the whole session.": "若畫面保持空白，請重新開啟。「停止」會結束整個工作階段。",
+  "Couldn't open the live view again. The current view is unchanged.": "無法重新開啟即時檢視，目前的檢視維持不變。",
+  "stopping": "停止中",
 });

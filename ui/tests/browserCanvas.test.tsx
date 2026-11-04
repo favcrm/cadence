@@ -88,18 +88,21 @@ const board = {
   viewUrl: VIEWER,
   stopHold: false,
   release: null as null | (() => void),
+  getHang: false,
+  viewHang: false,
   getHold: false,
   releaseGet: null as null | (() => void),
   viewHold: false,
   releaseView: null as null | (() => void),
   conversation: "c1",
 };
-globalThis.fetch = (async (input: unknown, init?: { method?: string }) => {
+globalThis.fetch = (async (input: unknown, init?: { method?: string; signal?: AbortSignal }) => {
   const url = new URL(String(input), "http://localhost");
   const method = init?.method ?? "GET";
   if (url.pathname === "/api/browser" && method === "GET") {
     board.gets++;
     equal(url.searchParams.get("conversation"), board.conversation, "the read names the conversation in view");
+    if (board.getHang) await new Promise<void>((_, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("aborted"))));
     if (board.getHold) {
       // The answer is what the board said when it was asked, however late it lands.
       const snap = JSON.stringify(board.body);
@@ -115,6 +118,7 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string }) => {
   }
   if (url.pathname === "/api/browser/view" && method === "POST") {
     board.views++;
+    if (board.viewHang) await new Promise<void>((_, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("aborted"))));
     if (board.viewHold) await new Promise<void>((resolve) => { board.releaseView = resolve; });
     if (board.viewStatus === 409) return new Response(JSON.stringify({ error: "not_in_handoff" }), { status: 409 });
     return new Response(JSON.stringify({ url: board.viewUrl }), { status: board.viewStatus });
@@ -125,6 +129,16 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string }) => {
     if (board.stopStatus === 503) return new Response(JSON.stringify({ error: "provider_unavailable" }), { status: 503 });
     board.body = { state: "ended", signedIn: false, url: null, instructions: null };
     return new Response(JSON.stringify({ status: "stopped" }), { status: 200 });
+  }
+  if (url.pathname === "/api/member-assistant/state") {
+    return new Response(JSON.stringify({ conversation_id: "cm1", assistant: { org: "o", sub: "u", assistant_id: "a", alias: "assistant", conversation_id: "cm1", state: "ready", bootstrap_state: null } }), { status: 200 });
+  }
+  if (url.pathname === "/api/member-assistant/history") {
+    return new Response(JSON.stringify({ conversation: { id: "cm1", alias: "assistant" }, entries: [
+      { seq: 1, role: "member", kind: "message", text: "compare the suppliers", message: "m1" },
+      { seq: 2, role: "agent", kind: "artifact", text: "", message: "m1", payload: { id: "art-html1", version: 1, kind: "html", title: "Supplier comparison", bytes: 12 } },
+      { seq: 3, role: "agent", kind: "turn_result", text: "Done.", message: "m1" },
+    ], more_before: false }), { status: 200 });
   }
   if (url.pathname.startsWith("/api/artifacts/")) {
     return new Response("<p>hello</p>", { status: 200, headers: { "Content-Type": "text/html" } });
@@ -149,7 +163,7 @@ async function mount() {
 }
 function reset(over: Partial<typeof board> = {}) {
   timers.clear();
-  Object.assign(board, { mode: "ok", body: { state: "none", signedIn: false, url: null, instructions: null }, gets: 0, views: 0, stops: 0, stopStatus: 200, stopHold: false, release: null, getHold: false, releaseGet: null, viewHold: false, releaseView: null, viewStatus: 200, viewUrl: VIEWER, conversation: "c1" }, over);
+  Object.assign(board, { mode: "ok", body: { state: "none", signedIn: false, url: null, instructions: null }, gets: 0, views: 0, stops: 0, stopStatus: 200, stopHold: false, release: null, getHang: false, viewHang: false, getHold: false, releaseGet: null, viewHold: false, releaseView: null, viewStatus: 200, viewUrl: VIEWER, conversation: "c1" }, over);
   store.resetBrowser();
   canvasStore.resetCanvas("c1", "home", "home");
   (win as any).innerWidth = 1600;
@@ -417,6 +431,14 @@ for (const bad of ["javascript:alert(1)", "http://live.test/x", "data:text/html,
 }
 
 
+const violation = (directive: string, blocked: string, disposition = "enforce") => {
+  const ev = new win.Event("securitypolicyviolation", { bubbles: true }) as any;
+  Object.defineProperty(ev, "effectiveDirective", { value: directive });
+  Object.defineProperty(ev, "blockedURI", { value: blocked });
+  Object.defineProperty(ev, "disposition", { value: disposition });
+  document.dispatchEvent(ev);
+};
+
 // ===== a frame the board's CSP refuses is an error now, and the retry is fresh =====
 {
   const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
@@ -424,9 +446,7 @@ for (const bad of ["javascript:alert(1)", "http://live.test/x", "data:text/html,
   await click(btn(m, "view")!);
   assert(el(m.host, "iframe[data-bz-frame]"), "the frame is up, still loading");
   await React.act(async () => {
-    const ev = new win.Event("securitypolicyviolation", { bubbles: true }) as any;
-    Object.defineProperty(ev, "effectiveDirective", { value: "frame-src" });
-    document.dispatchEvent(ev);
+    violation("frame-src", VIEWER);
   });
   await settle();
   assert(!el(m.host, "iframe"), "a frame-src violation tears the frame down without waiting for a load");
@@ -608,6 +628,421 @@ for (const mode of ["404", "unavailable"] as const) {
   equal(canvasStore.canvasSnapshot().tabs.length, 0, "artifact tabs and their titles are gone");
   equal(store.browserSnapshot().conversation, null, "and the Browser tab's conversation");
   await m.unmount();
+}
+
+
+// ===== only an enforced frame-src violation for the viewer's origin counts =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  const frame = el(m.host, "iframe[data-bz-frame]")!;
+  for (const [what, ...args] of [
+    ["another directive", "script-src", VIEWER, "enforce"],
+    ["another origin", "frame-src", "https://elsewhere.example.test/x", "enforce"],
+    ["a report-only policy", "frame-src", VIEWER, "report"],
+    ["no blocked URI", "frame-src", "inline", "enforce"],
+  ] as const) {
+    await React.act(async () => { violation(args[0], args[1], args[2]); });
+    await settle();
+    assert(el(m.host, "iframe[data-bz-frame]") === frame, `${what} does not tear the frame down`);
+  }
+  await React.act(async () => { violation("frame-src", VIEWER, "enforce"); });
+  await settle();
+  assert(!el(m.host, "iframe"), "an enforced frame-src violation for the viewer does");
+  await m.unmount();
+}
+
+// ===== neutral wording; a finished load does not cancel the frame timeout; reopen keeps the old frame =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  const first = el(m.host, "iframe[data-bz-frame]")!;
+  await React.act(async () => { first.dispatchEvent(new win.Event("load")); });
+  await settle();
+  await advance(30_000);
+  assert(el(m.host, "iframe[data-bz-frame]") === first, "a frame that loaded is not reported as failed 20 s later");
+  assert(text(panel(m)).includes("If it stays blank, open it again"), "the standing hint says what to do with a blank view");
+  assert(!/Done|control/.test(text(el(m.host, "[data-bz-dock]"))), "and promises no Done control");
+  // A failed reopen keeps what the person has.
+  board.viewStatus = 500;
+  await click(btn(m, "view")!);
+  assert(el(m.host, "iframe[data-bz-frame]") === first, "a failed reopen leaves the old frame in place");
+  assert(text(panel(m)).includes("The current view is unchanged"), "and says so");
+  // A reopen in flight keeps it too, and the new URL replaces it.
+  board.viewStatus = 200;
+  board.viewHold = true;
+  await click(btn(m, "view")!);
+  assert(el(m.host, "iframe[data-bz-frame]") === first, "while the new URL is fetched the old frame stays");
+  await React.act(async () => { board.releaseView!(); });
+  await settle();
+  const second = el(m.host, "iframe[data-bz-frame]")!;
+  assert(second && second !== first, "the new URL gets a fresh frame");
+  await m.unmount();
+}
+
+// ===== Enter on Open live view can never become Stop =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  const viewBtn = btn(m, "view")!;
+  await React.act(async () => { viewBtn.focus(); });
+  board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  await advance(2000);
+  const stopNow = btn(m, "stop")!;
+  assert(stopNow && stopNow !== viewBtn, "Stop is a different node from the Open live view the person was on");
+  assert(document.activeElement !== stopNow, "focus never carries onto Stop");
+  await React.act(async () => { (document.activeElement as HTMLElement)?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await settle();
+  equal(board.stops, 0, "an Enter or Space that lands after the takeover ended stops nothing");
+  await m.unmount();
+}
+
+// ===== focus: rescue only a removed control, once, never from chat =====
+{
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
+  await settle();
+  await click(tab(m)!);
+  const composer = document.createElement("textarea");
+  document.body.append(composer);
+  const stopBtn = btn(m, "stop")!;
+  await React.act(async () => { stopBtn.focus(); });
+  await React.act(async () => { composer.focus(); });
+  board.stopHold = true;
+  await click(stopBtn);
+  await React.act(async () => { board.release!(); });
+  await settle();
+  assert(document.activeElement === composer, "focus that moved to the chat is left there when the control goes");
+  await advance(9000);
+  assert(document.activeElement === composer, "and stays there through every later poll");
+  // The person clicks bare page, and the panel re-renders for some other reason:
+  // the control they once held is not a claim on focus any more.
+  await React.act(async () => { composer.blur(); });
+  assert(document.activeElement === document.body, "focus is on the bare page");
+  board.body = { state: "none", signedIn: false, url: null, instructions: null };
+  await React.act(async () => { await store.refreshBrowser(); });
+  await settle();
+  assert(document.activeElement === document.body, "a later re-render does not pull it into the panel");
+  composer.remove();
+  await m.unmount();
+}
+{
+  // A control removed while focus is elsewhere, and the platform said nothing
+  // about focus leaving (no blur, no focusout): the focus that is somewhere is left alone.
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
+  await settle();
+  await click(tab(m)!);
+  const composer = document.createElement("textarea");
+  document.body.append(composer);
+  const stopBtn = btn(m, "stop")!;
+  await React.act(async () => { stopBtn.focus(); });
+  const mute = (e: Event) => e.stopImmediatePropagation();
+  for (const type of ["blur", "focusout"]) win.document.addEventListener(type, mute, true);
+  await React.act(async () => { composer.focus(); });
+  for (const type of ["blur", "focusout"]) win.document.removeEventListener(type, mute, true);
+  // The stop fails: the dock swaps its controls and a retry would be the rescue's target.
+  board.stopHold = true;
+  board.stopStatus = 503;
+  await React.act(async () => { store.requestStop(); });
+  await React.act(async () => { board.release!(); });
+  await settle();
+  assert(!stopBtn.isConnected && btn(m, "stop"), "the Stop button was replaced");
+  assert(document.activeElement === composer, "and focus stayed where the person had put it, not on the retry");
+  composer.remove();
+  await m.unmount();
+}
+{
+  // The same control removed with nowhere else to go: the tab, or with no strip the heading.
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await openTab(m);
+  assert(!tab(m), "this path has no tab strip (the thread-card path)");
+  const stopBtn = btn(m, "stop")!;
+  await React.act(async () => { stopBtn.focus(); });
+  board.stopHold = true;
+  await click(stopBtn);
+  await React.act(async () => { board.release!(); });
+  await settle();
+  equal(document.activeElement?.id, "bz-heading", "with no tab the panel's heading takes the focus, not the page");
+  equal(el(m.host, "#bz-panel")!.getAttribute("aria-labelledby"), "bz-heading", "and the panel is labelled by something that exists");
+  await m.unmount();
+}
+{
+  // After the removal the claim is spent: a later poll does not pull focus back.
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await openTab(m);
+  const stopBtn = btn(m, "stop")!;
+  await React.act(async () => { stopBtn.focus(); });
+  board.stopHold = false;
+  await click(stopBtn);
+  await settle();
+  equal(document.activeElement?.id, "bz-heading", "rescued once");
+  const sink = document.createElement("button");
+  document.body.append(sink);
+  await React.act(async () => { sink.focus(); });
+  await React.act(async () => { sink.blur(); });
+  board.body = { state: "none", signedIn: false, url: null, instructions: null };
+  await advance(9000);
+  assert(document.activeElement !== el(m.host, "#bz-heading"), "a spent claim never takes focus again");
+  sink.remove();
+  await m.unmount();
+}
+
+// ===== the retry is a rescue target only for focus that was lost =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  const frame = el(m.host, "iframe[data-bz-frame]")!;
+  const composer = document.createElement("textarea");
+  document.body.append(composer);
+  await React.act(async () => { frame.focus(); });
+  const mute = (e: Event) => e.stopImmediatePropagation();
+  for (const type of ["blur", "focusout"]) win.document.addEventListener(type, mute, true);
+  await React.act(async () => { composer.focus(); });
+  for (const type of ["blur", "focusout"]) win.document.removeEventListener(type, mute, true);
+  await React.act(async () => { violation("frame-src", VIEWER, "enforce"); });
+  await settle();
+  assert(!frame.isConnected && btn(m, "view"), "the refused frame is gone and a retry is offered");
+  assert(document.activeElement === composer, "focus that was elsewhere is not pulled onto the retry");
+  composer.remove();
+  await m.unmount();
+}
+{
+  // ... and focus that was on the frame itself is.
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  const frame = el(m.host, "iframe[data-bz-frame]")!;
+  await React.act(async () => { frame.focus(); });
+  await React.act(async () => { violation("frame-src", VIEWER, "enforce"); });
+  await settle();
+  assert(document.activeElement === btn(m, "view"), "focus lost with the frame goes to the retry");
+  await m.unmount();
+}
+
+// ===== closing the last artifact keeps the Browser tab, and a live view in it =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
+  await settle();
+  await click(tab(m)!);
+  await click(btn(m, "view")!);
+  const frame = el(m.host, "iframe[data-bz-frame]")!;
+  await click(tab(m)!.closest(".cv-tab")!.previousElementSibling!.querySelector(".cv-tab-close") as HTMLElement);
+  equal(canvasStore.canvasSnapshot().tabs.length, 0, "the artifact tab is closed");
+  assert(drawer(m), "the drawer stays");
+  assert(el(m.host, "iframe[data-bz-frame]") === frame, "with the live view undisturbed");
+  await m.unmount();
+}
+// ... also when the Browser tab was behind the artifact.
+{
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
+  await settle();
+  assert(!store.browserSnapshot().focused, "the artifact is in front");
+  await click(el(m.host, ".cv-tab-close")!);
+  assert(drawer(m) && panel(m) && !panel(m)!.hidden, "closing it leaves the Browser tab showing");
+  await m.unmount();
+}
+
+// ===== the thread card names only the real host =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://accounts.google.com@evil.example.test/signin", instructions: "Sign in." });
+  const card = el(m.host, ".bz-card")!;
+  assert(card && !text(card).includes("google"), `the card does not show the userinfo: ${text(card)}`);
+  assert(text(card).includes("evil.example.test"), "it shows the host the page is really on");
+  await React.act(async () => { board.body = { state: "handoff", signedIn: false, url: `https://${"a".repeat(60)}.example.test/x`, instructions: "Sign in." }; await store.refreshBrowser(); });
+  await settle();
+  const long = text(el(m.host, ".bz-card .artmeta"));
+  assert(long.includes("…") && long.endsWith("example.test"), `a long host keeps its end: ${long}`);
+  equal(el(m.host, ".bz-card .artmeta")!.getAttribute("title"), `${"a".repeat(60)}.example.test`, "and the full host is its title");
+  await openTab(m);
+  assert(!text(panel(m)).includes("google"), "nor does the panel");
+  await m.unmount();
+}
+
+// ===== a takeover being stopped no longer asks anything of the person, and its frame is inert =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  board.stopHold = true;
+  await click(btn(m, "stop")!);
+  await click(btn(m, "go")!);
+  assert(!text(panel(m)).includes("asking you to take over") && text(panel(m)).includes("Closing the session"), "no frame: the panel no longer asks for a takeover");
+  await React.act(async () => { board.release!(); });
+  await settle();
+  await m.unmount();
+}
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  board.stopHold = true;
+  board.stopStatus = 503;
+  await click(btn(m, "stop")!);
+  await click(btn(m, "go")!);
+  const viewer = el(m.host, ".bz-viewer")!;
+  assert(viewer.hasAttribute("inert"), "while stopping, the frame is inert");
+  assert(text(viewer.querySelector(".bz-viewer-bar b") as HTMLElement).includes("Stopping"), "and its bar says so");
+  await React.act(async () => { board.release!(); });
+  await settle();
+  assert(!el(m.host, ".bz-viewer")!.hasAttribute("inert"), "a failed stop restores it");
+  await m.unmount();
+}
+
+// ===== a hung request fails instead of stopping the polling for good =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  board.getHang = true;
+  await advance(2000);
+  const reads = board.gets;
+  await advance(10_000);
+  assert(text(panel(m)).includes("Couldn't load the browser state"), "a GET that never answers is reported as a failed read");
+  board.getHang = false;
+  board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  await advance(4000);
+  assert(board.gets > reads, "and polling goes on");
+  assert(text(panel(m)).includes("Handed back"), "so the handback is noticed after all");
+  await m.unmount();
+}
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  board.viewHang = true;
+  await click(btn(m, "view")!);
+  await advance(15_000);
+  assert(text(panel(m)).includes("Couldn't open the live view"), "a view request that never answers ends as an error");
+  await m.unmount();
+}
+
+// ===== an unchanged answer changes nothing =====
+{
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  const before = store.browserSnapshot();
+  await advance(9000);
+  assert(store.browserSnapshot() === before, "polls that find nothing new leave the store's state as it was");
+  board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  await advance(3000);
+  assert(store.browserSnapshot() !== before && store.browserSnapshot().session?.signedIn === true, "a real change still lands");
+  await m.unmount();
+}
+
+// ===== Esc outside the panel does not leave a confirm waiting =====
+{
+  const m = await start({ state: "active", signedIn: true, url: "https://portal.example.test/orders" });
+  await openTab(m);
+  await click(btn(m, "stop")!);
+  equal(store.browserSnapshot().stop, "confirm", "confirm is up");
+  await React.act(async () => { document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+  await settle();
+  assert(!drawer(m), "Esc with focus outside the panel closes the drawer");
+  equal(store.browserSnapshot().stop, "idle", "and the confirm does not wait for the next opening");
+  await m.unmount();
+}
+
+// ===== the tab, the card and the feed =====
+{
+  // A takeover brings a hidden tab back.
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await openTab(m);
+  await React.act(async () => { store.hideBrowser(); });
+  assert(!store.tabVisible(store.browserSnapshot()), "hidden");
+  board.body = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." };
+  await advance(3000);
+  assert(store.tabVisible(store.browserSnapshot()), "a new takeover request unhides the tab");
+  await m.unmount();
+}
+{
+  // The artifact card says "in canvas" only when the artifact is what the canvas shows.
+  const ArtifactCard = require("../src/features/canvas/ArtifactCard").default;
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  const entry = { seq: 2, role: "agent", kind: "artifact", text: "", message: "m1", payload: { id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 } };
+  const cardHost = document.createElement("div");
+  document.body.append(cardHost);
+  const cardRoot = createRoot(cardHost);
+  await React.act(async () => { cardRoot.render(React.createElement(LocaleProvider, null, React.createElement(ArtifactCard, { entry }))); });
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
+  await settle();
+  assert(text(cardHost).includes("in canvas"), "the artifact in front reads in canvas");
+  await click(tab(m)!);
+  assert(!text(cardHost).includes("in canvas"), "with the Browser tab in front it does not");
+  await React.act(async () => { cardRoot.unmount(); });
+  cardHost.remove();
+  await m.unmount();
+}
+{
+  // The feed's auto-open takes the front from the Browser tab, except during a takeover.
+  const live = (id: string, turn: string) => ({ key: `${id}@1`, ref: { id, version: 1, kind: "html" as const, title: id, bytes: 1 }, live: true, operatorTurn: true, turn });
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await openTab(m);
+  assert(store.browserSnapshot().focused, "the Browser tab is in front");
+  await React.act(async () => { canvasStore.feedCanvas({ conversation: "c1", surface: "home", composerKey: "home", cards: [live("art-aaa", "t1")], working: null, turn: "t1" }); });
+  await settle();
+  assert(!store.browserSnapshot().focused, "a new artifact auto-opening takes the front while the assistant is reading");
+  await m.unmount();
+}
+{
+  // ... but not off a takeover: the person is mid-sign-in and the frame stays up.
+  const live = (id: string, turn: string) => ({ key: `${id}@1`, ref: { id, version: 1, kind: "html" as const, title: id, bytes: 1 }, live: true, operatorTurn: true, turn });
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  const frame = el(m.host, "iframe[data-bz-frame]")!;
+  await React.act(async () => { canvasStore.feedCanvas({ conversation: "c1", surface: "home", composerKey: "home", cards: [live("art-bbb", "t2")], working: null, turn: "t2" }); });
+  await settle();
+  assert(store.browserSnapshot().focused && el(m.host, "iframe[data-bz-frame]") === frame && !panel(m)!.hidden, "an artifact that arrives mid-takeover does not hide the live view");
+  assert(canvasStore.canvasSnapshot().tabs.some((t) => t.id === "art-bbb"), "it is still there as a tab");
+  await click(el(m.host, '[role="tab"]')!);
+  assert(!store.browserSnapshot().focused, "and a person's click on it does switch");
+  await m.unmount();
+}
+{
+  // everLive belongs to a conversation: another one that says 404 has no browser.
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  assert(store.browserSnapshot().everLive, "this conversation has had a live session");
+  board.conversation = "c2";
+  board.mode = "404";
+  await React.act(async () => { store.feedBrowser("c2"); });
+  await settle();
+  assert(!store.tabVisible(store.browserSnapshot()) && !store.browserSnapshot().everLive, "the next conversation starts with none of it");
+  await m.unmount();
+}
+
+// ===== the real Home path: MemberChat -> feedBrowser + useCanvasFeed -> drawer =====
+{
+  reset({ body: { state: "active", signedIn: false, url: "https://portal.example.test/orders", instructions: null }, conversation: "cm1" });
+  const MemberChat = require("../src/features/home/MemberChat").default;
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const root = createRoot(hostEl);
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(MemberChat, { scope: "s1:u1", readOnly: false, onOpenIssue: () => undefined }), React.createElement(CanvasDrawer)));
+  });
+  for (let i = 0; i < 6; i++) await advance(1000);
+  assert(board.gets >= 1, "the member chat reads the browser for its conversation (cm1)");
+  equal(store.browserSnapshot().conversation, "cm1", "through the explicit wiring");
+  equal(canvasStore.canvasSnapshot().conversation, "cm1", "and feeds the canvas the same conversation");
+  const bzCard = el(hostEl, ".bz-card");
+  assert(bzCard, "the thread has the Browser card");
+  const artCard = el(hostEl, '[data-kind="artifact"]');
+  assert(artCard, "and the artifact card");
+  await click(artCard as HTMLElement);
+  assert(drawer({ host: hostEl }) && canvasStore.canvasSnapshot().tabs.length === 1, "an artifact card opens the canvas in the member chat now");
+  assert(el(hostEl, "#bz-tab"), "with the Browser tab beside it");
+  await click(el(hostEl, "#bz-tab")!);
+  assert(!el(hostEl, "#bz-panel")!.hasAttribute("hidden"), "which shows the session");
+  const polls = board.gets;
+  await advance(9000);
+  assert(board.gets > polls, "an active session is polled while the chat is on screen");
+  await React.act(async () => { root.unmount(); });
+  hostEl.remove();
+  const after = board.gets;
+  await advance(30_000);
+  equal(board.gets, after, "leaving the chat stops the polling");
 }
 
 // ===== Home wiring: a conversation change resets, and leaving stops the polling =====

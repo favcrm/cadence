@@ -48,12 +48,28 @@ export function parseBrowserRead(body: unknown): BrowserRead | null {
   };
 }
 
+/** A read or a view request that never answers must not stall polling for
+ *  good: it is aborted after this long and reads as a failure. Stop is not
+ *  bounded: a hung page can take minutes to stop. */
+const READ_TIMEOUT_MS = 10_000;
+const VIEW_TIMEOUT_MS = 15_000;
+
+async function bounded<T>(ms: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await run(controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const route = (path: string, conversation: string): string =>
   `/api/browser${path}?conversation=${encodeURIComponent(conversation)}`;
 
 /** Read the session. Throws on a network error, a refusal or a malformed body. */
-export function readBrowser(conversation: string, signal?: AbortSignal): Promise<BrowserRead> {
-  return usingPrivateOperation(undefined, async (op) => {
+export function readBrowser(conversation: string): Promise<BrowserRead> {
+  return bounded(READ_TIMEOUT_MS, (signal) => usingPrivateOperation(undefined, async (op) => {
     const resp = await privateFetch(route("", conversation), { headers: sessionHeaders(), cache: "no-store", signal }, op);
     if (resp.status === 404) return { kind: "unavailable" } as const;
     if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
@@ -62,7 +78,7 @@ export function readBrowser(conversation: string, signal?: AbortSignal): Promise
     const read = parseBrowserRead(body);
     if (!read) throw new Error("Unreadable browser state");
     return read;
-  });
+  }));
 }
 
 /** `POST /api/browser/stop`. Resolves only on `{status: "stopped"}`; a 503
@@ -102,8 +118,8 @@ function httpsUrl(value: unknown): string | null {
  * the caller holds it in memory for the frame and nowhere else.
  */
 export function viewBrowser(conversation: string): Promise<ViewRead> {
-  return usingPrivateOperation(undefined, async (op) => {
-    const resp = await privateFetch(route("/view", conversation), { method: "POST", headers: sessionHeaders(), cache: "no-store" }, op);
+  return bounded(VIEW_TIMEOUT_MS, (signal) => usingPrivateOperation(undefined, async (op) => {
+    const resp = await privateFetch(route("/view", conversation), { method: "POST", headers: sessionHeaders(), cache: "no-store", signal }, op);
     if (resp.status === 409) return { kind: "not_in_handoff" } as const;
     if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
     const body: unknown = await resp.json();
@@ -111,5 +127,5 @@ export function viewBrowser(conversation: string): Promise<ViewRead> {
     const url = httpsUrl(typeof body === "object" && body !== null ? (body as { url?: unknown }).url : undefined);
     if (!url) throw new Error("Unreadable live view answer");
     return { kind: "url", url } as const;
-  });
+  }));
 }

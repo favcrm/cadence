@@ -16,7 +16,7 @@
  * - no viewer URL is ever held here (see browserClient.viewBrowser).
  */
 import { useSyncExternalStore } from "react";
-import { canvasSnapshot, onArtifactFocus, showDrawer } from "./canvasStore";
+import { canvasSnapshot, onArtifactFocus, onArtifactsEmptied, showDrawer } from "./canvasStore";
 import { onPrivateSessionReset } from "../../lib/privateSession";
 import { readBrowser, stopBrowser, type BrowserSession } from "./browserClient";
 
@@ -40,7 +40,7 @@ export interface BrowserTabState {
   focused: boolean;
   stop: StopPhase;
   stopStartedAt: number | null;
-  /** A takeover just ended: handoff -> active seen. Cleared on the next change. */
+  /** A takeover just ended: handoff -> active seen. Cleared by the next read. */
   handedBack: boolean;
 }
 
@@ -119,6 +119,9 @@ function schedule(): void {
   }, delay);
 }
 
+const sameSession = (a: BrowserSession | null, b: BrowserSession | null): boolean =>
+  a === b || (a !== null && b !== null && a.state === b.state && a.signedIn === b.signedIn && a.url === b.url && a.instructions === b.instructions);
+
 function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
   if (read.kind === "unavailable") {
     // A board that answered with a live session does not lose its browser: this
@@ -136,10 +139,11 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
   // A new takeover request brings a hidden tab back.
   const asked = next.state === "handoff" && prev !== "handoff";
   const over = next.state === "ended" || next.state === "none";
-  set({
+  const nextState: BrowserTabState = {
     ...state,
     availability: "available",
-    session: next,
+    // The same session keeps its identity, so an unchanged poll changes nothing.
+    session: sameSession(state.session, next) ? state.session : next,
     loadError: false,
     everLive: state.everLive || next.state === "active" || next.state === "handoff",
     hidden: asked ? false : state.hidden,
@@ -147,7 +151,10 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
     stop: over || (state.stop === "failed" && prev !== next.state) ? "idle" : state.stop,
     stopStartedAt: over ? null : state.stopStartedAt,
     handedBack,
-  });
+  };
+  // An unchanged answer is no change: a `set` would re-render every card.
+  const same = (Object.keys(nextState) as (keyof BrowserTabState)[]).every((k) => nextState[k] === state[k]);
+  if (!same) set(nextState);
 }
 
 /** Read the session now. One read at a time; an answer from before a
@@ -158,7 +165,7 @@ export async function refreshBrowser(): Promise<void> {
   reading = true;
   const mine = epoch;
   try {
-    const read = await readBrowser(conversation);
+    const read = await readBrowser(conversation); // bounded: a hung read fails
     if (mine === epoch) apply(read);
   } catch {
     // Keep what is shown. Only a tab that already exists says it cannot load;
@@ -205,17 +212,30 @@ export function focusBrowser(): void {
 export function hideBrowser(): void {
   if (state.hidden) return;
   if (state.open && canvasSnapshot().tabs.length > 0) showDrawer();
-  set({ ...state, hidden: true, focused: false, open: false });
+  set({ ...state, hidden: true, focused: false, open: false, stop: state.stop === "confirm" ? "idle" : state.stop });
 }
 
 /** The drawer closed. Nothing about the session changes. */
 export function closeBrowserDrawer(): void {
-  if (state.open || state.focused) set({ ...state, open: false });
+  // A confirm left pending must not wait there when the drawer reopens.
+  if (state.open || state.focused || state.stop === "confirm") {
+    set({ ...state, open: false, stop: state.stop === "confirm" ? "idle" : state.stop });
+  }
 }
 
-// An artifact taking focus (card click, tab click, auto-open) ends the browser's.
-onArtifactFocus(() => {
+// An artifact taking focus (card click, tab click, auto-open) ends the browser's,
+// except that the feed's auto-open never pulls the person off a takeover.
+onArtifactFocus((source) => {
+  if (source === "auto" && state.session?.state === "handoff") return;
   if (state.focused) set({ ...state, focused: false });
+});
+
+// Closing the last artifact keeps the drawer, and a live view in it, on the
+// Browser tab when there is one.
+onArtifactsEmptied(() => {
+  if (!tabVisible(state)) return false;
+  set({ ...state, open: true, focused: true });
+  return true;
 });
 
 /** Stop asks first only when something would be lost: a signed-in session or
