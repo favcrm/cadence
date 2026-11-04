@@ -302,6 +302,32 @@ impl Store {
             .map(|(store, _)| store)
     }
 
+    /// The stored schema version.
+    fn schema_version(conn: &Connection) -> Result<i64> {
+        Ok(conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?)
+    }
+
+    /// CAD-2120: the v62 backfill's resume cursor, or `None` when a concurrent
+    /// opener already completed v62 (it deletes the progress row and sets the
+    /// version in one transaction). A missing row on a store below v62 is a
+    /// real fault and stays an error.
+    pub(super) fn source_scope_progress(conn: &Connection) -> Result<Option<i64>> {
+        use rusqlite::OptionalExtension;
+        let cursor: Option<i64> = conn
+            .query_row(
+                "SELECT cursor FROM app_schema_progress WHERE name='cad2042-source-scope'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if cursor.is_none() && Self::schema_version(conn)? < 62 {
+            return Err(Error::rejected(
+                "v62 backfill progress is missing on a store below v62",
+            ));
+        }
+        Ok(cursor)
+    }
+
     pub(super) fn open_inner(
         path: &Path,
         marker: Option<ConsumedMarker>,
@@ -1585,6 +1611,13 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=61", [])?;
                 tx.commit()?;
             }
+            // CAD-2120: a concurrent opener may have finished v62 since `version` was read.
+            let version = if version < 62 {
+                Self::schema_version(&conn)?
+            } else {
+                version
+            };
+            // migration-lint: allow 62 -- CAD-2120: control flow only. The v62 SQL stays in this block byte for byte; the one changed statement reads the backfill cursor through Store::source_scope_progress, so an opener that lost the race to a finished migration stops instead of failing.
             if version < 62 {
                 // CAD-2042: the retained-source page must be an ordered scoped
                 // index range, not a join plus temp-B-tree sort over the whole
@@ -1625,11 +1658,9 @@ impl Store {
                 tx.commit()?;
                 loop {
                     let tx = super::seal::begin_legacy_migration_tx(&conn)?;
-                    let start: i64 = tx.query_row(
-                        "SELECT cursor FROM app_schema_progress WHERE name='cad2042-source-scope'",
-                        [],
-                        |row| row.get(0),
-                    )?;
+                    let Some(start) = Self::source_scope_progress(&tx)? else {
+                        break;
+                    };
                     let bound: i64 = tx.query_row(
                         "SELECT COALESCE(MAX(rowid),0) FROM app_capability_results",
                         [],
