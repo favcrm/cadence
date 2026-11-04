@@ -42,7 +42,10 @@ builds a campaign. Retention and quota are described in
   `pdftotext` seam the wiki ingest uses, under the attachment text cap. A
   corrupt, encrypted or text-free (image-only) PDF is refused at upload with
   its own reason — never retained as an attachment the assistant cannot read,
-  and no OCR is attempted.
+  and no OCR is attempted. `pdftotext` comes from `poppler-utils`, which the
+  host must install; without it a PDF is refused with a message naming the
+  missing tool rather than as a bad file, and the `tests` workflow installs it
+  on its runner.
 - Size: at most **10 MiB** per file; at most **5 files** per message.
 - Attachments fail closed: unsafe symlinks or ownership/modes in the captured
   operational workspace path, or in legacy quota custody, make uploads refuse.

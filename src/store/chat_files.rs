@@ -433,6 +433,15 @@ fn attachment_text(name: &str, mime: &str, bytes: &[u8]) -> Result<String> {
                 Error::rejected(format!("chat_file_upload '{name}': not UTF-8 text: {e}"))
             });
     }
+    pdf_attachment_text(PDFTOTEXT, name, bytes)
+}
+
+/// The converter a PDF attachment is read through (poppler-utils).
+const PDFTOTEXT: &str = "pdftotext";
+
+/// Read a PDF through `program`. A converter that cannot start is a missing
+/// install, said as such with its remedy — never reported as a bad PDF.
+fn pdf_attachment_text(program: &str, name: &str, bytes: &[u8]) -> Result<String> {
     use std::io::Write;
     let mut staged = tempfile::NamedTempFile::new().map_err(|e| {
         Error::rejected(format!(
@@ -448,17 +457,24 @@ fn attachment_text(name: &str, mime: &str, bytes: &[u8]) -> Result<String> {
             ))
         })?;
     let (output, bounds) = crate::proc::run_bounded_limited(
-        std::process::Command::new("pdftotext")
+        std::process::Command::new(program)
             .args(["-enc", "UTF-8", "-nopgbrk"])
             .arg(staged.path())
             .arg("-"),
         std::time::Duration::from_secs(20),
         CHAT_FILE_TEXT_CAP,
     )
-    .map_err(|e| {
-        Error::rejected(format!(
+    .map_err(|e| match e {
+        crate::proc::BoundedError::Spawn(ref io) if io.kind() == std::io::ErrorKind::NotFound => {
+            Error::rejected(format!(
+                "chat_file_upload refused '{name}': PDF text extraction is unavailable on \
+                 this host because `{program}` is not installed (install poppler-utils); \
+                 the PDF itself was not judged"
+            ))
+        }
+        e => Error::rejected(format!(
             "chat_file_upload refused '{name}': the PDF could not be read: {e}"
-        ))
+        )),
     })?;
     if bounds.stdout_exceeded {
         return Err(Error::rejected(format!(
@@ -2704,6 +2720,26 @@ mod tests {
             "Invoice 42"
         );
         assert_eq!(out["extractable"], json!(true));
+    }
+
+    /// A host without the converter says so and names the remedy; it must not
+    /// read as a fault in the user's file.
+    #[test]
+    fn a_missing_pdftotext_is_reported_as_missing_not_as_a_bad_pdf() {
+        let err = pdf_attachment_text(
+            "cadence-no-such-pdftotext",
+            "invoice.pdf",
+            &minimal_pdf("Invoice 42"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("`cadence-no-such-pdftotext` is not installed"),
+            "{err}"
+        );
+        assert!(err.contains("poppler-utils"), "{err}");
+        assert!(!err.contains("could not be read"), "{err}");
+        assert!(!err.contains("corrupt"), "{err}");
     }
 
     /// A PDF whose bytes are a PDF but which no converter can read is refused
