@@ -17,6 +17,48 @@ fn unsupported(verb: &str, flag: &str, why: &str) -> Error {
     Error::rejected(format!("remote `{verb}` cannot {flag} — {why}"))
 }
 
+pub(super) const HOSTED_ISSUE_LS_REFUSAL: &str = "the remote route's filter does not implement it";
+
+/// The presence checks and names used by both hosted routing and offline discovery.
+#[derive(Default)]
+struct HostedIssueLsOptions {
+    stage: bool,
+    health: bool,
+    since: bool,
+    until: bool,
+    ready: bool,
+    blocked: bool,
+    at: bool,
+    sort: bool,
+    limit: bool,
+    fields: bool,
+    summary: bool,
+}
+
+impl HostedIssueLsOptions {
+    fn restrictions(self) -> [(&'static str, bool); 11] {
+        [
+            ("--stage", self.stage),
+            ("--health", self.health),
+            ("--since", self.since),
+            ("--until", self.until),
+            ("--ready", self.ready),
+            ("--blocked", self.blocked),
+            ("--at", self.at),
+            ("--sort", self.sort),
+            ("--limit", self.limit),
+            ("--fields", self.fields),
+            ("--summary", self.summary),
+        ]
+    }
+}
+
+pub(super) fn hosted_issue_ls_unsupported_flags() -> [&'static str; 11] {
+    HostedIssueLsOptions::default()
+        .restrictions()
+        .map(|(flag, _)| flag)
+}
+
 /// `cadence <verb>` → AOS-128 `(verb, arguments)`. Every returned verb is
 /// in `remote_cli::REMOTE_VERBS` or `remote_cli::WIKI_ACTIONS`; every argument value is a primitive the
 /// server's `arguments` object accepts. A command outside the set — or a
@@ -198,30 +240,26 @@ fn verb_for(
                     json: _,
                 },
         } => {
-            // Straight pass-through of the list grammar; the remote
-            // tracker owns the same flags the local `issue ls` parses.
+            // Refuse list filters that cannot cross the hosted route faithfully.
             // CAD-1999: `--project` now crosses the wire — the hosted
             // route filters one registered (or ticket-derived) project,
             // so a repeated flag refuses rather than silently keeping one.
-            for (flag, present) in [
-                ("--stage", !stage.is_empty()),
-                ("--health", !health.is_empty()),
-                ("--since", since.is_some()),
-                ("--until", until.is_some()),
-                ("--ready", *ready),
-                ("--blocked", *blocked),
-                ("--at", at.is_some()),
-                ("--sort", sort.is_some()),
-                ("--limit", limit.is_some()),
-                ("--fields", !fields.is_empty()),
-                ("--summary", *summary),
-            ] {
+            let hosted_options = HostedIssueLsOptions {
+                stage: !stage.is_empty(),
+                health: !health.is_empty(),
+                since: since.is_some(),
+                until: until.is_some(),
+                ready: *ready,
+                blocked: *blocked,
+                at: at.is_some(),
+                sort: sort.is_some(),
+                limit: limit.is_some(),
+                fields: !fields.is_empty(),
+                summary: *summary,
+            };
+            for (flag, present) in hosted_options.restrictions() {
                 if present {
-                    return Err(unsupported(
-                        "issue ls",
-                        flag,
-                        "the remote route's filter does not implement it",
-                    ));
+                    return Err(unsupported("issue ls", flag, HOSTED_ISSUE_LS_REFUSAL));
                 }
             }
             if project.len() > 1 {

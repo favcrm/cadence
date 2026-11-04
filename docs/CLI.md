@@ -281,6 +281,9 @@ cadence commands "issue comment" --limit 20
 cadence commands --all                   # every public path
 cadence schema issue comment
 cadence schema agent wait
+cadence schema issue ls                  # known hosted-client restrictions
+cadence commands "create project"
+cadence schema project new
 ```
 
 `commands` with a query returns `{schema_version, commands, total, truncated}`.
@@ -294,6 +297,18 @@ for that one path. Argument entries are parser metadata (identifier,
 spelling, aliases, required, arity, action, possible values, help), not
 default values. A public alias resolves to the canonical path. An unknown
 or hidden path exits 2 and writes nothing to stdout.
+
+Some arguments include `hosted: { "client_route": "unsupported", "reason": ... }`.
+This records a refusal by the installed CLI before it contacts a hosted
+workspace. An absent annotation does not promise hosted support: the live
+workspace version, its configuration and the caller's permissions may differ.
+Local options remain available as documented.
+
+`project new` has different effects by destination. Locally it can register a
+repository and seed `PROJECT.md`; on a selected hosted workspace it registers
+an empty project, requires `--name` and an authorized live human owner, and
+does not create a local repository. Inspect `cadence schema project new` before
+acting.
 
 These streams stay raw and are not part of discovery: inbox and events
 NDJSON, logs and content bytes, a bare `build-slot acquire` token, and
