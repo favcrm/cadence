@@ -5662,3 +5662,372 @@ fn cad2009_profile_sync_postdispatch_503_is_unknown_but_invalid_request_is_defin
         assert_eq!(requests[1]["body"]["arguments"], json!(arguments));
     }
 }
+
+/// CAD-2111: answer each hosted doctor request by its path.
+fn doctor_worker(
+    n: usize,
+    answer: impl Fn(&str) -> (&'static str, Value) + Send + 'static,
+) -> (
+    TcpListener,
+    std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
+    thread::JoinHandle<()>,
+) {
+    finite_worker(n, move |_, socket, req| {
+        let (status, body) = answer(&req.path);
+        write_answer(socket, status, "", &body);
+    })
+}
+
+fn doctor_envelope(version: &str) -> Value {
+    json!({"version": version, "envelope": "aa.SECRETENVELOPE.cc", "scope": ["cli.read"]})
+}
+
+fn with_scopes(dir: &Path, scopes: &[&str]) {
+    let path = dir.join(format!("cli-{ORG}.json"));
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    saved["capabilities"] = json!(scopes);
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+}
+
+fn check<'a>(checks: &'a [probe::Check], id: &str) -> &'a probe::Check {
+    checks.iter().find(|c| c.id == id).unwrap()
+}
+
+/// No renewal is due in these, so the issuer must never be called.
+fn doctor_checks(dir: &Path, target: &RemoteTarget, offline: bool) -> Vec<probe::Check> {
+    probe::checks_at(dir, target, offline, |_, _, _, _, _, _| {
+        panic!("doctor renewed a login that was not due")
+    })
+}
+
+const DEFAULT_SCOPES: &[&str] = &["cli.read", "cli.write", "wiki.read", "wiki.write"];
+
+fn doctor_healthy(path: &str) -> (&'static str, Value) {
+    match path {
+        "/__platform/cli/authorize" => ("200 OK", doctor_envelope(CLI_VERSION)),
+        "/__platform/wiki/authorize" => ("200 OK", doctor_envelope(WIKI_VERSION)),
+        "/__platform/cli/call" => ("200 OK", json!({"projects": []})),
+        other => panic!("doctor sent an unexpected request: {other}"),
+    }
+}
+
+#[test]
+fn hosted_doctor_passes_a_working_login_with_only_reads() {
+    let (listener, seen, handle) = doctor_worker(3, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, DEFAULT_SCOPES);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 0, "{checks:?}");
+    for id in ["credential", "auth", "read", "wiki", "scopes"] {
+        assert_eq!(check(&checks, id).status, probe::Status::Ok, "{id}");
+    }
+    // Optional access a default login never asked for is listed, not a fault.
+    let scopes = &check(&checks, "scopes").summary;
+    assert!(
+        scopes.contains("--settings") && scopes.contains("--audit-approve"),
+        "{scopes}"
+    );
+
+    let seen = seen.lock().unwrap();
+    let paths: Vec<&str> = seen.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/__platform/cli/authorize",
+            "/__platform/cli/call",
+            "/__platform/wiki/authorize"
+        ]
+    );
+    assert_eq!(seen[0].body["requested_scopes"], json!(["cli.read"]));
+    assert_eq!(seen[1].body["verb"], "project_ls");
+}
+
+#[test]
+fn hosted_doctor_never_prints_a_credential_or_envelope() {
+    let (listener, _seen, handle) = doctor_worker(3, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, DEFAULT_SCOPES);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+    let printed = format!(
+        "{}{}",
+        probe::report_text(&target, &checks),
+        probe::report_json(&target, &checks)
+    );
+    assert!(!printed.contains(BRIDGE), "{printed}");
+    assert!(!printed.contains("SECRETENVELOPE"), "{printed}");
+}
+
+#[test]
+fn hosted_doctor_names_login_only_for_a_proven_ended_session() {
+    let (listener, _seen, handle) = doctor_worker(1, |_| {
+        (
+            "401 Unauthorized",
+            json!({"ok": false, "error": {"code": "session_revoked"}}),
+        )
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert_eq!(auth.status, probe::Status::Fail);
+    assert!(
+        auth.remedy
+            .as_deref()
+            .unwrap()
+            .contains("cadence login acme"),
+        "{auth:?}"
+    );
+    assert_eq!(check(&checks, "read").status, probe::Status::Skipped);
+}
+
+#[test]
+fn hosted_doctor_does_not_call_a_bare_401_an_expired_login() {
+    let (listener, _seen, handle) = doctor_worker(1, |_| {
+        (
+            "401 Unauthorized",
+            json!({"ok": false, "error": {"code": "unauthorized"}}),
+        )
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary.contains("does not prove it expired"),
+        "{auth:?}"
+    );
+    assert!(
+        auth.remedy
+            .as_deref()
+            .unwrap()
+            .contains("cadence login acme"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_says_a_server_fault_is_not_the_login() {
+    let (listener, _seen, handle) = doctor_worker(1, |_| {
+        (
+            "503 Service Unavailable",
+            json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+        )
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary.contains("your login is not the problem"),
+        "{auth:?}"
+    );
+    assert!(
+        !auth.remedy.as_deref().unwrap().contains("cadence login"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_reports_an_unreachable_workspace_without_blaming_the_login() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (target, _root, dir) = credentialed(&listener);
+    drop(listener);
+    let checks = doctor_checks(&dir, &target, false);
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary.contains("says nothing about your login"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_warns_on_a_login_that_cannot_write() {
+    let (listener, _seen, handle) = doctor_worker(3, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, &["cli.read", "wiki.read", "wiki.write"]);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 1);
+    let scopes = check(&checks, "scopes");
+    assert_eq!(scopes.status, probe::Status::Warn);
+    assert!(
+        scopes
+            .remedy
+            .as_deref()
+            .unwrap()
+            .contains("cadence login acme"),
+        "{scopes:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_skips_the_wiki_for_a_login_without_it() {
+    let (listener, seen, handle) = doctor_worker(2, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, &["cli.read", "cli.write"]);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 0, "{checks:?}");
+    assert_eq!(check(&checks, "wiki").status, probe::Status::Skipped);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn hosted_doctor_offline_sends_nothing() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, DEFAULT_SCOPES);
+    let checks = doctor_checks(&dir, &target, true);
+
+    assert_eq!(probe::exit_code(&checks), 0);
+    for id in ["auth", "read", "wiki"] {
+        assert_eq!(check(&checks, id).status, probe::Status::Skipped, "{id}");
+    }
+    assert_eq!(
+        listener.accept().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn hosted_doctor_without_a_login_stops_before_the_network() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let checks = doctor_checks(root.path(), &target, false);
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    assert!(check(&checks, "credential")
+        .remedy
+        .as_deref()
+        .unwrap()
+        .contains("cadence login acme"));
+    assert_eq!(check(&checks, "auth").status, probe::Status::Skipped);
+    assert_eq!(
+        listener.accept().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+/// A saved login whose access is due, so doctor must renew before it can sign
+/// in. Most real runs start here: access lasts minutes, sessions last days.
+fn due_login(target: &RemoteTarget) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let issuer = "https://api-v2.agenticos.hk";
+    let at = now().unwrap();
+    store_credential_at(root.path(), ORG, ORG_ID, &target.endpoint, at - 1);
+    let path = root.path().join(format!("cli-{ORG}.json"));
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    saved["issuer"] = json!(issuer);
+    saved["subject_id"] = json!("user_owner");
+    saved["organization_slug"] = json!(ORG);
+    saved["capabilities"] = json!(DEFAULT_SCOPES);
+    saved["cli_session"] = json!({
+        "session_id": "hcs_12345678-1234-4234-8234-123456789abc",
+        "refresh_token": format!("hcr_{}", "A".repeat(43)),
+        "generation": 1,
+        "device_label": "cadence CLI",
+        "idle_expires_at": at + 1000,
+        "absolute_expires_at": at + 10_000
+    });
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let pin = root.path().join("trusted-issuer");
+    fs::write(&pin, format!("{issuer}\n")).unwrap();
+    fs::set_permissions(&pin, fs::Permissions::from_mode(0o600)).unwrap();
+    root
+}
+
+/// The doctor result when renewal is due and the issuer does `answer`. The
+/// workspace listener must see nothing: a failed renewal stops the live pass.
+fn doctor_with_renewal(
+    answer: Result<crate::remote_enrollment::IssuerAnswer>,
+) -> Vec<probe::Check> {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = target(&listener);
+    let root = due_login(&target);
+    let checks = probe::checks_at(root.path(), &target, false, |_, _, _, _, _, _| answer);
+    assert_eq!(
+        listener.accept().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(check(&checks, "read").status, probe::Status::Skipped);
+    assert_eq!(check(&checks, "wiki").status, probe::Status::Skipped);
+    checks
+}
+
+fn issuer_answer(status: u16, body: Value) -> Result<crate::remote_enrollment::IssuerAnswer> {
+    Ok(crate::remote_enrollment::IssuerAnswer {
+        status,
+        body,
+        correlation: None,
+    })
+}
+
+#[test]
+fn hosted_doctor_due_renewal_with_the_issuer_unreachable_does_not_blame_the_login() {
+    let checks = doctor_with_renewal(Err(reject("Hosted CLI session request failed")));
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary.contains("says nothing about your login"),
+        "{auth:?}"
+    );
+    assert!(
+        !auth.remedy.as_deref().unwrap().contains("cadence login"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_due_renewal_with_an_issuer_outage_does_not_blame_the_login() {
+    let checks = doctor_with_renewal(issuer_answer(
+        503,
+        json!({"error": "authority_unavailable"}),
+    ));
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary
+            .contains("does not show a problem with your login"),
+        "{auth:?}"
+    );
+    assert!(
+        !auth.remedy.as_deref().unwrap().contains("cadence login"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_due_renewal_of_an_ended_session_names_login_with_the_org() {
+    for (status, code) in [(401, "invalid_token"), (400, "invalid_grant")] {
+        let checks = doctor_with_renewal(issuer_answer(status, json!({"error": code})));
+        assert_eq!(probe::exit_code(&checks), 2);
+        let auth = check(&checks, "auth");
+        assert!(auth.summary.contains("session has ended"), "{auth:?}");
+        assert_eq!(auth.remedy.as_deref(), Some("run `cadence login acme`"));
+    }
+}
+
+#[test]
+fn hosted_doctor_due_renewal_with_an_unreadable_success_is_not_called_healthy() {
+    let checks = doctor_with_renewal(issuer_answer(200, json!({"unexpected": true})));
+    assert_eq!(probe::exit_code(&checks), 1);
+    assert_eq!(check(&checks, "auth").status, probe::Status::Unknown);
+}

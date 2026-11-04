@@ -2707,24 +2707,34 @@ fn renewal_refusal(
     body: &Value,
     correlation: Option<&crate::remote_enrollment::IssuerCorrelation>,
 ) -> Error {
-    let code = body
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     // The issuer's id is shown only when the header was valid (see
     // `issuer_correlation`). It is a support reference, never an authority.
     let request = correlation
         .map(|c| format!(" (issuer request {})", c.request_id))
         .unwrap_or_default();
-    match (status, code) {
-        (401, "invalid_token") | (400, "invalid_grant") => reject(format!(
+    if renewal_session_ended(status, body) {
+        reject(format!(
             "the renewable CLI session was rejected by the issuer — run `cadence login` again{request}"
-        )),
-        _ => reject(format!(
+        ))
+    } else {
+        reject(format!(
             "remote CLI session renewal is not complete (HTTP {status}); your saved login \
              is kept, retry the command later{request}"
-        )),
+        ))
     }
+}
+
+/// The issuer's terminal refresh-grant refusals: the one proof a fresh login
+/// is the remedy for a renewal that did not complete.
+fn renewal_session_ended(status: u16, body: &Value) -> bool {
+    let code = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    matches!(
+        (status, code),
+        (401, "invalid_token") | (400, "invalid_grant")
+    )
 }
 
 fn validate_renewal_response(
@@ -3048,34 +3058,9 @@ fn authorize(
     scopes: &[&str],
     timeout: Duration,
 ) -> Result<String> {
-    let (relay, version) = surface.relay();
-    let (status, _, body) = post(
-        &target.endpoint,
-        &format!("{relay}/authorize"),
-        &cred.access_token,
-        &json!({
-            "version": version,
-            "organization_id": target.org_id,
-            "audience": target.endpoint,
-            "requested_scopes": scopes,
-            "ttl_seconds": MAX_TTL,
-        }),
-        timeout,
-    )?;
+    let (status, _, body) = authorize_answer(target, cred, surface, scopes, MAX_TTL, timeout)?;
     match status {
-        200 => {
-            let body = body.ok_or_else(|| reject("remote authorize answered non-JSON"))?;
-            let envelope = body["envelope"].as_str().unwrap_or_default();
-            let compact_jws = envelope.split('.').all(|p| {
-                !p.is_empty()
-                    && p.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-            }) && envelope.split('.').count() == 3;
-            if body["version"].as_str() != Some(version) || !compact_jws {
-                return Err(reject("remote authorize returned an invalid envelope"));
-            }
-            Ok(envelope.to_string())
-        }
+        200 => envelope_of(surface, body),
         s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
         403 if matches!(verb, "issue_message_send" | "issue_messages_read")
             && body
@@ -3092,6 +3077,49 @@ fn authorize(
         }
         _ => Err(refusal_error(status, body.as_ref())),
     }
+}
+
+/// The strict authorize request and its raw answer, before any refusal is
+/// decoded, so `doctor` can classify what `authorize` turns into an error.
+fn authorize_answer(
+    target: &RemoteTarget,
+    cred: &Credential,
+    surface: Surface,
+    scopes: &[&str],
+    ttl_seconds: u64,
+    timeout: Duration,
+) -> Result<(u16, Option<u64>, Option<Value>)> {
+    let (relay, version) = surface.relay();
+    post(
+        &target.endpoint,
+        &format!("{relay}/authorize"),
+        &cred.access_token,
+        &json!({
+            "version": version,
+            "organization_id": target.org_id,
+            "audience": target.endpoint,
+            "requested_scopes": scopes,
+            "ttl_seconds": ttl_seconds,
+        }),
+        timeout,
+    )
+}
+
+/// The envelope in a 200 authorize answer: it must echo the version and carry
+/// a compact JWS.
+fn envelope_of(surface: Surface, body: Option<Value>) -> Result<String> {
+    let (_, version) = surface.relay();
+    let body = body.ok_or_else(|| reject("remote authorize answered non-JSON"))?;
+    let envelope = body["envelope"].as_str().unwrap_or_default();
+    let compact_jws = envelope.split('.').all(|p| {
+        !p.is_empty()
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    }) && envelope.split('.').count() == 3;
+    if body["version"].as_str() != Some(version) || !compact_jws {
+        return Err(reject("remote authorize returned an invalid envelope"));
+    }
+    Ok(envelope.to_string())
 }
 
 /// One `POST /__platform/{cli,wiki}/call` attempt: fresh envelope, strict
@@ -5755,6 +5783,8 @@ pub fn web_envelope(response: WebResponse) -> Result<Value> {
         response.status
     )))
 }
+
+pub mod probe;
 
 #[cfg(test)]
 mod tests;

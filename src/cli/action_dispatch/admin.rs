@@ -12,6 +12,7 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             host,
             json,
             reclaim_plan,
+            offline: _,
         } => doctor::run(state_dir, host, json, reclaim_plan),
         Commands::Setup {
             json,

@@ -15,6 +15,25 @@ See [verification and rollout](#verification-and-rollout) for the scope of
 earlier checkpoints, [REMOTE-AUTH](../REMOTE-AUTH.md) for authentication,
 and [Workspace app catalog](app-catalog.md) for local package rules.
 
+## Check your connection
+
+`cadence --org <org> doctor` tells you whether this machine's connection to a
+hosted org works and what to do if it does not, on a client-only or native
+installation. It sends only a sign-in and one read, then reports each step:
+`install`, `selection`, `credential`, `auth`, `read`, `wiki` and `scopes`.
+
+- Exit 0 is ok, 1 is a warning or a result it could not determine, and 2 is a
+  failure. `--json` prints the same report for a script; `--offline` runs only
+  the local checks and sends nothing.
+- It names `cadence login` only when the login can help. An unavailable service
+  or an unreachable network says your login is not the problem, and a refusal
+  by policy says a new login does not change it.
+- It renews a login that is due, as any hosted command does. It does not use a
+  native daemon, the local tracker or a local fallback.
+- Optional access a login did not ask for is listed with its login flag and is
+  not a fault. A new login replaces the saved login's access, and a `--web` or
+  `--settings` login does not include the wiki.
+
 ## What runs where
 
 | Responsibility | Current owner / effect |

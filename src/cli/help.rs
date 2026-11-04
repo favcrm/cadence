@@ -67,7 +67,10 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
         "Fleet",
         &[
             ("status", "One-screen fleet overview"),
-            ("doctor", "Check environment, storage and provider CLIs"),
+            (
+                "doctor",
+                "Check this machine, or your connection to a hosted org",
+            ),
         ],
     ),
     (
