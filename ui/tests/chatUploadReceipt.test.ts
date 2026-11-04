@@ -63,7 +63,8 @@ refuses("hosted empty mime", { ...hosted, mime: "" });
 refuses("hosted blank name", { ...hosted, name: "  " });
 refuses("hosted empty conversation", { ...hosted, conversation: "" });
 refuses("hosted non-numeric created", { ...hosted, created: "now" });
-refuses("hosted mixed with native identity", { ...hosted, user_id: native.user_id, thread_id: "t" });
+for (const key of ["scope", "context_id", "uploader", "user_id", "thread_id", "location_version"])
+  refuses(`hosted mixed with native ${key}`, { ...hosted, [key]: native[key as keyof typeof native] });
 for (const key of Object.keys(native)) refuses(`native missing ${key}`, without(native, key));
 refuses("native bad user", { ...native, user_id: "u1" });
 refuses("not an object", "x");

@@ -65,8 +65,9 @@ import type {
   AvatarLook,
 } from "./types";
 
-/** The daemon-minted retained-file row `POST /api/chat/upload` answers
- *  (CAD-1168): the id is the only handle; metadata is server-derived. */
+/** The native daemon-minted retained-file row `POST /api/chat/upload` answers
+ *  (CAD-1168): the id is the only handle; metadata is server-derived. A hosted
+ *  board answers `HostedChatFileReceipt` instead. */
 export interface NativeChatFileRow {
   id: string;
   sha256: string;
@@ -96,10 +97,10 @@ export interface HostedChatFileReceipt {
   created: number;
 }
 
-/** What a send needs is `id`, `name` and `mime`, which both receipts carry. */
+/** A send carries only `{id}`; the composer store also keeps `name` and `mime`, which both receipts carry. */
 export type ChatFileRow = NativeChatFileRow | HostedChatFileReceipt;
 
-/** Validate the daemon's ChatFile::to_json receipt before a row can become
+/** Validate the upload receipt (native ChatFile::to_json or the hosted receipt) before a row can become
  *  ready. This checks the wire shape only; native scope proofs remain the
  *  authority for upload and later reads. */
 export function decodeChatFileRow(value: unknown): ChatFileRow {
@@ -787,7 +788,7 @@ export const api = {
       operation,
     ),
   /** `POST /api/chat/upload` — one retained chat attachment (CAD-1168).
-   *  Operator-only multipart; returns the daemon-minted row. `signal`
+   *  Operator-only multipart; returns the native daemon row or the hosted receipt. `signal`
    *  aborts only this upload's transport (a canceled row's late answer
    *  is ignored by its caller); it never deletes a retained blob. */
   chatFileUpload: (

@@ -509,7 +509,7 @@
 }
 
 /* A failed chip is a compact card, not a pill: the warning badge, a
-   two-line column (name/meta above, reason below) and a trailing Remove.
+   name/reason column (name/meta above, reason below) and a trailing Remove.
    The pill radius stays for the single-line states. */
 .app-chat-filerow.failed {
   height: auto;
@@ -569,7 +569,7 @@
 }
 
 /* The refusal reason: the failure colour at the meta size, wrapped under
-   the name so the remedy is readable (the full text is also the row's title). */
+   the name so the remedy is readable (the full text is also the reason's title). */
 .app-chat-filerow .app-chat-upload-error {
   display: block;
   min-width: 0;
