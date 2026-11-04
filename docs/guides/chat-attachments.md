@@ -18,31 +18,38 @@ The local-administrative session represents one shared local-admin account,
 not distinct human users; older unbound sessions must reauthenticate. Verified
 named issuer/workspace/subject accounts remain distinct.
 
-**Availability: text, Markdown and CSV only.** The allowlist is `.txt`,
-`.md` and `.csv`. A Home message carries Home uploads; an app conversation
-carries uploads scoped to its installation, context and conversation, and only
-while the installation's current exact-approved bundle declares `file.upload`
-(see [Scope and retry rules](#scope-and-retry-rules)). **PDF and image files
-(`.pdf`, `.png`, `.jpg`, `.jpeg`, `.webp`) are refused with a specific reason**
-at the composer, the board route and the daemon: their processing is CAD-1233.
-An uploaded CSV is a retained text attachment the assistant can read; it is
-not a staged import — the CRM review/mapping bridge (preview, field mapping,
-consent) is CAD-1233, so nothing here imports rows, infers consent or builds a
-campaign. Retention and quota are described in
+**Availability: a PDF, or structured text.** The allowlist is `.pdf`, `.txt`,
+`.md`, `.markdown`, `.csv`, `.tsv`, `.json`, `.jsonl`, `.yaml`, `.yml` and
+`.xml`. A Home message carries Home uploads; an app conversation carries
+uploads scoped to its installation, context and conversation, and only while
+the installation's current exact-approved bundle declares `file.upload` (see
+[Scope and retry rules](#scope-and-retry-rules)). **Image files (`.png`,
+`.jpg`, `.jpeg`, `.webp`, `.gif`) are refused with a specific reason** at the
+composer, the board route and the daemon: their representation to a model is
+CAD-1233. An uploaded CSV is a retained text attachment the assistant can read;
+it is not a staged import — the CRM review/mapping bridge (preview, field
+mapping, consent) is CAD-1233, so nothing here imports rows, infers consent or
+builds a campaign. Retention and quota are described in
 [Quota admission contract](#quota-admission-contract).
 
 ## What an operator can attach
 
-- Kinds (interim allowlist, enforced by daemon byte-sniff, not the extension
-  alone): `.txt`, `.md`, `.csv`. The extension must match the sniffed bytes.
+- Kinds (enforced by daemon byte-sniff, not the extension alone): `.pdf` and
+  the UTF-8 text kinds `.txt`, `.md`, `.markdown`, `.csv`, `.tsv`, `.json`,
+  `.jsonl`, `.yaml`, `.yml`, `.xml`. The extension must match the sniffed
+  bytes.
+- A `.pdf` is retained as the original and read through the same bounded
+  `pdftotext` seam the wiki ingest uses, under the attachment text cap. A
+  corrupt, encrypted or text-free (image-only) PDF is refused at upload with
+  its own reason — never retained as an attachment the assistant cannot read,
+  and no OCR is attempted.
 - Size: at most **10 MiB** per file; at most **5 files** per message.
 - Attachments fail closed: unsafe symlinks or ownership/modes in the captured
   operational workspace path, or in legacy quota custody, make uploads refuse.
-- The composer pre-checks the same list and cap and its file picker offers
-  only `.txt,.md,.csv`; the daemon's checks are the enforcement. A `.pdf`,
-  `.png`, `.jpg`, `.jpeg` or `.webp` upload (by name or by sniffed bytes) is
-  refused with "PDF and image processing is not available yet" — no parser,
-  OCR or image processing runs on attachments.
+- The composer pre-checks the same list and cap and its file picker offers only
+  those extensions; the daemon's checks are the enforcement. A `.png`, `.jpg`,
+  `.jpeg`, `.webp` or `.gif` upload (by name or by sniffed bytes) is refused
+  with "Image processing is not available yet".
 
 ## The path a file takes
 
@@ -94,11 +101,12 @@ campaign. Retention and quota are described in
    carries a daemon-minted `chf-<32-hex>` id and its digest is verified on read.
 5. `thread_send` accepts `attachments: [{id}]` (1–5 ids, `chf-` grammar) from
    the operator chat only. **Readiness is checked against the actual bytes,
-   not the row's existence**: the row must be a text kind, the blob must
+   not the row's existence**: the row must be a readable kind, the blob must
    exist as a regular file, and its bounded content must still match the
-   declared size and digest, sniff as an allowed text kind, decode as UTF-8
-   and pass the secret gate. An altered, unreadable, oversized or
-   non-text row refuses the send before the message is queued. Version-1
+   declared size and digest, sniff as the declared kind, extract (a PDF
+   through the bounded converter; a text kind by decoding) and pass the
+   secret gate. An altered, unreadable, oversized or mislabelled row refuses
+   the send before the message is queued. Version-1
    paths derive from the validated stored owner/thread/attachment tuple;
    legacy paths derive from the validated stored digest, never request data.
 6. The resolved `{id,name,size,mime,sha256}` rows are stored on the entry's
@@ -127,10 +135,12 @@ campaign. Retention and quota are described in
    any byte is read. A non-master agent is refused. The master's gate-2
    allowlists admit `chat_file_read` in home and app turns.
 9. Read re-verifies the same opened bytes (bounded by the cap) against the
-   row's digest and returns `{extractable:true, text: <bounded>}` for text
-   kinds (≤64k chars, `secret::guard` re-run). A non-text row (none can be
-   uploaded) returns `{extractable:false}` metadata only — no fabricated
-   extraction.
+   row's digest, re-proves that its bytes still sniff as the row's declared
+   kind — the Home operator read reaches this projection without the readiness
+   helper, so the proof lives here too — and returns
+   `{extractable:true, text: <bounded>}` for a readable kind (≤64k chars,
+   `secret::guard` re-run). A mislabelled row is refused; no fabricated
+   extraction is ever returned.
 
 ## Scope and retry rules
 
@@ -180,10 +190,12 @@ campaign. Retention and quota are described in
   `chat_file_read` both re-check with a bounded no-follow open).
 - A board upload-staging name that already exists (the board uses
   exclusive create and never truncates or deletes a path it did not create).
-- Empty or oversized files; extensions outside the interim allowlist;
+- Empty or oversized files; extensions outside the allowlist;
   extension/magic mismatches; unknown or grammar-bad `chf-` ids on
   `thread_send`.
-- PDF/image uploads, whatever their extension or claimed MIME.
+- Image uploads, whatever their extension or claimed MIME. A PDF is accepted
+  when its bytes are a PDF and its text extracts; a corrupt, encrypted or
+  text-free PDF is refused.
 - An app-scoped upload or send without the exact-approved `file.upload`
   declaration, or whose installation, context or conversation does not match
   the stored row.

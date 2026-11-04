@@ -508,18 +508,20 @@
   color: var(--color-ink-200);
 }
 
-/* A failed chip keeps the refusal reachable but stays bounded: the
-   name/meta line holds its one-line height, and the reason wraps to a
-   second truncated line inside the pill rather than growing a card. */
+/* A failed chip is a compact card, not a pill: the warning badge, a
+   two-line column (name/meta above, reason below) and a trailing Remove.
+   The pill radius stays for the single-line states. */
 .app-chat-filerow.failed {
   height: auto;
-  min-height: 1.75rem;
-  flex-wrap: wrap;
-  row-gap: 0.125rem;
-  padding-block: 0.25rem;
-  max-width: 100%;
-  border-color: color-mix(in srgb, var(--color-fail) 55%, transparent);
-  background: color-mix(in srgb, var(--color-fail) 6%, var(--color-ink-850));
+  min-height: 2.5rem;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.5rem;
+  max-width: min(26rem, 100%);
+  border-radius: 0.625rem;
+  border-color: color-mix(in srgb, var(--color-fail) 50%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-fail) 7%, var(--color-ink-850));
 }
 
 .app-chat-filerow > svg {
@@ -535,6 +537,17 @@
 
 .app-chat-filerow.failed > svg {
   color: var(--color-fail);
+}
+
+/* The name/meta line and, on a failure, its reason: one column so both
+   start at the same left edge. */
+.app-chat-filebody {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
 }
 
 /* Name and meta share one line: the name truncates first, the meta
@@ -555,24 +568,24 @@
   flex-shrink: 0;
 }
 
-/* Mock: .upload-error — the refusal reason is visible text, one
-   truncated line under the name (full text on the chip's title). */
-.app-chat-filename small.app-chat-upload-error {
-  font-size: var(--text-micro);
-  color: var(--color-fail);
-}
-
-/* CAD-1419/CAD-1462: one icon slot per draft chip. Rest shows the
-   status glyph (file, spinner while uploading, warning on failure);
-   hover or focus swaps in Remove, and a coarse pointer keeps Remove
-   visible. */
+/* The refusal reason: the failure colour at the meta size, one truncated
+   line under the name (the full text stays on the row's title). */
 .app-chat-filerow .app-chat-upload-error {
-  flex: 1 1 100%;
+  display: block;
   min-width: 0;
+  font-size: var(--text-micro);
+  line-height: 1.3;
+  color: var(--color-fail);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* CAD-1419/CAD-1462: one icon slot per draft chip. Rest shows the
+   status glyph (file, spinner while uploading, warning on failure);
+   hover or focus swaps in Remove on a live row, and a coarse pointer
+   keeps Remove visible. A failed row is excluded: its warning glyph
+   stays and its Remove sits at the trailing edge. */
 .app-chat-filerow .app-chat-chip-retry { flex-shrink: 0; }
 .app-chat-chip-name {
   display: block;
@@ -604,16 +617,25 @@
 }
 .app-chat-filerow.failed .app-chat-chip-status svg { color: var(--color-fail); }
 .app-chat-chip-slot > .app-chat-remove { opacity: 0; pointer-events: none; }
-.app-chat-filerow:hover .app-chat-chip-status,
-.app-chat-filerow:focus-within .app-chat-chip-status { visibility: hidden; }
-.app-chat-filerow:hover .app-chat-remove,
-.app-chat-filerow:focus-within .app-chat-remove { opacity: 1; pointer-events: auto; }
-/* Touch has no hover: Remove holds the one icon slot, and the state
-   that the glyph would show is written out in the chip's meta line. */
+.app-chat-filerow:not(.failed):hover .app-chat-chip-status,
+.app-chat-filerow:not(.failed):focus-within .app-chat-chip-status { visibility: hidden; }
+.app-chat-filerow:not(.failed):hover .app-chat-chip-slot > .app-chat-remove,
+.app-chat-filerow:not(.failed):focus-within .app-chat-chip-slot > .app-chat-remove { opacity: 1; pointer-events: auto; }
+/* The failed row's own Remove is always live. */
+.app-chat-remove-trailing {
+  background: color-mix(in srgb, var(--color-ink-700) 45%, transparent);
+  color: var(--color-ink-300);
+}
+.app-chat-remove-trailing:hover {
+  background: color-mix(in srgb, var(--color-fail) 22%, var(--color-ink-800));
+  color: var(--color-ink-100);
+}
+/* Touch has no hover: Remove holds the one icon slot on a live row, and
+   the state that the glyph would show is written out in the meta line. */
 .app-chat-touch-status { display: none; }
 @media (hover: none) {
-  .app-chat-chip-slot > .app-chat-remove { opacity: 1; pointer-events: auto; }
-  .app-chat-filerow .app-chat-chip-status { display: none; }
+  .app-chat-filerow:not(.failed) .app-chat-chip-slot > .app-chat-remove { opacity: 1; pointer-events: auto; }
+  .app-chat-filerow:not(.failed) .app-chat-chip-status { display: none; }
   .app-chat-touch-status { display: inline; }
 }
 .app-chat-spinner {
