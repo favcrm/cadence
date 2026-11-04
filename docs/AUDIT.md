@@ -312,7 +312,7 @@ the environment of the process that runs it. For daemon verbs and the board that
 is the service, as set when it started: a service pinned to the real store but
 started with `HOME` or `CADENCE_HOME` moved (`XDG_STATE_HOME` on the legacy
 layout) is unguarded on those paths until it restarts from the normal
-environment. For rollout verbs and `cadence update` it is the caller: moving
+environment. For rollout verbs, `cadence update` and app catalog migration it is the caller: moving
 those variables on the call while pinning the real store skips the guard.
 `cadence daemon
 start` and `cadence ui start` strip these variables from the service they start,
