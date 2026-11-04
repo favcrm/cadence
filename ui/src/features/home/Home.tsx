@@ -1315,7 +1315,7 @@ function MasterHome({
       const id = ++cmdSeq.current;
       if (name === "help") {
         setCmds((c) => [...c, { id, name, ok: true, text: t(helpText(offered)) }]);
-        return;
+        return arg ? false : undefined;
       }
       const known = SLASH_COMMANDS.find((c) => c.name === name);
       if (!known) {
@@ -1330,7 +1330,7 @@ function MasterHome({
           ...c,
           { id, name, unavailable: true, text: t("This command isn't available in this workspace. `/help` lists what is.") },
         ]);
-        return;
+        return arg ? false : undefined;
       }
       setCmds((c) => [...c, { id, name, arg: arg || undefined, running: true }]);
       api

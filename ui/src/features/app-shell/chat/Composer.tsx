@@ -86,7 +86,7 @@ export interface ComposerProps {
    * Full density only: a complete `/verb [arg]` submits through here
    * (never to the thread). Compact panes with their own commands
    * (`/new`) pass it too; without it every submission is a send. `false`
-   * means no such verb: the words may be a message, so the box keeps them.
+   * means the words did not run and may be a message, so the box keeps them.
    */
   onCommand?: (name: string, arg: string) => boolean | void;
   /** The verbs the menu offers, when this board cannot run them all. */

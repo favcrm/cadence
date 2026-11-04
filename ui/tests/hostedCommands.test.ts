@@ -133,6 +133,11 @@ async function main() {
   assert(!requests.some((r) => r.startsWith("POST")), `an unknown verb sends nothing (got ${requests.join(", ")})`);
   assert(box()?.value === prose, "an unknown verb keeps the operator's text");
   assert(host.querySelector('[data-cmd="tmp"]'), "and says it was refused");
+  for (const words of ["/compact the nightly logs before the audit", "/help me fix the login bug"]) {
+    await type(words);
+    await enter();
+    assert(box()?.value === words, `words after a verb that did not run stay in the box: ${words}`);
+  }
 
   await type("/help");
   await enter();
