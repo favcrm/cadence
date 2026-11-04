@@ -156,9 +156,9 @@ pub(crate) const SOURCE_PAGE_AFTER_SQL: &str = "SELECT id,created,run_id,rowid
   ORDER BY created DESC,id DESC LIMIT ?";
 
 /// CAD-2120: receipts recorded in this scope while one scan runs are skipped
-/// by the fence; a page examines at most this many index entries beyond its
-/// own size to find its rows. More skipped entries than this means the scope
-/// moved too far for the scan to continue, so it restarts.
+/// by the fence. A page skips at most this many entries to find its rows;
+/// more means the scope moved too far for the scan to continue (or the fence
+/// was forged), so it restarts.
 const SOURCE_PAGE_FENCE_SLACK: usize = 1024;
 
 impl Store {
@@ -562,10 +562,13 @@ impl Store {
 
     /// CAD-2042: one page of run-bound source reads for this install/context,
     /// newest first. The partial source index carries every scoped key and
-    /// the receipt order, so this is an ordered index range with LIMIT — it
-    /// reads the page, not the scoped history. `fence` is the scan-start
-    /// rowid: receipts recorded after the scan began are skipped, which costs
-    /// only the rows written during that scan.
+    /// the receipt order, so this is an ordered index range. `fence` is the
+    /// scan-start rowid: receipts recorded after the scan began are skipped.
+    /// An honest fence skips only rows written during the scan, so the page
+    /// reads about `limit` entries. The cursor carrying the fence is not
+    /// authenticated, so the skip budget is `SOURCE_PAGE_FENCE_SLACK`; past
+    /// it the scan is refused as `stale_cursor` rather than walking the
+    /// scoped history. This bounds this function only.
     pub(crate) fn app_source_run_candidates(
         &self,
         install: &str,
@@ -582,33 +585,28 @@ impl Store {
             Some(_) => SOURCE_PAGE_AFTER_SQL,
             None => SOURCE_PAGE_FIRST_SQL,
         })?;
-        let examine = limit.saturating_add(SOURCE_PAGE_FENCE_SLACK);
-        let map = |r: &rusqlite::Row<'_>| {
-            Ok((
-                (r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get(2)?),
-                r.get::<_, i64>(3)?,
-            ))
+        let examine = (limit.saturating_add(SOURCE_PAGE_FENCE_SLACK)) as i64;
+        let mut scan = match after {
+            Some((at, id)) => stmt.query(params![install, context, at, id, examine])?,
+            None => stmt.query(params![install, context, examine])?,
         };
-        let scanned = match after {
-            Some((at, id)) => stmt
-                .query_map(params![install, context, at, id, examine as i64], map)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-            None => stmt
-                .query_map(params![install, context, examine as i64], map)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        };
-        let exhausted = scanned.len() < examine;
-        let rows: Vec<_> = scanned
-            .into_iter()
-            .filter(|(_, rowid)| *rowid <= fence)
-            .map(|(row, _)| row)
-            .take(limit)
-            .collect();
-        if rows.len() < limit && !exhausted {
-            return Err(Error::invalid(
-                "stale_cursor",
-                "the retained source library changed during the scan — restart it",
-            ));
+        let mut rows = Vec::with_capacity(limit.min(SOURCE_PAGE_FENCE_SLACK));
+        let mut skipped = 0usize;
+        // Stop at `limit` rows past the fence: an honest page reads about its
+        // own size. The skip budget bounds a forged fence.
+        while rows.len() < limit {
+            let Some(row) = scan.next()? else { break };
+            if row.get::<_, i64>(3)? <= fence {
+                rows.push((row.get(0)?, row.get(1)?, row.get(2)?));
+            } else {
+                skipped += 1;
+                if skipped > SOURCE_PAGE_FENCE_SLACK {
+                    return Err(Error::invalid(
+                        "stale_cursor",
+                        "the retained source library changed during the scan — restart it",
+                    ));
+                }
+            }
         }
         Ok(rows)
     }
