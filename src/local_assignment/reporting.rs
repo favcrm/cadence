@@ -203,6 +203,16 @@ pub struct HostedBindingTarget {
     /// Member and issuer written at claim time. Never filled from a later login.
     pub subject_id: String,
     pub issuer: String,
+    /// The claim this binding serves; the agent credential is minted for it.
+    pub assignment_id: String,
+    pub claim_id: String,
+    pub generation: u64,
+}
+
+/// Where a session's own credential for this kickoff is cached, beside its
+/// `.bind` file (CAD-2149). Private, short-lived, and gone with the binding.
+pub fn agent_credential_path(state_dir: &Path, message_id: &str) -> Result<PathBuf> {
+    Ok(binding_path(state_dir, message_id)?.with_extension("agent"))
 }
 
 /// Read the live hosted target for `message_id`.
@@ -244,6 +254,9 @@ pub fn hosted_binding_target(
         organization_id: file.organization_id,
         subject_id,
         issuer,
+        assignment_id: file.assignment_id,
+        claim_id: file.claim_id,
+        generation: file.generation,
     }))
 }
 
@@ -700,7 +713,15 @@ fn mark_accepted(path: &Path, state: &str) -> Result<()> {
         return Ok(());
     }
     binding.reported_state = Some(state.to_string());
-    write_kickoff_file(path, &binding)
+    write_kickoff_file(path, &binding)?;
+    drop_agent_credential(path);
+    Ok(())
+}
+
+/// The assignment is over: its cached credential goes with it. The board ends
+/// it on its own; this only keeps a dead token off the disk.
+fn drop_agent_credential(binding: &Path) {
+    let _ = fs::remove_file(binding.with_extension("agent"));
 }
 
 fn mark_fenced(path: &Path) -> Result<()> {
@@ -715,7 +736,9 @@ fn mark_fenced(path: &Path) -> Result<()> {
         return Ok(());
     }
     binding.settled = true;
-    write_kickoff_file(path, &binding)
+    write_kickoff_file(path, &binding)?;
+    drop_agent_credential(path);
+    Ok(())
 }
 
 struct FileLock {
@@ -1130,5 +1153,42 @@ mod tests {
         assert!(hosted_binding_target(dir.path(), "target-1")
             .unwrap()
             .is_none());
+    }
+
+    // CAD-2149, independent acceptance: the assignment ending removes ITS
+    // credential file and only that one, whichever way it ends.
+    #[test]
+    fn ending_an_assignment_removes_only_its_own_agent_credential_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let plant = |message: &str| {
+            bind(dir.path(), message);
+            let path = agent_credential_path(dir.path(), message).unwrap();
+            fs::write(&path, b"{}").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            path
+        };
+        let (fenced, accepted, live) = (
+            plant("end-fenced"),
+            plant("end-accepted"),
+            plant("end-live"),
+        );
+        mark_fenced(&binding_path(dir.path(), "end-fenced").unwrap()).unwrap();
+        assert!(!fenced.exists() && accepted.exists() && live.exists());
+        mark_accepted(&binding_path(dir.path(), "end-accepted").unwrap(), "result").unwrap();
+        assert!(
+            !accepted.exists(),
+            "an accepted final report left its credential"
+        );
+        assert!(live.exists(), "another assignment's credential was removed");
+        assert!(hosted_binding_target(dir.path(), "end-fenced")
+            .unwrap()
+            .is_none());
+        assert!(hosted_binding_target(dir.path(), "end-accepted")
+            .unwrap()
+            .is_none());
+        assert!(hosted_binding_target(dir.path(), "end-live")
+            .unwrap()
+            .is_some());
     }
 }

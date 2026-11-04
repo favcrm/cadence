@@ -3080,6 +3080,12 @@ fn authorize(
     match status {
         200 => envelope_of(surface, body),
         s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
+        403 if refusal_fields(body.as_ref()).0 == Some(agent_credential::HUMAN_SESSION_REQUIRED) => {
+            Err(Error::invalid(
+                agent_credential::HUMAN_SESSION_REQUIRED,
+                refusal_error(status, body.as_ref()).to_string(),
+            ))
+        }
         403 if matches!(verb, "issue_message_send" | "issue_messages_read")
             && body
                 .as_ref()
@@ -4877,13 +4883,16 @@ pub fn call_verb(
     let dir = auth_dir(None).map_err(|_| {
         reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
-    call_verb_until(
+    let session = agent_credential::bound_session();
+    call_verb_until_retry(
         target,
         verb,
         arguments,
         deadline,
         wake_timeout,
         &dir,
+        true,
+        session.as_deref(),
         note,
         std::thread::sleep,
     )
@@ -4938,6 +4947,7 @@ fn call_verb_until(
         wake_timeout,
         dir,
         true,
+        None,
         note,
         sleep,
     )
@@ -4959,6 +4969,7 @@ pub(crate) fn call_bounded(
     let dir = auth_dir(None).map_err(|_| {
         reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
+    let session = agent_credential::bound_session();
     call_verb_until_retry(
         target,
         verb,
@@ -4967,6 +4978,7 @@ pub(crate) fn call_bounded(
         wake_timeout,
         &dir,
         retry_wake,
+        session.as_deref(),
         note,
         std::thread::sleep,
     )
@@ -5150,6 +5162,7 @@ fn call_verb_until_retry(
     wake_timeout: u64,
     dir: &Path,
     retry_wake: bool,
+    agent: Option<&AgentSlot>,
     note: impl Fn(&str),
     sleep: impl Fn(Duration),
 ) -> Result<RemoteAnswer> {
@@ -5191,9 +5204,20 @@ fn call_verb_until_retry(
     if wake_timeout == 0 {
         return Err(budget_over());
     }
+    // CAD-2149: a managed session's hosted verbs ride its own credential.
+    // `None` means the member's login, as for every human shell.
+    let mut on_agent = agent_credential::applies(agent, target, surface, verb);
     loop {
         request_timeout(deadline, AUTH_TIMEOUT)?;
-        let cred = renewed_credential(dir, target, deadline)?;
+        let agent_cred = match on_agent {
+            Some(slot) => agent_credential::bearer(slot, target, dir, deadline, &note)?,
+            None => None,
+        };
+        let using_agent = agent_cred.is_some();
+        let cred = match agent_cred {
+            Some(cred) => cred,
+            None => renewed_credential(dir, target, deadline)?,
+        };
         // A login that records its capabilities must hold the wiki scope the
         // action needs; a legacy login with none is left to the server's check.
         if matches!(surface, Surface::Wiki) && !cred.capabilities.is_empty() {
@@ -5215,6 +5239,17 @@ fn call_verb_until_retry(
         // settings.* scope; `master_status` needs settings.read. A login
         // without the needed scope is refused here, before a request is
         // built — never downgraded to another verb or the local org.
+        if using_agent && (verb == REMOTE_SETTINGS_VERB || verb == REMOTE_MASTER_STATUS_VERB) {
+            return Err(reject(format!(
+                "a managed agent session can't use `{}` — it needs a person's login; \
+                 nothing was sent",
+                if verb == REMOTE_SETTINGS_VERB {
+                    "settings agents"
+                } else {
+                    "master status"
+                }
+            )));
+        }
         if verb == REMOTE_SETTINGS_VERB && !cred.capabilities.is_empty() {
             let operation = arguments
                 .get("operation")
@@ -5247,8 +5282,26 @@ fn call_verb_until_retry(
                 "remote command deadline elapsed during session renewal",
             ));
         }
-        let (status, retry_after, body) =
-            call_once(target, &cred, surface, verb, &arguments, deadline)?;
+        let answered = call_once(target, &cred, surface, verb, &arguments, deadline);
+        // A tenant that predates the agent identity refuses the credential with
+        // exactly this code, before it forwards or runs anything. That one
+        // answer keeps the login; every other refusal is the agent's own.
+        let refused_agent = match (&answered, on_agent) {
+            (Err(error), Some(_)) if using_agent => {
+                error.code() == Some(agent_credential::HUMAN_SESSION_REQUIRED)
+            }
+            (Ok((403, _, body)), Some(_)) if using_agent => {
+                refusal_fields(body.as_ref()).0 == Some(agent_credential::HUMAN_SESSION_REQUIRED)
+            }
+            _ => false,
+        };
+        if refused_agent {
+            if let Some(slot) = on_agent.take() {
+                slot.keep_login(&note, "this workspace has not been updated to accept it");
+            }
+            continue;
+        }
+        let (status, retry_after, body) = answered?;
         if effect.is_mutation() {
             if let Some(code) = explicit_mutation_uncertainty(body.as_ref()) {
                 return Err(Error::unknown(format!(
@@ -5987,6 +6040,10 @@ pub fn web_envelope(response: WebResponse) -> Result<Value> {
     )))
 }
 
+mod agent_credential;
+pub use agent_credential::{
+    bind_managed_session, bound_session, unbind_managed_session, AgentSlot,
+};
 pub mod probe;
 
 #[cfg(test)]

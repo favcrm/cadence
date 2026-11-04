@@ -6773,3 +6773,822 @@ fn cad2127_platform_status_correlates_both_selectors() {
         );
     }
 }
+
+// CAD-2149: a managed session's hosted verbs ride its own credential. These
+// drive the real client (`call_verb_until_retry`) against a synthetic board and
+// read what the board saw: which bearer carried each request.
+mod agent_credential_acceptance {
+    use super::*;
+    use std::sync::Mutex;
+
+    const AGENT: &str = "hct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const ASSIGNMENT: &str = "hla_00000000-0000-4000-8000-000000000001";
+    const CLAIM: &str = "hlc_00000000-0000-4000-8000-000000000002";
+    const ISSUER: &str = "https://issuer.invalid";
+    const SUBJECT: &str = "usr_member";
+
+    /// What the synthetic board answers, by route and bearer.
+    struct Board {
+        mint: (u16, Value),
+        agent_authorize: (u16, Value),
+        agent_call: (u16, Value),
+        login_call: (u16, Value),
+    }
+
+    fn minted() -> (u16, Value) {
+        (
+            200,
+            json!({
+                "version": "hosted-cadence-local-assignment.v1",
+                "assignment_id": ASSIGNMENT,
+                "generation": 1,
+                "claim_id": CLAIM,
+                "principal": {"kind": "agent", "agent_id": CLAIM, "actor": format!("agents/{CLAIM}")},
+                "capabilities": ["cli.read", "cli.write", "wiki.read"],
+                "credential": {
+                    "credential_id": "hca_00000000-0000-4000-8000-000000000003",
+                    "access_token": AGENT,
+                    "token_type": "Bearer",
+                    "issued_at": now().unwrap(),
+                    "expires_at": now().unwrap() + 900,
+                    "renewal": "remint",
+                },
+            }),
+        )
+    }
+
+    fn envelope(n: usize) -> Value {
+        json!({"version": CLI_VERSION, "envelope": format!("h.e.{n}"),
+            "bearer": "x", "expires_at": 0, "actor": "users/o", "scope": ["cli.read"], "issuer": "i"})
+    }
+
+    fn comment_receipt() -> Value {
+        json!({"issue": {"id": "SYN-1"}, "comment": {"body": "Synthetic"}})
+    }
+
+    fn board() -> Board {
+        Board {
+            mint: minted(),
+            agent_authorize: (200, envelope(0)),
+            agent_call: (200, comment_receipt()),
+            login_call: (200, comment_receipt()),
+        }
+    }
+
+    fn status_line(status: u16) -> &'static str {
+        match status {
+            200 => "200 OK",
+            401 => "401 Unauthorized",
+            403 => "403 Forbidden",
+            404 => "404 Not Found",
+            409 => "409 Conflict",
+            500 => "500 Internal Server Error",
+            _ => "400 Bad Request",
+        }
+    }
+
+    struct Session {
+        target: RemoteTarget,
+        dir: PathBuf,
+        slot: AgentSlot,
+        _root: tempfile::TempDir,
+        _listener: TcpListener,
+        seen: std::sync::Arc<Mutex<Vec<Request>>>,
+        notes: Mutex<Vec<String>>,
+    }
+
+    /// `n` is the exact number of requests the board will serve.
+    fn session(board: Board, n: usize) -> Session {
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let (listener, seen, _server) = finite_worker(n, move |_, socket, req| {
+            let (status, body) = if req.path.ends_with("/agent-credential") {
+                board.mint.clone()
+            } else if req.path.ends_with("/authorize") {
+                if req.bearer == AGENT {
+                    board.agent_authorize.clone()
+                } else {
+                    let version = if req.path.contains("/wiki/") {
+                        WIKI_VERSION
+                    } else {
+                        CLI_VERSION
+                    };
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        200,
+                        json!({"version": version, "envelope": format!("h.l.{n}")}),
+                    )
+                }
+            } else if req.bearer == AGENT {
+                board.agent_call.clone()
+            } else {
+                board.login_call.clone()
+            };
+            write_answer(socket, status_line(status), "", &body);
+        });
+        let target = RemoteTarget {
+            identity: Some(CliIdentityPin {
+                subject_id: SUBJECT.into(),
+                issuer: ISSUER.into(),
+            }),
+            ..target(&listener)
+        };
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("auth");
+        let assignments = root.path().join("hosted-assignments");
+        for path in [&dir, &assignments] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let login = json!({"version": "hosted-cadence-auth.v1", "organization_id": ORG_ID,
+            "organization_slug": ORG, "audience": target.endpoint, "issuer": ISSUER,
+            "subject_id": SUBJECT, "capabilities": ["cli.read", "cli.write", "wiki.read"],
+            "access_token": BRIDGE, "expires_at": now().unwrap() + 300});
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(format!("cli-{ORG}.json")))
+            .unwrap();
+        file.write_all(login.to_string().as_bytes()).unwrap();
+        let slot = AgentSlot::new(
+            assignments.join("msg_1.agent"),
+            &target,
+            ASSIGNMENT.into(),
+            CLAIM.into(),
+            1,
+        );
+        Session {
+            target,
+            dir,
+            slot,
+            _root: root,
+            _listener: listener,
+            seen,
+            notes: Mutex::new(Vec::new()),
+        }
+    }
+
+    impl Session {
+        fn send(&self, managed: bool, verb: &str, args: Value) -> Result<Value> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            call_verb_until_retry(
+                &self.target,
+                verb,
+                args.as_object().unwrap().clone(),
+                deadline,
+                10,
+                &self.dir,
+                true,
+                managed.then_some(&self.slot),
+                |line| self.notes.lock().unwrap().push(line.to_string()),
+                |_| {},
+            )
+            .map(|answer| match answer {
+                RemoteAnswer::Ok(body) | RemoteAnswer::Conflict(body) => body,
+            })
+        }
+
+        fn comment(&self, managed: bool) -> Result<Value> {
+            self.send(
+                managed,
+                "issue_comment",
+                json!({"id": "SYN-1", "body": "Synthetic"}),
+            )
+        }
+
+        /// (route, which bearer) for every request the board served.
+        fn trail(&self) -> Vec<(String, &'static str)> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|req| {
+                    let route = req.path.rsplit('/').next().unwrap().to_string();
+                    let bearer = match req.bearer.as_str() {
+                        AGENT => "agent",
+                        BRIDGE => "login",
+                        _ => "other",
+                    };
+                    (route, bearer)
+                })
+                .collect()
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.notes.lock().unwrap().clone()
+        }
+    }
+
+    fn step(route: &str, bearer: &'static str) -> (String, &'static str) {
+        (route.to_string(), bearer)
+    }
+
+    #[test]
+    fn a_managed_comment_is_sent_on_the_agent_credential_and_it_is_cached_private() {
+        let s = session(board(), 5);
+        s.comment(true).unwrap();
+        s.comment(true).unwrap();
+        // One mint on the member's login, then only the agent bearer; the second
+        // comment reuses the cached credential instead of minting again.
+        assert_eq!(
+            s.trail(),
+            vec![
+                step("agent-credential", "login"),
+                step("authorize", "agent"),
+                step("call", "agent"),
+                step("authorize", "agent"),
+                step("call", "agent"),
+            ]
+        );
+        let mint = s.seen.lock().unwrap()[0].body.clone();
+        assert_eq!(
+            mint,
+            json!({"version": "hosted-cadence-local-assignment.v1", "organization_id": ORG_ID,
+                "expected_generation": 1, "claim_id": CLAIM})
+        );
+        let meta = std::fs::metadata(&s.slot.path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert!(std::fs::read_to_string(&s.slot.path)
+            .unwrap()
+            .contains(AGENT));
+        assert!(s.lines().is_empty(), "{:?}", s.lines());
+    }
+
+    #[test]
+    fn a_board_without_the_mint_keeps_the_login_with_one_line() {
+        for (status, body) in [
+            (404, json!({"ok": false, "code": "not_found"})),
+            (
+                409,
+                json!({"ok": false, "code": "renewable_login_required"}),
+            ),
+        ] {
+            let mut b = board();
+            b.mint = (status, body);
+            let s = session(b, 3);
+            s.comment(true).unwrap();
+            assert_eq!(
+                s.trail(),
+                vec![
+                    step("agent-credential", "login"),
+                    step("authorize", "login"),
+                    step("call", "login"),
+                ],
+                "HTTP {status}"
+            );
+            assert_eq!(s.lines().len(), 1, "{:?}", s.lines());
+            assert!(!s.slot.path.exists());
+        }
+    }
+
+    #[test]
+    fn wiki_and_the_audit_verdicts_stay_on_the_login_and_a_review_rides_the_credential() {
+        let mut b = board();
+        b.agent_call = (
+            200,
+            json!({"review": {"artifact": "a", "digest": "d", "decision": "approve"}}),
+        );
+        let s = session(b, 9);
+        s.send(true, "read", json!({"path": "notes"})).unwrap();
+        s.send(true, "audit_verdict_project", json!({"project": "p"}))
+            .unwrap();
+        s.send(true, "audit_verdict", json!({"repo": "r"})).unwrap();
+        assert_eq!(
+            s.trail(),
+            vec![
+                step("authorize", "login"),
+                step("call", "login"),
+                step("authorize", "login"),
+                step("call", "login"),
+                step("authorize", "login"),
+                step("call", "login"),
+            ]
+        );
+        // `issue review` is judged against an artifact's author, and an attach
+        // from this session is recorded as the agent: it must be the agent too.
+        s.send(
+            true,
+            "issue_review",
+            json!({"artifact": "a", "digest": "d", "decision": "approve"}),
+        )
+        .unwrap();
+        let trail = s.trail();
+        assert_eq!(
+            trail[6..],
+            [
+                step("agent-credential", "login"),
+                step("authorize", "agent"),
+                step("call", "agent"),
+            ]
+        );
+        assert!(s.lines().is_empty());
+    }
+
+    // The board's own `issued_at` bounds the lifetime; a slow mint (the client
+    // reads the clock after the answer) is not aged out of it.
+    #[test]
+    fn a_slow_mint_is_judged_from_the_boards_issued_at() {
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint: "http://127.0.0.1:1".into(),
+            org_id: ORG_ID.into(),
+            identity: None,
+        };
+        let slot = AgentSlot::new(
+            PathBuf::from("/nonexistent/x.agent"),
+            &target,
+            ASSIGNMENT.into(),
+            CLAIM.into(),
+            1,
+        );
+        let answer = |issued: u64, expires: u64| {
+            let mut value = minted().1;
+            value["credential"]["issued_at"] = json!(issued);
+            value["credential"]["expires_at"] = json!(expires);
+            value
+        };
+        let at = 1_000_000;
+        let check = |issued, expires, at| {
+            agent_credential::validated(&slot, &target, Some(&answer(issued, expires)), at)
+        };
+        // Issued 8 s before the client looked at the clock: still usable.
+        assert!(check(at - 8, at - 8 + 900, at).is_ok());
+        // Past its own lifetime, issued in the future, or longer than 900 s.
+        assert!(check(at - 901, at - 1, at).is_err());
+        assert!(check(at + 60, at + 960, at).is_err());
+        assert!(check(at, at + 100_000, at).is_err());
+    }
+}
+
+// CAD-2149 / AOS-502: independent refusal acceptance for the managed session's
+// own credential, written from the two tickets and the server contract, not
+// from the implementation. Each check drives the real client
+// (`call_verb_until_retry`) against a synthetic loopback board and reads which
+// bearer carried every request. The implementer must not edit it.
+mod agent_credential_refusals {
+    use super::*;
+    use std::net::Shutdown;
+    use std::sync::{atomic::AtomicUsize, Arc, Mutex};
+
+    const ASSIGNMENT: &str = "hla_00000000-0000-4000-8000-000000000001";
+    const CLAIM: &str = "hlc_00000000-0000-4000-8000-000000000002";
+    const OTHER_CLAIM: &str = "hlc_00000000-0000-4000-8000-000000000009";
+    const ISSUER: &str = "https://issuer.invalid";
+    const SUBJECT: &str = "usr_member";
+    const LOGIN: &str = "login";
+
+    fn tok(c: char) -> String {
+        format!("hct_{}", c.to_string().repeat(43))
+    }
+
+    /// Which token the board mints for a claim and generation, so a request
+    /// shows exactly which mint it rode on.
+    fn tok_for(claim: &str, generation: u64) -> String {
+        tok(match (claim == CLAIM, generation) {
+            (true, 1) => 'A',
+            (true, _) => 'C',
+            (false, _) => 'D',
+        })
+    }
+
+    fn minted(claim: &str, generation: u64, ttl: u64) -> Value {
+        json!({
+            "version": "hosted-cadence-local-assignment.v1",
+            "assignment_id": ASSIGNMENT,
+            "generation": generation,
+            "claim_id": claim,
+            "principal": {"kind": "agent", "agent_id": claim, "actor": format!("agents/{claim}")},
+            "capabilities": ["cli.read", "cli.write", "wiki.read"],
+            "credential": {
+                "credential_id": "hca_00000000-0000-4000-8000-000000000003",
+                "access_token": tok_for(claim, generation),
+                "token_type": "Bearer",
+                "issued_at": now().unwrap(),
+                "expires_at": now().unwrap() + ttl,
+                "renewal": "remint",
+            },
+        })
+    }
+
+    fn refused(code: &str) -> Value {
+        json!({"ok": false, "error": {"code": code}})
+    }
+
+    enum Reply {
+        Json(u16, Value),
+        Raw(u16, &'static str),
+        Hangup,
+    }
+
+    fn reason(status: u16) -> &'static str {
+        match status {
+            200 => "200 OK",
+            401 => "401 Unauthorized",
+            403 => "403 Forbidden",
+            409 => "409 Conflict",
+            500 => "500 Internal Server Error",
+            _ => "400 Bad Request",
+        }
+    }
+
+    fn deliver(socket: &mut std::net::TcpStream, reply: Reply) {
+        match reply {
+            Reply::Json(status, body) => write_answer(socket, reason(status), "", &body),
+            Reply::Raw(status, text) => {
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 {}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}",
+                    reason(status),
+                    text.len()
+                );
+            }
+            // The request was read; the answer is lost.
+            Reply::Hangup => {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    fn agent(req: &Request) -> bool {
+        req.bearer != BRIDGE
+    }
+
+    struct Rig {
+        target: RemoteTarget,
+        dir: PathBuf,
+        root: tempfile::TempDir,
+        seen: Arc<Mutex<Vec<Request>>>,
+        notes: Mutex<Vec<String>>,
+        _listener: TcpListener,
+    }
+
+    /// A synthetic board serving at most `n` requests. `script` may override
+    /// the answer to a route (the last path segment); the default board mints
+    /// what was asked for, authorizes and answers every call.
+    fn rig(n: usize, script: impl Fn(&str, &Request) -> Option<Reply> + Send + 'static) -> Rig {
+        let envelopes = AtomicUsize::new(0);
+        let (listener, seen, _server) = finite_worker(n, move |_, socket, req| {
+            let route = req.path.rsplit('/').next().unwrap().to_owned();
+            let reply = script(&route, req).unwrap_or_else(|| match route.as_str() {
+                "agent-credential" => ok200(minted(
+                    req.body["claim_id"].as_str().unwrap_or_default(),
+                    req.body["expected_generation"].as_u64().unwrap_or_default(),
+                    900,
+                )),
+                "authorize" => ok200(json!({"version": CLI_VERSION, "envelope": format!(
+                    "h.e.{}", envelopes.fetch_add(1, std::sync::atomic::Ordering::SeqCst))})),
+                _ => ok200(json!({"issue": {"id": "SYN-1"}, "comment": {"body": "Synthetic"}})),
+            });
+            deliver(socket, reply);
+        });
+        let target = RemoteTarget {
+            identity: Some(CliIdentityPin {
+                subject_id: SUBJECT.into(),
+                issuer: ISSUER.into(),
+            }),
+            ..target(&listener)
+        };
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("auth");
+        for path in [&dir, &root.path().join("hosted-assignments")] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let login = json!({"version": "hosted-cadence-auth.v1", "organization_id": ORG_ID,
+            "organization_slug": ORG, "audience": target.endpoint, "issuer": ISSUER,
+            "subject_id": SUBJECT, "capabilities": ["cli.read", "cli.write", "wiki.read"],
+            "access_token": BRIDGE, "expires_at": now().unwrap() + 300});
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(format!("cli-{ORG}.json")))
+            .unwrap();
+        file.write_all(login.to_string().as_bytes()).unwrap();
+        Rig {
+            target,
+            dir,
+            root,
+            seen,
+            notes: Mutex::new(Vec::new()),
+            _listener: listener,
+        }
+    }
+
+    fn ok200(body: Value) -> Reply {
+        Reply::Json(200, body)
+    }
+
+    impl Rig {
+        fn slot(&self, claim: &str, generation: u64) -> AgentSlot {
+            AgentSlot::new(
+                self.root.path().join("hosted-assignments/msg_1.agent"),
+                &self.target,
+                ASSIGNMENT.into(),
+                claim.into(),
+                generation,
+            )
+        }
+
+        /// `None` is a human shell: no managed session was bound.
+        fn send(&self, slot: Option<&AgentSlot>, verb: &str, args: Value) -> Result<Value> {
+            call_verb_until_retry(
+                &self.target,
+                verb,
+                args.as_object().unwrap().clone(),
+                Instant::now() + Duration::from_secs(10),
+                10,
+                &self.dir,
+                true,
+                slot,
+                |line| self.notes.lock().unwrap().push(line.to_string()),
+                |_| {},
+            )
+            .map(|answer| match answer {
+                RemoteAnswer::Ok(body) | RemoteAnswer::Conflict(body) => body,
+            })
+        }
+
+        fn comment(&self, slot: Option<&AgentSlot>) -> Result<Value> {
+            self.send(
+                slot,
+                "issue_comment",
+                json!({"id": "SYN-1", "body": "Synthetic"}),
+            )
+        }
+
+        /// `route:bearer` for every request the board served, where the bearer
+        /// is `login` or the first letter of the minted token.
+        fn trail(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|req| {
+                    let who = if req.bearer == BRIDGE {
+                        LOGIN.to_string()
+                    } else {
+                        req.bearer[4..5].to_string()
+                    };
+                    format!("{}:{who}", req.path.rsplit('/').next().unwrap())
+                })
+                .collect()
+        }
+
+        fn notes(&self) -> Vec<String> {
+            self.notes.lock().unwrap().clone()
+        }
+    }
+
+    const MINT: &str = "agent-credential:login";
+
+    // 1. The agent's own refusals stand.
+    #[test]
+    fn a_refusal_on_the_agent_credential_is_never_retried_on_the_login() {
+        let profile = json!({"id": "ap_synthetic", "expectedRevision": 1, "model": "m"});
+        for (verb, args, stage, status, code) in [
+            ("team_invites", json!({}), "authorize", 401, "unauthorized"),
+            ("team_list", json!({}), "authorize", 403, "forbidden"),
+            (
+                "agent_profile_update",
+                profile.clone(),
+                "authorize",
+                403,
+                "forbidden",
+            ),
+            ("agent_profile_update", profile, "call", 403, "forbidden"),
+        ] {
+            let r = rig(8, move |route, req| {
+                (agent(req) && route == stage).then(|| Reply::Json(status, refused(code)))
+            });
+            let slot = r.slot(CLAIM, 1);
+            r.send(Some(&slot), verb, args).unwrap_err();
+            let mut want = vec![MINT, "authorize:A"];
+            if stage == "call" {
+                want.push("call:A");
+            }
+            assert_eq!(r.trail(), want, "{verb} {status} {code} at {stage}");
+            assert!(r.notes().is_empty(), "{verb}: {:?}", r.notes());
+        }
+    }
+
+    // 2. Exactly `human_session_required` falls back, once; nothing else does.
+    #[test]
+    fn only_exactly_human_session_required_falls_back_and_says_so_once() {
+        for stage in ["authorize", "call"] {
+            let r = rig(12, move |route, req| {
+                (agent(req) && route == stage)
+                    .then(|| Reply::Json(403, refused("human_session_required")))
+            });
+            let slot = r.slot(CLAIM, 1);
+            r.comment(Some(&slot)).unwrap();
+            r.comment(Some(&slot)).unwrap();
+            let mut want = vec![MINT, "authorize:A"];
+            if stage == "call" {
+                want.push("call:A");
+            }
+            want.extend([
+                "authorize:login",
+                "call:login",
+                "authorize:login",
+                "call:login",
+            ]);
+            assert_eq!(r.trail(), want, "fallback at {stage}");
+            let notes = r.notes();
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(!notes[0].contains("hct_"), "{notes:?}");
+        }
+        let lookalikes = [
+            (
+                "authorize",
+                Reply::Json(
+                    403,
+                    json!({"ok": false, "error": {
+                "code": "forbidden", "message": "human_session_required"}}),
+                ),
+            ),
+            (
+                "authorize",
+                Reply::Json(403, refused("human_session_required_x")),
+            ),
+            ("authorize", Reply::Raw(403, "human_session_required")),
+            (
+                "authorize",
+                Reply::Raw(403, "<html>human_session_required</html>"),
+            ),
+            ("call", Reply::Raw(403, "human_session_required")),
+            (
+                "call",
+                Reply::Json(403, refused("human_session_required_x")),
+            ),
+        ];
+        for (i, (stage, reply)) in lookalikes.into_iter().enumerate() {
+            let reply = std::sync::Mutex::new(Some(reply));
+            let r = rig(8, move |route, req| {
+                if agent(req) && route == stage {
+                    reply.lock().unwrap().take()
+                } else {
+                    None
+                }
+            });
+            let slot = r.slot(CLAIM, 1);
+            r.comment(Some(&slot)).unwrap_err();
+            let mut want = vec![MINT, "authorize:A"];
+            if stage == "call" {
+                want.push("call:A");
+            }
+            assert_eq!(r.trail(), want, "lookalike {i} at {stage} fell back");
+            assert!(r.notes().is_empty(), "lookalike {i}: {:?}", r.notes());
+        }
+    }
+
+    // 3. A write whose answer is lost is unknown: never replayed, never moved.
+    #[test]
+    fn a_lost_answer_to_a_write_under_the_agent_credential_is_unknown_with_no_replay() {
+        let r = rig(8, |route, req| {
+            (agent(req) && route == "call").then_some(Reply::Hangup)
+        });
+        let slot = r.slot(CLAIM, 1);
+        let error = r.comment(Some(&slot)).unwrap_err();
+        assert_eq!(error.kind(), "unknown", "{error}");
+        assert_eq!(r.trail(), [MINT, "authorize:A", "call:A"]);
+        assert!(r.notes().is_empty(), "{:?}", r.notes());
+    }
+
+    // 4. A mint that is not exactly this claim's refuses before anything is sent.
+    #[test]
+    fn a_bad_mint_refuses_with_nothing_sent() {
+        type Case = (&'static str, Box<dyn Fn() -> Reply + Send>);
+        let cases: Vec<Case> = vec![
+            (
+                "403",
+                Box::new(|| Reply::Json(403, json!({"ok": false, "code": "forbidden"}))),
+            ),
+            (
+                "409 fenced",
+                Box::new(|| Reply::Json(409, json!({"ok": false, "code": "fenced"}))),
+            ),
+            (
+                "409 terminal",
+                Box::new(|| Reply::Json(409, json!({"ok": false, "code": "terminal"}))),
+            ),
+            (
+                "500",
+                Box::new(|| Reply::Json(500, json!({"ok": false, "code": "internal"}))),
+            ),
+            ("malformed", Box::new(|| ok200(json!({"unexpected": true})))),
+            (
+                "no credential",
+                Box::new(|| {
+                    let mut v = minted(CLAIM, 1, 900);
+                    v.as_object_mut().unwrap().remove("credential");
+                    ok200(v)
+                }),
+            ),
+            (
+                "oversized lifetime",
+                Box::new(|| ok200(minted(CLAIM, 1, 100_000))),
+            ),
+            (
+                "wrong assignment",
+                Box::new(|| {
+                    let mut v = minted(CLAIM, 1, 900);
+                    v["assignment_id"] = json!("hla_00000000-0000-4000-8000-0000000000ff");
+                    ok200(v)
+                }),
+            ),
+            (
+                "wrong claim",
+                Box::new(|| ok200(minted(OTHER_CLAIM, 1, 900))),
+            ),
+            (
+                "wrong generation",
+                Box::new(|| ok200(minted(CLAIM, 2, 900))),
+            ),
+        ];
+        for (name, reply) in cases {
+            let reply = Mutex::new(Some(reply()));
+            let r = rig(4, move |route, _| {
+                if route == "agent-credential" {
+                    reply.lock().unwrap().take()
+                } else {
+                    None
+                }
+            });
+            let slot = r.slot(CLAIM, 1);
+            r.comment(Some(&slot)).unwrap_err();
+            assert_eq!(r.trail(), [MINT], "{name}");
+            assert!(r.notes().is_empty(), "{name}: {:?}", r.notes());
+            assert!(!slot.path.exists(), "{name} left a cache file");
+        }
+    }
+
+    #[test]
+    fn a_credential_cached_for_another_claim_or_generation_is_never_used() {
+        let r = rig(12, |_, _| None);
+        r.comment(Some(&r.slot(CLAIM, 1))).unwrap();
+        // The same file path now holds A's credential. A different claim, then
+        // a different generation of the first claim, must each mint afresh.
+        r.comment(Some(&r.slot(OTHER_CLAIM, 1))).unwrap();
+        r.comment(Some(&r.slot(CLAIM, 2))).unwrap();
+        assert_eq!(
+            r.trail(),
+            [
+                MINT,
+                "authorize:A",
+                "call:A",
+                MINT,
+                "authorize:D",
+                "call:D",
+                MINT,
+                "authorize:C",
+                "call:C",
+            ]
+        );
+    }
+
+    // 5. The credential file.
+    #[test]
+    fn the_credential_file_is_private_not_followed_and_never_printed() {
+        let r = rig(12, |_, _| None);
+        let slot = r.slot(CLAIM, 1);
+        let out = r.comment(Some(&slot)).unwrap();
+        let meta = std::fs::symlink_metadata(&slot.path).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        // The bearer rides only in the Authorization header: never a URL, a
+        // body, a note (stderr) or the verb's answer (stdout). The client
+        // spawns no process, so there is no argv for it to appear on.
+        assert!(!out.to_string().contains("hct_"), "{out}");
+        assert!(r.notes().is_empty());
+        for req in r.seen.lock().unwrap().iter() {
+            assert!(!req.path.contains("hct_"), "{}", req.path);
+            assert!(!req.body.to_string().contains("hct_"), "{}", req.path);
+        }
+        // Replace the file with a symlink to a perfectly good credential.
+        let planted = r.root.path().join("planted.json");
+        std::fs::rename(&slot.path, &planted).unwrap();
+        let before = std::fs::read(&planted).unwrap();
+        std::os::unix::fs::symlink(&planted, &slot.path).unwrap();
+        r.comment(Some(&slot)).unwrap();
+        assert_eq!(
+            r.trail()[3..],
+            [MINT, "authorize:A", "call:A"],
+            "the symlink was read through instead of minting"
+        );
+        assert_eq!(std::fs::read(&planted).unwrap(), before, "written through");
+    }
+
+    // 6. A human shell is unchanged.
+    #[test]
+    fn a_human_shell_never_reads_the_credential_file() {
+        let r = rig(8, |_, _| None);
+        let slot = r.slot(CLAIM, 1);
+        r.comment(Some(&slot)).unwrap();
+        let cached = std::fs::read(&slot.path).unwrap();
+        r.comment(None).unwrap();
+        assert_eq!(r.trail()[3..], ["authorize:login", "call:login"]);
+        assert_eq!(std::fs::read(&slot.path).unwrap(), cached);
+        assert!(r.notes().is_empty());
+    }
+}
