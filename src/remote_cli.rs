@@ -1841,6 +1841,9 @@ fn settings_receipt_correlates(
     }
 }
 
+/// Stable code for a board that refused `include_body` on the verdict read.
+pub const VERDICT_BODY_UNSUPPORTED: &str = "verdict_body_unsupported";
+
 /// CAD-2001: the project-scoped review-evidence verbs. Every one carries an
 /// explicit `project` — plus `issue` for the two approvals — so the answer is
 /// that project's evidence and no other's. They are newer than the tenant
@@ -5508,6 +5511,20 @@ fn call_verb_until_retry(
         if status == 501 && matches!(verb, "artifact_find" | "artifact_show" | "artifact_read") {
             let verb = verb.replacen('_', " ", 1);
             return Err(reject(artifact_tenant_too_old(&verb, status, "read")));
+        }
+        // CAD-2150: a board that predates `include_body` refuses the field as an
+        // invalid request. That is not "the tenant cannot serve the verb": the
+        // plain read still works, so the caller gets a typed code and re-reads
+        // without the field instead of the release-order refusal.
+        if verb == "audit_verdicts_project"
+            && arguments.contains_key("include_body")
+            && status == 400
+            && refusal_code.as_deref() == Some("invalid_request")
+        {
+            return Err(Error::invalid(
+                VERDICT_BODY_UNSUPPORTED,
+                "the board does not know `include_body` for verdicts",
+            ));
         }
         if PROJECT_SCOPED_GATE_VERBS.contains(&verb) {
             let checked_conflict = body.as_ref().is_some_and(|b| {
