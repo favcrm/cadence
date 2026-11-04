@@ -80,7 +80,9 @@ def fail(msg):
 
 def aws(args, *, env, capture=True, binary=False):
     """Run aws s3api; every failure is a refusal with stderr, never a guess."""
-    cmd = ["aws", "s3api", *args]
+    # CAD-2109: R2's only signing region. Named here so a runner's AWS
+    # configuration cannot steer it: R2 refuses `us-west-2` on writes.
+    cmd = ["aws", "s3api", "--region", "auto", *args]
     try:
         out = subprocess.run(
             cmd, env=env, capture_output=capture, text=not binary, check=False

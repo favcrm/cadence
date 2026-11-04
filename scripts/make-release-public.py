@@ -130,7 +130,9 @@ def aws(args, *, env):
     classification and never surfaced verbatim."""
     try:
         out = subprocess.run(
-            ["aws", "s3api", *args],
+            # CAD-2109: R2's only signing region, named so a runner's AWS
+            # configuration cannot steer it.
+            ["aws", "s3api", "--region", "auto", *args],
             env=env,
             capture_output=True,
             text=True,
