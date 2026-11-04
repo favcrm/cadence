@@ -1047,6 +1047,7 @@ Object.assign(zhTW, {
   "Checking update status…": "正在檢查更新狀態…", "Update status unavailable.": "無法確認更新狀態。", "Review published versions": "檢視已發佈版本", "Browse published apps": "瀏覽已發佈應用程式",
   "Check the catalogue for published updates.": "請查看應用程式目錄中的已發佈更新。",
   "Removed — restore it to review published updates.": "已移除 — 還原後即可檢視已發佈的更新。",
+  "Removed — updates are unavailable.": "已移除 — 無法使用更新。",
   "Package validation reported secret warnings; review the source before applying.": "套件驗證回報了機密資訊警告；套用前請先審查原始碼。", "Applying…": "套用中…", "Apply checked update": "套用已檢查的更新", "Connections and setup": "連線與設定", "The accounts and helpers {title} uses.": "{title} 使用的帳戶與輔助工具。", "No outside accounts.": "沒有外部帳戶。",
   "Open its page": "開啟其頁面", "Access": "存取", "Let {title} work": "允許 {title} 運作", "Off — the app is removed.": "已關閉 — 應用程式已移除。", "Off — it can't run or use its connections. Its data is kept.": "已關閉 — 無法執行或使用其連線。其資料會保留。", "On — it can run and use its connections.": "已開啟 — 可執行並使用其連線。",
   "Restore {title}": "還原 {title}", "Removed apps restore within 30 days, with the same data.": "已移除的應用程式可在 30 天內還原，資料保持不變。", "The restore window has closed.": "還原期限已過。", "Remove {title}": "移除 {title}", "Takes the app and its data out of this workspace. You'll see exactly what goes before anything is deleted.": "會將應用程式及其資料從此工作區移除。刪除任何內容前，你會先看到將被移除的確切項目。", "Remove app…": "移除應用程式…",
