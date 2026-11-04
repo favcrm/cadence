@@ -104,6 +104,18 @@ pub(crate) enum LocalAgentAction {
 fn coordinator(target: &RemoteTarget) -> Result<Coordinator<BoardHttp>> {
     BoardHttp::open(target)?.into_coordinator()
 }
+pub(super) fn hosted_finish(
+    target: &RemoteTarget,
+    issue: Option<&str>,
+    worktree: Option<&Path>,
+) -> Error {
+    match coordinator(target) {
+        Ok(coord) => cadence_agent::local_assignment::finish_guidance::refusal(&coord, issue, worktree),
+        Err(_) => Error::rejected(
+            "Hosted issue finish does not release lanes; the lane state cannot be confirmed; leave it for the reconcile sweep",
+        ),
+    }
+}
 
 pub(super) fn run(
     target: &RemoteTarget,

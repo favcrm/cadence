@@ -27,6 +27,7 @@ use crate::worktree::{self, layout};
 
 pub mod delivery;
 pub mod events;
+pub mod finish_guidance;
 pub mod http;
 pub mod notifications;
 pub mod reporting;

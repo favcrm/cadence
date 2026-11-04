@@ -421,6 +421,12 @@ selected workspace's supported ticket update, for example:
 cadence --org acme issue set <issue-id> status=done --if-rev <issue-rev>
 ```
 
+Hosted `issue finish` never removes a lane or runs the local tracker finish.
+Its refusal directs the worker to the reconcile sweep and reports a local
+lane observation only when it can identify the recorded checkout and verify
+its state. An unavailable or ambiguous observation does not mean the lane
+is clean or merged; leave it intact for reconciliation.
+
 ### Leaving a message for a role on a ticket
 
 A session can leave a message for whoever holds a role on a ticket. The role is
