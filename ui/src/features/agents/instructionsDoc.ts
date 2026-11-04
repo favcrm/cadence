@@ -93,43 +93,43 @@ export function profileBody(from: StoredAgentProfile, text: string, expectedRevi
 
 /**
  * How a failed write reads. A refusal (4xx) means nothing was written. A 409 is
- * the board's revision fence. Anything else - no answer, a 5xx, a session that
- * changed under the request - leaves it unknown whether the write landed.
+ * the revision fence, which only a hosted profile has: on native it is just a
+ * refusal, so no use-theirs or save-mine is offered. Anything else - no answer,
+ * a 5xx, a session that changed under the request - leaves it unknown whether
+ * the write landed.
  */
-export function classifyFailure(error: unknown): "conflict" | "unconfirmed" | "refused" {
+export function classifyFailure(error: unknown, kind: DocKind): "conflict" | "unconfirmed" | "refused" {
   if (!(error instanceof ApiError)) return "unconfirmed";
-  if (error.status === 409) return "conflict";
+  if (error.status === 409) {
+    return kind === "hosted" && (error.code === undefined || error.code === "revision_conflict") ? "conflict" : "refused";
+  }
   if (error.status >= 500 || error.status === 0 || error.status === 408) return "unconfirmed";
   return "refused";
 }
 
-function failure(error: unknown, profile: StoredAgentProfile | null = null): DocOutcome {
-  const kind = classifyFailure(error);
-  if (kind === "conflict") return { kind, profile };
-  if (kind === "unconfirmed") return { kind };
-  return { kind, message: error instanceof Error ? error.message : String(error) };
+function failure(error: unknown, kind: DocKind): DocOutcome {
+  const out = classifyFailure(error, kind);
+  if (out === "conflict") return { kind: out, profile: null };
+  if (out === "unconfirmed") return { kind: out };
+  return { kind: out, message: error instanceof Error ? error.message : String(error) };
 }
 
-/** Save to a hosted profile at the revision the draft started from. */
+/** Save to a hosted profile at the revision `base` was read at. On a 409 the
+ *  board's current profile is read and returned, so "Save mine" writes at THAT
+ *  revision: a newer one gets another 409 instead of being overwritten. */
 export async function saveHosted(deps: DocDeps, base: StoredAgentProfile, text: string): Promise<DocOutcome> {
   try {
     const profile = await deps.writeProfile(base.id, profileBody(base, text, base.revision));
     return { kind: "saved", text: profile.responsibilities, profile, applies: null };
   } catch (error) {
-    return failure(error);
+    const out = failure(error, "hosted");
+    if (out.kind !== "conflict") return out;
+    try {
+      return { kind: "conflict", profile: await deps.readProfile(base.id) };
+    } catch {
+      return out;
+    }
   }
-}
-
-/** "Save mine" after a conflict: take THEIR current profile, so their other
- *  edits survive, and put this text on top of it at their revision. */
-export async function saveOverTheirs(deps: DocDeps, id: string, text: string): Promise<DocOutcome> {
-  let theirs: StoredAgentProfile;
-  try {
-    theirs = await deps.readProfile(id);
-  } catch {
-    return { kind: "refused", message: "Could not read the current version, so nothing was saved." };
-  }
-  return saveHosted(deps, theirs, text);
 }
 
 /** Native has no revision: the text replaces whatever is stored. */
@@ -138,7 +138,7 @@ export async function saveNative(deps: DocDeps, alias: string, text: string): Pr
     const out = await deps.writeNative(alias, text);
     return { kind: "saved", text, profile: null, applies: out.applies };
   } catch (error) {
-    return failure(error);
+    return failure(error, "native");
   }
 }
 
@@ -164,21 +164,38 @@ export async function checkNative(deps: DocDeps, alias: string, text: string): P
   } catch {
     return { kind: "unconfirmed" };
   }
+  // Not served is not "different": nothing was learned, so it stays unconfirmed.
+  if (latest === null) return { kind: "unconfirmed" };
   if (latest === text) return { kind: "saved", text, profile: null, applies: null };
   return { kind: "not_saved", profile: null };
 }
 
 /** The toast after a save, saying when the agent sees the new text. A turn
  *  already running is never changed. `checked` is a save found by a check
- *  after the answer was lost, so the board never said when it applies. */
-export function savedText(kind: DocKind, applies: string | null, checked = false): string {
-  const lead = checked ? "It did save." : "Saved.";
-  if (kind === "hosted") return `${lead} It applies when a session next loads this profile. A running turn isn’t changed.`;
-  if (applies === null) return `${lead} The board did not say when it applies.`;
-  const when = appliesText(applies);
+ *  after the answer was lost, so the board never said when it applies. Each
+ *  sentence goes through `t` on its own. */
+export function savedText(kind: DocKind, applies: string | null, checked: boolean, t: (english: string) => string): string {
+  const lead = t(checked ? "It did save." : "Saved.");
+  if (kind === "hosted") return `${lead} ${t("It applies when a session next loads this profile.")} ${t("A running turn isn’t changed.")}`;
+  if (applies === null) return `${lead} ${t("The board did not say when it applies.")}`;
+  const when = t(appliesText(applies));
   return applies === "next_turn" || applies === "next_launch"
-    ? `${lead} ${when}. A turn already running keeps the text it started with.`
+    ? `${lead} ${when}. ${t("A turn already running keeps the text it started with.")}`
     : `${when}.`;
+}
+
+/** Which way, if any, this agent's instructions are edited. Hosted edits the
+ *  profile; native overwrites a runtime's text, except for the master and an
+ *  agent whose job comes from a settings profile. */
+export function instructionsKind(a: {
+  hired: boolean;
+  hostedBoard: boolean;
+  served: string | null;
+  master: boolean;
+  profileBound: boolean;
+}): DocKind | null {
+  if (a.hired) return a.hostedBoard ? "hosted" : null;
+  return a.served !== null && !a.master && !a.profileBound ? "native" : null;
 }
 
 /** Native `instructions_updated` events carry who made the change. */
@@ -191,4 +208,28 @@ export function nativeChange(event: { kind: string; at: string; payload?: Record
 /** An estimate, not a count: the usual four characters to a token. */
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+/** A line of the Context drawer: what loads, and an estimate where one is honest. */
+export interface ContextLine {
+  name: string;
+  size: string;
+}
+
+/** What loads, said only where it is true. Only the document is measured, and
+ *  only as an estimate; the rest is named and not counted. Hosted conversations
+ *  are not bound to a profile, and an agent whose last save was not delivered
+ *  does not read the text, so neither is told "every session starts with" it. */
+export function contextOf(text: string, kind: DocKind | null, applies: string | null): { heading: string; lines: ContextLine[] } {
+  const rest: ContextLine[] = [
+    { name: "Platform and workspace rules", size: "Not counted" },
+    { name: "Skill names and descriptions", size: "Not counted" },
+    { name: "Tool definitions", size: "Not counted" },
+  ];
+  if (kind === "native" && applies === "not_delivered") return { heading: "Loaded at session start", lines: rest };
+  const own: ContextLine = { name: "Instructions", size: `About ${estimateTokens(text).toLocaleString("en")} tokens (estimate)` };
+  return {
+    heading: kind === "hosted" ? "A session that loads this profile starts with" : "Every session starts with",
+    lines: [own, ...rest],
+  };
 }

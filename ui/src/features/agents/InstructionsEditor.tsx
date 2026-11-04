@@ -3,15 +3,8 @@ import { useTranslate } from "../../lib/localeText";
 import Button from "../../ui/Button";
 import Md from "../../ui/Md";
 import DrawerShell from "../app-shell/shared/DrawerShell";
-import { isDirty, sizeNote, textProblem } from "./instructionsDoc";
+import { isDirty, sizeNote, textProblem, type ContextLine } from "./instructionsDoc";
 import type { InstructionsDoc } from "./useInstructionsDoc";
-
-/** A line of the Context drawer: what loads, and an estimate where one is honest. */
-export interface ContextLine {
-  name: string;
-  /** "About 120 tokens (estimate)" or "Not counted". */
-  size: string;
-}
 
 /**
  * The Instructions tab: one Markdown document that fills the page. Edit and
@@ -23,6 +16,7 @@ export default function InstructionsEditor({
   doc,
   writable,
   resetTo,
+  contextHeading,
   contextLines,
   contextNote,
 }: {
@@ -30,6 +24,8 @@ export default function InstructionsEditor({
   writable: boolean;
   /** The role's own text, offered as a quiet reset when the draft differs. */
   resetTo: string | null;
+  /** What the lines are the start of; true only where a session really loads it. */
+  contextHeading: string;
   contextLines: ContextLine[];
   contextNote: ReactNode;
 }) {
@@ -43,8 +39,23 @@ export default function InstructionsEditor({
   const dirty = isDirty(kind, doc.draft, served);
   const pending = doc.phase === "conflict" || doc.phase === "unconfirmed";
   const saving = doc.phase === "saving";
-  const editable = writable && !saving;
-  const problem = dirty ? textProblem(kind, text) : null;
+  // While a save's outcome is unknown the text stays as it was sent, so a
+  // check judges what was actually written.
+  const editable = writable && (doc.phase === "idle" || doc.phase === "conflict");
+  const problem = dirty && doc.phase === "idle" ? textProblem(kind, text) : null;
+  const unsaved = dirty || pending;
+  // Whatever is unsaved stays on screen, even while the board can't take a
+  // write: a missing Save must never read as "saved".
+  const view = writable || unsaved ? mode : "edit";
+  const hint = !writable
+    ? doc.phase === "unconfirmed"
+      ? "Not confirmed. The board isn’t answering; check once it does."
+      : "Not saved. The board isn’t answering, so saving is paused."
+    : doc.phase === "unconfirmed"
+      ? "Not confirmed: the last save may or may not have reached the board. The text is locked until you check."
+      : doc.phase === "conflict"
+        ? "Someone else changed this. Your draft is kept."
+        : problem;
 
   const remember = () => {
     const el = area.current;
@@ -72,14 +83,17 @@ export default function InstructionsEditor({
   return (
     <div className="ap-doc">
       <div className="ap-doc-bar">
-        <div className="rc-cats" role="group" aria-label={t("Instructions view")}>
-          <button type="button" className="rc-cat" aria-pressed={mode === "edit"} onClick={toEdit}>
-            {t("Edit")}
-          </button>
-          <button type="button" className="rc-cat" aria-pressed={mode === "preview"} onClick={toPreview}>
-            {t("Preview")}
-          </button>
-        </div>
+        {/* A reader has nothing to edit, so Edit would be inert. */}
+        {(writable || unsaved) && (
+          <div className="rc-cats" role="group" aria-label={t("Instructions view")}>
+            <button type="button" className="rc-cat" aria-pressed={mode === "edit"} onClick={toEdit}>
+              {t("Edit")}
+            </button>
+            <button type="button" className="rc-cat" aria-pressed={mode === "preview"} onClick={toPreview}>
+              {t("Preview")}
+            </button>
+          </div>
+        )}
         <span className="ap-doc-spacer" />
         {editable && resetTo !== null && text !== resetTo && (
           <button type="button" className="ap-link" onClick={() => doc.setDraft(resetTo)}>
@@ -94,7 +108,7 @@ export default function InstructionsEditor({
         ref={area}
         className="field rc-text ap-doc-text"
         aria-label={t("Instructions")}
-        hidden={mode !== "edit"}
+        hidden={view !== "edit"}
         spellCheck
         value={text}
         readOnly={!editable}
@@ -103,16 +117,16 @@ export default function InstructionsEditor({
         onSelect={remember}
         onScroll={remember}
       />
-      {mode === "preview" && (
+      {view === "preview" && (
         <div className="ap-doc-preview issue-reader text-secondary text-ink-300" tabIndex={0} aria-label={t("Instructions preview")}>
           {text.trim() ? <Md text={text} /> : <p className="rc-note">{t("Nothing written yet.")}</p>}
         </div>
       )}
-      {(dirty || pending) && writable && (
+      {unsaved && (
         <div className="ap-doc-save">
-          <small className="ap-doc-hint" role={problem ? "alert" : undefined}>
-            {problem ? t(problem) : (sizeNote(kind, text) ?? "")}
-            {!problem && kind === "native" && (
+          <small className="ap-doc-hint" role={hint ? "alert" : undefined}>
+            {hint ? t(hint) : (sizeNote(kind, text) ?? "")}
+            {!hint && kind === "native" && doc.phase === "idle" && (
               <span className="ap-doc-hint-note">
                 {t("This board keeps no revision, so saving replaces the text it holds.")}
               </span>
@@ -121,19 +135,19 @@ export default function InstructionsEditor({
           <span className="ap-doc-spacer" />
           {doc.phase === "conflict" ? (
             <>
-              <Button size="sm" disabled={saving} onClick={doc.useTheirs}>
-                {t("Use theirs")}
+              <Button size="sm" disabled={!writable || saving} onClick={doc.useTheirs}>
+                {t("Discard mine, use theirs")}
               </Button>
-              <Button variant="primary" size="sm" onClick={doc.saveMine}>
+              <Button variant="primary" size="sm" disabled={!writable || saving} onClick={doc.saveMine}>
                 {t("Save mine")}
               </Button>
             </>
           ) : doc.phase === "unconfirmed" ? (
             <>
-              <Button variant="ghost" size="sm" onClick={doc.discard}>
+              <Button variant="ghost" size="sm" disabled={!writable} onClick={doc.discard}>
                 {t("Discard")}
               </Button>
-              <Button variant="primary" size="sm" onClick={doc.check}>
+              <Button variant="primary" size="sm" disabled={!writable} onClick={doc.check}>
                 {t("Check now")}
               </Button>
             </>
@@ -142,7 +156,7 @@ export default function InstructionsEditor({
               <Button variant="ghost" size="sm" disabled={saving} onClick={doc.discard}>
                 {t("Discard")}
               </Button>
-              <Button variant="primary" size="sm" disabled={saving || problem !== null} onClick={doc.save}>
+              <Button variant="primary" size="sm" disabled={!writable || saving || problem !== null} onClick={doc.save}>
                 {saving ? t("Saving…") : t("Save")}
               </Button>
             </>
@@ -161,7 +175,7 @@ export default function InstructionsEditor({
               panel: (
                 <div className="ap-body">
                   <section>
-                    <h4 className="ap-doc-h">{t("Every session starts with")}</h4>
+                    <h4 className="ap-doc-h">{t(contextHeading)}</h4>
                     <ul className="ap-doc-lines">
                       {contextLines.map((line) => (
                         <li key={line.name}>

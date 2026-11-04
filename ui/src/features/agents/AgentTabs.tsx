@@ -13,8 +13,8 @@ import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref
 import Link from "../../ui/Link";
 import { ProfileBlock } from "./AgentProfile";
 import { MASTER } from "../home/master";
-import InstructionsEditor, { type ContextLine } from "./InstructionsEditor";
-import { estimateTokens, nativeChange } from "./instructionsDoc";
+import InstructionsEditor from "./InstructionsEditor";
+import { contextOf, nativeChange } from "./instructionsDoc";
 import type { InstructionsDoc } from "./useInstructionsDoc";
 import {
   BUNDLED_SKILLS,
@@ -34,7 +34,6 @@ export interface TabContext {
   hosted: boolean;
   resume: string | null | undefined;
   onOpenIssue: (id: string) => void;
-  onSaved: () => void;
   /** Set when this page is a profile with no runtime: nothing to read but itself. */
   hired: HiredProfile | undefined;
   /** This viewer may save, and the board can take the write now. */
@@ -362,11 +361,11 @@ function History({ c }: { c: TabContext }) {
           <>
             <Rows>
               <Row
-                left={`${t("Instructions last changed")} · ${t("revision")} ${changed.revision}`}
+                left={`${t("Profile last changed")} · ${t("revision")} ${changed.revision}`}
                 right={fmtTime(new Date(changed.updated_at).toISOString())}
               />
             </Rows>
-            <Note>{t("This board records when the instructions changed, not who changed them.")}</Note>
+            <Note>{t("This board records when the profile last changed, not who changed it or which field.")}</Note>
           </>
         )}
         <Note>{t("No other history yet: it has no runtime.")}</Note>
@@ -444,7 +443,7 @@ function History({ c }: { c: TabContext }) {
       ) : (
         <Note>{t(reading(c) ? "Loading…" : "No events yet.")}</Note>
       )}
-      {(detail?.events.length ?? 0) >= 20 && <Note>{t("Only the last 20 events are shown, so an older edit may be missing.")}</Note>}
+      {!c.detailNotServed && <Note>{t("Recent events only. An older edit may not be listed.")}</Note>}
       {shown && (
         <ItemDrawer title={shown.name} onClose={() => setOpen(null)}>
           <Facts items={shown.facts} />
@@ -454,20 +453,10 @@ function History({ c }: { c: TabContext }) {
   );
 }
 
-/** What loads at session start. Only the document itself is measured, and only
- *  as an estimate; the rest is named and not counted. */
-function contextLines(text: string): ContextLine[] {
-  return [
-    { name: "Instructions", size: `About ${estimateTokens(text).toLocaleString("en")} tokens (estimate)` },
-    { name: "Platform and workspace rules", size: "Not counted" },
-    { name: "Skill names and descriptions", size: "Not counted" },
-    { name: "Tool definitions", size: "Not counted" },
-  ];
-}
-
 function Instructions({ c }: { c: TabContext }) {
   const t = useTranslate();
   const doc = c.doc;
+  const context = contextOf(doc.draft ?? doc.served ?? "", doc.kind, doc.applies);
   const editor = (reason?: string) => (
     <div className="ap-body">
       {reason && <Note>{t(reason)}</Note>}
@@ -475,7 +464,8 @@ function Instructions({ c }: { c: TabContext }) {
         doc={doc}
         writable={c.writable && doc.kind !== null}
         resetTo={c.role?.instructions ?? null}
-        contextLines={contextLines(doc.draft ?? doc.served ?? "")}
+        contextHeading={context.heading}
+        contextLines={context.lines}
         contextNote={
           <p className="ap-drawer-lead">
             {t("Skills in full, wiki pages the agent reads, earlier sessions, and a repository’s own agent instructions file during project work.")}

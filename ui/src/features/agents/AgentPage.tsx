@@ -13,7 +13,7 @@ import { seatStatus } from "./SeatCard";
 import { RecoveryBlock } from "./AgentProfile";
 import { MASTER } from "../home/master";
 import { useInstructionsDoc } from "./useInstructionsDoc";
-import type { DocKind } from "./instructionsDoc";
+import { instructionsKind } from "./instructionsDoc";
 import AgentTabBody, { SettingsDrawer, Work, type TabContext } from "./AgentTabs";
 import {
   categoryLabel,
@@ -228,14 +228,13 @@ export default function AgentPage({
 
   // Hosted keeps a profile with a revision; native overwrites the runtime's text.
   // A master, or an agent whose job comes from a settings profile, is read-only.
-  const docHosted = hostedBoard || hosted;
-  const docKind: DocKind | null = hired
-    ? docHosted
-      ? "hosted"
-      : null
-    : served !== null && alias !== MASTER && params?.profile === undefined
-      ? "native"
-      : null;
+  const docKind = instructionsKind({
+    hired: hired !== undefined,
+    hostedBoard: hostedBoard || hosted,
+    served,
+    master: alias === MASTER,
+    profileBound: params?.profile !== undefined,
+  });
   const doc = useInstructionsDoc({
     alias,
     kind: docKind,
@@ -260,7 +259,6 @@ export default function AgentPage({
     hosted,
     resume,
     onOpenIssue,
-    onSaved: () => setRetry((n) => n + 1),
     hired,
     writable: operator === true && boardBlock === null && !rosterStale,
     toast: onToast,

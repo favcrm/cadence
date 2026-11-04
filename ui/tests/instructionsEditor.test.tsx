@@ -52,28 +52,36 @@ async function main() {
   let stored = profile();
   const writes: Record<string, unknown>[] = [];
   let writeFails: (() => Error) | null = null;
+  let nativeFails: (() => Error) | null = null;
+  let nativeStored: string | null = "native text";
+  let nativeMode = false;
   const deps: DocDeps = {
     readProfile: async () => stored,
     writeProfile: async (_id, body) => {
       writes.push(body as Record<string, unknown>);
       if (writeFails) throw writeFails();
+      if ((body as { expectedRevision: number }).expectedRevision !== stored.revision) throw new ApiError("Reload the agent profile.", 409);
       stored = profile({ revision: stored.revision + 1, responsibilities: String((body as { responsibilities: string }).responsibilities).trim() });
       return stored;
     },
-    readNative: async () => null,
-    writeNative: async () => ({ applies: "next_turn" }),
+    readNative: async () => nativeStored,
+    writeNative: async (_alias, text) => {
+      if (nativeFails) throw nativeFails();
+      nativeStored = text;
+      return { applies: "next_turn" };
+    },
   };
   const toasts: [string, string][] = [];
   const toast = (kind: string, text: string) => toasts.push([kind, text]);
 
   function Harness({ writable, tick }: { writable: boolean; tick: number }) {
     const doc = useInstructionsDoc({
-      alias: "ads-agent", kind: "hosted", profileId: "ap_1", nativeServed: null, writable, onSaved: () => {},
+      alias: "ads-agent", kind: nativeMode ? "native" : "hosted", profileId: nativeMode ? null : "ap_1", nativeServed: nativeMode ? "native text" : null, writable, onSaved: () => {},
       toast: toast as never, deps,
     });
     if (doc.read !== "ready") return React.createElement("p", null, "loading");
     return React.createElement("div", { "data-tick": tick },
-      React.createElement(Editor, { doc, writable, resetTo: null, contextLines: [], contextNote: null }));
+      React.createElement(Editor, { doc, writable, resetTo: null, contextHeading: "x", contextLines: [], contextNote: null }));
   }
 
   const host = document.createElement("div");
@@ -133,7 +141,7 @@ async function main() {
   await click("Save");
   assert(writes.length === 1 && writes[0]!.expectedRevision === 3, "one write, at the revision the draft started from");
   assert(area().value === "# Ads\n\nMine.", "the draft is kept");
-  assert(button("Use theirs") && button("Save mine") && !button("Save"), "use theirs or save mine");
+  assert(button("Discard mine, use theirs") && button("Save mine") && !button("Save"), "use theirs or save mine");
   assert(primaries() === 1, "still one primary");
   assert(toasts.some(([, text]) => /changed this/.test(text)), "a toast says so");
   writeFails = null;
@@ -147,7 +155,7 @@ async function main() {
   writeFails = () => new ApiError("Reload the agent profile.", 409);
   stored = profile({ revision: 9, responsibilities: "# Ads\n\nTheirs again." });
   await click("Save");
-  await click("Use theirs");
+  await click("Discard mine, use theirs");
   assert(area().value === "# Ads\n\nTheirs again." && !button("Save mine"), "use theirs loads their text");
 
   // A dropped connection is not confirmed, never success; Check settles it.
@@ -169,11 +177,79 @@ async function main() {
   assert(toasts.some(([kind, text]) => kind === "ok" && /did save/.test(text)), "a check that finds it says it did save");
   assert(!button("Save") && !button("Check now"), "and the bar is gone");
 
+  // Save mine writes at the revision the conflict was raised with: a newer one
+  // gets another conflict, and nothing is written over it.
+  await type("# Ads\n\nMine three.");
+  writeFails = () => new ApiError("Reload the agent profile.", 409);
+  stored = profile({ revision: 20, responsibilities: "# Ads\n\nTheirs 20." });
+  await click("Save");
+  writeFails = null;
+  stored = profile({ revision: 21, responsibilities: "# Ads\n\nTheirs 21, unseen." });
+  const writesBefore = writes.length;
+  await click("Save mine");
+  assert(writes.length === writesBefore + 1 && writes[writes.length - 1]!.expectedRevision === 20, "save mine writes at the revision the conflict named");
+  assert(stored.responsibilities === "# Ads\n\nTheirs 21, unseen.", "a newer revision is not overwritten");
+  assert(button("Save mine") && area().value === "# Ads\n\nMine three.", "another conflict, the draft still kept");
+  await click("Discard mine, use theirs");
+  assert(area().value === "# Ads\n\nTheirs 21, unseen.", "use theirs loads the newest");
+
+  // A lost answer locks the text; Discard reads first and says what the board holds.
+  writeFails = () => new TypeError("Failed to fetch");
+  await type("# Ads\n\nLost answer.");
+  await click("Save");
+  assert(area().readOnly, "the text is locked while the outcome is unknown");
+  stored = profile({ revision: stored.revision + 1, responsibilities: "# Ads\n\nLost answer." });
+  toasts.length = 0;
+  await click("Discard");
+  assert(toasts.some(([kind, text]) => kind === "ok" && /did save/.test(text)), "Discard reports that the write landed");
+  assert(area().value === "# Ads\n\nLost answer." && !button("Check now") && !button("Discard"), "and the board's text is what is shown");
+  await type("# Ads\n\nNever landed.");
+  await click("Save");
+  toasts.length = 0;
+  await click("Discard");
+  assert(toasts.some(([, text]) => /did not save/.test(text)), "Discard says when the write did not land");
+  assert(area().value === "# Ads\n\nLost answer.", "and shows what the board holds");
+  writeFails = null;
+
+  // Unsaved work stays on screen, disabled, when the board stops taking writes.
+  await type("# Ads\n\nStale roster.");
+  await render(false, 3);
+  assert(area().value === "# Ads\n\nStale roster." && area().readOnly, "the draft stays, read-only");
+  assert(/Not saved/.test(host.querySelector(".ap-doc-save")?.textContent ?? "") && button("Save")?.disabled, "Save is shown disabled, with the reason");
+  await render(true, 4);
+  assert(!button("Save")?.disabled, "and comes back when the board does");
+  await click("Discard");
+
+  // Preview drops a javascript: link; a reader gets no inert Edit.
+  await type("[click](javascript:alert(1)) and [ok](https://example.com)");
+  await click("Preview");
+  assert(![...host.querySelectorAll(".ap-doc-preview a")].some((a) => (a.getAttribute("href") ?? "").startsWith("javascript:")), "a javascript: link is not a link");
+  await click("Discard");
+
   // A viewer reads it and cannot change it.
   await render(false);
   assert(area().readOnly && !button("Save") && !button("Discard"), "a viewer reads, and has no write action");
+  assert(!button("Edit") && !button("Preview"), "a reader has no inert Edit toggle");
 
+  // Native has no revision: a 409 there is a refusal, not use-theirs or save-mine.
+  nativeMode = true;
   await React.act(async () => { root.unmount(); });
+  const root2 = createRoot(host);
+  await React.act(async () => { root2.render(React.createElement(Harness, { writable: true, tick: 9 })); });
+  await flush();
+  await type("native edit");
+  nativeFails = () => new ApiError("conflict", 409);
+  await click("Save");
+  assert(!button("Save mine") && !button("Discard mine, use theirs") && button("Save"), "a native 409 offers neither use theirs nor save mine");
+  assert(toasts.some(([kind]) => kind === "err"), "it says why");
+  // A lost native answer with an unreadable board is unconfirmed, never "did not save".
+  nativeFails = () => new TypeError("Failed to fetch");
+  await click("Save");
+  nativeStored = null;
+  toasts.length = 0;
+  await click("Check now");
+  assert(button("Check now") && !toasts.some(([, text]) => /did not save/.test(text)), "a null native read stays unconfirmed");
+  await React.act(async () => { root2.unmount(); });
   console.log("instructionsEditor checks passed");
 }
 void main().catch((e: unknown) => { console.error(e); process.exit(1); });

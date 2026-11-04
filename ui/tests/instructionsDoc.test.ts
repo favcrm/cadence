@@ -14,7 +14,8 @@ import {
   profileBody,
   saveHosted,
   saveNative,
-  saveOverTheirs,
+  contextOf,
+  instructionsKind,
   savedText,
   sizeNote,
   textProblem,
@@ -65,6 +66,8 @@ function deps(over: Partial<DocDeps> = {}): { deps: DocDeps; calls: Calls } {
   };
 }
 
+const id = (english: string) => english;
+
 async function main() {
   // The update body carries exactly the keys the board accepts, no model, and
   // the revision the draft STARTED from.
@@ -76,12 +79,14 @@ async function main() {
   check(body.expectedRevision === 3 && !("model" in body) && !("id" in body), "revision from the draft's base, model left to the board");
 
   // Outcome classification.
-  check(classifyFailure(new ApiError("stale", 409)) === "conflict", "409 is the fence");
-  check(classifyFailure(new ApiError("no", 403)) === "refused", "403 is a refusal");
-  check(classifyFailure(new ApiError("no", 400)) === "refused", "400 is a refusal");
-  check(classifyFailure(new ApiError("down", 503)) === "unconfirmed", "5xx may have committed");
-  check(classifyFailure(new TypeError("Failed to fetch")) === "unconfirmed", "a dropped connection is not confirmed");
-  check(classifyFailure(new Error("Session changed during request")) === "unconfirmed", "a changed session is not confirmed");
+  check(classifyFailure(new ApiError("stale", 409), "hosted") === "conflict", "409 is the fence");
+  check(classifyFailure(new ApiError("stale", 409), "native") === "refused", "a native 409 is no revision conflict: no use-theirs or save-mine");
+  check(classifyFailure(new ApiError("x", 409, { code: "alias_taken" }), "hosted") === "refused", "a 409 that is not the revision fence is a refusal");
+  check(classifyFailure(new ApiError("no", 403), "hosted") === "refused", "403 is a refusal");
+  check(classifyFailure(new ApiError("no", 400), "hosted") === "refused", "400 is a refusal");
+  check(classifyFailure(new ApiError("down", 503), "hosted") === "unconfirmed", "5xx may have committed");
+  check(classifyFailure(new TypeError("Failed to fetch"), "hosted") === "unconfirmed", "a dropped connection is not confirmed");
+  check(classifyFailure(new Error("Session changed during request"), "hosted") === "unconfirmed", "a changed session is not confirmed");
 
   // Save: success replaces the draft with what the board stored (it trims).
   {
@@ -98,8 +103,8 @@ async function main() {
       },
     });
     const out = await saveHosted(d, profile(), "mine");
-    check(out.kind === "conflict", "stale revision reads as a conflict");
-    check(calls.writes.length === 0 && calls.reads === 0, "a conflict neither retries nor overwrites");
+    check(out.kind === "conflict" && out.profile?.revision === 3, "stale revision reads as a conflict and carries their profile");
+    check(calls.writes.length === 0 && calls.reads === 1, "a conflict reads theirs once and never overwrites");
   }
   // A dropped connection is never success.
   {
@@ -111,24 +116,29 @@ async function main() {
     const out = await saveHosted(d, profile(), "mine");
     check(out.kind === "unconfirmed", "a dropped save is not confirmed");
   }
-  // Save mine: THEIR other fields survive, at THEIR revision, with MY text.
+  // Save mine: THEIR other fields survive, at THEIR revision, with MY text; a
+  // revision newer than the one that raised the conflict gets another 409.
   {
     const theirs = profile({ revision: 7, name: "ads-agent-renamed", skills: ["cadence", "website-builder"], responsibilities: "theirs" });
     const { deps: d, calls } = deps({ readProfile: async () => theirs });
-    const out = await saveOverTheirs(d, "ap_1", "mine");
+    const out = await saveHosted(d, theirs, "mine");
     check(out.kind === "saved", "save mine lands");
     const sent = calls.writes[0]!.body;
     check(sent.expectedRevision === 7 && sent.name === "ads-agent-renamed" && sent.responsibilities === "mine", "save mine rides their revision and fields");
     check(JSON.stringify(sent.skills) === JSON.stringify(["cadence", "website-builder"]), "their skills survive");
   }
   {
+    let boardRevision = 8;
     const { deps: d, calls } = deps({
-      readProfile: async () => {
-        throw new TypeError("offline");
+      readProfile: async () => profile({ revision: boardRevision }),
+      writeProfile: async (_id, b) => {
+        if ((b as { expectedRevision: number }).expectedRevision !== boardRevision) throw new ApiError("Reload the agent profile.", 409);
+        throw new Error("unreachable in this probe");
       },
     });
-    const out = await saveOverTheirs(d, "ap_1", "mine");
-    check(out.kind === "refused" && calls.writes.length === 0, "an unreadable current version writes nothing");
+    const out = await saveHosted(d, profile({ revision: 7 }), "mine");
+    check(out.kind === "conflict" && out.profile?.revision === boardRevision, "a newer revision than the one seen gets another conflict, with the newer profile");
+    check(calls.writes.length === 0, "and nothing is written over it");
   }
 
   // Check after a dropped save.
@@ -151,6 +161,10 @@ async function main() {
   }
   check((await checkNative(deps().deps, "ads", "native text")).kind === "saved", "native check: same text did save");
   check((await checkNative(deps().deps, "ads", "other")).kind === "not_saved", "native check: different text did not");
+  check(
+    (await checkNative(deps({ readNative: async () => null }).deps, "ads", "x")).kind === "unconfirmed",
+    "native check: a text the board does not serve tells nothing, so it stays unconfirmed",
+  );
 
   // Native overwrites and says when it applies.
   {
@@ -178,15 +192,29 @@ async function main() {
   check(!isDirty("native", null, "same"), "no draft is not a change");
 
   // When it applies: a running turn is never changed.
-  check(/running turn/.test(savedText("hosted", null)), "hosted says a running turn is not changed");
-  check(/next turn/.test(savedText("native", "next_turn")) && /already running/.test(savedText("native", "next_turn")), "native next turn");
-  check(!/already running/.test(savedText("native", "not_delivered")) && /does not read it yet/.test(savedText("native", "not_delivered")), "not delivered is plain");
-  check(/did save/.test(savedText("native", null, true)), "a checked save says so");
+  check(/running turn/.test(savedText("hosted", null, false, id)), "hosted says a running turn is not changed");
+  check(/next turn/.test(savedText("native", "next_turn", false, id)) && /already running/.test(savedText("native", "next_turn", false, id)), "native next turn");
+  check(!/already running/.test(savedText("native", "not_delivered", false, id)) && /does not read it yet/.test(savedText("native", "not_delivered", false, id)), "not delivered is plain");
+  check(/did save/.test(savedText("native", null, true, id)), "a checked save says so");
 
   // Who changed it, where the board records it.
   check(nativeChange({ kind: "instructions_updated", at: "x", payload: { by: "operator" } })?.by === "operator", "native event carries who");
   check(nativeChange({ kind: "instructions_updated", at: "x" })?.by === null, "no payload: not recorded");
   check(nativeChange({ kind: "turn_started", at: "x" }) === null, "other events are not edits");
+  // Which way an agent is edited, if at all.
+  const base = { hired: false, hostedBoard: false, served: "text" as string | null, master: false, profileBound: false };
+  check(instructionsKind(base) === "native", "a runtime agent that serves its text is edited natively");
+  check(instructionsKind({ ...base, master: true }) === null, "the master is read-only");
+  check(instructionsKind({ ...base, profileBound: true }) === null, "an agent whose job comes from a settings profile is read-only");
+  check(instructionsKind({ ...base, served: null }) === null, "nothing served, nothing to edit");
+  check(instructionsKind({ ...base, hired: true, hostedBoard: true }) === "hosted", "a hosted profile is edited through its revision");
+  check(instructionsKind({ ...base, hired: true }) === null, "a native settings profile has no edit route");
+  // The Context drawer says "every session" only where that is true.
+  check(contextOf("x", "native", null).heading === "Every session starts with", "native agent: every session");
+  check(contextOf("x", "hosted", null).heading === "A session that loads this profile starts with", "hosted: only a session that loads the profile");
+  const undelivered = contextOf("x", "native", "not_delivered");
+  check(!undelivered.lines.some((l) => l.name === "Instructions") && !/Every session/.test(undelivered.heading), "not delivered: the instructions are not stated as loaded");
+  check(contextOf("x".repeat(40), "native", "next_turn").lines[0]!.size.includes("(estimate)"), "the figure is labelled an estimate");
   console.log("instructionsDoc checks passed");
 }
 void main().catch((e: unknown) => {
