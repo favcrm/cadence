@@ -10,6 +10,7 @@ mod admin;
 mod agents;
 mod issues;
 mod providers;
+mod update_notice;
 
 pub(super) fn show_login_code(url: &str, code: &str, no_open: bool) -> Result<()> {
     cadence_agent::output::eprint_format_line(format_args!(
@@ -115,6 +116,10 @@ pub(crate) fn run() -> Result<i32> {
     let argv: Vec<String> = std::env::args_os()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    if argv.len() == 2 && argv[1] == update_notice::REFRESH_ARG {
+        update_notice::refresh();
+        return Ok(0);
+    }
     // CAD-888: `help operator|advanced|all` print the sections the
     // default root help leaves out; `help <verb>` stays clap's own.
     // CAD-1432: the master's help is bounded and refuses malformed or
@@ -185,7 +190,12 @@ pub(crate) fn run() -> Result<i32> {
             return Err(Error::usage(text.strip_prefix("error: ").unwrap_or(text)));
         }
     };
-    run_cli(cli)
+    let notice = update_notice::eligible(&cli);
+    let result = run_cli(cli);
+    if notice && result.as_ref().is_ok_and(|code| *code == 0) {
+        update_notice::after_success();
+    }
+    result
 }
 
 /// Every argument id the command line typed, at the root and in each
