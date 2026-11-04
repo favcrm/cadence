@@ -1551,8 +1551,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     # The commit the path lists are read at: main's live tip for a main-based PR (a PR
     # cannot edit the lists it is judged by: the tip holds no unmerged PR), else the
     # PR's base commit. Empty when that commit could not be read (main's tip or
-    # `baseRefOid`); the conditions below then read nothing rather than let an empty
-    # ref read the default branch, and a failed diff has already refused.
+    # `baseRefOid`); the reads below then return nothing (an empty ref would read the
+    # default branch), and a failed diff has already refused.
     lists_ref = live_tip if base == "main" else base_oid
     paths = sorted({c[3] for c in changes})
     if not changes and not any("cannot list the changed files" in r for r in reasons):
@@ -1562,8 +1562,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     rc, toml_text, _ = (run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
                              f"repos/{repo}/contents/{ONE_REVIEW_FILE}?ref={lists_ref}"])
                         if lists_ref else (1, "", ""))
-    one_text = toml_text if rc == 0 and lists_ref else None
-    one = rc == 0 and bool(lists_ref) and one_review_qualifies(changes, toml_text)
+    one_text = toml_text if rc == 0 else None
+    one = rc == 0 and one_review_qualifies(changes, toml_text)
     report.append("reviews required: " + ("one (diff is on the one-review list)" if one else "two (Standards and Spec/security)"))
     need_qa = any(p.startswith("ui/") for p in paths)
 
@@ -1756,7 +1756,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     rc, risk_text, _ = (run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
                              f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={lists_ref}"])
                         if lists_ref else (1, "", ""))
-    risk_text = risk_text if rc == 0 and lists_ref else None
+    risk_text = risk_text if rc == 0 else None
     risk = risk_globs(risk_text)
     why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the diff's anchor (fail closed)"]
     why += [p for p in paths if is_human_path(p, risk or ())][:5]

@@ -7396,7 +7396,7 @@ mod cad2100_classifier_merge_base {
         assert_eq!(class_of(&answer), "strict", "{answer}");
         // 300 files or more is never a complete list.
         let result = daemon.classify(&case, json!({"compare_pad": 300}));
-        refused_with(&result, "truncated or differs");
+        refused_with(&result, "truncated");
         // A list that omits the very file the trees show changed, or names one they do not.
         let result = daemon.classify(&case, json!({"compare_drop": ["src/peer.rs"]}));
         refused_with(&result, "does not match the trees");
@@ -7463,7 +7463,7 @@ mod cad2100_classifier_merge_base {
         );
         // And GitHub's file count is still checked against the list for it.
         let result = daemon.classify(&case, json!({"changed_files": 3}));
-        refused_with(&result, "truncated or differs");
+        refused_with(&result, "differs from the PR file count");
     }
 }
 

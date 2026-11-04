@@ -426,9 +426,10 @@ pub(crate) fn classify_from<I: RequirementInputs + ?Sized>(
     let comparison = api(shared, &format!("repos/{repo}/compare/{anchor}...{head}"))?;
     // CAD-2117: GitHub's compare answers ONE merge base. When the two commits
     // have several (a criss-cross merge) that answer is not provably the right
-    // one and the API cannot enumerate the rest, so this path does not claim to
-    // detect it. `scripts/enqueue-reviewed` runs `git merge-base --all` and
-    // refuses on more than one, and it is the gate every merge passes through.
+    // one and the API cannot enumerate the rest, so this path cannot detect it.
+    // `scripts/enqueue-reviewed` runs `git merge-base --all` and refuses on more
+    // than one; the daemon's own landing path (unattended_landing) does not go
+    // through that script, so it relies on main staying free of merge commits.
     let merge_base = comparison["merge_base_commit"]["sha"]
         .as_str()
         .filter(|s| valid_sha(s))
