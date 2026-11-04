@@ -26,7 +26,7 @@ export interface RecordCard {
   operation: string;
   facts: { label: string; value: string; strong?: boolean }[];
   /** CAD-2146: plain-language cards (send, content approval, test send) set these; every other card leaves them unset. */
-  title?: string; note?: string; confirm?: string; details?: { label: string; value: string }[];
+  title?: string; note?: string; retry?: string; confirm?: string; details?: { label: string; value: string }[];
   input?: { field: "to_email" | "connection_id" | "resolution" | "unsubscribe_origin" | "brief" | "choice"; label: string; value?: string; choices?: { value: string; label: string }[] };
 }
 /** Records consume trusted text; generic browser effects receive only a liveness callback. */

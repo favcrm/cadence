@@ -8,9 +8,9 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
   const [input, setInput] = useState(card.input?.value ?? "");
   const pressed = useRef(0);
   const titles: Record<string, string> = {
-    "records.csv.import": "Import this CSV plan?", "records.csv.confirm": "Confirm this CSV plan?", "content.approve": "Approve this email?",
+    "records.csv.import": "Import this CSV plan?", "records.csv.confirm": "Confirm this CSV plan?",
     "smtp.manage": "Open email sending settings?", "smtp.bind": "Bind this SMTP connection?", "smtp.rebind": "Replace this SMTP binding?", "smtp.revoke": "Revoke this SMTP binding?",
-    "smtp.test-send": "Send one test email?", "sends.approve": "Approve this frozen send?", "sends.resolve": "Resolve this uncertain delivery?",
+    "sends.resolve": "Resolve this uncertain delivery?",
     "origin.manage": "Change the daemon-global unsubscribe origin?", "chat.campaign.open": "Open this campaign's assistant?", "chat.campaign.brief": "Send this campaign brief?", "chat.whatsapp.brief": "Ask the assistant to draft this reply?",
     "whatsapp.reply.send": "Send this WhatsApp reply?",
     "whatsapp.template.send": "Send this WhatsApp template?", "whatsapp.broadcast.test.send": "Send one WhatsApp test message?",
@@ -31,7 +31,7 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
           : field.field === "brief" ? <textarea value={input} readOnly rows={6} />
           : <input type={field.field === "to_email" ? "email" : "url"} value={input} maxLength={field.field === "to_email" ? 320 : 2048} onChange={e => setInput(e.target.value)} disabled={view.pending} />}
       </label>}
-      <p>No automatic retry. If the result is uncertain, inspect fresh status before requesting another effect.</p>
+      <p>{card.retry ?? "No automatic retry. If the result is uncertain, inspect fresh status before requesting another effect."}</p>
       <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
         <Button disabled={view.pending} onClick={() => onCancel(view.token)}>Cancel</Button>
         <button type="button" className="btn btn-primary" disabled={view.pending || invalid} aria-busy={view.pending}

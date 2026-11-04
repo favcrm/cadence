@@ -163,6 +163,7 @@ const plainSubject = (subject: string) => subject.replace(/\{\{\s*first_name\s*(
  * Native and hosted prepare replies carry different facts, so every row is
  * optional except what recordCard already requires; a missing fact is omitted.
  */
+const PLAIN_RETRY = "If the result is unclear, check its status before trying again.";
 function plainCard(operation: "sends.approve" | "content.approve" | "smtp.test-send", facts: ActionArgs, content: ActionArgs, freeze: ActionArgs | null): RecordCard {
   const facts_: RecordCard["facts"] = [], details: NonNullable<RecordCard["details"]> = [];
   const add = (rows: { label: string; value: string }[], label: string, value: unknown) => { if (value !== undefined && value !== null && value !== "") rows.push({ label, value: typeof value === "object" ? JSON.stringify(value) : String(value) }); };
@@ -177,21 +178,30 @@ function plainCard(operation: "sends.approve" | "content.approve" | "smtp.test-s
   if (operation === "content.approve") {
     add(facts_, "Version", content.revision ?? facts.revision);
     add(details, "Campaign", content.campaign_id ?? facts.campaign_id); add(details, "Name", content.name); add(details, "Content digest", content.content_digest ?? facts.content_digest);
-    return { operation, title: "Approve this email?", note: "Nothing is sent yet.", confirm: "Approve", facts: facts_, details };
+    return { operation, title: "Approve this email?", note: "Nothing is sent yet.", retry: PLAIN_RETRY, confirm: "Approve", facts: facts_, details };
   }
   if (operation === "smtp.test-send") {
     add(facts_, "From", from);
+    add(details, "Version", content.revision); add(details, "Name", content.name);
     add(details, "Campaign", content.campaign_id ?? facts.campaign_id); bindingDetails();
-    return { operation, title: "Send one test email?", note: "Sends this email to one address.", confirm: "Send test", facts: facts_, details, input: { field: "to_email", label: "Send to" } };
+    return { operation, title: "Send one test email?", note: "Sends this email to one address.", retry: PLAIN_RETRY, confirm: "Send test", facts: facts_, details, input: { field: "to_email", label: "Send to" } };
   }
   const count = Number(freeze?.final_count), people = `${count.toLocaleString("en")} ${count === 1 ? "person" : "people"}`;
   const base = freeze && object(freeze.base) ? freeze.base : null;
-  const audience = base?.mode === "all" ? "Everyone" : base?.mode === "segment" && typeof base.segment_id === "string" ? `Segment ${base.segment_id}` : base?.mode === "custom" && Array.isArray(base.customer_ids) ? `${base.customer_ids.length} selected contacts` : freeze?.freeze_id;
+  const excluded = freeze?.exclusion_list_id !== undefined && freeze?.exclusion_list_id !== null;
+  let audience: string | undefined;
+  if (base?.mode === "all") audience = excluded ? "Everyone who can be emailed, except an exclusion list" : "Everyone who can be emailed";
+  else if (base?.mode === "segment") audience = typeof base.segment_name === "string" && base.segment_name ? base.segment_name : "A saved segment";
+  else if (base?.mode === "custom") {
+    const chosen = Array.isArray(base.customer_ids) ? base.customer_ids.length : base.customer_count;
+    if (typeof chosen === "number" && Number.isSafeInteger(chosen)) audience = chosen === 1 ? "1 chosen customer" : `${chosen.toLocaleString("en")} chosen customers`;
+  }
+  if (audience && excluded && base?.mode !== "all") audience += ", except an exclusion list";
   add(facts_, "Audience", audience); facts_.push({ label: "Recipients", value: count.toLocaleString("en"), strong: true }); add(facts_, "From", from);
-  add(details, "Send", facts.send_id); add(details, "Campaign", facts.campaign_id); add(details, "Content version", facts.content_revision); add(details, "Content digest", facts.content_digest);
-  add(details, "Send digest", facts.send_digest); add(details, "Audience id", freeze?.freeze_id); add(details, "Audience digest", freeze?.digest); add(details, "Recipient limit", freeze?.max_recipients);
+  add(details, "Send", facts.send_id); add(details, "State", facts.state); add(details, "Campaign", facts.campaign_id); add(details, "Content version", facts.content_revision); add(details, "Content digest", facts.content_digest);
+  add(details, "Send digest", facts.send_digest); add(details, "Audience id", freeze?.freeze_id); add(details, "Segment", base?.mode === "segment" ? base.segment_id : undefined); add(details, "Exclusion list", freeze?.exclusion_list_id); add(details, "Audience digest", freeze?.digest); add(details, "Recipient limit", freeze?.max_recipients);
   bindingDetails(); add(details, "Unsubscribe origin", facts.unsubscribe_origin);
-  return { operation, title: `Send to ${people}?`, note: "This can't be undone.", confirm: `Send to ${people}`, facts: facts_, details };
+  return { operation, title: `Send to ${people}?`, note: "This can't be undone.", retry: PLAIN_RETRY, confirm: `Send to ${people}`, facts: facts_, details };
 }
 
 function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionArgs): RecordCard {
@@ -205,7 +215,7 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
   const audience = object(facts.audience) ? facts.audience : null;
   const freeze = audience && object(audience.freeze) ? audience.freeze : null;
   if (freeze) { show("Audience", freeze.freeze_id); show("Recipients", freeze.final_count); show("Recipient ceiling", freeze.max_recipients); show("Audience digest", freeze.digest); }
-  if (operation === "sends.approve" && (!freeze || !Number.isSafeInteger(freeze.final_count) || typeof facts.content_revision !== "number" || typeof facts.send_digest !== "string")) throw new ApiError("Incomplete frozen send facts", 502);
+  if (operation === "sends.approve" && (!freeze || !Number.isSafeInteger(freeze.final_count) || Number(freeze.final_count) < 1 || typeof facts.content_revision !== "number" || typeof facts.send_digest !== "string")) throw new ApiError("Incomplete frozen send facts", 502);
   if (operation === "sends.approve" || operation === "content.approve" || operation === "smtp.test-send") return plainCard(operation, facts, content, freeze);
   show("Frozen send digest", facts.send_digest);
   const outer = object(facts.binding) ? facts.binding : null;

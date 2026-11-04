@@ -22,21 +22,32 @@ async function card(operation: string, facts: Record<string, unknown>, args: Rec
 const labels = (rows: { label: string }[] | undefined) => (rows ?? []).map(r => r.label).join("|");
 
 async function main(): Promise<void> {
-  const freeze = { freeze_id: "freeze-1", base: { mode: "segment", segment_id: "seg-9" }, final_count: 1204, max_recipients: 2000, digest: "sha256:aa" };
+  const freeze = { freeze_id: "freeze-1", exclusion_list_id: null, base: { mode: "segment", segment_id: "seg-9" }, final_count: 1204, max_recipients: 2000, digest: "sha256:aa" };
   // Hosted shape: subject present, binding without a digest, no sender.
   const hosted = await card("sends.approve", { send_id: "send-1", campaign_id: "camp-1", subject: "Hi {{first_name|Friend}}", state: "prepared", content_revision: 2, content_digest: "sha256:bb", send_digest: "sha256:cc", audience: { freeze }, binding: { connection_id: "conn-1", link_revision: 3, state: "live" } });
   check(typeof hosted !== "string", "hosted send card builds");
   if (typeof hosted !== "string") {
     check(hosted.title === "Send to 1,204 people?" && hosted.confirm === "Send to 1,204 people", "send title and button name the count");
-    check(labels(hosted.facts) === "Email|Audience|Recipients", `hosted rows: ${labels(hosted.facts)}`);
+    check(labels(hosted.facts) === "Email|Audience|Recipients" && hosted.facts[1].value === "A saved segment", `hosted rows: ${labels(hosted.facts)}`);
     check(hosted.facts[0].value === "Hi {first name}", "merge tag shown without its fallback");
-    check(hosted.facts[2].strong === true && hosted.facts[2].value === "1,204", "recipients stand out");
+    check(hosted.facts[2].strong === true && hosted.facts[2].value === "1,204" && labels(hosted.details).includes("Segment") && labels(hosted.details).includes("State") && labels(hosted.details).includes("Exclusion list") === false, "recipients stand out");
     check(hosted.note === "This can't be undone.", "irreversible note");
+    check(hosted.note === "This can't be undone." && hosted.retry === "If the result is unclear, check its status before trying again.", "irreversible note and plain retry wording");
     check(labels(hosted.details).includes("Send digest") && labels(hosted.details).includes("Binding state"), "technical values stay in details");
   }
   // Native shape: no subject, binding nested with a digest, sender carried when the host has one.
   const native = await card("sends.approve", { send_id: "send-1", campaign_id: "camp-1", state: "prepared", content_revision: 2, content_digest: "sha256:bb", send_digest: "sha256:cc", audience: { freeze }, binding: { binding: { connection_id: "conn-1", link_revision: 3, state: "live", digest: "sha256:dd", sender: { name: "Shop", address: "shop@example.test" } } }, unsubscribe_origin: "https://x.example.test" });
   check(typeof native !== "string" && labels(native.facts) === "Audience|Recipients|From" && native.facts[2].value === "Shop <shop@example.test>", "native rows omit the subject and show the sender when carried");
+  const sendWith = (f: Record<string, unknown>) => card("sends.approve", { send_id: "s", content_revision: 2, send_digest: "sha256:cc", audience: { freeze: f } });
+  const audienceOf = async (f: Record<string, unknown>) => { const c = await sendWith({ ...freeze, ...f }); return typeof c === "string" ? c : c.facts.find(r => r.label === "Audience")?.value; };
+  check(await audienceOf({ base: { mode: "all" } }) === "Everyone who can be emailed", "all, no exclusion");
+  const excluded = await sendWith({ ...freeze, base: { mode: "all" }, exclusion_list_id: "ex-1" });
+  check(typeof excluded !== "string" && excluded.facts[0].value === "Everyone who can be emailed, except an exclusion list" && excluded.details?.some(r => r.label === "Exclusion list" && r.value === "ex-1"), "exclusion list is stated and kept in details");
+  check(await audienceOf({ base: { mode: "segment", segment_id: "seg-9", segment_name: "Pilot" } }) === "Pilot", "segment name");
+  check(await audienceOf({ base: { mode: "custom", customer_ids: ["a"] } }) === "1 chosen customer", "one chosen customer");
+  check(await audienceOf({ base: { mode: "custom", customer_count: 3 } }) === "3 chosen customers", "customer_count when ids not sent");
+  check(await audienceOf({ base: undefined }) === undefined, "no base omits the Audience row");
+  check(await sendWith({ ...freeze, final_count: 0 }) === "refused", "zero recipients are refused");
   // Validation is unchanged: each required fact still refuses.
   for (const bad of [{ content_revision: undefined }, { send_digest: undefined }, { audience: {} }, { audience: { freeze: { ...freeze, final_count: "9" } } }]) {
     const r = await card("sends.approve", { send_id: "s", content_revision: 2, send_digest: "sha256:cc", audience: { freeze }, ...bad });
@@ -44,8 +55,8 @@ async function main(): Promise<void> {
   }
   const content = await card("content.approve", { content: { campaign_id: "camp-1", subject: "Spring", revision: 4, name: "Spring", content_digest: "sha256:ee" } });
   check(typeof content !== "string" && content.title === "Approve this email?" && labels(content.facts) === "Subject|Version" && content.details?.length === 3, "content card");
-  const test = await card("smtp.test-send", { binding: { binding: { connection_id: "conn-1", link_revision: 3, state: "live", digest: "sha256:dd" } } });
-  check(typeof test !== "string" && test.input?.field === "to_email" && test.facts.length === 0 && labels(test.details) === "SMTP connection|Binding revision|Binding state|Binding digest", "test-send card omits what the host did not send");
+  const test = await card("smtp.test-send", { content: { campaign_id: "camp-1", revision: 4, name: "Spring" }, binding: { binding: { connection_id: "conn-1", link_revision: 3, state: "live", digest: "sha256:dd" } } });
+  check(typeof test !== "string" && test.input?.field === "to_email" && test.facts.length === 0 && labels(test.details) === "Version|Name|Campaign|SMTP connection|Binding revision|Binding state|Binding digest", "test-send card omits what the host did not send");
   // Any other operation keeps its card.
   const other = await card("works.review", { title: "Plan", revision: 3 }, { id: "doc-1", revision: 3 });
   check(typeof other !== "string" && !other.title && !other.details && labels(other.facts) === "Revision|Title|Revision|Decision", "other operations are untouched");
