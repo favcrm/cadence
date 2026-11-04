@@ -302,6 +302,16 @@ passes. Operator-by-positive-proof as a design decision
 (tracker issue **CAD-280**, "operator by positive proof") will replace this rule for
 board writes, `slot_reconcile` and these verbs alike.
 
+On the default store, daemon operator verbs, rollout verbs and the board's
+peer proof also refuse a caller with a known coding-agent runtime variable on
+its ancestry (CAD-2059). This is a guardrail against accidents, not a boundary:
+an agent that scrubs its environment, or starts through `systemd-run`, cron or
+`ssh localhost`, still passes. Other stores are not covered. `cadence daemon
+start` and `cadence ui start` strip these variables from the service they start,
+because a service started from an agent's shell is not that agent, so a board
+started that way still passes. A direct `cadence ui run` from an agent's shell is
+not stripped, and neither is a marked board that outlives a daemon restart.
+
 Board writes moved first (CAD-313, ADR 0004 phase 1): the board's
 operator is the holder of a session opened with a `cadence ui login`
 link, and minting that link needs this same proof **plus** the
@@ -310,10 +320,12 @@ that reads `<state>/operator/secret` and passes the proof can mint a
 link. A process cadence launched (a pane, a managed endpoint, a runner,
 anything the daemon started) must evade the proof — `setsid -f` with a
 scrubbed env and stdio (`operator_secret_theft_residual_pinned` pins
-it). **A same-uid process cadence never launched needs no evasion at
-all**: an agent CLI the operator started by hand, outside every
-registered pane, passes the proof as it is (the PR #249 reviewer minted
-a link from its own Claude Code shell), and can read the file. A board
+it). **A same-uid process cadence never launched needs little or no
+evasion**: an agent CLI the operator started by hand, outside every
+registered pane, passes the proof as it is when it carries no known
+marker or runs on another store, and otherwise only has to scrub its
+environment (before CAD-2059, the PR #249 reviewer minted a link from
+its own Claude Code shell). Either way it can read the file. A board
 session is two credentials: the HttpOnly cookie and a key the signed-in
 tab keeps in its `sessionStorage` and sends as `X-Cadence-Session`.
 Phase 1 therefore refuses cadence-launched agents, relays, forged

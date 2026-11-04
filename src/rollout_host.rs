@@ -31,20 +31,23 @@ pub(super) fn require_operator_proof(state_dir: &Path, verb: &str) -> Result<()>
     let panes = registered_panes(state_dir)?;
     let roots = enrolled_roots(state_dir)?;
     let daemon_pid = daemon_pid_for_proof(state_dir)?;
-    crate::peer::operator_proof(
-        std::process::id(),
-        unsafe { libc::getuid() },
-        daemon_pid,
-        &panes,
-        |pid| roots.contains(&pid),
-    )
-    .map_err(|why| {
-        Error::rejected(format!(
-            "{verb} is an operator action — this process is not \
+    crate::peer::refuse_agent_runtime(std::process::id(), state_dir)
+        .and_then(|()| {
+            crate::peer::operator_proof(
+                std::process::id(),
+                unsafe { libc::getuid() },
+                daemon_pid,
+                &panes,
+                |pid| roots.contains(&pid),
+            )
+        })
+        .map_err(|why| {
+            Error::rejected(format!(
+                "{verb} is an operator action — this process is not \
              provably the operator: {why}; run it from a shell outside every pane \
              and managed endpoint"
-        ))
-    })
+            ))
+        })
 }
 
 /// Registered pty panes (pane pid → alias) for the operator-proof deny

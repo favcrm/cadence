@@ -380,6 +380,11 @@ impl Shared {
                 )),
             };
         }
+        // The daemon's own dispatches come back over the socket. It may carry a
+        // marker if an older CLI started it from an agent's shell (CAD-2059).
+        if peer_pid != std::process::id() {
+            crate::peer::refuse_agent_runtime(peer_pid, &self.state_dir)?;
+        }
         let panes = crate::peer::AgentPids::classify(self.store.pty_pane_pids().map_err(|e| {
             format!("the registered panes cannot be read to prove this connection is not one ({e})")
         })?)

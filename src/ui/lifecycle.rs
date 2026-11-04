@@ -541,6 +541,10 @@ pub(crate) fn start_inner(
     // leak into the child (a `daemon restart --ui` under it would
     // blanket-assert every board→daemon RPC).
     command.env_remove(crate::test_seam::AS_ENV);
+    // CAD-2059: the board's own daemon calls must not read as an agent's.
+    for marker in crate::peer::AGENT_RUNTIME_MARKERS {
+        command.env_remove(marker);
+    }
     // CAD-841: the child must never push a device-login config — the
     // parent already did (or nobody did). Its argv carries none of the
     // flags; strip the env fallbacks so an inherited
