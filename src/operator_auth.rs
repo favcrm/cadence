@@ -157,15 +157,15 @@ pub fn secret_path(state_dir: &Path) -> PathBuf {
 fn check_dir(dir: &Path) -> Result<()> {
     let md = fs::symlink_metadata(dir).map_err(|e| {
         refuse(format!(
-            "{}: {e} — run `cadence ui login` to create the operator secret",
-            dir.display()
+            "Path {}: {e} — run `cadence ui login` to create the operator secret",
+            crate::printed_command::shown(dir)
         ))
     })?;
     if !md.is_dir() {
         return Err(refuse(format!(
-            "{} is not a directory (a symlink or a file) — refusing it; move it aside \
+            "Path {} is not a directory (a symlink or a file) — refusing it; move it aside \
              and run `cadence ui login --rotate`",
-            dir.display()
+            crate::printed_command::shown(dir)
         )));
     }
     if md.uid() != euid() {
@@ -178,7 +178,7 @@ fn check_dir(dir: &Path) -> Result<()> {
     }
     if md.mode() & 0o077 != 0 {
         return Err(refuse(format!(
-            "{} has mode {:03o}; it must be private — run {}",
+            "Path {} has mode {:03o}; it must be private — run {}",
             crate::printed_command::shown(dir),
             md.mode() & 0o777,
             crate::printed_command::with_path("chmod 700", dir, "")
@@ -231,14 +231,14 @@ pub fn read_secret(state_dir: &Path) -> Result<String> {
         .map_err(|e| {
             if e.raw_os_error() == Some(libc::ELOOP) {
                 refuse(format!(
-                    "{} is a symlink — refusing it; remove it and run \
+                    "Path {} is a symlink — refusing it; remove it and run \
                      `cadence ui login --rotate`",
-                    path.display()
+                    crate::printed_command::shown(&path)
                 ))
             } else {
                 refuse(format!(
-                    "{}: {e} — run `cadence ui login` to create it",
-                    path.display()
+                    "Path {}: {e} — run `cadence ui login` to create it",
+                    crate::printed_command::shown(&path)
                 ))
             }
         })?;
@@ -259,7 +259,7 @@ pub fn read_secret(state_dir: &Path) -> Result<String> {
     }
     if md.mode() & 0o077 != 0 {
         return Err(refuse(format!(
-            "{} has mode {:03o}; it must be readable by this user only — run \
+            "Path {} has mode {:03o}; it must be readable by this user only — run \
              {}, then `cadence ui login --rotate` (another user may have read it)",
             crate::printed_command::shown(&path),
             md.mode() & 0o777,
@@ -271,8 +271,8 @@ pub fn read_secret(state_dir: &Path) -> Result<String> {
     let secret = raw.trim();
     if !well_formed(secret) {
         return Err(refuse(format!(
-            "{} does not hold a well-formed secret — run `cadence ui login --rotate`",
-            path.display()
+            "Path {} does not hold a well-formed secret — run `cadence ui login --rotate`",
+            crate::printed_command::shown(&path)
         )));
     }
     Ok(secret.to_string())
@@ -383,7 +383,7 @@ pub fn read_private(state_dir: &Path, name: &str) -> Result<Vec<u8>> {
         return Err(Error::invalid(
             "capability_unavailable",
             format!(
-                "{} has mode {:03o}; it must be private — run {}",
+                "Path {} has mode {:03o}; it must be private — run {}",
                 crate::printed_command::shown(&path),
                 md.mode() & 0o777,
                 crate::printed_command::with_path("chmod 600", &path, "")
@@ -1807,6 +1807,20 @@ mod tests {
             ensure_secret(&state).unwrap();
             chmod(&dir(&state), 0o755);
             let shown = read_secret(&state).unwrap_err().to_string();
+            crate::printed_command::tests::assert_inert_when_pasted(&shown);
+
+            // A malformed secret, and a symlink where the secret belongs.
+            chmod(&dir(&state), 0o700);
+            let path = secret_path(&state);
+            fs::write(&path, "not a secret").unwrap();
+            let shown = read_secret(&state).unwrap_err().to_string();
+            assert!(shown.contains("well-formed"), "{shown}");
+            crate::printed_command::tests::assert_inert_when_pasted(&shown);
+
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(root.path().join("elsewhere"), &path).unwrap();
+            let shown = read_secret(&state).unwrap_err().to_string();
+            assert!(shown.contains("symlink"), "{shown}");
             crate::printed_command::tests::assert_inert_when_pasted(&shown);
         }
     }

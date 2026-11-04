@@ -617,10 +617,11 @@ fn reuse_lane(
         let (want, _) = layout::issue_names(&front.id, &front.title, Some(name))?;
         if want != wt_name {
             return Err(Error::rejected(format!(
-                "{id} already has an open worktree '{slug}' at {path} — \
+                "{id} already has an open worktree {slug} at {path} — \
                  --name {name} would start a second lane. Re-run without \
                  --name to reuse it, or close it first with {finish}",
                 id = front.id,
+                slug = crate::printed_command::sanitized(slug),
                 path = crate::printed_command::shown(lane),
                 finish = {
                     use crate::printed_command::{command, Part};
@@ -636,12 +637,12 @@ fn reuse_lane(
     }
     if let Some(other) = lane_root(lane).filter(|r| r != root) {
         return Err(Error::rejected(format!(
-            "{}'s open worktree {} belongs to repo {}, not {} — pass --repo {}",
+            "{}: open worktree {} belongs to repo {}, not {} — pass --repo {}",
             front.id,
-            lane.display(),
-            other.display(),
-            root.display(),
-            other.display()
+            crate::printed_command::shown(lane),
+            crate::printed_command::shown(&other),
+            crate::printed_command::shown(root),
+            crate::printed_command::shown(&other)
         )));
     }
     let open_branch = |b: &str| {
@@ -687,7 +688,7 @@ pub(crate) fn resolve_lane(
             front.id,
             many.len(),
             many.iter()
-                .map(|p| p.display().to_string())
+                .map(|p| crate::printed_command::shown(p))
                 .collect::<Vec<_>>()
                 .join("\n  "),
             front.id

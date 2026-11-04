@@ -522,18 +522,7 @@ pub fn bind_browser(dir: &Path) -> Result<ContinuityInfo> {
     private_dir(dir, false)?;
     let _guard = lock(dir, true)?;
     let enrollment = read_locked(dir)?;
-    enrollment.valid(now()?).map_err(|error| {
-        // Re-enrolling here would spend a consent and then refuse: the record belongs
-        // to the expired child.
-        if fs::symlink_metadata(dir.join(CONTINUITY_RECORD)).is_ok() {
-            reject(
-                "Hosted enrollment is invalid or expired and this directory holds a continuity \
-                 key; repeat `browser` with owner consent in a new private enrollment directory",
-            )
-        } else {
-            error
-        }
-    })?;
+    valid_for_continuity(dir, &enrollment)?;
     require_trusted_issuer(dir, &enrollment.issuer)?;
     if enrollment.source != EnrollmentSource::Browser {
         return Err(reject(
@@ -1838,12 +1827,27 @@ pub fn with_current<T>(
     record.valid(now()?)?;
     record.with_pin(pin, send)?
 }
+/// Check the record. Re-enrolling in a directory with continuity state would spend a
+/// consent and then refuse, because that state belongs to the old child, so say so first.
+fn valid_for_continuity(dir: &Path, enrollment: &Enrollment) -> Result<()> {
+    enrollment.valid(now()?).map_err(|error| {
+        if fs::symlink_metadata(dir.join(CONTINUITY_RECORD)).is_ok() {
+            reject(
+                "Hosted enrollment is invalid or expired and this directory has continuity \
+                 state; repeat `browser` with owner consent in a new private enrollment directory",
+            )
+        } else {
+            error
+        }
+    })
+}
+
 pub fn current(dir: &Path) -> Result<EnrollmentInfo> {
     private_dir(dir, false)?;
     let _guard = lock(dir, false)?;
     let record = read_locked(dir)?;
     require_trusted_issuer(dir, &record.issuer)?;
-    record.valid(now()?)?;
+    valid_for_continuity(dir, &record)?;
     Ok(record.info())
 }
 /// Explicit renewal uses the previously stored service credential. The issuer

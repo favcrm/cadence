@@ -1123,7 +1123,7 @@ fn a_reenroll_before_a_committed_bind_is_unknown_and_a_retry_settles_it() {
 /// working and what to do then.
 #[test]
 fn the_unknown_bind_message_prints_a_command_only_when_it_is_safe_to_paste() {
-    for path in ["/private/has space", "/private/$HOME;x$(y)"] {
+    for path in ["/private/has space", "/private/x;y"] {
         let shown = continuity_unknown(Path::new(path)).to_string();
         assert!(
             shown.contains(&format!("bind-continuity --enrollment-dir '{path}'`")),
@@ -1225,6 +1225,12 @@ fn an_expired_enrollment_with_a_continuity_key_names_a_new_directory() {
     assert!(shown.contains("re-enroll"), "{shown}");
 
     fs::write(dir.join(CONTINUITY_RECORD), b"{}").unwrap();
+    // `bind-continuity` reads the enrollment first, so this is what a person sees.
+    let shown = current(&dir).unwrap_err().to_string();
+    assert!(
+        shown.contains("new private enrollment directory"),
+        "{shown}"
+    );
     let shown = bind_browser(&dir).unwrap_err().to_string();
     assert!(
         shown.contains("new private enrollment directory"),

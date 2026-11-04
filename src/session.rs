@@ -1855,7 +1855,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                 let project = checkout_project(&sc.repos, &root);
                 let rel = layout::rel_dir(&name);
                 recon.push(Finding::new(
-                    format!("worktree:{}/{rel}", root.display()),
+                    orphan_worktree_key(&root, &rel),
                     project,
                     Sev::Warn,
                     format!(
@@ -2599,6 +2599,13 @@ fn gc_not_permitted(row: Row, detail: String, refused: &[String]) -> Row {
     row
 }
 
+/// The finding key, which prints unquoted at the head of the row. The directory name
+/// comes from `read_dir`, so an agent able to create one must not be able to put a
+/// command in an operator's output. An ordinary path keeps its key, so acks survive.
+fn orphan_worktree_key(root: &Path, rel: &str) -> String {
+    crate::printed_command::sanitized(&format!("worktree:{}/{rel}", root.display()))
+}
+
 /// The command that removes an orphan worktree. Its directory name comes from
 /// `read_dir`, so it is as untrusted as the checkout's path.
 fn orphan_worktree_remedy(root: &Path, rel: &str) -> String {
@@ -2613,6 +2620,26 @@ fn orphan_worktree_remedy(root: &Path, rel: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_orphan_worktree_row_is_inert_when_the_whole_line_is_pasted() {
+        use crate::printed_command::tests::{assert_inert_when_pasted, CRAFTED};
+        let root = std::path::Path::new("/repo");
+        assert_eq!(
+            super::orphan_worktree_key(root, ".cadence/wt/cad-1-a"),
+            "worktree:/repo/.cadence/wt/cad-1-a"
+        );
+        for name in CRAFTED {
+            let rel = format!(".cadence/wt/{name}");
+            let row = format!(
+                "· [{}] orphan worktree {} — no open PR or issue; inspect, then {}",
+                super::orphan_worktree_key(root, &rel),
+                crate::printed_command::shown(&root.join(&rel)),
+                super::orphan_worktree_remedy(root, &rel),
+            );
+            assert_inert_when_pasted(&row);
+        }
+    }
+
     #[test]
     fn a_crafted_orphan_worktree_name_cannot_run_as_a_command() {
         let shown = super::orphan_worktree_remedy(
