@@ -112,7 +112,8 @@ fn cad690_context_migration_is_atomic_and_preserves_legacy_snapshots_and_authori
     drop(s);
     let db = dir.path().join("t.sqlite3");
     let conn = Connection::open(&db).unwrap();
-    conn.execute_batch("DROP INDEX app_runs_context; ALTER TABLE app_runs DROP COLUMN context_id; DROP TABLE app_contexts;").unwrap();
+    conn.execute_batch("DROP TRIGGER IF EXISTS app_capability_results_source_scope;
+        DROP INDEX app_runs_context; ALTER TABLE app_runs DROP COLUMN context_id; DROP TABLE app_contexts;").unwrap();
     // This fixture retains the authentic v21 connection objects while removing
     // only this increment's additive objects. It must follow merged CAD688.
     let previous = 21;
