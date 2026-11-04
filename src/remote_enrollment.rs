@@ -54,11 +54,17 @@ fn is_service_source(source: &EnrollmentSource) -> bool {
 fn reject(message: &str) -> Error {
     Error::rejected(message)
 }
-/// Single-quote a value for a shell command the CLI only ever *prints*
-/// (the trusted-issuer remedy). `'` becomes `'\''` so a crafted
-/// `--auth-dir` or issuer cannot break out of the quotes.
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+/// One single-quoted argument of a command a refusal prints, or `None` when the
+/// value has no safe printed form. Refusals reach stderr as JSON, which rewrites
+/// `\`, `"` and control characters, so the printed command must not contain them:
+/// `'\''` becomes `'\\''` when pasted, which ends the quote and runs the rest of a
+/// crafted path. Shell syntax has no way to write `'` inside quotes without one of
+/// those, so such a value gets no command.
+fn pasteable_arg(value: &str) -> Option<String> {
+    let safe = !value
+        .chars()
+        .any(|c| matches!(c, '\'' | '\\' | '"') || c.is_control());
+    safe.then(|| format!("'{value}'"))
 }
 fn now() -> Result<u64> {
     Ok(SystemTime::now()
@@ -485,12 +491,17 @@ struct ContinuityBindReply {
 
 fn continuity_unknown(dir: &Path) -> Error {
     let shown = dir.display().to_string();
+    let command = match pasteable_arg(&shown) {
+        Some(arg) => format!("`cadence remote enrollment bind-continuity --enrollment-dir {arg}`"),
+        None => "`cadence remote enrollment bind-continuity` with --enrollment-dir set to that \
+                 directory (its path cannot be printed as a safe command)"
+            .to_string(),
+    };
     Error::unknown(format!(
         "hosted continuity binding is unknown; retain the pending key in {shown} and reconcile \
-         with `cadence remote enrollment bind-continuity --enrollment-dir {}` before this \
-         enrollment expires, five minutes at most after it was issued. After that this directory \
-         cannot finish: repeat `browser` with owner consent in a new private enrollment directory",
-        shell_quote(&shown)
+         with {command} before this enrollment expires, five minutes at most after it was \
+         issued. After that this directory cannot finish: repeat `browser` with owner consent in \
+         a new private enrollment directory"
     ))
 }
 
@@ -661,6 +672,23 @@ fn private_dir(dir: &Path, create: bool) -> Result<()> {
     }
     Ok(())
 }
+/// Name the exact file and the exact commands. `echo` rather than `printf '%s\n'`,
+/// because the `\n` would be doubled in the JSON a refusal prints, and pasting that
+/// writes a literal backslash-n into the pin. `pasteable_arg` keeps backslashes out
+/// of the values, so `echo` writes them unchanged.
+fn missing_pin_remedy(issuer: &str, file: &str) -> String {
+    match (pasteable_arg(issuer), pasteable_arg(file)) {
+        (Some(issuer), Some(path)) => format!(
+            "Trusted issuer pin is missing. Create it yourself, then retry: \
+             echo {issuer} > {path} && chmod 600 {path}"
+        ),
+        _ => format!(
+            "Trusted issuer pin is missing. Create {file} yourself with the issuer as its only \
+             line, mode 600, then retry (this path or issuer cannot be printed as a safe command)"
+        ),
+    }
+}
+
 /// The operator must establish this independent trust pin before a service
 /// credential is ever transmitted. Enrollment never creates it.
 fn require_trusted_issuer(dir: &Path, issuer: &str) -> Result<()> {
@@ -673,18 +701,9 @@ fn require_trusted_issuer(dir: &Path, issuer: &str) -> Result<()> {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // The pin is the operator's independent trust decision — the CLI
-            // never creates it. Name the exact file and the exact commands,
-            // every interpolated value shell-quoted so a crafted --auth-dir
-            // cannot break out of the printed command.
-            let file = dir.join(TRUSTED_ISSUER);
-            let file = file.display().to_string();
-            return Err(Error::rejected(format!(
-                "Trusted issuer pin is missing. Create it yourself, then retry: \
-                 printf '%s\\n' {} > {} && chmod 600 {}",
-                shell_quote(issuer),
-                shell_quote(&file),
-                shell_quote(&file)
-            )));
+            // never creates it.
+            let file = dir.join(TRUSTED_ISSUER).display().to_string();
+            return Err(Error::rejected(missing_pin_remedy(issuer, &file)));
         }
         // Anything else (a symlink the O_NOFOLLOW refused, EACCES, a dangling
         // path component) is a refusal, not "missing": never print a write
