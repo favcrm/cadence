@@ -1154,4 +1154,41 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    // CAD-2149, independent acceptance: the assignment ending removes ITS
+    // credential file and only that one, whichever way it ends.
+    #[test]
+    fn ending_an_assignment_removes_only_its_own_agent_credential_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let plant = |message: &str| {
+            bind(dir.path(), message);
+            let path = agent_credential_path(dir.path(), message).unwrap();
+            fs::write(&path, b"{}").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            path
+        };
+        let (fenced, accepted, live) = (
+            plant("end-fenced"),
+            plant("end-accepted"),
+            plant("end-live"),
+        );
+        mark_fenced(&binding_path(dir.path(), "end-fenced").unwrap()).unwrap();
+        assert!(!fenced.exists() && accepted.exists() && live.exists());
+        mark_accepted(&binding_path(dir.path(), "end-accepted").unwrap(), "result").unwrap();
+        assert!(
+            !accepted.exists(),
+            "an accepted final report left its credential"
+        );
+        assert!(live.exists(), "another assignment's credential was removed");
+        assert!(hosted_binding_target(dir.path(), "end-fenced")
+            .unwrap()
+            .is_none());
+        assert!(hosted_binding_target(dir.path(), "end-accepted")
+            .unwrap()
+            .is_none());
+        assert!(hosted_binding_target(dir.path(), "end-live")
+            .unwrap()
+            .is_some());
+    }
 }
