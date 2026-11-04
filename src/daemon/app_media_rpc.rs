@@ -385,6 +385,44 @@ impl Shared {
         })
     }
 
+    /// Imported custody has no producing run to re-prove and must outlive
+    /// the installation that imported it, so the receiver's own admission
+    /// is the whole currentness check here. A post-admission rule belongs
+    /// in `receiver_install_admitted`, which every arm — this one, the
+    /// producer pairing, and the pre-byte gate — calls; the wrapper differs
+    /// only where the provider needs a two-install snapshot.
+    fn with_receiver_only_current<T>(
+        &self,
+        caller: &str,
+        message_id: &str,
+        read: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let Some(receiver) = self.image_receiver_scope(caller, message_id)? else {
+            // Unstamped chat has no receiver install to admit. Provider
+            // bytes fall back to the producer's binding receipt; imported
+            // bytes have no producer, so the admission here is the same one
+            // the catalog already gave — the pinned resolver read a
+            // verified workspace asset whose revision and byte digest match
+            // the message's own refs. There is no install to bind because
+            // the asset deliberately outlives the installation that
+            // imported it.
+            return read();
+        };
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot(&pm, &receiver.0, |caller_snap, _| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.receiver_install_admitted(caller, message_id, &receiver, caller_snap)?;
+            read()
+        })
+    }
+
     /// Producing custody together with the persisted receiver, under one
     /// pm → custody → release section. No app stamp keeps the producer-only
     /// proof used by general pinned chat.
@@ -392,9 +430,12 @@ impl Shared {
         &self,
         caller: &str,
         message_id: &str,
-        original: &crate::store::app_media::MediaOriginalProof,
+        authority: OriginalAuthority<'_>,
         read: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        let OriginalAuthority::Provider(original) = authority else {
+            return self.with_receiver_only_current(caller, message_id, read);
+        };
         let Some(receiver) = self.image_receiver_scope(caller, message_id)? else {
             return self.with_media_source_current(original, read);
         };
@@ -492,7 +533,7 @@ impl Shared {
             .original
             .as_ref()
             .map(|original| original.media_type.clone())
-            .unwrap_or_else(|| display.media_type.clone());
+            .unwrap_or_else(|| display.media_type.to_string());
         if display.asset.revision != revision
             || !matches!(declared.as_str(), "image/png" | "image/jpeg")
         {
@@ -505,7 +546,7 @@ impl Shared {
         let media_type = display.media_type;
         let proof = display.original;
         let preview =
-            crate::platform::agenticos_external::image::preview_jpeg(&display.bytes, &media_type)
+            crate::platform::agenticos_external::image::preview_jpeg(&display.bytes, media_type)
                 .map_err(|(_, reason)| Error::rejected(reason))?;
         const PREFIX: &str = "data:image/jpeg;base64,";
         let mut data_url = String::with_capacity(PREFIX.len() + preview.len().div_ceil(3) * 4);
@@ -1563,17 +1604,27 @@ impl Shared {
         // Receiver admission is persisted scope, proved before any retained
         // byte read. Producer pairing repeats inside each currentness check.
         self.gate_image_receiver_before_bytes(&caller, message_id)?;
-        let image = self.store.app_media_context_image(asset_id)?;
-        if pin["revision"].as_i64() != Some(image.asset.revision)
-            || pin["sha256"].as_str() != Some(image.original.sha256.as_str())
-        {
-            return Err(Error::rejected("media inspect reference is stale"));
-        }
+        // CAD-2078: the pin names the bytes' own digest, so an imported
+        // asset is inspectable exactly like a provider-produced one; the
+        // authority it carries says which door must be re-proved.
+        let pinned_revision = pin["revision"]
+            .as_i64()
+            .ok_or_else(|| Error::rejected("media inspect reference is stale"))?;
+        let pinned_sha = pin["sha256"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("media inspect reference is stale"))?;
+        let image = self
+            .store
+            .app_media_pinned_display(asset_id, pinned_revision, pinned_sha)?
+            .ok_or_else(|| Error::rejected("media inspect reference is stale"))?;
         let delivery = MediaInspectionDelivery {
             shared: self,
             params,
             peer_pid,
-            original: &image.original,
+            authority: match &image.original {
+                Some(original) => OriginalAuthority::Provider(original),
+                None => OriginalAuthority::Imported,
+            },
             asset_id,
             revision: image.asset.revision,
             pin: &pin,
@@ -1581,7 +1632,7 @@ impl Shared {
         delivery.with_current(|| ())?;
         let header = json!({
             "asset_id": asset_id, "revision": image.asset.revision,
-            "sha256": image.digest, "media_type": image.media_type,
+            "sha256": image.sha256, "media_type": image.media_type,
             "bytes": image.bytes.len(),
         });
         deliver(&header, &image.bytes, &delivery)
@@ -1748,7 +1799,7 @@ pub(super) struct MediaInspectionDelivery<'a> {
     shared: &'a Shared,
     params: &'a Value,
     peer_pid: u32,
-    original: &'a crate::store::app_media::MediaOriginalProof,
+    authority: OriginalAuthority<'a>,
     asset_id: &'a str,
     revision: i64,
     pin: &'a Value,
@@ -1762,7 +1813,7 @@ impl MediaInspectionDelivery<'_> {
         };
         let message_id = required_str(self.params, "message")?;
         self.shared
-            .with_turn_image_current(&caller, message_id, self.original, || {
+            .with_turn_image_current(&caller, message_id, self.authority, || {
                 let current = self.shared.media_inspect_turn(self.params, self.peer_pid)?;
                 if &current != self.pin
                     || self.shared.store.app_media_revision(self.asset_id)? != self.revision
@@ -1822,6 +1873,7 @@ pub(super) struct OriginalRequest<'a> {
     pub action_token: &'a str,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum OriginalAuthority<'a> {
     Provider(&'a crate::store::app_media::MediaOriginalProof),
     /// Workspace custody: no producing run and no install binding, so

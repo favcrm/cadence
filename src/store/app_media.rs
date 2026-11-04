@@ -115,6 +115,19 @@ pub(crate) struct MediaImport<'a> {
     pub request_id: &'a str,
 }
 
+/// The closed set of image types the catalog serves, as a static so the
+/// adapter's `TurnImage` can carry it without copying.
+fn static_media_type(value: &str) -> Result<&'static str> {
+    match value {
+        "image/png" => Ok("image/png"),
+        "image/jpeg" => Ok("image/jpeg"),
+        "image/webp" => Ok("image/webp"),
+        _ => Err(Error::rejected(
+            "media asset carries an unsupported image type",
+        )),
+    }
+}
+
 /// Display material for one catalog asset, whichever provenance it has:
 /// imported workspace custody or a provider-produced original, together
 /// with the original proof when one exists. `media_type` describes
@@ -122,7 +135,7 @@ pub(crate) struct MediaImport<'a> {
 /// provider path always has.
 pub(crate) struct DisplayImage {
     pub asset: MediaAsset,
-    pub media_type: String,
+    pub media_type: &'static str,
     pub sha256: String,
     pub bytes: Vec<u8>,
     /// The provider-produced original, when the bytes are provider bytes.
@@ -685,7 +698,7 @@ impl Store {
         if let Some(imported) = self.app_media_imported_image(asset_id)? {
             return Ok(Some(DisplayImage {
                 asset: imported.asset,
-                media_type: imported.media_type,
+                media_type: static_media_type(&imported.media_type)?,
                 sha256: imported.sha256,
                 bytes: imported.bytes,
                 original: None,
@@ -697,11 +710,35 @@ impl Store {
         let image = self.app_media_context_image(asset_id)?;
         Ok(Some(DisplayImage {
             asset: image.asset,
-            media_type: image.media_type.to_string(),
+            media_type: image.media_type,
             sha256: image.original.sha256.clone(),
             bytes: image.bytes,
             original: Some(image.original),
         }))
+    }
+
+    /// CAD-2078: display material for a pinned library image. The pin
+    /// names the revision and the digest of the bytes themselves, so the
+    /// check is provenance-neutral: an imported workspace asset and a
+    /// provider-produced one pass or refuse on the same terms, and
+    /// `None` means the pin no longer names these bytes, or the id names no
+    /// catalog asset, so each caller words its own refusal. A row that is
+    /// present but cannot be read as a verified asset — unsupported stored
+    /// type, custody digest mismatch — keeps its store error, because that
+    /// is a broken catalog row rather than a stale pin.
+    pub(crate) fn app_media_pinned_display(
+        &self,
+        asset_id: &str,
+        revision: i64,
+        sha256: &str,
+    ) -> Result<Option<DisplayImage>> {
+        let Some(image) = self.app_media_display_image(asset_id)? else {
+            return Ok(None);
+        };
+        if image.asset.revision != revision || image.sha256 != sha256 {
+            return Ok(None);
+        }
+        Ok(Some(image))
     }
 
     /// CAD-1962: the verified custody bytes behind one imported asset.
