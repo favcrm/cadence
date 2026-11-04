@@ -453,6 +453,55 @@ lane observation only when it can identify the recorded checkout and verify
 its state. An unavailable or ambiguous observation does not mean the lane
 is clean or merged; leave it intact for reconciliation.
 
+### Managing agent profiles from the CLI (CAD-2101)
+
+The owner can do from the CLI what the agent page does for a profile. Name the
+org on every call; the echoed `org=` line is the destination.
+
+```sh
+cadence --org acme agent profile get ap_<profile-id>
+cadence --org acme agent profile create ledger --catalogue accountant [--job-file job.md|-] [--model <m>]
+cadence --org acme agent profile edit ap_<profile-id> --expect-rev 3 \
+  --set role="Bookkeeper" --set-json 'skills=["invoices","payroll"]' --file responsibilities=-
+cadence --org acme agent profile archive ap_<profile-id> --latest
+```
+
+- Every command prints one JSON document, the stored profile with its
+  `revision`. `edit` sends only the fields you name; the board merges them onto
+  the profile at the revision you give and leaves the rest as stored.
+- Field names are the board's. `--set FIELD=VALUE` sends text, `--set-json
+  FIELD=JSON` sends a value that is not text (`skills` is an array), and
+  `--file FIELD=PATH|-` sends a file's or stdin's text unchanged. The client
+  holds no field list and no limits: the board refuses an unknown field or a
+  value that is too long, with its own code (`invalid_request`).
+- `edit` and `archive` need `--expect-rev N` or `--latest`. `--latest` reads the
+  current revision first and says so on stderr; it still fences that write, but
+  against whatever was stored when it read. A stale revision exits 5, prints the
+  board's `revision_conflict` and writes nothing. `archive` is an edit of
+  `status`.
+- Refusals keep the board's code: `not_permitted`, `unauthorized`, `not_found`,
+  `alias_taken`, `invalid_request`, `capability_unavailable`. They exit 3, like
+  every other hosted refusal. A lost answer to a write exits 1 with the read to
+  run before repeating it (`agent profile get`, `agent profiles`).
+- Creating and editing are a live human owner's act. A member is refused by the
+  board. A board that predates these commands answers "update the board first";
+  nothing is written.
+- A native board has a daemon path for `create` only (the one behind
+  `POST /api/agent-profiles`). `get`, `edit` and `archive` refuse and say what
+  is missing; they never fall back to another store.
+
+**A managed agent cannot be stopped from the server.** With `CADENCE_ALIAS`
+(or a grant) set, the client refuses a profile write: "a managed agent can't
+edit profiles; propose the change". That is a client check and nothing more.
+The hosted board refuses an `agent` or `service` principal, but a managed agent
+that runs under a member's or owner's saved human login arrives as that user,
+and the board has no fact that tells the two apart. So an agent that bypasses
+the client (a direct call with the saved login, or an unmanaged shell) is judged
+as the person whose login it uses. Treat the saved login as the person's, keep
+it out of agent environments, and have agents propose changes (`agent
+propose-hire`). Closing this needs a server-side fact, such as a distinct
+principal for a managed session; it is not done here.
+
 ### Leaving a message for a role on a ticket
 
 A session can leave a message for whoever holds a role on a ticket. The role is

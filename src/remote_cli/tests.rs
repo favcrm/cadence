@@ -5662,3 +5662,192 @@ fn cad2009_profile_sync_postdispatch_503_is_unknown_but_invalid_request_is_defin
         assert_eq!(requests[1]["body"]["arguments"], json!(arguments));
     }
 }
+
+#[test]
+fn cad2101_profile_verbs_are_registered_with_their_scopes() {
+    use super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb, REMOTE_VERBS};
+    for verb in [
+        "agent_profile_show",
+        "agent_profile_create",
+        "agent_profile_update",
+    ] {
+        assert!(REMOTE_VERBS.contains(&verb), "{verb}");
+    }
+    assert_eq!(cli_requested_scopes("agent_profile_show"), &["cli.read"]);
+    assert_eq!(cli_requested_scopes("agent_profile_create"), &["cli.write"]);
+    assert_eq!(cli_requested_scopes("agent_profile_update"), &["cli.write"]);
+    assert!(!mutating_cli_verb("agent_profile_show"));
+    assert!(mutating_cli_verb("agent_profile_create"));
+    assert!(mutating_cli_verb("agent_profile_update"));
+    assert!(lost_mutation_note("agent_profile_update").contains("agent profile get"));
+    assert!(lost_mutation_note("agent_profile_create").contains("agent profiles"));
+    // CAD-2009: the classifier is total; the read must not be a possible write.
+    assert!(super::mutation_reconcile("agent_profile_show").is_none());
+    assert!(super::mutation_reconcile("agent_profile_create").is_some());
+}
+
+#[test]
+fn cad2101_profile_refusals_keep_their_code_and_are_never_retried() {
+    // Server text is arbitrary; the client answers the bounded code with its
+    // own text. Synthetic bodies only.
+    let refusal = |code: &str| json!({"error": {"code": code, "message": "server-text /private"}});
+    for (verb, status, code) in [
+        ("agent_profile_show", 404u16, "not_found"),
+        ("agent_profile_update", 404, "not_found"),
+        ("agent_profile_create", 403, "not_permitted"),
+        ("agent_profile_update", 403, "not_permitted"),
+        // The call gate answers a member or a non-user principal this way.
+        ("agent_profile_create", 401, "unauthorized"),
+        ("agent_profile_update", 401, "unauthorized"),
+        ("agent_profile_create", 409, "alias_taken"),
+        ("agent_profile_create", 400, "invalid_request"),
+        ("agent_profile_update", 400, "invalid_request"),
+        ("agent_profile_show", 503, "capability_unavailable"),
+    ] {
+        let (out, requests) = run(vec![(status, "", refusal(code))], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        let shown = err.to_string();
+        assert_eq!(err.code(), Some(code), "{verb} {status}: {shown}");
+        assert_eq!(err.kind(), "rejected", "{verb} {status}: {shown}");
+        assert!(
+            !shown.contains("server-text") && !shown.contains("/private"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("coordination"),
+            "a profile refusal read as an outage: {shown}"
+        );
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb} {code}");
+    }
+}
+
+#[test]
+fn cad2101_stale_revision_is_a_conflict_answer_that_writes_nothing() {
+    // The 409 is a verdict, not an error: the caller prints it and exits 5.
+    let (out, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"error": {"code": "revision_conflict", "message": "x"}}),
+        )],
+        "agent_profile_update",
+        json!({"id": "ap_synthetic-0001", "expectedRevision": 1, "role": "r"})
+            .as_object()
+            .unwrap()
+            .clone(),
+        10,
+    );
+    let body = out.expect("a conflict is an answer, not an error");
+    assert_eq!(body["error"]["code"], "revision_conflict");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn cad2101_a_board_without_the_verbs_says_to_update_it() {
+    // The tenant board answers 501 not_implemented for a verb it lacks.
+    for verb in [
+        "agent_profile_show",
+        "agent_profile_create",
+        "agent_profile_update",
+    ] {
+        let (out, requests) = run(
+            vec![(501, "", json!({"error": {"code": "not_implemented"}}))],
+            verb,
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("update the board first"), "{verb}: {shown}");
+        assert!(!shown.contains("coordination"), "{shown}");
+        assert!(shown.contains("Nothing was"), "{shown}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+    // A bare 400 from an older relay is also what a bad value gets, so the
+    // text names both and still says to update the board.
+    let (out, _) = run(
+        vec![(400, "", json!({"error": {"code": "invalid_request"}}))],
+        "agent_profile_update",
+        Map::new(),
+        10,
+    );
+    assert!(out
+        .unwrap_err()
+        .to_string()
+        .contains("update the board first"));
+}
+
+#[test]
+fn cad2101_profile_write_without_a_matching_receipt_is_unknown() {
+    let update = || {
+        json!({"id": "ap_synthetic-0001", "expectedRevision": 2, "role": "r"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    for receipt in [
+        Value::Null,
+        json!({"ok": true}),
+        json!({"profile": {"id": "ap_other", "revision": 3}}),
+        json!({"profile": {"id": "ap_synthetic-0001"}}),
+    ] {
+        let (out, requests) = run(
+            vec![(200, "", receipt)],
+            "agent_profile_update",
+            update(),
+            10,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        assert!(err.to_string().contains("agent profile get"), "{err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "replayed");
+    }
+    let (out, _) = run(
+        vec![(
+            200,
+            "",
+            json!({"profile": {"id": "ap_synthetic-0001", "revision": 3, "role": "r"}}),
+        )],
+        "agent_profile_update",
+        update(),
+        10,
+    );
+    assert_eq!(out.unwrap()["profile"]["revision"], 3);
+    // Create: any profile id with a revision matches; no profile does not.
+    let create = || {
+        json!({"alias": "ledger", "catalogue": "accountant"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    let (out, _) = run(
+        vec![(200, "", json!({"profile": {}}))],
+        "agent_profile_create",
+        create(),
+        10,
+    );
+    assert_eq!(out.unwrap_err().kind(), "unknown");
+    let (out, _) = run(
+        vec![(500, "", json!({"error": {"code": "internal"}}))],
+        "agent_profile_create",
+        create(),
+        10,
+    );
+    let err = out.unwrap_err();
+    assert_eq!(err.kind(), "unknown", "{err}");
+    assert!(err.to_string().contains("agent profiles"), "{err}");
+    // A write's 503 is an unknown outcome too, not a refusal with an exit 3.
+    let (out, _) = run(
+        vec![(
+            503,
+            "",
+            json!({"error": {"code": "capability_unavailable"}}),
+        )],
+        "agent_profile_update",
+        json!({"id": "ap_synthetic-0001", "expectedRevision": 2, "role": "r"})
+            .as_object()
+            .unwrap()
+            .clone(),
+        10,
+    );
+    assert_eq!(out.unwrap_err().kind(), "unknown");
+}
