@@ -57,25 +57,8 @@ export interface CanvasTab {
   turn: string | null;
 }
 
-/** One tool step of the running turn, as the thread records it. */
-export interface WorkStep {
-  /** Plain words: no command line, path or JSON. */
-  text: string;
-  /** The step as the thread recorded it, for the "details" disclosure. */
-  raw: string;
-  done: boolean;
-}
-
-/**
- * The running turn in plain words, from the thread alone: the agent's latest
- * commentary, the live step, the recent steps and how many ran so far. The
- * daemon announces no stage names and no total, so there is no "of M".
- */
+/** The turn running in the thread, and what it is changing in the canvas. */
 export interface Working {
-  plan: string | null;
-  step: string | null;
-  steps: WorkStep[];
-  count: number;
   turn: string | null;
   /** Artifact ids this turn has asked to add a version to (`--id`). */
   updating: string[];

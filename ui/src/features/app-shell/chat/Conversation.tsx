@@ -2399,8 +2399,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         onSend={({ body, refs, attachments, mediaRefs }) => send(body, refs, attachments, mediaRefs)}
         onSubmitted={engage}
         onCommand={(name) => {
-          if (name === "new" || name === "clear") startNew();
-          else setComposerNotice({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name } });
+          if (name === "new" || name === "clear") {
+            startNew();
+            return true;
+          }
+          setComposerNotice({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name } });
+          return false;
         }}
         onNotice={setComposerNotice}
         attach={{ enabled: canAttach, reason: attachReason, destination: attachDestination }}

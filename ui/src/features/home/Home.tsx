@@ -1113,6 +1113,8 @@ function MasterHome({
     setUnseen(0);
     setActivity(false);
     setGlideTick((n) => n + 1);
+    // A command's answer lasts until the next send; one still running stays.
+    setCmds((c) => c.filter((x) => x.running));
   }, []);
   const sendPersonalRequest = useCallback(async (text: string) => {
     if (readOnly || block || homeConversation === undefined) throw new Error("Sending is unavailable.");
@@ -1330,11 +1332,11 @@ function MasterHome({
 
   /** One `/` verb → the board's command route; its answer is a card. */
   const runCommand = useCallback(
-    (name: string, arg: string) => {
+    (name: string, arg: string): boolean | void => {
       const id = ++cmdSeq.current;
       if (name === "help") {
         setCmds((c) => [...c, { id, name, ok: true, text: t(helpText(offered)) }]);
-        return;
+        return arg ? false : undefined;
       }
       const known = SLASH_COMMANDS.find((c) => c.name === name);
       if (!known) {
@@ -1342,14 +1344,14 @@ function MasterHome({
           ...c,
           { id, name, ok: false, text: `Unknown command — \`/help\` lists what the master accepts.` },
         ]);
-        return;
+        return false;
       }
       if (!offered.includes(known)) {
         setCmds((c) => [
           ...c,
           { id, name, unavailable: true, text: t("This command isn't available in this workspace. `/help` lists what is.") },
         ]);
-        return;
+        return arg ? false : undefined;
       }
       setCmds((c) => [...c, { id, name, arg: arg || undefined, running: true }]);
       api

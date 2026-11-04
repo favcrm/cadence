@@ -120,12 +120,28 @@ async function main() {
   await type("/compact");
   await enter();
   assert(!requests.some((r) => r.startsWith("POST")), `an unavailable command sends nothing (got ${requests.join(", ")})`);
+  assert(box()?.value === "" && menu().length === 0, "a submitted command leaves the box empty and the menu closed");
   const card = host.querySelector('[data-cmd="compact"]');
   assert(card?.textContent?.includes("not available"), "the card says it is not available");
   assert(!card?.textContent?.includes("failed"), "an unavailable command did not fail");
 
+  // No such verb: the words may be a message, and they must not be lost.
+  const prose = "/tmp is full and the nightly backup stopped";
+  requests.length = 0;
+  await type(prose);
+  await enter();
+  assert(!requests.some((r) => r.startsWith("POST")), `an unknown verb sends nothing (got ${requests.join(", ")})`);
+  assert(box()?.value === prose, "an unknown verb keeps the operator's text");
+  assert(host.querySelector('[data-cmd="tmp"]'), "and says it was refused");
+  for (const words of ["/compact the nightly logs before the audit", "/help me fix the login bug"]) {
+    await type(words);
+    await enter();
+    assert(box()?.value === words, `words after a verb that did not run stay in the box: ${words}`);
+  }
+
   await type("/help");
   await enter();
+  assert(!host.querySelector('[data-cmd="compact"]'), "the next send clears a command's answer");
   const help = host.querySelector('[data-cmd="help"]')?.textContent ?? "";
   assert(!help.includes("/compact") && !help.includes("/model"), "help lists only what this board can run");
   assert(help.includes("Just type your message") && !help.includes("what it does"), "help with nothing to list says so, with no empty table");
@@ -181,10 +197,9 @@ async function main() {
     resources.masterState.write(() => master as never);
   });
   await settle();
-  const cardsBefore = host.querySelectorAll('[data-cmd="stop"]').length;
   await type("/stop");
   await enter();
-  const typed = Array.from(host.querySelectorAll('[data-cmd="stop"]')).slice(cardsBefore).map((card) => card.textContent ?? "");
+  const typed = Array.from(host.querySelectorAll('[data-cmd="stop"]')).map((card) => card.textContent ?? "");
   assert(typed.length === 2, `a typed stop shows its answer and the notice (got ${typed.length})`);
   assert(typed.some((text) => text.includes("Stopped.")) && typed.some((text) => text.includes("A queued message was withdrawn too")), "the typed stop's notice is not overwritten by its answer");
   stopAnswer = null;
