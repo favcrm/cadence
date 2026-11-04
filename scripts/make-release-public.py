@@ -130,7 +130,9 @@ def aws(args, *, env):
     classification and never surfaced verbatim."""
     try:
         out = subprocess.run(
-            ["aws", "s3api", *args],
+            # CAD-2109: named so the runner cannot steer it. With no region
+            # set, aws takes one from a cloud runner's metadata.
+            ["aws", "s3api", "--region", "auto", *args],
             env=env,
             capture_output=True,
             text=True,

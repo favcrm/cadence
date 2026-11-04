@@ -129,18 +129,16 @@ jobs:
           test -f dist/bundles/publication-attestation.jsonl
           args+=(--artifact "publication-receipt.json=dist/bundles/publication-receipt.json:publication:application/json")
           args+=(--artifact "publication-attestation.jsonl=dist/bundles/publication-attestation.jsonl:publication:application/json")
-          # The retry writes the same profile as the automatic publisher and
-          # keeps today's effective visibility: the variable was unset in this
-          # repository, so `private` is what this path has always written. The
-          # private->public flip stays with the `production`-gated
-          # release-visibility workflow. Whether a retry should instead
-          # reproduce a `public` record directly is an operator decision about
-          # an outward action — a one-word change, not a default to widen here.
+          # The retry writes the same record as the automatic publisher
+          # (ci.yml `release-publish-r2`): a client record is public by
+          # construction, and no workflow can flip one later. Operator decision
+          # 2026-11-04 (CAD-2109). A replay of a record stored as private is
+          # refused as a conflict rather than overwritten.
           python3 scripts/publish-release.py \
             --endpoint "$RELEASES_ENDPOINT" \
             --bucket "$RELEASES_BUCKET" \
             --product cadence --profile public-client \
             --version "$TAG" --source-sha "$SOURCE_SHA" \
-            --visibility private \
+            --visibility public \
             --published-at "$PUBLISHED_AT" \
             "${args[@]}"
