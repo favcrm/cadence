@@ -5,6 +5,8 @@ import { setComposerRefs } from "../app-shell/chat/composerStore";
 import ArtifactView, { downloadName, saveBytes, useArtifactBytes, type HtmlView } from "./ArtifactView";
 import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
+import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
+import { closeBrowserDrawer, focusBrowser, hideBrowser, tabVisible, useBrowserTab } from "./browserStore";
 import {
   clampWidth,
   closeDrawer,
@@ -111,7 +113,7 @@ function focusComposer(): void {
   box?.focus();
 }
 
-function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpand, htmlView, onHtmlView }: {
+function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpand, onClose, htmlView, onHtmlView }: {
   conversation: string;
   tab: CanvasTab;
   composerKey: string | null;
@@ -119,6 +121,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
   sheet: boolean;
   expanded: boolean;
   onExpand: () => void;
+  onClose: () => void;
   htmlView: HtmlView;
   onHtmlView: (view: HtmlView) => void;
 }) {
@@ -150,7 +153,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
     if (!composerKey) return;
     const passage = selectedPassage(contentRef.current);
     setComposerRefs(composerKey, [makeAskRef({ artifact: tab.id, version: tab.selected, title: tab.title, passage })]);
-    if (sheet) closeDrawer();
+    if (sheet) onClose();
     requestAnimationFrame(focusComposer);
   };
 
@@ -166,7 +169,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
     <>
       <header className="cv-head">
         {sheet ? (
-          <button type="button" className="cv-iconbtn cv-back" onClick={closeDrawer} aria-label={t("Back to chat")}>
+          <button type="button" className="cv-iconbtn cv-back" onClick={onClose} aria-label={t("Back to chat")}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
               <path d="m15 18-6-6 6-6" />
             </svg>
@@ -194,7 +197,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
                 {expanded ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /> : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />}
               </svg>
             </button>
-            <button type="button" className="cv-iconbtn" onClick={closeDrawer} aria-label={t("Close canvas")}>
+            <button type="button" className="cv-iconbtn" onClick={onClose} aria-label={t("Close canvas")}>
               <IconClose size={12} />
             </button>
           </>
@@ -280,14 +283,24 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
 export default function CanvasDrawer() {
   const t = useTranslate();
   const canvas = useCanvas();
+  const browser = useBrowserTab();
   const viewport = useViewport();
   // The width the operator dragged to wins; until then each kind has its own.
   const [dragged, setDragged] = useState(readWidth);
   const [expanded, setExpanded] = useState(false);
   // Per artifact, held here because Body remounts when the version changes.
   const [htmlViews, setHtmlViews] = useState<Record<string, HtmlView>>({});
-  const open = canvas.open && canvas.tabs.length > 0 && canvas.conversation !== null;
+  // The session tab (browserStore.ts) is not an artifact: it can open the drawer
+  // on its own and shares the strip, but canvasStore never models it.
+  const hasBrowser = tabVisible(browser);
+  const conversation = canvas.conversation ?? browser.conversation;
+  const open = conversation !== null && ((canvas.open && canvas.tabs.length > 0) || (browser.open && hasBrowser));
   const tab = canvas.tabs.find((x) => x.id === canvas.active) ?? canvas.tabs[0] ?? null;
+  const showBrowser = hasBrowser && (browser.focused || tab === null);
+  const closeAll = useCallback(() => {
+    closeDrawer();
+    closeBrowserDrawer();
+  }, []);
   const want = dragged !== null ? clampWidth(dragged, viewport) : defaultWidthFor(tab?.kind ?? "md", viewport);
   const [layout, setLayout] = useState<DrawerLayout>({ mode: "push", width: want });
   const pushed = useRef(0);
@@ -325,11 +338,11 @@ export default function CanvasDrawer() {
       if (e.key !== "Escape" || e.defaultPrevented) return;
       // Esc first restores the width, then closes.
       if (expanded) setExpanded(false);
-      else closeDrawer();
+      else closeAll();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, expanded]);
+  }, [open, expanded, closeAll]);
 
   useEffect(() => {
     if (!open) setExpanded(false);
@@ -338,7 +351,7 @@ export default function CanvasDrawer() {
   // The active tab scrolls into view when it changes.
   useEffect(() => {
     rootRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [canvas.active, canvas.tabs.length, open]);
+  }, [canvas.active, canvas.tabs.length, showBrowser, open]);
 
   const commit = useCallback((px: number) => {
     const next = clampWidth(px, window.innerWidth);
@@ -369,7 +382,7 @@ export default function CanvasDrawer() {
     e.preventDefault();
   };
 
-  if (!open || !tab || canvas.conversation === null) return null;
+  if (!open || (!tab && !showBrowser) || conversation === null) return null;
   const sheet = layout.mode === "sheet";
   const working = canvas.working;
   return (
@@ -398,32 +411,69 @@ export default function CanvasDrawer() {
           onKeyDown={onResizeKey}
         />
       ) : null}
-      {canvas.tabs.length > 1 ? (
+      {canvas.tabs.length + (hasBrowser ? 1 : 0) > 1 ? (
         <div className="cv-tabs" role="tablist" aria-label={t("Artifacts")}>
-          {canvas.tabs.map((x) => (
-            <span key={x.id} className="cv-tab" data-active={x.id === tab.id || undefined}>
-              <button type="button" role="tab" aria-selected={x.id === tab.id} className="cv-tab-label" onClick={() => focusTab(x.id)}>
-                {x.title}
+          {canvas.tabs.map((x) => {
+            const on = !showBrowser && tab !== null && x.id === tab.id;
+            return (
+              <span key={x.id} className="cv-tab" data-active={on || undefined}>
+                <button type="button" role="tab" aria-selected={on} className="cv-tab-label" onClick={() => focusTab(x.id)}>
+                  {x.title}
+                </button>
+                <button type="button" className="cv-tab-close" aria-label={`${t("Close")} ${x.title}`} onClick={() => closeTab(x.id)}>
+                  <IconClose size={10} />
+                </button>
+              </span>
+            );
+          })}
+          {hasBrowser ? (
+            <span className="cv-tab" data-kind="session" data-active={showBrowser || undefined}>
+              <button type="button" role="tab" id="bz-tab" aria-selected={showBrowser} aria-controls="bz-panel" className="cv-tab-label" onClick={focusBrowser}>
+                <BrowserTabLabel />
               </button>
-              <button type="button" className="cv-tab-close" aria-label={`${t("Close")} ${x.title}`} onClick={() => closeTab(x.id)}>
+              <button
+                type="button"
+                className="cv-tab-close"
+                aria-label={t("Hide Browser tab. The session keeps running.")}
+                title={t("Hide Browser tab. The session keeps running.")}
+                onClick={hideBrowser}
+              >
                 <IconClose size={10} />
               </button>
             </span>
-          ))}
+          ) : null}
         </div>
       ) : null}
-      <Body
-        key={`${tab.id}@${tab.selected}`}
-        conversation={canvas.conversation}
-        tab={tab}
-        composerKey={canvas.composerKey}
-        working={working}
-        sheet={sheet}
-        expanded={expanded}
-        onExpand={() => setExpanded((x) => !x)}
-        htmlView={htmlViews[tab.id] ?? "rendered"}
-        onHtmlView={(view) => setHtmlViews((views) => ({ ...views, [tab.id]: view }))}
-      />
+      {tab ? (
+        // Kept mounted while the Browser tab is in front, so an artifact's
+        // scroll position and frame survive the switch.
+        <div className="cv-pane" hidden={showBrowser}>
+          <Body
+            key={`${tab.id}@${tab.selected}`}
+            conversation={canvas.conversation ?? conversation}
+            tab={tab}
+            composerKey={canvas.composerKey}
+            working={working}
+            sheet={sheet}
+            expanded={expanded}
+            onExpand={() => setExpanded((x) => !x)}
+            onClose={closeAll}
+            htmlView={htmlViews[tab.id] ?? "rendered"}
+            onHtmlView={(view) => setHtmlViews((views) => ({ ...views, [tab.id]: view }))}
+          />
+        </div>
+      ) : null}
+      {hasBrowser ? (
+        <BrowserPanel
+          key={conversation}
+          conversation={conversation}
+          active={showBrowser}
+          sheet={sheet}
+          expanded={expanded}
+          onExpand={() => setExpanded((x) => !x)}
+          onClose={closeAll}
+        />
+      ) : null}
     </aside>
   );
 }

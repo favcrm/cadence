@@ -129,6 +129,16 @@ function emptyState(
   return { conversation, surface, composerKey, open: false, tabs: [], active: null, working: null };
 }
 
+/** An artifact took the active tab (card, tab click or auto-open). The
+ *  session tab (browserStore.ts) is not modelled here; it listens instead. */
+const artifactFocusListeners = new Set<() => void>();
+export function onArtifactFocus(listener: () => void): void {
+  artifactFocusListeners.add(listener);
+}
+function artifactFocused(): void {
+  for (const l of [...artifactFocusListeners]) l();
+}
+
 function set(next: CanvasState): void {
   if (next === state) return;
   state = next;
@@ -203,6 +213,7 @@ export function feedCanvas(input: FeedInput): void {
   let tabs = state.tabs;
   let open = state.open;
   let active = state.active;
+  let focused = false;
   for (const card of input.cards) {
     if (seen.has(card.key)) continue;
     seen.add(card.key);
@@ -217,6 +228,7 @@ export function feedCanvas(input: FeedInput): void {
       if (!tabs.some((t) => t.id === ref.id)) tabs = [...tabs, newTab(ref, card.turn)];
       open = true;
       active = ref.id;
+      focused = true;
     }
   }
   if (tabs.length === 0) {
@@ -225,6 +237,7 @@ export function feedCanvas(input: FeedInput): void {
   } else if (active === null || !tabs.some((t) => t.id === active)) {
     active = tabs[0].id;
   }
+  if (focused) artifactFocused();
   const composerKey = input.composerKey;
   const working = sameWorking(input.working, state.working) ? state.working : input.working;
   if (
@@ -249,10 +262,13 @@ export function openArtifact(ref: ArtifactRef): void {
       )
     : [...state.tabs, newTab(ref, null)];
   set({ ...state, tabs, active: ref.id, open: true });
+  artifactFocused();
 }
 
 export function focusTab(id: string): void {
-  if (state.tabs.some((t) => t.id === id) && state.active !== id) set({ ...state, active: id });
+  if (!state.tabs.some((t) => t.id === id)) return;
+  if (state.active !== id) set({ ...state, active: id });
+  artifactFocused();
 }
 
 export function closeTab(id: string): void {
