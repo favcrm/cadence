@@ -56,7 +56,12 @@ fn pdf_text(source: &Path) -> std::result::Result<String, String> {
         Duration::from_secs(20),
         EXTRACT_BYTES,
     )
-    .map_err(|e| format!("pdftotext unavailable or timed out: {e}"))?;
+    .map_err(|e| match e {
+        crate::proc::BoundedError::Spawn(ref io) if io.kind() == std::io::ErrorKind::NotFound => {
+            "pdftotext is not installed on this host (install poppler-utils)".to_string()
+        }
+        e => format!("pdftotext unavailable or timed out: {e}"),
+    })?;
     if bounds.stdout_exceeded {
         return Err(format!("extracted text exceeds {EXTRACT_BYTES} bytes"));
     }
