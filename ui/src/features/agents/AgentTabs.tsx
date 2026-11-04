@@ -12,7 +12,10 @@ import type { Agent, AgentAccess, AgentDetail, AgentRole, HiredProfile } from ".
 import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref, detailTasksNotOnRoster, partitionActiveTasks } from "./AgentBlocks";
 import Link from "../../ui/Link";
 import { ProfileBlock } from "./AgentProfile";
-import { appliesText } from "./agentRoles";
+import { MASTER } from "../home/master";
+import InstructionsEditor, { type ContextLine } from "./InstructionsEditor";
+import { estimateTokens, nativeChange } from "./instructionsDoc";
+import type { InstructionsDoc } from "./useInstructionsDoc";
 import {
   BUNDLED_SKILLS,
   HISTORY_FILTERS,
@@ -48,9 +51,9 @@ export interface TabContext {
   /** Whether the role is known yet. A profile that names none has nothing to wait for. */
   roleRead: "read" | "reading" | "failed";
   retryRole: () => void;
-  /** The unsaved Instructions text. It outlives the section, so a tab trip keeps it. */
-  draft: string | null;
-  setDraft: (text: string) => void;
+  /** The Instructions document: draft, revision and save state. It lives on the
+   *  page, so a tab trip keeps the draft and the caret. */
+  doc: InstructionsDoc;
 }
 
 const NOT_RECORDED = "This board doesn’t record agent history.";
@@ -351,7 +354,25 @@ function History({ c }: { c: TabContext }) {
   const [filter, setFilter] = useState<HistoryFilter>("all");
   const [open, setOpen] = useState<string | null>(null);
   const detail = c.detail;
-  if (c.hired) return <Note>{t("No history yet: it has no runtime.")}</Note>;
+  if (c.hired) {
+    const changed = c.doc.kind === "hosted" ? c.doc.profile : null;
+    return (
+      <div className="ap-body">
+        {changed && (
+          <>
+            <Rows>
+              <Row
+                left={`${t("Instructions last changed")} · ${t("revision")} ${changed.revision}`}
+                right={fmtTime(new Date(changed.updated_at).toISOString())}
+              />
+            </Rows>
+            <Note>{t("This board records when the instructions changed, not who changed them.")}</Note>
+          </>
+        )}
+        <Note>{t("No other history yet: it has no runtime.")}</Note>
+      </div>
+    );
+  }
   const running = (detail?.running ?? []).map((m) => ({
     key: `m-${m.id}`,
     name: t("Turn running"),
@@ -363,18 +384,28 @@ function History({ c }: { c: TabContext }) {
       ["Started", m.created ? fmtTime(m.created) : null],
     ] as Fact[],
   }));
-  const events = (detail?.events ?? []).map((e) => ({
-    key: `e-${e.seq}`,
-    name: e.kind,
-    line: [e.task_id ?? e.job_id, fmtTime(e.at)].filter(Boolean).join(" · "),
-    group: historyKind(e.kind),
-    facts: [
-      ["Event", `#${e.seq}`],
-      ["Task", e.task_id],
-      ["Job", e.job_id],
-      ["When", fmtTime(e.at)],
-    ] as Fact[],
-  }));
+  const events = (detail?.events ?? []).map((e) => {
+    // Instructions edits record who made them; say so, or say it is not recorded.
+    const edit = nativeChange(e);
+    return {
+      key: `e-${e.seq}`,
+      name: edit ? t("Instructions edited") : e.kind,
+      line: [
+        edit ? (edit.by ? `${t("By")} ${edit.by}` : t("Who isn’t recorded")) : (e.task_id ?? e.job_id),
+        fmtTime(e.at),
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      group: historyKind(e.kind),
+      facts: [
+        ["Event", `#${e.seq}`],
+        ["Task", e.task_id],
+        ["Job", e.job_id],
+        ["By", edit?.by],
+        ["When", fmtTime(e.at)],
+      ] as Fact[],
+    };
+  });
   const all = [...running, ...events];
   const rows = all.filter((r) => filter === "all" || r.group === filter);
   const shown = all.find((r) => r.key === open);
@@ -413,6 +444,7 @@ function History({ c }: { c: TabContext }) {
       ) : (
         <Note>{t(reading(c) ? "Loading…" : "No events yet.")}</Note>
       )}
+      {(detail?.events.length ?? 0) >= 20 && <Note>{t("Only the last 20 events are shown, so an older edit may be missing.")}</Note>}
       {shown && (
         <ItemDrawer title={shown.name} onClose={() => setOpen(null)}>
           <Facts items={shown.facts} />
@@ -422,39 +454,55 @@ function History({ c }: { c: TabContext }) {
   );
 }
 
+/** What loads at session start. Only the document itself is measured, and only
+ *  as an estimate; the rest is named and not counted. */
+function contextLines(text: string): ContextLine[] {
+  return [
+    { name: "Instructions", size: `About ${estimateTokens(text).toLocaleString("en")} tokens (estimate)` },
+    { name: "Platform and workspace rules", size: "Not counted" },
+    { name: "Skill names and descriptions", size: "Not counted" },
+    { name: "Tool definitions", size: "Not counted" },
+  ];
+}
+
 function Instructions({ c }: { c: TabContext }) {
   const t = useTranslate();
-  // The board serves the saved text to the operator only.
-  const served = c.detail?.agent.instructions ?? null;
-  const text = c.draft ?? served ?? "";
-  const [saving, setSaving] = useState(false);
+  const doc = c.doc;
+  const editor = (reason?: string) => (
+    <div className="ap-body">
+      {reason && <Note>{t(reason)}</Note>}
+      <InstructionsEditor
+        doc={doc}
+        writable={c.writable && doc.kind !== null}
+        resetTo={c.role?.instructions ?? null}
+        contextLines={contextLines(doc.draft ?? doc.served ?? "")}
+        contextNote={
+          <p className="ap-drawer-lead">
+            {t("Skills in full, wiki pages the agent reads, earlier sessions, and a repository’s own agent instructions file during project work.")}
+          </p>
+        }
+      />
+    </div>
+  );
   if (c.hired) {
+    if (doc.kind === "hosted") {
+      if (doc.read === "failed") return <Failed text="The instructions could not be read." onRetry={doc.retry} />;
+      if (doc.read !== "ready") return <Note>{t("Loading instructions…")}</Note>;
+      return editor();
+    }
     return c.hired.job ? (
       <p className="rc-profile-job">{c.hired.job}</p>
     ) : (
       <Note>{t("There are no instructions to show for this agent.")}</Note>
     );
   }
-  const save = async () => {
-    if (!c.writable || saving) return;
-    setSaving(true);
-    try {
-      const out = await api.setAgentInstructions(c.alias, text);
-      c.toast("ok", `${t("Saved.")} ${t(appliesText(out.applies))}`);
-      c.onSaved();
-    } catch (error) {
-      c.toast("err", error instanceof ApiError || error instanceof Error ? error.message : String(error));
-    } finally {
-      setSaving(false);
-    }
-  };
   if (c.detailNotServed) {
     if (c.role?.instructions) return <p className="rc-profile-job">{c.role.instructions}</p>;
     return <Note>{c.role ? t("This agent was hired as {role}.").replace("{role}", () => c.role!.title) : t("This board doesn’t show job text for this agent.")}</Note>;
   }
   if (c.detailFailed && !c.detail) return <Note>{t("Agent details are unavailable.")}</Note>;
   if (!c.detail) return <Note>{t("Loading agent details…")}</Note>;
-  if (served === null) {
+  if (doc.served === null) {
     return (
       <Note>
         {c.role
@@ -466,31 +514,12 @@ function Instructions({ c }: { c: TabContext }) {
       </Note>
     );
   }
-  return (
-    <div className="ap-body">
-      <textarea
-        className="field rc-text"
-        style={{ minHeight: "24rem" }}
-        aria-label={t("Instructions")}
-        value={text}
-        readOnly={!c.writable}
-        onChange={(event) => c.setDraft(event.target.value)}
-      />
-      {c.writable && (
-        <div className="rc-sugs">
-          {text !== served && (
-            <Button variant="primary" size="sm" disabled={saving} onClick={() => void save()}>
-              {saving ? t("Saving…") : t("Save")}
-            </Button>
-          )}
-          {c.role && text !== c.role.instructions && (
-            <Button size="sm" onClick={() => c.setDraft(c.role!.instructions)}>
-              {t("Reset to role")}
-            </Button>
-          )}
-        </div>
-      )}
-    </div>
+  return editor(
+    doc.kind === null
+      ? c.alias === MASTER
+        ? "The master’s instructions are not edited here."
+        : "This agent’s job comes from its settings profile, which this board cannot edit."
+      : undefined,
   );
 }
 
