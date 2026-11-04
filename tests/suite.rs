@@ -7477,10 +7477,14 @@ mod cad2100_classifier_merge_base {
     mod cad2117_gate_gaps {
         use super::*;
 
-        const CLASSIFIER: [&str; 3] = [
+        const CLASSIFIER: [&str; 7] = [
             "crates/cadence-core/src/delivery_requirements.rs",
             "crates/cadence-core/src/delivery_rules.rs",
             "src/daemon/delivery_requirements_rpc.rs",
+            "crates/cadence-core/src/delivery.rs",
+            "crates/cadence-core/src/lib.rs",
+            "crates/cadence-core/src/evaluate.rs",
+            "src/daemon/unattended_landing.rs",
         ];
 
         // 1. Each classifier file is human-class by path: the script and the classifier
@@ -7536,6 +7540,73 @@ mod cad2100_classifier_merge_base {
             );
             let run = gate(&repo, &head).main_at(&tip).run();
             run.refused(&["2 merge bases"]);
+        }
+
+        /// A clone of `repo` over `file://`, with `flags`, wrapped so the gate runs inside it.
+        fn clone_of(repo: &Repo, flags: &[&str]) -> Repo {
+            git(&repo.work(), &["config", "uploadpack.allowFilter", "true"]);
+            let dir = tempfile::Builder::new()
+                .prefix("c2117")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let url = format!("file://{}", repo.work().display());
+            let work = dir.path().join("work");
+            let mut args = vec!["clone", "-q", "--no-single-branch"];
+            args.extend(flags);
+            args.extend([url.as_str(), work.to_str().unwrap()]);
+            git(dir.path(), &args);
+            Repo {
+                dir,
+                base: repo.base.clone(),
+                mid: repo.mid.clone(),
+                tip: repo.tip.clone(),
+            }
+        }
+
+        // 4. A shallow checkout can hide a second merge base: refused, naming the way out,
+        // under a stale lean answer. Main's tip merges `fix` and `side`; the head reaches `fix`
+        // at once but `side` only through two more commits, so a depth-3 cut leaves one merge
+        // base (`fix`) where the full history has two, and hides the restored `src/peer.rs`.
+        #[test]
+        fn a_shallow_checkout_is_refused_where_the_cut_hides_a_merge_base() {
+            let repo = Repo::new();
+            let d = repo.work();
+            let fix = repo.branch("fix", &repo.base, |d| put(d, "src/peer.rs", "fixed\n"));
+            let side = repo.branch("side", &repo.base, |d| put(d, "docs/side.md", "x\n"));
+            let z = repo.branch("z", &side, |d| put(d, "docs/z.md", "x\n"));
+            let y = repo.branch("y", &z, |d| put(d, "docs/y.md", "x\n"));
+            git(&d, &["checkout", "-q", "-B", "tip", &fix]);
+            git(&d, &["merge", "-q", "--no-ff", "--no-edit", &side]);
+            let tip = git(&d, &["rev-parse", "HEAD"]);
+            git(&d, &["checkout", "-q", "-B", "head", &y]);
+            git(&d, &["merge", "-q", "--no-ff", "--no-edit", &fix]);
+            git(&d, &["checkout", &repo.base, "--", "src/peer.rs"]);
+            let head = commit(&d, "restore peer");
+            git(&d, &["checkout", "-q", "main"]);
+            // Only `tip` and `head` may keep the history alive in the clone.
+            git(&d, &["branch", "-q", "-D", "fix", "side", "z", "y"]);
+            let bases = |dir: &Path| git(dir, &["merge-base", "--all", &tip, &head]);
+            assert_eq!(bases(&d).lines().count(), 2);
+            let shallow = clone_of(&repo, &["--depth", "3"]);
+            assert_eq!(
+                git(&shallow.work(), &["rev-parse", "--is-shallow-repository"]),
+                "true"
+            );
+            assert_eq!(bases(&shallow.work()), fix, "the cut should leave one base");
+            gate(&shallow, &head)
+                .main_at(&tip)
+                .run()
+                .refused(&["git fetch --unshallow"]);
+        }
+
+        // 5. A partial clone keeps the whole history, so shallowness is not why it is refused.
+        #[test]
+        fn a_partial_clone_is_not_refused_for_being_shallow() {
+            let repo = Repo::new();
+            let head = repo.touching("plain", &repo.tip, &["docs/y.md"]);
+            let partial = clone_of(&repo, &["--filter=blob:none"]);
+            let run = gate(&partial, &head).run();
+            assert!(!run.said().contains("shallow"), "{}", run.show());
         }
 
         // 3. A rename out of a human path is judged on both ends by the classifier.
