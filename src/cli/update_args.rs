@@ -220,7 +220,7 @@ impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
             Self::Http(s) => s.published_proof(sha),
         }
     }
-    fn merged_titles(&self, base: &str, head: &str) -> Result<Vec<String>> {
+    fn merged_titles(&self, base: &str, head: &str) -> Result<Option<Vec<String>>> {
         match self {
             Self::Gh(s) => s.merged_titles(base, head),
             Self::Http(s) => s.merged_titles(base, head),

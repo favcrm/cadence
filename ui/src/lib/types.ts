@@ -1376,11 +1376,14 @@ export interface WaitingTurn {
 export interface UpdateStatus {
   current: { sha: string | null; version: string | null };
   check: UpdateCheck | null;
+  /** Complete check when its summary cannot safely be represented to older tabs. */
+  check_with_unavailable_summary?: UpdateCheck | null;
   checked_at: number | null;
   checking: boolean;
   update_available: boolean;
-  change_count: number;
-  changes: string[];
+  changes_available?: boolean;
+  change_count: number | null;
+  changes: string[] | null;
   migration: boolean;
   blockers: string[];
   running: boolean;
@@ -1398,8 +1401,9 @@ export interface UpdateCheck {
   target: string;
   target_version: string | null;
   up_to_date: boolean;
-  changes: string[];
-  change_count: number;
+  changes_available?: boolean;
+  changes: string[] | null;
+  change_count: number | null;
   schema: { current: number | null; target: number | null; migration: boolean };
   lease: Record<string, unknown> | null;
   waiters: WaitingTurn[];
