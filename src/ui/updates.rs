@@ -110,9 +110,13 @@ pub(super) fn get(state_dir: &Path) -> HttpResp {
             && c["changes"].is_array()
             && c["change_count"].as_u64().is_some()
     });
+    // A board tab opened before nullable summaries existed assumes
+    // `check.changes` is an array. Give it no check rather than a false
+    // empty summary; newer tabs read the complete check from the added field.
     json_response(json!({
         "current": current,
-        "check": check,
+        "check": available_changes,
+        "check_with_unavailable_summary": check.as_ref().filter(|_| available_changes.is_none()),
         "checked_at": checked_at,
         "checking": BOARD_UPDATE.checking.load(Ordering::SeqCst),
         "update_available": update_available,

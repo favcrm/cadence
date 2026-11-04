@@ -163,11 +163,12 @@ export default function Update({
 
   const inactive =
     !!blocked || !status || !!readError || busy !== null || active || checking;
+  const report = status?.check ?? status?.check_with_unavailable_summary ?? null;
   const run = async (kind: "check" | "update") => {
     if (
       inactive ||
       action.current ||
-      (kind === "update" && (!status?.check || status.check.up_to_date))
+      (kind === "update" && (!report || report.up_to_date))
     )
       return;
     action.current = true;
@@ -201,7 +202,6 @@ export default function Update({
     }
   };
 
-  const report = status?.check;
   const changes =
     report?.changes_available === true &&
     Array.isArray(report.changes) &&

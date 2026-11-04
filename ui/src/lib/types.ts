@@ -1376,6 +1376,8 @@ export interface WaitingTurn {
 export interface UpdateStatus {
   current: { sha: string | null; version: string | null };
   check: UpdateCheck | null;
+  /** Complete check when its summary cannot safely be represented to older tabs. */
+  check_with_unavailable_summary?: UpdateCheck | null;
   checked_at: number | null;
   checking: boolean;
   update_available: boolean;

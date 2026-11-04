@@ -49,6 +49,12 @@ unavailable or incomplete comparison cannot prove an empty summary. In
 `true`, `[]` and `0`. The board treats older cached reports without the
 availability field as unknown rather than as zero changes.
 
+On the board's `GET /api/update`, an unavailable-summary check is carried in
+`check_with_unavailable_summary` while the legacy `check` field is null.
+Updated clients use that field; a tab loaded before the update sees its
+check as unavailable rather than crashing or receiving a fabricated empty
+summary.
+
 `cadence update` is operator-only and proves it the same way
 `rollout claim --as` does: the process must run outside every pane and
 managed endpoint, which an agent, a pane descendant or an unproven
