@@ -251,13 +251,18 @@ pub(crate) fn route_client_only(cli: Cli) -> Result<i32> {
         .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
         .transpose()?;
     match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
-        org::Resolved::Remote(target) => remote::run(
-            target,
-            cli.command,
-            cli.wake_timeout,
-            cli.state_dir.clone(),
-            cli.command_path,
-        ),
+        org::Resolved::Remote(target) => {
+            // CAD-2101: the same refusal as the full install; a saved default
+            // is not naming the org for a profile command.
+            super::agent_profile::require_named_org(cli.org.as_deref(), &cli.command, &target.org)?;
+            remote::run(
+                target,
+                cli.command,
+                cli.wake_timeout,
+                cli.state_dir.clone(),
+                cli.command_path,
+            )
+        }
         org::Resolved::Local(_) => Err(local_command_refusal()),
     }
 }
@@ -301,6 +306,12 @@ fn refuse_native_options(cli: &Cli) -> Result<()> {
 fn require_install() -> Result<ClientInstall> {
     let exe = current_binary().ok_or_else(client_only_required)?;
     identify(&exe)?.ok_or_else(client_only_required)
+}
+
+/// The notice is only for a positively identified client-only installation.
+pub(super) fn notice_install() -> Option<(PathBuf, String)> {
+    let install = require_install().ok()?;
+    Some((install.prefix, install.tag))
 }
 
 /// A client-only installation's `update`: the public release, client only.
@@ -373,7 +384,7 @@ pub(crate) fn run(
 }
 
 /// `vMAJOR.MINOR.PATCH` with plain digits; anything else has no known order.
-fn version_key(tag: &str) -> Option<[u64; 3]> {
+pub(super) fn version_key(tag: &str) -> Option<[u64; 3]> {
     let mut parts = tag.strip_prefix('v')?.split('.');
     let mut key = [0u64; 3];
     for slot in &mut key {
@@ -519,7 +530,7 @@ fn run_limited(cmd: &mut Command, timeout: Duration, limit: usize, what: &str) -
 /// GitHub API (CAD-1479: the catalogue is the default; `--release-source`
 /// remains the advanced https:// override and a source failure refuses,
 /// never silently falling back to GitHub).
-fn latest_tag(release_source: Option<&str>) -> Result<String> {
+pub(super) fn latest_tag(release_source: Option<&str>) -> Result<String> {
     let base = cadence_agent::releases::resolve_base(release_source)?;
     let source =
         cadence_agent::releases::source_for(&base, cadence_agent::releases::PROFILE_PUBLIC_CLIENT)?;

@@ -339,22 +339,26 @@ fn project_new_without_a_correlated_receipt_is_unknown_and_not_retried() {
 
 #[test]
 fn project_new_ambiguous_5xx_is_unknown_but_pre_forward_5xx_stays_definite() {
-    // CAD-1999: a 5xx naming no pre-forward worker `state` may follow a
-    // committed create. A 5xx that names one, and a board gate refusal
-    // (`hop: board`), are decided before the verb ran and stay definite.
+    // CAD-1999, narrowed by CAD-2009: a 5xx without proof it preceded the verb
+    // may follow a committed create, and a `state` the relay does not document
+    // is no such proof. A failed wake, a tracker refusal and a board gate
+    // refusal (`hop: board`) are decided before the verb ran and stay definite.
     let args = || {
         json!({"key": "ops", "name": "Operations"})
             .as_object()
             .unwrap()
             .clone()
     };
-    for status in [500u16, 503] {
-        let (out, requests) = run(
-            vec![(status, "", json!({"ok": false}))],
-            "project_new",
-            args(),
-            1,
-        );
+    for (status, body) in [
+        (500u16, json!({"ok": false})),
+        (503, json!({"ok": false})),
+        (500, json!({"state": "unavailable"})),
+        (
+            503,
+            json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+        ),
+    ] {
+        let (out, requests) = run(vec![(status, "", body)], "project_new", args(), 1);
         let err = out.unwrap_err();
         assert_eq!(err.kind(), "unknown", "{status}: {err}");
         let text = err.to_string();
@@ -367,13 +371,13 @@ fn project_new_ambiguous_5xx_is_unknown_but_pre_forward_5xx_stays_definite() {
         );
     }
 
-    let (out, _) = run(
-        vec![(500, "", json!({"state": "unavailable"}))],
-        "project_new",
-        args(),
-        1,
-    );
-    assert_eq!(out.unwrap_err().kind(), "rejected");
+    for body in [
+        json!({"state": "wake_failed", "code": "wake_failed"}),
+        json!({"ok": false, "error": {"code": "tracker_unavailable"}}),
+    ] {
+        let (out, _) = run(vec![(503, "", body)], "project_new", args(), 1);
+        assert_eq!(out.unwrap_err().kind(), "rejected");
+    }
 
     let (out, _) = run(
         vec![(
@@ -1455,23 +1459,38 @@ fn a_bare_409_without_the_conflict_shape_is_a_generic_refusal() {
 
 #[test]
 fn a_bare_503_is_availability_and_is_not_retried_or_login() {
-    // A 503 without a waking state is terminal for this command: retry
-    // later, keep the saved login, never ask for a fresh one.
-    let (out, requests) = run(
-        vec![(503, "", json!({"state": "board_unreachable"}))],
-        "issue_set",
-        Map::new(),
-        10,
-    );
-    let shown = out.unwrap_err().to_string();
-    assert!(shown.contains("unavailable"), "{shown}");
-    assert!(shown.contains("retry later"), "{shown}");
-    assert!(!shown.contains("cadence login"), "{shown}");
-    assert_eq!(
-        hits(&requests, "/__platform/cli/call"),
-        1,
-        "a bare 503 was retried"
-    );
+    // A 503 without a waking state is terminal for this command and keeps the
+    // saved login. A read changed nothing, so it is availability: retry later.
+    // A write may have committed behind the same answer (CAD-2009), so it is
+    // an unknown outcome to reconcile, never advice to retry.
+    for body in [
+        json!({"state": "board_unreachable"}),
+        json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+    ] {
+        let (out, requests) = run(vec![(503, "", body.clone())], "issue_ls", Map::new(), 10);
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("unavailable"), "{shown}");
+        assert!(shown.contains("retry later"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a bare 503 on a read was retried"
+        );
+
+        let (out, requests) = run(vec![(503, "", body)], "issue_set", Map::new(), 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        let shown = err.to_string();
+        assert!(shown.contains("issue show"), "{shown}");
+        assert!(!shown.contains("retry later"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a bare 503 on a write was retried"
+        );
+    }
 }
 
 /// The exact Cadence container refusal (`src/ui/wiki_envelope.rs`): a path
@@ -3661,13 +3680,14 @@ fn cad1434_blocker_local_status_legacy_expiry_keeps_command_refusal() {
 }
 
 #[test]
-fn a_permission_error_is_unavailable_never_no_credential() {
-    // Only a missing file is absence. A stat failure (here: the credential
-    // directory is unreadable) is unavailable, not proof that nothing is stored.
+fn a_stat_failure_is_unavailable_never_no_credential() {
+    // Only a missing file is absence. Any other stat failure is unavailable,
+    // not proof that nothing is stored. A file in the directory's place forces
+    // ENOTDIR for every user; chmod 000 does not, because root and a process
+    // holding CAP_DAC_READ_SEARCH pass it and get a plain ENOENT.
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("a");
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    std::fs::write(&dir, b"").unwrap();
     let target = RemoteTarget {
         identity: None,
         org: ORG.into(),
@@ -3675,16 +3695,7 @@ fn a_permission_error_is_unavailable_never_no_credential() {
         org_id: ORG_ID.into(),
     };
     let status = local_status_at(&dir, &target);
-    // Restore before asserting so the tempdir can be removed either way.
-    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-    assert_ne!(status["state"], "no_credential", "{status}");
-    assert!(
-        matches!(
-            status["state"].as_str(),
-            Some("unavailable" | "invalid_local_credential")
-        ),
-        "{status}"
-    );
+    assert_eq!(status["state"], "unavailable", "{status}");
 }
 
 #[test]
@@ -5661,4 +5672,562 @@ fn cad2009_profile_sync_postdispatch_503_is_unknown_but_invalid_request_is_defin
         assert_eq!(requests[1]["body"]["verb"], "settings_agents");
         assert_eq!(requests[1]["body"]["arguments"], json!(arguments));
     }
+}
+
+#[test]
+fn cad2101_profile_verbs_are_registered_with_their_scopes() {
+    use super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb, REMOTE_VERBS};
+    for verb in [
+        "agent_profile_show",
+        "agent_profile_create",
+        "agent_profile_update",
+    ] {
+        assert!(REMOTE_VERBS.contains(&verb), "{verb}");
+    }
+    assert_eq!(cli_requested_scopes("agent_profile_show"), &["cli.read"]);
+    assert_eq!(cli_requested_scopes("agent_profile_create"), &["cli.write"]);
+    assert_eq!(cli_requested_scopes("agent_profile_update"), &["cli.write"]);
+    assert!(!mutating_cli_verb("agent_profile_show"));
+    assert!(mutating_cli_verb("agent_profile_create"));
+    assert!(mutating_cli_verb("agent_profile_update"));
+    assert!(lost_mutation_note("agent_profile_update").contains("agent profile get"));
+    assert!(lost_mutation_note("agent_profile_create").contains("agent profiles"));
+    // CAD-2009: the classifier is total; the read must not be a possible write.
+    assert!(super::mutation_reconcile("agent_profile_show").is_none());
+    assert!(super::mutation_reconcile("agent_profile_create").is_some());
+}
+
+#[test]
+fn cad2101_profile_refusals_keep_their_code_and_are_never_retried() {
+    // Server text is arbitrary; the client answers the bounded code with its
+    // own text. Synthetic bodies only.
+    let refusal = |code: &str| json!({"error": {"code": code, "message": "server-text /private"}});
+    for (verb, status, code) in [
+        ("agent_profile_show", 404u16, "not_found"),
+        ("agent_profile_update", 404, "not_found"),
+        ("agent_profile_create", 403, "not_permitted"),
+        ("agent_profile_update", 403, "not_permitted"),
+        // The call gate answers a member or a non-user principal this way.
+        ("agent_profile_create", 401, "unauthorized"),
+        ("agent_profile_update", 401, "unauthorized"),
+        ("agent_profile_create", 409, "alias_taken"),
+        ("agent_profile_create", 400, "invalid_request"),
+        ("agent_profile_update", 400, "invalid_request"),
+        ("agent_profile_show", 503, "capability_unavailable"),
+    ] {
+        let (out, requests) = run(vec![(status, "", refusal(code))], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        let shown = err.to_string();
+        assert_eq!(err.code(), Some(code), "{verb} {status}: {shown}");
+        assert_eq!(err.kind(), "rejected", "{verb} {status}: {shown}");
+        assert!(
+            !shown.contains("server-text") && !shown.contains("/private"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("coordination"),
+            "a profile refusal read as an outage: {shown}"
+        );
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb} {code}");
+    }
+}
+
+#[test]
+fn cad2101_stale_revision_is_a_conflict_answer_that_writes_nothing() {
+    // The 409 is a verdict, not an error: the caller prints it and exits 5.
+    let (out, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"error": {"code": "revision_conflict", "message": "x"}}),
+        )],
+        "agent_profile_update",
+        json!({"id": "ap_synthetic-0001", "expectedRevision": 1, "role": "r"})
+            .as_object()
+            .unwrap()
+            .clone(),
+        10,
+    );
+    let body = out.expect("a conflict is an answer, not an error");
+    assert_eq!(body["error"]["code"], "revision_conflict");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn cad2101_a_board_without_the_verbs_says_to_update_it() {
+    // The tenant board answers 501 not_implemented for a verb it lacks.
+    for verb in [
+        "agent_profile_show",
+        "agent_profile_create",
+        "agent_profile_update",
+    ] {
+        let (out, requests) = run(
+            vec![(501, "", json!({"error": {"code": "not_implemented"}}))],
+            verb,
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("update the board first"), "{verb}: {shown}");
+        assert!(!shown.contains("coordination"), "{shown}");
+        assert!(shown.contains("Nothing was"), "{shown}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+    // A bare 400 from an older relay is also what a bad value gets, so the
+    // text names both and still says to update the board.
+    let (out, _) = run(
+        vec![(400, "", json!({"error": {"code": "invalid_request"}}))],
+        "agent_profile_update",
+        Map::new(),
+        10,
+    );
+    assert!(out
+        .unwrap_err()
+        .to_string()
+        .contains("update the board first"));
+}
+
+#[test]
+fn cad2101_profile_write_without_a_matching_receipt_is_unknown() {
+    let update = || {
+        json!({"id": "ap_synthetic-0001", "expectedRevision": 2, "role": "r"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    for receipt in [
+        Value::Null,
+        json!({"ok": true}),
+        json!({"profile": {"id": "ap_other", "revision": 3}}),
+        json!({"profile": {"id": "ap_synthetic-0001"}}),
+    ] {
+        let (out, requests) = run(
+            vec![(200, "", receipt)],
+            "agent_profile_update",
+            update(),
+            10,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        assert!(err.to_string().contains("agent profile get"), "{err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "replayed");
+    }
+    let (out, _) = run(
+        vec![(
+            200,
+            "",
+            json!({"profile": {"id": "ap_synthetic-0001", "revision": 3, "role": "r"}}),
+        )],
+        "agent_profile_update",
+        update(),
+        10,
+    );
+    assert_eq!(out.unwrap()["profile"]["revision"], 3);
+    // Create: any profile id with a revision matches; no profile does not.
+    let create = || {
+        json!({"alias": "ledger", "catalogue": "accountant"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    let (out, _) = run(
+        vec![(200, "", json!({"profile": {}}))],
+        "agent_profile_create",
+        create(),
+        10,
+    );
+    assert_eq!(out.unwrap_err().kind(), "unknown");
+    let (out, _) = run(
+        vec![(500, "", json!({"error": {"code": "internal"}}))],
+        "agent_profile_create",
+        create(),
+        10,
+    );
+    let err = out.unwrap_err();
+    assert_eq!(err.kind(), "unknown", "{err}");
+    assert!(err.to_string().contains("agent profiles"), "{err}");
+    // A write's 503 is an unknown outcome too, not a refusal with an exit 3.
+    let (out, _) = run(
+        vec![(
+            503,
+            "",
+            json!({"error": {"code": "capability_unavailable"}}),
+        )],
+        "agent_profile_update",
+        json!({"id": "ap_synthetic-0001", "expectedRevision": 2, "role": "r"})
+            .as_object()
+            .unwrap()
+            .clone(),
+        10,
+    );
+    assert_eq!(out.unwrap_err().kind(), "unknown");
+}
+
+/// CAD-2111: answer each hosted doctor request by its path.
+fn doctor_worker(
+    n: usize,
+    answer: impl Fn(&str) -> (&'static str, Value) + Send + 'static,
+) -> (
+    TcpListener,
+    std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
+    thread::JoinHandle<()>,
+) {
+    finite_worker(n, move |_, socket, req| {
+        let (status, body) = answer(&req.path);
+        write_answer(socket, status, "", &body);
+    })
+}
+
+fn doctor_envelope(version: &str) -> Value {
+    json!({"version": version, "envelope": "aa.SECRETENVELOPE.cc", "scope": ["cli.read"]})
+}
+
+fn with_scopes(dir: &Path, scopes: &[&str]) {
+    let path = dir.join(format!("cli-{ORG}.json"));
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    saved["capabilities"] = json!(scopes);
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+}
+
+fn check<'a>(checks: &'a [probe::Check], id: &str) -> &'a probe::Check {
+    checks.iter().find(|c| c.id == id).unwrap()
+}
+
+/// No renewal is due in these, so the issuer must never be called.
+fn doctor_checks(dir: &Path, target: &RemoteTarget, offline: bool) -> Vec<probe::Check> {
+    probe::checks_at(dir, target, offline, |_, _, _, _, _, _| {
+        panic!("doctor renewed a login that was not due")
+    })
+}
+
+const DEFAULT_SCOPES: &[&str] = &["cli.read", "cli.write", "wiki.read", "wiki.write"];
+
+fn doctor_healthy(path: &str) -> (&'static str, Value) {
+    match path {
+        "/__platform/cli/authorize" => ("200 OK", doctor_envelope(CLI_VERSION)),
+        "/__platform/wiki/authorize" => ("200 OK", doctor_envelope(WIKI_VERSION)),
+        "/__platform/cli/call" => ("200 OK", json!({"projects": []})),
+        other => panic!("doctor sent an unexpected request: {other}"),
+    }
+}
+
+#[test]
+fn hosted_doctor_passes_a_working_login_with_only_reads() {
+    let (listener, seen, handle) = doctor_worker(3, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, DEFAULT_SCOPES);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 0, "{checks:?}");
+    for id in ["credential", "auth", "read", "wiki", "scopes"] {
+        assert_eq!(check(&checks, id).status, probe::Status::Ok, "{id}");
+    }
+    // Optional access a default login never asked for is listed, not a fault.
+    let scopes = &check(&checks, "scopes").summary;
+    assert!(
+        scopes.contains("--settings") && scopes.contains("--audit-approve"),
+        "{scopes}"
+    );
+
+    let seen = seen.lock().unwrap();
+    let paths: Vec<&str> = seen.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/__platform/cli/authorize",
+            "/__platform/cli/call",
+            "/__platform/wiki/authorize"
+        ]
+    );
+    assert_eq!(seen[0].body["requested_scopes"], json!(["cli.read"]));
+    assert_eq!(seen[1].body["verb"], "project_ls");
+}
+
+#[test]
+fn hosted_doctor_never_prints_a_credential_or_envelope() {
+    let (listener, _seen, handle) = doctor_worker(3, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, DEFAULT_SCOPES);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+    let printed = format!(
+        "{}{}",
+        probe::report_text(&target, &checks),
+        probe::report_json(&target, &checks)
+    );
+    assert!(!printed.contains(BRIDGE), "{printed}");
+    assert!(!printed.contains("SECRETENVELOPE"), "{printed}");
+}
+
+#[test]
+fn hosted_doctor_names_login_only_for_a_proven_ended_session() {
+    let (listener, _seen, handle) = doctor_worker(1, |_| {
+        (
+            "401 Unauthorized",
+            json!({"ok": false, "error": {"code": "session_revoked"}}),
+        )
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert_eq!(auth.status, probe::Status::Fail);
+    assert!(
+        auth.remedy
+            .as_deref()
+            .unwrap()
+            .contains("cadence login acme"),
+        "{auth:?}"
+    );
+    assert_eq!(check(&checks, "read").status, probe::Status::Skipped);
+}
+
+#[test]
+fn hosted_doctor_does_not_call_a_bare_401_an_expired_login() {
+    let (listener, _seen, handle) = doctor_worker(1, |_| {
+        (
+            "401 Unauthorized",
+            json!({"ok": false, "error": {"code": "unauthorized"}}),
+        )
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary.contains("does not prove it expired"),
+        "{auth:?}"
+    );
+    assert!(
+        auth.remedy
+            .as_deref()
+            .unwrap()
+            .contains("cadence login acme"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_says_a_server_fault_is_not_the_login() {
+    let (listener, _seen, handle) = doctor_worker(1, |_| {
+        (
+            "503 Service Unavailable",
+            json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+        )
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary.contains("your login is not the problem"),
+        "{auth:?}"
+    );
+    assert!(
+        !auth.remedy.as_deref().unwrap().contains("cadence login"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_reports_an_unreachable_workspace_without_blaming_the_login() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (target, _root, dir) = credentialed(&listener);
+    drop(listener);
+    let checks = doctor_checks(&dir, &target, false);
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary.contains("says nothing about your login"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_warns_on_a_login_that_cannot_write() {
+    let (listener, _seen, handle) = doctor_worker(3, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, &["cli.read", "wiki.read", "wiki.write"]);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 1);
+    let scopes = check(&checks, "scopes");
+    assert_eq!(scopes.status, probe::Status::Warn);
+    assert!(
+        scopes
+            .remedy
+            .as_deref()
+            .unwrap()
+            .contains("cadence login acme"),
+        "{scopes:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_skips_the_wiki_for_a_login_without_it() {
+    let (listener, seen, handle) = doctor_worker(2, doctor_healthy);
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, &["cli.read", "cli.write"]);
+    let checks = doctor_checks(&dir, &target, false);
+    handle.join().unwrap();
+
+    assert_eq!(probe::exit_code(&checks), 0, "{checks:?}");
+    assert_eq!(check(&checks, "wiki").status, probe::Status::Skipped);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn hosted_doctor_offline_sends_nothing() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (target, _root, dir) = credentialed(&listener);
+    with_scopes(&dir, DEFAULT_SCOPES);
+    let checks = doctor_checks(&dir, &target, true);
+
+    assert_eq!(probe::exit_code(&checks), 0);
+    for id in ["auth", "read", "wiki"] {
+        assert_eq!(check(&checks, id).status, probe::Status::Skipped, "{id}");
+    }
+    assert_eq!(
+        listener.accept().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn hosted_doctor_without_a_login_stops_before_the_network() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let checks = doctor_checks(root.path(), &target, false);
+
+    assert_eq!(probe::exit_code(&checks), 2);
+    assert!(check(&checks, "credential")
+        .remedy
+        .as_deref()
+        .unwrap()
+        .contains("cadence login acme"));
+    assert_eq!(check(&checks, "auth").status, probe::Status::Skipped);
+    assert_eq!(
+        listener.accept().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+/// A saved login whose access is due, so doctor must renew before it can sign
+/// in. Most real runs start here: access lasts minutes, sessions last days.
+fn due_login(target: &RemoteTarget) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let issuer = "https://api-v2.agenticos.hk";
+    let at = now().unwrap();
+    store_credential_at(root.path(), ORG, ORG_ID, &target.endpoint, at - 1);
+    let path = root.path().join(format!("cli-{ORG}.json"));
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    saved["issuer"] = json!(issuer);
+    saved["subject_id"] = json!("user_owner");
+    saved["organization_slug"] = json!(ORG);
+    saved["capabilities"] = json!(DEFAULT_SCOPES);
+    saved["cli_session"] = json!({
+        "session_id": "hcs_12345678-1234-4234-8234-123456789abc",
+        "refresh_token": format!("hcr_{}", "A".repeat(43)),
+        "generation": 1,
+        "device_label": "cadence CLI",
+        "idle_expires_at": at + 1000,
+        "absolute_expires_at": at + 10_000
+    });
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let pin = root.path().join("trusted-issuer");
+    fs::write(&pin, format!("{issuer}\n")).unwrap();
+    fs::set_permissions(&pin, fs::Permissions::from_mode(0o600)).unwrap();
+    root
+}
+
+/// The doctor result when renewal is due and the issuer does `answer`. The
+/// workspace listener must see nothing: a failed renewal stops the live pass.
+fn doctor_with_renewal(
+    answer: Result<crate::remote_enrollment::IssuerAnswer>,
+) -> Vec<probe::Check> {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = target(&listener);
+    let root = due_login(&target);
+    let checks = probe::checks_at(root.path(), &target, false, |_, _, _, _, _, _| answer);
+    assert_eq!(
+        listener.accept().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(check(&checks, "read").status, probe::Status::Skipped);
+    assert_eq!(check(&checks, "wiki").status, probe::Status::Skipped);
+    checks
+}
+
+fn issuer_answer(status: u16, body: Value) -> Result<crate::remote_enrollment::IssuerAnswer> {
+    Ok(crate::remote_enrollment::IssuerAnswer {
+        status,
+        body,
+        correlation: None,
+    })
+}
+
+#[test]
+fn hosted_doctor_due_renewal_with_the_issuer_unreachable_does_not_blame_the_login() {
+    let checks = doctor_with_renewal(Err(reject("Hosted CLI session request failed")));
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary.contains("says nothing about your login"),
+        "{auth:?}"
+    );
+    assert!(
+        !auth.remedy.as_deref().unwrap().contains("cadence login"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_due_renewal_with_an_issuer_outage_does_not_blame_the_login() {
+    let checks = doctor_with_renewal(issuer_answer(
+        503,
+        json!({"error": "authority_unavailable"}),
+    ));
+    assert_eq!(probe::exit_code(&checks), 2);
+    let auth = check(&checks, "auth");
+    assert!(
+        auth.summary
+            .contains("does not show a problem with your login"),
+        "{auth:?}"
+    );
+    assert!(
+        !auth.remedy.as_deref().unwrap().contains("cadence login"),
+        "{auth:?}"
+    );
+}
+
+#[test]
+fn hosted_doctor_due_renewal_of_an_ended_session_names_login_with_the_org() {
+    for (status, code) in [(401, "invalid_token"), (400, "invalid_grant")] {
+        let checks = doctor_with_renewal(issuer_answer(status, json!({"error": code})));
+        assert_eq!(probe::exit_code(&checks), 2);
+        let auth = check(&checks, "auth");
+        assert!(auth.summary.contains("session has ended"), "{auth:?}");
+        assert_eq!(auth.remedy.as_deref(), Some("run `cadence login acme`"));
+    }
+}
+
+#[test]
+fn hosted_doctor_due_renewal_with_an_unreadable_success_is_not_called_healthy() {
+    let checks = doctor_with_renewal(issuer_answer(200, json!({"unexpected": true})));
+    assert_eq!(probe::exit_code(&checks), 1);
+    assert_eq!(check(&checks, "auth").status, probe::Status::Unknown);
 }

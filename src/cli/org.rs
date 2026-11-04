@@ -1287,18 +1287,18 @@ pub(super) mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
-    const EP_A: &str = "https://alpha.cadencecloud.app";
+    pub(in crate::cli) const EP_A: &str = "https://alpha.cadencecloud.app";
     const EP_B: &str = "https://beta.cadencecloud.app";
 
     pub(in crate::cli) static RESOLVE_ENV: Mutex<()> = Mutex::new(());
 
-    struct EnvGuard {
+    pub(in crate::cli) struct EnvGuard {
         home: tempfile::TempDir,
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
 
     impl EnvGuard {
-        fn bare() -> Self {
+        pub(in crate::cli) fn bare() -> Self {
             let home = tempfile::tempdir().unwrap();
             let saved = [
                 "HOME",
@@ -1341,7 +1341,7 @@ pub(super) mod tests {
                 .join("cadence")
                 .join("orgs.json")
         }
-        fn write_registry(&self, registry: &Value) {
+        pub(in crate::cli) fn write_registry(&self, registry: &Value) {
             let path = self.registry_path();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, serde_json::to_vec_pretty(registry).unwrap()).unwrap();
@@ -1359,7 +1359,12 @@ pub(super) mod tests {
         }
     }
 
-    fn remote_registry(org: &str, endpoint: &str, org_id: &str, selected: bool) -> Value {
+    pub(in crate::cli) fn remote_registry(
+        org: &str,
+        endpoint: &str,
+        org_id: &str,
+        selected: bool,
+    ) -> Value {
         json!({
             "selected": selected.then(|| json!({"org": org})),
             "connections": [{

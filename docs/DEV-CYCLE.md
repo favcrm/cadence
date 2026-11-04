@@ -34,7 +34,7 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    enforce that yet; merges use the temporary `--exception` (exact-head operator approval and two
    advisory links, standards and spec-security, plus browser-qa for a `ui/`
    change) until `EXCEPTION_ENDS`
-   (2026-11-10).
+   (2026-12-31).
 5. The version-one delivery tiers apply to clean default-equivalent policies
    by default after the reviewed implementation is installed; the introducing
    PR must still satisfy the current trusted-base gates. Routine changes need
@@ -389,6 +389,15 @@ scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA> --dry-run
 scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA>
 ```
 
+The gate refuses (dry run: warns) when `scripts/enqueue-reviewed` or
+`scripts/delivery-gate` differs from `origin/main`'s (CAD-2108), and its first
+line names the gate's content hash. Recover by writing both files from
+`git show origin/main:scripts/<name>` into a scratch directory and running that
+copy from inside the repo; fetch `origin/main` first, since a stale ref is not
+detected. With `origin/main` present, a gate file missing or unreadable on either
+side refuses; with no `origin/main` there is no check. A PR that edits the gate is
+enqueued from main's copy.
+
 Temporary path (CAD-1946; remove this note when it ends): while the hosted
 reviewer attestation cannot be produced, add `--exception --advisory
 standards=<url> --advisory spec-security=<url>` (plus `--advisory
@@ -396,7 +405,7 @@ browser-qa=<url>` for a `ui/` change) to the enqueue. It waives only the
 missing reviewer attestation and, on a hosted routine PR, the readiness proof
 hosted cannot yet produce; the evidence names both. The advisory reviews are PR comments posted by
 separately assigned sessions, and the operator approves each exact head. The
-path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10).
+path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31).
 
 The helper enforces exact-head checks, verdicts, evidence and approval. Queue
 position is not merge evidence: watch the merge-group run and verify the

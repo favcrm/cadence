@@ -619,6 +619,24 @@ export interface InstructionsResult {
   new_sha256?: string;
 }
 
+/** `GET|POST /api/agent-profiles/<id>` on a hosted board: the stored profile
+ *  with the `revision` its writes are fenced on. Typed here because the board
+ *  API generator covers the roster row, which carries neither. */
+export interface StoredAgentProfile {
+  id: string;
+  name: string;
+  role: string;
+  responsibilities: string;
+  skills: string[];
+  status: "active" | "archived";
+  revision: number;
+  created_at: number;
+  updated_at: number;
+  created_by: string;
+  catalogue: string | null;
+  model: string;
+}
+
 /** One `/api/agents` row. Generated from the daemon's Rust type, except the
  *  fields re-declared here: a registered agent always reports `provider`,
  *  `endpoint_kind` and `state` (only the Rust row type is lenient), the board

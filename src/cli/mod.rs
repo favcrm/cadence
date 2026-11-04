@@ -13,6 +13,7 @@ pub(crate) use daemon::{
 };
 mod action_dispatch;
 mod agent;
+mod agent_profile;
 mod agent_uid;
 mod app;
 mod artifact;
@@ -194,8 +195,8 @@ pub(crate) struct Cli {
     /// original member; registry defaults and org switch stay refused.
     #[arg(long, global = true, value_name = "ORG")]
     org: Option<String>,
-    /// Seconds a remote command waits while its org's container wakes
-    /// (CAD-1019 slice 2). Only used when the selected org is remote.
+    /// Seconds a remote command waits when the hosted org answers that it is
+    /// still starting. Only used when the selected org is remote.
     #[arg(long, global = true, default_value_t = cadence_agent::remote_cli::WAKE_TIMEOUT_DEFAULT)]
     wake_timeout: u64,
     /// The argument ids the command line itself typed, read at the CLI

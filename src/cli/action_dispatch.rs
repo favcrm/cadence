@@ -10,6 +10,7 @@ mod admin;
 mod agents;
 mod issues;
 mod providers;
+mod update_notice;
 
 pub(super) fn show_login_code(url: &str, code: &str, no_open: bool) -> Result<()> {
     cadence_agent::output::eprint_format_line(format_args!(
@@ -115,6 +116,10 @@ pub(crate) fn run() -> Result<i32> {
     let argv: Vec<String> = std::env::args_os()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    if argv.len() == 2 && argv[1] == update_notice::REFRESH_ARG {
+        update_notice::refresh();
+        return Ok(0);
+    }
     // CAD-888: `help operator|advanced|all` print the sections the
     // default root help leaves out; `help <verb>` stays clap's own.
     // CAD-1432: the master's help is bounded and refuses malformed or
@@ -185,7 +190,12 @@ pub(crate) fn run() -> Result<i32> {
             return Err(Error::usage(text.strip_prefix("error: ").unwrap_or(text)));
         }
     };
-    run_cli(cli)
+    let notice = update_notice::eligible(&cli);
+    let result = run_cli(cli);
+    if notice && result.as_ref().is_ok_and(|code| *code == 0) {
+        update_notice::after_success();
+    }
+    result
 }
 
 /// Every argument id the command line typed, at the root and in each
@@ -275,6 +285,30 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         return discovery::run(&cli.command);
     }
     let client_only = client_update::client_only_mode()?;
+    // CAD-2111: plain doctor on a hosted org checks that connection from this
+    // machine, on any installation, before any local state exists. `route`
+    // reads the registry without a lock or a state dir, and its refusals (an
+    // unknown org, a pin conflict) stand: there is no local fallback. A local
+    // selection falls through to the environment probe unchanged.
+    if let Commands::Doctor {
+        host: false,
+        json,
+        offline,
+        ..
+    } = &cli.command
+    {
+        if let org::Routed::Remote(target) =
+            org::route(cli.org.as_deref(), cli.state_dir.clone(), tracker_pin()?)?
+        {
+            return Ok(doctor::run_remote(
+                &target,
+                *json,
+                *offline,
+                cli.org.is_some(),
+                client_only,
+            ));
+        }
+    }
     // CAD-1437: a valid client-only receipt selects the public updater before
     // any org, credential, tracker or state work. Native-only options refuse.
     if let Commands::Update {
@@ -785,6 +819,11 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     let state_dir = match resolved {
         org::Resolved::Local(state_dir) => state_dir,
         org::Resolved::Remote(target) => {
+            // CAD-2101: a profile command acts on one workspace's agents, so
+            // the org must be named on this command line. A saved default or
+            // `CADENCE_ORG` is not naming it: it could point at another
+            // workspace than the caller means. Refused before any request.
+            agent_profile::require_named_org(cli.org.as_deref(), &cli.command, &target.org)?;
             // CAD-1019 slice 2: a remote org never opens local state or
             // adopts a sandbox profile — the allowlisted verb goes over
             // HTTPS; everything else refuses inside `remote::run`.

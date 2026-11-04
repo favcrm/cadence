@@ -128,6 +128,15 @@ fn verb_for(
         Commands::Agent {
             action: AgentAction::Roles,
         } => "agent_roles",
+        // CAD-2101: the hosted profile verbs. The board owns the field names,
+        // limits, revision fence and who may write.
+        Commands::Agent {
+            action: AgentAction::Profile { action },
+        } => {
+            let (verb, built) = super::agent_profile::request(action)?;
+            args = built;
+            verb
+        }
         Commands::Agent {
             action: AgentAction::Context { id },
         } => {
@@ -2238,6 +2247,17 @@ where
     ) {
         refuse_managed(&target, "project new")?;
     }
+    let mut command = command;
+    if let Commands::Agent {
+        action: AgentAction::Profile { action },
+    } = &mut command
+    {
+        // CAD-2101: refused in the client before any request exists; the
+        // board cannot tell a managed agent on its owner's login from the
+        // owner (docs/guides/hosted-workspace.md).
+        super::agent_profile::refuse_managed_write(action, target.identity.is_some())?;
+        super::agent_profile::resolve_latest(&target, action, wake_timeout)?;
+    }
     let (verb, args) = verb_for(&command, command_path.as_deref())?;
     // CAD-1568: a remote send keeps its caller-chosen `--message` id for
     // reconciliation. An `unknown` outcome — the response was lost after
@@ -3382,6 +3402,57 @@ mod read_contract_tests {
         assert_eq!(
             args,
             json!({"id": "ap_11111111-2222-4333-8444-555555555555"})
+        );
+    }
+
+    #[test]
+    fn agent_profile_commands_map_to_the_hosted_verbs() {
+        use crate::cli::agent_profile::ProfileAction;
+        let id = "ap_11111111-2222-4333-8444-555555555555";
+        let profile = |action| Commands::Agent {
+            action: AgentAction::Profile { action },
+        };
+        let (verb, args) = outcome(&profile(ProfileAction::Get { id: id.into() })).unwrap();
+        assert_eq!((verb, args), ("agent_profile_show", json!({"id": id})));
+
+        let (verb, args) = outcome(&profile(ProfileAction::Create {
+            alias: "ledger".into(),
+            catalogue: "accountant".into(),
+            job_file: None,
+            model: Some("inherit".into()),
+        }))
+        .unwrap();
+        assert_eq!(verb, "agent_profile_create");
+        assert_eq!(
+            args,
+            json!({"alias": "ledger", "catalogue": "accountant", "model": "inherit"})
+        );
+
+        let (verb, args) = outcome(&profile(ProfileAction::Edit {
+            id: id.into(),
+            set: vec!["role=Planner".into()],
+            set_json: vec!["skills=[\"a\"]".into()],
+            file: vec![],
+            expect_rev: Some(4),
+            latest: false,
+        }))
+        .unwrap();
+        assert_eq!(verb, "agent_profile_update");
+        assert_eq!(
+            args,
+            json!({"id": id, "expectedRevision": 4, "role": "Planner", "skills": ["a"]})
+        );
+
+        let (verb, args) = outcome(&profile(ProfileAction::Archive {
+            id: id.into(),
+            expect_rev: Some(4),
+            latest: false,
+        }))
+        .unwrap();
+        assert_eq!(verb, "agent_profile_update");
+        assert_eq!(
+            args,
+            json!({"id": id, "expectedRevision": 4, "status": "archived"})
         );
     }
 

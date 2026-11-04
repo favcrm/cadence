@@ -458,6 +458,13 @@ pub(crate) enum AgentAction {
     /// List this workspace's agent profiles. Read-only: a profile is a
     /// description a runtime registers against, never a credential.
     Profiles,
+    /// Read, create, edit or archive one agent profile (CAD-2101). The board
+    /// decides who may; a managed agent is refused here and proposes the
+    /// change instead.
+    Profile {
+        #[command(subcommand)]
+        action: super::agent_profile::ProfileAction,
+    },
     /// Print one agent profile's context: the profile and the job a runtime
     /// registered against it (`cadence join <group> <provider> --profile <id>`) is
     /// briefed with. A hosted org adds the wiki pages under
@@ -1185,6 +1192,9 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
         }
         AgentAction::Context { id } => {
             client::rpc(&state_dir, "agent_profile_context", json!({"id": id}))?
+        }
+        AgentAction::Profile { action } => {
+            return super::agent_profile::run_native(state_dir, &action);
         }
         AgentAction::ProposeHire { role, name, job_file } => {
             // The job is read through the master's command-file rules, never

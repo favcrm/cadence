@@ -25,9 +25,22 @@
 //! op proves the declaration agrees with them, and the caller must hash the
 //! exact bytes it installed. It grants no install, mount, execution or effect
 //! authority.
+//!
+//! `app.screen.asset-integrity` runs that same check under the host-owned
+//! operation admission: the declaration, assets and `screen_count` are
+//! identical and every shared rule still applies, but each `operations` token
+//! is checked as a bounded typed host token only. Which operations a host
+//! serves, and whether each is a CALL or a host-confirmed SLOT, is that
+//! host's closed vocabulary and permission classification — not the core's.
+//! The value is the same `app` tag and carries no operation grant; the caller
+//! must apply its own operation set and its own grants before publishing,
+//! installing or re-validating a package. `app.screen.integrity` keeps
+//! refusing an operation this core does not serve.
 
 use crate::app_compat::{parse_requires, Compat, ContractStage, HostContracts, SemVer};
-use crate::app_screen_decl::{validate_facts, ScreenAssetFact, MAX_SCREENS};
+use crate::app_screen_decl::{
+    validate_facts, validate_facts_asset_integrity, ScreenAssetFact, MAX_SCREENS,
+};
 use crate::frontmatter::split_front;
 use crate::issue::{self, ReadinessInput, ReadinessValue, ValidateInput, ValidateValue};
 use schemars::JsonSchema;
@@ -100,6 +113,12 @@ pub enum Operation {
     /// (CAD-2008).
     #[serde(rename = "app.screen.integrity")]
     AppScreenIntegrity(ScreenIntegrityInput),
+    /// Check the same declaration, facts and `screen_count` with the host
+    /// owning the `operations` vocabulary (CAD-2118/AOS-479). Shared
+    /// structure and byte facts only; the caller still decides operation
+    /// membership and CALL/SLOT grants.
+    #[serde(rename = "app.screen.asset-integrity")]
+    AppScreenAssetIntegrity(ScreenIntegrityInput),
     /// Check an issue id, project key, tags, status and priority.
     #[serde(rename = "issue.validate")]
     IssueValidate(ValidateInput),
@@ -166,7 +185,7 @@ pub struct RequirementsInput {
     pub target: TargetProfile,
 }
 
-/// Input of `app.screen.integrity`.
+/// Input of `app.screen.integrity` and `app.screen.asset-integrity`.
 ///
 /// The declaration is the exact `screens.json` text of one `screens/<tag>/`
 /// package, and `assets` carries host-computed *facts* for the bytes that host
@@ -176,11 +195,18 @@ pub struct RequirementsInput {
 /// any JSON work, and the declaration by the screen contract's own 32 KiB and
 /// 32-asset limits, so no multi-megabyte asset can be encoded through the ABI.
 ///
+/// Both operations take exactly this shape and run the same checks. They
+/// differ only in who owns the declaration's `operations` vocabulary:
+/// `app.screen.integrity` resolves each name against the native set and
+/// requires its `records.call`/`records.slot` grant, while
+/// `app.screen.asset-integrity` checks the token bound only and leaves
+/// membership and CALL/SLOT classification to the caller.
+///
 /// **Authority**: the facts and the count are the caller's report. A caller
 /// must compute `size`/`sha256` over the exact installed bytes and count the
 /// `screens/<tag>/` packages it actually installed; the op proves the
 /// declaration agrees with what it was told, and nothing here installs,
-/// mounts, executes or grants effect authority.
+/// mounts, executes or grants effect — or operation — authority.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScreenIntegrityInput {
@@ -330,14 +356,17 @@ pub enum RequirementCheck {
     },
 }
 
-/// Success value of `app.screen.integrity`: the declared app tag of the one
-/// declaration that passed.
+/// Success value of `app.screen.integrity` and
+/// `app.screen.asset-integrity`: the declared app tag of the one declaration
+/// that passed.
 ///
 /// `ok: true` on the envelope only says the check ran; this value says the
-/// declaration and the supplied facts agreed under the native screen contract.
-/// It is integrity evidence, not install, mount, execution or effect authority,
-/// and it covers the facts the caller supplied — the caller must have hashed
-/// the exact bytes it installed.
+/// declaration and the supplied facts agreed under the shared screen
+/// contract. It is integrity evidence, not install, mount, execution or
+/// effect authority, and it covers the facts the caller supplied — the caller
+/// must have hashed the exact bytes it installed. Under
+/// `app.screen.asset-integrity` it likewise says nothing about operation
+/// membership or CALL/SLOT permission: the caller checks those itself.
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScreenIntegrityValue {
@@ -380,6 +409,10 @@ pub enum OpValue {
     /// supplied facts (CAD-2008).
     #[serde(rename = "app.screen.integrity")]
     ScreenIntegrity(ScreenIntegrityValue),
+    /// The same app tag under the host-owned operation admission
+    /// (CAD-2118/AOS-479); no operation membership is implied.
+    #[serde(rename = "app.screen.asset-integrity")]
+    ScreenAssetIntegrity(ScreenIntegrityValue),
     #[serde(rename = "issue.validate")]
     Validate(ValidateValue),
     #[serde(rename = "issue.readiness")]
@@ -566,6 +599,35 @@ fn delivery_requirements_value(input: &DeliveryRequirementsInput) -> Result<Valu
     .map_err(|error| refuse(Code::InvalidCommand, error.to_string()))
 }
 
+/// The shared half of both screen operations: the app-level package count
+/// bound first, then the one screen validator the operation selects. The two
+/// operations differ only in that selector — the strict fact admission or the
+/// host-owned asset-integrity admission — and in the checked value each
+/// yields.
+fn screen_integrity_check<T>(
+    input: &ScreenIntegrityInput,
+    validate: fn(&str, &BTreeMap<String, ScreenAssetFact>) -> crate::error::Result<T>,
+) -> Result<T, Refusal> {
+    // The app-level package count is checked first, against the same
+    // bound the native bundle scan applies, so an over-count app
+    // refuses before any declaration work on either host. The shared
+    // bound widens to the input's fixed width and the input is never
+    // narrowed, so the answer is identical on 32- and 64-bit hosts.
+    if !(1..=MAX_SCREENS as u64).contains(&input.screen_count) {
+        return Err(refuse(
+            Code::InvalidManifest,
+            format!(
+                "screen_count {} — an app declares 1 to {MAX_SCREENS} screen packages",
+                input.screen_count
+            ),
+        ));
+    }
+    // The one shared screen validator: the declaration's grammar and
+    // bounds, then the declared↔supplied size/sha256 comparison. A
+    // refusal is a package-bytes refusal, not a command-shape one.
+    validate(&input.manifest, &input.assets).map_err(|error| refuse(Code::InvalidManifest, error))
+}
+
 fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(refuse(
@@ -618,27 +680,18 @@ fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
             Ok(OpValue::Requirements(compat.report(&host)))
         }
         Operation::AppScreenIntegrity(input) => {
-            // The app-level package count is checked first, against the same
-            // bound the native bundle scan applies, so an over-count app
-            // refuses before any declaration work on either host. The shared
-            // bound widens to the input's fixed width and the input is never
-            // narrowed, so the answer is identical on 32- and 64-bit hosts.
-            if !(1..=MAX_SCREENS as u64).contains(&input.screen_count) {
-                return Err(refuse(
-                    Code::InvalidManifest,
-                    format!(
-                        "screen_count {} — an app declares 1 to {MAX_SCREENS} screen packages",
-                        input.screen_count
-                    ),
-                ));
-            }
-            // The one shared screen validator: the declaration's grammar and
-            // bounds, then the declared↔supplied size/sha256 comparison. A
-            // refusal is a package-bytes refusal, not a command-shape one.
-            let checked = validate_facts(&input.manifest, &input.assets)
-                .map_err(|error| refuse(Code::InvalidManifest, error))?;
+            let checked = screen_integrity_check(&input, validate_facts)?;
             Ok(OpValue::ScreenIntegrity(ScreenIntegrityValue {
-                app: checked.app().to_string(),
+                app: checked.into_app(),
+            }))
+        }
+        Operation::AppScreenAssetIntegrity(input) => {
+            // Identical input, bounds and declaration pipeline; the operation
+            // tokens are the caller's vocabulary here, so the caller must
+            // still apply its closed operation set and its CALL/SLOT grants.
+            let checked = screen_integrity_check(&input, validate_facts_asset_integrity)?;
+            Ok(OpValue::ScreenAssetIntegrity(ScreenIntegrityValue {
+                app: checked.into_app(),
             }))
         }
         Operation::DeliveryRequirementsEvaluate(input) => Ok(OpValue::DeliveryRequirements(
@@ -946,6 +999,97 @@ mod tests {
         );
         assert_eq!(response["ok"], false, "{response}");
         assert_eq!(response["code"], "invalid_command");
+    }
+
+    /// CAD-2118/AOS-479: the asset-integrity operation admits a host-only
+    /// operation name while the strict op keeps refusing it. Both return the
+    /// same `app` value shape; neither grants operation permission, and every
+    /// other declaration/byte/count refusal still applies.
+    #[test]
+    fn asset_integrity_op_admits_host_operation_names_only() {
+        use sha2::{Digest, Sha256};
+
+        let body = "console.log(1);\n";
+        let digest = format!("sha256:{:x}", Sha256::digest(body.as_bytes()));
+        let manifest = serde_json::json!({
+            "contract": "app-screens/v2",
+            "app": "demo",
+            "entry": "client.js",
+            "assets": [{
+                "name": "client.js",
+                "media_type": "text/javascript",
+                "sha256": digest,
+                "size": body.len(),
+            }],
+            "provenance": {
+                "source_digest": digest,
+                "sdk_digest": digest,
+                "toolchain_digest": digest,
+            },
+            "host_contract": "screen-records.v1",
+            "may": ["records.call"],
+            "operations": ["sends.cancel"],
+        })
+        .to_string();
+        let call = |op: &str, screen_count: u64, assets: Value, manifest: &str| -> Value {
+            let request = serde_json::json!({
+                "v": CONTRACT_VERSION,
+                "op": op,
+                "input": {
+                    "manifest": manifest,
+                    "assets": assets,
+                    "screen_count": screen_count,
+                },
+            });
+            serde_json::from_slice(&evaluate(&serde_json::to_vec(&request).unwrap())).unwrap()
+        };
+        let assets = json!({ "client.js": { "size": body.len(), "sha256": digest } });
+        const ASSET_INTEGRITY: &str = "app.screen.asset-integrity";
+
+        let strict = call("app.screen.integrity", 1, assets.clone(), &manifest);
+        assert_eq!(strict["ok"], false, "{strict}");
+        assert_eq!(strict["code"], "invalid_manifest", "{strict}");
+
+        let admitted = call(ASSET_INTEGRITY, 1, assets.clone(), &manifest);
+        assert_eq!(admitted["ok"], true, "{admitted}");
+        assert_eq!(admitted["op"], ASSET_INTEGRITY);
+        assert_eq!(admitted["value"], json!({ "app": "demo" }));
+
+        // Wrong bytes, a repeated operation entry and the app-level count
+        // bound keep their existing refusals.
+        let wrong = json!({
+            "client.js": { "size": body.len(), "sha256": format!("sha256:{}", "0".repeat(64)) },
+        });
+        let refused = call(ASSET_INTEGRITY, 1, wrong, &manifest);
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["code"], "invalid_manifest");
+
+        let duplicate = manifest.replace("\"sends.cancel\"", "\"sends.cancel\",\"sends.cancel\"");
+        let refused = call(ASSET_INTEGRITY, 1, assets.clone(), &duplicate);
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["code"], "invalid_manifest");
+
+        for screen_count in [0, MAX_SCREENS as u64 + 1] {
+            let refused = call(ASSET_INTEGRITY, screen_count, assets.clone(), &manifest);
+            assert_eq!(refused["ok"], false, "{refused}");
+            assert_eq!(refused["code"], "invalid_manifest", "{screen_count}");
+        }
+
+        // Facts still carry no bytes.
+        let with_body =
+            json!({ "client.js": { "size": body.len(), "sha256": digest, "body": body } });
+        let refused = call(ASSET_INTEGRITY, 1, with_body, &manifest);
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["code"], "invalid_command");
+
+        // A native operation still passes both: the new operation adds an
+        // admission mode, it does not replace the strict one.
+        let native = manifest.replace("\"sends.cancel\"", "\"records.list\"");
+        assert_eq!(
+            call("app.screen.integrity", 1, assets.clone(), &native)["ok"],
+            true
+        );
+        assert_eq!(call(ASSET_INTEGRITY, 1, assets, &native)["ok"], true);
     }
 
     #[test]

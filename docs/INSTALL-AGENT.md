@@ -168,6 +168,17 @@ A client-only installation upgrades itself with `cadence-client update`
 (`--check` selects and reports the target only, with no download or
 verification; `--version <tag>` pins a newer release, and the real upgrade
 verifies it before any change). The old `client-update` command is removed.
+
+After a successful interactive command, a client-only installation can show
+an advisory notice on stderr when the public-client catalogue lists a newer
+release. The check runs in the background at most once per day after success
+(once per hour after failure); the first notice may appear on a later command.
+Results are cached under `${XDG_CACHE_HOME:-$HOME/.cache}/cadence`. Set
+`CADENCE_NO_UPDATE_NOTIFIER=1` to disable it. Piped and managed-agent commands
+do not check. The notice does not download or verify an artifact, update the
+client, or apply to a native daemon; use `cadence-client update --check` to
+review the target and `cadence-client update` to install it.
+
 The published v0.1.1 has legacy client-only support through `client-update`;
 it cannot be upgraded to the unified `update` in place. v0.2.0 provides the
 unified client-only updater. Reinstall once with the v0.2.0 `install.sh` using

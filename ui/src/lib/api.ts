@@ -17,6 +17,7 @@ import type {
   AgentRegisterBody,
   AgentProfileBody,
   HiredProfile,
+  StoredAgentProfile,
   AgentRolesPayload,
   InstructionsResult,
   AgentsPayload,
@@ -953,6 +954,14 @@ export const api = {
    *  launches nothing. Operator only. */
   createAgentProfile: (body: AgentProfileBody) =>
     post<{ profile: HiredProfile }>("/api/agent-profiles", body),
+  /** `GET /api/agent-profiles/<id>` - the stored profile and its revision. A
+   *  hosted member may read an active one. */
+  agentProfile: (id: string) =>
+    get<{ profile: StoredAgentProfile }>(`/api/agent-profiles/${encodeURIComponent(id)}`),
+  /** `POST /api/agent-profiles/<id>` - the whole profile and the revision it
+   *  was read at. Owner only; a stale revision answers 409. */
+  saveAgentProfile: (id: string, body: object) =>
+    post<{ profile: StoredAgentProfile }>(`/api/agent-profiles/${encodeURIComponent(id)}`, body),
   /** `GET /api/agent-roles` (CAD-1752) — the role catalogue. Any signed-in viewer. */
   agentRoles: () => get<AgentRolesPayload>("/api/agent-roles"),
   /** `POST /api/agents/<alias>/instructions` (CAD-1752) — replace the

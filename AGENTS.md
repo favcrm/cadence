@@ -20,12 +20,23 @@ prose and an authoritative source disagree, the source wins.
   `src/issue/delivery_requirements.rs` turns the resolved delivery policy
   and the PR's diff into the requirements; read them with
   `cadence delivery requirements --issue <ID> --pr <url> --head <sha>`.
-  The evaluator reads the path lists at the PR's base, so a PR can never
+  The evaluator reads the changed set and the path lists at the PR's anchor
+  (main's live tip for a main-based PR, else the PR's base), so a PR can never
   classify itself under rules it edited.
 - The local merge gate is `scripts/enqueue-reviewed <pr> --head <sha>`
   (`--dry-run` enqueues nothing). It cannot supply a missing hosted evaluator
   or approval store. If it is unavailable, report the refusal; do not infer
   a pass or authorize a bypass. Hosted delivery is tracked by CAD-1946.
+- The gate must be main's. It compares its own bytes and the sibling
+  `scripts/delivery-gate` with `origin/main:scripts/<name>` (local git, current
+  directory, no network, CAD-2108). A real enqueue from a differing copy refuses
+  and names the file; `--dry-run` warns and runs. A lane merely behind main passes
+  while the gate files match. To run main's copy, write both files from
+  `git show origin/main:scripts/<name>` into one scratch directory and run it from
+  inside the repo (`git fetch origin main` first: a stale ref is not detected). A PR
+  editing the gate is judged by main's copy, never its own. No `origin/main` here
+  means no check; with `origin/main` present, a gate file missing or unreadable
+  on either side refuses. It guards accidents, not an adversary.
 - Risk classes, triggers, who approves what: `docs/roles/risk-classes.md`.
 - Path lists: `docs/roles/one-review-paths.toml` (review count),
   `docs/roles/risk-paths.toml` (triggers; the daemon compiles it in).
@@ -125,11 +136,12 @@ the code you just wrote.
   since CAD-2049, refuses the author's principal; local notes count by their
   self-declared `From:` alias, which is not attested. It cannot tell a fresh
   session from the author when both act under one login. Two routes exist.
-  Workflow-issued reviews (below) are the intended one but their workflows are
-  not shipped yet (CAD-2081 stage 3). Until they are, merge through the
-  temporary exception (`--exception --advisory standards=<url> --advisory
-  spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
-  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-11-10). Of the advisory
+  Workflow-issued reviews (below) are the intended one; their workflows are in
+  `.github/workflows/` (CAD-2088) but are not live until the `cadence-review`
+  environment and its keys are set up and the first run files a verdict. Until
+  then, merge through the temporary exception (`--exception --advisory
+  standards=<url> --advisory spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
+  at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31). Of the advisory
   links, it checks only that they are separate https URLs; it proves
   neither head binding nor that Browser QA ran. A verdict filed under the
   author's identity still refuses under the exception, so a same-login
@@ -140,9 +152,20 @@ the code you just wrote.
   that merges main and restores an old file diffs as docs-only against it.
   `scripts/enqueue-reviewed` therefore diffs a main-based PR from the merge base
   with main's live tip (the changed files, line count and every path class read
-  from that diff) and refuses if the tip cannot be read. A PR on another base keeps
-  the PR's base.
-- **Workflow-issued reviews (CAD-2081; the workflows are not shipped yet).** The
+  from that diff) and refuses if the tip cannot be read. `risk-paths.toml` and
+  `one-review-paths.toml` are read at that same tip, and `cadence delivery
+  requirements` classifies from the same merge base and lists (CAD-2100; it
+  refuses a file list the merge-base and head trees do not confirm, since GitHub's
+  `changedFiles` counts from its own, possibly stale, base). The tip is resolved
+  once per evaluation. A PR that edits the lists is judged by main's copy, not its
+  own, and `docs/roles/` is human-class, so the operator approves it. The gate also
+  refuses a `routine` or `consequential` class its own diff does not support (not on
+  the one-review list, human-class by path or size, or for `routine` not plain
+  markdown docs), because the classifier on a host can be an older build. The
+  evidence comment's `Base:` stays the PR's recorded base commit; `Merge base
+  judged:` and `Main tip:` record what was judged. A PR on another base keeps the
+  PR's base.
+- **Workflow-issued reviews (CAD-2081; workflows in CAD-2088, not live until set up).** The
   gate counts a hosted row whose `identity_source` is `workflow-oidc` only when
   all of these hold, each read at gate time: its principal is in
   `docs/roles/review-workflow-principals.toml` at the live tip of `main` (not the
@@ -439,7 +462,7 @@ limitation; only an authorized operator can decide an exception.
   comments from fresh-session reviews (see the review standard above); the gate
   cannot prove freshness, and the operator accepts that and approves each
   exact head. The path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`
-  (2026-11-10).
+  (2026-12-31).
 
 ### Checks: trust exit codes, not filtered text
 

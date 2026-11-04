@@ -74,7 +74,7 @@ attested principal and refuses the author's principal, while local notes count
 by their self-declared `From:` alias, which is not attested. Until the review
 workflows ship (CAD-2081 stage 3) merges use the temporary `--exception
 --advisory ...` path (ends at `EXCEPTION_ENDS` in `scripts/delivery-gate`,
-2026-11-10).
+2026-12-31).
 
 CAD-2081 row shape: a hosted row with `identity_source: "workflow-oidc"` has no
 `github_login` and carries `run_id`, `run_attempt`, `workflow_sha`, `jti` and

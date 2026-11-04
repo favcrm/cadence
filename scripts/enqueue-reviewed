@@ -23,8 +23,9 @@ unless ALL of these hold for the pinned head:
     required count of PASS verdicts pinned to this exact head from distinct
     reviewers, none of them the PR author: two (Standards plus Spec/security),
     or one (`Review (standards+spec)`) when every change is on the one-review
-    list (docs/roles/one-review-paths.toml, CAD-957, read at the PR's base
-    commit so a PR cannot widen its own list). A `ui/` change also needs a
+    list (docs/roles/one-review-paths.toml, CAD-957, read with the diff's anchor:
+    main's live tip for a PR based on main, else the PR's base commit, so a PR
+    cannot widen its own list). A `ui/` change also needs a
     Browser QA pass. AOS-473: a document whose `origin` is `hosted` is counted
     by the owner's attestation instead — the row must name this repo and carry
     a reviewer_id and a github_login (except a CAD-2081 workflow-issued row,
@@ -42,6 +43,12 @@ unless ALL of these hold for the pinned head:
     verdicts --project` and `cadence audit approval --project --issue`. The
     project is never derived from the repo or the cwd, and a hosted read that
     cannot name it is refused rather than answered from repo-scoped evidence;
+  * this gate is main's (CAD-2108): its own bytes and the sibling delivery-gate
+    equal origin/main:scripts/<name>, read by local git from the current
+    directory with no network. Differing, or a file unreadable on either side
+    while origin/main exists, refuses (--dry-run warns and runs). No origin/main
+    in the current directory means no check. A stale local origin/main is not
+    detected. The first stdout line names the gate's content hash;
   * a ticket comment for this head lists those verdict notes (created after
     the other gates pass; dry-run only checks an existing comment);
   * for a human-class diff (a path trigger, more than 1500 changed lines, any
@@ -56,8 +63,8 @@ fresh-context session that is not the author, a subagent included (AGENTS.md
 principal and the author's is refused, local notes count by their self-declared
 `From:` alias (not attested), so it cannot tell a fresh session from the author
 under one login. CAD-2081 adds workflow-issued rows (see AGENTS.md "Review"), but
-their workflows are not shipped yet, so until they are the temporary exception
-below is the merge path.
+their workflows (CAD-2088) are not live until their environment and keys are set
+up, so until then the temporary exception below is the merge path.
 
 CAD-1946 temporary exception: `--exception --advisory standards=<url> --advisory
 spec-security=<url>` (and `browser-qa=<url>` for a `ui/` change) waives only the
@@ -117,7 +124,7 @@ AUTHOR_ROW_HINT = (" (a filed row under the author's identity still refuses unde
 REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a non-author session, "
                         "and this gate cannot yet tell one from the author under one login: use "
                         "--exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate "
-                        "(workflow-issued reviews, CAD-2081, are not shipped yet). "
+                        "(workflow-issued reviews, CAD-2081/CAD-2088, are not live yet). "
                         "A verdict filed under the author's identity still refuses under the exception, "
                         "so a same-login session posts its findings as a PR comment and files no verdict)")
 
@@ -129,7 +136,8 @@ REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a no
 HUMAN_PREFIXES = (".github/", "scripts/", "docs/roles/", ".config/", ".cargo/",
                   "src/audit/", "src/delegation/", "src/delivery/", "tests/common/", "config/")
 # Every [schema]/[trigger4]/[trigger6]/[trigger7] glob in this file, read at the
-# PR's base, is human too (CAD-1104). Unreadable means human (fail closed).
+# diff's anchor (main's live tip for a main-based PR), is human too (CAD-1104).
+# Unreadable means human (fail closed).
 RISK_PATHS_FILE = "docs/roles/risk-paths.toml"
 RISK_HUMAN_TABLES = ("schema", "trigger4", "trigger6", "trigger7")
 # CAD-2081: a PR with a workflow-issued review needs the operator unless EVERY
@@ -153,6 +161,12 @@ HUMAN_EXACT = {
     # trigger 7: approval and delivery rules (CAD-1104)
     "src/delegation.rs", "src/issue/delivery_policy.rs",
     "src/issue/delivery_requirements.rs",
+    # CAD-2117: the classifier's own files (the one above is now a re-export
+    # shim). Keep in agreement with HUMAN_EXACT in cadence-core's
+    # delivery_requirements.rs.
+    "crates/cadence-core/src/delivery_requirements.rs",
+    "crates/cadence-core/src/delivery_rules.rs",
+    "src/daemon/delivery_requirements_rpc.rs",
     "docs/AUDIT.md", "tests/safety_floor.rs",
 }
 
@@ -284,7 +298,7 @@ def parse_raw_diff(raw):
 
 
 def pr_changes(pr, head, base, base_oid, main_tip=None):
-    """(changes, changed_lines) of the PR, from git in the current checkout:
+    """(changes, changed_lines, merge_base) of the PR, from git in the current checkout:
     fetch the base and the PR head when either commit is absent, then diff the
     merge base to the pinned head with no rename detection (a rename is a
     delete plus an add, so both ends are seen). Raises on any failure.
@@ -310,10 +324,17 @@ def pr_changes(pr, head, base, base_oid, main_tip=None):
     for sha in (head, base_oid, anchor):
         if not have(sha):
             raise RuntimeError(f"commit {sha} is not in this checkout (run from a checkout of the repo)")
-    rc, mb, err = run(["git", "merge-base", anchor, head])
-    if rc != 0 or not FULL_SHA.fullmatch(mb.strip()):
+    # CAD-2117: `git merge-base` alone picks one of several best common ancestors
+    # (a criss-cross merge), and the diff from the wrong one can hide a restored
+    # file. More than one is refused: nothing here can say which is the right base.
+    rc, mbs, err = run(["git", "merge-base", "--all", anchor, head])
+    bases = mbs.split()
+    if rc != 0 or not bases or not all(FULL_SHA.fullmatch(b) for b in bases):
         raise RuntimeError(f"no merge base of {anchor} and {head}: {err.strip()}")
-    mb = mb.strip()
+    if len(bases) > 1:
+        raise RuntimeError(f"{anchor} and {head} have {len(bases)} merge bases ({', '.join(b[:12] for b in bases)}), "
+                           "so the changed set is ambiguous (fail closed)")
+    mb = bases[0]
     rc, out, err = run(["git", "diff", "--raw", "-z", "--no-renames", "--no-abbrev", mb, head])
     if rc != 0:
         raise RuntimeError(f"git diff failed: {err.strip()}")
@@ -324,7 +345,7 @@ def pr_changes(pr, head, base, base_oid, main_tip=None):
     for row in num.splitlines():
         added, deleted = row.split("\t")[:2]
         lines += (int(added) if added.isdigit() else 0) + (int(deleted) if deleted.isdigit() else 0)
-    return parse_raw_diff(out), lines
+    return parse_raw_diff(out), lines, mb
 
 
 def risk_globs(toml_text):
@@ -373,6 +394,33 @@ def workflow_auto_reasons(changes, toml_text):
         out.append(f"{path} ({why})")
     return ([f"a workflow review cannot stand in for the operator: {'; '.join(out[:5])}"]
             if out else [])
+
+
+ROUTINE_EXACT = ("README.md", "CONTRIBUTING.md")  # as in cadence-core's routine allowlist
+
+
+def lean_class_reasons(klass, changes, one, human_paths, lines):
+    """Why a routine or consequential class understates this script's own diff (CAD-2100).
+
+    `consequential` is checked as one combined review and `routine` as none, so a class
+    the evaluator gave from a different diff must not stand when this script's diff needs
+    more: not wholly on the one-review list (two reviews), human-class by path or size,
+    or, for routine, not plain regular-file markdown docs. Any other class is not lean."""
+    if klass not in ("routine", "consequential"):
+        return []
+    out = []
+    if not one:
+        out.append("this PR's own diff is not on the one-review list, so it needs two reviews")
+    if human_paths or lines > HUMAN_LINES:
+        out.append("this PR's own diff is human-class by path or size")
+    if klass == "routine" and not all(
+            s in ("A", "M") and new == "100644" and (old == new or s == "A") and path.endswith(".md")
+            and (path.startswith("docs/") or path in ROUTINE_EXACT)
+            for s, old, new, path in changes):
+        out.append("this PR's own diff is not plain ordinary markdown documentation")
+    return ([f"the evaluator's {klass} class does not hold for this script's diff against "
+             f"main's live tip: {'; '.join(out)} (an older classifier build can be stale; "
+             "refusing rather than merging on fewer reviews)"] if out else [])
 
 
 def is_human_path(path, risk=()):
@@ -1311,13 +1359,13 @@ PATH_TRIGGER_TABLES = (("schema", 2), ("trigger4", 4), ("trigger6", 6), ("trigge
 
 def path_triggers(paths, risk_text):
     """(triggers hit, [unmapped human paths]) from the risk-paths tables read
-    at the base, or (None, reason) when a table is unreadable. A human-class
+    at the diff's anchor, or (None, reason) when a table is unreadable. A human-class
     path (is_human_path) in no table is unmapped: it needs a per-head approval."""
     tables = []
     for t, n in PATH_TRIGGER_TABLES:
         g = glob_list(risk_text, (t, "paths"))
         if g is None:
-            return None, f"cannot read the [{t}] list of {RISK_PATHS_FILE} at the base"
+            return None, f"cannot read the [{t}] list of {RISK_PATHS_FILE} at the diff's anchor"
         tables.append((n, g))
     hit, unmapped = set(), []
     for p in paths:
@@ -1342,7 +1390,7 @@ def scope_reasons(issue, title, branch, ticket, paths, risk_text, one_text, verd
     t13 = [g for t in ("trigger1", "trigger3") for g in (glob_list(risk_text, (t, "paths")) or [None])]
     exc = glob_list(one_text, ("one_review_exclude",))
     if None in t13 or exc is None:
-        why.append(f"cannot read the trigger 1/3 lists ({RISK_PATHS_FILE}, {ONE_REVIEW_FILE}) at the base")
+        why.append(f"cannot read the trigger 1/3 lists ({RISK_PATHS_FILE}, {ONE_REVIEW_FILE}) at the diff's anchor")
     else:
         hit = [p for p in paths if any(glob_match(g, p) for g in t13 + exc)]
         if hit:
@@ -1491,22 +1539,31 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             except RuntimeError as e:
                 reasons.append(str(e))
 
-    # Changed paths (modes included) and size, straight from git.
+    # Changed paths (modes included) and size, straight from git. CAD-2100: for a PR
+    # based on main, main's tip is resolved once here; the diff and both path lists
+    # below are read with it, so they cannot disagree within one evaluation.
     live_tip = live_main_tip(repo) if base == "main" else ""
     try:
-        changes, lines = pr_changes(pr, head, base, base_oid, live_tip)
+        changes, lines, merge_base = pr_changes(pr, head, base, base_oid, live_tip)
     except RuntimeError as e:
         reasons.append(f"cannot list the changed files of PR #{pr}: {e}")
-        changes, lines = [], 0
+        changes, lines, merge_base = [], 0, ""
+    # The commit the path lists are read at: main's live tip for a main-based PR (a PR
+    # cannot edit the lists it is judged by: the tip holds no unmerged PR), else the
+    # PR's base commit. Empty when that commit could not be read (main's tip or
+    # `baseRefOid`); the reads below then return nothing (an empty ref would read the
+    # default branch), and a failed diff has already refused.
+    lists_ref = live_tip if base == "main" else base_oid
     paths = sorted({c[3] for c in changes})
     if not changes and not any("cannot list the changed files" in r for r in reasons):
         reasons.append(f"PR #{pr} has an empty diff against {base}")
 
-    # One-review list, read at the PR's base commit.
-    rc, toml_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
-                            f"repos/{repo}/contents/{ONE_REVIEW_FILE}?ref={base_oid}"])
-    one_text = toml_text if rc == 0 and base_oid else None
-    one = rc == 0 and bool(base_oid) and one_review_qualifies(changes, toml_text)
+    # One-review list, read with the diff's anchor.
+    rc, toml_text, _ = (run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                             f"repos/{repo}/contents/{ONE_REVIEW_FILE}?ref={lists_ref}"])
+                        if lists_ref else (1, "", ""))
+    one_text = toml_text if rc == 0 else None
+    one = rc == 0 and one_review_qualifies(changes, toml_text)
     report.append("reviews required: " + ("one (diff is on the one-review list)" if one else "two (Standards and Spec/security)"))
     need_qa = any(p.startswith("ui/") for p in paths)
 
@@ -1696,14 +1753,20 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     # or (CAD-2081) a workflow-issued review on any change outside the workflow
     # auto-paths allowlist. `cadence delivery requirements` does not report that last
     # rule; this script adds it.
-    rc, risk_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
-                            f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={base_oid}"])
-    risk_text = risk_text if rc == 0 and base_oid else None
+    rc, risk_text, _ = (run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                             f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={lists_ref}"])
+                        if lists_ref else (1, "", ""))
+    risk_text = risk_text if rc == 0 else None
     risk = risk_globs(risk_text)
-    why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the base (fail closed)"]
+    why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the diff's anchor (fail closed)"]
     why += [p for p in paths if is_human_path(p, risk or ())][:5]
     if lines > HUMAN_LINES:
         why.append(f"{lines} changed lines")
+    # CAD-2100: a lean class (routine, consequential) cannot hide what this script's
+    # own diff found. The classifier may be an older build than this script.
+    if authority is not None and authority["requirements"]["activation"] == "active":
+        reasons += lean_class_reasons(authority["requirements"]["class"], changes, one,
+                                      [p for p in paths if is_human_path(p, risk or ())], lines)
     if has_workflow:
         auto_text = None
         if main_tip:
@@ -1748,6 +1811,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         evidence.update(issue=issue, repo=repo, pr=pr, head=head, base=base_oid, base_ref=base,
                         notes=sorted({n["name"] for n in counted}),
                         checks=sorted(names), comments=ticket.get("comments") or [],
+                        merge_base=merge_base, main_tip=live_tip,
                         binding=authority["binding"] if authority else None,
                         requirements=authority["requirements"] if authority else None,
                         readiness=authority["readiness"] if authority else None)
@@ -1780,6 +1844,13 @@ def evidence_body(evidence):
              f"Base branch: {evidence['base_ref']}",
              f"Green CI run: {evidence['ci_run']}",
              "Required checks: " + ", ".join(evidence["checks"])]
+    # CAD-2100: `Base:` is the PR's recorded base commit, which the final head check
+    # compares with GitHub's. These record what the classification judged. Not required
+    # by check_comment, so an evidence comment without them still counts.
+    if evidence.get("merge_base"):
+        lines.append(f"Merge base judged: {evidence['merge_base']}")
+    if evidence.get("main_tip"):
+        lines.append(f"Main tip: {evidence['main_tip']}")
     for name in sorted(evidence.get("ci_proofs") or {}):
         url = evidence["ci_proofs"][name]
         if url != evidence["ci_run"]:
@@ -1962,6 +2033,76 @@ def self_test():
     return 0 if not failures else 1
 
 
+MAIN_REF = "refs/remotes/origin/main"  # fully qualified: a local branch or tag named origin/main cannot shadow it
+
+
+def main_ref_present():
+    """True when MAIN_REF resolves here (False: not a repo, no such ref, no git)."""
+    try:
+        r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", MAIN_REF + "^{commit}"],
+                           capture_output=True)
+    except OSError:
+        return False
+    return r.returncode == 0
+
+
+def git_main_blob(name):
+    """origin/main's scripts/<name> bytes, or None when git cannot read it."""
+    try:
+        blob = subprocess.run(["git", "show", f"{MAIN_REF}:scripts/{name}"], capture_output=True)
+    except OSError:
+        return None
+    return blob.stdout if blob.returncode == 0 else None
+
+
+def check_gate_copy(dry_run):
+    """CAD-2108: a gate that differs from main's must not sign. Returns refusal lines.
+
+    Compares this script and its sibling delivery-gate, byte for byte, with
+    origin/main's, read by local git from the CURRENT directory (not the script's:
+    a copy of main's gate run from a scratch directory inside the repo must pass).
+    No network. A stale local origin/main is not detected. No origin/main here means
+    no opinion; origin/main present but the file unreadable cannot prove equality."""
+    files = {}
+    for path in (os.path.abspath(__file__), GATE_SCRIPT):
+        try:
+            with open(path, "rb") as fh:
+                files[os.path.basename(path)] = fh.read()
+        except OSError:
+            files[os.path.basename(path)] = None
+    digest = hashlib.sha256()
+    for name in sorted(files):
+        digest.update(name.encode() + b"\0" + (files[name] or b"") + b"\0")
+    short = digest.hexdigest()[:12]
+    problems = []
+    if not main_ref_present():
+        print(f"{ME}: gate {short} (unchecked)", flush=True)
+        print(f"{ME}: gate not compared with origin/main (no origin/main in the current directory)",
+              file=sys.stderr)
+        return []
+    for name in sorted(files):
+        main_bytes = git_main_blob(name)
+        if files[name] is None:
+            problems.append(f"{name} cannot be read here, so it cannot be compared with origin/main")
+        elif main_bytes is None:
+            problems.append(f"scripts/{name} cannot be read from origin/main, so equality is unproven")
+        elif files[name] != main_bytes:
+            problems.append(f"{name} differs from origin/main:scripts/{name}")
+    if not problems:
+        print(f"{ME}: gate {short} (same as origin/main)", flush=True)
+        return []
+    how = ("run main's copy from inside the repo: d=$(mktemp -d) && for f in enqueue-reviewed delivery-gate; do "
+           "git show refs/remotes/origin/main:scripts/$f > $d/$f; done && chmod +x $d/enqueue-reviewed && "
+           "$d/enqueue-reviewed <args> (git fetch origin main first if your origin/main is old)")
+    if dry_run:
+        print(f"{ME}: gate {short} (differs from origin/main; dry run continues)", flush=True)
+        for p in problems:
+            print(f"{ME}: warning: {p}; a real enqueue refuses; {how}", file=sys.stderr)
+        return []
+    print(f"{ME}: gate {short} (differs from origin/main)", flush=True)
+    return [f"{p}; this gate would sign with rules main does not have; {how}" for p in problems]
+
+
 def main(argv):
     if "--self-test" in argv:
         return self_test()
@@ -1990,6 +2131,11 @@ def main(argv):
     if args.pr < 1 or not FULL_SHA.match(args.head):
         print(f"{ME}: --head must be the full 40-hex SHA and <pr> a positive number", file=sys.stderr)
         return 2
+    gate_refusals = check_gate_copy(args.dry_run)
+    if gate_refusals:
+        for r in gate_refusals:
+            print(f"{ME}: refused: {r}", file=sys.stderr)
+        return 1
     repo = args.repo
     try:
         if not repo:

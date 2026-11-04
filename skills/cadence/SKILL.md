@@ -46,6 +46,7 @@ reviewer identity or approval:
 ```bash
 cadence --org <org> agent profiles
 cadence --org <org> agent context <profile-id>
+cadence --org <org> agent profile get <profile-id>   # owner-only writes: create, edit, archive
 cadence --org <org> issue show <issue-id>
 ```
 
@@ -693,7 +694,7 @@ During implementation and handoff:
   findings as a PR comment. In the Cadence
   repository itself, merges use the temporary `--exception --advisory ...`
   path (exact-head operator approval and two advisory links, plus browser-qa for a `ui/` change) until
-  `EXCEPTION_ENDS` (2026-11-10); it checks only that the links are separate https URLs.
+  `EXCEPTION_ENDS` (2026-12-31); it checks only that the links are separate https URLs.
   A second attested human is not required.
 - Make review converge. First inspect the complete change against acceptance;
   verify each blocking finding with a concrete failure scenario and source

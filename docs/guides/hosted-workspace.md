@@ -15,6 +15,25 @@ See [verification and rollout](#verification-and-rollout) for the scope of
 earlier checkpoints, [REMOTE-AUTH](../REMOTE-AUTH.md) for authentication,
 and [Workspace app catalog](app-catalog.md) for local package rules.
 
+## Check your connection
+
+`cadence --org <org> doctor` tells you whether this machine's connection to a
+hosted org works and what to do if it does not, on a client-only or native
+installation. It sends only a sign-in and one read, then reports each step:
+`install`, `selection`, `credential`, `auth`, `read`, `wiki` and `scopes`.
+
+- Exit 0 is ok, 1 is a warning or a result it could not determine, and 2 is a
+  failure. `--json` prints the same report for a script; `--offline` runs only
+  the local checks and sends nothing.
+- It names `cadence login` only when the login can help. An unavailable service
+  or an unreachable network says your login is not the problem, and a refusal
+  by policy says a new login does not change it.
+- It renews a login that is due, as any hosted command does. It does not use a
+  native daemon, the local tracker or a local fallback.
+- Optional access a login did not ask for is listed with its login flag and is
+  not a fault. A new login replaces the saved login's access, and a `--web` or
+  `--settings` login does not include the wiki.
+
 ## What runs where
 
 | Responsibility | Current owner / effect |
@@ -453,6 +472,60 @@ lane observation only when it can identify the recorded checkout and verify
 its state. An unavailable or ambiguous observation does not mean the lane
 is clean or merged; leave it intact for reconciliation.
 
+### Managing agent profiles from the CLI (CAD-2101)
+
+The owner can do from the CLI what the agent page does for a profile. Name the
+org with `--org` on every call. A saved default org or `CADENCE_ORG` does not
+count: a profile command that would use one is refused before any request
+(`org_not_named`), reads included, on a full install and a client-only one
+alike. The echoed `org=` line is the destination.
+
+```sh
+cadence --org acme agent profile get ap_<profile-id>
+cadence --org acme agent profile create ledger --catalogue accountant [--job-file job.md|-] [--model <m>]
+cadence --org acme agent profile edit ap_<profile-id> --expect-rev 3 \
+  --set role="Bookkeeper" --set-json 'skills=["invoices","payroll"]' --file responsibilities=-
+cadence --org acme agent profile archive ap_<profile-id> --latest
+```
+
+- Every command prints one JSON document, the stored profile with its
+  `revision`. `edit` sends only the fields you name; the board merges them onto
+  the profile at the revision you give and leaves the rest as stored.
+- Field names are the board's. `--set FIELD=VALUE` sends text, `--set-json
+  FIELD=JSON` sends a value that is not text (`skills` is an array), and
+  `--file FIELD=PATH|-` sends a file's or stdin's text unchanged. A hosted
+  board trims it when it saves, so a final newline doesn't survive. The client
+  holds no field list and no limits: the board refuses an unknown field or a
+  value that is too long, with its own code (`invalid_request`).
+- `edit` and `archive` need `--expect-rev N` or `--latest`. `--latest` reads the
+  current revision first and says so on stderr; it still fences that write, but
+  against whatever was stored when it read. A stale revision exits 5, prints the
+  board's `revision_conflict` and writes nothing. `archive` is an edit of
+  `status`.
+- Refusals keep the board's code: `not_permitted`, `unauthorized`, `not_found`,
+  `alias_taken`, `invalid_request`. They exit 3, like every other hosted
+  refusal. A write whose answer is lost or is a server error, including
+  `capability_unavailable`, exits 1 (outcome unknown) with the read to run
+  before repeating it (`agent profile get`, `agent profiles`).
+- Creating and editing are a live human owner's act. A member is refused by the
+  board. A board that predates these commands answers "update the board first";
+  nothing is written.
+- A native board has a daemon path for `create` only (the one behind
+  `POST /api/agent-profiles`). `get`, `edit` and `archive` refuse and say what
+  is missing; they never fall back to another store.
+
+**A managed agent cannot be stopped from the server.** With `CADENCE_ALIAS`
+(or a grant) set, the client refuses a profile write: "a managed agent can't
+edit profiles; propose the change". That is a client check and nothing more.
+The hosted board refuses an `agent` or `service` principal, but a managed agent
+that runs under a member's or owner's saved human login arrives as that user,
+and the board has no fact that tells the two apart. So an agent that bypasses
+the client (a direct call with the saved login, or an unmanaged shell) is judged
+as the person whose login it uses. Treat the saved login as the person's, keep
+it out of agent environments, and have agents propose changes (`agent
+propose-hire`). Closing this needs a server-side fact, such as a distinct
+principal for a managed session; it is tracked as AOS-502.
+
 ### Leaving a message for a role on a ticket
 
 A session can leave a message for whoever holds a role on a ticket. The role is
@@ -466,18 +539,36 @@ cadence --org acme issue messages-read <issue-id> --role developer --through <la
 ```
 
 - `state: "stored"` is all a send proves. Nothing wakes a session or proves a read.
-- Reuse the same `--message` and text to retry a send whose answer was lost.
+- To retry a send whose answer was lost, repeat it as the same member with the
+  same `--message`, `--to` and text, and with `--from` only if the first send had
+  it. The same id with anything different is refused.
 - Read with `--to`, and repeat with `--after <last-seq>` while `more` is true.
   Without `--to`, the unread map stops at 100 roles and `unread_more` says so.
 - Pass `--through` the last `seq` you received. The read point is shared by
-  everyone in the role, so one reader marking read hides messages from the others.
+  everyone in the role, so one reader marking read lowers the unread count for
+  the others. The messages themselves stay readable with `--after`.
 - `from` is a label. `sender_subject` is verified, and it is the member, not the
   session. A message approves nothing and changes nothing on the ticket.
 
 ### Reviewing software changes
 
-The owning repository's delivery policy determines the required reviews,
-checks and approvals. The review standard (operator decision 2026-11-03) is a
+Find out what a PR needs before starting reviews. The caller needs `gh` read
+access to the repository:
+
+```sh
+cadence --org acme delivery requirements --issue <issue-id> \
+  --pr https://github.com/<owner>/<name>/pull/<number> --head <full-sha>
+```
+
+`requirements.reviews`, `review_kind`, `operator_approval` and `browser_qa` are the
+requirement for that exact head, computed from the policy recorded on the board
+and the repository's path lists (`docs/roles/risk-paths.toml` and
+`docs/roles/one-review-paths.toml`), which are read at the PR's base commit so a PR
+cannot weaken its own rules. The merge gate can add an operator approval: when a
+head-pinned verdict's Risk is not `auto`, and under the workflow auto-paths rule
+(AGENTS.md "Review").
+
+The review standard (operator decision 2026-11-03) is a
 fresh-session review: a session that is not the author and inherits no
 conversation or context from the work, including a subagent (a fork or a
 resumed authoring session does not count). Record the actual reviewer/session,
@@ -491,8 +582,9 @@ can tell a fresh session from the author (the workflow-issued reviews of
 CAD-2081, not shipped yet; AGENTS.md "Review"), merges use the temporary
 `--exception --advisory ...` path (exact-head operator approval and two
 advisory links, standards and spec-security, plus browser-qa for a `ui/`
-change; ends at `EXCEPTION_ENDS` in
-`scripts/delivery-gate`, 2026-11-10); see AGENTS.md "Review". The exception
+change, even where the board asks for fewer or no approval. A hosted `routine`
+PR needs this route too, because a hosted board has no readiness record yet; ends at `EXCEPTION_ENDS` in
+`scripts/delivery-gate`, 2026-12-31); see AGENTS.md "Review". The exception
 only checks that the advisory links are separate https URLs; it proves neither
 head binding nor that Browser QA ran. A verdict filed under the author's
 identity still refuses under it, so a session on the author's login posts its

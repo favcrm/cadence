@@ -129,6 +129,8 @@ pub const REMOTE_VERBS: &[&str] = &[
     // the caller's own role and wiki access, and returns no agent identity.
     "agent_profile_list",
     "agent_profile_context",
+    // CAD-2101: one stored profile with its revision.
+    "agent_profile_show",
     "issue_ls",
     "issue_show",
     "issue_history",
@@ -165,6 +167,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     // from its own storage, and requires a live human owner: a project key
     // and prefix are workspace structure every later card inherits.
     "project_new",
+    // CAD-2101: define or edit an agent profile. The board requires a live
+    // human owner and owns the field limits and the revision fence.
+    "agent_profile_create",
+    "agent_profile_update",
     "message_send",
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
@@ -223,6 +229,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_identities"
         | "agent_profile_list"
         | "agent_profile_context"
+        | "agent_profile_show"
         | "agent_roles"
         | "project_ls" => &["cli.read"],
         // The owner's merge approval and the delivery inputs it binds both
@@ -231,7 +238,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         // CAD-1999: creating a project is a workspace-structure write; the
         // board also requires a live human owner. Reading the registry is a
         // plain cli.read above.
-        "project_new" => &["cli.write"],
+        "project_new" | "agent_profile_create" | "agent_profile_update" => &["cli.write"],
         // CAD-2001: attesting project eligibility or a principal's GitHub
         // identity decides whose verdicts count, so both writes need the same
         // `audit.approve` login as the merge approval — and the tenant admits
@@ -307,6 +314,8 @@ const RECONCILE_ISSUE_MESSAGES_READ: &str =
     it only moves forward";
 const RECONCILE_PROJECT_POLICY: &str = "the recorded policy may or may not have been written — read the project's recorded policy again before repeating it";
 const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been registered — read `issue project ls` with the same explicit --org before repeating it; the same key, name and prefix is the same project";
+const RECONCILE_PROFILE_CREATE: &str = "the profile may or may not have been saved — read `agent profiles` with the same explicit --org before repeating it; the same alias is refused as taken if it landed";
+const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
 const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have run and been charged — replay the same command; the relayed key returns the door's recorded outcome instead of running it a second time";
 const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
 const RECONCILE_TEAM: &str =
@@ -347,6 +356,7 @@ fn cli_effect(verb: &str) -> Effect {
         | "agent_roles"
         | "agent_profile_list"
         | "agent_profile_context"
+        | "agent_profile_show"
         | "issue_ls"
         | "issue_show"
         | "issue_history"
@@ -380,6 +390,8 @@ fn cli_effect(verb: &str) -> Effect {
         "issue_messages_read" => mutation(RECONCILE_ISSUE_MESSAGES_READ),
         "project_policy" => mutation(RECONCILE_PROJECT_POLICY),
         "project_new" => mutation(RECONCILE_PROJECT_NEW),
+        "agent_profile_create" => mutation(RECONCILE_PROFILE_CREATE),
+        "agent_profile_update" => mutation(RECONCILE_PROFILE_UPDATE),
         "platform_call" => mutation(RECONCILE_PLATFORM_CALL),
         "message_send" => mutation(RECONCILE_SEND),
         // `settings_agents` is refined per operation by [`call_effect`]; without
@@ -2707,24 +2719,34 @@ fn renewal_refusal(
     body: &Value,
     correlation: Option<&crate::remote_enrollment::IssuerCorrelation>,
 ) -> Error {
-    let code = body
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     // The issuer's id is shown only when the header was valid (see
     // `issuer_correlation`). It is a support reference, never an authority.
     let request = correlation
         .map(|c| format!(" (issuer request {})", c.request_id))
         .unwrap_or_default();
-    match (status, code) {
-        (401, "invalid_token") | (400, "invalid_grant") => reject(format!(
+    if renewal_session_ended(status, body) {
+        reject(format!(
             "the renewable CLI session was rejected by the issuer — run `cadence login` again{request}"
-        )),
-        _ => reject(format!(
+        ))
+    } else {
+        reject(format!(
             "remote CLI session renewal is not complete (HTTP {status}); your saved login \
              is kept, retry the command later{request}"
-        )),
+        ))
     }
+}
+
+/// The issuer's terminal refresh-grant refusals: the one proof a fresh login
+/// is the remedy for a renewal that did not complete.
+fn renewal_session_ended(status: u16, body: &Value) -> bool {
+    let code = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    matches!(
+        (status, code),
+        (401, "invalid_token") | (400, "invalid_grant")
+    )
 }
 
 fn validate_renewal_response(
@@ -3048,34 +3070,9 @@ fn authorize(
     scopes: &[&str],
     timeout: Duration,
 ) -> Result<String> {
-    let (relay, version) = surface.relay();
-    let (status, _, body) = post(
-        &target.endpoint,
-        &format!("{relay}/authorize"),
-        &cred.access_token,
-        &json!({
-            "version": version,
-            "organization_id": target.org_id,
-            "audience": target.endpoint,
-            "requested_scopes": scopes,
-            "ttl_seconds": MAX_TTL,
-        }),
-        timeout,
-    )?;
+    let (status, _, body) = authorize_answer(target, cred, surface, scopes, MAX_TTL, timeout)?;
     match status {
-        200 => {
-            let body = body.ok_or_else(|| reject("remote authorize answered non-JSON"))?;
-            let envelope = body["envelope"].as_str().unwrap_or_default();
-            let compact_jws = envelope.split('.').all(|p| {
-                !p.is_empty()
-                    && p.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-            }) && envelope.split('.').count() == 3;
-            if body["version"].as_str() != Some(version) || !compact_jws {
-                return Err(reject("remote authorize returned an invalid envelope"));
-            }
-            Ok(envelope.to_string())
-        }
+        200 => envelope_of(surface, body),
         s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
         403 if matches!(verb, "issue_message_send" | "issue_messages_read")
             && body
@@ -3092,6 +3089,49 @@ fn authorize(
         }
         _ => Err(refusal_error(status, body.as_ref())),
     }
+}
+
+/// The strict authorize request and its raw answer, before any refusal is
+/// decoded, so `doctor` can classify what `authorize` turns into an error.
+fn authorize_answer(
+    target: &RemoteTarget,
+    cred: &Credential,
+    surface: Surface,
+    scopes: &[&str],
+    ttl_seconds: u64,
+    timeout: Duration,
+) -> Result<(u16, Option<u64>, Option<Value>)> {
+    let (relay, version) = surface.relay();
+    post(
+        &target.endpoint,
+        &format!("{relay}/authorize"),
+        &cred.access_token,
+        &json!({
+            "version": version,
+            "organization_id": target.org_id,
+            "audience": target.endpoint,
+            "requested_scopes": scopes,
+            "ttl_seconds": ttl_seconds,
+        }),
+        timeout,
+    )
+}
+
+/// The envelope in a 200 authorize answer: it must echo the version and carry
+/// a compact JWS.
+fn envelope_of(surface: Surface, body: Option<Value>) -> Result<String> {
+    let (_, version) = surface.relay();
+    let body = body.ok_or_else(|| reject("remote authorize answered non-JSON"))?;
+    let envelope = body["envelope"].as_str().unwrap_or_default();
+    let compact_jws = envelope.split('.').all(|p| {
+        !p.is_empty()
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    }) && envelope.split('.').count() == 3;
+    if body["version"].as_str() != Some(version) || !compact_jws {
+        return Err(reject("remote authorize returned an invalid envelope"));
+    }
+    Ok(envelope.to_string())
 }
 
 /// One `POST /__platform/{cli,wiki}/call` attempt: fresh envelope, strict
@@ -3995,6 +4035,10 @@ fn upload_outcome_unknown(detail: &str) -> Error {
     ))
 }
 
+const PROFILE_WRITE_NOT_PERMITTED: &str = "defining or editing a profile is a live human \
+    workspace owner's act, and this login is a member or not a user principal. If you are the \
+    owner and this login may have ended, run `cadence login` once. Nothing was written";
+
 /// CAD-1568: actionable text for a verb's typed refusals, keyed on the
 /// container's bounded `error.code` — the raw `error.message` the route
 /// returns is never shown (a `cli_fail` body can carry arbitrary server
@@ -4083,6 +4127,44 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "container_required",
             "a hosted workspace cannot serve this command. Retrying will not help, and \
              nothing was changed",
+        )),
+        // CAD-2101: the profile verbs' typed refusals. The code stays in the
+        // text and the board's own message is not shown. (A stale revision is
+        // not here: it is a conflict answer, which prints the board's body.)
+        ("agent_profile_create" | "agent_profile_update", Some("not_permitted")) => {
+            Some(("not_permitted", PROFILE_WRITE_NOT_PERMITTED))
+        }
+        ("agent_profile_create" | "agent_profile_update", Some("unauthorized")) => {
+            Some(("unauthorized", PROFILE_WRITE_NOT_PERMITTED))
+        }
+        ("agent_profile_show", Some("not_permitted")) => Some((
+            "not_permitted",
+            "this login may not read that profile; nothing was read",
+        )),
+        ("agent_profile_show" | "agent_profile_update", Some("not_found")) => Some((
+            "not_found",
+            "this workspace has no profile with that id, or it is archived and only the \
+             owner can read it; nothing was read or changed",
+        )),
+        ("agent_profile_create", Some("alias_taken")) => Some((
+            "alias_taken",
+            "a profile or a runtime already holds that alias; pick another. Nothing was written",
+        )),
+        (
+            "agent_profile_show" | "agent_profile_create" | "agent_profile_update",
+            Some("invalid_request"),
+        ) => Some((
+            "invalid_request",
+            "the board refused the request: a value or field was not accepted (the board \
+                 owns the field names and limits), or this workspace's board predates agent \
+                 profile commands — if the values are right, update the board first. Nothing \
+                 was written",
+        )),
+        // A write's 503 with no `state` is an unknown outcome (exit 1) before
+        // it gets here, so only the read reaches this arm.
+        ("agent_profile_show", Some("capability_unavailable")) => Some((
+            "capability_unavailable",
+            "the board could not reach its profile store; nothing was read. Try again later",
         )),
         // CAD-1999: the hosted project registry's own typed refusals. A key
         // that already exists as a ticket-only project conflicts exactly like
@@ -4855,6 +4937,44 @@ pub(crate) fn call_bounded(
     )
 }
 
+/// CAD-2101: a profile write's 2xx must carry a `profile` object with a
+/// profile id (the named one, for an update) and a numeric revision.
+fn profile_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String, Value>) -> bool {
+    let Some(profile) = receipt.get("profile") else {
+        return false;
+    };
+    let id = profile.get("id").and_then(Value::as_str);
+    let named = if verb == "agent_profile_update" {
+        id.is_some() && id == arguments.get("id").and_then(Value::as_str)
+    } else {
+        id.is_some_and(|id| !id.is_empty())
+    };
+    named && profile.get("revision").is_some_and(Value::is_u64)
+}
+
+/// CAD-2101: a tenant board that predates the profile verbs answers
+/// `501 not_implemented` before it reads anything. Say to update the board,
+/// never that coordination is unavailable. A newer tenant behind an older
+/// control answers a bare `400 invalid_request`, which a bad value gets too,
+/// so that case is left to the verb's own refusal text.
+fn profile_board_too_old(verb: &str, status: u16) -> Option<Error> {
+    if !verb.starts_with("agent_profile_") || status != 501 {
+        return None;
+    }
+    let nothing = if mutating_cli_verb(verb) {
+        "Nothing was written"
+    } else {
+        "Nothing was read"
+    };
+    Some(Error::invalid(
+        "not_implemented",
+        format!(
+            "this workspace's board predates `{verb}` (HTTP {status}, not_implemented) — update \
+             the board first, then use this client. {nothing}"
+        ),
+    ))
+}
+
 /// Whether a ticket message write's 2xx names the write that was asked for.
 /// The ticket id can come back in its stored case.
 fn ticket_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String, Value>) -> bool {
@@ -5239,6 +5359,9 @@ fn call_verb_until_retry(
                 }
                 "project_policy" => !policy_receipt_correlates(reply, &arguments),
                 "project_new" => !project_receipt_correlates(reply, &arguments),
+                "agent_profile_create" | "agent_profile_update" => {
+                    !profile_receipt_correlates(verb, reply, &arguments)
+                }
                 "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => {
                     !team_receipt_correlates(verb, status, reply, &arguments)
                 }
@@ -5284,6 +5407,11 @@ fn call_verb_until_retry(
                     && status != 501
                     && body.as_ref().and_then(|b| b["state"].as_str()).is_none()));
         let unknown_correlation = refusal_correlation(body.as_ref());
+        // CAD-2101: a board without the profile verbs answers 501; say to
+        // update it, not that coordination is unavailable.
+        if let Some(error) = profile_board_too_old(verb, status) {
+            return Err(error);
+        }
         // CAD-2001: a project-scoped gate verb the tenant cannot serve is a
         // release-order problem, not an availability blip and not "no
         // evidence". Report it before the generic decoder can call it
@@ -5755,6 +5883,8 @@ pub fn web_envelope(response: WebResponse) -> Result<Value> {
         response.status
     )))
 }
+
+pub mod probe;
 
 #[cfg(test)]
 mod tests;

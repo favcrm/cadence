@@ -579,6 +579,21 @@ over-count app, or any grammar/bound violation. The command accepts no asset
 bodies, so a multi-megabyte leaf cannot ride the ABI, and it grants no install,
 mount, execution or effect authority.
 
+The `app.screen.asset-integrity` command is the same check under the
+host-owned operation admission. It takes the identical declaration, facts and
+screen count, and every shared rule still applies: the byte/depth/node/asset
+bounds, the closed declaration grammar, repeated-key and repeated-operation
+refusal, and the exact declared↔supplied size/sha256 comparison. It differs
+only in the declaration's `operations` list — each name is checked as a
+bounded, typed, duplicate-free host token, and the rules core neither knows
+nor infers which operations a host serves or whether one is a call or a
+host-confirmed slot. A host that uses it must still check every declared
+operation against its own closed operation set and its own call/slot
+permission classification at each publication, install and revalidation entry
+point. The command returns only the app tag: it grants no operation, install,
+mount, execution or effect authority. `app.screen.integrity` keeps the native
+vocabulary unchanged and still refuses an operation this core does not serve.
+
 ## Offline screen-frame previews and projection fixtures
 
 `cadence app frame-kit --out <dir> [--bundle <local-app-bundle>] [--parent-origin <origin>]`

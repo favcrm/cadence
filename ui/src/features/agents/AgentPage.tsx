@@ -11,6 +11,9 @@ import { ConnectRuntime, ProfileDetails, workText } from "./ProfileSeat";
 import type { ToastMsg } from "../../ui/Toast";
 import { seatStatus } from "./SeatCard";
 import { RecoveryBlock } from "./AgentProfile";
+import { MASTER } from "../home/master";
+import { useInstructionsDoc } from "./useInstructionsDoc";
+import { instructionsKind } from "./instructionsDoc";
 import AgentTabBody, { SettingsDrawer, Work, type TabContext } from "./AgentTabs";
 import {
   categoryLabel,
@@ -116,7 +119,6 @@ export default function AgentPage({
 
   // The gear opens over the current section; `?tab=settings` opens over Instructions.
   const [gear, setGear] = useState(false);
-  const [draft, setDraft] = useState<string | null>(null);
   const hired = observed ? undefined : profiles.find((p) => p.alias === alias);
   const chat = tab === "overview";
   const leave = chat ? onBack : () => onTab("overview");
@@ -167,11 +169,7 @@ export default function AgentPage({
   }, [leave]);
 
   const a = detail?.agent;
-  // A saved draft is the served text now, so it stops being a draft.
   const served = a?.instructions ?? null;
-  useEffect(() => {
-    if (draft !== null && draft === served) setDraft(null);
-  }, [draft, served]);
   // A collection observation keeps evidence available during loading/failure.
   // Detail carries provider evidence, but not selection provenance or grouping.
   const profile: Agent | undefined = a
@@ -228,6 +226,25 @@ export default function AgentPage({
           ["Hired", hiredText(figures?.hired_at)],
         ];
 
+  // Hosted keeps a profile with a revision; native overwrites the runtime's text.
+  // A master, or an agent whose job comes from a settings profile, is read-only.
+  const docKind = instructionsKind({
+    hired: hired !== undefined,
+    hostedBoard: hostedBoard || hosted,
+    served,
+    master: alias === MASTER,
+    profileBound: params?.profile !== undefined,
+  });
+  const doc = useInstructionsDoc({
+    alias,
+    kind: docKind,
+    profileId: hired?.id ?? null,
+    nativeServed: served,
+    writable: operator === true && boardBlock === null && !rosterStale,
+    onSaved: () => setRetry((n) => n + 1),
+    toast: onToast,
+  });
+
   const unread = err !== null || (notServed && observed === undefined);
   const retryDetail = () => {
     setRetry((r) => r + 1);
@@ -242,8 +259,8 @@ export default function AgentPage({
     hosted,
     resume,
     onOpenIssue,
-    onSaved: () => setRetry((n) => n + 1),
     hired,
+    operator: operator === true,
     writable: operator === true && boardBlock === null && !rosterStale,
     toast: onToast,
     stats,
@@ -254,8 +271,7 @@ export default function AgentPage({
     retryDetail,
     roleRead: roles.data || (hired && !hired.catalogue) ? "read" : roles.error ? "failed" : "reading",
     retryRole: roles.retry,
-    draft,
-    setDraft,
+    doc,
   };
 
   const cloudCards = (
