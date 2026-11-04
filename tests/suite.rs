@@ -13334,3 +13334,616 @@ mod cad2102_paid_read_unknown {
         stub.assert_quiet();
     }
 }
+
+// CAD-2064 acceptance, independently authored; implementers must not weaken it.
+#[cfg(all(unix, feature = "test-seam"))]
+mod cad2064_artifact_acceptance {
+    use base64::Engine;
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::{Command, Output, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const ORG: &str = "artifact-acceptance";
+    const ORG_ID: &str = "ws_artifact_acceptance";
+    const ENDPOINT: &str = "https://lc.cadencecloud.app";
+    const RELAY_VERSION: &str = "hosted-cadence-cli.v1";
+    const REQUESTED_ID: &str = "art-requested";
+    const BYTES: &[u8] = b"abcdef";
+    const VERSION: u64 = 7;
+
+    fn valid_pages() -> Vec<Value> {
+        let digest = Sha256::digest(BYTES)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let file = json!({
+            "id": REQUESTED_ID, "version": VERSION,
+            "kind": "md", "title": "Synthetic acceptance",
+            "label": "", "customer": "", "bytes": BYTES.len(),
+            "digest": digest, "created": "2026-11-03T00:00:00.000Z",
+            "issue": null, "shared": false
+        });
+        [0_usize, 3]
+            .into_iter()
+            .map(|offset| {
+                json!({
+                    "file": file.clone(), "offset": offset, "total": BYTES.len(),
+                    "content_base64": base64::engine::general_purpose::STANDARD
+                        .encode(&BYTES[offset..offset + 3])
+                })
+            })
+            .collect()
+    }
+
+    fn openssl(dir: &Path, args: &[&str]) {
+        let mut command = Command::new("openssl");
+        command
+            .current_dir(dir)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = cadence_agent::reaper::status(&mut command)
+            .expect("openssl is required for CAD-2064's disposable TLS fixture");
+        assert!(status.success(), "openssl fixture step failed: {args:?}");
+    }
+
+    struct Board {
+        home: tempfile::TempDir,
+        address: SocketAddr,
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl Board {
+        fn new(pages: Vec<Value>) -> Self {
+            assert!(!pages.is_empty());
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path();
+            openssl(
+                root,
+                &[
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "ec",
+                    "-pkeyopt",
+                    "ec_paramgen_curve:P-256",
+                    "-nodes",
+                    "-keyout",
+                    "ca.key",
+                    "-out",
+                    "ca.pem",
+                    "-days",
+                    "2",
+                    "-subj",
+                    "/CN=CAD-2064-CA",
+                    "-addext",
+                    "basicConstraints=critical,CA:TRUE",
+                    "-addext",
+                    "keyUsage=critical,keyCertSign,cRLSign",
+                ],
+            );
+            openssl(
+                root,
+                &[
+                    "req",
+                    "-new",
+                    "-newkey",
+                    "ec",
+                    "-pkeyopt",
+                    "ec_paramgen_curve:P-256",
+                    "-nodes",
+                    "-keyout",
+                    "leaf.key",
+                    "-out",
+                    "leaf.csr",
+                    "-subj",
+                    "/CN=lc.cadencecloud.app",
+                ],
+            );
+            fs::write(
+                root.join("leaf.ext"),
+                concat!(
+                    "subjectAltName=DNS:lc.cadencecloud.app\n",
+                    "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\n",
+                    "extendedKeyUsage=serverAuth\n"
+                ),
+            )
+            .unwrap();
+            openssl(
+                root,
+                &[
+                    "x509",
+                    "-req",
+                    "-in",
+                    "leaf.csr",
+                    "-CA",
+                    "ca.pem",
+                    "-CAkey",
+                    "ca.key",
+                    "-CAcreateserial",
+                    "-days",
+                    "2",
+                    "-extfile",
+                    "leaf.ext",
+                    "-out",
+                    "leaf.pem",
+                ],
+            );
+            fs::set_permissions(root.join("ca.pem"), fs::Permissions::from_mode(0o600)).unwrap();
+            let chain = rustls_pemfile::certs(&mut BufReader::new(
+                fs::File::open(root.join("leaf.pem")).unwrap(),
+            ))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+            let key = rustls_pemfile::private_key(&mut BufReader::new(
+                fs::File::open(root.join("leaf.key")).unwrap(),
+            ))
+            .unwrap()
+            .unwrap();
+            let tls = Arc::new(
+                rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap(),
+            );
+
+            let config = root.join("config/cadence");
+            let auth = config.join("remote-auth");
+            fs::create_dir_all(&auth).unwrap();
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(
+                config.join("orgs.json"),
+                serde_json::to_vec(&json!({
+                    "selected": {"org": ORG},
+                    "connections": [{
+                        "selection": {"org": ORG},
+                        "destination": {
+                            "mode": "remote", "endpoint": ENDPOINT, "org_id": ORG_ID
+                        }
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let expires = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600;
+            let credential = auth.join(format!("cli-{ORG}.json"));
+            fs::write(
+                &credential,
+                serde_json::to_vec(&json!({
+                    "version": "hosted-cadence-auth.v1",
+                    "organization_id": ORG_ID, "audience": ENDPOINT,
+                    "access_token": format!("hct_{}", "B".repeat(43)),
+                    "expires_at": expires
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::set_permissions(credential, fs::Permissions::from_mode(0o600)).unwrap();
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let server_calls = Arc::clone(&calls);
+            let worker = thread::spawn(move || {
+                for incoming in listener.incoming() {
+                    let socket = incoming.unwrap();
+                    if server_stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let stream = rustls::StreamOwned::new(
+                        rustls::ServerConnection::new(Arc::clone(&tls)).unwrap(),
+                        socket,
+                    );
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let path = line.split_whitespace().nth(1).unwrap().to_owned();
+                    let mut length = None;
+                    loop {
+                        line.clear();
+                        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        let (key, value) = line.split_once(':').unwrap();
+                        if key.eq_ignore_ascii_case("content-length") {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                    let mut raw = vec![0; length.expect("JSON request must have content-length")];
+                    reader.read_exact(&mut raw).unwrap();
+                    let request: Value = serde_json::from_slice(&raw).unwrap();
+                    let response = match path.as_str() {
+                        "/__platform/cli/authorize" => json!({
+                            "version": RELAY_VERSION, "envelope": "synthetic.fixture.envelope"
+                        }),
+                        "/__platform/cli/call" => {
+                            let mut seen = server_calls.lock().unwrap();
+                            let index = seen.len();
+                            seen.push(request);
+                            // Repeat for the existing-destination control's second download.
+                            pages[index % pages.len()].clone()
+                        }
+                        other => panic!("unexpected fixture request: {other}"),
+                    };
+                    let encoded = serde_json::to_vec(&response).unwrap();
+                    let wire = reader.get_mut();
+                    write!(
+                        wire,
+                        concat!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n",
+                            "content-length: {}\r\nconnection: close\r\n\r\n"
+                        ),
+                        encoded.len()
+                    )
+                    .unwrap();
+                    wire.write_all(&encoded).unwrap();
+                    wire.flush().unwrap();
+                }
+            });
+            Self {
+                home,
+                address,
+                stop,
+                worker: Some(worker),
+                calls,
+            }
+        }
+
+        fn run(&self, explicit: bool) -> Output {
+            let root = self.home.path();
+            let mut command = Command::new("timeout");
+            command
+                .args(["--kill-after=2s", "20s"])
+                .arg(env!("CARGO_BIN_EXE_cadence"))
+                .env_clear()
+                .current_dir(root)
+                .env(
+                    "PATH",
+                    std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+                )
+                .env("HOME", root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .env("CADENCE_TEST_TLS_CA", root.join("ca.pem"))
+                .env("CADENCE_TEST_TLS_CONNECT", self.address.to_string())
+                .args(["--org", ORG, "artifact", "show", REQUESTED_ID, "--out"])
+                .arg(root.join("download.bin"));
+            if explicit {
+                command.args(["--version", "7"]);
+            }
+            let output = cadence_agent::reaper::output(&mut command)
+                .expect("CAD-2064 acceptance requires GNU timeout on PATH; no unbounded fallback");
+            // GNU timeout reports 124 on expiry. Its kill-after escalation can
+            // kill the process group, observed as SIGKILL rather than code 137.
+            assert!(
+                output
+                    .status
+                    .code()
+                    .is_some_and(|code| code != 124 && code != 137),
+                "packaged CLI exceeded its 20-second fixture deadline or was signalled: \
+                 status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        fn assert_request(&self, explicit: bool, minimum_pages: usize) {
+            let calls = self.calls.lock().unwrap();
+            let expected_version = json!(VERSION);
+            assert!(
+                calls.len() >= minimum_pages,
+                "did not reach the supplied bad page: {calls:?}"
+            );
+            for (index, request) in calls.iter().enumerate() {
+                assert_eq!(request["verb"], "artifact_read");
+                assert_eq!(request["arguments"]["id"], REQUESTED_ID);
+                assert_eq!(request["arguments"]["offset"], json!(index * 3));
+                assert_eq!(
+                    request["arguments"].get("version"),
+                    if explicit || index > 0 {
+                        Some(&expected_version)
+                    } else {
+                        None
+                    }
+                );
+            }
+        }
+    }
+
+    impl Drop for Board {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wake accept; no timing-based polling and no background fixture left alive.
+            let _ = TcpStream::connect_timeout(&self.address, Duration::from_secs(2));
+            let result = self.worker.take().unwrap().join();
+            if !thread::panicking() {
+                result.expect("CAD-2064 TLS fixture panicked");
+            }
+        }
+    }
+
+    fn assert_refused(board: &Board, explicit: bool, minimum_pages: usize) {
+        let output = board.run(explicit);
+        board.assert_request(explicit, minimum_pages);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "expected rejection, got stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "refusal printed a success receipt"
+        );
+        assert_eq!(
+            fs::symlink_metadata(board.home.path().join("download.bin"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "refusal must not leave even an empty destination or symlink"
+        );
+    }
+
+    #[test]
+    fn valid_multipage_download_pins_version_and_preserves_create_new_and_mode() {
+        for explicit in [false, true] {
+            let board = Board::new(valid_pages());
+            let output = board.run(explicit);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            board.assert_request(explicit, 2);
+            assert_eq!(board.calls.lock().unwrap().len(), 2);
+            let destination = board.home.path().join("download.bin");
+            assert_eq!(fs::read(&destination).unwrap(), BYTES);
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(receipt["file"]["id"], REQUESTED_ID);
+            assert_eq!(receipt["file"]["version"], VERSION);
+            assert_eq!(receipt["written"], destination.to_str().unwrap());
+
+            fs::write(&destination, b"do not overwrite").unwrap();
+            let existing = board.run(explicit);
+            assert_eq!(existing.status.code(), Some(3));
+            assert_eq!(fs::read(&destination).unwrap(), b"do not overwrite");
+        }
+    }
+
+    #[test]
+    fn foreign_artifact_id_is_refused_before_creating_destination() {
+        // The final-page case proves a valid prefix is not sufficient. The first-page
+        // case prevents trusting only the final file descriptor.
+        for bad_page in [1_usize, 0] {
+            let mut pages = valid_pages();
+            pages[bad_page]["file"]["id"] = json!("art-foreign");
+            let board = Board::new(pages);
+            assert_refused(&board, false, bad_page + 1);
+        }
+    }
+
+    #[test]
+    fn wrong_explicit_version_is_refused_before_creating_destination() {
+        for bad_page in [1_usize, 0] {
+            let mut pages = valid_pages();
+            pages[bad_page]["file"]["version"] = json!(8);
+            let board = Board::new(pages);
+            assert_refused(&board, true, bad_page + 1);
+        }
+    }
+
+    #[test]
+    fn pagination_cannot_change_the_pinned_version_offset_total_or_final_length() {
+        for fault in ["implicit-version", "offset", "total", "overrun"] {
+            let mut pages = valid_pages();
+            match fault {
+                "implicit-version" => pages[1]["file"]["version"] = json!(8),
+                "offset" => pages[1]["offset"] = json!(2),
+                "total" => pages[1]["total"] = json!(5),
+                "overrun" => {
+                    for page in &mut pages {
+                        page["total"] = json!(5);
+                        page["file"]["bytes"] = json!(5);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let board = Board::new(pages);
+            // All cases retain the correct digest of abcdef: digest-only checking
+            // therefore cannot accidentally satisfy these refusal assertions.
+            assert_refused(&board, false, 2);
+        }
+    }
+
+    #[test]
+    fn missing_required_metadata_on_any_page_never_creates_destination() {
+        for bad_page in [1_usize, 0] {
+            for key in [
+                "id",
+                "version",
+                "offset",
+                "total",
+                "content_base64",
+                "digest",
+            ] {
+                let mut pages = valid_pages();
+                let object = if matches!(key, "id" | "version" | "digest") {
+                    pages[bad_page]["file"].as_object_mut().unwrap()
+                } else {
+                    pages[bad_page].as_object_mut().unwrap()
+                };
+                object.remove(key).unwrap();
+                let board = Board::new(pages);
+                assert_refused(&board, false, bad_page + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_page_sizes_nonprogress_and_changed_digests_never_create_destination() {
+        for fault in [
+            "total-bound",
+            "empty-nonterminal",
+            "oversized-page",
+            "digest-first",
+            "digest-last",
+        ] {
+            let mut pages = valid_pages();
+            let minimum_pages = match fault {
+                "total-bound" => {
+                    pages[0]["total"] = json!(10 * 1024 * 1024 + 1);
+                    pages[0]["file"]["bytes"] = pages[0]["total"].clone();
+                    1
+                }
+                "empty-nonterminal" => {
+                    pages[0]["content_base64"] = json!("");
+                    1
+                }
+                "oversized-page" => {
+                    // All six real bytes arrive against a declared total of five.
+                    // The digest still matches all six bytes, so digest-only
+                    // checking cannot accidentally satisfy the refusal.
+                    pages[0]["total"] = json!(5);
+                    pages[0]["file"]["bytes"] = json!(5);
+                    pages[0]["content_base64"] =
+                        json!(base64::engine::general_purpose::STANDARD.encode(BYTES));
+                    1
+                }
+                "digest-first" => {
+                    // The final digest is correct, but it replaced the first
+                    // page's digest. Checking only the last descriptor is unsafe.
+                    pages[0]["file"]["digest"] = json!("0".repeat(64));
+                    2
+                }
+                "digest-last" => {
+                    // Both page identity and final byte count are otherwise valid.
+                    pages[1]["file"]["digest"] = json!("0".repeat(64));
+                    2
+                }
+                _ => unreachable!(),
+            };
+            let board = Board::new(pages);
+            assert_refused(&board, false, minimum_pages);
+        }
+    }
+
+    #[test]
+    fn valid_zero_length_content_creates_an_empty_private_destination() {
+        let mut page = valid_pages().remove(0);
+        page["total"] = json!(0);
+        page["file"]["bytes"] = json!(0);
+        page["content_base64"] = json!("");
+        page["file"]["digest"] =
+            json!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        let board = Board::new(vec![page]);
+        let output = board.run(false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        board.assert_request(false, 1);
+        assert_eq!(board.calls.lock().unwrap().len(), 1);
+        let destination = board.home.path().join("download.bin");
+        let metadata = fs::symlink_metadata(&destination).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), 0);
+        assert!(fs::read(&destination).unwrap().is_empty());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["file"]["id"], REQUESTED_ID);
+        assert_eq!(receipt["file"]["version"], VERSION);
+        assert_eq!(receipt["written"], destination.to_str().unwrap());
+    }
+
+    #[test]
+    fn consistent_but_incorrect_digest_is_refused_before_creating_destination() {
+        let mut pages = valid_pages();
+        for page in &mut pages {
+            page["file"]["digest"] = json!("0".repeat(64));
+        }
+        let board = Board::new(pages);
+        assert_refused(&board, false, 2);
+    }
+
+    #[test]
+    fn valid_padded_base64_pages_preserve_exact_bytes_and_pin_version() {
+        let mut pages = valid_pages();
+        // Independent literal encodings: "ab" and "cdef", both padded.
+        pages[0]["content_base64"] = json!("YWI=");
+        pages[1]["offset"] = json!(2);
+        pages[1]["content_base64"] = json!("Y2RlZg==");
+        let board = Board::new(pages);
+        let output = board.run(false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        {
+            let calls = board.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            for call in calls.iter() {
+                assert_eq!(call["verb"], "artifact_read");
+            }
+            assert_eq!(
+                calls[0]["arguments"],
+                json!({
+                    "id": REQUESTED_ID, "offset": 0
+                })
+            );
+            assert_eq!(
+                calls[1]["arguments"],
+                json!({
+                    "id": REQUESTED_ID, "offset": 2, "version": VERSION
+                })
+            );
+        }
+        let destination = board.home.path().join("download.bin");
+        assert_eq!(fs::read(&destination).unwrap(), BYTES);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["file"]["id"], REQUESTED_ID);
+        assert_eq!(receipt["file"]["version"], VERSION);
+        assert_eq!(receipt["written"], destination.to_str().unwrap());
+    }
+}

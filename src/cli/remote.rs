@@ -1598,9 +1598,13 @@ fn artifact(
                 print_json(&found);
                 return Ok(0);
             };
+            fn malformed_page() -> Error {
+                Error::rejected("remote answered a malformed or inconsistent artifact page; nothing was written")
+            }
             let mut bytes = Vec::new();
-            // Pinned from the first answer, so a new version cannot land mid-read.
             let mut pinned = version.map(u64::from);
+            let mut pinned_total: Option<usize> = None;
+            let mut pinned_digest: Option<[u8; 64]> = None;
             let file = loop {
                 let mut args = serde_json::Map::new();
                 args.insert("id".into(), json!(id));
@@ -1608,33 +1612,88 @@ fn artifact(
                 if let Some(version) = pinned {
                     args.insert("version".into(), json!(version));
                 }
-                let body = read("artifact_read", args)?;
-                let chunk = body["content_base64"]
-                    .as_str()
-                    .and_then(|text| {
-                        use base64::Engine;
-                        base64::engine::general_purpose::STANDARD.decode(text).ok()
-                    })
-                    .ok_or_else(|| Error::rejected("remote answered a malformed artifact read"))?;
-                let total = body["total"]
-                    .as_u64()
-                    .filter(|total| *total <= ARTIFACT_MAX_BYTES)
-                    .ok_or_else(|| Error::rejected("remote answered a malformed artifact size"))?;
-                if chunk.is_empty() && (bytes.len() as u64) < total {
-                    return Err(Error::rejected("remote artifact read stopped early"));
+                let mut body = read("artifact_read", args)?;
+                let metadata = body
+                    .get("file")
+                    .and_then(Value::as_object)
+                    .ok_or_else(malformed_page)?;
+                if metadata.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+                    return Err(malformed_page());
                 }
-                pinned = pinned.or(body["file"]["version"].as_u64());
-                bytes.extend_from_slice(&chunk);
-                if bytes.len() as u64 >= total {
-                    break body["file"].clone();
+                let page_version = metadata
+                    .get("version")
+                    .and_then(Value::as_u64)
+                    .filter(|v| *v > 0 && *v <= 9_007_199_254_740_991)
+                    .ok_or_else(malformed_page)?;
+                if pinned.is_some_and(|version| version != page_version) {
+                    return Err(malformed_page());
+                }
+                pinned = Some(page_version);
+                let total = body
+                    .get("total")
+                    .and_then(Value::as_u64)
+                    .filter(|total| *total <= ARTIFACT_MAX_BYTES)
+                    .and_then(|total| usize::try_from(total).ok())
+                    .ok_or_else(malformed_page)?;
+                if pinned_total.is_some_and(|expected| expected != total)
+                    || body.get("offset").and_then(Value::as_u64) != Some(bytes.len() as u64)
+                    || metadata
+                        .get("bytes")
+                        .is_some_and(|size| size.as_u64() != Some(total as u64))
+                {
+                    return Err(malformed_page());
+                }
+                pinned_total = Some(total);
+                let digest = metadata
+                    .get("digest")
+                    .and_then(Value::as_str)
+                    .filter(|digest| {
+                        digest.len() == 64
+                            && digest
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    })
+                    .ok_or_else(malformed_page)?;
+                if let Some(expected) = &pinned_digest {
+                    if expected.as_slice() != digest.as_bytes() {
+                        return Err(malformed_page());
+                    }
+                } else {
+                    let mut expected = [0; 64];
+                    expected.copy_from_slice(digest.as_bytes());
+                    pinned_digest = Some(expected);
+                }
+                let encoded = body
+                    .get("content_base64")
+                    .and_then(Value::as_str)
+                    .ok_or_else(malformed_page)?;
+                let remaining = total.checked_sub(bytes.len()).ok_or_else(malformed_page)?;
+                if encoded.len() > remaining.div_ceil(3) * 4 {
+                    return Err(malformed_page());
+                }
+                let previous_len = bytes.len();
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode_vec(encoded, &mut bytes)
+                    .map_err(|_| malformed_page())?;
+                if bytes.len() > total || (bytes.len() == previous_len && bytes.len() < total) {
+                    return Err(malformed_page());
+                }
+                if bytes.len() == total {
+                    break body["file"].take();
                 }
             };
             use sha2::{Digest, Sha256};
-            let digest: String = Sha256::digest(&bytes)
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let actual = Sha256::digest(&bytes);
+            let expected = pinned_digest.expect("a completed page has a digest");
+            if !actual
                 .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            if file["digest"].as_str() != Some(digest.as_str()) {
+                .zip(expected.as_chunks::<2>().0.iter())
+                .all(|(byte, pair)| {
+                    pair[0] == HEX[(byte >> 4) as usize] && pair[1] == HEX[(byte & 0xf) as usize]
+                })
+            {
                 return Err(Error::rejected(
                     "the artifact's bytes do not match its digest. Nothing was written",
                 ));

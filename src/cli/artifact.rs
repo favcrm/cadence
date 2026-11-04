@@ -60,7 +60,7 @@ pub(crate) enum ArtifactAction {
         id: String,
         #[arg(long)]
         version: Option<u32>,
-        /// A new file for the bytes. Never overwrites; the digest is checked first.
+        /// A new file; identity, version, pages and digest are checked first. Never overwrites.
         #[arg(long)]
         out: Option<PathBuf>,
     },
