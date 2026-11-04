@@ -466,8 +466,9 @@ cadence --org acme issue messages-read <issue-id> --role developer --through <la
 ```
 
 - `state: "stored"` is all a send proves. Nothing wakes a session or proves a read.
-- To retry a send whose answer was lost, reuse the same `--message`, `--to`,
-  `--from` and text. The same id with anything different is refused.
+- To retry a send whose answer was lost, repeat it as the same member with the
+  same `--message`, `--to` and text, and with `--from` only if the first send had
+  it. The same id with anything different is refused.
 - Read with `--to`, and repeat with `--after <last-seq>` while `more` is true.
   Without `--to`, the unread map stops at 100 roles and `unread_more` says so.
 - Pass `--through` the last `seq` you received. The read point is shared by
@@ -478,18 +479,23 @@ cadence --org acme issue messages-read <issue-id> --role developer --through <la
 
 ### Reviewing software changes
 
-Ask the board what a PR needs before starting reviews:
+Find out what a PR needs before starting reviews. The caller needs `gh` read
+access to the repository:
 
 ```sh
 cadence --org acme delivery requirements --issue <issue-id> \
   --pr https://github.com/<owner>/<name>/pull/<number> --head <full-sha>
 ```
 
-Its `reviews`, `review_kind`, `operator_approval` and `browser_qa` fields are the
-requirement for that exact head. They come from the policy recorded on the board
-and from the repository's path lists (`docs/roles/risk-paths.toml` and
-`one-review-paths.toml`), read at the PR's base commit so a PR cannot weaken its
-own rules. The review standard (operator decision 2026-11-03) is a
+`requirements.reviews`, `review_kind`, `operator_approval` and `browser_qa` are the
+requirement for that exact head, computed from the policy recorded on the board
+and the repository's path lists (`docs/roles/risk-paths.toml` and
+`docs/roles/one-review-paths.toml`), which are read at the PR's base commit so a PR
+cannot weaken its own rules. The merge gate can add an operator approval: when a
+head-pinned verdict's Risk is not `auto`, and under the workflow auto-paths rule
+(AGENTS.md "Review").
+
+The review standard (operator decision 2026-11-03) is a
 fresh-session review: a session that is not the author and inherits no
 conversation or context from the work, including a subagent (a fork or a
 resumed authoring session does not count). Record the actual reviewer/session,
@@ -503,8 +509,8 @@ can tell a fresh session from the author (the workflow-issued reviews of
 CAD-2081, not shipped yet; AGENTS.md "Review"), merges use the temporary
 `--exception --advisory ...` path (exact-head operator approval and two
 advisory links, standards and spec-security, plus browser-qa for a `ui/`
-change, even where the board asks for fewer or no approval, because a hosted
-board has no routine readiness record yet; ends at `EXCEPTION_ENDS` in
+change, even where the board asks for fewer or no approval. A hosted `routine`
+PR needs this route too, because a hosted board has no readiness record yet; ends at `EXCEPTION_ENDS` in
 `scripts/delivery-gate`, 2026-11-10); see AGENTS.md "Review". The exception
 only checks that the advisory links are separate https URLs; it proves neither
 head binding nor that Browser QA ran. A verdict filed under the author's
