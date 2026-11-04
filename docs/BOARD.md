@@ -2353,6 +2353,16 @@ identity of that conversation's actor. A custom name is literal in English and
 Traditional Chinese; the localized role label is only the unset-name fallback.
 An unavailable profile is not reported as an unnamed or successfully saved one.
 
+On a hosted board that supports profile-bound conversations, an owner or
+member can open an active profile's private chat from its agent page. Each
+conversation retains its profile revision; **New conversation** starts a
+session with the current profile, and the conversation selector returns to
+earlier sessions and their in-memory drafts. The board verifies the server's
+profile binding before showing a composer. If creation is uncertain, it checks
+for the result before offering an explicit second attempt; it never substitutes
+the personal Home chat. These conversations do not grant the profile's caller
+additional permissions. An older API must be upgraded before this chat works.
+
 Member-assistant setup is optional and request-first. The assistant may ask
 "What would you like to call me?" and "How would you like me to communicate?",
 one question per turn; skip/later do not block work. On Native, the existing

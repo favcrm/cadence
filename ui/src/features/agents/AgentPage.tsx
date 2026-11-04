@@ -389,7 +389,7 @@ export default function AgentPage({
             body: t("This doesn’t mean you’ve been signed out. The connection may be interrupted."),
             extra: <Button onClick={onRetryAccess}>{t("Retry")}</Button>,
           }
-      : !operator
+      : !operator && !(boardIsHosted && hired)
         ? boardIsHosted
           ? {
               title: t("Your assistant is on Home"),
@@ -400,20 +400,18 @@ export default function AgentPage({
               title: boardBlock ?? t("Conversations with agents are for the operator"),
               body: t("You can still see what this agent is working on."),
             }
-        : hired
+        : hired && !boardIsHosted
           ? {
               title: t("{alias} can’t reply here yet").replace("{alias}", () => alias),
-              body: boardIsHosted
-                ? t("Chat with a profile isn’t available on hosted boards yet. It works on issues started under its profile.")
-                : t("It has no runtime connected to this board. Connect one to talk to it here."),
-              extra: <ConnectRuntime profile={hired} hosted={boardIsHosted} groups={groups} />,
+              body: t("It has no runtime connected to this board. Connect one to talk to it here."),
+              extra: <ConnectRuntime profile={hired} hosted={false} groups={groups} />,
             }
           : mailbox
             ? {
                 title: t("This is a mailbox, not an agent"),
                 body: t("Mail waits here until an agent reads it."),
               }
-            : !profile && (err !== null || notServed)
+            : !hired && !profile && (err !== null || notServed)
               ? {
                   title: t("No agent named {alias}").replace("{alias}", () => alias),
                   body: t("It may have been removed. Pick another agent from the list."),
@@ -423,11 +421,12 @@ export default function AgentPage({
     return (
       <AgentChat
         alias={alias}
+        hostedProfileId={boardIsHosted && hired ? hired.id : undefined}
         gate={gate}
         look={agentLook(alias, params)}
         expectation={t(dmExpectation(profile))}
         attach={!boardIsHosted}
-        block={writeBlock}
+        block={boardIsHosted && hired ? boardBlock ?? (rosterStale ? t("The agent list may be out of date. Refresh it before starting a conversation.") : null) : writeBlock}
         onBack={onBack}
         onOpenIssue={onOpenIssue}
         // With nothing known about the agent, the gate is already the one answer
@@ -450,7 +449,7 @@ export default function AgentPage({
                 {hired ? (
                   <>
                     <span className="rc-dot" style={{ "--c": "var(--color-ink-500)" } as React.CSSProperties} />{" "}
-                    {hiredWork ? workText(hiredWork, t) : t("Idle · no runtime")}
+                    {boardIsHosted ? t("Hosted conversation") : hiredWork ? workText(hiredWork, t) : t("Idle · no runtime")}
                   </>
                 ) : (
                   <>

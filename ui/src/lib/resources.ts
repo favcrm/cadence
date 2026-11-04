@@ -6,11 +6,11 @@ import { loadThread, type PageReader, type ThreadState } from "../features/home/
 import { onPrivateReadsPaused, onPrivateSessionReset } from "./privateSession";
 
 /** Page reads of one agent's thread. */
-export function threadReader(alias: string): PageReader {
+export function threadReader(alias: string, conversation?: string): PageReader {
   return {
-    after: (after, limit) => api.thread(alias, { after, limit }),
-    tail: (limit) => api.thread(alias, { tail: true, limit }),
-    before: (before, limit) => api.thread(alias, { before, limit }),
+    after: (after, limit) => api.thread(alias, { after, limit, ...(conversation ? { conversation } : {}) }),
+    tail: (limit) => api.thread(alias, { tail: true, limit, ...(conversation ? { conversation } : {}) }),
+    before: (before, limit) => api.thread(alias, { before, limit, ...(conversation ? { conversation } : {}) }),
   };
 }
 import type {
