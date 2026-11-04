@@ -1,6 +1,6 @@
-//! CLI-side socket client: one request/response per connection.
-//! Long waits (`ask`, `events --follow`) are driven client-side by
-//! repeating requests, so a hung call never holds a daemon slot.
+//! CLI-side socket client. Most calls use one request per connection;
+//! connected paid reads retain one connection across discovery and dispatch.
+//! Long waits (`ask`, `events --follow`) repeat requests client-side.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -908,6 +908,10 @@ pub(crate) fn write_bounded(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> R
 /// general path's per-read inactivity timeout. Peer EOF before the
 /// newline is a closed connection, not an answer.
 pub(crate) fn read_line_bounded(fd: RawFd, deadline: Instant) -> Result<String> {
+    read_line_with_limit(fd, deadline, usize::MAX)
+}
+
+fn read_line_with_limit(fd: RawFd, deadline: Instant, limit: usize) -> Result<String> {
     let mut line = Vec::new();
     let mut buf = [0u8; 2048];
     loop {
@@ -921,12 +925,16 @@ pub(crate) fn read_line_bounded(fd: RawFd, deadline: Instant) -> Result<String> 
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
         if n > 0 {
             let chunk = &buf[..n as usize];
-            match chunk.iter().position(|b| *b == b'\n') {
-                Some(end) => {
-                    line.extend_from_slice(&chunk[..end]);
-                    break;
-                }
-                None => line.extend_from_slice(chunk),
+            let end = chunk.iter().position(|b| *b == b'\n');
+            let part = &chunk[..end.unwrap_or(chunk.len())];
+            if part.len() > limit.saturating_sub(line.len()) {
+                return Err(Error::internal(
+                    "daemon response exceeds the frame size bound",
+                ));
+            }
+            line.extend_from_slice(part);
+            if end.is_some() {
+                break;
             }
             continue;
         }
@@ -972,6 +980,59 @@ pub fn rpc_answer(state_dir: &Path, method: &str, params: Value) -> Result<Resul
         params,
         Duration::from_secs(700),
     )?))
+}
+
+// The provider HTTP body is limited to 2 MiB; leave room for the daemon
+// envelope without allowing an unusable answer to grow without bound.
+const RPC_SESSION_FRAME_CAP: usize = 4 * 1024 * 1024;
+
+/// A sequence of RPCs pinned to one daemon connection. Connected paid reads
+/// use it to bind capability discovery to the daemon that receives the call.
+pub struct RpcSession<'a> {
+    state_dir: &'a Path,
+    stream: UnixStream,
+}
+
+impl<'a> RpcSession<'a> {
+    pub fn connect(state_dir: &'a Path) -> Result<Self> {
+        let socket = rpc_socket_path(state_dir)?;
+        let stream = UnixStream::connect(&socket).map_err(|_| daemon_unreachable(&socket))?;
+        stream.set_nonblocking(true)?;
+        Ok(Self { state_dir, stream })
+    }
+
+    /// Distinguish a complete daemon answer from an unusable transport frame.
+    /// There is no reconnect or replay after a request has been written.
+    pub fn answer(&mut self, method: &str, params: Value) -> Result<Result<Value>> {
+        let mut request = proto::request(method, params);
+        if let Some(test_caller) = crate::test_seam::caller_frame(self.state_dir)? {
+            request[crate::test_seam::FRAME_FIELD] = test_caller;
+        }
+        let mut body = request.to_string();
+        body.push('\n');
+        let deadline = Instant::now() + Duration::from_secs(700);
+        let fd = self.stream.as_raw_fd();
+        write_bounded(fd, body.as_bytes(), deadline)?;
+        let line = read_line_with_limit(fd, deadline, RPC_SESSION_FRAME_CAP)?;
+        let frame: Value = serde_json::from_str(&line).map_err(|_| malformed_daemon_response())?;
+        let valid = match frame.get("ok").and_then(Value::as_bool) {
+            Some(true) => frame.get("result").is_some() && frame.get("error").is_none(),
+            Some(false) => {
+                frame.get("result").is_none()
+                    && ["/error/kind", "/error/message"].iter().all(|field| {
+                        frame
+                            .pointer(field)
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| !value.trim().is_empty())
+                    })
+            }
+            None => false,
+        };
+        if !valid {
+            return Err(malformed_daemon_response());
+        }
+        Ok(proto::unwrap(frame))
+    }
 }
 
 /// CAD-508 retry budget for connects across the daemon restart window.

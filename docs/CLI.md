@@ -655,6 +655,28 @@ hosted CLI login is deferred to CAD-1592. Managing agents running on the local
 or hosted runtime use that runtime's local daemon and exact grants instead.
 
 
+## Connected-read recovery
+
+A local `platform call` for a connected read uses `--request` as its stable
+handle. If omitted, the CLI creates one before requesting the read. An
+unknown outcome reports both that handle and the provider key; it does not
+automatically retry the call.
+
+To reconcile, repeat the same call in the same workspace with the same account,
+connection, input and charge control, passing the reported **handle** as
+`--request`. Do not pass the `read-`-prefixed provider key as the handle: the
+daemon adds that prefix. The platform may still report the original call as in
+progress; do not start a new key merely because the first answer was lost.
+
+The CLI requires a daemon that advertises connected-read recovery. An older
+daemon is refused before dispatch; update and restart it before making the
+call. Discovery and the read use the same daemon connection, so a daemon
+replacement cannot redirect an admitted read to an older process.
+
+Direct `platform_call` RPC callers must provide `request` for a connected
+read. Without a caller-held handle, a lost daemon reply would leave no safe
+way to recover the provider key, so the daemon refuses before dispatch.
+
 ## Observation output
 
 `status`, `overview`, `memory ls`, and `build-slot status` print a table

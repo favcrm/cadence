@@ -13,7 +13,7 @@
 
 use serde_json::Value;
 
-use super::adapter::{ConnectedRead, PlatformAdapter};
+use super::adapter::{AppCapabilityError, ConnectedRead, PlatformAdapter};
 use crate::contract_fixture::ToolTable;
 use crate::error::{Error, Result};
 
@@ -24,6 +24,44 @@ const DEFAULT_BASE: &str = "https://api-v2.agenticos.hk";
 const READ_PATH: &str = "/v1/runtime/tools/read";
 const BODY_CAP: u64 = 2 * 1024 * 1024;
 const TIMEOUT_SECS: u64 = 90;
+
+fn valid_settled_price(price: &Value) -> bool {
+    let Some(fields) = price.as_object() else {
+        return false;
+    };
+    if fields.len() != 3 || price["currency"] != "USD" || price["scale"].as_u64() != Some(6) {
+        return false;
+    }
+    let Some((whole, fraction)) = price["amount"].as_str().and_then(|s| s.split_once('.')) else {
+        return false;
+    };
+    !whole.is_empty()
+        && whole.len() <= 10
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && (whole == "0" || !whole.starts_with('0'))
+        && fraction.len() == 6
+        && fraction.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Validate the platform's first-execution and sparse replay receipt shapes.
+/// The settled price is checked as protocol data, never against a spending cap.
+pub fn valid_connected_read_receipt(envelope: &Value) -> bool {
+    if envelope["ok"] != true {
+        return false;
+    }
+    let data = &envelope["data"];
+    let (Some(repeated), Some(result)) = (data["repeated"].as_bool(), data.get("result")) else {
+        return false;
+    };
+    let price = data.get("price");
+    let valid_price = price.is_some_and(valid_settled_price);
+    if data.get("effect").is_some_and(|effect| effect != "read")
+        || (price.is_some() && !valid_price)
+    {
+        return false;
+    }
+    repeated || (!result.is_null() && data["effect"] == "read" && valid_price)
+}
 
 /// Only operations AgenticOS v2 has qualified are declared. A provider whose
 /// operation is not qualified is absent here, so this listing never promises a
@@ -79,8 +117,8 @@ impl AgenticosProviderAdapter {
         })
     }
 
-    /// One connected read. Returns the platform's own outcome object
-    /// (`{effect, price, result, repeated}`) or the platform's refusal.
+    /// One connected read. Preserve the platform's receipt, and distinguish
+    /// pre-dispatch refusals from answers that cannot prove the outcome.
     fn read(
         &self,
         credential: &[u8],
@@ -89,18 +127,28 @@ impl AgenticosProviderAdapter {
         connection: &str,
         max_charge_minor: u64,
         idempotency_key: &str,
-    ) -> std::result::Result<Value, String> {
+    ) -> std::result::Result<Value, AppCapabilityError> {
         let token = std::str::from_utf8(credential)
-            .map_err(|_| "the enrolled AgenticOS provider credential is not UTF-8")?
+            .map_err(|_| {
+                AppCapabilityError::Refused(
+                    "the enrolled AgenticOS provider credential is not UTF-8".into(),
+                )
+            })?
             .trim();
         if token.is_empty() {
-            return Err("the enrolled AgenticOS provider credential is empty".into());
+            return Err(AppCapabilityError::Refused(
+                "the enrolled AgenticOS provider credential is empty".into(),
+            ));
         }
         if connection.is_empty() {
-            return Err("a connected read needs the connection it reads".into());
+            return Err(AppCapabilityError::Refused(
+                "a connected read needs the connection it reads".into(),
+            ));
         }
         if idempotency_key.is_empty() {
-            return Err("a connected read needs an idempotency key".into());
+            return Err(AppCapabilityError::Refused(
+                "a connected read needs an idempotency key".into(),
+            ));
         }
         let body = serde_json::json!({
             "slug": tool,
@@ -116,36 +164,89 @@ impl AgenticosProviderAdapter {
             .header("idempotency-key", idempotency_key)
             .header("content-type", "application/json")
             .send(body.to_string())
-            .map_err(|_| "the AgenticOS provider could not be reached")?;
+            .map_err(|_| {
+                AppCapabilityError::Uncertain(
+                    "the AgenticOS provider request could not be confirmed".into(),
+                )
+            })?;
         let status = response.status().as_u16();
         let bytes = response
             .body_mut()
             .with_config()
             .limit(BODY_CAP)
             .read_to_vec()
-            .map_err(|_| "the AgenticOS provider answer exceeds the supported bound")?;
-        let envelope: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| "the AgenticOS provider answer is not JSON")?;
-        if status != 200 {
-            let code = envelope["error"]["code"]
-                .as_str()
-                .filter(|code| {
-                    !code.is_empty()
-                        && code.len() <= 64
-                        && code
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                })
-                .unwrap_or("unavailable");
-            let message = envelope["error"]["message"]
-                .as_str()
-                .filter(|message| !message.is_empty() && message.len() <= 400)
-                .unwrap_or("the platform refused the read");
-            return Err(format!(
-                "AgenticOS provider refused the read: {code}: {message}"
+            .map_err(|_| {
+                AppCapabilityError::Uncertain(
+                    "the AgenticOS provider answer could not be read within the supported bound"
+                        .into(),
+                )
+            })?;
+        let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| {
+            AppCapabilityError::Uncertain("the AgenticOS provider answer is not JSON".into())
+        })?;
+        if status == 200 && envelope["ok"] == true {
+            if valid_connected_read_receipt(&envelope) {
+                return Ok(envelope);
+            }
+            return Err(AppCapabilityError::Uncertain(
+                "the AgenticOS provider answer has no confirmable receipt".into(),
             ));
         }
-        Ok(envelope)
+        let code = envelope["error"]["code"].as_str().filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        });
+        let message = envelope["error"]["message"]
+            .as_str()
+            .filter(|message| !message.is_empty() && message.len() <= 400)
+            .unwrap_or("the platform did not confirm the read");
+        // These status/code pairs are produced before provider dispatch by the
+        // connected-read door. In-progress, uncertain and upstream failures
+        // can instead follow a funded attempt, regardless of HTTP status.
+        let definite = envelope["ok"] == false
+            && matches!(
+                (status, code),
+                (400, Some("invalid_request" | "quote_required"))
+                    | (401, Some("unauthorized"))
+                    | (402, Some("insufficient_funds"))
+                    | (
+                        403,
+                        Some("insufficient_scope" | "credential_revoked" | "not_a_read")
+                    )
+                    | (404, Some("not_allowlisted" | "foreign_connection"))
+                    | (
+                        409,
+                        Some(
+                            "unavailable"
+                                | "toolkit_disabled"
+                                | "connection_inactive"
+                                | "disabled"
+                                | "unpriced"
+                                | "price_limit"
+                                | "price_changed"
+                                | "not_configured"
+                                | "unsupported_currency"
+                        )
+                    )
+                    | (503, Some("capability_unavailable"))
+            );
+        let detail = format!(
+            "AgenticOS provider {}: {}: {message}",
+            if definite {
+                "refused the read"
+            } else {
+                "outcome is unconfirmed"
+            },
+            code.unwrap_or("unconfirmed"),
+        );
+        Err(if definite {
+            AppCapabilityError::Refused(detail)
+        } else {
+            AppCapabilityError::Uncertain(detail)
+        })
     }
 }
 
@@ -180,13 +281,15 @@ impl PlatformAdapter for AgenticosProviderAdapter {
         _account: &str,
         credential: &[u8],
         call: &ConnectedRead<'_>,
-    ) -> std::result::Result<Value, String> {
+    ) -> std::result::Result<Value, AppCapabilityError> {
         if !self
             .table
             .declared(call.tool)
             .is_some_and(|decl| decl.connected_read)
         {
-            return Err("this tool is not a reviewed connected read".into());
+            return Err(AppCapabilityError::Refused(
+                "this tool is not a reviewed connected read".into(),
+            ));
         }
         self.read(
             credential,
@@ -324,12 +427,12 @@ mod tests {
 
     #[test]
     fn a_read_posts_the_platform_contract_and_returns_its_own_outcome() {
-        let outcome = json!({
+        let outcome = json!({"ok": true, "data": {
             "effect": "read",
-            "price": {"amountMinor": 25, "currency": "USD"},
+            "price": {"currency": "USD", "scale": 6, "amount": "0.000025"},
             "result": {"rows": [{"keys": ["example"], "clicks": 3}]},
             "repeated": false
-        });
+        }});
         let (base, seen, worker) = door(outcome.clone(), 200);
         let adapter = AgenticosProviderAdapter::new(&base).unwrap();
         let out = adapter
@@ -363,7 +466,7 @@ mod tests {
     #[test]
     fn the_platforms_refusal_is_repeated_verbatim() {
         let (base, _seen, worker) = door(
-            json!({"error": {"code": "unavailable", "message": "This tool is not available."}}),
+            json!({"ok": false, "error": {"code": "unavailable", "message": "This tool is not available."}}),
             409,
         );
         let adapter = AgenticosProviderAdapter::new(&base).unwrap();
@@ -381,8 +484,11 @@ mod tests {
             )
             .unwrap_err();
         worker.join().unwrap();
-        assert!(error.contains("unavailable"), "{error}");
-        assert!(error.contains("This tool is not available."), "{error}");
+        assert!(error.reason().contains("unavailable"), "{error}");
+        assert!(
+            error.reason().contains("This tool is not available."),
+            "{error}"
+        );
     }
 
     #[test]
@@ -401,7 +507,10 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(error.contains("not a reviewed connected read"), "{error}");
+        assert!(
+            error.reason().contains("not a reviewed connected read"),
+            "{error}"
+        );
         let error = adapter
             .execute(b"token", "search_console_report", &input(), "req-4", None)
             .unwrap_err();

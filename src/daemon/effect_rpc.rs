@@ -223,13 +223,11 @@ impl Shared {
                 // send never reaches here without an agent.
                 let actor = agent.as_deref().unwrap_or("operator");
                 if let Some(call) = connected {
-                    // A caller's own handle makes a resubmission a replay
-                    // rather than a second charge; the platform derives the
-                    // ledger key from it.
-                    let key = match optional_str(params, "request") {
-                        Some(request) => format!("read-{request}"),
-                        None => format!("read-{}", uuid::Uuid::new_v4().simple()),
-                    };
+                    // The caller must retain the handle before dispatch: a
+                    // daemon-generated key would be lost with the RPC reply.
+                    let request = optional_str(params, "request").ok_or_else(|| {
+                        Error::rejected("platform call: a connected read needs a request handle")
+                    })?;
                     return self.execute_connected_read(
                         actor,
                         &platform,
@@ -238,7 +236,7 @@ impl Shared {
                         &input,
                         &call.connection,
                         call.max_charge_minor,
-                        &key,
+                        request,
                         &adapter,
                     );
                 }
@@ -307,6 +305,9 @@ impl Shared {
                         "connected_read": decl.connected_read,
                         "available": available,
                     });
+                    if decl.connected_read {
+                        row["connected_read_recovery"] = json!(true);
+                    }
                     if !available {
                         row["unavailable"] = json!(format!(
                             "no credential is enrolled for {platform} — run `cadence platform \
@@ -508,9 +509,10 @@ impl Shared {
         input: &Value,
         connection: &str,
         max_charge_minor: u64,
-        idempotency_key: &str,
+        request: &str,
         adapter: &Arc<dyn PlatformAdapter>,
     ) -> Result<Value> {
+        let idempotency_key = format!("read-{request}");
         let bytes = if adapter.credentialless() {
             Vec::new()
         } else {
@@ -524,23 +526,34 @@ impl Shared {
                 input,
                 connection,
                 max_charge_minor,
-                idempotency_key,
+                idempotency_key: &idempotency_key,
             },
         ) {
             Ok(result) => result,
-            Err(message) => {
-                // The refusal is the platform's text, not ours, and the
-                // credential is still in scope here. A downstream that echoes
-                // it must never be the place this is caught.
-                if platform::refuse_leak("platform refusal", &message, &bytes).is_err() {
-                    return Err(Error::internal(
-                        "the platform refusal would carry the enrolled credential — withheld",
-                    ));
-                }
-                return Err(Error::rejected(message));
+            Err(error) => {
+                // The credential is still in scope: never echo a downstream
+                // diagnostic that carries it, even for an unknown outcome.
+                let reason = if platform::refuse_leak("platform refusal", error.reason(), &bytes)
+                    .is_err()
+                {
+                    "the platform response was withheld because it carried the enrolled credential"
+                } else {
+                    error.reason()
+                };
+                return Err(if error.kind() == "uncertain" {
+                    Error::unknown(format!(
+                        "Connected read outcome is unknown: {reason}. Provider key {idempotency_key}; reconcile with the same --request handle {request:?}. No automatic retry was made."
+                    ))
+                } else {
+                    Error::rejected(reason)
+                });
             }
         };
-        platform::refuse_leak("platform result", &result.to_string(), &bytes)?;
+        if platform::refuse_leak("platform result", &result.to_string(), &bytes).is_err() {
+            return Err(Error::unknown(format!(
+                "Connected read result was withheld; the outcome is unknown. Provider key {idempotency_key}; reconcile with the same --request handle {request:?}. No automatic retry was made."
+            )));
+        }
         let _ = self.store.event_public(
             agent,
             "platform_called",
