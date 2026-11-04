@@ -339,22 +339,26 @@ fn project_new_without_a_correlated_receipt_is_unknown_and_not_retried() {
 
 #[test]
 fn project_new_ambiguous_5xx_is_unknown_but_pre_forward_5xx_stays_definite() {
-    // CAD-1999: a 5xx naming no pre-forward worker `state` may follow a
-    // committed create. A 5xx that names one, and a board gate refusal
-    // (`hop: board`), are decided before the verb ran and stay definite.
+    // CAD-1999, narrowed by CAD-2009: a 5xx without proof it preceded the verb
+    // may follow a committed create, and a `state` the relay does not document
+    // is no such proof. A failed wake, a tracker refusal and a board gate
+    // refusal (`hop: board`) are decided before the verb ran and stay definite.
     let args = || {
         json!({"key": "ops", "name": "Operations"})
             .as_object()
             .unwrap()
             .clone()
     };
-    for status in [500u16, 503] {
-        let (out, requests) = run(
-            vec![(status, "", json!({"ok": false}))],
-            "project_new",
-            args(),
-            1,
-        );
+    for (status, body) in [
+        (500u16, json!({"ok": false})),
+        (503, json!({"ok": false})),
+        (500, json!({"state": "unavailable"})),
+        (
+            503,
+            json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+        ),
+    ] {
+        let (out, requests) = run(vec![(status, "", body)], "project_new", args(), 1);
         let err = out.unwrap_err();
         assert_eq!(err.kind(), "unknown", "{status}: {err}");
         let text = err.to_string();
@@ -367,13 +371,13 @@ fn project_new_ambiguous_5xx_is_unknown_but_pre_forward_5xx_stays_definite() {
         );
     }
 
-    let (out, _) = run(
-        vec![(500, "", json!({"state": "unavailable"}))],
-        "project_new",
-        args(),
-        1,
-    );
-    assert_eq!(out.unwrap_err().kind(), "rejected");
+    for body in [
+        json!({"state": "wake_failed", "code": "wake_failed"}),
+        json!({"ok": false, "error": {"code": "tracker_unavailable"}}),
+    ] {
+        let (out, _) = run(vec![(503, "", body)], "project_new", args(), 1);
+        assert_eq!(out.unwrap_err().kind(), "rejected");
+    }
 
     let (out, _) = run(
         vec![(
@@ -1455,23 +1459,38 @@ fn a_bare_409_without_the_conflict_shape_is_a_generic_refusal() {
 
 #[test]
 fn a_bare_503_is_availability_and_is_not_retried_or_login() {
-    // A 503 without a waking state is terminal for this command: retry
-    // later, keep the saved login, never ask for a fresh one.
-    let (out, requests) = run(
-        vec![(503, "", json!({"state": "board_unreachable"}))],
-        "issue_set",
-        Map::new(),
-        10,
-    );
-    let shown = out.unwrap_err().to_string();
-    assert!(shown.contains("unavailable"), "{shown}");
-    assert!(shown.contains("retry later"), "{shown}");
-    assert!(!shown.contains("cadence login"), "{shown}");
-    assert_eq!(
-        hits(&requests, "/__platform/cli/call"),
-        1,
-        "a bare 503 was retried"
-    );
+    // A 503 without a waking state is terminal for this command and keeps the
+    // saved login. A read changed nothing, so it is availability: retry later.
+    // A write may have committed behind the same answer (CAD-2009), so it is
+    // an unknown outcome to reconcile, never advice to retry.
+    for body in [
+        json!({"state": "board_unreachable"}),
+        json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+    ] {
+        let (out, requests) = run(vec![(503, "", body.clone())], "issue_ls", Map::new(), 10);
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("unavailable"), "{shown}");
+        assert!(shown.contains("retry later"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a bare 503 on a read was retried"
+        );
+
+        let (out, requests) = run(vec![(503, "", body)], "issue_set", Map::new(), 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        let shown = err.to_string();
+        assert!(shown.contains("issue show"), "{shown}");
+        assert!(!shown.contains("retry later"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a bare 503 on a write was retried"
+        );
+    }
 }
 
 /// The exact Cadence container refusal (`src/ui/wiki_envelope.rs`): a path
@@ -3661,13 +3680,14 @@ fn cad1434_blocker_local_status_legacy_expiry_keeps_command_refusal() {
 }
 
 #[test]
-fn a_permission_error_is_unavailable_never_no_credential() {
-    // Only a missing file is absence. A stat failure (here: the credential
-    // directory is unreadable) is unavailable, not proof that nothing is stored.
+fn a_stat_failure_is_unavailable_never_no_credential() {
+    // Only a missing file is absence. Any other stat failure is unavailable,
+    // not proof that nothing is stored. A file in the directory's place forces
+    // ENOTDIR for every user; chmod 000 does not, because root and a process
+    // holding CAP_DAC_READ_SEARCH pass it and get a plain ENOENT.
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("a");
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    std::fs::write(&dir, b"").unwrap();
     let target = RemoteTarget {
         identity: None,
         org: ORG.into(),
@@ -3675,16 +3695,7 @@ fn a_permission_error_is_unavailable_never_no_credential() {
         org_id: ORG_ID.into(),
     };
     let status = local_status_at(&dir, &target);
-    // Restore before asserting so the tempdir can be removed either way.
-    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-    assert_ne!(status["state"], "no_credential", "{status}");
-    assert!(
-        matches!(
-            status["state"].as_str(),
-            Some("unavailable" | "invalid_local_credential")
-        ),
-        "{status}"
-    );
+    assert_eq!(status["state"], "unavailable", "{status}");
 }
 
 #[test]
