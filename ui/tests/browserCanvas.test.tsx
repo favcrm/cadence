@@ -318,7 +318,7 @@ for (const [state, words] of [["none", "No browser session"], ["ended", "Session
   assert(btn(m, "view")?.getAttribute("aria-label") === "Open live view again", "and a small control to open it again stays available while a frame shows");
   board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
   await advance(2000);
-  assert(!el(m.host, "iframe"), "when the board sees the takeover over, the frame is torn down");
+  assert(el(m.host, "iframe[data-bz-frame]") === frame, "when the board sees the takeover over, an open frame stays: the same node");
   assert(text(panel(m)).includes("Reading") && !text(panel(m)).includes("Handed back") && !text(panel(m)).includes("You had control"), "now reading, with no notice about it");
   await advance(3000);
   assert(board.gets > before, "an active session carries on being polled");
@@ -1719,6 +1719,134 @@ for (const mode of ["404", "unavailable"] as const) {
   const after = board.gets;
   await advance(10 * 60_000);
   equal(board.gets, after, `${mode}: zero further reads over ten minutes`);
+  await m.unmount();
+}
+
+// ===== the header is one row: name and state, address, actions =====
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in?next=1", instructions: "Sign in." });
+  await openTab(m);
+  const head = el(m.host, ".bz-panel .cv-head")!;
+  assert(el(head, ".bz-title #bz-heading") && el(head, ".bz-title .bz-badge"), "Browser and its state sit together in the header");
+  assert(!el(head, ".arttype") && el(head, ".bz-globe svg"), "a plain globe, no box");
+  const addr = el(head, ".bz-addr")!;
+  assert(addr && !el(m.host, ".bz-panel > .bz-addr"), "the address is inline in the header, not a row of its own");
+  equal(addr.getAttribute("title"), "https://login.supplier-example.test/sign-in?next=1", "with the full address as its title");
+  assert(el(head, ".bz-host")!.tagName === "B" && !el(head, ".bz-scheme"), "host in bold, no scheme");
+  assert(el(head, "[data-bz-dock] [data-bz-act=view]") && el(head, "[data-bz-dock] [data-bz-act=stop]"), "Open live view and Stop are in the header");
+  assert(!el(m.host, ".bz-panel > [data-bz-dock]") && !el(m.host, ".cv-foot"), "no bar at the foot");
+  assert(btn(m, "view")!.getAttribute("aria-label") === "Open live view" && btn(m, "stop")!.getAttribute("aria-label") === "Stop session", "the actions keep accessible names");
+  await click(btn(m, "view")!);
+  assert(!el(head, ".bz-addr") && el(head, "[data-bz-act=stop]"), "with the frame open the address goes and Stop stays");
+  await click(btn(m, "stop")!);
+  assert(el(head, "[data-bz-act=go]") && el(head, "[data-bz-act=keep]") && head.hasAttribute("data-confirm"), "the confirm replaces the actions in the header");
+  await m.unmount();
+}
+{
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/" });
+  await openTab(m);
+  assert(!el(m.host, ".bz-addr .bz-rest"), "a bare / adds no second line");
+  await m.unmount();
+}
+
+// ===== Done leaves the open live view up, view only =====
+{
+  const takeover = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." };
+  const read = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  const m = await start(takeover);
+  await openTab(m);
+  await click(btn(m, "view")!);
+  const frame = el(m.host, "iframe[data-bz-frame]") as HTMLIFrameElement;
+  await React.act(async () => { frame.dispatchEvent(new win.Event("load")); });
+  await settle();
+  assert(!el(m.host, ".bz-viewer")!.hasAttribute("inert"), "while the person has control the view takes input");
+  board.body = read;
+  await advance(2000);
+  assert(el(m.host, "iframe[data-bz-frame]") === frame && frame.isConnected, "Done: the very same frame node, not reloaded");
+  assert(el(m.host, ".bz-viewer")!.hasAttribute("inert"), "inert: no pointer, key or focus reaches the page");
+  equal(board.views, 1, "no new viewer request");
+  assert(text(el(m.host, ".bz-badge")).includes("Reading"), "the badge reads Reading");
+  assert(!btn(m, "view") && btn(m, "stop"), "no reopen while reading (the board refuses it); Stop stays");
+  assert(text(el(m.host, '.bz-body [role="status"]')).includes("view only"), "and the state is not silent to assistive tech");
+  await advance(20_000);
+  equal(board.views, 1, "never a viewer request while active");
+  // The assistant hands over again: the same frame takes input and the reopen route returns.
+  board.body = takeover;
+  await advance(2000);
+  assert(el(m.host, "iframe[data-bz-frame]") === frame && !el(m.host, ".bz-viewer")!.hasAttribute("inert"), "a later handoff lifts inert on the same frame");
+  assert(btn(m, "view"), "and the reopen control is back");
+  board.body = read;
+  await advance(2000);
+  // Stop from the view-only state.
+  await click(btn(m, "stop")!);
+  await click(btn(m, "go")!);
+  equal(board.stops, 1, "Stop works from the view-only state");
+  assert(!el(m.host, "iframe"), "and the stopped session's frame is torn down");
+  await m.unmount();
+}
+{
+  // A frame still loading when Done is pressed is torn down.
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  assert(el(m.host, "iframe[data-bz-frame]"), "the frame is loading");
+  board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  await advance(2000);
+  assert(!el(m.host, "iframe"), "a view not yet open is torn down");
+  await m.unmount();
+}
+for (const next of ["ended", "none"] as const) {
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  await React.act(async () => { el(m.host, "iframe[data-bz-frame]")!.dispatchEvent(new win.Event("load")); });
+  board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  await advance(2000);
+  assert(el(m.host, "iframe[data-bz-frame]"), "view only");
+  board.body = { state: next, signedIn: false, url: null, instructions: null };
+  await advance(3000);
+  assert(!el(m.host, "iframe"), `${next}: the frame is torn down`);
+  await m.unmount();
+}
+{
+  // Active with no open frame, as after a reload: no frame, no viewer request.
+  const m = await start({ state: "active", signedIn: true, url: "https://portal.example.test/orders" });
+  await openTab(m);
+  await advance(10_000);
+  assert(!el(m.host, "iframe") && !btn(m, "view"), "no frame and no reopen");
+  equal(board.views, 0, "nothing asked for a viewer");
+  await m.unmount();
+}
+{
+  // Focus inside the view when Done is pressed goes to the tab, never to Stop.
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
+  await settle();
+  await click(tab(m)!);
+  await click(btn(m, "view")!);
+  const frame = el(m.host, "iframe[data-bz-frame]") as HTMLIFrameElement;
+  await React.act(async () => { frame.dispatchEvent(new win.Event("load")); });
+  await React.act(async () => { frame.focus(); });
+  board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  await advance(2000);
+  assert(document.activeElement === tab(m), "focus moves to the tab");
+  assert(document.activeElement !== btn(m, "stop"), "never onto Stop");
+  await m.unmount();
+}
+{
+  // ... and a person who has moved on to the chat draft keeps their focus.
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await click(btn(m, "view")!);
+  const frame = el(m.host, "iframe[data-bz-frame]") as HTMLIFrameElement;
+  await React.act(async () => { frame.dispatchEvent(new win.Event("load")); });
+  const composer = document.createElement("textarea");
+  document.body.append(composer);
+  await React.act(async () => { composer.focus(); });
+  board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  await advance(2000);
+  assert(document.activeElement === composer, "focus in the composer is left alone");
+  composer.remove();
   await m.unmount();
 }
 

@@ -227,17 +227,22 @@
 .cv-tab[data-kind="session"] .cv-tab-label svg { flex: none; }
 @keyframes bz-pulse { 50% { opacity: 0.35; } }
 .bz-badge { display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 9999px; background: color-mix(in srgb, var(--c, var(--color-accent)) 16%, transparent); color: var(--c, var(--color-accent)); font: 500 var(--text-micro) var(--font-sans); }
-.arttype:has(> svg) { color: var(--color-accent); }
-.cv-title b[tabindex]:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; border-radius: 2px; }
+.arttype:has(> svg), .bz-globe { color: var(--color-accent); }
+.bz-title b[tabindex]:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; border-radius: 2px; }
 .canvas-drawer:focus { outline: none; }
 
-/* One address line, the last page read. It wraps rather than clips: the real host is the part that must stay readable. */
-.bz-addr { display: flex; flex-wrap: wrap; align-items: center; gap: 0 6px; min-width: 0; padding: 6px 12px; background: var(--color-ink-875); border-bottom: 1px solid var(--color-ink-800); font: var(--text-label) var(--font-mono); color: var(--color-ink-500); overflow-wrap: anywhere; }
-.bz-addr[data-empty] { font-family: var(--font-sans); }
-.bz-addr svg { flex: none; }
-.bz-host { color: var(--color-ink-100); font-weight: 600; }
-/* Only the tail is capped: the host never needs an in-row scroll. */
-.bz-rest { flex: 1 1 100%; min-width: 0; max-height: 3.4rem; overflow-y: auto; }
+/* The header is one row: globe, name and state, the address in the flexible middle, the
+   actions, then the canvas controls. The confirm may wrap to a second row rather than clip. */
+.bz-head { flex-wrap: nowrap; gap: 8px; }
+.bz-head[data-confirm] { flex-wrap: wrap; }
+.bz-globe { display: inline-flex; flex: none; }
+.bz-title { display: flex; flex: none; align-items: baseline; gap: 6px; }
+.bz-title b { color: var(--color-ink-100); font-size: var(--text-label); font-weight: 500; }
+.bz-gap { flex: 1; }
+/* One line, never wrapping: the path gives way first, then the host is clipped from its START. */
+.bz-addr { flex: 1 1 0; min-width: 0; display: flex; align-items: baseline; white-space: nowrap; overflow: hidden; font: var(--text-label) var(--font-mono); color: var(--color-ink-500); }
+.bz-host { flex: 0 0 auto; max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; color: var(--color-ink-100); font-weight: 600; }
+.bz-rest { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 .bz-body { gap: 12px; }
 .bz-body .sempty { flex: none; text-align: center; }
@@ -248,10 +253,13 @@
 .bz-says small { color: var(--color-ink-500); font-size: var(--text-micro); }
 .bz-says p { margin: 0; max-height: 9rem; overflow-y: auto; color: var(--color-ink-100); font-size: var(--text-body); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-/* The dock: only the actions that apply, in the flow, so it never covers the live view. */
-.bz-dock { flex: none; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; padding: 8px 12px; background: var(--color-ink-850); }
-.bz-dock:focus-visible { outline: 2px solid var(--color-accent); }
-.bz-ask { margin-right: auto; color: var(--color-ink-300); font-size: var(--text-label); }
+/* The actions that apply, in the header. */
+.bz-actions { flex: none; display: flex; align-items: center; gap: 6px; }
+.bz-actions:focus-visible { outline: 2px solid var(--color-accent); }
+.bz-actions .btn { display: inline-flex; align-items: center; gap: 5px; }
+.bz-ask { color: var(--color-ink-300); font-size: var(--text-label); }
+.bz-head[data-confirm] .bz-actions { order: 9; flex: 1 0 100%; flex-wrap: wrap; }
+.bz-head[data-confirm] .bz-ask { margin-right: auto; }
 
 /* The live view fills the panel: a frame to the provider's own page, scoped by frame-src. */
 .bz-viewer { flex: 1; min-height: 0; display: flex; }
@@ -268,8 +276,9 @@
 @media (prefers-reduced-motion: reduce) {
   .bz-dot[data-pulse], .cv-bar-run { animation: none; }
 }
-.canvas-drawer[data-mode="sheet"] .bz-dock .btn { flex: 1 1 8rem; min-height: 2.25rem; }
 .canvas-drawer[data-mode="sheet"] .cv-iconbtn { min-width: 2.25rem; min-height: 2.25rem; }
 .canvas-drawer[data-mode="sheet"] .cv-tab-close { min-width: 2.25rem; min-height: 2.25rem; }
-/* A phone's canvas is the whole screen with its actions at the foot: the board's toast rides above them. */
-body:has(.canvas-drawer[data-mode="sheet"]) .board-toast { bottom: 4.5rem; }
+/* A phone's canvas is the whole screen with its actions in the header: the toast stays at the foot, clear of them.
+   Narrow: the address goes first, then the action labels (they keep their accessible names). */
+@media (max-width: 520px) { .canvas-drawer[data-mode="sheet"] .bz-addr { display: none; } }
+@media (max-width: 420px) { .canvas-drawer[data-mode="sheet"] .bz-actions .bz-lbl { display: none; } }
