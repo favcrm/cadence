@@ -48,7 +48,11 @@ jobs:
           case "$TAG" in
             *[!0-9A-Za-z.+_-]*) echo "tag '$TAG' has characters the publisher refuses" >&2; exit 1 ;;
           esac
-          sha=$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)
+          # CAD-2110: the fully qualified ref. A bare `commits/$TAG` also
+          # matches a branch of the same name, which the tag ruleset does
+          # not cover. This form resolves only the tag and peels an
+          # annotated tag to its commit.
+          sha=$(gh api "repos/$GH_REPO/commits/refs/tags/$TAG" --jq .sha)
           if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "tag $TAG does not resolve to a commit" >&2
             exit 1
@@ -59,8 +63,18 @@ jobs:
             echo "tag $TAG is not a published GitHub Release" >&2
             exit 1
           fi
+          # CAD-2110: only the tag's own run counts: it ran for this tag
+          # (head_branch), at this commit, in this repository and not a
+          # fork's (both run repository ids equal the repository's id).
+          repo_id=$(gh api "repos/$GH_REPO" --jq .id)
           artifact=$(gh api "repos/$GH_REPO/actions/artifacts?name=release-bundles-$TAG&per_page=100" \
-            | jq -c --arg sha "$sha" '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha)] | sort_by(.id) | last // empty')
+            | jq -c --arg sha "$sha" --arg tag "$TAG" --argjson repo "$repo_id" '
+                [.artifacts[] | select(.expired == false
+                  and .workflow_run.head_sha == $sha
+                  and .workflow_run.head_branch == $tag
+                  and .workflow_run.repository_id == $repo
+                  and .workflow_run.head_repository_id == $repo)]
+                | sort_by(.id) | last // empty')
           run_id=$(printf '%s' "$artifact" | jq -r '.workflow_run.id // empty')
           if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
             echo "no release-bundles artifact for $TAG at $sha" >&2
@@ -95,6 +109,7 @@ jobs:
           TAG: ${{ inputs.tag }}
           SOURCE_SHA: ${{ steps.release.outputs.sha }}
           PUBLISHED_AT: ${{ steps.release.outputs.published_at }}
+          GH_REPO: ${{ github.repository }}
           CONFIGURED_ENDPOINT: ${{ vars.RELEASES_R2_ENDPOINT }}
           CONFIGURED_BUCKET: ${{ vars.RELEASES_R2_BUCKET }}
           AWS_ACCESS_KEY_ID: ${{ secrets.RELEASES_R2_ACCESS_KEY_ID }}
@@ -116,6 +131,25 @@ jobs:
           if [ -f dist/bundles/bundles/build-attestation-x86_64-linux.jsonl ]; then
             mv dist/bundles/bundles/*.jsonl dist/bundles/
           fi
+          # CAD-2110: the publication receipt is attested by the tag's own
+          # approved run. Compare its tag, repository, source, release date
+          # and archive digests with the bytes about to be written, and
+          # refuse before the publisher makes any storage call. The receipt
+          # names exactly the three archives; their `.sha256` files were
+          # already checked against the archives in the download step.
+          test -f dist/bundles/publication-receipt.json
+          expected=$(for target in x86_64-linux aarch64-linux aarch64-macos; do
+            asset="cadence-$TAG-$target.tar.gz"
+            jq -n --arg name "$asset" --arg digest "sha256:$(sha256sum "dist/$asset" | cut -d' ' -f1)" \
+              '{key: $name, value: $digest}'
+          done | jq -s 'from_entries')
+          jq -e --arg tag "$TAG" --arg repo "$GH_REPO" --arg source "$SOURCE_SHA" \
+              --arg published_at "$PUBLISHED_AT" --argjson archives "$expected" '
+            .schema == 1 and .tag == $tag and .repo == $repo
+            and .source_sha == $source and .published_at == $published_at
+            and .archives == $archives' dist/bundles/publication-receipt.json >/dev/null || {
+            echo "publication-receipt.json does not match tag $TAG, source $SOURCE_SHA and the downloaded archives" >&2
+            exit 1; }
           args=()
           for target in x86_64-linux aarch64-linux aarch64-macos; do
             asset="cadence-$TAG-$target.tar.gz"
