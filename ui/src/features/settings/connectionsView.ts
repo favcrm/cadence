@@ -32,11 +32,28 @@ export function pinWord(status: Pick<Connection["status"], "manifest_status">): 
   switch (status.manifest_status) {
     case "matched":
       return "reviewed contract matches the deployment";
+    case "approved":
+      return "approved for this board";
     case "missing":
       return "deployment has no reported contract to compare";
     default:
       return "deployment differs from the reviewed contract";
   }
+}
+
+/**
+ * Can apps actually use this account? The same rule the daemon applies when it
+ * binds one, so a row never looks healthy while apps are refused. A hosted board
+ * reports its own email accounts as `approved`, which is its form of matched.
+ */
+export function connectionNeedsAttention(row: Connection): boolean {
+  if (row.kind !== "enrolled") return false;
+  const status: string | undefined = row.status.manifest_status;
+  return !isAvailable(row) || (status !== "matched" && status !== "approved");
+}
+
+export function connectionsNeedingAttention(rows: readonly Connection[]): number {
+  return rows.filter(connectionNeedsAttention).length;
 }
 
 /** The connection's readiness in one plain line. */

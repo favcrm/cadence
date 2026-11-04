@@ -64,6 +64,7 @@ const FORBIDDEN_TEXT = [
   "not found",
   "not on this board",
   "Add connection",
+  "+ Add",
   "Save connection",
   "Update credentials",
   "Disconnect",
@@ -235,7 +236,7 @@ async function main() {
     });
     await settle(() => {
       assert(text().includes("Connections"), "operator:true renders the index");
-      assert(text().includes("Add connection"), "operator:true writable shows the add action");
+      assert(text().includes("+ Add"), "operator:true writable shows the add action");
       assert(!text().includes("Checking access"), "operator:true is not gated as unknown");
     });
     assert(calls.some((c) => c.url.endsWith("/api/connections")), "operator:true issues the connections read");

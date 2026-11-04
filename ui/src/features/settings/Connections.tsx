@@ -17,6 +17,7 @@ import {
   canManage,
   capabilityWords,
   connectionCapabilities,
+  connectionNeedsAttention,
   enrollmentSupport,
   isAvailable,
   pinWord,
@@ -30,15 +31,14 @@ import {
   smtpUnreadable,
   smtpErrorMessage,
   verificationSupport,
-  type ServiceGroup,
   type VerificationOutcome,
 } from "./connectionsView";
-import { PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
+import { connectErrorText, PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
 import { errorCopy, openTrustedEntry } from "../connections/credentialRequestView";
 import { useProtectedEntry } from "../connections/useProtectedEntry";
 import { RecentCredentialRequestList } from "../connections/CredentialRequestCard";
 import SmtpAccountForm from "./SmtpAccountForm";
-import ProtectedManagement from "./ProtectedManagement";
+import SettingsDrawer from "./SettingsDrawer";
 import { connectionLabel } from "../../lib/connections";
 import "./connections.css";
 import { useTranslate } from "../../lib/locale";
@@ -55,7 +55,7 @@ import { useTranslate } from "../../lib/locale";
  */
 // UI-owned copy: kept as English keys, translated at render (never stored translated).
 const UI_CUSTODY_UNPROTECTED = "The daemon cannot isolate this credential from agents using the same system account, so it refused to store it — nothing was stored. To save it anyway, tick the storage-consent box below, then retry — it is never pre-selected.";
-const UI_ENROLL_UNCERTAIN = "Could not confirm the connection was added. Refresh connections before retrying.";
+const UI_ENROLL_UNCERTAIN = "Could not confirm the connection was added. Check your connections before retrying.";
 
 const ENROLL_ERROR: Record<string, string> = {
   // The only stable code the daemon actually emits on this path
@@ -185,7 +185,10 @@ const emptyGate = {
 export default function Connections({
   viewer,
   page,
+  hostedBoard = false,
 }: {
+  /** A hosted board manages keys for you, and only serves the actions it can do. */
+  hostedBoard?: boolean;
   viewer: {
     operator: boolean | null;
     readOnly: boolean;
@@ -200,7 +203,7 @@ export default function Connections({
   // Unknown access grants nothing on any Connections route. Reuse the
   // index's checking/unavailable state until the bounded proof answers.
   if (viewer.operator === null) {
-    return <ConnectionsIndex viewer={viewer} canWrite={false} />;
+    return <ConnectionsIndex viewer={viewer} canWrite={false} hostedBoard={hostedBoard} />;
   }
   const provenViewer = { ...viewer, operator: viewer.operator };
   if (page?.kind === "add" || page?.kind === "addProvider") {
@@ -209,9 +212,9 @@ export default function Connections({
   if (page?.kind === "detail") {
     // Keyed to the id: an id change remounts the page so a stale
     // per-mount `answered` flag can never carry the proof across ids.
-    return <ConnectionsDetail key={page.id} viewer={provenViewer} canWrite={canWrite} id={page.id} />;
+    return <ConnectionsDetail key={page.id} viewer={provenViewer} canWrite={canWrite} id={page.id} hostedBoard={hostedBoard} />;
   }
-  return <ConnectionsIndex viewer={viewer} canWrite={canWrite} />;
+  return <ConnectionsIndex viewer={viewer} canWrite={canWrite} hostedBoard={hostedBoard} />;
 }
 
 /**
@@ -221,7 +224,7 @@ export default function Connections({
  */
 /** The daemon's own custody facts, stated as reported — never inferred from
  *  a stored flag and never presented as protection when isolation is absent. */
-function CustodyStatusPanel({ canWrite }: { canWrite: boolean }) {
+export function CustodyStatusPanel({ canWrite }: { canWrite: boolean }) {
   const t = useTranslate();
   const [custody, setCustody] = useState<{
     configured: boolean;
@@ -298,7 +301,9 @@ function CustodyStatusPanel({ canWrite }: { canWrite: boolean }) {
 function ConnectionsIndex({
   viewer,
   canWrite,
+  hostedBoard,
 }: {
+  hostedBoard: boolean;
   viewer: {
     operator: boolean | null;
     readOnly: boolean;
@@ -321,11 +326,16 @@ function ConnectionsIndex({
   const rows = listState?.data ?? [];
   const providers = providersState?.data ?? [];
   const catalogUnavailable = providersState?.status === "empty";
+  const partialRes = viewer.operator && hostedBoard ? resources.connectionsPartial : null;
+  const partialState = useMaybeResource(partialRes);
+  const partial = partialState?.data?.partial === true;
   const refresh = () => {
-    if (listRes) void listRes.revalidate();
+    if (listRes) void listRes.refresh();
     if (providersRes) void providersRes.revalidate();
   };
   const groups = serviceGroups(providers, rows);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const open = rows.find((row) => row.id === openId) ?? null;
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-title">
@@ -335,17 +345,11 @@ function ConnectionsIndex({
           <p className="text-label text-ink-400 mt-1 break-words">{t("The accounts your apps use. Credentials stay here; each app chooses how it uses them.")}</p>
         </div>
         {viewer.operator && (
-          <div className="flex flex-wrap gap-2 shrink-0 items-center">
+          <div className="flex flex-wrap gap-1 shrink-0 items-center">
             <StaleChip state={listState ?? emptyGate} />
             <StaleChip state={providersState ?? emptyGate} />
-            <Button
-              variant="ghost"
-              icon={<IconRefresh />}
-              loading={Boolean(listState?.inFlight || providersState?.inFlight)}
-              onClick={refresh}
-            >{t("Refresh")}</Button>
             {canWrite && (
-              <Button variant="primary" href={connectionAddHref()}>{t("Add connection")}</Button>
+              <Link href={connectionAddHref()} className="settings-quiet">{t("+ Add")}</Link>
             )}
           </div>
         )}
@@ -368,10 +372,11 @@ function ConnectionsIndex({
         <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
       ) : (
         <>
-          <div className="space-y-3 mb-3">
-            <CustodyStatusPanel canWrite={canWrite} />
-            <RecentCredentialRequestList />
-          </div>
+          {!hostedBoard && (
+            <div className="mb-3">
+              <RecentCredentialRequestList />
+            </div>
+          )}
           <ResourceGate
             state={listState ?? emptyGate}
             loading="loading connections…"
@@ -392,126 +397,69 @@ function ConnectionsIndex({
           )}
           {listState?.data && (
             <div className="space-y-3 min-w-0">
-              {groups.length === 0 ? (
-                <section className="card px-4 py-3.5 min-w-0" aria-label={t("connections")}>
-                  <p className="text-label text-ink-500">{t("No services are registered and no accounts are connected.")}</p>
-                  {canWrite && (
-                    <p className="text-label mt-2">
-                      <Link href={connectionAddHref()} className="lnk">{t("Add a connection")}</Link>
-                    </p>
-                  )}
+              {partial && (
+                <p className="text-label text-fail flex flex-wrap items-center gap-2 mb-3" role="alert" data-state="connections-partial">
+                  {t("Some connected accounts couldn't be loaded, so this list may be incomplete.")}
+                  <Button size="sm" onClick={refresh}>{t("Retry")}</Button>
+                </p>
+              )}
+              {rows.length === 0 && partial ? null : rows.length === 0 ? (
+                <section className="settings-rows px-4 py-6 text-center" aria-label={t("connections")}>
+                  <p className="text-secondary text-ink-300">{t("No accounts connected")}</p>
+                  <p className="text-label text-ink-500 mt-1">{t("Connect an account so your apps can post or send email.")}</p>
                 </section>
               ) : (
-                groups.map((group) => (
-                  <ServiceSection
-                    key={group.provider}
-                    group={group}
-                    canWrite={canWrite}
-                  />
-                ))
+                <ul className="settings-rows" aria-label={t("connections")}>
+                  {rows.map((row) => {
+                    const flagged = connectionNeedsAttention(row);
+                    const service = groups.find((group) => group.provider === row.provider)?.label ?? row.provider;
+                    return (
+                      <li key={row.id}>
+                        <button type="button" className="settings-row" data-record-id={row.id} onClick={() => setOpenId(row.id)}>
+                          <span className="settings-row-text">
+                            <b>{service.charAt(0).toUpperCase() + service.slice(1)}</b>
+                            <small>{isSmtpSender(row) && row.smtp?.sender ? row.smtp.sender : row.account}</small>
+                          </span>
+                          {flagged && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
               )}
             </div>
           )}
-          <div className="mt-3">
-            <ProtectedManagement canWrite={canWrite} />
-          </div>
+          {open && (
+            // Keyed to the account: rows stay reachable by keyboard behind the drawer, and a
+            // typed credential or armed Disconnect must never carry over to another account.
+            <SettingsDrawer
+              key={open.id}
+              title={isSmtpSender(open) && open.smtp?.sender ? open.smtp.sender : open.account}
+              onClose={() => setOpenId(null)}
+            >
+              <ConnectionDetail
+                row={open}
+                provider={providers.find((item) => item.provider === open.provider) ?? null}
+                capabilities={connectionCapabilities(providers, open.provider)}
+                canWrite={canWrite}
+                standalone
+                hostedBoard={hostedBoard}
+                providerMetaPending={
+                  !providers.some((item) => item.provider === open.provider) &&
+                  providersState?.status !== "ok" &&
+                  !catalogUnavailable
+                }
+                onChanged={() => {
+                  if (listRes) void listRes.invalidate();
+                }}
+                onRevoked={() => {
+                  setOpenId(null);
+                  if (listRes) void listRes.invalidate();
+                }}
+              />
+            </SettingsDrawer>
+          )}
         </>
-      )}
-    </section>
-  );
-}
-
-/**
- * One service group on the index: the provider heading, its account
- * links and a setup action when the service offers a reviewed
- * enrollment. Never silently drops an unavailable provider or an
- * orphaned account.
- */
-function ServiceSection({
-  group,
-  canWrite,
-}: {
-  group: ServiceGroup;
-  canWrite: boolean;
-}) {
-  const t = useTranslate();
-  const support = enrollmentSupport(group.info);
-  return (
-    <section
-      className="card px-4 py-3.5 min-w-0"
-      aria-label={t("{label} connections").replace("{label}", () => String(group.label ?? ""))}
-    >
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-2">
-        <h2 className="slabel">{group.label}</h2>
-        <span className="text-micro text-ink-500">
-          {group.connections.length === 0
-            ? t("nothing connected")
-            : t("{count} connected").replace("{count}", String(group.connections.length))}
-        </span>
-        {group.builtin && (
-          <span className="chip bg-ink-800 text-ink-300">{t("built-in")}</span>
-        )}
-        {!group.builtin && canWrite && support.shapes.length > 0 && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="ml-auto"
-            href={connectionAddProviderHref(group.provider)}
-          >
-            {t("Set up {label}").replace("{label}", () => String(group.label ?? ""))}</Button>
-        )}
-        {!group.builtin && canWrite && group.provider === "smtp" && group.info === null && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="ml-auto"
-            href={connectionAddProviderHref("smtp")}
-          >
-            {group.connections.length === 0 ? t("Add email account") : t("Replace email account")}</Button>
-        )}
-      </div>
-      {group.connections.length === 0 ? (
-        <p className="text-label text-ink-500 break-words">
-          {group.builtin
-            ? t("No built-in accounts.")
-            : support.shapes.length === 0
-              ? support.reason
-              : t("No {label} account connected yet.").replace("{label}", () => String(group.label ?? ""))}
-        </p>
-      ) : (
-        <ul className="space-y-1.5">
-          {group.connections.map((row) => (
-            <li key={row.id}>
-              <Link
-                href={connectionDetailHref(row.id)}
-                className="conn-row"
-              >
-                <span className="conn-row-main">
-                  <span className="text-label font-medium text-ink-100 min-w-0 break-words">
-                    {isSmtpSender(row) && row.smtp?.sender ? row.smtp.sender : connectionLabel(row)}
-                  </span>
-                  <span
-                    className={`chip ${row.kind === "builtin" ? "bg-ink-800 text-ink-300" : "bg-accent/15 text-accent"}`}
-                  >
-                    {row.kind === "builtin" ? t("built-in") : t("enrolled")}
-                  </span>
-                  {!isAvailable(row) && (
-                    <span className="chip bg-warn/10 text-warn">{t("unavailable")}</span>
-                  )}
-                </span>
-                <span className="conn-row-sub text-micro text-ink-500 break-words">
-                  {readinessText(row)}
-                </span>
-              </Link>
-            </li>
-          ))}
-        </ul>
-      )}
-      {group.builtin && (
-        <p className="text-micro text-ink-500 mt-2 break-words">{t("Built-in accounts are always present — they carry no credential and cannot be edited or disconnected here.")}</p>
-      )}
-      {!group.builtin && !group.info && group.provider !== "smtp" && (
-        <p className="text-micro text-ink-500 mt-2 break-words">{t("This provider's service metadata could not be loaded — the account stays under its recorded name. Refresh services; a failed load is not proof the provider was removed.")}</p>
       )}
     </section>
   );
@@ -745,7 +693,9 @@ function ConnectionsDetail({
   viewer,
   canWrite,
   id,
+  hostedBoard,
 }: {
+  hostedBoard: boolean;
   viewer: { operator: boolean; readOnly: boolean };
   canWrite: boolean;
   id: string;
@@ -849,6 +799,7 @@ function ConnectionsDetail({
                 canWrite={canWrite}
                 standalone
                 providerMetaPending={providerUnknown}
+                hostedBoard={hostedBoard}
                 onChanged={refresh}
                 onRevoked={() => {
                   refresh();
@@ -882,6 +833,7 @@ export function ConnectionDetail({
   canWrite,
   standalone = false,
   providerMetaPending = false,
+  hostedBoard = false,
   onChanged,
   onRevoked,
 }: {
@@ -889,6 +841,8 @@ export function ConnectionDetail({
   provider?: ConnectionProvider | null;
   capabilities: string | null;
   canWrite: boolean;
+  /** Only what this board serves: its own email accounts can be updated or removed. */
+  hostedBoard?: boolean;
   /** Standalone page: the card owns the heading; skip the inner title. */
   standalone?: boolean;
   /** Provider metadata is still loading or failed — its absence is not
@@ -1197,7 +1151,32 @@ export function ConnectionDetail({
           {t(verifyNote.text)}
         </p>
       )}
-      {canWrite && (
+      {canWrite && hostedBoard && !isSmtpSender(row) && (
+        <p className="text-label text-ink-400 mt-3">
+          {t("This account is managed through its own sign-in. To change it, connect it again from Add.")}
+        </p>
+      )}
+      {canWrite && hostedBoard && isSmtpSender(row) && (
+        <div className="flex flex-wrap items-center gap-2 mt-3">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              setRevoking(false);
+              setRotating((v) => !v);
+            }}
+          >{t("Update credentials…")}</Button>
+          <Button
+            variant="danger"
+            size="sm"
+            onClick={() => {
+              setRotating(false);
+              setRevoking((v) => !v);
+            }}
+          >{t("Disconnect…")}</Button>
+        </div>
+      )}
+      {canWrite && !hostedBoard && (
         <div className="flex flex-wrap items-center gap-2 mt-3">
           <Button variant="secondary" size="sm" onClick={check} loading={checking}>
             {checking ? t("Checking…") : t("Check configuration")}
@@ -1249,8 +1228,8 @@ export function ConnectionDetail({
       {!canWrite && managed && (
         <p className="text-micro text-ink-500 mt-2">{t("Updating credentials and disconnecting are the operator's on an editable board.")}</p>
       )}
-      {managed && rotating && !entryRequired && (
-        <RotateForm row={row} onDone={onChanged} onClose={() => setRotating(false)} />
+      {managed && rotating && (hostedBoard || !entryRequired) && (
+        <RotateForm row={row} hostedBoard={hostedBoard} onDone={onChanged} onClose={() => setRotating(false)} />
       )}
       {managed && revoking && (
         <RevokeConfirm row={row} onDone={onRevoked} onClose={() => setRevoking(false)} />
@@ -1267,7 +1246,10 @@ export function RotateForm({
   row,
   onDone,
   onClose,
+  hostedBoard = false,
 }: {
+  /** A hosted board replaces the settings whole, so a blank field must send the live value. */
+  hostedBoard?: boolean;
   row: Connection;
   onDone: () => void;
   onClose: () => void;
@@ -1328,7 +1310,18 @@ export function RotateForm({
       const bad = smtpPortTlsError(effHost, String(effPort), effTls);
       if (bad) { setError(bad); return; }
     }
-    const body = isSmtp
+    const senderName = smtp.sender_name.trim() || row.smtp?.sender_name?.trim() || "";
+    const body = isSmtp && hostedBoard
+      ? {
+          secret: token.trim(),
+          host: effHost,
+          port: effPort,
+          tls_mode: effTls,
+          username: smtp.username.trim() || (row.smtp?.username ?? ""),
+          sender: smtp.sender.trim() || (row.smtp?.sender ?? ""),
+          ...(senderName ? { sender_name: senderName } : {}),
+        }
+      : isSmtp
       ? {
           ...base,
           secret: token.trim(),
@@ -1354,7 +1347,7 @@ export function RotateForm({
       })
       // CAD-1013: rotate also carries the fresh SMTP password — same
       // typed-code safe reason, never the raw downstream message.
-      .catch((e: ApiError) => setError(enrollErrorMessage(e)))
+      .catch((e: ApiError) => setError(hostedBoard ? connectErrorText(e) : enrollErrorMessage(e)))
       .finally(() => {
         // The credential crossed this one request into daemon custody.
         // It must not survive in the form, whatever the outcome.

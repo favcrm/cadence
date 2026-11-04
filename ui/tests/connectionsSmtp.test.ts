@@ -501,8 +501,7 @@ async function main() {
   const host5 = document.createElement("div");
   document.body.appendChild(host5);
   const root5 = createRoot(host5);
-  const sections = () => Array.from(host5.querySelectorAll('section[aria-label$=" connections"]'));
-  const groupLabel = (el: Element) => el.getAttribute("aria-label") ?? "";
+  const accountRows = () => Array.from(host5.querySelectorAll("button.settings-row"));
 
   act(() => {
     root5.render(withLocale(React.createElement(ConnectionsPage, { viewer: { operator: true, readOnly: false } })));
@@ -512,55 +511,50 @@ async function main() {
     await Promise.all([resources.connections.refresh(), resources.connectionProviders.refresh()]);
   });
   await settle(() => {
-    const labels = sections().map(groupLabel);
-    assert(labels.includes("Email (SMTP) connections"), "smtp service group renders under its friendly label");
-    assert(labels.includes("AgenticOS connections"), "token service group renders under AgenticOS");
-    assert(labels.includes("Local outbox connections"), "built-in Local outbox group renders");
-    assert(labels.includes("empty_svc connections"), "registered-but-empty provider keeps a group");
-    assert(labels.includes("ghost_provider connections"), "unregistered provider keeps its own group");
+    const names = accountRows().map((row) => row.querySelector("b")?.textContent);
+    assert(names.includes("Email (SMTP)"), "an smtp account is named by its service");
+    assert(names.includes("Ghost_provider"), "an unregistered provider's account is never dropped");
   }, 30000);
 
   const text5 = () => host5.textContent ?? "";
-  // CAD-1319: the index is compact links and routed setup actions — no
-  // in-place expansion, no credential form. Contextual setup lands on
-  // enrollable services only; the empty/built-in ones carry the explicit
-  // unsupported reason; an unregistered account is never dropped.
-  assert(byTextIn(host5, "a", "Set up Email (SMTP)"), "smtp service links to its pinned setup");
-  assert(byTextIn(host5, "a", "Set up AgenticOS"), "token service links to its pinned setup");
-  assert(
-    (byTextIn(host5, "a", "Set up Email (SMTP)") as HTMLAnchorElement)?.getAttribute("href") ===
-      "/settings/connections/new/smtp",
-    "smtp setup href is the pinned new/<provider> route",
-  );
-  assert(text5().includes("No empty_svc account connected yet"), "empty provider names its setup state");
-  assert(
-    text5().includes("could not be loaded") || text5().includes("not proof") || text5().includes("may be stale") || text5().includes("not registered"),
-    "unregistered provider is honest — metadata-missing is not deregistration",
-  );
+  // A row is a name and one line: no custody panel, no expanded detail, no form.
+  assert(!text5().includes("Credential custody"), "custody is not on the index");
   assert(!text5().includes("Check configuration"), "index carries no expanded detail");
   assert(!host5.querySelector('section[aria-label="add connection"]'), "index carries no credential form");
+  assert(!text5().includes("reviewed contract"), "the pin fact stays out of the row");
+  assert(
+    (byTextIn(host5, "a", "+ Add") as HTMLAnchorElement)?.getAttribute("href") === "/settings/connections/new",
+    "add goes to the chooser",
+  );
 
-  // CAD-1810: the group count is translated, not a raw template string.
-  window.localStorage.setItem("cadence-locale", "zh-TW");
-  const host7 = document.createElement("div");
-  document.body.appendChild(host7);
-  const root7 = createRoot(host7);
-  act(() => {
-    root7.render(withLocale(React.createElement(ConnectionsPage, { viewer: { operator: true, readOnly: false } })));
-  });
+  // A row opens one drawer holding the account's details and actions, and Esc
+  // gives focus back to the row. The /account/<id> page stays for old links.
+  const smtpAccountRow = accountRows().find((row) => (row.textContent ?? "").includes("news")) as HTMLButtonElement;
+  assert(smtpAccountRow, "smtp account row renders as a button");
+  await act(async () => { smtpAccountRow.focus(); smtpAccountRow.click(); });
   await settle(() => {
-    const text7 = host7.textContent ?? "";
-    assert(text7.includes("已連接 1 個"), "Chinese Connections count is translated");
-    assert(!text7.includes("1 connected"), "Chinese view does not leak the English count");
-  }, 30000);
-  await act(async () => root7.unmount());
-  window.localStorage.removeItem("cadence-locale");
-
-  // Account rows are links to their own detail pages — the smtp row
-  // names its exact /account/<id> URL.
-  const smtpRowLink = Array.from(host5.querySelectorAll("a")).find((a) => (a.textContent ?? "").includes("news")) as HTMLAnchorElement | undefined;
-  assert(smtpRowLink, "smtp account row renders as a link");
-  equal(smtpRowLink!.getAttribute("href"), "/settings/connections/account/c-smtp", "smtp row links to its detail route");
+    assert(text5().includes("Check configuration"), "the drawer has the local check action");
+    assert(text5().includes("Disconnect"), "the drawer offers disconnect");
+  });
+  // A credential typed for one account must never carry to another: rows stay
+  // reachable by keyboard behind the drawer, so this path is real.
+  await act(async () => { (byTextIn(host5, "button", "Update credentials…") as HTMLButtonElement).click(); });
+  const typed = host5.querySelector('.crm-drawer input[type="password"], .crm-drawer input') as HTMLInputElement;
+  assert(typed, "the update form opened");
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(typed), "value")!.set!.call(typed, "ALPHA-SECRET");
+    typed.dispatchEvent(new window.Event("input", { bubbles: true }) as unknown as Event);
+  });
+  const otherRow = accountRows().find((row) => row !== smtpAccountRow && /ghost/i.test(row.textContent ?? "")) as HTMLButtonElement;
+  assert(otherRow, "a second account row exists");
+  await act(async () => { otherRow.click(); });
+  await settle(() => {
+    const values = Array.from(host5.querySelectorAll<HTMLInputElement>(".crm-drawer input")).map((i) => i.value);
+    assert(!values.includes("ALPHA-SECRET"), "the typed credential did not follow to the other account");
+  });
+  await act(async () => {
+    document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }) as unknown as Event);
+  });
 
   // The dedicated detail page mounts the exact row — check, update and
   // disconnect in place; the honest unsupported remote-verification line
@@ -589,6 +583,117 @@ async function main() {
     assert(text6().includes("unsupported"), "remote verification reports unsupported, never a fake success");
     assert(!text6().includes("Login verified"), "no simulated success ships");
   });
+
+  // A hosted board offers only what it serves. Its email accounts can be updated or
+  // removed; there's no local check or secure entry, and a sign-in account has neither.
+  act(() => {
+    root6.render(React.createElement(ConnectionsPage, {
+      viewer: { operator: true, readOnly: false },
+      page: { kind: "detail", id: "c-smtp" },
+      hostedBoard: true,
+    }));
+  });
+  await settle(() => {
+    assert(text6().includes("Update credentials"), "hosted email account can be updated");
+    assert(text6().includes("Disconnect"), "hosted email account can be removed");
+    assert(!text6().includes("Check configuration"), "no local check on a hosted board");
+    assert(!text6().includes("secure entry"), "no secure entry on a hosted board");
+  });
+
+  // A hosted board replaces the settings whole and requires every field, so a
+  // password-only update sends the live values, including the sender name.
+  {
+    const hostR = document.createElement("div");
+    document.body.appendChild(hostR);
+    const rootR = createRoot(hostR);
+    const liveRow = { ...smtpRow, smtp: { ...smtpRow.smtp, sender_name: "Example Owner" } };
+    act(() => {
+      rootR.render(React.createElement(RotateForm, {
+        row: liveRow, hostedBoard: true, onDone: () => {}, onClose: () => {},
+      }));
+    });
+    const password = hostR.querySelector('input[type="password"]') as HTMLInputElement;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!.call(password, "hosted-secret");
+      password.dispatchEvent(new window.Event("input", { bubbles: true }) as unknown as Event);
+    });
+    const hostedPosts: any[] = [];
+    const earlierFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (init?.method === "POST" && String(input).includes("/rotate")) {
+        hostedPosts.push(JSON.parse(String(init.body)));
+        return new Response(JSON.stringify({ connection: { id: "c-1", revision: 2 } }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      return earlierFetch(input as RequestInfo | URL, init);
+    }) as typeof fetch;
+    await act(async () => {
+      hostR.querySelector("form")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }) as unknown as Event);
+    });
+    await settle(() => assert(hostedPosts.length === 1, "the hosted update posted"), 30000);
+    globalThis.fetch = earlierFetch;
+    const sent = hostedPosts[0];
+    equal(sent.secret, "hosted-secret", "hosted update sends the new password");
+    equal(sent.host, liveRow.smtp.host, "hosted update keeps the live host");
+    equal(sent.port, liveRow.smtp.port, "hosted update keeps the live port");
+    equal(sent.tls_mode, liveRow.smtp.tls_mode, "hosted update keeps the live security");
+    equal(sent.username, liveRow.smtp.username, "hosted update keeps the live username");
+    equal(sent.sender, liveRow.smtp.sender, "hosted update keeps the live sender");
+    equal(sent.sender_name, "Example Owner", "hosted update keeps the sender name");
+    // A definite refusal arrives nested under `error`, and keeps its specific words.
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (init?.method === "POST" && String(input).includes("/rotate"))
+        return new Response(JSON.stringify({ ok: false, error: { code: "smtp_auth", message: "no" } }), {
+          status: 400, headers: { "Content-Type": "application/json" },
+        });
+      return earlierFetch(input as RequestInfo | URL, init);
+    }) as typeof fetch;
+    const passwordAgain = hostR.querySelector('input[type="password"]') as HTMLInputElement;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!.call(passwordAgain, "wrong");
+      passwordAgain.dispatchEvent(new window.Event("input", { bubbles: true }) as unknown as Event);
+    });
+    await act(async () => {
+      hostR.querySelector("form")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }) as unknown as Event);
+    });
+    await settle(() => assert((hostR.textContent ?? "").includes("Couldn't sign in"), "a hosted refusal keeps its specific words"), 30000);
+    globalThis.fetch = earlierFetch;
+    await act(async () => rootR.unmount());
+  }
+
+  // A list the board couldn't fully read says so, rather than looking complete or empty.
+  {
+    const earlierFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (String(input).endsWith("/api/connections") && (init?.method ?? "GET") === "GET")
+        return new Response(JSON.stringify({ connections: [], hosted_smtp: true, connections_unavailable: { code: "x" } }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      return earlierFetch(input as RequestInfo | URL, init);
+    }) as typeof fetch;
+    const hostP = document.createElement("div");
+    document.body.appendChild(hostP);
+    const rootP = createRoot(hostP);
+    act(() => {
+      rootP.render(React.createElement(ConnectionsPage, {
+        viewer: { operator: true, readOnly: false },
+        hostedBoard: true,
+      }));
+    });
+    await act(async () => {
+      await resources.connections.refresh();
+    });
+    await settle(() => {
+      const text = hostP.textContent ?? "";
+      assert(text.includes("may be incomplete"), "a partial list says so");
+      assert(!text.includes("No accounts connected"), "a partial list isn't presented as empty");
+      assert(text.includes("Retry"), "a partial list offers Retry");
+    }, 30000);
+    await act(async () => rootP.unmount());
+    globalThis.fetch = earlierFetch;
+    await act(async () => { await resources.connections.refresh(); });
+  }
 
   // The built-in Local outbox detail has NO edit/disconnect actions.
   act(() => {

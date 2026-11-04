@@ -847,6 +847,8 @@ export interface AgentDetail {
 export type Meta = Api.MetaResponse & {
   /** A hosted board sets this when its Worker serves /api/wiki. */
   wiki?: boolean;
+  /** The Settings sections this board serves for this viewer. Absent: not stated. */
+  settings_sections?: readonly string[];
 };
 
 export interface Health {
@@ -1609,6 +1611,8 @@ export interface ConnectionsPayload {
   /** CAD-1126: enrolled SMTP senders send through the hosted
    *  `smtp.internal` pass-through (a hosted workspace). */
   hosted_smtp?: boolean;
+  /** The list is partial: the board couldn't reach the platform's accounts. */
+  connections_unavailable?: { code?: string; message?: string };
 }
 
 export interface ConnectionPayload {

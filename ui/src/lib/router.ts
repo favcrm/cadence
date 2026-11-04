@@ -42,7 +42,7 @@ import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } fr
  */
 
 export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows" | "settings";
-export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences";
+export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences" | "general" | "custody";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). `trash`
  *  is the operator's deleted-landing browser (CAD-2018); its selector is a
  *  server-issued `.trash/…` value, never a logical wiki path. */
@@ -297,6 +297,8 @@ export function matchRoute(pathname: string): Route {
       if (a === "preferences") return { screen: "settings", section: "preferences" };
       if (a === "permissions") return { screen: "settings", section: "permissions" };
       if (a === "email") return { screen: "settings", section: "email" };
+      if (a === "general") return { screen: "settings", section: "general" };
+      if (a === "custody") return { screen: "settings", section: "custody" };
       if (a === "templates") return { screen: "settings", section: "templates" };
       if (a === "connections") {
         if (!b) return { screen: "settings", section: "connections" };
@@ -404,6 +406,8 @@ export function routePath(route: Route): string {
         return "/settings/connections";
       }
       if (route.section === "email") return "/settings/email";
+      if (route.section === "general") return "/settings/general";
+      if (route.section === "custody") return "/settings/custody";
       if (route.section === "templates") return "/settings/templates";
       return "/settings";
     case "notFound":
