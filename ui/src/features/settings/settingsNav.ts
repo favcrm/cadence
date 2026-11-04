@@ -2,7 +2,7 @@ import type { SettingsSection } from "../../lib/router";
 
 export type SettingsIcon =
   | "preferences" | "connections" | "email" | "general"
-  | "status" | "agents" | "memory" | "permissions" | "custody" | "account";
+  | "status" | "agents" | "memory" | "permissions" | "custody" | "account" | "members";
 
 export type SettingsNavEntry = { section: SettingsSection; label: string; icon: SettingsIcon };
 export type SettingsNavGroupSpec = { label: string; items: SettingsNavEntry[] };
@@ -18,6 +18,9 @@ const ENTRIES = {
   permissions: { section: "permissions", label: "Master permissions", icon: "permissions" },
   custody: { section: "custody", label: "Advanced custody", icon: "custody" },
   account: { section: "account", label: "Account", icon: "account" },
+  /** CAD-2115: hosted only — a native board has no tenant member list, so this
+   *  entry is offered only by a board that names `members` in its sections. */
+  members: { section: "members", label: "Members", icon: "members" },
 } satisfies Record<string, SettingsNavEntry>;
 
 /** The fields of `/api/meta` that decide what Settings offers. */
@@ -29,7 +32,8 @@ export type SettingsMeta = {
 /**
  * Which sections to offer. A board that sends `settings_sections` has said what
  * it serves, so only those appear. One that doesn't (a native board, or a hosted
- * board that predates the field) keeps the full list.
+ * board that predates the field) keeps the full list — which has no `members`:
+ * a native board has no tenant member list to show.
  */
 export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
   const account = meta?.platform_account_configured ? [ENTRIES.account] : [];
@@ -45,21 +49,34 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
     names.filter((name) => listed.includes(name)).map((name) => ENTRIES[name]);
   return [
     { label: "You", items: pick("preferences") },
-    { label: "Workspace", items: pick("connections", "email", "general") },
+    // CAD-2115: Members leads the workspace pages, as the approved mockup shows.
+    { label: "Workspace", items: pick("members", "connections", "email", "general") },
     { label: "System", items: [...pick("status"), ...account] },
   ].filter((group) => group.items.length > 0);
 }
 
 /**
+ * Sections only a hosted board can serve. A native board has no tenant member
+ * list, so it neither offers nor mounts one.
+ */
+const HOSTED_ONLY: readonly SettingsSection[] = ["members"];
+
+/**
  * Where a request for `section` should land instead, or null when it is fine.
  * Nothing moves until the board has said what it serves, and an unknown list
- * refuses nothing, so a slow or old board can't lose a working page.
+ * refuses nothing, so a slow or old board can't lose a working page. The one
+ * exception is a hosted-only section: a board that answered without it is
+ * native, where that page does not exist — a direct link moves instead of
+ * mounting a page that has nothing to read.
  */
 export function settingsRedirect(section: SettingsSection, meta: SettingsMeta): SettingsSection | null {
-  if (!meta?.settings_sections) return null;
+  if (!meta) return null;
   const groups = settingsNavGroups(meta);
   if (groups.some((group) => group.items.some((item) => item.section === section))) return null;
-  // Agents is the bare /settings route; a board without it opens on its first working page.
+  // No list at all: a native board. Only a hosted-only page is refused there;
+  // every other section is one this board still has.
+  if (!meta.settings_sections && !HOSTED_ONLY.includes(section)) return null;
+  // Workspace leads; a member whose board serves none of it keeps the first group.
   const workspace = groups.find((group) => group.label === "Workspace")?.items[0];
   return workspace?.section ?? groups[0]?.items[0]?.section ?? "preferences";
 }

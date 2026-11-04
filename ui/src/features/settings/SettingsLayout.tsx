@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { BrainIcon, GlobalIcon, Key01Icon, Mail01Icon, Shield01Icon, SlidersHorizontalIcon, UserIcon } from "@hugeicons/core-free-icons";
+import { BrainIcon, GlobalIcon, Key01Icon, Mail01Icon, Shield01Icon, SlidersHorizontalIcon, UserIcon, UserMultiple02Icon } from "@hugeicons/core-free-icons";
 import Link from "../../ui/Link";
 import { IconAgents, IconConnection, IconPulse } from "../../ui/icons";
 import { useTranslate } from "../../lib/locale";
@@ -23,6 +23,7 @@ const ICONS: Record<SettingsIcon, ReactNode> = {
   permissions: line(Shield01Icon),
   custody: line(Key01Icon),
   account: line(UserIcon),
+  members: line(UserMultiple02Icon),
 };
 
 /**
