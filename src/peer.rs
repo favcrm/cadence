@@ -368,8 +368,9 @@ fn agent_runtime_marker(environ: &[u8]) -> Option<&'static str> {
 /// so [`operator_proof`] accepts it. On the production store, a known runtime
 /// marker on the caller's ancestry refuses it. This only narrows (ADR 0005 P3):
 /// it stops an agent acting as the operator by accident. One that scrubs its
-/// environment, or starts through `systemd-run`, cron or `ssh localhost`, still
-/// passes. An unreadable hop is skipped, as in [`operator_proof`].
+/// environment and leaves the marked ancestry (`setsid -f env -i`), or starts
+/// through `systemd-run`, cron or `ssh localhost`, still passes. An unreadable
+/// hop is skipped, as in [`operator_proof`].
 pub(crate) fn refuse_agent_runtime(peer_pid: u32, state_dir: &Path) -> Result<(), String> {
     if !production_store(state_dir) {
         return Ok(());

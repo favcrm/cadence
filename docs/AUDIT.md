@@ -305,8 +305,16 @@ board writes, `slot_reconcile` and these verbs alike.
 On the default store, daemon operator verbs, rollout verbs and the board's
 peer proof also refuse a caller with a known coding-agent runtime variable on
 its ancestry (CAD-2059). This is a guardrail against accidents, not a boundary:
-an agent that scrubs its environment, or starts through `systemd-run`, cron or
-`ssh localhost`, still passes. Other stores are not covered. `cadence daemon
+an agent that scrubs its environment and leaves the marked ancestry (`setsid -f
+env -i`), or starts through `systemd-run`, cron or `ssh localhost`, still passes.
+Other stores are not covered. The check compares the store with the default in
+the environment of the process that runs it. For daemon verbs and the board that
+is the service, as set when it started: a service pinned to the real store but
+started with `HOME` or `CADENCE_HOME` moved (`XDG_STATE_HOME` on the legacy
+layout) is unguarded on those paths until it restarts from the normal
+environment. For rollout verbs and `cadence update` it is the caller: moving
+those variables on the call while pinning the real store skips the guard.
+`cadence daemon
 start` and `cadence ui start` strip these variables from the service they start,
 because a service started from an agent's shell is not that agent, so a board
 started that way still passes. A direct `cadence ui run` from an agent's shell is
@@ -323,8 +331,8 @@ scrubbed env and stdio (`operator_secret_theft_residual_pinned` pins
 it). **A same-uid process cadence never launched needs little or no
 evasion**: an agent CLI the operator started by hand, outside every
 registered pane, passes the proof as it is when it carries no known
-marker or runs on another store, and otherwise only has to scrub its
-environment (before CAD-2059, the PR #249 reviewer minted a link from
+marker or runs on another store, and otherwise has to scrub its
+environment and leave the marked ancestry (before CAD-2059, the PR #249 reviewer minted a link from
 its own Claude Code shell). Either way it can read the file. A board
 session is two credentials: the HttpOnly cookie and a key the signed-in
 tab keeps in its `sessionStorage` and sends as `X-Cadence-Session`.

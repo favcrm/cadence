@@ -37,9 +37,10 @@ connection. A `--state-dir` pin stays a plain local binding.
 
 `cadence update` is operator-only and proves it the same way
 `rollout claim --as` does: the process must run outside every pane and
-managed endpoint, which an agent, a pane descendant or an unproven
-caller can never satisfy — a forged `--as` or scrubbed environment
-changes nothing. `--as operator:<name>` is now optional: it only names
+managed endpoint, which a process in a registered agent's pane or a pane
+descendant cannot satisfy. A forged `--as` changes nothing. Scrubbing alone does
+not help a process cadence launched, but scrubbing and detaching can, and a
+hand-started process needs less: see `docs/AUDIT.md`. `--as operator:<name>` is now optional: it only names
 the audit label. Without it, the run is labelled from the proven local
 OS identity (the real uid and pid), never from `$USER`,
 `$CADENCE_ALIAS` or a client-supplied field.

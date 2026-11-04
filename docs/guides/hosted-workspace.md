@@ -616,9 +616,10 @@ schema and release PRs, and two of them satisfy other PRs; AGENTS.md "Review"), 
 `routine` or `ui/**` PR still merges with the temporary
 `--exception --advisory ...` path (exact-head operator approval and two
 advisory links, standards and spec-security, plus browser-qa for a `ui/`
-change, even where the board asks for fewer or no approval. A hosted `routine`
-PR needs this route too, because a hosted board has no readiness record yet; ends at `EXCEPTION_ENDS` in
-`scripts/delivery-gate`, 2026-12-31); see AGENTS.md "Review". The exception
+change, even where the board asks for fewer or no approval; ends at
+`EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31); see AGENTS.md "Review".
+A hosted `routine` PR needs this route too, because a hosted board has no
+readiness record yet. The exception
 only checks that the advisory links are separate https URLs; it proves neither
 head binding nor that Browser QA ran. Agents in this workspace do
 not run `audit verdict` below: they post findings as a PR comment and use it as
