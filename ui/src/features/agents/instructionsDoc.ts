@@ -38,7 +38,8 @@ export type DocOutcome =
   /** The answer never arrived: the write may or may not have happened. */
   | { kind: "unconfirmed" }
   /** A check found the write did not happen. */
-  | { kind: "not_saved"; profile: StoredAgentProfile | null }
+  /** `text` is what a native check read, so a different one can be shown. */
+  | { kind: "not_saved"; profile: StoredAgentProfile | null; text?: string | null }
   /** The board said no, so nothing was written. */
   | { kind: "refused"; message: string };
 
@@ -144,17 +145,18 @@ export async function saveNative(deps: DocDeps, alias: string, text: string): Pr
 
 /** After a dropped save: read what is stored and say whether it is ours. */
 export async function checkHosted(deps: DocDeps, base: StoredAgentProfile, text: string): Promise<DocOutcome> {
-  let latest: StoredAgentProfile;
+  // A read that answers with something unusable tells nothing: unconfirmed.
   try {
-    latest = await deps.readProfile(base.id);
+    const latest = await deps.readProfile(base.id);
+    if (typeof latest.revision !== "number" || typeof latest.responsibilities !== "string") throw new Error("unusable read");
+    if (latest.revision > base.revision && latest.responsibilities === text.trim()) {
+      return { kind: "saved", text: latest.responsibilities, profile: latest, applies: null };
+    }
+    if (latest.revision === base.revision) return { kind: "not_saved", profile: latest };
+    return { kind: "conflict", profile: latest };
   } catch {
     return { kind: "unconfirmed" };
   }
-  if (latest.revision > base.revision && latest.responsibilities === text.trim()) {
-    return { kind: "saved", text: latest.responsibilities, profile: latest, applies: null };
-  }
-  if (latest.revision === base.revision) return { kind: "not_saved", profile: latest };
-  return { kind: "conflict", profile: latest };
 }
 
 export async function checkNative(deps: DocDeps, alias: string, text: string): Promise<DocOutcome> {
@@ -167,7 +169,7 @@ export async function checkNative(deps: DocDeps, alias: string, text: string): P
   // Not served is not "different": nothing was learned, so it stays unconfirmed.
   if (latest === null) return { kind: "unconfirmed" };
   if (latest === text) return { kind: "saved", text, profile: null, applies: null };
-  return { kind: "not_saved", profile: null };
+  return { kind: "not_saved", profile: null, text: latest };
 }
 
 /** The toast after a save, saying when the agent sees the new text. A turn
@@ -213,7 +215,9 @@ export function estimateTokens(text: string): number {
 /** A line of the Context drawer: what loads, and an estimate where one is honest. */
 export interface ContextLine {
   name: string;
+  /** English with `{n}` standing for `count`, so it can be translated. */
   size: string;
+  count?: number;
 }
 
 /** What loads, said only where it is true. Only the document is measured, and
@@ -227,7 +231,7 @@ export function contextOf(text: string, kind: DocKind | null, applies: string | 
     { name: "Tool definitions", size: "Not counted" },
   ];
   if (kind === "native" && applies === "not_delivered") return { heading: "Loaded at session start", lines: rest };
-  const own: ContextLine = { name: "Instructions", size: `About ${estimateTokens(text).toLocaleString("en")} tokens (estimate)` };
+  const own: ContextLine = { name: "Instructions", size: "About {n} tokens (estimate)", count: estimateTokens(text) };
   return {
     heading: kind === "hosted" ? "A session that loads this profile starts with" : "Every session starts with",
     lines: [own, ...rest],

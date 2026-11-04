@@ -3,6 +3,7 @@
  * profile revision; native overwrites. Each outcome is a different promise to
  * the person editing, so each is driven here against a fake board.
  */
+import { translateUiText } from "../src/lib/locale";
 import { ApiError } from "../src/lib/apiError";
 import type { StoredAgentProfile } from "../src/lib/types";
 import {
@@ -166,6 +167,17 @@ async function main() {
     "native check: a text the board does not serve tells nothing, so it stays unconfirmed",
   );
 
+  // A check whose read answers with nothing usable is unconfirmed, not a crash.
+  check(
+    (await checkHosted(deps({ readProfile: async () => ({}) as StoredAgentProfile }).deps, profile(), "x")).kind === "unconfirmed",
+    "a malformed check read settles as unconfirmed",
+  );
+  check((await checkNative(deps({ readNative: async () => "other" }).deps, "ads", "x")).kind === "not_saved", "native check: other text");
+  {
+    const out = await checkNative(deps({ readNative: async () => "other" }).deps, "ads", "x");
+    check(out.kind === "not_saved" && out.text === "other", "native not_saved carries what it read");
+  }
+
   // Native overwrites and says when it applies.
   {
     const out = await saveNative(deps().deps, "ads", "text");
@@ -215,6 +227,11 @@ async function main() {
   const undelivered = contextOf("x", "native", "not_delivered");
   check(!undelivered.lines.some((l) => l.name === "Instructions") && !/Every session/.test(undelivered.heading), "not delivered: the instructions are not stated as loaded");
   check(contextOf("x".repeat(40), "native", "next_turn").lines[0]!.size.includes("(estimate)"), "the figure is labelled an estimate");
+  // zh-TW: the History line has its own key; "By" stays "deleted by".
+  const by = translateUiText("By {actor}", "zh-TW");
+  check(by !== "By {actor}" && !by.includes("刪除") && by.includes("{actor}"), "History 'By' has its own zh-TW key");
+  check(translateUiText("By", "zh-TW") === "刪除者", "the existing 'By' is left alone");
+  check(translateUiText("About {n} tokens (estimate)", "zh-TW") !== "About {n} tokens (estimate)", "the estimate translates");
   console.log("instructionsDoc checks passed");
 }
 void main().catch((e: unknown) => {

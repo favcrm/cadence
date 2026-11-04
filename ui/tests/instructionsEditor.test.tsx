@@ -55,6 +55,7 @@ async function main() {
   let nativeFails: (() => Error) | null = null;
   let nativeStored: string | null = "native text";
   let nativeMode = false;
+  let reloads = 0;
   const deps: DocDeps = {
     readProfile: async () => stored,
     writeProfile: async (_id, body) => {
@@ -76,7 +77,7 @@ async function main() {
 
   function Harness({ writable, tick }: { writable: boolean; tick: number }) {
     const doc = useInstructionsDoc({
-      alias: "ads-agent", kind: nativeMode ? "native" : "hosted", profileId: nativeMode ? null : "ap_1", nativeServed: nativeMode ? "native text" : null, writable, onSaved: () => {},
+      alias: "ads-agent", kind: nativeMode ? "native" : "hosted", profileId: nativeMode ? null : "ap_1", nativeServed: nativeMode ? "native text" : null, writable, onSaved: () => { reloads += 1; },
       toast: toast as never, deps,
     });
     if (doc.read !== "ready") return React.createElement("p", null, "loading");
@@ -227,9 +228,13 @@ async function main() {
   await click("Discard");
 
   // A viewer reads it and cannot change it.
+  await click("Edit");
   await render(false);
   assert(area().readOnly && !button("Save") && !button("Discard"), "a viewer reads, and has no write action");
-  assert(!button("Edit") && !button("Preview"), "a reader has no inert Edit toggle");
+  assert(!button("Edit"), "a reader has no inert Edit toggle");
+  assert(button("Preview") && !button("Preview")!.hidden && area().value.length > 0 && !area().hidden, "a reader still reads the text by default, and can preview it");
+  await click("Preview");
+  assert(host.querySelector(".ap-doc-preview"), "a reader gets Preview");
 
   // Native has no revision: a 409 there is a refusal, not use-theirs or save-mine.
   nativeMode = true;
@@ -249,7 +254,42 @@ async function main() {
   toasts.length = 0;
   await click("Check now");
   assert(button("Check now") && !toasts.some(([, text]) => /did not save/.test(text)), "a null native read stays unconfirmed");
+  // A native read that finds other text shows it: Check says so and keeps the
+  // draft, Discard shows the board's text; neither says "did not save" over it.
   await React.act(async () => { root2.unmount(); });
+  const root3 = createRoot(host);
+  await React.act(async () => { root3.render(React.createElement(Harness, { writable: true, tick: 10 })); });
+  await flush();
+  nativeFails = null;
+  nativeStored = "native text";
+  await type("lost A");
+  nativeFails = () => new TypeError("Failed to fetch");
+  await click("Save");
+  nativeStored = "SOMEONE ELSE";
+  reloads = 0;
+  toasts.length = 0;
+  await click("Check now");
+  assert(toasts.some(([, text]) => /different version, now shown/.test(text)) && !toasts.some(([, text]) => text.startsWith("It did not save")), "native Check reports someone else's text");
+  assert(reloads === 1 && area().value === "lost A", "and reloads the page's stored text, keeping the draft");
+  await click("Discard");
+  nativeFails = () => new TypeError("Failed to fetch");
+  await type("lost B");
+  await click("Save");
+  nativeStored = "ELSE AGAIN";
+  reloads = 0;
+  toasts.length = 0;
+  await click("Discard");
+  assert(toasts.some(([, text]) => /different version, now shown/.test(text)), "native Discard says the board holds a different version");
+  assert(reloads === 1 && area().value === "ELSE AGAIN", "and shows what the board holds");
+  // Same text as the page holds stored: then, and only then, "did not save".
+  await type("lost C");
+  await click("Save");
+  nativeStored = "ELSE AGAIN";
+  reloads = 0;
+  toasts.length = 0;
+  await click("Discard");
+  assert(toasts.some(([, text]) => /did not save/.test(text)) && reloads === 0, "an unchanged board is the only time it says did not save");
+  await React.act(async () => { root3.unmount(); });
   console.log("instructionsEditor checks passed");
 }
 void main().catch((e: unknown) => { console.error(e); process.exit(1); });

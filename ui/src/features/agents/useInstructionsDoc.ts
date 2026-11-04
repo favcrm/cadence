@@ -46,6 +46,8 @@ export interface InstructionsDoc {
   profile: StoredAgentProfile | null;
   /** Native: what the last save said about when the agent reads it. */
   applies: string | null;
+  /** What the busy phase is doing, so a read is not labelled "Saving". */
+  working: "save" | "check" | null;
   selection: MutableRefObject<DocSelection>;
   retry: () => void;
   save: () => void;
@@ -81,6 +83,7 @@ export function useInstructionsDoc(opts: {
   const [nativeSaved, setNativeSaved] = useState<string | null>(null);
   const [applies, setApplies] = useState<string | null>(null);
   const [retries, setRetries] = useState(0);
+  const [working, setWorking] = useState<"save" | "check" | null>(null);
   const selection = useRef<DocSelection>({ start: 0, end: 0, top: 0 });
   const busy = useRef(false);
   /** The exact text a save sent, and the profile it was sent from. A check
@@ -157,14 +160,19 @@ export function useInstructionsDoc(opts: {
           if (out.profile) setProfile(out.profile);
           setPhase("idle");
           setDraftState(text);
-          toast("warn", "It did not save. Your draft is kept.");
+          // A native read that found other text than the page holds: show it.
+          if (out.text != null && out.text !== served) {
+            setNativeSaved(out.text);
+            onSaved();
+            toast("warn", "The board holds a different version, now shown. Your draft is kept.");
+          } else toast("warn", "It did not save. Your draft is kept.");
           return;
         case "refused":
           setPhase(phase === "conflict" ? "conflict" : "idle");
           toast("err", out.message);
       }
     },
-    [kind, adopt, toast, t, onSaved, phase],
+    [kind, adopt, toast, t, onSaved, phase, served],
   );
 
   const run = useCallback(
@@ -173,10 +181,12 @@ export function useInstructionsDoc(opts: {
       busy.current = true;
       if (!wasCheck) sent.current = { text, base };
       setPhase("saving");
+      setWorking(wasCheck ? "check" : "save");
       try {
-        settle(await job(), text, wasCheck);
+        settle(await job().catch((): DocOutcome => ({ kind: "unconfirmed" })), text, wasCheck);
       } finally {
         busy.current = false;
+        setWorking(null);
       }
     },
     [settle],
@@ -201,6 +211,7 @@ export function useInstructionsDoc(opts: {
     phase,
     profile,
     applies,
+    working,
     selection,
     retry: () => setRetries((n) => n + 1),
     save: () => {
@@ -255,29 +266,37 @@ export function useInstructionsDoc(opts: {
       if (!job || busy.current) return;
       busy.current = true;
       setPhase("saving");
+      setWorking("check");
       void job()
+        .catch((): DocOutcome => ({ kind: "unconfirmed" }))
         .then((out) => {
           if (out.kind === "saved") {
             adopt(out);
-            toast("ok", `${t("It did save, so the board holds your text.")}`);
+            toast("ok", "It did save, so the board holds your text.");
             if (!out.profile) onSaved();
           } else if (out.kind === "unconfirmed") {
             setPhase("unconfirmed");
             toast("warn", "Still can’t reach the board, so nothing was discarded.");
           } else {
-            if (out.kind === "conflict" || out.kind === "not_saved") if (out.profile) setProfile(out.profile);
+            if (out.kind !== "refused" && out.profile) setProfile(out.profile);
+            const other = out.kind === "not_saved" && out.text != null && out.text !== served;
+            if (other) {
+              setNativeSaved(out.text as string);
+              onSaved();
+            }
             setDraftState(null);
             setPhase("idle");
             toast(
               "ok",
-              out.kind === "conflict"
+              out.kind === "conflict" || other
                 ? "The board holds a different version, now shown. Your draft is discarded."
-                : "It did not save. The board holds the earlier text, now shown.",
+                : "It did not save. The board’s current text is shown.",
             );
           }
         })
         .finally(() => {
           busy.current = false;
+          setWorking(null);
         });
     },
   };

@@ -46,7 +46,7 @@ export default function InstructionsEditor({
   const unsaved = dirty || pending;
   // Whatever is unsaved stays on screen, even while the board can't take a
   // write: a missing Save must never read as "saved".
-  const view = writable || unsaved ? mode : "edit";
+  const view = mode;
   const hint = !writable
     ? doc.phase === "unconfirmed"
       ? "Not confirmed. The board isn’t answering; check once it does."
@@ -83,17 +83,22 @@ export default function InstructionsEditor({
   return (
     <div className="ap-doc">
       <div className="ap-doc-bar">
-        {/* A reader has nothing to edit, so Edit would be inert. */}
-        {(writable || unsaved) && (
-          <div className="rc-cats" role="group" aria-label={t("Instructions view")}>
+        {/* A reader has nothing to edit, so only Edit is left out: Preview stays. */}
+        <div className="rc-cats" role="group" aria-label={t("Instructions view")}>
+          {(writable || unsaved) && (
             <button type="button" className="rc-cat" aria-pressed={mode === "edit"} onClick={toEdit}>
               {t("Edit")}
             </button>
-            <button type="button" className="rc-cat" aria-pressed={mode === "preview"} onClick={toPreview}>
-              {t("Preview")}
-            </button>
-          </div>
-        )}
+          )}
+          <button
+            type="button"
+            className="rc-cat"
+            aria-pressed={mode === "preview"}
+            onClick={mode === "preview" && !(writable || unsaved) ? toEdit : toPreview}
+          >
+            {t("Preview")}
+          </button>
+        </div>
         <span className="ap-doc-spacer" />
         {editable && resetTo !== null && text !== resetTo && (
           <button type="button" className="ap-link" onClick={() => doc.setDraft(resetTo)}>
@@ -157,7 +162,7 @@ export default function InstructionsEditor({
                 {t("Discard")}
               </Button>
               <Button variant="primary" size="sm" disabled={!writable || saving || problem !== null} onClick={doc.save}>
-                {saving ? t("Saving…") : t("Save")}
+                {saving ? t(doc.working === "check" ? "Checking…" : "Saving…") : t("Save")}
               </Button>
             </>
           )}
@@ -180,7 +185,7 @@ export default function InstructionsEditor({
                       {contextLines.map((line) => (
                         <li key={line.name}>
                           <span>{t(line.name)}</span>
-                          <span className="ap-doc-muted">{t(line.size)}</span>
+                          <span className="ap-doc-muted">{t(line.size).replace("{n}", () => (line.count ?? 0).toLocaleString("en"))}</span>
                         </li>
                       ))}
                     </ul>

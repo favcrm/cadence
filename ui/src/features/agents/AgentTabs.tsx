@@ -390,7 +390,7 @@ function History({ c }: { c: TabContext }) {
       key: `e-${e.seq}`,
       name: edit ? t("Instructions edited") : e.kind,
       line: [
-        edit ? (edit.by ? `${t("By")} ${edit.by}` : t("Who isn’t recorded")) : (e.task_id ?? e.job_id),
+        edit ? (edit.by ? t("By {actor}").replace("{actor}", () => edit.by as string) : t("Who isn’t recorded")) : (e.task_id ?? e.job_id),
         fmtTime(e.at),
       ]
         .filter(Boolean)
