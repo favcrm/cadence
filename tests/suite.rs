@@ -7471,13 +7471,14 @@ mod cad2100_classifier_merge_base {
         refused_with(&result, "differs from the PR file count");
     }
 
-    // CAD-2117 acceptance: the gate gaps that item 1, 2 and 3 of the ticket name, driven
+    // CAD-2117 acceptance: the gate gaps the ticket names (human-class files, several or hidden merge bases,
+    // renames, shallow checkouts), driven
     // through the real script and the real daemon classifier. Nested so it can use the
     // module's stub, repository and daemon helpers, which are private to it.
     mod cad2117_gate_gaps {
         use super::*;
 
-        const CLASSIFIER: [&str; 7] = [
+        const HUMAN_FILES: [&str; 11] = [
             "crates/cadence-core/src/delivery_requirements.rs",
             "crates/cadence-core/src/delivery_rules.rs",
             "src/daemon/delivery_requirements_rpc.rs",
@@ -7485,15 +7486,19 @@ mod cad2100_classifier_merge_base {
             "crates/cadence-core/src/lib.rs",
             "crates/cadence-core/src/evaluate.rs",
             "src/daemon/unattended_landing.rs",
+            "src/issue/mod.rs",
+            "src/lib.rs",
+            "crates/cadence-core/src/wasm.rs",
+            "src/daemon/delivery_rpc.rs",
         ];
 
-        // 1. Each classifier file is human-class by path: the script and the classifier
+        // 1. Each of these files is human-class by path: the script and the classifier
         // both ask for the operator, with a stale lean answer and with no list naming it.
         #[test]
         fn a_change_to_a_classifier_file_requires_the_operator_in_both_halves() {
             let repo = Repo::new();
             let daemon = Daemon::start();
-            for (i, file) in CLASSIFIER.iter().enumerate() {
+            for (i, file) in HUMAN_FILES.iter().enumerate() {
                 let head = repo.touching(&format!("cls{i}"), &repo.tip, &[file]);
                 let run = gate(&repo, &head).unapproved().run();
                 run.refused(&[HUMAN, NO_APPROVAL]);
@@ -7563,49 +7568,76 @@ mod cad2100_classifier_merge_base {
             }
         }
 
-        // 4. A shallow checkout can hide a second merge base: refused, naming the way out,
-        // under a stale lean answer. Main's tip merges `fix` and `side`; the head reaches `fix`
-        // at once but `side` only through two more commits, so a depth-3 cut leaves one merge
-        // base (`fix`) where the full history has two, and hides the restored `src/peer.rs`.
+        // 4. A shallow checkout can hide a merge base: refused, naming the way out, under a stale
+        // lean answer. Main's tip merges `fix` and `side`. The head merges `side` with `y`, which
+        // reaches `fix` only through `z`, so a depth-3 cut leaves `side` as the single merge
+        // base, and its diff to the head no longer shows the restored `src/peer.rs`.
         #[test]
         fn a_shallow_checkout_is_refused_where_the_cut_hides_a_merge_base() {
             let repo = Repo::new();
             let d = repo.work();
             let fix = repo.branch("fix", &repo.base, |d| put(d, "src/peer.rs", "fixed\n"));
             let side = repo.branch("side", &repo.base, |d| put(d, "docs/side.md", "x\n"));
-            let z = repo.branch("z", &side, |d| put(d, "docs/z.md", "x\n"));
+            let z = repo.branch("z", &fix, |d| put(d, "docs/z.md", "x\n"));
             let y = repo.branch("y", &z, |d| put(d, "docs/y.md", "x\n"));
             git(&d, &["checkout", "-q", "-B", "tip", &fix]);
             git(&d, &["merge", "-q", "--no-ff", "--no-edit", &side]);
             let tip = git(&d, &["rev-parse", "HEAD"]);
-            git(&d, &["checkout", "-q", "-B", "head", &y]);
-            git(&d, &["merge", "-q", "--no-ff", "--no-edit", &fix]);
+            git(&d, &["checkout", "-q", "-B", "head", &side]);
+            git(&d, &["merge", "-q", "--no-ff", "--no-edit", &y]);
             git(&d, &["checkout", &repo.base, "--", "src/peer.rs"]);
             let head = commit(&d, "restore peer");
             git(&d, &["checkout", "-q", "main"]);
             // Only `tip` and `head` may keep the history alive in the clone.
             git(&d, &["branch", "-q", "-D", "fix", "side", "z", "y"]);
             let bases = |dir: &Path| git(dir, &["merge-base", "--all", &tip, &head]);
-            assert_eq!(bases(&d).lines().count(), 2);
+            assert_eq!(bases(&d).lines().count(), 2, "full history has two bases");
             let shallow = clone_of(&repo, &["--depth", "3"]);
-            assert_eq!(
-                git(&shallow.work(), &["rev-parse", "--is-shallow-repository"]),
-                "true"
+            let w = shallow.work();
+            assert_eq!(git(&w, &["rev-parse", "--is-shallow-repository"]), "true");
+            assert_eq!(bases(&w), side, "the cut should leave only `side`");
+            let diff = git(&w, &["diff", "--name-only", &side, &head]);
+            assert!(
+                !diff.contains("src/peer.rs"),
+                "the cut should hide it: {diff}"
             );
-            assert_eq!(bases(&shallow.work()), fix, "the cut should leave one base");
             gate(&shallow, &head)
                 .main_at(&tip)
                 .run()
                 .refused(&["git fetch --unshallow"]);
         }
 
-        // 5. A partial clone keeps the whole history, so shallowness is not why it is refused.
+        // 5. A git that cannot say whether the checkout is shallow is refused, not guessed at.
+        #[test]
+        fn a_checkout_that_cannot_say_whether_it_is_shallow_is_refused() {
+            let repo = Repo::new();
+            let head = repo.touching("plain", &repo.tip, &["docs/y.md"]);
+            let bin = repo.dir.path().join(".stubs");
+            std::fs::create_dir_all(&bin).unwrap();
+            let shim = bin.join("git");
+            let script = "#!/bin/sh\ncase \"$*\" in *--is-shallow-repository*) exit 1;; esac\nexec /usr/bin/git \"$@\"\n";
+            std::fs::write(&shim, script).unwrap();
+            std::fs::set_permissions(&shim, PermissionsExt::from_mode(0o755)).unwrap();
+            gate(&repo, &head)
+                .run()
+                .refused(&["cannot tell whether this checkout is shallow"]);
+        }
+
+        // 6. A partial clone keeps the whole history: the diff is read (a human-class file
+        // is found) and shallowness is not mentioned.
         #[test]
         fn a_partial_clone_is_not_refused_for_being_shallow() {
             let repo = Repo::new();
-            let head = repo.touching("plain", &repo.tip, &["docs/y.md"]);
+            let file = "crates/cadence-core/src/delivery.rs";
+            let head = repo.touching("plain", &repo.tip, &[file]);
             let partial = clone_of(&repo, &["--filter=blob:none"]);
-            let run = gate(&partial, &head).run();
+            let run = gate(&partial, &head).unapproved().run();
+            run.refused(&[HUMAN, NO_APPROVAL]);
+            assert!(
+                run.stdout.contains(&format!("class: human ({file}")),
+                "{}",
+                run.show()
+            );
             assert!(!run.said().contains("shallow"), "{}", run.show());
         }
 
