@@ -162,9 +162,10 @@ pub(crate) enum PlatformAction {
         #[arg(long)]
         query: Option<String>,
         /// Stable handle for this call. A hosted org replays the recorded
-        /// outcome of the same handle instead of charging twice, so an
-        /// identical resubmission is safe; pass a fresh handle to run the
-        /// same call again. Omitted: derived from the tool and its input.
+        /// outcome of the same handle instead of charging twice. A local
+        /// connected read creates a fresh handle when omitted and reports it
+        /// if its outcome is unknown. Other hosted calls derive an omitted
+        /// handle from the tool and input.
         #[arg(long)]
         request: Option<String>,
         /// Disambiguate when several adapters declare the same tool.
@@ -383,11 +384,15 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
             let input = input.as_deref().ok_or_else(|| {
                 Error::usage("platform call needs --input or, on a hosted org, --query")
             })?;
+            // Read input before opening the session so a slow stdin cannot hold
+            // a daemon connection between discovery and the paid call.
+            let input = parse_platform_input(input)?;
             let mut listing = json!({});
             if let Some(project) = project {
                 listing["project"] = json!(project);
             }
-            let tools = rpc("platform_tools", listing)?;
+            let mut session = client::RpcSession::connect(state_dir)?;
+            let tools = session.answer("platform_tools", listing)??;
             let (owner, facts) = resolve_platform_tool(&tools, tool, platform.as_deref())?;
             // A connector nobody has enrolled cannot run, and the listing says
             // why: refusing here keeps the reason the daemon computed instead
@@ -406,10 +411,11 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
             // so an incomplete call never reaches the platform.
             let (connection, max_charge) =
                 connected_read_flags(tool, facts, connection.clone(), *max_charge)?;
+            let agenticos_provider = owner == cadence_agent::platform::agenticos_provider::PLATFORM;
             let mut params = json!({
                 "platform": owner,
                 "tool": tool,
-                "input": parse_platform_input(input)?,
+                "input": input,
             });
             if let Some(account) = account {
                 params["account"] = json!(account);
@@ -417,8 +423,10 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
             if let Some(project) = project {
                 params["project"] = json!(project);
             }
-            if let Some(request) = request {
-                params["request"] = json!(request);
+            if !facts.connected_read {
+                if let Some(request) = request {
+                    params["request"] = json!(request);
+                }
             }
             if let Some(connection) = connection {
                 params["connection"] = json!(connection);
@@ -426,7 +434,45 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
             if let Some(max_charge) = max_charge {
                 params["max_charge_minor"] = json!(max_charge);
             }
-            print_json(&rpc("platform_call", params)?);
+            if facts.connected_read {
+                let generated;
+                let handle = match request.as_deref() {
+                    Some(handle) => handle,
+                    None => {
+                        generated = uuid::Uuid::new_v4().simple().to_string();
+                        &generated
+                    }
+                };
+                params["request"] = json!(handle);
+                let unknown = |reason: &str| {
+                    Error::unknown(format!(
+                        "Connected read outcome is unknown: {reason}. Provider key read-{handle}; reconcile with the same --request handle {handle:?}. No automatic retry was made."
+                    ))
+                };
+                let value = match session.answer("platform_call", params) {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) if matches!(error.kind(), "unknown" | "internal") => {
+                        return Err(unknown(&error.to_string()));
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => return Err(unknown(&error.to_string())),
+                };
+                if value["result"] != "executed"
+                    || value["effect"] != "read"
+                    || value.get("platform_result").is_none()
+                    || value["platform_result"].is_null()
+                    || (agenticos_provider
+                        && !cadence_agent::platform::agenticos_provider::valid_connected_read_receipt(
+                            &value["platform_result"],
+                        ))
+                {
+                    return Err(unknown("the daemon returned no confirmable receipt"));
+                }
+                print_json(&value);
+            } else {
+                drop(session);
+                print_json(&rpc("platform_call", params)?);
+            }
         }
         PlatformAction::Defaults => {
             print_json(&rpc("platform_defaults", json!({}))?);
@@ -487,8 +533,8 @@ pub(super) fn run(state_dir: PathBuf, action: PlatformAction) -> Result<i32> {
 pub(super) struct ToolFacts<'a> {
     pub(super) direct: bool,
     pub(super) connected_read: bool,
-    /// The listing's own reason when this tool cannot run yet — a connected
-    /// read with no enrolled account. `None` means runnable.
+    /// Why this tool cannot run: either the daemon's own availability reason
+    /// or an unsupported connected-read recovery protocol.
     pub(super) unavailable: Option<&'a str>,
 }
 
@@ -513,12 +559,20 @@ fn resolve_platform_tool<'a>(
             .flatten()
             .find(|decl| decl["tool"].as_str() == Some(tool))
         {
+            let connected_read = decl["connected_read"].as_bool().unwrap_or(false);
+            let unavailable = decl["unavailable"].as_str().or_else(|| {
+                (connected_read && decl["connected_read_recovery"].as_bool() != Some(true))
+                    .then_some(
+                        "this daemon does not support connected-read recovery; update and restart \
+                         it before calling this tool",
+                    )
+            });
             owners.push((
                 name.to_string(),
                 ToolFacts {
                     direct: decl["direct"].as_bool().unwrap_or(false),
-                    connected_read: decl["connected_read"].as_bool().unwrap_or(false),
-                    unavailable: decl["unavailable"].as_str(),
+                    connected_read,
+                    unavailable,
                 },
             ));
         }

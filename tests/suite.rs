@@ -11722,3 +11722,1363 @@ mod cad2108_gate_copy {
         assert!(out.calls.is_empty(), "{}", out.show());
     }
 }
+
+// CAD-2102 acceptance, authored independently of the fix; implementers must not
+// edit it. A paid connected read the provider accepted can lose its answer
+// (dropped connection, corrupt body, 409 idempotency_in_progress/uncertain, or
+// post-attempt 502 upstream_error). The caller must get an unknown outcome --
+// never a definite rejection -- carrying the exact operation key it can
+// reconcile with, even without --request. The CLI must choose the handle before
+// its daemon RPC, and the raw key (read-<handle>) must stay distinct from the
+// bare --request handle so a retry cannot double-prefix it. All state and
+// traffic are synthetic and loopback; every wait is event-driven with a timeout
+// only as the bounded failure safeguard. No fixed sleeps.
+#[cfg(feature = "test-seam")]
+mod cad2102_paid_read_unknown {
+    use serde_json::{json, Value};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Output, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    const TOOL: &str = "search_console_report";
+    const CONNECTION: &str = "con_21020000-0000-4000-8000-000000000001";
+    const ACCOUNT: &str = "synthetic";
+    // Mixed-case synthetic bearer: no >=8-character window can occur in the
+    // lowercase enrollment metadata or the hex fingerprint, so the credential
+    // redaction check never refuses the enrollment fixture itself.
+    const TOKEN: &str = "Zq7vX2Kp9Lm4Rt8";
+    // The qualified v2 read accepts exactly these three required fields.
+    const INPUT: &str = r#"{"site_url":"https://example.invalid/","start_date":"2026-10-01","end_date":"2026-10-31"}"#;
+
+    /// The synthetic provider's scripted answer to one accepted request.
+    #[derive(Clone, Debug)]
+    enum Answer {
+        /// Read the whole request, then close without response bytes.
+        Drop,
+        /// 200 with a body that is not complete JSON.
+        Corrupt,
+        /// A source-compatible idempotent replay of the same key.
+        Replay,
+        /// The source envelope's uncertainty: {ok:false,error:{code,message}}.
+        Refuse { status: u16, code: &'static str },
+        /// A literal 200 receipt envelope, for receipt-shape cases.
+        Receipt(Value),
+        /// 503 capability_unavailable: credential lookup failed before the
+        /// provider claim/reserve, so the read provably never ran.
+        CapabilityUnavailable,
+    }
+
+    struct Seen {
+        key: String,
+        authorization: Option<String>,
+        body: Value,
+    }
+
+    struct Provider {
+        base: String,
+        addr: SocketAddr,
+        requests: mpsc::Receiver<Seen>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Provider {
+        fn start(script: Vec<Answer>) -> Provider {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind synthetic provider");
+            let addr = listener.local_addr().expect("synthetic provider address");
+            let base = format!("http://{addr}");
+            let (send, requests) = mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                let mut next = 0usize;
+                loop {
+                    // Blocking accept; Drop wakes this with one sentinel
+                    // connection, consumed before anything is read.
+                    let (mut stream, _) = listener.accept().expect("provider accept");
+                    if thread_stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    // An unexpected extra request (an automatic replay) is
+                    // sent to the test, whose quiet check catches it.
+                    let answer = script.get(next).cloned().unwrap_or(Answer::Drop);
+                    next += 1;
+                    let seen = read_http(&mut stream);
+                    if send.send(seen).is_err() {
+                        return;
+                    }
+                    answer_request(&mut stream, answer);
+                }
+            });
+            Provider {
+                base,
+                addr,
+                requests,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        /// The next accepted request, or the bounded failure safeguard.
+        fn next(&self, what: &str) -> Seen {
+            self.requests
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("CAD-2102: the provider saw no request for {what}"))
+        }
+
+        /// Any automatic replay would have been dispatched before the CLI
+        /// process exited, so an empty channel is the no-replay proof.
+        fn assert_quiet(&self) {
+            assert!(
+                self.requests.try_recv().is_err(),
+                "CAD-2102: the provider received an unexpected extra request"
+            );
+        }
+    }
+
+    impl Drop for Provider {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect_timeout(&self.addr, Duration::from_secs(2));
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn read_http(stream: &mut TcpStream) -> Seen {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("provider read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("provider write timeout");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("read provider request line");
+        assert!(
+            request_line.ends_with('\n'),
+            "CAD-2102: the client closed before the provider request line"
+        );
+        let mut key = None;
+        let mut authorization = None;
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).expect("read provider header");
+            assert!(
+                read > 0,
+                "CAD-2102: the client closed in the provider headers"
+            );
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                break;
+            }
+            let (name, value) = line.split_once(':').expect("header line");
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            match name.as_str() {
+                "content-length" => length = value.parse().expect("content-length"),
+                "idempotency-key" => key = Some(value),
+                "authorization" => authorization = Some(value),
+                _ => {}
+            }
+        }
+        let mut body = vec![0u8; length];
+        reader
+            .read_exact(&mut body)
+            .expect("read provider request body");
+        drop(reader);
+        Seen {
+            key: key.expect("CAD-2102: the provider request carried no Idempotency-Key"),
+            authorization,
+            body: serde_json::from_slice(&body).expect("provider request body is JSON"),
+        }
+    }
+
+    fn answer_request(stream: &mut TcpStream, answer: Answer) {
+        match answer {
+            Answer::Drop => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            Answer::Corrupt => {
+                // A 200 whose body ends mid-structure: accepted, not parseable.
+                write_answer(
+                    stream,
+                    200,
+                    br#"{"ok":true,"data":{"repeated":true,"result":"#,
+                )
+            }
+            Answer::Replay => {
+                // Replay may omit effect/price; the same key, no new charge.
+                let body = serde_json::to_vec(&json!({
+                    "ok": true,
+                    "data": { "repeated": true, "result": { "clicks": 7 } }
+                }))
+                .unwrap();
+                write_answer(stream, 200, &body);
+            }
+            Answer::Refuse { status, code } => {
+                let body = serde_json::to_vec(&json!({
+                    "ok": false,
+                    "error": { "code": code, "message": "synthetic provider uncertainty" }
+                }))
+                .unwrap();
+                write_answer(stream, status, &body);
+            }
+            Answer::Receipt(envelope) => {
+                let body = serde_json::to_vec(&envelope).unwrap();
+                write_answer(stream, 200, &body);
+            }
+            Answer::CapabilityUnavailable => {
+                let body = serde_json::to_vec(&json!({
+                    "ok": false,
+                    "error": {
+                        "code": "capability_unavailable",
+                        "message": "Composio is not configured."
+                    }
+                }))
+                .unwrap();
+                write_answer(stream, 503, &body);
+            }
+        }
+    }
+
+    fn write_answer(stream: &mut TcpStream, status: u16, body: &[u8]) {
+        let reason = match status {
+            200 => "OK",
+            409 => "Conflict",
+            502 => "Bad Gateway",
+            _ => "Error",
+        };
+        let head = format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .expect("write provider response headers");
+        stream
+            .write_all(body)
+            .expect("write provider response body");
+        stream.flush().expect("flush provider response");
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    }
+
+    struct Fixture {
+        root: tempfile::TempDir,
+        state: PathBuf,
+        child: Child,
+    }
+
+    impl Fixture {
+        fn start(provider_base: &str) -> Fixture {
+            let root = tempfile::Builder::new()
+                .prefix("cad2102-paid-read-")
+                .tempdir_in("/tmp")
+                .expect("CAD-2102 temp root");
+            let state = root.path().join("state");
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::create_dir_all(root.path().join("config")).unwrap();
+            // The daemon opens its tracker at startup; an initialized empty
+            // project keeps the fixture on the ordinary path.
+            let pm = root.path().join("pm");
+            std::fs::create_dir_all(pm.join("cadence/CAD-1/reports")).unwrap();
+            cadence_agent::issue::Pm::init(&pm).unwrap();
+            std::fs::write(
+                pm.join("cadence/project.yaml"),
+                "key: cadence\nprefix: CAD\nrepos:\n- remote: https://github.com/favcrm/cadence.git\n",
+            )
+            .unwrap();
+            std::fs::write(
+                pm.join("cadence/CAD-1/issue.md"),
+                "---\nid: CAD-1\ntitle: synthetic\nstatus: doing\npriority: P2\n\
+                 created: 2026-01-01T00:00:00Z\n---\n\nacceptance:\n- synthetic\n",
+            )
+            .unwrap();
+
+            let log = root.path().join("daemon.log");
+            let file = std::fs::File::create(&log).unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+            base_env(&mut command, root.path(), &state);
+            command
+                .env("CADENCE_TEST_SEAM", "1")
+                .env("CADENCE_AGENTICOS_PROVIDER_URL", provider_base)
+                .args(["daemon", "run"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(file.try_clone().unwrap()))
+                .stderr(Stdio::from(file));
+            let child = cadence_agent::reaper::spawn(&mut command).expect("spawn the real daemon");
+            // The fixture owns the child before waiting, so a panic in the
+            // readiness probe still kills exactly this daemon.
+            let fixture = Fixture { root, state, child };
+            let health = cadence_agent::client::rpc_relay(&fixture.state, "health", json!({}))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "CAD-2102: the daemon never answered health: {error}: {}",
+                        std::fs::read_to_string(fixture.root.path().join("daemon.log"))
+                            .unwrap_or_default()
+                    )
+                });
+            assert_eq!(
+                health["pid"].as_u64(),
+                Some(u64::from(fixture.child.id())),
+                "CAD-2102: the health answer belongs to another daemon: {health}"
+            );
+            fixture
+        }
+
+        fn cli(&self, as_who: &str, args: &[&str]) -> Output {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+            base_env(&mut command, self.root.path(), &self.state);
+            command.env("CADENCE_TEST_AS", as_who).args(args);
+            cadence_agent::reaper::output(&mut command).expect("run the cadence CLI")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn base_env(command: &mut Command, root: &Path, state: &Path) {
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/local/bin")
+            .env("HOME", root)
+            .env("TMPDIR", "/tmp")
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("xdg-state"))
+            .env("CADENCE_STATE_DIR", state)
+            .env("CADENCE_PM_DIR", root.join("pm"));
+    }
+
+    fn stdout(out: &Output) -> String {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn stderr(out: &Output) -> String {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    fn assert_no_credential(out: &Output, what: &str) {
+        for (stream, text) in [("stdout", stdout(out)), ("stderr", stderr(out))] {
+            assert!(
+                !text.contains(TOKEN),
+                "CAD-2102: {what} leaked the enrolled credential to {stream}: {text}"
+            );
+        }
+    }
+
+    fn enroll(fixture: &Fixture) {
+        let out = fixture.cli(
+            "operator",
+            &[
+                "platform",
+                "enroll",
+                "agenticos-provider",
+                "--account",
+                ACCOUNT,
+                "--scope",
+                "provider.read",
+                "--token",
+                TOKEN,
+                "--accept-same-uid-risk",
+            ],
+        );
+        assert_no_credential(&out, "enrollment");
+        assert!(
+            out.status.success(),
+            "CAD-2102 enrollment failed: {}",
+            stderr(&out)
+        );
+    }
+
+    fn call_argv(with_input: bool, with_connection: bool, request: Option<&str>) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "platform".into(),
+            "call".into(),
+            TOOL.into(),
+            "--account".into(),
+            ACCOUNT.into(),
+        ];
+        if with_input {
+            args.push("--input".into());
+            args.push(INPUT.into());
+        }
+        if with_connection {
+            args.push("--connection".into());
+            args.push(CONNECTION.into());
+        }
+        args.push("--max-charge".into());
+        args.push("250".into());
+        if let Some(request) = request {
+            args.push("--request".into());
+            args.push(request.to_string());
+        }
+        args
+    }
+
+    fn argv_output(fixture: &Fixture, args: &[String]) -> Output {
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        fixture.cli("operator", &borrowed)
+    }
+
+    fn run_call(fixture: &Fixture, request: Option<&str>) -> Output {
+        argv_output(fixture, &call_argv(true, true, request))
+    }
+
+    /// The CLI's JSON failure object. A successful command has none.
+    fn error_object(out: &Output) -> Value {
+        serde_json::from_slice(&out.stderr).unwrap_or_else(|_| {
+            panic!(
+                "CAD-2102: expected the CLI's JSON error, got: {}",
+                stderr(out)
+            )
+        })
+    }
+
+    fn error_text(error: &Value) -> &str {
+        error["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("CAD-2102: the unknown outcome carries no message: {error}"))
+    }
+
+    /// The ticket's caller-visible contract: an uncertain paid outcome is
+    /// `kind: unknown` and exit 1 (the one kind the retry table says may be
+    /// retried only after checking whether the effect landed) -- never a
+    /// definite `rejected`/`provider` refusal.
+    fn assert_unknown(out: &Output, what: &str) -> Value {
+        assert_no_credential(out, what);
+        let detail = stderr(out);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "CAD-2102: {what} must exit 1 as an unknown outcome, not {:?}: {detail}",
+            out.status.code()
+        );
+        let error = error_object(out);
+        assert_eq!(
+            error["kind"], "unknown",
+            "CAD-2102: {what} was reported as a definite outcome: {error}"
+        );
+        assert!(
+            !error_text(&error).trim().is_empty(),
+            "CAD-2102: {what} printed an empty unknown message: {error}"
+        );
+        error
+    }
+
+    fn assert_pre_effect_refusal(out: &Output, flag: &str, provider: &Provider, what: &str) {
+        assert_no_credential(out, what);
+        let detail = format!("{}{}", stdout(out), stderr(out));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "CAD-2102: {what} is a usage refusal before any effect, not an outcome: {detail}"
+        );
+        assert!(
+            detail.contains(flag),
+            "CAD-2102: {what} must name the missing {flag}: {detail}"
+        );
+        assert!(
+            !detail.contains("\"unknown\""),
+            "CAD-2102: {what} must stay a definite refusal, not an unknown outcome: {detail}"
+        );
+        provider.assert_quiet();
+    }
+
+    fn tools_listing(connected_read_recovery: bool) -> Value {
+        let mut listing = json!({"platforms": [{
+            "platform": "agenticos-provider",
+            "manifest_version": "cadence-provider-tools@1",
+            "default_account": null,
+            "tools": [{
+                "tool": TOOL,
+                "effect": "read",
+                "scopes": ["provider.read"],
+                "label": "Synthetic report",
+                "direct": true,
+                "connected_read": true,
+                "available": true
+            }]
+        }]});
+        if connected_read_recovery {
+            listing["platforms"][0]["tools"][0]["connected_read_recovery"] = json!(true);
+        }
+        listing
+    }
+
+    #[test]
+    fn cad2102_a_lost_or_corrupt_provider_answer_is_unknown_and_recoverable() {
+        let provider = Provider::start(vec![
+            Answer::Drop,
+            Answer::Replay,
+            Answer::Drop,
+            Answer::Corrupt,
+            Answer::Refuse {
+                status: 409,
+                code: "idempotency_in_progress",
+            },
+            Answer::Refuse {
+                status: 502,
+                code: "upstream_error",
+            },
+        ]);
+        let fixture = Fixture::start(&provider.base);
+        enroll(&fixture);
+
+        // A missing input, and a missing connection, are decided before the
+        // daemon runs anything: definite usage refusals, zero provider hits.
+        let missing_input = argv_output(&fixture, &call_argv(false, true, None));
+        assert_pre_effect_refusal(
+            &missing_input,
+            "--input",
+            &provider,
+            "a call with no --input",
+        );
+        let missing_connection = argv_output(&fixture, &call_argv(true, false, None));
+        assert_pre_effect_refusal(
+            &missing_connection,
+            "--connection",
+            &provider,
+            "a connected read with no --connection",
+        );
+
+        // The provider reads the request and settles it, then the connection
+        // drops before an answer. The caller got no --request: the daemon's
+        // generated operation key is the only way back to that call.
+        let lost = run_call(&fixture, None);
+        let first = provider.next("a dropped provider answer");
+        let error = assert_unknown(&lost, "a dropped provider answer");
+        provider.assert_quiet();
+        assert_eq!(
+            first.authorization.as_deref(),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+        assert_eq!(first.body["slug"], json!(TOOL));
+        assert_eq!(first.body["connection_id"], json!(CONNECTION));
+        assert_eq!(
+            first.body["input"]["site_url"],
+            json!("https://example.invalid/")
+        );
+        assert_eq!(first.body["input"]["start_date"], json!("2026-10-01"));
+        assert_eq!(first.body["input"]["end_date"], json!("2026-10-31"));
+        assert_eq!(first.body["max_charge_minor"], json!(250));
+        assert!(
+            first.key.starts_with("read-"),
+            "CAD-2102: the daemon's operation key keeps its read- prefix: {}",
+            first.key
+        );
+        assert!(
+            error_text(&error).contains(&first.key),
+            "CAD-2102: the unknown outcome must name the exact operation key {}: {error}",
+            first.key
+        );
+
+        // The bare handle is what `--request` takes; retrying with it must
+        // send the identical outbound key and replay the same charge.
+        let handle = first
+            .key
+            .strip_prefix("read-")
+            .expect("the operation key carries the daemon's read- prefix");
+        let reconciled = run_call(&fixture, Some(handle));
+        let replay_seen = provider.next("the reconciled replay");
+        provider.assert_quiet();
+        assert_eq!(
+            replay_seen.key, first.key,
+            "CAD-2102: same-handle reconciliation must send the identical provider key"
+        );
+        assert!(
+            reconciled.status.success(),
+            "CAD-2102: the reconciled replay failed: {}",
+            stderr(&reconciled)
+        );
+        assert_no_credential(&reconciled, "the reconciled replay");
+        let replay: Value =
+            serde_json::from_slice(&reconciled.stdout).expect("the replay prints its result");
+        assert_eq!(replay["platform_result"]["data"]["repeated"], json!(true));
+        assert_eq!(
+            replay["platform_result"]["data"]["result"]["clicks"],
+            json!(7)
+        );
+
+        // Explicit handles keep their existing meaning: `--request X` is the
+        // operation key `read-X`, which is why the generated key above must
+        // be exposed without its `read-` prefix as the retry handle.
+        let explicit = run_call(&fixture, Some("cad2102-keep"));
+        let explicit_seen = provider.next("a dropped explicit-key read");
+        provider.assert_quiet();
+        assert_eq!(
+            explicit_seen.key, "read-cad2102-keep",
+            "CAD-2102: an explicit --request must keep the existing read- prefix"
+        );
+        let error = assert_unknown(&explicit, "a dropped explicit-key read");
+        assert!(
+            error_text(&error).contains("read-cad2102-keep"),
+            "CAD-2102: the unknown outcome must name the explicit operation key: {error}"
+        );
+
+        // A corrupt 200, a funded/in-flight 409 and a post-attempt 502 are all
+        // uncertainty, not definite refusals: unknown, the exact key, no
+        // automatic replay -- and each fresh call chooses a fresh key.
+        let mut previous = first.key.clone();
+        for label in [
+            "a corrupt provider answer",
+            "a 409 idempotency_in_progress provider answer",
+            "a 502 upstream_error provider answer",
+        ] {
+            let out = run_call(&fixture, None);
+            let seen = provider.next(label);
+            provider.assert_quiet();
+            let error = assert_unknown(&out, label);
+            assert_ne!(
+                seen.key, previous,
+                "CAD-2102: {label} is a fresh call and chooses a fresh key"
+            );
+            assert!(
+                error_text(&error).contains(&seen.key),
+                "CAD-2102: {label} must name its key {}: {error}",
+                seen.key
+            );
+            previous = seen.key;
+        }
+    }
+
+    /// A proven pre-effect 503 capability_unavailable is definite; another 503
+    /// code is not proof and stays unknown.
+    #[test]
+    fn cad2102_capability_unavailable_is_definite_but_billing_unavailable_is_not() {
+        let provider = Provider::start(vec![
+            Answer::CapabilityUnavailable,
+            Answer::Refuse {
+                status: 503,
+                code: "billing_unavailable",
+            },
+        ]);
+        let fixture = Fixture::start(&provider.base);
+        enroll(&fixture);
+
+        let unavailable = run_call(&fixture, None);
+        let _ = provider.next("a 503 capability_unavailable provider answer");
+        provider.assert_quiet();
+        assert_no_credential(&unavailable, "a 503 capability_unavailable provider answer");
+        assert_eq!(
+            unavailable.status.code(),
+            Some(3),
+            "CAD-2102: capability_unavailable is a definite refusal, not {:?}: {}",
+            unavailable.status.code(),
+            stderr(&unavailable)
+        );
+        let error = error_object(&unavailable);
+        assert_eq!(
+            error["kind"], "rejected",
+            "CAD-2102: capability_unavailable stayed definite: {error}"
+        );
+        assert!(
+            error_text(&error).contains("capability_unavailable"),
+            "CAD-2102: the refusal carries the provider code: {error}"
+        );
+
+        let ambiguous = run_call(&fixture, None);
+        let seen = provider.next("a 503 billing_unavailable provider answer");
+        provider.assert_quiet();
+        let error = assert_unknown(&ambiguous, "a 503 billing_unavailable provider answer");
+        assert!(
+            error_text(&error).contains(&seen.key),
+            "CAD-2102: the ambiguous 503 names its key {}: {error}",
+            seen.key
+        );
+    }
+
+    /// A first receipt must prove effect=read, a strict six-scale USD price and
+    /// a non-null result; a repeated replay may be sparse and may carry an
+    /// explicit null result.
+    #[test]
+    fn cad2102_unusable_first_receipts_are_unknown_and_a_sparse_replay_is_accepted() {
+        let provider = Provider::start(vec![
+            Answer::Receipt(json!({
+                "ok": true,
+                "data": {
+                    "effect": "read",
+                    "price": { "currency": "USD", "scale": 6, "amount": "0.000250" },
+                    "result": { "clicks": 7 },
+                    "repeated": false
+                }
+            })),
+            Answer::Receipt(json!({"ok": true, "data": {"repeated": false, "result": null}})),
+            Answer::Receipt(json!({
+                "ok": true,
+                "data": {
+                    "effect": "send",
+                    "price": { "currency": "USD", "scale": 6, "amount": "0.000250" },
+                    "result": { "clicks": 7 },
+                    "repeated": false
+                }
+            })),
+            Answer::Receipt(json!({
+                "ok": true,
+                "data": {
+                    "effect": "read",
+                    "price": { "currency": "USD", "scale": 3, "amount": "0.250" },
+                    "result": { "clicks": 7 },
+                    "repeated": false
+                }
+            })),
+            Answer::Receipt(json!({
+                "ok": true,
+                "data": {
+                    "effect": "read",
+                    "result": { "clicks": 7 },
+                    "repeated": false
+                }
+            })),
+            Answer::Drop,
+            Answer::Receipt(json!({"ok": true, "data": {"repeated": true, "result": null}})),
+        ]);
+        let fixture = Fixture::start(&provider.base);
+        enroll(&fixture);
+
+        let receipt = run_call(&fixture, None);
+        let _ = provider.next("a valid first receipt");
+        provider.assert_quiet();
+        assert!(
+            receipt.status.success(),
+            "CAD-2102: a valid first receipt failed: {}",
+            stderr(&receipt)
+        );
+        assert_no_credential(&receipt, "a valid first receipt");
+        let value: Value =
+            serde_json::from_slice(&receipt.stdout).expect("the first receipt prints its result");
+        assert_eq!(value["platform_result"]["data"]["effect"], json!("read"));
+        assert_eq!(
+            value["platform_result"]["data"]["price"]["amount"],
+            json!("0.000250")
+        );
+        assert_eq!(value["platform_result"]["data"]["repeated"], json!(false));
+        assert_eq!(
+            value["platform_result"]["data"]["result"]["clicks"],
+            json!(7)
+        );
+
+        for label in [
+            "a first receipt with a null result",
+            "a first receipt with a non-read effect",
+            "a first receipt with an invalid price",
+            "a first receipt with no price",
+        ] {
+            let out = run_call(&fixture, None);
+            let seen = provider.next(label);
+            provider.assert_quiet();
+            let error = assert_unknown(&out, label);
+            assert!(
+                error_text(&error).contains(&seen.key),
+                "CAD-2102: {label} must name its key {}: {error}",
+                seen.key
+            );
+        }
+
+        let lost = run_call(&fixture, None);
+        let seen = provider.next("a sparse replay's dropped answer");
+        provider.assert_quiet();
+        let error = assert_unknown(&lost, "a sparse replay's dropped answer");
+        assert!(
+            error_text(&error).contains(&seen.key),
+            "CAD-2102: the sparse replay's unknown names its key {}: {error}",
+            seen.key
+        );
+        let handle = seen
+            .key
+            .strip_prefix("read-")
+            .expect("the operation key carries the daemon's read- prefix");
+        let sparse = run_call(&fixture, Some(handle));
+        let _ = provider.next("the sparse replay");
+        provider.assert_quiet();
+        assert!(
+            sparse.status.success(),
+            "CAD-2102: a sparse null-result replay failed: {}",
+            stderr(&sparse)
+        );
+        assert_no_credential(&sparse, "the sparse replay");
+        let value: Value =
+            serde_json::from_slice(&sparse.stdout).expect("the sparse replay prints its result");
+        let data = &value["platform_result"]["data"];
+        assert_eq!(data["repeated"], json!(true));
+        assert!(
+            data.get("result").is_some_and(Value::is_null),
+            "CAD-2102: an explicit null replay result must be preserved: {value}"
+        );
+    }
+
+    /// A direct daemon `platform_call` that bypasses the CLI cannot have its
+    /// reply-loss recovery handle chosen by the CLI, so it must refuse before
+    /// any provider traffic rather than start a paid attempt it cannot name.
+    #[test]
+    fn cad2102_direct_rpc_without_a_request_handle_refuses_before_the_provider() {
+        let provider = Provider::start(vec![Answer::Drop]);
+        let fixture = Fixture::start(&provider.base);
+        enroll(&fixture);
+        let params = json!({
+            "platform": "agenticos-provider",
+            "tool": TOOL,
+            "input": serde_json::from_str::<Value>(INPUT).expect("fixture input"),
+            "account": ACCOUNT,
+            "connection": CONNECTION,
+            "max_charge_minor": 250,
+        });
+        let refused =
+            cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
+                cadence_agent::client::rpc_private_timeout(
+                    &fixture.state,
+                    "platform_call",
+                    params,
+                    Duration::from_secs(20),
+                )
+            })
+            .expect_err("a direct platform_call with no request handle must refuse");
+        assert_eq!(
+            refused.kind(),
+            "rejected",
+            "a missing request handle is a definite pre-effect refusal, not {}: {refused}",
+            refused.kind()
+        );
+        assert!(
+            refused.to_string().contains("request"),
+            "the refusal must name the missing request handle: {refused}"
+        );
+        provider.assert_quiet();
+    }
+
+    #[derive(Clone)]
+    enum StubMode {
+        /// No response bytes: the daemon's answer is lost.
+        Lost,
+        /// A valid wrapper whose platform_result is explicitly null.
+        NullReceipt,
+        /// Parseable JSON without `ok` or an error message.
+        Malformed,
+        /// A valid success frame larger than the 4 MiB bound.
+        Oversized,
+    }
+
+    struct StubDaemon {
+        calls: mpsc::Receiver<Value>,
+        stop: Arc<AtomicBool>,
+        socket: PathBuf,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StubDaemon {
+        /// A stub daemon on the real socket path: answers platform_tools with
+        /// the requested recovery advertisement, then records platform_call
+        /// and answers according to `mode`.
+        fn start(state: &Path, connected_read_recovery: bool, mode: StubMode) -> StubDaemon {
+            let socket = cadence_agent::client::socket_path(state);
+            let listener = UnixListener::bind(&socket).expect("stub daemon socket");
+            let (send, calls) = mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || loop {
+                // Blocking accept; Drop wakes this with one sentinel
+                // connection, consumed before any frame is read.
+                let (mut stream, _) = listener.accept().expect("stub daemon accept");
+                if thread_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                // The real daemon serves several frames on one connection; the
+                // CLI keeps one connection for the listing and the paid call.
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 {
+                        break;
+                    }
+                    let frame: Value =
+                        serde_json::from_str(&line).expect("stub daemon request frame");
+                    match frame["method"].as_str() {
+                        Some("platform_tools") => {
+                            let answer = json!({
+                                "ok": true,
+                                "result": tools_listing(connected_read_recovery)
+                            });
+                            writeln!(stream, "{answer}").unwrap();
+                        }
+                        Some("platform_call") => {
+                            if send.send(frame["params"].clone()).is_err() {
+                                return;
+                            }
+                            match &mode {
+                                StubMode::Lost => {
+                                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                                    break;
+                                }
+                                StubMode::NullReceipt => {
+                                    writeln!(
+                                        stream,
+                                        "{}",
+                                        json!({"ok": true, "result": {
+                                            "result": "executed",
+                                            "effect": "read",
+                                            "platform_result": null
+                                        }})
+                                    )
+                                    .unwrap();
+                                }
+                                StubMode::Malformed => {
+                                    writeln!(stream, "{}", json!({"error": {"kind": "rejected"}}))
+                                        .unwrap();
+                                }
+                                StubMode::Oversized => {
+                                    // A structurally valid success receipt padded
+                                    // past the 4 MiB frame bound. The client may
+                                    // close mid-write; that broken pipe is expected.
+                                    let blob = "x".repeat(5 * 1024 * 1024);
+                                    let frame = json!({"ok": true, "result": {
+                                        "result": "executed",
+                                        "effect": "read",
+                                        "platform_result": {
+                                            "ok": true,
+                                            "data": {
+                                                "effect": "read",
+                                                "price": {
+                                                    "currency": "USD",
+                                                    "scale": 6,
+                                                    "amount": "0.000250"
+                                                },
+                                                "result": { "blob": blob },
+                                                "repeated": false
+                                            }
+                                        }
+                                    }});
+                                    let _ = writeln!(stream, "{frame}");
+                                }
+                            }
+                        }
+                        other => {
+                            panic!("CAD-2102 stub daemon got {other:?}: {frame}");
+                        }
+                    }
+                }
+            });
+            StubDaemon {
+                calls,
+                stop,
+                socket,
+                thread: Some(thread),
+            }
+        }
+
+        /// The next platform_call, or the bounded failure safeguard.
+        fn next_call(&self, what: &str) -> Value {
+            self.calls
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|_| {
+                    panic!("CAD-2102: the stub daemon saw no platform_call for {what}")
+                })
+        }
+
+        /// Any automatic replay would have been dispatched before the CLI
+        /// process exited, so an empty channel is the no-replay proof.
+        fn assert_quiet(&self) {
+            assert!(
+                self.calls.try_recv().is_err(),
+                "CAD-2102: the CLI dispatched an unexpected extra platform_call"
+            );
+        }
+    }
+
+    impl Drop for StubDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = UnixStream::connect(&self.socket);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn stub_cli(root: &Path, state: &Path, request: Option<&str>) -> Output {
+        let args = call_argv(true, true, request);
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        base_env(&mut command, root, state);
+        command.args(&borrowed);
+        cadence_agent::reaper::output(&mut command).expect("run the cadence CLI against the stub")
+    }
+
+    fn stub_root(prefix: &str) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in("/tmp")
+            .expect("CAD-2102 temp root");
+        let state = root.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        (root, state)
+    }
+
+    /// A daemon that predates the typed same-key recovery protocol advertises
+    /// no `connected_read_recovery`; the CLI must refuse before dispatching a
+    /// paid read it could not reconcile.
+    #[test]
+    fn cad2102_a_legacy_daemon_without_recovery_refuses_before_platform_call() {
+        let (root, state) = stub_root("cad2102-legacy-daemon-");
+        let stub = StubDaemon::start(&state, false, StubMode::Lost);
+        let refused = stub_cli(root.path(), &state, None);
+        stub.assert_quiet();
+        assert_no_credential(&refused, "a legacy daemon listing");
+        assert_eq!(
+            refused.status.code(),
+            Some(3),
+            "CAD-2102: a daemon without connected_read_recovery is a definite refusal, \
+             not {:?}: {}",
+            refused.status.code(),
+            stderr(&refused)
+        );
+        let error = error_object(&refused);
+        assert_eq!(
+            error["kind"], "rejected",
+            "CAD-2102: the missing recovery protocol must stay a definite refusal: {error}"
+        );
+        assert!(
+            error_text(&error).to_lowercase().contains("recovery"),
+            "CAD-2102: the refusal must name the missing recovery protocol: {error}"
+        );
+    }
+
+    /// A valid wrapper whose platform_result is null is not a usable receipt:
+    /// the CLI must report unknown with the key it chose, never success.
+    #[test]
+    fn cad2102_a_null_platform_result_is_unknown_not_success() {
+        let (root, state) = stub_root("cad2102-null-receipt-");
+        let stub = StubDaemon::start(&state, true, StubMode::NullReceipt);
+        let out = stub_cli(root.path(), &state, None);
+        let params = stub.next_call("a null platform receipt");
+        stub.assert_quiet();
+        let handle = params["request"]
+            .as_str()
+            .expect("the CLI chooses the request handle before the RPC");
+        let error = assert_unknown(&out, "a null platform receipt");
+        let key = format!("read-{handle}");
+        assert!(
+            error_text(&error).contains(&key),
+            "CAD-2102: a null receipt must name the operation key {key}: {error}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "CAD-2102: a null receipt must not print a success document: {}",
+            stdout(&out)
+        );
+    }
+
+    /// A parseable wrapper missing `ok` and an error message is not a proven
+    /// refusal; the CLI must report unknown with the same handle.
+    #[test]
+    fn cad2102_a_malformed_daemon_wrapper_is_unknown_not_rejected() {
+        let (root, state) = stub_root("cad2102-malformed-wrapper-");
+        let stub = StubDaemon::start(&state, true, StubMode::Malformed);
+        let out = stub_cli(root.path(), &state, None);
+        let params = stub.next_call("a malformed daemon wrapper");
+        stub.assert_quiet();
+        let handle = params["request"]
+            .as_str()
+            .expect("the CLI chooses the request handle before the RPC");
+        let error = assert_unknown(&out, "a malformed daemon wrapper");
+        let key = format!("read-{handle}");
+        assert!(
+            error_text(&error).contains(&key),
+            "CAD-2102: a malformed wrapper must name the operation key {key}: {error}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "CAD-2102: a malformed wrapper must not print a success document: {}",
+            stdout(&out)
+        );
+    }
+
+    /// A daemon reply larger than the 4 MiB frame bound must not be read into
+    /// memory and printed as success; it is an unusable answer, so the CLI must
+    /// report unknown with the retained key and never replay.
+    #[test]
+    fn cad2102_an_oversized_daemon_frame_is_unknown_not_success() {
+        let (root, state) = stub_root("cad2102-oversized-frame-");
+        let stub = StubDaemon::start(&state, true, StubMode::Oversized);
+        let out = stub_cli(root.path(), &state, None);
+        let params = stub.next_call("an oversized daemon frame");
+        stub.assert_quiet();
+        let handle = params["request"]
+            .as_str()
+            .expect("the CLI chooses the request handle before the RPC");
+        let error = assert_unknown(&out, "an oversized daemon frame");
+        let key = format!("read-{handle}");
+        assert!(
+            error_text(&error).contains(&key),
+            "CAD-2102: an oversized frame must name the operation key {key}: {error}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "CAD-2102: an oversized frame must not print a success document: {}",
+            stdout(&out)
+        );
+    }
+
+    /// A two-daemon socket race: a capable listener answers the listing, then
+    /// atomically replaces its socket path with a legacy listener. The accepted
+    /// capable stream stays alive, so a CLI that keeps the connection sends the
+    /// paid call to the capable daemon, while a reconnect reaches legacy.
+    struct RaceStub {
+        capable: mpsc::Receiver<Value>,
+        legacy: mpsc::Receiver<Value>,
+        stop: Arc<AtomicBool>,
+        socket: PathBuf,
+        legacy_path: PathBuf,
+        capable_thread: Option<std::thread::JoinHandle<()>>,
+        legacy_thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl RaceStub {
+        fn start(state: &Path) -> RaceStub {
+            let socket = cadence_agent::client::socket_path(state);
+            let legacy_path = state.join("legacy.sock");
+            let capable_listener = UnixListener::bind(&socket).expect("race capable socket");
+            let legacy_listener = UnixListener::bind(&legacy_path).expect("race legacy socket");
+            let (capable_send, capable) = mpsc::channel();
+            let (legacy_send, legacy) = mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let capable_stop = Arc::clone(&stop);
+            let capable_socket = socket.clone();
+            let capable_legacy = legacy_path.clone();
+            let capable_thread = std::thread::spawn(move || {
+                serve_capable(
+                    capable_listener,
+                    &capable_socket,
+                    &capable_legacy,
+                    &capable_stop,
+                    &capable_send,
+                )
+            });
+            let legacy_stop = Arc::clone(&stop);
+            let legacy_thread = std::thread::spawn(move || {
+                serve_legacy(legacy_listener, &legacy_stop, &legacy_send)
+            });
+            RaceStub {
+                capable,
+                legacy,
+                stop,
+                socket,
+                legacy_path,
+                capable_thread: Some(capable_thread),
+                legacy_thread: Some(legacy_thread),
+            }
+        }
+
+        fn try_capable(&self) -> Option<Value> {
+            self.capable.try_recv().ok()
+        }
+
+        fn try_legacy(&self) -> Option<Value> {
+            self.legacy.try_recv().ok()
+        }
+
+        fn assert_quiet(&self) {
+            assert!(
+                self.capable.try_recv().is_err() && self.legacy.try_recv().is_err(),
+                "CAD-2102: the paid call was replayed"
+            );
+        }
+    }
+
+    fn serve_capable(
+        listener: UnixListener,
+        socket: &Path,
+        legacy_path: &Path,
+        stop: &AtomicBool,
+        calls: &mpsc::Sender<Value>,
+    ) {
+        let (mut stream, _) = listener.accept().expect("race capable accept");
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        drop(listener);
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                return;
+            }
+            let frame: Value = serde_json::from_str(&line).expect("race capable frame");
+            match frame["method"].as_str() {
+                Some("platform_tools") => {
+                    // Atomic replacement: any reconnect reaches the legacy
+                    // listener, while this accepted stream stays capable.
+                    std::fs::rename(legacy_path, socket).expect("replace race socket");
+                    let answer = json!({"ok": true, "result": tools_listing(true)});
+                    writeln!(stream, "{answer}").unwrap();
+                }
+                Some("platform_call") => {
+                    let params = frame["params"].clone();
+                    let handle = params["request"].as_str().unwrap_or("missing").to_string();
+                    if calls.send(params).is_err() {
+                        return;
+                    }
+                    let answer = json!({"ok": false, "error": {
+                        "kind": "unknown",
+                        "message": format!(
+                            "the capable daemon's answer was lost; provider key read-{handle}"
+                        )
+                    }});
+                    writeln!(stream, "{answer}").unwrap();
+                }
+                other => panic!("CAD-2102 race capable got {other:?}: {frame}"),
+            }
+        }
+    }
+
+    fn serve_legacy(listener: UnixListener, stop: &AtomicBool, calls: &mpsc::Sender<Value>) {
+        loop {
+            let (mut stream, _) = listener.accept().expect("race legacy accept");
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let frame: Value = serde_json::from_str(&line).expect("race legacy frame");
+                match frame["method"].as_str() {
+                    Some("platform_tools") => {
+                        // A lying stale daemon still advertises recovery, so a
+                        // reconnect can reach the paid call.
+                        let answer = json!({"ok": true, "result": tools_listing(true)});
+                        writeln!(stream, "{answer}").unwrap();
+                    }
+                    Some("platform_call") => {
+                        if calls.send(frame["params"].clone()).is_err() {
+                            return;
+                        }
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"ok": false, "error": {
+                                "kind": "rejected",
+                                "message": "a stale daemon refused the connected read"
+                            }})
+                        )
+                        .unwrap();
+                    }
+                    other => panic!("CAD-2102 race legacy got {other:?}: {frame}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for RaceStub {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = UnixStream::connect(&self.socket);
+            let _ = UnixStream::connect(&self.legacy_path);
+            if let Some(thread) = self.capable_thread.take() {
+                let _ = thread.join();
+            }
+            if let Some(thread) = self.legacy_thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// The listing's daemon is replaced by a stale one before the paid call.
+    /// The CLI must keep the already accepted capable stream for the call (not
+    /// reconnect to the replacement), and the capable daemon's lost answer must
+    /// stay unknown with the retained key -- with no paid call reaching the
+    /// replacement.
+    #[test]
+    fn cad2102_a_replaced_daemon_cannot_take_the_retained_paid_call() {
+        let (root, state) = stub_root("cad2102-stale-daemon-");
+        let stub = RaceStub::start(&state);
+        let out = stub_cli(root.path(), &state, None);
+        assert_no_credential(&out, "a stale daemon race");
+        let capable = stub.try_capable();
+        let legacy = stub.try_legacy();
+        assert!(
+            legacy.is_none(),
+            "CAD-2102: the paid call reached the replacement daemon"
+        );
+        let params = capable.expect("the paid call must use the accepted capable stream");
+        let handle = params["request"]
+            .as_str()
+            .expect("the CLI chooses the request handle before the RPC");
+        let error = assert_unknown(&out, "a lost answer on the capable stream");
+        let key = format!("read-{handle}");
+        assert!(
+            error_text(&error).contains(&key),
+            "CAD-2102: the capable stream's unknown must name {key}: {error}"
+        );
+        stub.assert_quiet();
+    }
+
+    /// Recovery edge: if the daemon's own answer is lost, a key revealed only
+    /// in that answer is gone. The CLI must choose the handle before the RPC,
+    /// name it in the unknown outcome, and pass the same bare handle through
+    /// on a manual retry -- the daemon owns the `read-` prefix.
+    #[test]
+    fn cad2102_a_lost_daemon_answer_still_names_the_handle_the_cli_chose() {
+        let (root, state) = stub_root("cad2102-rpc-loss-");
+        let stub = StubDaemon::start(&state, true, StubMode::Lost);
+
+        let lost = stub_cli(root.path(), &state, None);
+        let params = stub.next_call("a lost daemon answer");
+        let handle = params["request"].as_str().unwrap_or_else(|| {
+            panic!(
+                "CAD-2102: the CLI must choose the request handle before the daemon RPC; \
+                 platform_call params were {params}"
+            )
+        });
+        assert!(!handle.is_empty(), "CAD-2102: the chosen handle is empty");
+        assert!(
+            !handle.starts_with("read-"),
+            "CAD-2102: the CLI handle is the bare --request value; the read- prefix belongs \
+             to the operation key the daemon derives: {handle}"
+        );
+        let error = assert_unknown(&lost, "a lost daemon answer");
+        let key = format!("read-{handle}");
+        assert!(
+            error_text(&error).contains(&key),
+            "CAD-2102: a lost daemon answer must name the operation key {key}: {error}"
+        );
+        assert!(
+            !error_text(&error).contains(&format!("read-{key}")),
+            "CAD-2102: the unknown outcome must not double-prefix its own key: {error}"
+        );
+        stub.assert_quiet();
+
+        let again = stub_cli(root.path(), &state, Some(handle));
+        let params = stub.next_call("a lost daemon answer on reconciliation");
+        assert_eq!(
+            params["request"],
+            json!(handle),
+            "CAD-2102: a manual same-handle retry must send the same bare handle"
+        );
+        let error = assert_unknown(&again, "a lost daemon answer on reconciliation");
+        assert!(
+            error_text(&error).contains(&key),
+            "CAD-2102: reconciliation must keep the same operation key {key}: {error}"
+        );
+        assert!(
+            !error_text(&error).contains(&format!("read-{key}")),
+            "CAD-2102: a retried handle must not be double-prefixed: {error}"
+        );
+        stub.assert_quiet();
+    }
+}

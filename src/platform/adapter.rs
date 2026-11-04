@@ -271,18 +271,18 @@ pub trait PlatformAdapter: Send + Sync {
         self.execute(credential, tool, input, idempotency_key, expected_hash)
     }
 
-    /// CAD-1974: a read the caller scoped to one connection and priced with a
-    /// ceiling they accepted before anything ran. Only an adapter whose table
-    /// declares `connected_read` receives this, and only for a `read` effect;
-    /// everyone else refuses, so a connected read can never fall back to the
-    /// unattended path.
+    /// A connected read distinguishes a proven refusal from an outcome that
+    /// may have reached the provider and must be reconciled with the same key.
+    /// Only a tool declared as `connected_read` reaches this method.
     fn execute_connected_read(
         &self,
         _account: &str,
         _credential: &[u8],
         _call: &ConnectedRead<'_>,
-    ) -> std::result::Result<Value, String> {
-        Err("this platform has no connected-read door".into())
+    ) -> std::result::Result<Value, AppCapabilityError> {
+        Err(AppCapabilityError::Refused(
+            "this platform has no connected-read door".into(),
+        ))
     }
 
     /// Preserve a protocol's typed outcome where its adapter can establish one.
