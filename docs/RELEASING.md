@@ -8,6 +8,36 @@ Neither path authorizes an agent to approve or restart production. Follow
 [artifact checklist](guides/rollout-checklist.md); image-managed hosts use the runtime
 image path instead of self-update.
 
+## Stable v0.3.18 (published, immutable)
+
+[Cadence 0.3.18](https://github.com/favcrm/cadence/releases/tag/v0.3.18) was
+published as the stable GitHub Release on 2026-11-04 at 10:59:44 UTC
+(`prerelease=false`, `latest=true`, `draft=false`, immutable). Its annotated tag
+object is `e4fb136f738acafbd661d4cb9a3ccf9aefed82e4`, peeled to source
+`a294d88e78f6911b293a4e08b5f932564eeda2a8`. The producing
+[tag workflow run 41816256526, attempt 1](https://github.com/favcrm/cadence/actions/runs/41816256526)
+completed successfully: the four tag gates (`fmt`, `clippy`, `build`, `ui`),
+`release-gate`, three native release builds and three exact-candidate native
+installation legs passed before the release environment was approved. Tests run
+in their own scheduled workflow, not in the tag gates.
+
+All nine published HTTPS assets were anonymously downloaded and their bytes
+matched the published `.sha256` files. The x86_64 archive's manifest names
+`v0.3.18`, target `x86_64-linux`, runner `ubuntu-22.04`, the source digest above,
+that run and attempt, features `["ui"]` and checks
+`["fmt","clippy","build","ui"]`. The installer is byte-identical to the v0.2.0
+one, SHA-256
+`c335171994e89da9d8d86b3cece9a7de8899a52056b6c42904a5f63dfa33c7e5`.
+The public native clean-install workflow ran its three actual published-URL
+installation legs successfully in
+[run 41818596207](https://github.com/favcrm/cadence/actions/runs/41818596207);
+each leg acquires `install.sh`, one platform archive and that archive's
+checksum. The owned `public-client` catalogue answers `v0.3.18`.
+
+This record covers the public client release only. It does not promote a
+native-host candidate, install or restart a daemon, or establish operational
+verification; those remain separate operator decisions.
+
 ## Stable v0.2.0 (published, immutable)
 
 [Cadence 0.2.0](https://github.com/favcrm/cadence/releases/tag/v0.2.0) was
