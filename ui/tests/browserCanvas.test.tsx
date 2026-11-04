@@ -74,6 +74,11 @@ async function advance(ms: number) {
   await settle();
 }
 
+const masterTurn = () => (board.masterTurn ? { state: "working", message: "o1", summary: "working", since: 1, conversation: "cmaster" } : null);
+// What the board's toast would be told.
+const toasts: string[] = [];
+store.onBrowserAlert((text) => toasts.push(text));
+
 // ---- the board, stateful ----
 const VIEWER = "https://live.viewer-example.test/session/TOKEN-9f3a1c?sig=SECRET-7d2e";
 type Mode = "ok" | "unavailable" | "404" | "network" | "malformed";
@@ -95,6 +100,9 @@ const board = {
   viewHold: false,
   releaseView: null as null | (() => void),
   late: false,
+  /** The member's turn in the history: 0 none, 1 open (a send and a tool call), 2 answered. */
+  turn: 0,
+  masterTurn: false,
   conversation: "c1",
 };
 globalThis.fetch = (async (input: unknown, init?: { method?: string; signal?: AbortSignal }) => {
@@ -131,6 +139,19 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string; signal?: Ab
     board.body = { state: "ended", signedIn: false, url: null, instructions: null };
     return new Response(JSON.stringify({ status: "stopped" }), { status: 200 });
   }
+  if (url.pathname === "/api/threads/master/stream") {
+    const body = new ReadableStream<Uint8Array>({ start(controller) {
+      controller.enqueue(new TextEncoder().encode(`event: master\ndata: ${JSON.stringify({ alias: "master", live: true, turn: masterTurn(), queue: [] })}\n\n`));
+      init?.signal?.addEventListener("abort", () => controller.close(), { once: true });
+    } });
+    return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+  }
+  if (url.pathname === "/api/threads/master") {
+    const thread = { id: "cmaster", alias: "master", created: "", updated: "" };
+    return new Response(JSON.stringify({ thread, entries: [{ seq: 1, role: "operator", kind: "message", text: "hello", message: "o1" }], cursor: 1, more_before: false, more_after: false }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+  if (url.pathname === "/api/agents") return new Response(JSON.stringify({ daemon: "reachable", agents: [{ alias: "master", state: "idle" }], totals: null, by_issue: {} }), { status: 200 });
+  if (url.pathname === "/api/master/state") return new Response(JSON.stringify({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true, turn: masterTurn(), queue: [] }), { status: 200 });
   if (url.pathname === "/api/member-assistant/state") {
     return new Response(JSON.stringify({ conversation_id: "cm1", assistant: { org: "o", sub: "u", assistant_id: "a", alias: "assistant", conversation_id: "cm1", state: "ready", bootstrap_state: null } }), { status: 200 });
   }
@@ -140,6 +161,12 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string; signal?: Ab
       { seq: 2, role: "agent", kind: "artifact", text: "", message: "m1", payload: { id: "art-html1", version: 1, kind: "html", title: "Supplier comparison", bytes: 12 } },
       { seq: 3, role: "agent", kind: "turn_result", text: "Done.", message: "m1" },
     ];
+    if (board.turn > 0) {
+      entries.push({ seq: 7, role: "member", kind: "message", text: "look it up", message: "m3" }, { seq: 8, role: "agent", kind: board.turn === 4 ? "assistant_text" : "tool_call", text: "browser: open", message: "m3" });
+      if (board.turn === 2) entries.push({ seq: 9, role: "agent", kind: "turn_result", text: "Done, take over.", message: "m3" });
+      // 3: the turn goes on with one more step and still no answer.
+      if (board.turn === 3) entries.push({ seq: 10, role: "agent", kind: "tool_call", text: "browser: read", message: "m3" });
+    }
     if (board.late) {
       // A second turn the person started, whose artifact arrives after the chat mounted.
       entries.push(
@@ -173,7 +200,8 @@ async function mount() {
 }
 function reset(over: Partial<typeof board> = {}) {
   timers.clear();
-  Object.assign(board, { mode: "ok", body: { state: "none", signedIn: false, url: null, instructions: null }, gets: 0, views: 0, stops: 0, stopStatus: 200, stopHold: false, release: null, late: false, getHang: false, viewHang: false, getHold: false, releaseGet: null, viewHold: false, releaseView: null, viewStatus: 200, viewUrl: VIEWER, conversation: "c1" }, over);
+  Object.assign(board, { mode: "ok", body: { state: "none", signedIn: false, url: null, instructions: null }, gets: 0, views: 0, stops: 0, stopStatus: 200, stopHold: false, release: null, late: false, turn: 0, masterTurn: false, getHang: false, viewHang: false, getHold: false, releaseGet: null, viewHold: false, releaseView: null, viewStatus: 200, viewUrl: VIEWER, conversation: "c1" }, over);
+  toasts.length = 0;
   store.resetBrowser();
   canvasStore.resetCanvas("c1", "home", "home");
   (win as any).innerWidth = 1600;
@@ -218,6 +246,11 @@ for (const mode of ["unavailable", "404", "network", "malformed"] as const) {
     assert(board.gets <= 3, `${mode}: and not quickly (${board.gets} reads a minute on)`);
   } else {
     equal(board.gets, 1, `${mode}: a definite answer is not asked again`);
+    // Not by a new thread entry or a running turn either.
+    await React.act(async () => { store.watchBrowser(true); await store.refreshBrowser(); });
+    await advance(10_000);
+    await React.act(async () => { store.watchBrowser(false); });
+    equal(board.gets, 1, `${mode}: no read at all, whatever the host says`);
   }
   await m.unmount();
 }
@@ -281,13 +314,12 @@ for (const [state, words] of [["none", "No browser session"], ["ended", "Session
   await React.act(async () => { frame.dispatchEvent(new win.Event("load")); });
   await settle();
   assert(!text(panel(m)).includes("in control"), "a loaded cross-origin frame proves nothing about control, and the panel does not claim it");
-  assert(text(el(m.host, ".bz-viewer-bar")).includes("Live view"), "it says Live view");
-  assert(btn(m, "view") && text(btn(m, "view")).includes("Open live view again"), "and Open live view again stays available while a frame shows");
+  assert(!el(m.host, ".bz-viewer-bar") && !el(m.host, ".bz-addr"), "an open live view has no bar of ours and no address line: the viewer has its own");
+  assert(btn(m, "view")?.getAttribute("aria-label") === "Open live view again", "and a small control to open it again stays available while a frame shows");
   board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
   await advance(2000);
   assert(!el(m.host, "iframe"), "when the board sees the takeover over, the frame is torn down");
-  assert(text(panel(m)).includes("Handed back. The assistant is reading again."), "and the transition is shown");
-  assert(text(panel(m)).includes("Reading"), "now reading");
+  assert(text(panel(m)).includes("Reading") && !text(panel(m)).includes("Handed back") && !text(panel(m)).includes("You had control"), "now reading, with no notice about it");
   await advance(3000);
   assert(board.gets > before, "an active session carries on being polled");
   await m.unmount();
@@ -302,8 +334,9 @@ for (const [state, words] of [["none", "No browser session"], ["ended", "Session
   equal(board.stops, 1, "unsigned active: Stop goes straight to the board, no confirm");
   assert(!btn(m, "go"), "no confirm shown");
   assert(text(el(m.host, "[data-bz-dock]")).includes("Stopping…"), "it shows stopping in progress while the request hangs");
+  assert(el(m.host, "[data-bz-dock] button")!.getAttribute("aria-busy") === "true" && !!el(m.host, "[data-bz-dock] .btn-spin"), "with a spinner on the button");
   await advance(65_000);
-  assert(/65 s/.test(text(el(m.host, "[data-bz-dock]"))), `with the time so far: ${text(el(m.host, "[data-bz-dock]"))}`);
+  assert(!/\d+ s\b/.test(text(el(m.host, "[data-bz-dock]"))), `and no elapsed counter: ${text(el(m.host, "[data-bz-dock]"))}`);
   assert(board.gets > 2, "a stop in progress is polled");
   await React.act(async () => { board.release!(); });
   await settle();
@@ -319,6 +352,7 @@ for (const body of [
   await click(btn(m, "stop")!);
   equal(board.stops, 0, `${body.state}/${body.signedIn}: Stop asks first`);
   assert(btn(m, "go") && btn(m, "keep"), "with Stop session and Keep it running");
+  assert(text(el(m.host, "[data-bz-dock]")).length < 90 && !el(m.host, "[data-bz-dock] p"), "in one short line");
   // Esc cancels the confirm and does not close the canvas.
   await esc(btn(m, "keep")!);
   assert(!btn(m, "go"), "Esc cancels the confirm");
@@ -331,8 +365,9 @@ for (const body of [
   await click(btn(m, "stop")!);
   await click(btn(m, "go")!);
   equal(board.stops, 1, "confirmed: the board is asked");
-  assert(text(panel(m)).includes("Couldn't stop the session. It may still be running."), "a 503 is shown as not stopped");
-  assert(!text(panel(m)).includes("Session ended"), "and not as ended");
+  equal(toasts, ["Couldn't stop the session. It may still be running."], "a 503 is a toast: not stopped");
+  assert(!text(panel(m)).includes("Session ended") && btn(m, "stop"), "never as ended, and Stop is there to try again");
+  toasts.length = 0;
   await m.unmount();
 }
 
@@ -423,9 +458,11 @@ for (const bad of ["javascript:alert(1)", "http://live.test/x", "data:text/html,
   const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
   await openTab(m);
   board.viewStatus = 409;
+  const reads = board.gets;
   await click(btn(m, "view")!);
-  assert(text(panel(m)).includes("isn't asking for a takeover any more"), "409 not_in_handoff is said plainly");
-  assert(!el(m.host, "iframe"), "and opens nothing");
+  assert(board.gets > reads, "409 not_in_handoff makes the panel read the board again");
+  equal(toasts.length, 0, "and is no error to toast");
+  assert(!el(m.host, "iframe") && btn(m, "view"), "and opens nothing");
   await m.unmount();
 }
 
@@ -438,7 +475,7 @@ for (const bad of ["javascript:alert(1)", "http://live.test/x", "data:text/html,
   equal(says.textContent, hostile, "the words show exactly as written");
   equal(says.children.length, 0, "as one text node: no element came out of them");
   assert(!el(panel(m)!, "img[src='x']") && !all(panel(m)!, "a").length, "no image, no link anywhere in the panel");
-  const host = el(m.host, ".bz-url .bz-host")!;
+  const host = el(m.host, ".bz-addr .bz-host")!;
   equal(host.tagName, "B", "the host is bold");
   equal(host.textContent, "xn--80ak6aa92e.test", "and is the real host, punycode as it is");
   assert(!text(panel(m)).includes("Warning") && !el(m.host, ".bz-warn"), "no warning chip: that is the board's judgement, not the UI's");
@@ -466,8 +503,8 @@ const violation = (directive: string, blocked: string, disposition = "enforce") 
   });
   await settle();
   assert(!el(m.host, "iframe"), "a frame-src violation tears the frame down without waiting for a load");
-  assert(text(panel(m)).includes("Couldn't open the live view"), "and says so");
-  assert(btn(m, "view") && text(btn(m, "view")).includes("Open live view again"), "with a retry");
+  equal(toasts.length, 1, "and says so, once, as a toast");
+  assert(btn(m, "view") && text(btn(m, "view")) === "Open live view", "back to Open live view");
   await click(btn(m, "view")!);
   equal(board.views, 2, "the retry fetches a fresh URL; the refused one is not reused");
   await m.unmount();
@@ -482,13 +519,13 @@ const violation = (directive: string, blocked: string, disposition = "enforce") 
   board.mode = "network";
   await advance(2000);
   assert(el(m.host, "iframe[data-bz-frame]") === frame, "one failed poll leaves the very same frame in place");
-  assert(text(panel(m)).includes("Couldn't load the browser state"), "and shows the read error as a note");
+  assert(text(el(m.host, ".bz-badge")).includes("Can't load") && toasts.length === 0, "and says so in the state label, with no toast for one failed poll");
   assert(btn(m, "stop"), "Stop is still there");
   board.mode = "ok";
   await advance(2000);
   assert(el(m.host, "iframe[data-bz-frame]") === frame, "recovery does not remount it either");
   equal(board.views, 1, "no second viewer URL was fetched without a click");
-  assert(!text(panel(m)).includes("Couldn't load the browser state"), "the note clears");
+  assert(!text(el(m.host, ".bz-badge")).includes("Can't load"), "the label clears");
   await m.unmount();
 }
 
@@ -500,13 +537,16 @@ for (const mode of ["404", "unavailable"] as const) {
   await advance(3000);
   assert(store.tabVisible(store.browserSnapshot()), `${mode} after a live session: the tab stays`);
   assert(btn(m, "stop"), `${mode}: so does Stop`);
-  assert(text(panel(m)).includes("Couldn't load the browser state"), `${mode}: with a retry note`);
+  assert(text(el(m.host, ".bz-badge")).includes("Can't load") && toasts.length === 0, `${mode}: the state label says so, and one failed poll is no toast`);
   const reads = board.gets;
   await advance(6000);
   assert(board.gets > reads, `${mode}: and polling carries on`);
+  equal(toasts, ["Can't load the browser state."], `${mode}: three failures in a row are told once`);
+  await advance(9000);
+  equal(toasts.length, 1, `${mode}: and not again while it stays down`);
   board.mode = "ok";
   await advance(3000);
-  assert(!text(panel(m)).includes("Couldn't load"), `${mode}: recovers`);
+  assert(!text(el(m.host, ".bz-badge")).includes("Can't load"), `${mode}: recovers`);
   await m.unmount();
 }
 
@@ -518,14 +558,13 @@ for (const mode of ["404", "unavailable"] as const) {
   board.stopStatus = 503;
   await click(btn(m, "stop")!);
   await click(btn(m, "go")!);
-  const dock = el(m.host, "[data-bz-dock]")!;
-  assert(text(dock).includes("Couldn't stop the session"), "the failure is shown");
-  assert(btn(m, "view"), "above Open live view, which is still offered");
+  equal(toasts, ["Couldn't stop the session. It may still be running."], "the failure is a toast");
+  assert(btn(m, "view"), "Open live view again is still offered");
   assert(el(m.host, "iframe[data-bz-frame]"), "and the live view was not destroyed by the failed stop");
-  assert(text(btn(m, "stop")).includes("Try stopping again"), "with a way to try again");
+  assert(btn(m, "stop"), "with Stop there to try again");
   board.body = { state: "active", signedIn: false, url: "https://portal.example.test/orders", instructions: null };
   await advance(2000);
-  assert(!text(el(m.host, "[data-bz-dock]")).includes("Couldn't stop"), "a phase change clears the old failure");
+  equal(store.browserSnapshot().stop, "idle", "a phase change clears the old failure");
   await m.unmount();
 }
 
@@ -592,19 +631,19 @@ for (const mode of ["404", "unavailable"] as const) {
   await m.unmount();
 }
 
-// ===== focus goes to the tab after a stop, and a long instruction keeps its caution =====
+// ===== a long instruction is plain text in one place, and the frame has none of our words =====
 {
   const long = "Please sign in. ".repeat(40);
   const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: long });
   await React.act(async () => { canvasStore.openArtifact({ id: "art-html1", version: 1, kind: "html", title: "Doc", bytes: 12 }); });
   await settle();
   await click(tab(m)!);
-  assert(el(m.host, "#bz-says-t")!.getAttribute("data-clamp") === "full", "a long instruction is clamped, with Show all");
-  assert(text(panel(m)).includes("check where you are"), "and the caution is outside the clamp");
-  assert(text(panel(m)).includes("Last page the assistant read") && !text(panel(m)).includes("You will be on this page"), "the address is the last page the assistant read, not a promise of where the person will be");
+  equal(el(m.host, "#bz-says-t")!.textContent, long, "a long instruction shows whole, scrolled by the page and never clamped behind a button");
+  assert(text(el(m.host, ".bz-says small")) === "Your assistant:", "attributed to the assistant");
+  assert(!all(m.host, "button").some((x) => /show (all|less)/i.test(x.textContent ?? "")), "with no Show all");
+  assert(!/check where you are|Last page the assistant read|can be wrong/.test(text(panel(m))), "and no caution paragraph or address block");
   await click(btn(m, "view")!);
-  assert(el(m.host, "#bz-says-t")!.getAttribute("data-clamp") === "compact", "in the live view the clamp is compact");
-  assert(text(panel(m)).includes("check where you are"), "and the caution is still shown there");
+  assert(!el(m.host, "#bz-says-t") && !el(m.host, ".bz-says"), "in the live view the instructions are the viewer's to show");
   await m.unmount();
 }
 {
@@ -680,13 +719,12 @@ for (const mode of ["404", "unavailable"] as const) {
   await settle();
   await advance(30_000);
   assert(el(m.host, "iframe[data-bz-frame]") === first, "a frame that loaded is not reported as failed 20 s later");
-  assert(text(panel(m)).includes("If it stays blank, open it again"), "the standing hint says what to do with a blank view");
-  assert(!/Done|control/.test(text(el(m.host, "[data-bz-dock]"))), "and promises no Done control");
+  assert(!/blank|Done|control/.test(text(panel(m))), "no standing hint about a blank view, and no promise of a Done control");
   // A failed reopen keeps what the person has.
   board.viewStatus = 500;
   await click(btn(m, "view")!);
   assert(el(m.host, "iframe[data-bz-frame]") === first, "a failed reopen leaves the old frame in place");
-  assert(text(panel(m)).includes("The current view is unchanged"), "and says so");
+  equal(toasts, ["Couldn't open the live view."], "and says so in a toast");
   // A reopen in flight keeps it too, and the new URL replaces it.
   board.viewStatus = 200;
   board.viewHold = true;
@@ -900,7 +938,7 @@ for (const mode of ["404", "unavailable"] as const) {
   board.stopHold = true;
   await click(btn(m, "stop")!);
   await click(btn(m, "go")!);
-  assert(!text(panel(m)).includes("asking you to take over") && text(panel(m)).includes("Closing the session"), "no frame: the panel no longer asks for a takeover");
+  assert(!el(m.host, "#bz-says-t") && el(m.host, "[data-bz-dock] .btn-spin"), "no frame: the panel no longer asks for a takeover, and the dock shows the stop");
   await React.act(async () => { board.release!(); });
   await settle();
   await m.unmount();
@@ -915,7 +953,6 @@ for (const mode of ["404", "unavailable"] as const) {
   await click(btn(m, "go")!);
   const viewer = el(m.host, ".bz-viewer")!;
   assert(viewer.hasAttribute("inert"), "while stopping, the frame is inert");
-  assert(text(viewer.querySelector(".bz-viewer-bar b") as HTMLElement).includes("Stopping"), "and its bar says so");
   await React.act(async () => { board.release!(); });
   await settle();
   assert(!el(m.host, ".bz-viewer")!.hasAttribute("inert"), "a failed stop restores it");
@@ -930,12 +967,12 @@ for (const mode of ["404", "unavailable"] as const) {
   await advance(2000);
   const reads = board.gets;
   await advance(10_000);
-  assert(text(panel(m)).includes("Couldn't load the browser state"), "a GET that never answers is reported as a failed read");
+  assert(text(el(m.host, ".bz-badge")).includes("Can't load"), "a GET that never answers is reported as a failed read");
   board.getHang = false;
   board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
   await advance(4000);
   assert(board.gets > reads, "and polling goes on");
-  assert(text(panel(m)).includes("Handed back"), "so the handback is noticed after all");
+  equal(store.browserSnapshot().session?.state, "active", "so the handback is noticed after all");
   await m.unmount();
 }
 {
@@ -944,7 +981,8 @@ for (const mode of ["404", "unavailable"] as const) {
   board.viewHang = true;
   await click(btn(m, "view")!);
   await advance(15_000);
-  assert(text(panel(m)).includes("Couldn't open the live view"), "a view request that never answers ends as an error");
+  equal(toasts, ["Couldn't open the live view."], "a view request that never answers ends as a toast");
+  assert(btn(m, "view") && !el(m.host, "iframe"), "back to Open live view");
   await m.unmount();
 }
 
@@ -1175,7 +1213,7 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
   }
   await advance(16_000);
   await raf();
-  assert(text(panel(m)).includes("Couldn't open the live view"), `${what}: it failed`);
+  equal(toasts, ["Couldn't open the live view."], `${what}: it failed, in a toast`);
   assert(document.activeElement === btn(m, "view"), `${what}: focus is still on Open live view, so Enter retries`);
   await m.unmount();
 }
@@ -1187,8 +1225,8 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
   await React.act(async () => { stopBtn.focus(); });
   await click(stopBtn);
   await raf();
-  assert(text(panel(m)).includes("Couldn't stop the session"), "the stop failed at once");
-  assert(document.activeElement === btn(m, "stop") && text(btn(m, "stop")).includes("Try stopping again"), "focus is on Try stopping again");
+  equal(toasts, ["Couldn't stop the session. It may still be running."], "the stop failed at once");
+  assert(document.activeElement === btn(m, "stop"), "focus is on Stop, to try again");
   await m.unmount();
 }
 
@@ -1228,19 +1266,17 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
   await click(btn(m, "keep")!);
   board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
   await advance(2000);
-  assert(text(el(m.host, ".bz-addr")).includes("You had control"), "after the handback, with the person's control recorded, it says so");
+  assert(!/You had control|Handed back/.test(text(panel(m))), "after the handback nothing remarks on it");
   await m.unmount();
 }
 
-// ===== the viewer bar names no site; the last-read address and the caution stay with the frame =====
+// ===== an open live view carries none of the board's words about the page =====
 {
   const m = await start({ state: "handoff", signedIn: false, url: "https://stale-page.example.test/orders", instructions: "Sign in." });
   await openTab(m);
   await click(btn(m, "view")!);
-  const bar = text(el(m.host, ".bz-viewer-bar"));
-  assert(!bar.includes("stale-page"), `the bar does not name the (possibly stale) host: ${bar}`);
-  assert(text(panel(m)).includes("Last page the assistant read") && text(panel(m)).includes("check where you are"), "the label and the caution are still on screen while the frame is open");
-  assert(!/live view itself/.test(text(panel(m))), "and the caution does not assume the viewer has its own address bar");
+  assert(!text(panel(m)).includes("stale-page"), "the (possibly stale) last-read host is not shown beside the frame");
+  assert(el(m.host, "iframe[data-bz-frame]") && !el(m.host, ".bz-addr") && !el(m.host, ".bz-says"), "no address line and no instructions: the viewer has its own");
   await m.unmount();
 }
 
@@ -1315,6 +1351,374 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
   await advance(30_000);
   equal(board.gets, after, "leaving Home stops the polling");
   assert(!tab(m), "and the tab goes with it");
+  await m.unmount();
+}
+
+
+// ===== no leftover copy in any state, and the card says three things =====
+for (const body of [
+  { state: "none" },
+  { state: "ended", url: null },
+  { state: "active", signedIn: true, url: "https://portal.example.test/orders" },
+  { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." },
+]) {
+  const m = await start(body);
+  await openTab(m);
+  const words = text(panel(m));
+  assert(!/session-backed|keeps running if you close|state and address only|reading this page|You had control|Handed back|Written by the assistant|on its own/.test(words), `${body.state}: no status footnote or notice: ${words}`);
+  assert(!el(m.host, ".cv-foot") && !el(m.host, ".bz-remind"), `${body.state}: no footer and no reminder line`);
+  if (body.state === "none" || body.state === "ended") {
+    equal(all(m.host, ".sempty p").length, 1, `${body.state}: one short line of empty state`);
+    assert(!el(m.host, ".bz-addr") && !el(m.host, "[data-bz-dock]"), `${body.state}: nothing else`);
+  } else {
+    equal(all(m.host, ".bz-addr").length, 1, `${body.state}: one address line`);
+  }
+  if (body.state === "handoff") {
+    assert(el(m.host, '[data-bz-act="view"].btn-primary') && !all(m.host, ".btn-primary").some((x) => x.getAttribute("data-bz-act") !== "view"), "one primary action: Open live view");
+    assert(!all(m.host, "p, small").some((x) => /caution|can be wrong|check where/i.test(x.textContent ?? "")), "no caution paragraph");
+  }
+  if (body.state === "active") assert(all(m.host, "[data-bz-dock] button").length === 1 && btn(m, "stop"), "active: only Stop");
+  const card = el(m.host, ".bz-card");
+  if (card) {
+    const parts = all(card, ".arttext > *").map((x) => text(x));
+    equal(parts.length, body.state === "ended" ? 2 : 3, `${body.state}: the card is a name, a state and the host`);
+    assert(!/Open|in canvas/.test(text(card)), `${body.state}: and no button label`);
+  }
+  await m.unmount();
+}
+
+// ===== item 1: a session or takeover that starts mid-turn shows with no reload =====
+let chats = 0;
+async function mountChat() {
+  // Each chat is its own scope: the thread store outlives a mount.
+  const scope = `s${++chats}:u1`;
+  const MemberChat = require("../src/features/home/MemberChat").default;
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const root = createRoot(hostEl);
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(MemberChat, { scope, readOnly: false, onOpenIssue: () => undefined }), React.createElement(CanvasDrawer)));
+  });
+  return { host: hostEl, scope, unmount: async () => { await React.act(async () => { root.unmount(); }); hostEl.remove(); } };
+}
+{
+  reset({ body: { state: "none" }, conversation: "cm1" });
+  const c = await mountChat();
+  for (let i = 0; i < 4; i++) await advance(1000);
+  assert(board.gets >= 1 && !el(c.host, ".bz-card"), "no session: no card");
+  const idle = board.gets;
+  await advance(30_000);
+  equal(board.gets, idle, "an idle chat on a board with no session is not polled");
+  // The person asks. The turn's entries land (the thread polls every 6 s), and the
+  // board starts a takeover partway through it, with no later entry to say so.
+  board.turn = 1;
+  await advance(7000);
+  assert(!el(c.host, ".bz-card"), "the turn is running and nothing has started yet");
+  board.body = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Please sign in." };
+  await advance(3000);
+  assert(el(c.host, ".bz-card") && store.tabVisible(store.browserSnapshot()), "the card and the tab show within seconds, without a reload");
+  await c.unmount();
+  const after = board.gets;
+  await advance(30_000);
+  equal(board.gets, after, "leaving the chat stops it");
+}
+{
+  // The turn settling reads once more, then an idle none stops.
+  const m = await start({ state: "none" });
+  const base = board.gets;
+  await React.act(async () => { store.watchBrowser(true); });
+  await advance(1000);
+  equal(board.gets, base, "a running turn is read on a short interval, not at once");
+  await advance(1000);
+  equal(board.gets, base + 1, "every two seconds");
+  board.body = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." };
+  await React.act(async () => { store.watchBrowser(false); });
+  await settle();
+  equal(board.gets, base + 2, "the turn settling reads once more");
+  equal(store.browserSnapshot().session?.state, "handoff", "and finds a takeover asked for after the last entry");
+  await m.unmount();
+}
+{
+  const m = await start({ state: "none" });
+  await React.act(async () => { store.watchBrowser(true); });
+  await advance(4000);
+  await React.act(async () => { store.watchBrowser(false); });
+  await settle();
+  const quiet = board.gets;
+  await advance(60_000);
+  equal(board.gets, quiet, "once the turn is over a board in none is not polled again");
+  await m.unmount();
+}
+
+// ===== item 3: the operator's own Home, on a hosted board =====
+{
+  const Home = require("../src/features/home/Home").default;
+  const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
+  for (const hosted of [true, false]) {
+    reset({ body: { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Please sign in." }, conversation: "cmaster" });
+    resources.masterThread.reset();
+    const hostEl = document.createElement("div");
+    document.body.append(hostEl);
+    const root = createRoot(hostEl);
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
+        readOnly: false, hosted, overview: resources.overview.get(), onOpenIssue: () => undefined,
+        onOpenDecision: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      }), React.createElement(CanvasDrawer)));
+    });
+    for (let i = 0; i < 6; i++) await advance(1000);
+    if (hosted) {
+      equal(store.browserSnapshot().conversation, "cmaster", "hosted: the master thread's own conversation is the selector");
+      assert(el(hostEl, ".bz-card"), "hosted: the thread has the Browser card");
+      const reads = board.gets;
+      await advance(6000);
+      assert(board.gets > reads, "a live session is polled on this surface too");
+      await click(el(hostEl, ".bz-card")!);
+      assert(el(hostEl, "#bz-panel") && !el(hostEl, "#bz-panel")!.hasAttribute("hidden"), "the card opens the panel");
+      await click(el(hostEl, '[data-bz-act="stop"]')!);
+      await click(el(hostEl, '[data-bz-act="go"]')!);
+      equal(board.stops, 1, "and Stop reaches the board");
+    } else {
+      equal(board.gets, 0, "native: /api/browser is never read");
+      equal(store.browserSnapshot().conversation, null, "native: the store is never fed");
+      assert(!el(hostEl, ".bz-card"), "native: no card");
+    }
+    await React.act(async () => { root.unmount(); });
+    hostEl.remove();
+    const after = board.gets;
+    await advance(30_000);
+    equal(board.gets, after, `${hosted ? "hosted" : "native"}: leaving Home stops it`);
+  }
+}
+
+// ===== the member chat's turn is bounded: 3 minutes from the thread's last change =====
+const WINDOW = 3 * 60_000;
+// 4: the turn's last entry is a commentary line.
+for (const turn of [1, 4]) {
+  // Reopening a chat mid-turn polls from the start, with no new entry to wake it.
+  reset({ body: { state: "none" }, conversation: "cm1", turn });
+  const c = await mountChat();
+  await advance(4000);
+  board.body = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." };
+  await advance(3000);
+  assert(el(c.host, ".bz-card"), `a chat opened mid-turn (tail ${turn}) sees a session that starts with no new entry`);
+  await c.unmount();
+}
+{
+  reset({ body: { state: "none" }, conversation: "cm1", turn: 1 });
+  const c = await mountChat();
+  await advance(WINDOW - 20_000);
+  const before = board.gets;
+  assert(before > 20, `a turn with no answer is read on a short interval (${before})`);
+  await advance(40_000);
+  const ended = board.gets;
+  await advance(60 * 60_000);
+  equal(board.gets, ended, "after the window it stays at zero reads for an hour, with one last read at the end");
+  assert(ended <= before + 12, `and nothing like a poll went on past it (${before} -> ${ended})`);
+  equal(toasts.length, 0, "no toast for the window ending");
+  // A new thread entry restarts it.
+  board.turn = 3;
+  await advance(7000);
+  const restarted = board.gets;
+  await advance(6000);
+  assert(board.gets >= restarted + 2, "a new entry reopens the window");
+  await advance(WINDOW + 10_000);
+  const closed = board.gets;
+  await advance(10 * 60_000);
+  equal(board.gets, closed, "and it closes again");
+  await c.unmount();
+}
+{
+  // An answer closes it at once.
+  reset({ body: { state: "none" }, conversation: "cm1", turn: 1 });
+  const c = await mountChat();
+  await advance(6000);
+  board.turn = 2;
+  await advance(7000);
+  const done = board.gets;
+  await advance(60_000);
+  equal(board.gets, done, "an answered turn is not polled");
+  await c.unmount();
+}
+{
+  // A failed send is no running turn.
+  reset({ body: { state: "none" }, conversation: "cm1" });
+  const { memberThreadStore } = require("../src/features/home/memberThread") as typeof import("../src/features/home/memberThread");
+  const { addPending, settlePending } = require("../src/features/home/thread") as typeof import("../src/features/home/thread");
+  const c = await mountChat();
+  await advance(8000);
+  await React.act(async () => { memberThreadStore(c.scope).write((st: any) => settlePending(addPending(st, "p1", "look it up", 1), "p1", { ok: false, error: "offline" })); });
+  await advance(2000);
+  const quiet = board.gets;
+  await advance(60_000);
+  equal(board.gets, quiet, "a failed pending send does not poll");
+  await c.unmount();
+}
+
+// ===== the operator's running turn drives polling =====
+{
+  const Home = require("../src/features/home/Home").default;
+  const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
+  for (const running of [true, false]) {
+    reset({ body: { state: "none" }, conversation: "cmaster", masterTurn: running });
+    resources.masterThread.reset();
+    const hostEl = document.createElement("div");
+    document.body.append(hostEl);
+    const root = createRoot(hostEl);
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
+        readOnly: false, hosted: true, overview: resources.overview.get(), onOpenIssue: () => undefined,
+        onOpenDecision: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      }), React.createElement(CanvasDrawer)));
+    });
+    for (let i = 0; i < 4; i++) await advance(1000);
+    const base = board.gets;
+    await advance(20_000);
+    if (running) assert(board.gets >= base + 8, `a running master turn polls the board in none (${base} -> ${board.gets})`);
+    else equal(board.gets, base, "an idle master does not");
+    await React.act(async () => { root.unmount(); });
+    hostEl.remove();
+  }
+}
+
+// ===== a failed read with no live session shows nothing; focus never lands on Stop =====
+{
+  const m = await start({ state: "none" });
+  board.mode = "network";
+  for (let i = 0; i < 4; i++) await React.act(async () => { await store.refreshBrowser(); });
+  await settle();
+  assert(!el(m.host, ".bz-card") && !store.browserSnapshot().loadError, "a failed read in none shows no card and no error");
+  equal(toasts.length, 0, "and no toast");
+  await m.unmount();
+}
+{
+  const m = await start({ state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." });
+  await openTab(m);
+  await React.act(async () => { btn(m, "view")!.focus(); });
+  board.body = { state: "active", signedIn: true, url: "https://portal.example.test/orders", instructions: null };
+  await advance(2000);
+  assert(btn(m, "stop") && document.activeElement !== btn(m, "stop"), "when the takeover ends under focus, focus is not on Stop");
+  await m.unmount();
+}
+
+// ===== the operator's send that is never answered is watched for the window only =====
+{
+  const Home = require("../src/features/home/Home").default;
+  const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
+  const { addPending } = require("../src/features/home/thread") as typeof import("../src/features/home/thread");
+  reset({ body: { state: "none" }, conversation: "cmaster" });
+  resources.masterThread.reset();
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const root = createRoot(hostEl);
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
+      readOnly: false, hosted: true, overview: resources.overview.get(), onOpenIssue: () => undefined,
+      onOpenDecision: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+    }), React.createElement(CanvasDrawer)));
+  });
+  for (let i = 0; i < 4; i++) await advance(1000);
+  const idle = board.gets;
+  await advance(30_000);
+  equal(board.gets, idle, "an idle operator Home is not polled");
+  await React.act(async () => { resources.masterThread.write((st: any) => addPending(st, "p9", "look it up", 1)); });
+  await advance(WINDOW - 20_000);
+  assert(board.gets > idle + 20, `a send is read on a short interval (${idle} -> ${board.gets})`);
+  await advance(40_000);
+  const ended = board.gets;
+  await advance(60 * 60_000);
+  equal(board.gets, ended, "never answered: zero reads for an hour after the window");
+  equal(toasts.length, 0, "and no toast");
+  await React.act(async () => { resources.masterThread.write((st: any) => ({ ...st, entries: [...st.entries, { seq: 50, role: "agent", kind: "tool_call", text: "browser: read", message: "o9" }] })); });
+  await advance(6000);
+  assert(board.gets >= ended + 2, "a new entry reopens it");
+  await React.act(async () => { root.unmount(); });
+  hostEl.remove();
+}
+
+// ===== the final rounds: Stop clears a failed read, a failed last read is retried, the settle read =====
+{
+  // 1. A successful Stop with reads failing says Ended, not Can't load.
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  await openTab(m);
+  board.mode = "network";
+  await advance(3000);
+  assert(text(el(m.host, ".bz-badge")).includes("Can't load"), "a failed read on a live session says so");
+  await click(btn(m, "stop")!);
+  equal(board.stops, 1, "Stop reaches the board");
+  assert(!store.browserSnapshot().loadError && text(el(m.host, ".bz-badge")).includes("Ended"), `a stop that succeeded reads Ended: ${text(el(m.host, ".bz-badge"))}`);
+  await m.unmount();
+}
+{
+  // 2. A failed settle read with no live session is retried slowly, silently, until one answers.
+  const m = await start({ state: "none" });
+  await React.act(async () => { store.watchBrowser(true); });
+  board.mode = "network";
+  await React.act(async () => { store.watchBrowser(false); });
+  await settle();
+  const failed = board.gets;
+  await advance(95_000);
+  assert(board.gets >= failed + 3, `retried every 30 s (${failed} -> ${board.gets})`);
+  equal(toasts.length, 0, "silently");
+  assert(!store.browserSnapshot().loadError && !el(m.host, ".bz-card"), "with no card and no label");
+  board.mode = "ok";
+  board.body = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." };
+  await advance(31_000);
+  equal(store.browserSnapshot().session?.state, "handoff", "the session the failed read hid shows once one read answers");
+  await m.unmount();
+}
+{
+  const m = await start({ state: "none" });
+  await React.act(async () => { store.watchBrowser(true); });
+  board.mode = "network";
+  await React.act(async () => { store.watchBrowser(false); });
+  await settle();
+  board.mode = "ok";
+  await advance(31_000);
+  const answered = board.gets;
+  await advance(10 * 60_000);
+  equal(board.gets, answered, "once one read answers, an idle none makes zero reads again");
+  await m.unmount();
+}
+{
+  // 3 and 4. The final read at expiry, and at the turn settling after it, through the hook alone.
+  const Feed = (props: { running: boolean }) => { store.useBrowserFeed("c1", props.running, "r1"); return null; };
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const root = createRoot(hostEl);
+  const render = (running: boolean) => React.act(async () => { root.render(React.createElement(Feed, { running })); });
+  reset({ body: { state: "none" } });
+  Object.defineProperty(document, "hidden", { value: true, configurable: true });
+  await render(true);
+  await settle();
+  const g0 = board.gets;
+  await advance(WINDOW - 5000);
+  equal(board.gets, g0, "a hidden tab's ticks read nothing before the window ends");
+  await advance(10_000);
+  equal(board.gets, g0 + 1, "the window ending makes one final read");
+  board.body = { state: "handoff", signedIn: false, url: "https://login.supplier-example.test/sign-in", instructions: "Sign in." };
+  await render(false);
+  await settle();
+  equal(board.gets, g0 + 2, "the turn settling after the window still reads once more");
+  equal(store.browserSnapshot().session?.state, "handoff", "and finds the session");
+  await React.act(async () => { root.unmount(); });
+  hostEl.remove();
+  delete (document as any).hidden;
+}
+
+// ===== an unavailable or 404 answer, once nothing is live, ends polling and the retry =====
+for (const mode of ["404", "unavailable"] as const) {
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  board.body = { state: "ended", signedIn: false, url: null, instructions: null };
+  await advance(3000);
+  equal(store.browserSnapshot().session?.state, "ended", `${mode}: the session ended`);
+  board.mode = mode;
+  await React.act(async () => { await store.refreshBrowser(); });
+  await settle();
+  assert(store.tabVisible(store.browserSnapshot()), `${mode}: the tab stays`);
+  const after = board.gets;
+  await advance(10 * 60_000);
+  equal(board.gets, after, `${mode}: zero further reads over ten minutes`);
   await m.unmount();
 }
 

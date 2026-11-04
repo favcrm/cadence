@@ -22,7 +22,7 @@ import { memberThreadReader } from "./memberThread";
 import { ImageConversation } from "../canvas/imageConversation";
 import { useCanvasFeed } from "../canvas/feed";
 import { BrowserCard } from "../canvas/BrowserPanel";
-import { feedBrowser, refreshBrowser } from "../canvas/browserStore";
+import { useBrowserFeed } from "../canvas/browserStore";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
@@ -68,6 +68,7 @@ interface MemberSurface {
 }
 
 const LOADING_IDENTITY: IdentityRead = { state: "loading" };
+
 
 export default function MemberChat({
   scope,
@@ -224,20 +225,16 @@ export default function MemberChat({
 
   // CAD-2103: this surface does not feed the canvas by itself, so the
   // assistant's conversation (the same id the image provider below uses) is
-  // wired to the canvas and the Browser tab explicitly. A new entry in the
-  // thread is when a session may have started, so it re-reads the browser.
+  // wired to the canvas and the Browser tab explicitly.
   const conversationId = surface?.conversation ?? null;
   // Auto-open is off here: an artifact opens the drawer when the person asks,
   // so on a phone the drawer never covers the chat they are reading.
   useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null, autoOpen: false });
-  useEffect(() => {
-    feedBrowser(conversationId);
-    return () => feedBrowser(null);
-  }, [conversationId]);
-  const newestSeq = lastSeq(thread.data);
-  useEffect(() => {
-    if (conversationId !== null) void refreshBrowser();
-  }, [conversationId, newestSeq]);
+  // There is no turn state on this surface, so a turn counts as open while the
+  // thread does not end on an answer or a failed send; the store bounds how long.
+  const tail = [...items].reverse().find((i) => !["system", "artifact", "image", "video", "hire"].includes(i.type));
+  const turnOpen = tail !== undefined && tail.type !== "answer" && !(tail.type === "pending" && tail.pending.state === "failed");
+  useBrowserFeed(conversationId, turnOpen, `${lastSeq(thread.data) ?? 0}:${thread.data?.pending?.length ?? 0}`);
 
   const [glideTick, setGlide] = useState(0);
   const scrollPanel = useCallback((kind: "glide" | "jump") => {
