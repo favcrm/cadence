@@ -1667,6 +1667,7 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=61", [])?;
                 tx.commit()?;
             }
+            // migration-lint: allow 62 -- CAD-2120: control flow only (re-read the version under the write lock; a missing progress row on a v62 store is completion). No DDL, column, index or trigger text changes; a store already at v62 is untouched.
             if version < 62 {
                 // CAD-2042: the retained-source page must be an ordered scoped
                 // index range, not a join plus temp-B-tree sort over the whole
