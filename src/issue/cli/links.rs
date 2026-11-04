@@ -164,7 +164,7 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             if bytes.len() as u64 > pm.config.artifact_max_bytes {
                 return Err(Error::rejected("artifact unavailable"));
             }
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            crate::output::write_stdout(&bytes)?;
             Ok(0)
         }
         // A verdict's authority is the hosted reviewer's own enrollment and

@@ -3527,3 +3527,827 @@ fn oversized_identity_fails_before_any_issuer_request_or_child_save() {
     assert!(listener.accept().is_err(), "issuer was contacted");
     assert!(!dir.join(RECORD).exists());
 }
+
+// CAD-2009: independently authored enrollment/continuity acceptance.
+#[cfg(unix)]
+mod cad2009_enrollment_uncertainty_acceptance {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        Lost,
+        NonJson,
+        Oversized,
+        MissingReceipt,
+        ForeignReceipt,
+        Bare503,
+        LocalSaveRefused,
+    }
+
+    fn fault_reply(socket: &mut std::net::TcpStream, fault: Fault, foreign: Value) {
+        let (status, bytes) = match fault {
+            Fault::Lost => return,
+            Fault::NonJson => ("200 OK", b"not-json".to_vec()),
+            Fault::Oversized => ("200 OK", vec![b'x'; MAX_RESPONSE as usize + 1]),
+            Fault::MissingReceipt | Fault::LocalSaveRefused => ("200 OK", b"{}".to_vec()),
+            Fault::ForeignReceipt => ("200 OK", serde_json::to_vec(&foreign).unwrap()),
+            Fault::Bare503 => ("503 Service Unavailable", b"{}".to_vec()),
+        };
+        // A client that reaches its response cap may close before this write.
+        let _ = write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+        let _ = socket.write_all(&bytes);
+        let _ = socket.flush();
+    }
+
+    fn read_request(socket: &mut std::net::TcpStream) -> Value {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let first: Vec<_> = line.split_whitespace().collect();
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0], "POST");
+        let path = first[1].to_string();
+        let mut length = None;
+        let mut authorization = None;
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            let (key, value) = line.split_once(':').unwrap();
+            if key.eq_ignore_ascii_case("content-length") {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+            if key.eq_ignore_ascii_case("authorization") {
+                authorization = Some(value.trim().to_string());
+            }
+            assert!(!key.eq_ignore_ascii_case("cookie"));
+        }
+        let length = length.unwrap();
+        assert!(length <= 64 * 1024);
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes).unwrap();
+        json!({"path": path, "authorization": authorization,
+               "body": serde_json::from_slice::<Value>(&bytes).unwrap()})
+    }
+
+    // Keep listening until client completion so automatic replays are counted.
+    fn exercise<T>(
+        work: impl FnOnce(&str) -> T,
+        mut reply: impl FnMut(usize, &Value, &mut std::net::TcpStream) + Send,
+    ) -> (T, Vec<Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let (completion, completed) = UnixStream::pair().unwrap();
+        std::thread::scope(|scope| {
+            let server = scope.spawn(move || {
+                let mut requests = Vec::new();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "enrollment fixture did not settle");
+                    let mut fds = [
+                        libc::pollfd {
+                            fd: listener.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: completed.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: fds contains exactly two initialized pollfd values.
+                    let ready = unsafe {
+                        libc::poll(
+                            fds.as_mut_ptr(),
+                            2,
+                            remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+                        )
+                    };
+                    if ready < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    assert!(ready > 0, "enrollment fixture deadline expired");
+                    if fds[0].revents & libc::POLLIN != 0 {
+                        let (mut socket, _) = listener.accept().unwrap();
+                        let request = read_request(&mut socket);
+                        reply(requests.len(), &request, &mut socket);
+                        requests.push(request);
+                    } else if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                        return requests;
+                    } else {
+                        panic!("unexpected enrollment fixture poll events");
+                    }
+                }
+            });
+            let result = work(&issuer);
+            drop(completion);
+            (result, server.join().unwrap())
+        })
+    }
+
+    fn grant(at: u64) -> Value {
+        json!({"version": VERSION, "organization_id": "ws_real",
+            "audience": "http://127.0.0.1:1",
+            "principal": {"kind": "service", "subject_id": "hsp_subject",
+                "current_role": "member", "provisioned_by": "owner_1"},
+            "capabilities": ["bridge.enroll", "results.submit"],
+            "credential": {"credential_id": "hcb_credential", "access_token": BRIDGE,
+                "token_type": "Bearer", "issued_at": at, "expires_at": at + 120,
+                "renewal": "reexchange"}})
+    }
+
+    fn child_reply(at: u64) -> Value {
+        json!({"version": VERSION, "organization_id": "ws_real",
+            "audience": "http://127.0.0.1:1", "bridge_id": "hcb_bridge", "agents": [{
+                "agent_id": "hca_agent", "bridge_id": "hcb_bridge", "client_agent_id": "worker",
+                "principal_subject_id": "hsp_subject", "organization_id": "ws_real",
+                "audience": "http://127.0.0.1:1", "role": "implementer",
+                "capabilities": ["results.submit"], "credential": {
+                    "credential_id": "hcc_new", "access_token": CHILD, "token_type": "Bearer",
+                    "issued_at": at, "expires_at": at + 120, "renewal": "reexchange"}}]})
+    }
+
+    fn assert_unknown(error: Error, dir: &Path) {
+        assert_eq!(
+            error.kind(),
+            "unknown",
+            "a dispatched mutation is unproved: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown") || message.contains("uncertain"),
+            "{message}"
+        );
+        assert!(
+            message.contains(dir.to_str().unwrap()),
+            "recovery must name the actual retained enrollment directory: {message}"
+        );
+        assert!(
+            !message.contains(SERVICE) && !message.contains(BRIDGE) && !message.contains(CHILD),
+            "recovery diagnostics exposed a bearer"
+        );
+        assert!(!message.contains("enrollment status --remote"), "{message}");
+    }
+
+    #[test]
+    fn cad2009_service_exchange_and_child_enrollment_uncertainty_retain_local_custody() {
+        for fail_exchange in [true, false] {
+            for fault in [
+                Fault::Lost,
+                Fault::NonJson,
+                Fault::Oversized,
+                Fault::MissingReceipt,
+                Fault::ForeignReceipt,
+                Fault::Bare503,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let dir = root.path().join("retained-enrollment");
+                let at = now().unwrap();
+                let (result, requests) = exercise(
+                    |issuer| {
+                        trust(&dir, issuer);
+                        let mut prior = record(at + 300);
+                        prior.issuer = issuer.to_string();
+                        save(&dir, &prior).unwrap();
+                        let before = fs::read(dir.join(RECORD)).unwrap();
+                        let result = enroll(
+                            issuer,
+                            "ws_real",
+                            "http://127.0.0.1:1",
+                            "worker",
+                            SERVICE,
+                            &dir,
+                        );
+                        assert_eq!(fs::read(dir.join(RECORD)).unwrap(), before,
+                        "{fault:?}: an unproved enrollment must not replace or delete existing custody");
+                        result
+                    },
+                    |index, request, socket| {
+                        if index == 0 {
+                            assert_eq!(request["path"], "/v1/hosted-cadence/service/exchange");
+                            assert_eq!(request["authorization"], format!("Bearer {SERVICE}"));
+                            if !fail_exchange {
+                                respond(socket, &grant(at));
+                                return;
+                            }
+                        } else if index == 1 && !fail_exchange {
+                            assert_eq!(request["path"], "/v1/hosted-cadence/service/enroll");
+                            assert_eq!(request["authorization"], format!("Bearer {BRIDGE}"));
+                            assert_eq!(request["body"]["agents"][0]["client_agent_id"], "worker");
+                        } else {
+                            fault_reply(socket, Fault::Bare503, json!({}));
+                            return;
+                        }
+                        let mut foreign = if fail_exchange {
+                            grant(at)
+                        } else {
+                            child_reply(at)
+                        };
+                        foreign["organization_id"] = json!("ws_foreign");
+                        fault_reply(socket, fault, foreign);
+                    },
+                );
+                assert_eq!(
+                    requests.len(),
+                    if fail_exchange { 1 } else { 2 },
+                    "{fault:?}: no uncertain mutation may replay or continue to child enrollment"
+                );
+                assert_unknown(result.unwrap_err(), &dir);
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_service_enrollment_pin_refusal_remains_pre_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("unpinned-enrollment");
+        let (result, requests) = exercise(
+            |issuer| {
+                trust(&dir, "https://different.example.test");
+                enroll(
+                    issuer,
+                    "ws_real",
+                    "http://127.0.0.1:1",
+                    "worker",
+                    SERVICE,
+                    &dir,
+                )
+            },
+            |_, _, _| panic!("a failed issuer pin must send nothing"),
+        );
+        assert!(requests.is_empty());
+        assert_eq!(result.unwrap_err().kind(), "rejected");
+        assert!(!dir.join(RECORD).exists());
+    }
+
+    #[test]
+    fn cad2009_confirmed_service_enrollment_still_saves_the_child() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("confirmed-enrollment");
+        let at = now().unwrap();
+        let (result, requests) = exercise(
+            |issuer| {
+                trust(&dir, issuer);
+                enroll(
+                    issuer,
+                    "ws_real",
+                    "http://127.0.0.1:1",
+                    "worker",
+                    SERVICE,
+                    &dir,
+                )
+            },
+            |index, _, socket| match index {
+                0 => respond(socket, &grant(at)),
+                1 => respond(socket, &child_reply(at)),
+                _ => fault_reply(socket, Fault::Bare503, json!({})),
+            },
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(result.unwrap().agent_id(), "hca_agent");
+        assert_eq!(current(&dir).unwrap().agent_id(), "hca_agent");
+    }
+
+    fn challenge(at: u64) -> Value {
+        json!({"version": CONTINUITY_VERSION, "challengeId": format!("ch_{}", "A".repeat(43)),
+            "operationId": format!("op_{}", "B".repeat(43)), "nonce": "C".repeat(43),
+            "registryEpoch": "D".repeat(43), "issuedAtMs": at * 1000,
+            "expiresAtMs": at * 1000 + 30_000})
+    }
+
+    fn bound_reply() -> Value {
+        json!({"version": CONTINUITY_VERSION, "delivery": "bound", "lineageId": LINEAGE,
+            "keyId": format!("key_{}", "E".repeat(43)), "generation": 1,
+            "organizationId": "ws_real", "audience": "https://real.board.example.test",
+            "subjectId": "hsp_subject", "bridgeId": "hcb_bridge", "agentId": "hca_agent",
+            "credentialKind": "child"})
+    }
+
+    #[test]
+    fn cad2009_unproved_continuity_bind_keeps_exact_pending_key_and_recovery_directory() {
+        for fault in [
+            Fault::Lost,
+            Fault::NonJson,
+            Fault::Oversized,
+            Fault::MissingReceipt,
+            Fault::ForeignReceipt,
+            Fault::Bare503,
+            Fault::LocalSaveRefused,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("same-pending-key");
+            let at = now().unwrap();
+            let pending = std::sync::Mutex::new(None::<Vec<u8>>);
+            let (result, requests) = exercise(
+                |issuer| {
+                    trust(&dir, issuer);
+                    let mut child = record(at + 300);
+                    child.issuer = issuer.to_string();
+                    child.source = EnrollmentSource::Browser;
+                    child.service_token = None;
+                    save(&dir, &child).unwrap();
+                    let enrollment_before = fs::read(dir.join(RECORD)).unwrap();
+                    let result = bind_browser(&dir);
+                    assert_eq!(fs::read(dir.join(RECORD)).unwrap(), enrollment_before);
+                    result
+                },
+                |index, request, socket| match index {
+                    0 => {
+                        assert_eq!(request["path"], "/v1/hosted-cadence/continuity/challenge");
+                        assert_eq!(request["authorization"], format!("Bearer {CHILD}"));
+                        *pending.lock().unwrap() =
+                            Some(fs::read(dir.join(CONTINUITY_RECORD)).unwrap());
+                        respond(socket, &challenge(at));
+                    }
+                    1 => {
+                        assert_eq!(request["path"], "/v1/hosted-cadence/continuity/bind");
+                        assert_eq!(request["authorization"], format!("Bearer {CHILD}"));
+                        assert!(request["body"]["publicKey"].as_str().is_some());
+                        assert!(request["body"]["signature"].as_str().is_some());
+                        if matches!(fault, Fault::LocalSaveRefused) {
+                            fs::set_permissions(
+                                dir.join(CONTINUITY_RECORD),
+                                fs::Permissions::from_mode(0o644),
+                            )
+                            .unwrap();
+                            respond(socket, &bound_reply());
+                        } else {
+                            let mut foreign = bound_reply();
+                            foreign["organizationId"] = json!("ws_foreign");
+                            fault_reply(socket, fault, foreign);
+                        }
+                    }
+                    _ => fault_reply(socket, Fault::Bare503, json!({})),
+                },
+            );
+            assert_eq!(
+                requests.len(),
+                2,
+                "{fault:?}: bind must not retry or start a new challenge"
+            );
+            assert_eq!(
+                fs::read(dir.join(CONTINUITY_RECORD)).unwrap(),
+                pending.into_inner().unwrap().unwrap(),
+                "{fault:?}: preserve the exact durable pending seed, not a replacement key"
+            );
+            fs::set_permissions(
+                dir.join(CONTINUITY_RECORD),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            assert!(matches!(
+                read_continuity_locked(&dir).unwrap().state,
+                ContinuityState::Pending
+            ));
+            assert!(
+                bound_browser(&dir).is_err(),
+                "an unproved reply must never manufacture Bound"
+            );
+            let error = result.unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("bind-continuity") && message.contains("--enrollment-dir"),
+                "{message}"
+            );
+            assert_unknown(error, &dir);
+        }
+    }
+
+    #[test]
+    fn cad2009_service_child_cannot_bind_browser_continuity_before_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("service-child");
+        let (result, requests) = exercise(
+            |issuer| {
+                trust(&dir, issuer);
+                let mut child = record(now().unwrap() + 300);
+                child.issuer = issuer.to_string();
+                save(&dir, &child).unwrap();
+                bind_browser(&dir)
+            },
+            |_, _, _| panic!("service children cannot reach browser continuity transport"),
+        );
+        assert!(requests.is_empty());
+        assert_eq!(result.unwrap_err().kind(), "rejected");
+        assert!(!dir.join(CONTINUITY_RECORD).exists());
+    }
+}
+
+// CAD-2009: independently authored one-shot device-token acceptance.
+#[cfg(unix)]
+mod cad2009_device_token_uncertainty_acceptance {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Reply {
+        Lost,
+        NonJson,
+        Oversized,
+        MissingGrant,
+        ForeignGrant,
+        Bare503,
+        Pending,
+        SlowDown,
+        InvalidGrant,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Flow {
+        Login,
+        BrowserEnrollment,
+    }
+
+    struct Runtime {
+        baseline: Instant,
+        elapsed: u64,
+        waits: Vec<u64>,
+        code_calls: usize,
+        token_calls: usize,
+        challenge: Option<String>,
+        verifier: Option<String>,
+    }
+
+    impl Runtime {
+        fn new() -> Self {
+            Self {
+                baseline: Instant::now(),
+                elapsed: 0,
+                waits: Vec::new(),
+                code_calls: 0,
+                token_calls: 0,
+                challenge: None,
+                verifier: None,
+            }
+        }
+    }
+
+    impl LoginRuntime for Runtime {
+        fn now(&mut self) -> Instant {
+            self.baseline + Duration::from_secs(self.elapsed)
+        }
+        fn wait(&mut self, interval: Duration) {
+            self.elapsed += interval.as_secs();
+            self.waits.push(interval.as_secs());
+        }
+        fn post_public(
+            &mut self,
+            issuer: &str,
+            path: &str,
+            body: Value,
+            access: Option<&AccessIngress>,
+        ) -> Result<(u16, Value)> {
+            assert!(access.is_none());
+            match path {
+                "/v1/hosted-cadence/device/code" => {
+                    self.code_calls += 1;
+                    assert_eq!(
+                        self.code_calls, 1,
+                        "an ambiguous redemption must not start new consent"
+                    );
+                    assert_eq!(body["version"], DEVICE_VERSION);
+                    assert_eq!(body["organization_id"], "ws_real");
+                    self.challenge = Some(body["code_challenge"].as_str().unwrap().to_string());
+                    Ok((200, browser_code(60)))
+                }
+                "/v1/hosted-cadence/device/token" => {
+                    self.token_calls += 1;
+                    assert_eq!(body["device_code"], format!("hcd_{}", "A".repeat(43)));
+                    let verifier = body["code_verifier"].as_str().unwrap();
+                    assert_eq!(verifier.len(), 43);
+                    assert_eq!(
+                        self.challenge.as_deref(),
+                        Some(
+                            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                .encode(Sha256::digest(verifier.as_bytes()))
+                                .as_str()
+                        )
+                    );
+                    if let Some(original) = &self.verifier {
+                        assert_eq!(
+                            verifier, original,
+                            "pending polls must keep the original PKCE proof"
+                        );
+                    }
+                    self.verifier = Some(verifier.to_string());
+                    // Only waits and device/code are scripted. Token redemption
+                    // uses the production bounded HTTP/parser/ingress path.
+                    post_public_with_access(issuer, path, body, access)
+                }
+                _ => panic!("unexpected device-flow request"),
+            }
+        }
+    }
+
+    fn read_token(socket: &mut std::net::TcpStream) -> Value {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(
+            line.trim_end(),
+            "POST /v1/hosted-cadence/device/token HTTP/1.1"
+        );
+        let mut length = None;
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            let (key, value) = line.split_once(':').unwrap();
+            if key.eq_ignore_ascii_case("content-length") {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+            assert!(!key.eq_ignore_ascii_case("cookie"));
+            assert!(!key.eq_ignore_ascii_case("authorization"));
+        }
+        let length = length.unwrap();
+        assert!(length < 4096);
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes).unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.as_object().unwrap().len(), 2);
+        assert_eq!(body["device_code"], format!("hcd_{}", "A".repeat(43)));
+        assert_eq!(body["code_verifier"].as_str().unwrap().len(), 43);
+        body
+    }
+
+    fn answer(socket: &mut std::net::TcpStream, reply: Reply, flow: Flow) {
+        let (status, bytes) = match reply {
+            Reply::Lost => return,
+            Reply::NonJson => ("200 OK", b"not-json".to_vec()),
+            Reply::Oversized => ("200 OK", vec![b'x'; MAX_RESPONSE as usize + 1]),
+            Reply::MissingGrant => ("200 OK", b"{}".to_vec()),
+            Reply::ForeignGrant => {
+                let mut grant = login_grant_body();
+                if matches!(flow, Flow::BrowserEnrollment) {
+                    grant["capabilities"] = json!(["bridge.enroll", "results.submit"]);
+                    grant["audience"] = json!("https://real.board.example.test");
+                    grant.as_object_mut().unwrap().remove("cli_session");
+                }
+                grant["organization_id"] = json!("ws_foreign");
+                ("200 OK", serde_json::to_vec(&grant).unwrap())
+            }
+            Reply::Bare503 => ("503 Service Unavailable", b"{}".to_vec()),
+            Reply::Pending => (
+                "400 Bad Request",
+                b"{\"error\":\"authorization_pending\"}".to_vec(),
+            ),
+            Reply::SlowDown => ("400 Bad Request", b"{\"error\":\"slow_down\"}".to_vec()),
+            Reply::InvalidGrant => ("400 Bad Request", b"{\"error\":\"invalid_grant\"}".to_vec()),
+        };
+        // Early client closure after its response cap is expected.
+        let _ = write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+        let _ = socket.write_all(&bytes);
+        let _ = socket.flush();
+    }
+
+    fn exercise<T>(plan: Vec<Reply>, flow: Flow, work: impl FnOnce(&str) -> T) -> (T, Vec<Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let (completion, completed) = UnixStream::pair().unwrap();
+        std::thread::scope(|scope| {
+            let server = scope.spawn(move || {
+                let mut requests = Vec::new();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "device-token fixture did not settle");
+                    let mut fds = [
+                        libc::pollfd {
+                            fd: listener.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: completed.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: fds contains exactly two initialized pollfd values.
+                    let ready = unsafe {
+                        libc::poll(
+                            fds.as_mut_ptr(),
+                            2,
+                            remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+                        )
+                    };
+                    if ready < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    assert!(ready > 0, "device-token fixture deadline expired");
+                    if fds[0].revents & libc::POLLIN != 0 {
+                        let (mut socket, _) = listener.accept().unwrap();
+                        let request = read_token(&mut socket);
+                        let reply = plan
+                            .get(requests.len())
+                            .copied()
+                            .unwrap_or(Reply::InvalidGrant);
+                        requests.push(request);
+                        answer(&mut socket, reply, flow);
+                    } else if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                        return requests;
+                    } else {
+                        panic!("unexpected device-token fixture poll events");
+                    }
+                }
+            });
+            let result = work(&issuer);
+            drop(completion);
+            (result, server.join().unwrap())
+        })
+    }
+
+    fn run_flow(flow: Flow, issuer: &str, dir: &Path, runtime: &mut Runtime) -> Result<()> {
+        match flow {
+            Flow::Login => {
+                login_browser_with(issuer, "ws_real", "acme", dir, |_, _| Ok(()), runtime)
+                    .map(|_| ())
+            }
+            Flow::BrowserEnrollment => enroll_browser_with(
+                issuer,
+                "ws_real",
+                "https://real.board.example.test",
+                "worker",
+                dir,
+                |_, _| Ok(()),
+                runtime,
+            )
+            .map(|_| ()),
+        }
+    }
+
+    #[test]
+    fn cad2009_one_shot_token_uncertainty_stops_flow_without_replay_or_new_consent() {
+        for flow in [Flow::Login, Flow::BrowserEnrollment] {
+            for pending_first in [false, true] {
+                for fault in [
+                    Reply::Lost,
+                    Reply::NonJson,
+                    Reply::Oversized,
+                    Reply::MissingGrant,
+                    Reply::ForeignGrant,
+                    Reply::Bare503,
+                ] {
+                    let root = tempfile::tempdir().unwrap();
+                    let dir = root.path().join("retained-authority");
+                    let mut runtime = Runtime::new();
+                    let mut plan = if pending_first {
+                        vec![Reply::Pending]
+                    } else {
+                        Vec::new()
+                    };
+                    plan.push(fault);
+                    let expected = plan.len();
+                    let ((result, issuer), requests) = exercise(plan, flow, |issuer| {
+                        trust(&dir, issuer);
+                        let mut prior = record(now().unwrap() + 300);
+                        prior.issuer = issuer.to_string();
+                        save(&dir, &prior).unwrap();
+                        let before = fs::read(dir.join(RECORD)).unwrap();
+                        let result = run_flow(flow, issuer, &dir, &mut runtime);
+                        assert_eq!(
+                            fs::read(dir.join(RECORD)).unwrap(),
+                            before,
+                            "an ambiguous token redemption must preserve existing enrollment"
+                        );
+                        assert!(
+                            !dir.join("cli-acme.json").exists(),
+                            "an unproved grant must not publish new CLI authority"
+                        );
+                        assert!(
+                            !dir.join(CONTINUITY_RECORD).exists(),
+                            "an unproved grant cannot create continuity authority"
+                        );
+                        (result, issuer.to_string())
+                    });
+                    assert_eq!(runtime.code_calls, 1);
+                    assert_eq!(
+                        runtime.token_calls, expected,
+                        "{flow:?}/{fault:?}: no token POST after ambiguous redemption"
+                    );
+                    assert_eq!(
+                        requests.len(),
+                        expected,
+                        "{flow:?}/{fault:?}: transport must not replay a one-shot token exchange"
+                    );
+                    assert_eq!(runtime.waits, vec![5; expected]);
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind(), "unknown", "{flow:?}/{fault:?}: {error}");
+                    let text = error.to_string();
+                    assert!(
+                        text.contains("token")
+                            && (text.contains("unknown") || text.contains("uncertain")),
+                        "{text}"
+                    );
+                    assert!(
+                        text.contains("reconcil")
+                            || text.contains("recover")
+                            || text.contains("inspect"),
+                        "uncertainty must preserve recovery guidance: {text}"
+                    );
+                    assert!(
+                        text.contains(dir.to_str().unwrap()),
+                        "recovery must identify the actual retained authority directory: {text}"
+                    );
+                    assert!(text.contains("ws_real") || text.contains("acme"), "{text}");
+                    assert!(
+                        !text.contains("start again") && !text.contains("grant refused"),
+                        "an unproved redemption must not advise blind reissuance: {text}"
+                    );
+                    assert!(
+                        !text.contains(runtime.verifier.as_deref().unwrap()),
+                        "PKCE verifier leaked"
+                    );
+                    assert!(
+                        !text.contains(&format!("hcd_{}", "A".repeat(43))),
+                        "device bearer leaked"
+                    );
+                    assert!(
+                        !text.contains(BRIDGE) && !text.contains(CHILD),
+                        "access bearer leaked"
+                    );
+                    assert!(
+                        !text.contains("enrollment status --remote"),
+                        "do not invent an unavailable readback endpoint at {issuer}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_pending_and_slow_down_are_pre_effect_but_invalid_grant_is_terminal() {
+        for flow in [Flow::Login, Flow::BrowserEnrollment] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("auth");
+            let mut runtime = Runtime::new();
+            let (result, requests) = exercise(
+                vec![Reply::Pending, Reply::SlowDown, Reply::InvalidGrant],
+                flow,
+                |issuer| {
+                    trust(&dir, issuer);
+                    run_flow(flow, issuer, &dir, &mut runtime)
+                },
+            );
+            assert_eq!(runtime.code_calls, 1);
+            assert_eq!(runtime.token_calls, 3);
+            assert_eq!(requests.len(), 3);
+            assert_eq!(
+                runtime.waits,
+                [5, 5, 10],
+                "only proven pending/slow_down may continue polling"
+            );
+            assert_eq!(result.unwrap_err().kind(), "rejected");
+            assert!(!dir.join(RECORD).exists());
+            assert!(!dir.join("cli-acme.json").exists());
+            assert!(!dir.join(CONTINUITY_RECORD).exists());
+        }
+    }
+
+    #[test]
+    fn cad2009_device_flow_pin_refusal_sends_no_code_or_token_request() {
+        for flow in [Flow::Login, Flow::BrowserEnrollment] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("wrong-pin");
+            let mut runtime = Runtime::new();
+            let (result, requests) = exercise(Vec::new(), flow, |issuer| {
+                trust(&dir, "https://different.example.test");
+                run_flow(flow, issuer, &dir, &mut runtime)
+            });
+            assert_eq!(runtime.code_calls, 0);
+            assert_eq!(runtime.token_calls, 0);
+            assert!(requests.is_empty());
+            assert!(runtime.waits.is_empty());
+            assert_eq!(result.unwrap_err().kind(), "rejected");
+        }
+    }
+}

@@ -466,17 +466,24 @@ pub fn effective(
 
 /// Every project's approved gate digest, from the daemon. An
 /// unreachable daemon is no approvals — custom gates then read as the
-/// defaults, the fail-safe direction.
+/// defaults, the fail-safe direction. Best-effort: the read is bounded
+/// by one absolute deadline (the courtesy-read cap), never the general
+/// 700 s call bound, so a wedged daemon cannot hang a board read.
 pub fn fetch_approvals(state_dir: &Path) -> Approvals {
-    crate::client::rpc(state_dir, "project_work_approvals", json!({}))
-        .ok()
-        .and_then(|v| v["approvals"].as_object().cloned())
-        .map(|m| {
-            m.into_iter()
-                .filter_map(|(k, v)| v["digest"].as_str().map(|d| (k, d.to_string())))
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::client::rpc_deadline(
+        state_dir,
+        "project_work_approvals",
+        json!({}),
+        crate::client::MetaBudget::READ_CAP,
+    )
+    .ok()
+    .and_then(|v| v["approvals"].as_object().cloned())
+    .map(|m| {
+        m.into_iter()
+            .filter_map(|(k, v)| v["digest"].as_str().map(|d| (k, d.to_string())))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// An epic's effective stage and where it came from.

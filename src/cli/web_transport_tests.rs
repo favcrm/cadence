@@ -241,10 +241,14 @@ fn prepare_handler(missing: Vec<&'static str>) -> Handler {
                     "expiresAt": "2030-01-01T00:00:00.000Z"}}),
                 )
             }
-            ("PUT", p) if p.starts_with("/v1/web-sites/uploads/upl_22222222/files/") => (
-                200,
-                json!({"ok": true, "data": {"path": "x", "verified": true}}),
-            ),
+            ("PUT", p) if p.starts_with("/v1/web-sites/uploads/upl_22222222/files/") => {
+                let encoded = &p["/v1/web-sites/uploads/upl_22222222/files/".len()..];
+                let path = crate::web_publish::decode_artifact_segment(encoded).unwrap();
+                (
+                    200,
+                    json!({"ok": true, "data": {"path": path, "verified": true}}),
+                )
+            }
             ("POST", "/v1/web-sites/uploads/upl_22222222/finalize") => (
                 200,
                 json!({"ok": true, "data": {
@@ -356,10 +360,11 @@ fn a_refused_upload_stops_before_finalize_and_nothing_goes_live() {
     let site = tiny_site(root.path());
     let (addr, log) = serve(Arc::new(|seen: &Seen| {
         if seen.method == "POST" && seen.path == "/v1/web-sites/uploads" {
+            let sent: Value = serde_json::from_slice(&seen.body).unwrap();
             return (
                 200,
                 json!({"ok": true, "data": {
-                    "siteId": SITE, "uploadId": UPLOAD, "manifestDigest": "x",
+                    "siteId": SITE, "uploadId": UPLOAD, "manifestDigest": sent["manifestDigest"],
                     "missingPaths": ["index.html"], "expiresAt": "2030-01-01T00:00:00.000Z"}}),
             );
         }
@@ -495,10 +500,12 @@ fn action_handler(state: &'static str, approval: Value) -> Handler {
                 json!({"ok": true, "data": {"siteId": SITE, "slug": "my-site", "revision": 4}}),
             ),
             ("POST", p) if p == format!("/v1/web-sites/sites/{SITE}/actions") => {
+                let sent: Value = serde_json::from_slice(&seen.body).unwrap();
                 let mut action = json!({
-                    "actionId": "act_44444444", "siteId": SITE, "operation": "publish",
-                    "state": state, "releaseId": RELEASE, "expectedRevision": 4,
-                    "resultRevision": null, "manifestDigest": "a".repeat(64),
+                    "actionId": "act_44444444", "siteId": SITE, "operation": sent["operation"],
+                    "state": state, "releaseId": sent.get("releaseId").cloned().unwrap_or(Value::Null),
+                    "expectedRevision": sent["expectedRevision"],
+                    "resultRevision": null, "manifestDigest": sent.get("releaseId").map(|_| "a".repeat(64)),
                     "liveUrl": null, "approvalUrl": null,
                     "approvalExpiresAt": null, "updatedAt": "2030-01-01T00:00:00.000Z"
                 });
@@ -1861,6 +1868,445 @@ fn the_daemon_adapter_uploads_a_staged_site_through_the_gate() {
             .any(|request| request.method == "POST" && request.path.ends_with("/finalize")),
         "finalize missing"
     );
+}
+
+// CAD-2009: independently authored hosted-web negative acceptance.
+// Covers real adapter/daemon dispatch and CLI error decoding for uncertain
+// finalize outcomes, retained same-workspace reconciliation, and definite refusal.
+
+#[cfg(feature = "test-seam")]
+fn cad2009_web_shared(state: &Path, pm: &Path) -> Arc<crate::daemon::Shared> {
+    let mut opts = crate::daemon::ServeOptions {
+        provider_env: crate::adapter::ProviderEnv::refusing_providers(),
+        lease: Some(Default::default()),
+        test_seam: true,
+        ..Default::default()
+    };
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    crate::platform::agenticos_web::attach(&mut opts, state).unwrap();
+    crate::daemon::Shared::new(state, &opts).unwrap()
+}
+
+#[cfg(feature = "test-seam")]
+fn cad2009_register_web_target(config: &Path) {
+    write_private(
+        &config.join("cadence/orgs.json"),
+        &serde_json::to_vec(&json!({"connections": [{
+            "selection": {"org": ORG},
+            "destination": {
+                "mode": "remote", "endpoint": BOARD_AUDIENCE, "org_id": ORG_ID
+            }
+        }]}))
+        .unwrap(),
+    );
+}
+
+#[cfg(feature = "test-seam")]
+fn cad2009_web_cli_decode(
+    shared: &Arc<crate::daemon::Shared>,
+    params: &Value,
+) -> crate::error::Result<Value> {
+    let frame = crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
+        match shared.dispatch("platform_call", params, std::process::id()) {
+            Ok(value) => crate::proto::ok(value),
+            Err(error) => crate::proto::err(&error),
+        }
+    });
+    // Do not merely inspect the internal Error: preserve the real JSON protocol
+    // representation and decode through the function client::rpc actually uses.
+    let bytes = serde_json::to_vec(&frame).unwrap();
+    crate::proto::unwrap(serde_json::from_slice(&bytes).unwrap())
+}
+
+#[cfg(feature = "test-seam")]
+#[test]
+fn cad2009_web_finalize_unknown_survives_adapter_and_cli_decode_with_same_key() {
+    // Mode 0: response lost after fixture commit. Mode 1: HTTP success with an
+    // unusable release receipt after fixture commit. Neither proves rejection.
+    for mode in [0u8, 1] {
+        #[derive(Default)]
+        struct Committed {
+            create_body: Option<Value>,
+            finalized: bool,
+            commits: usize,
+            finalize_calls: usize,
+        }
+        let committed = Arc::new(Mutex::new(Committed::default()));
+        let producer = Arc::clone(&committed);
+        let (issuer, seen) = serve(Arc::new(move |request: &Seen| {
+            let mut state = producer.lock().unwrap();
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v1/web-sites/uploads") => {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(body["workspaceId"], ORG_ID);
+                    if let Some(original) = &state.create_body {
+                        assert_eq!(&body, original, "reconciliation changed upload intent");
+                    } else {
+                        state.create_body = Some(body.clone());
+                    }
+                    (
+                        200,
+                        json!({"ok":true,"data":{
+                            "siteId":SITE,"uploadId":UPLOAD,
+                            "manifestDigest":body["manifestDigest"],
+                            "missingPaths":if state.finalized { Vec::<&str>::new() } else { vec!["index.html"] },
+                            "expiresAt":"2030-01-01T00:00:00.000Z"
+                        }}),
+                    )
+                }
+                ("PUT", path)
+                    if path == format!("/v1/web-sites/uploads/{UPLOAD}/files/index.html") =>
+                {
+                    assert_eq!(
+                        request.headers.get("x-workspace-id").map(String::as_str),
+                        Some(ORG_ID)
+                    );
+                    assert!(
+                        !state.finalized,
+                        "reconciliation unnecessarily reuploaded finalized bytes"
+                    );
+                    (
+                        200,
+                        json!({"ok":true,"data":{"path":"index.html","verified":true}}),
+                    )
+                }
+                ("POST", path) if path == format!("/v1/web-sites/uploads/{UPLOAD}/finalize") => {
+                    assert_eq!(
+                        request.headers.get("x-workspace-id").map(String::as_str),
+                        Some(ORG_ID)
+                    );
+                    state.finalize_calls += 1;
+                    if !state.finalized {
+                        state.finalized = true;
+                        state.commits += 1;
+                    }
+                    if state.finalize_calls == 1 {
+                        if mode == 0 {
+                            return (0, Value::Null);
+                        }
+                        return (
+                            200,
+                            json!({"ok":true,"data":{
+                                "state":"ready", "releaseId":"unusable-receipt"
+                            }}),
+                        );
+                    }
+                    let digest = state.create_body.as_ref().unwrap()["manifestDigest"].clone();
+                    (
+                        200,
+                        json!({"ok":true,"data":{
+                            "state":"ready","releaseId":RELEASE,"manifestDigest":digest
+                        }}),
+                    )
+                }
+                _ => panic!(
+                    "unexpected fixture request: {} {}",
+                    request.method, request.path
+                ),
+            }
+        }));
+        let config = credential_dir(&issuer);
+        cad2009_register_web_target(config.path());
+        let state = tempfile::tempdir().unwrap();
+        let pm = tempfile::tempdir().unwrap();
+        crate::issue::Pm::init(pm.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let frozen = web_publish::freeze(&tiny_site(source.path())).unwrap();
+        let staging = stage_for_test(state.path(), &frozen, "my-site", false);
+        let params = json!({
+            "platform":"agenticos-web", "account":ORG, "tool":"prepare_site",
+            "input":{"org":ORG,"staging":staging,"wake_timeout":5}
+        });
+        with_config(config.path(), || {
+            let shared = cad2009_web_shared(state.path(), pm.path());
+            let first = cad2009_web_cli_decode(&shared, &params);
+            assert!(
+                committed.lock().unwrap().finalized,
+                "no post-effect failure was exercised"
+            );
+            assert_eq!(committed.lock().unwrap().commits, 1);
+            let pending = read_record(config.path());
+            assert_eq!(pending["identity"], fixture_identity(&issuer));
+            assert_eq!(pending["intents"].as_array().unwrap().len(), 1);
+            let intent = &pending["intents"][0];
+            assert_eq!(intent["kind"], "prepare");
+            assert_eq!(intent["state"], "open");
+            assert_eq!(intent["site_id"], SITE);
+            assert_eq!(intent["upload_id"], UPLOAD);
+            let original = committed.lock().unwrap().create_body.clone().unwrap();
+            let key = intent["request_key"].as_str().unwrap().to_owned();
+            assert_eq!(original["requestKey"], key);
+            assert!(pending["releases"].as_array().unwrap().is_empty());
+            assert_eq!(
+                committed.lock().unwrap().finalize_calls,
+                1,
+                "unknown result was blindly replayed"
+            );
+            let error = first.expect_err("lost/unusable finalize answer must not report success");
+            assert_eq!(error.kind(), "unknown", "mode={mode}: {error}");
+            assert_eq!(crate::error::exit_code_for_kind(error.kind()), 1);
+            let guidance = error.to_string();
+            assert!(
+                guidance.contains(&key),
+                "unknown omitted saved request key: {guidance}"
+            );
+            assert!(
+                guidance.contains(ORG),
+                "unknown omitted workspace binding: {guidance}"
+            );
+            assert!(
+                guidance.contains("cadence web"),
+                "unknown omitted CLI reconciliation guidance: {guidance}"
+            );
+            // Fresh in-process workflow invocation, not a process-restart claim.
+            drop(shared);
+            let resumed = cad2009_web_shared(state.path(), pm.path());
+            let value = cad2009_web_cli_decode(&resumed, &params)
+                .expect("same-intent reconciliation failed");
+            assert_eq!(value["platform_result"]["releaseId"], RELEASE);
+            assert_eq!(value["platform_result"]["manifestDigest"], frozen.digest);
+            let done = read_record(config.path());
+            assert_eq!(done["identity"], pending["identity"]);
+            assert_eq!(done["intents"].as_array().unwrap().len(), 1);
+            assert_eq!(done["intents"][0]["request_key"], key);
+            assert_eq!(done["intents"][0]["state"], "done");
+            assert_eq!(done["releases"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                committed.lock().unwrap().commits,
+                1,
+                "reconciliation created another release"
+            );
+            let requests = seen.lock().unwrap();
+            let creates: Vec<Value> = requests
+                .iter()
+                .filter(|r| r.method == "POST" && r.path == "/v1/web-sites/uploads")
+                .map(|r| serde_json::from_slice(&r.body).unwrap())
+                .collect();
+            assert_eq!(creates, vec![original.clone(), original]);
+            assert!(
+                requests
+                    .iter()
+                    .all(|r| !r.path.ends_with("/actions") && !r.path.ends_with("/approvals")),
+                "prepare/reconcile attempted publication or owner approval"
+            );
+        });
+    }
+}
+
+#[cfg(feature = "test-seam")]
+#[test]
+fn cad2009_web_foreign_pending_workspace_refuses_before_dispatch_and_stays_definite() {
+    let (issuer, seen) = serve(Arc::new(|request: &Seen| {
+        panic!(
+            "pre-dispatch refusal unexpectedly reached issuer: {} {}",
+            request.method, request.path
+        )
+    }));
+    let config = credential_dir(&issuer);
+    cad2009_register_web_target(config.path());
+    let mut foreign = fixture_identity(&issuer);
+    foreign["organization_id"] = json!("ws_other");
+    write_record(config.path(), foreign, Vec::new());
+    let pending_before = read_record(config.path());
+    let state = tempfile::tempdir().unwrap();
+    let pm = tempfile::tempdir().unwrap();
+    crate::issue::Pm::init(pm.path()).unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let frozen = web_publish::freeze(&tiny_site(source.path())).unwrap();
+    let staging = stage_for_test(state.path(), &frozen, "my-site", false);
+    with_config(config.path(), || {
+        let shared = cad2009_web_shared(state.path(), pm.path());
+        let error = cad2009_web_cli_decode(
+            &shared,
+            &json!({
+                "platform":"agenticos-web", "account":ORG, "tool":"prepare_site",
+                "input":{"org":ORG,"staging":staging,"wake_timeout":5}
+            }),
+        )
+        .expect_err("foreign-workspace pending record must refuse");
+        assert_eq!(
+            error.kind(),
+            "rejected",
+            "proven pre-effect refusal was mislabeled: {error}"
+        );
+        assert_eq!(crate::error::exit_code_for_kind(error.kind()), 3);
+        assert!(seen.lock().unwrap().is_empty(), "a request was dispatched");
+        assert_eq!(
+            read_record(config.path()),
+            pending_before,
+            "refusal mutated foreign intent"
+        );
+    });
+}
+
+// Independently authored CAD-2009 action-custody acceptance; do not weaken.
+// Real daemon gate, adapter, saved-login transport and protocol error decoder;
+// only the issuer is a loopback simulator. Fresh in-process invocations reload
+// durable intents; this does not claim a packaged CLI or process-restart test.
+#[cfg(feature = "test-seam")]
+#[test]
+fn cad2009_web_action_unknown_survives_a_later_predispatch_refusal() {
+    #[derive(Default)]
+    struct Host {
+        // Model the producer's (site, requestKey) uniqueness, not a single
+        // hard-coded action: a changed key really creates another owner action.
+        actions: BTreeMap<String, (Value, String)>,
+        posts: Vec<Value>,
+    }
+    let host = Arc::new(Mutex::new(Host::default()));
+    let producer = Arc::clone(&host);
+    let lose_replies = Arc::new(AtomicBool::new(true));
+    let lose = Arc::clone(&lose_replies);
+    let (issuer, seen) = serve(Arc::new(move |request: &Seen| {
+        assert_eq!(request.headers["authorization"], format!("Bearer {BEARER}"));
+        assert!(!request.headers.contains_key("cookie"));
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", path) if path == format!("/v1/web-sites/sites/{SITE}") => {
+                assert_eq!(request.headers["x-workspace-id"], ORG_ID);
+                (200, json!({"ok":true,"data":{"siteId":SITE,"revision":4}}))
+            }
+            ("POST", path) if path == format!("/v1/web-sites/sites/{SITE}/actions") => {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["version"], "1");
+                assert_eq!(body["workspaceId"], ORG_ID);
+                assert_eq!(body["operation"], "publish");
+                assert_eq!(body["releaseId"], RELEASE);
+                assert_eq!(body["expectedRevision"], 4);
+                let key = body["requestKey"].as_str().unwrap().to_owned();
+                let mut state = producer.lock().unwrap();
+                let action_id = match state.actions.get(&key) {
+                    Some((original, action_id)) => {
+                        assert_eq!(&body, original, "same-key reconciliation changed intent");
+                        action_id.clone()
+                    }
+                    None => {
+                        let action_id = format!("act_{:08}", state.actions.len() + 1);
+                        state.actions.insert(key, (body.clone(), action_id.clone()));
+                        action_id
+                    }
+                };
+                state.posts.push(body);
+                // Commit before closing the actual HTTP connection. Both
+                // permitted attempts lose their replies in the first invocation.
+                if lose.load(Ordering::SeqCst) {
+                    return (0, Value::Null);
+                }
+                (
+                    200,
+                    json!({"ok":true,"data":action_dto(
+                        &action_id, "awaiting_approval", SITE, "publish", Some(RELEASE), 4
+                    )}),
+                )
+            }
+            _ => panic!(
+                "unexpected web request: {} {}",
+                request.method, request.path
+            ),
+        }
+    }));
+    let config = credential_dir(&issuer);
+    cad2009_register_web_target(config.path());
+    seed_ready_release(config.path());
+    let state = tempfile::tempdir().unwrap();
+    let pm = tempfile::tempdir().unwrap();
+    crate::issue::Pm::init(pm.path()).unwrap();
+
+    with_config(config.path(), || {
+        let invoke = |wake_timeout: u64| {
+            // Every invocation gets a fresh daemon Shared and reloads the same
+            // saved credential and intent file. No caller injects an outcome.
+            let shared = cad2009_web_shared(state.path(), pm.path());
+            cad2009_web_cli_decode(
+                &shared,
+                &json!({
+                    "platform":"agenticos-web", "account":ORG, "tool":"publish_site",
+                    "input":{"org":ORG,"release":RELEASE,"wake_timeout":wake_timeout}
+                }),
+            )
+        };
+
+        // Fresh pre-dispatch control: zero budget must remain the existing
+        // timeout, not an invented unknown operation, and must send nothing.
+        let before = read_record(config.path());
+        let fresh = invoke(0).expect_err("zero budget cannot dispatch a fresh action");
+        assert_eq!(fresh.kind(), "busy");
+        assert_eq!(fresh.code(), Some("timeout"));
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(host.lock().unwrap().actions.is_empty());
+        assert_eq!(read_record(config.path()), before);
+
+        let first = invoke(5).expect_err("committed action with lost replies is unknown");
+        assert_eq!(first.kind(), "unknown");
+        assert_eq!(crate::error::exit_code_for_kind(first.kind()), 1);
+        let pending = read_record(config.path());
+        assert_eq!(pending["identity"], fixture_identity(&issuer));
+        assert_eq!(pending["intents"].as_array().unwrap().len(), 2);
+        let original_intent = pending["intents"][1].clone();
+        assert_eq!(original_intent["kind"], "publish");
+        assert_eq!(original_intent["state"], "open");
+        assert!(original_intent["action_id"].is_null());
+        let original_body = original_intent["body"].clone();
+        let original_key = original_intent["request_key"].as_str().unwrap().to_owned();
+        assert_eq!(original_body["requestKey"], original_key);
+        let original_action = {
+            let producer = host.lock().unwrap();
+            assert_eq!(
+                producer.posts.len(),
+                2,
+                "only the identical-key retry is permitted"
+            );
+            assert_eq!(producer.actions.len(), 1);
+            assert!(producer.posts.iter().all(|body| body == &original_body));
+            producer.actions.get(&original_key).unwrap().1.clone()
+        };
+        let sent_before_refusal = seen.lock().unwrap().len();
+
+        // A later invocation's pre-send timeout says nothing about the first
+        // invocation's committed action. It must not close that original intent.
+        let interrupted = invoke(0).expect_err("zero budget cannot reconcile over HTTP");
+        assert_eq!(seen.lock().unwrap().len(), sent_before_refusal);
+        assert_eq!(host.lock().unwrap().posts.len(), 2);
+        let after_refusal = read_record(config.path());
+
+        // Complete the trajectory even when the middle verdict is wrong: the
+        // simulator would insert a second action if the client invents a key.
+        lose_replies.store(false, Ordering::SeqCst);
+        let recovered = invoke(5).expect("normal same-key reconciliation must recover");
+        let after_recovery = read_record(config.path());
+        let producer = host.lock().unwrap();
+        assert_eq!(
+            producer.actions.len(),
+            1,
+            "pre-dispatch refusal discarded uncertain custody and allowed another owner action"
+        );
+        assert_eq!(producer.posts.len(), 3);
+        assert!(producer.posts.iter().all(|body| body == &original_body));
+        assert_eq!(recovered["platform_result"]["actionId"], original_action);
+        assert_eq!(recovered["platform_result"]["requestKey"], original_key);
+        assert_eq!(
+            interrupted.kind(),
+            "unknown",
+            "a prior committed action remains unproved: {interrupted}"
+        );
+        assert_eq!(crate::error::exit_code_for_kind(interrupted.kind()), 1);
+        let guidance = interrupted.to_string();
+        assert!(
+            guidance.contains(&original_key) && guidance.contains(ORG),
+            "lost original operation guidance: {guidance}"
+        );
+        assert_eq!(
+            after_refusal, pending,
+            "pre-dispatch failure changed the prior uncertain intent"
+        );
+        assert_eq!(after_recovery["identity"], pending["identity"]);
+        assert_eq!(after_recovery["releases"], pending["releases"]);
+        assert_eq!(after_recovery["intents"].as_array().unwrap().len(), 2);
+        assert_eq!(after_recovery["intents"][1]["request_key"], original_key);
+        assert_eq!(after_recovery["intents"][1]["body"], original_body);
+        assert_eq!(after_recovery["intents"][1]["state"], "open");
+        assert_eq!(after_recovery["intents"][1]["action_id"], original_action);
+    });
 }
 
 #[test]

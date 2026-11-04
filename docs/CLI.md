@@ -427,11 +427,12 @@ whether or not it exists yet. A consolidated installation — a genuine first
 run, or one already living in `~/.cadence` — keeps its config under its own
 home even when the variable is exported: writing the first credential into the
 legacy root would make the next run see both layouts and refuse the
-installation as ambiguous. With no `HOME` at all, an absolute
-`XDG_CONFIG_HOME` still names the hosted config root, so hosted-only use needs
-no home. Inside the consolidated home a
-symlinked `~/.cadence`, `~/.cadence/config` or credential directory is refused
-rather than followed.
+installation as ambiguous. With `HOME` absent and no explicit home or
+sandbox profile, an absolute `XDG_CONFIG_HOME` still names the hosted config
+root. An absolute `CADENCE_HOME` without either variable uses its own `config`
+directory. An invalid declared home or stale sandbox profile refuses rather
+than falling back to another root. Inside the consolidated home a symlinked
+`~/.cadence`, `~/.cadence/config` or credential directory is refused.
 
 The state directory holds the daemon socket, so `<state>/cadence.sock` must
 fit the 107-byte Unix socket limit; `setup` and `dev up` refuse a longer path
@@ -585,8 +586,10 @@ cadence settings agents profile sync review --expected-revision "$REV"
 
 Capture the new revision after each configuration change. Saving does not
 sync exports. Sync reports per-file status and a `snapshot`; it preserves
-unmanaged files. Preview starts no process and proves neither authentication
-nor future launch success. Launch saved profiles through the existing
+unmanaged files. A sync that may have changed an export reports an unknown
+outcome: inspect `cadence settings agents show` in the same workspace before
+repeating it. Preview starts no process and proves neither authentication nor
+future launch success. Launch saved profiles through the existing
 `cadence join ... --profile review` path.
 
 ### Managing-agent authorization
@@ -665,6 +668,28 @@ ignored.
 `milestone ls`, and `memory ls`, follow that decision. They do not need
 a separate `--json` when stdout is already JSON, and they are refused
 on a table.
+
+For live local `issue ls` and `issue show`, JSON includes `job_state.state`:
+`known`, `unavailable`, or `malformed`. When job state is not known,
+readiness is not asserted; the unfiltered tracker read remains available.
+Malformed state includes invalid daemon response frames and issue-bound job
+rows without usable selection fields or task summaries.
+`issue ls --ready` and `--blocked` refuse rather than report an authoritative
+filtered list. Text output warns on stderr. Historical `--at` reads keep
+their historical derivation without consulting the daemon. Job and approval
+probes use bounded deadlines.
+
+`CADENCE_JSON=pretty` or `compact` also controls JSON from org commands,
+hosted answers and offline result receipts. Raw text and byte streams retain
+their own formats.
+
+CLI-owned finite console output does not interrupt a command when its consumer
+closes stdout or stderr; the command's own result still determines the exit
+status. Other I/O errors remain failures. A follower stops before its next
+read, execution or sync after a stdout write detects a closed consumer, while
+finishing the current page, acknowledgement or sync result. Closing stderr
+alone does not cancel work. A follower cannot detect closure until it writes;
+inbox child-process output is not an observation by the parent.
 
 With `--watch`, machine mode writes one compact JSON value per line and
 no terminal-control bytes, including when `CADENCE_JSON=pretty`. A

@@ -63,9 +63,9 @@ the workspace explicitly.
 ## What a hosted run does not start
 
 The daemon and the board are local services. A run whose scope is hosted —
-and a run whose requested browser approval did not complete — reports them
-without starting either, so signing in never starts a local board. Only a
-run that chose this machine starts the daemon and the board, exactly as
+and a run whose requested sign-in was not confirmed — reports them without
+starting either, so signing in never starts a local board. Only a run that
+chose this machine starts the daemon and the board, exactly as
 before. `cadence ui start` is the explicit command to start the board
 later.
 
@@ -160,17 +160,22 @@ A sign-in this run verified is `verified`. A login this machine already
 holds is `saved`: the credential file is named, never read, so it is not
 verified and may be expired. That includes the `credential.json` that
 `cadence auth login` writes, whose workspace this run does not read: it is
-`saved` without a slug and the plan is `unknown`. A failed approval is `failed` with the
-issuer's own message; a workspace the browser created, if any, is not
-bound to this machine because no credential was saved. A store that cannot
-be inspected is `unknown`, never `signed out`. A run whose approval did not
-complete reports the plan as `unknown`, never `none`: the browser may have
-created a workspace this machine did not bind.
+`saved` without a slug and the plan is `unknown`. A definite approval failure
+is `failed` with the issuer's message. If a session was issued but its local
+credential or workspace binding could not be confirmed, sign-in is `unknown`:
+the handover names the workspace and credential directory for reconciliation
+without claiming that approval failed or that no credential was saved. A store
+that cannot be inspected is also `unknown`, never `signed out`. An unconfirmed
+sign-in reports the plan as `unknown`, never `none`.
 
-`scope` is the scope this run selected, not what the credential store
-happens to hold: `1`/`--local` stays local even when a hosted login is
-saved, and a failed approval bound nothing, so it stays local too. Only
-this run's verified hosted sign-in makes the scope hosted.
+If local setup subsequently fails, an unknown sign-in retains its reconciliation
+guidance and unknown exit. A verified sign-in is reported as still saved while
+the original local error and exit code are preserved.
+
+`scope` is what this run can confirm, not everything the credential store may
+hold: `1`/`--local` stays local even with a saved login. Only a verified hosted
+sign-in makes the scope hosted; an unconfirmed sign-in keeps the local handover
+without claiming that no hosted session exists.
 
 No outcome proposes another approval — the live instruction already says
 not to open a second login, and after an interruption (denial, expiry,
@@ -198,6 +203,6 @@ never calls the billing API. A pipe is asked the one question on stderr —
 an empty line signs in, `1` stays local, `2` registers, and EOF with no line
 stays local — so the run's own output is never mixed with it.
 
-Exit 1 when a check failed, and when a requested browser approval did not
-complete. `missing`, `unknown`, `unavailable` and a plan that was not read
+Exit 1 when a check failed or a requested sign-in was not confirmed.
+`missing`, `unknown`, `unavailable` and a plan that was not read
 are facts, not failures.

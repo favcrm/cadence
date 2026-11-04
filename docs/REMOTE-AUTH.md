@@ -185,9 +185,16 @@ requires explicit `--issuer` and `--org`. Browser login uses PKCE and
 short-lived device codes; denial, expiry, mismatched identity or audience
 refuse before recording the org or credential. Org records use the
 verified workspace slug and canonical `https://<slug>.cadencecloud.app`
-endpoint. Credentials are stored at
-`$XDG_CONFIG_HOME/cadence/remote-auth/cli-<slug>.json` (0600), bound to
-the verified workspace ID and endpoint, and never sent to another host.
+endpoint. Credentials are stored in the resolved config root as
+`remote-auth/cli-<slug>.json` (0600), bound to the verified workspace ID and
+endpoint, and never sent to another host.
+
+An absent org registry permits standalone local operation. A registry or
+declared config/home root that cannot be inspected or parsed, a dangling
+ancestor, or a symlinked registry refuses implicit destination selection
+instead of silently selecting local state. A stale sandbox profile refuses
+rather than reading the host registry. Explicit local state bindings and managed
+callers keep their existing routing.
 
 ### Advanced custom issuer trust
 
@@ -263,29 +270,73 @@ The gateway's real refusal shapes (AOS-243):
   proven session loss.
 - A `401 unauthorized` with no reason means the bearer did not resolve, but the
   server cannot say whether it expired or was revoked.
-- `503` means waking or unavailable. Without JSON, the HTTP status still
-  classifies the refusal: `401` is uncertain, `403` is authorization, and any
-  other `5xx` is availability. No server reason or correlation is inferred.
-- One exception: a dispatched mutation verb whose answer is lost, or that
-  answers with a bare `5xx`, is `outcome_unknown` and not availability. The
-  platform records a membership write and its receipt in the same batch, so a
-  `5xx` can follow a write that already committed. This covers `message_send`
-  and the four team mutations (`team_invite`, `team_revoke_invite`,
-  `team_set_role`, `team_remove`); the two team reads commit nothing and stay
-  availability. A `5xx` carrying the platform's own state marker is not a
-  bare one, and a refusal raised by the board's gate before the verb ran is
-  decided before anything was written, so neither is ambiguous.
-- A `503` whose safe `error.code` is `mutation_outcome_uncertain` or
-  `invite_email_uncertain` is the platform stating that a mutation may already
-  have committed. It is its own category, not availability.
+- `503` can mean waking or unavailable. Without JSON, `401` is uncertain,
+  `403` is authorization, and a read's `5xx` is availability; no server
+  reason or correlation is inferred.
+- A dispatched mutation whose answer is lost, whose `2xx` body is not an
+  object, or whose bare `5xx` lacks proof of a pre-forward refusal is
+  `outcome_unknown`. This includes hosted issue, wiki, team, settings and
+  audit mutations. A response can be lost after a write committed. A
+  documented `503` waking response, a board-gate refusal, the native CLI
+  route's `503 tracker_unavailable`, or `501` remains pre-effect; checked
+  `409` conflicts still mean not written. Other state strings and a waking
+  marker on a different status do not prove the call was unforwarded.
+- An issue, wiki upload, team, settings, delivery or audit receipt that fails
+  the operation's correlation checks is also `outcome_unknown`, not proof
+  that nothing was recorded. Team and settings writes require a receipt
+  consistent with the requested change; reconcile an uncertain result using
+  `team list`, `team invites` or the appropriate `settings agents` read.
+  Invite addresses are correlated using the tenant's whitespace and
+  lowercase normalization, without treating a different address as a match.
+  The native grant-request receipt contains only the new request id; the
+  grant-allow receipt does not echo the request id. Their shapes alone cannot
+  prove a request-to-grant correlation; inspect `settings agents grant list`
+  when that correlation is needed.
+- `artifact put` confirms the uploaded bytes and a usable version; when an
+  existing artifact ID was requested, the receipt must name that same ID.
+  A lost or unproved answer is unknown: inspect `artifact find` in the same
+  workspace before repeating an upload that could add another version. The
+  native CLI route's `tracker_unavailable` proof does not apply to this
+  separate upload endpoint or wiki uploads.
+- Hosted local-assignment writes use a separate protocol: authorization can be
+  rechecked after a report, claim or reassignment commits. A post-dispatch
+  `401` or `403` therefore does not prove rejection. A failed local activation
+  can itself send a blocked report; if its answer is lost, the result remains
+  unknown alongside the local failure. If a correlated receipt confirms the
+  remote action but local custody cannot be recorded, the error says the action
+  was confirmed and identifies the local failure. Inspect `cadence agent status`
+  in the same selected workspace and retain the assignment, claim, generation
+  and operation identifiers before deciding whether to retry. Unsupported work
+  kinds are never started locally; a confirmed receipt is recorded before that
+  local refusal.
+- Hosted app release mutations retain the caller's operation UUID. On an
+  unproved response, inspect `app catalog operation` or `reconcile` for that
+  UUID in the same workspace; do not create a new operation blindly.
+- A lost device-token or enrollment response may follow one-time credential
+  issuance. If registration or login receives a session but cannot save it,
+  the CLI reports the issued session and the original authority directory;
+  `register --json` reports `registered: null` when the outcome is unknown.
+  Inspect that directory and consult the issuer owner; a lost secret is not
+  assumed recoverable. An unconfirmed logout keeps the local session and names
+  the exact session for same-session recovery.
+- Publish Web retains its original workspace, request key and intent before
+  dispatch. An unproved upload or action remains unknown; inspect `cadence web
+  status` and reconcile with the original intent, not a different key. A later
+  refusal before dispatch does not settle an earlier uncertain action.
+- A result outbox's `local_pending` state proves local custody only, not remote
+  absence. Inspect the original command and destination before any retry; a
+  remote status or reconciliation route is not assumed to exist.
+- A response whose safe `error.code` is `mutation_outcome_uncertain` or
+  `invite_email_uncertain` states that a mutation may already have committed.
+  It takes precedence over a contradictory waking marker and is never retried.
 
 | Category | When | Next action |
 | --- | --- | --- |
 | `authorization` | `401` with an allowlisted policy reason (`scope_not_granted`, `grant_narrowed`, `binding_mismatch`); `403` with `insufficient_scope` (container path or scope denial); or any `403` with `forbidden` or no safe code | Not a login problem. Read-only diagnosis (below): check the workspace role and target path. Not retried |
 | `authentication` | A terminal session code: `invalid_token`, `invalid_grant`, `session_expired`, `session_revoked`, `lineage_terminal` | `cadence login` again, once. The only case that names login as the known remedy |
 | `uncertain` | `401` with no reason, `envelope_invalid`, or a non-JSON `401` | Not confirmed expiry or revocation. Run the read-only diagnosis before any login. Not retried |
-| `outcome_unknown` | The platform's `mutation_outcome_uncertain` or `invite_email_uncertain`; or a lost answer or a bare `5xx` on a dispatched mutation verb (`message_send`, `team_invite`, `team_revoke_invite`, `team_set_role`, `team_remove`) | The action may have committed. Reconcile with a read for the same explicit `--org` — `team list` or `team invites` for a team mutation, `message_read` for a send — then decide. Never replay the mutation with a fresh envelope first. Not retried |
-| `availability` | any other `5xx` (except a dispatched mutation verb — that is `outcome_unknown`), or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
+| `outcome_unknown` | The platform's `mutation_outcome_uncertain` or `invite_email_uncertain`; or a lost, unusable or unproven `5xx` answer to a dispatched mutation | The action may have committed. Reconcile with a read for the same explicit `--org`, such as `issue show`, `wiki cat`, `team list`, or `audit verdicts`, then decide. Never replay blindly. Not retried |
+| `availability` | A read's `5xx`, a proven pre-forward unavailable response, or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
 | `unknown` | Any other answer. A `400`/`409`/`413`/`422` keeps its safe code, such as `payload_too_large` | Report the status and code. Not retried |
 
 ### Where a write or upload is refused (AOS-243)
@@ -328,11 +379,12 @@ issuer's `invalid_token` (401) and `invalid_grant` (400) ask for a fresh login.
 Any other answer keeps the saved login and the pending operation for a later
 retry, with no consent prompt.
 
-A mutation whose outcome is unknown — a dropped connection after dispatch, a
-`5xx` after forward, or the platform's own `mutation_outcome_uncertain` /
-`invite_email_uncertain` — is never replayed automatically. Reconcile with a
-read (`issue show`, `wiki ls`, `team list`, `team invites`) before repeating
-the write.
+Generic hosted CLI mutations whose outcome is unknown are not replayed
+automatically. Reconcile with a read (`issue show`, `wiki ls`, `team list`,
+`team invites`) before repeating the write. Publish Web action creation is a
+separate idempotent protocol: it may resend the identical body and request key
+once to recover the same action, never a new key. If still unknown, inspect
+the saved intent in the same workspace before deciding what to do.
 
 ### Hosted credential status (CAD-1434)
 
@@ -409,13 +461,17 @@ nothing. `--if-rev` is also accepted locally, where it uses the same
 under-lock check; without it, local `issue set` keeps its existing
 unconditional behavior.
 
+For `issue new`, a success receipt must name the requested project and title.
+The tenant trims those inputs; the native route preserves the title. Both
+receipt forms are accepted, but a foreign project or title remains unknown.
+
 A wake retry is the only automatic retry — it fires only on the
-pre-forward `waking` verdict. A timeout, dropped connection or error
-after forward is an explicitly unresolved outcome: the mutation may or
-may not have landed, so reconcile with `issue show`/`issue log` rather
-than re-issuing blindly. A 200 confirms the write was accepted — not
-that the tracker survived a later hard loss; durability is a hosted
-operational concern outside this client feature.
+pre-forward `waking` verdict. A timeout, dropped connection, unusable
+success response or unproven error after forward leaves the mutation
+unresolved. Reconcile with `issue show`/`issue log` rather than re-issuing
+blindly. An accepted receipt does not prove that the tracker survived a
+later hard loss; durability is a hosted operational concern outside this
+client feature.
 
 Each collaborating writer enrolls independently: a separate
 `XDG_CONFIG_HOME` (or separate account/machine) per identity, its own

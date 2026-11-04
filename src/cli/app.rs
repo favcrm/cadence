@@ -3001,6 +3001,9 @@ pub(super) fn run_inspect(source: &str, _json: bool) -> Result<i32> {
 
 fn print_package_report(report: serde_json::Value) -> Result<i32> {
     let ok = report["ok"].as_bool() == Some(true);
+    // The report is written before the verdict is known, so it must not
+    // be able to change it: `print_json` drops a closed consumer's EPIPE
+    // instead of panicking, and this return still decides the status.
     print_json(&report);
     Ok(if ok { 0 } else { 3 })
 }
@@ -3093,13 +3096,13 @@ fn run_package_dev(root: &Path, port: u16, host: &str, exec_child: bool) -> Resu
     if exec_child {
         use std::os::unix::process::CommandExt;
         let error = child.exec();
-        eprintln!("app dev: {error}");
+        eprint_line(&format!("app dev: {error}"));
         return Ok(launch_error_code(&error));
     }
     match cadence_agent::reaper::status(&mut child) {
         Ok(status) => Ok(status.code().unwrap_or(1)),
         Err(error) => {
-            eprintln!("app dev: {error}");
+            eprint_line(&format!("app dev: {error}"));
             Ok(launch_error_code(&error))
         }
     }

@@ -434,4 +434,227 @@ mod tests {
         drop(second);
         assert!(slot().is_none());
     }
+
+    // CAD-2009: independently authored verified-TLS logout acceptance.
+    #[cfg(unix)]
+    mod cad2009_logout_uncertainty_acceptance {
+        use super::*;
+        use serde_json::{json, Value};
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
+
+        const SESSION: &str = "hcs_00000000-0000-4000-8000-000000000009";
+        const REFRESH: &str = "hcr_RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR";
+
+        #[derive(Clone, Copy, Debug)]
+        enum Answer {
+            Lost,
+            NonJson,
+            Oversized,
+            Missing,
+            Foreign,
+            Bare503,
+            Refused,
+            Revoked,
+        }
+
+        fn run(
+            answer: Answer,
+            trust_matches: bool,
+        ) -> (crate::error::Result<i32>, Vec<Value>, bool) {
+            let _serial = serial();
+            let pki = Pki::generate();
+            let mut certs = BufReader::new(fs::File::open(pki.path("leaf.pem")).unwrap());
+            let chain = rustls_pemfile::certs(&mut certs)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let mut keys = BufReader::new(fs::File::open(pki.path("leaf.key")).unwrap());
+            let key = rustls_pemfile::private_key(&mut keys).unwrap().unwrap();
+            let config = Arc::new(
+                ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap(),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let _tls = TestWebIssuerTls::install(
+                ISSUER,
+                listener.local_addr().unwrap(),
+                &pki.read("ca.pem"),
+            )
+            .unwrap();
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let path = root.path().join("cli-acme.json");
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let credential = json!({"version": "hosted-cadence-auth.v1", "organization_id": "ws_real",
+            "organization_slug": "acme", "audience": "https://acme.cadencecloud.app", "issuer": ISSUER,
+            "subject_id": "user_1", "capabilities": ["cli.read", "cli.write"],
+            "access_token": "hct_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "expires_at": at + 300,
+            "cli_session": {"session_id": SESSION, "refresh_token": REFRESH, "generation": 1,
+                "device_label": "synthetic", "idle_expires_at": at + 3600, "absolute_expires_at": at + 7200}});
+            fs::write(&path, serde_json::to_vec(&credential).unwrap()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let before = fs::read(&path).unwrap();
+            let pin = root.path().join("trusted-issuer");
+            fs::write(
+                &pin,
+                if trust_matches {
+                    ISSUER
+                } else {
+                    "https://different.example.test"
+                },
+            )
+            .unwrap();
+            fs::set_permissions(&pin, fs::Permissions::from_mode(0o600)).unwrap();
+            let target = crate::remote_cli::RemoteTarget {
+                identity: None,
+                org: "acme".into(),
+                org_id: "ws_real".into(),
+                endpoint: "https://acme.cadencecloud.app".into(),
+            };
+            let (completion, completed) = UnixStream::pair().unwrap();
+            let (result, requests) = std::thread::scope(|scope| {
+                let server = scope.spawn(move || {
+                let mut requests = Vec::new();
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    assert!(!remaining.is_zero(), "logout fixture did not settle");
+                    let mut fds = [
+                        libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                        libc::pollfd { fd: completed.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                    ];
+                    // SAFETY: fds contains exactly two initialized pollfd values.
+                    let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2,
+                        remaining.as_millis().clamp(1, i32::MAX as u128) as i32) };
+                    if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+                    assert!(ready > 0, "logout fixture deadline expired");
+                    if fds[0].revents & libc::POLLIN != 0 {
+                        let (tcp, _) = listener.accept().unwrap();
+                        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let mut tls = StreamOwned::new(ServerConnection::new(config.clone()).unwrap(), tcp);
+                        let mut reader = BufReader::new(&mut tls);
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        assert_eq!(line.trim_end(), "POST /v1/hosted-cadence/cli-session/revoke HTTP/1.1");
+                        let mut length = None;
+                        let mut bearer = None;
+                        loop {
+                            line.clear();
+                            assert!(reader.read_line(&mut line).unwrap() > 0);
+                            if line == "\r\n" { break; }
+                            let (key, value) = line.split_once(':').unwrap();
+                            if key.eq_ignore_ascii_case("content-length") { length = Some(value.trim().parse::<usize>().unwrap()); }
+                            if key.eq_ignore_ascii_case("authorization") { bearer = Some(value.trim().to_string()); }
+                            assert!(!key.eq_ignore_ascii_case("cookie"));
+                        }
+                        assert_eq!(bearer.as_deref(), Some(format!("Bearer {REFRESH}").as_str()));
+                        let mut bytes = vec![0; length.unwrap()];
+                        reader.read_exact(&mut bytes).unwrap();
+                        drop(reader);
+                        let request: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(request, json!({"version": "hosted-cadence-cli-session.v1", "session_id": SESSION}));
+                        requests.push(request);
+                        if matches!(answer, Answer::Lost) && requests.len() == 1 { continue; }
+                        let (status, body) = if requests.len() > 1 {
+                            ("503 Service Unavailable", b"{}".to_vec())
+                        } else { match answer {
+                            Answer::Lost | Answer::Bare503 => ("503 Service Unavailable", b"{}".to_vec()),
+                            Answer::NonJson => ("200 OK", b"not-json".to_vec()),
+                            Answer::Oversized => ("200 OK", vec![b'x'; 64 * 1024 + 1]),
+                            Answer::Missing => ("200 OK", b"{}".to_vec()),
+                            Answer::Foreign => ("200 OK", serde_json::to_vec(&json!({"version": "hosted-cadence-cli-session.v1", "status": "revoked", "session_id": "hcs_00000000-0000-4000-8000-000000000099"})).unwrap()),
+                            Answer::Refused => ("401 Unauthorized", b"{\"error\":\"invalid_token\"}".to_vec()),
+                            Answer::Revoked => ("200 OK", serde_json::to_vec(&json!({"version": "hosted-cadence-cli-session.v1", "status": "revoked", "session_id": SESSION})).unwrap()),
+                        }};
+                        let _ = write!(tls, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        let _ = tls.write_all(&body);
+                        let _ = tls.flush();
+                    } else if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 { return requests; }
+                    else { panic!("unexpected logout fixture poll events"); }
+                }
+            });
+                let result = crate::remote_cli::logout(root.path(), &target);
+                drop(completion);
+                (result, server.join().unwrap())
+            });
+            let retained = path.exists();
+            if retained {
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    before,
+                    "logout changed uncertain local authority"
+                );
+            }
+            (result, requests, retained)
+        }
+
+        #[test]
+        fn cad2009_unproved_logout_retains_exact_session_and_never_replays() {
+            for answer in [
+                Answer::Lost,
+                Answer::NonJson,
+                Answer::Oversized,
+                Answer::Missing,
+                Answer::Foreign,
+                Answer::Bare503,
+            ] {
+                let (result, requests, retained) = run(answer, true);
+                assert_eq!(
+                    requests.len(),
+                    1,
+                    "{answer:?}: revocation was blindly replayed"
+                );
+                assert!(
+                    retained,
+                    "{answer:?}: uncertain revocation discarded local authority"
+                );
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), "unknown", "{answer:?}: {error}");
+                let text = error.to_string();
+                assert!(text.contains(SESSION) && text.contains("acme"),
+                "recovery must name the exact retained session and org, not an invented readback: {text}");
+                assert!(text.contains("retain") || text.contains("kept"), "{text}");
+                assert!(
+                    !text.contains(REFRESH),
+                    "logout recovery exposed its refresh bearer"
+                );
+            }
+        }
+
+        #[test]
+        fn cad2009_logout_pin_and_issuer_auth_refusals_stay_definite() {
+            let (result, requests, retained) = run(Answer::Revoked, false);
+            assert!(
+                requests.is_empty(),
+                "a pin refusal transmitted the refresh bearer"
+            );
+            assert!(retained);
+            assert_eq!(result.unwrap_err().kind(), "rejected");
+            let (result, requests, retained) = run(Answer::Refused, true);
+            assert_eq!(requests.len(), 1);
+            assert!(retained);
+            assert_eq!(result.unwrap_err().kind(), "rejected");
+        }
+
+        #[test]
+        fn cad2009_correlated_logout_receipt_still_removes_local_authority() {
+            let (result, requests, retained) = run(Answer::Revoked, true);
+            assert_eq!(requests.len(), 1);
+            assert_eq!(result.unwrap(), 0);
+            assert!(!retained);
+        }
+    }
 }

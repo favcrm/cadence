@@ -113,7 +113,7 @@ fn a_tenant_that_cannot_serve_a_project_verb_names_the_release_order() {
     // An older tenant refuses the name (501 / 400 / 409 / 503) rather than
     // answering, and the client must say so — never read it as "no evidence"
     // and never fall back to the repo-scoped verbs.
-    use super::{tenant_cannot_serve, PROJECT_SCOPED_GATE_VERBS};
+    use super::{mutating_cli_verb, tenant_cannot_serve, PROJECT_SCOPED_GATE_VERBS};
 
     for verb in PROJECT_SCOPED_GATE_VERBS {
         for (status, body) in [
@@ -128,10 +128,6 @@ fn a_tenant_that_cannot_serve_a_project_verb_names_the_release_order() {
             (
                 409,
                 json!({"ok": false, "error": {"code": "container_required"}}),
-            ),
-            (
-                503,
-                json!({"ok": false, "error": {"code": "capability_unavailable"}}),
             ),
         ] {
             let why = tenant_cannot_serve(verb, status, Some(&body)).expect("a version signal");
@@ -153,6 +149,25 @@ fn a_tenant_that_cannot_serve_a_project_verb_names_the_release_order() {
             Some(&json!({"ok": false, "error": {"code": "not_permitted"}}))
         )
         .is_none());
+    }
+    // A tenant that predates the project verbs answers 503 for a capability
+    // it lacks. A read keeps the release-order refusal; a write with the same
+    // code is the mutation classifier's unknown outcome, so it is asserted
+    // separately (and must not be read as "nothing was recorded").
+    for verb in PROJECT_SCOPED_GATE_VERBS
+        .iter()
+        .copied()
+        .filter(|verb| !mutating_cli_verb(verb))
+    {
+        let why = tenant_cannot_serve(
+            verb,
+            503,
+            Some(&json!({"ok": false, "error": {"code": "capability_unavailable"}})),
+        )
+        .expect("a version signal");
+        assert!(why.contains("Release order"), "{verb}: {why}");
+        assert!(why.contains("repo-scoped"), "{verb}: {why}");
+        assert!(why.contains(verb), "{verb}: {why}");
     }
     // A project with no proven policy is a real refusal with its own remedy.
     let why = tenant_cannot_serve(
@@ -479,8 +494,8 @@ fn answer(mut socket: std::net::TcpStream, status: &str, extra: &str, body: &Val
 
 /// The strict `/__platform/cli/authorize` gate (mirrors
 /// `hostedCadenceCliAuthorizeRequestSchema`): every key required, no key
-/// extra, org and audience pinned to this board, scopes a subset of
-/// `cli.*`, ttl within 1..=300.
+/// extra, org and audience pinned to this board, scopes from the CLI
+/// authorization contract, and ttl within 1..=300.
 fn check_authorize(req: &Request) -> bool {
     req.path == "/__platform/cli/authorize"
         && req.bearer == BRIDGE
@@ -490,8 +505,18 @@ fn check_authorize(req: &Request) -> bool {
         && req.body["audience"].as_str().is_some()
         && req.body["requested_scopes"].as_array().is_some_and(|s| {
             !s.is_empty()
-                && s.iter()
-                    .all(|v| v.as_str().is_some_and(|s| s.starts_with("cli.")))
+                && s.iter().all(|v| {
+                    matches!(
+                        v.as_str(),
+                        Some(
+                            "cli.read"
+                                | "cli.write"
+                                | "settings.read"
+                                | "settings.write"
+                                | "audit.approve"
+                        )
+                    )
+                })
         })
         && req.body["ttl_seconds"]
             .as_u64()
@@ -626,6 +651,8 @@ fn fake_worker(
                 };
                 let line = match status {
                     200 => "200 OK",
+                    201 => "201 Created",
+                    202 => "202 Accepted",
                     302 => "302 Found",
                     401 => "401 Unauthorized",
                     403 => "403 Forbidden",
@@ -857,6 +884,9 @@ fn wiki_refuses_forged_authority_before_mint_and_never_uses_cli_relay() {
             };
             let response = if req.path.ends_with("/authorize") {
                 json!({"version": version, "envelope": "h.e.1"})
+            } else if req.body["action"] == "write" {
+                json!({"path": "global/acceptance.md", "rev": "fnv1a:0123456789abcdef",
+                    "committed": true})
             } else {
                 json!({"ok": true})
             };
@@ -1812,6 +1842,1426 @@ fn a_lost_response_to_a_team_mutation_is_unknown_not_a_refusal() {
     let text = err.to_string();
     assert!(text.contains("team list"), "{text}");
     assert!(!text.contains("retry later"), "{text}");
+}
+
+/// A team 2xx whose receipt does not name the row this call changed proves
+/// nothing about the write: it is the same unknown outcome a lost answer is,
+/// with the directory read named and the call never replayed.
+fn team_receipt_unknown(status: u16, verb: &str, args: Value, receipt: Value) {
+    let (result, requests) = run(
+        vec![(status, "", receipt.clone())],
+        verb,
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), "unknown", "{verb} {receipt}: {error}");
+    let text = error.to_string();
+    assert!(text.contains("team list"), "{verb} {receipt}: {text}");
+    assert!(!text.contains("retry later"), "{verb} {receipt}: {text}");
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "{verb} must not replay a write whose receipt did not prove it"
+    );
+}
+
+/// CAD-2009: each platform team write answers a receipt naming the row it
+/// changed — the normalized invite address, the revoked invite, the member's
+/// role, the removed id. The documented success shapes ride the real
+/// transport seam; a foreign or unusable receipt does not become success.
+#[test]
+fn cad2009_team_receipts_must_name_the_member_or_invite_they_changed() {
+    let invite = |id: &str, email: &str, role: &str, status: &str| {
+        json!({"invite": {
+            "id": id, "email": email, "role": role, "status": status,
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "expiresAt": "2026-01-08T00:00:00.000Z"}})
+    };
+    let member = |user: &str, role: &str| {
+        json!({"member": {
+            "userId": user, "name": "Synthetic", "email": "synthetic@example.test",
+            "role": role, "joinedAt": "2026-01-01T00:00:00.000Z"}})
+    };
+    let invite_args = json!({"email": " New@Example.TEST ", "role": "owner"});
+    let revoke_args = json!({"invite_id": "inv_1"});
+    let role_args = json!({"user_id": "usr_1", "role": "owner"});
+    let remove_args = json!({"user_id": "usr_1"});
+
+    for (status, verb, args, receipt) in [
+        (
+            201u16,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "new@example.test", "owner", "pending"),
+        ),
+        // A live pending invite already exists: the server returns it
+        // unchanged, so its stored role may legitimately differ from the
+        // role this call asked for.
+        (
+            200,
+            "team_invite",
+            json!({"email": "NEW@example.test", "role": "owner"}),
+            invite("inv_0", "new@example.test", "member", "pending"),
+        ),
+        (
+            200,
+            "team_revoke_invite",
+            revoke_args.clone(),
+            invite("inv_1", "new@example.test", "member", "revoked"),
+        ),
+        (
+            200,
+            "team_set_role",
+            role_args.clone(),
+            member("usr_1", "owner"),
+        ),
+        (
+            200,
+            "team_remove",
+            remove_args.clone(),
+            json!({"removed": "usr_1"}),
+        ),
+    ] {
+        let (result, requests) = run(
+            vec![(status, "", receipt.clone())],
+            verb,
+            args.as_object().unwrap().clone(),
+            10,
+        );
+        assert_eq!(result.unwrap(), receipt, "{verb} HTTP {status}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb}");
+    }
+
+    for (status, verb, args, receipt) in [
+        (200u16, "team_invite", invite_args.clone(), json!({})),
+        (
+            200,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "other@example.test", "owner", "pending"),
+        ),
+        // A new invite must record the requested role and stay pending.
+        (
+            201,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "new@example.test", "member", "pending"),
+        ),
+        (
+            201,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "new@example.test", "owner", "accepted"),
+        ),
+        (
+            200,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "new@example.test", "owner", "accepted"),
+        ),
+        // Only 200 and 201 are the documented invite answers; a 202 with a
+        // valid pending receipt is not proof the invite was created.
+        (
+            202,
+            "team_invite",
+            invite_args.clone(),
+            invite("inv_1", "new@example.test", "owner", "pending"),
+        ),
+        (200, "team_revoke_invite", revoke_args.clone(), json!({})),
+        (
+            200,
+            "team_revoke_invite",
+            revoke_args.clone(),
+            invite("inv_2", "new@example.test", "member", "revoked"),
+        ),
+        (
+            200,
+            "team_revoke_invite",
+            revoke_args.clone(),
+            invite("inv_1", "new@example.test", "member", "pending"),
+        ),
+        (200, "team_set_role", role_args.clone(), json!({})),
+        (
+            200,
+            "team_set_role",
+            role_args.clone(),
+            member("usr_2", "owner"),
+        ),
+        (
+            200,
+            "team_set_role",
+            role_args.clone(),
+            member("usr_1", "member"),
+        ),
+        (200, "team_remove", remove_args.clone(), json!({})),
+        (
+            200,
+            "team_remove",
+            remove_args.clone(),
+            json!({"removed": "usr_2"}),
+        ),
+        (
+            200,
+            "team_remove",
+            remove_args.clone(),
+            json!({"removed": 7}),
+        ),
+    ] {
+        team_receipt_unknown(status, verb, args, receipt);
+    }
+}
+
+fn settings_args(operation: &str, payload: Value) -> Map<String, Value> {
+    json!({"operation": operation, "expected_revision": null, "payload": payload})
+        .as_object()
+        .unwrap()
+        .clone()
+}
+
+// CAD-2009: independently authored by the fresh-session Standards reviewer.
+// Authorization scope is deliberately unchanged: the hosted schema does not
+// list fleet.check, but that does not make this native read a settings write.
+// Current AgenticOS origin/staging 36dd174ea668e30cebe92a6fd0f6a57cc1902e98
+// refuses settings_agents with 409 container_required before execution.
+// These loopback peers exercise the real HTTP client, not current deployment.
+fn cad2009_assert_fleet_read_failure(error: &Error, requests: &[Value]) {
+    assert_eq!(error.kind(), "rejected", "{error}");
+    assert_eq!(crate::error::exit_code_for_kind(error.kind()), 3);
+    let diagnostic = error.to_string();
+    for false_claim in [
+        "outcome_unknown",
+        "may already have committed",
+        "may or may not have been applied",
+        "settings agents show",
+        "settings agents history",
+    ] {
+        assert!(
+            !diagnostic.contains(false_claim),
+            "a read failure must not claim an uncertain settings write: {diagnostic}"
+        );
+    }
+    assert_eq!(requests.len(), 2, "no automatic replay: {requests:?}");
+    assert_eq!(requests[0]["path"], "/__platform/cli/authorize");
+    assert_eq!(
+        requests[0]["body"]["requested_scopes"],
+        json!(["settings.write"]),
+        "effect classification must not change the hosted authorization contract"
+    );
+    assert_eq!(requests[1]["path"], "/__platform/cli/call");
+    assert_eq!(requests[1]["body"]["verb"], "settings_agents");
+    assert_eq!(
+        requests[1]["body"]["arguments"],
+        json!({"operation": "fleet.check", "expected_revision": null, "payload": {}})
+    );
+}
+
+#[test]
+fn cad2009_fleet_read_503_is_availability_not_mutation_uncertainty() {
+    let (result, requests) = run(
+        vec![(
+            503,
+            "",
+            json!({"ok": false, "error": {"code": "capability_unavailable"}}),
+        )],
+        "settings_agents",
+        settings_args("fleet.check", json!({})),
+        10,
+    );
+    let error = result.unwrap_err();
+    cad2009_assert_fleet_read_failure(&error, &requests);
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("availability"), "{diagnostic}");
+    assert!(diagnostic.contains("retry later"), "{diagnostic}");
+}
+
+#[test]
+fn cad2009_fleet_read_container_required_remains_a_definite_refusal() {
+    let (result, requests) = run(
+        vec![(
+            409,
+            "",
+            json!({"ok": false, "error": {"code": "container_required"}}),
+        )],
+        "settings_agents",
+        settings_args("fleet.check", json!({})),
+        10,
+    );
+    let error = result.unwrap_err();
+    cad2009_assert_fleet_read_failure(&error, &requests);
+    assert_eq!(error.code(), Some("container_required"));
+}
+
+#[test]
+fn cad2009_fleet_read_lost_answer_is_not_mutation_uncertainty() {
+    use std::os::fd::AsRawFd;
+
+    fn accept_bounded(listener: &TcpListener) -> std::net::TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "fleet HTTP request deadline elapsed");
+            let mut descriptor = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: descriptor is initialized and the listener remains live.
+            let ready = unsafe {
+                libc::poll(
+                    &mut descriptor,
+                    1,
+                    remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+                )
+            };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+                continue;
+            }
+            assert_eq!(ready, 1, "CLI did not send the fleet HTTP request");
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            return socket;
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = target(&listener);
+    let worker = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let (socket, request) = read_request(accept_bounded(&listener));
+        assert!(check_authorize(&request));
+        assert_eq!(request.body["requested_scopes"], json!(["settings.write"]));
+        requests.push(json!({"path": request.path, "body": request.body}));
+        answer(
+            socket,
+            "200 OK",
+            "",
+            &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+        );
+
+        let (socket, request) = read_request(accept_bounded(&listener));
+        assert!(check_call(&request));
+        assert_eq!(request.body["verb"], "settings_agents");
+        assert_eq!(
+            request.body["arguments"],
+            json!({"operation": "fleet.check", "expected_revision": null, "payload": {}})
+        );
+        requests.push(json!({"path": request.path, "body": request.body}));
+        // Complete request observed, then close without an HTTP response.
+        drop(socket);
+        requests
+    });
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    store_credential(root.path(), &target.endpoint);
+    let result = call_verb_in(
+        &target,
+        "settings_agents",
+        settings_args("fleet.check", json!({})),
+        10,
+        root.path(),
+        |_| {},
+        |_| {},
+    );
+    let requests = worker.join().unwrap();
+    let error = result.unwrap_err();
+    cad2009_assert_fleet_read_failure(&error, &requests);
+    assert!(
+        error.to_string().contains("remote request failed"),
+        "{error}"
+    );
+}
+
+/// The native config-write result (`build_snapshot`): a revision token plus
+/// the whole config document. A 2xx that lacks either is not that receipt.
+fn config_snapshot(revision: &str) -> Value {
+    json!({
+        "revision": revision,
+        "config": {
+            "harnesses": [], "providers": [], "models": [], "profiles": [],
+            "scope": {},
+            "roleDefaults": {
+                "pm": "", "research": "", "architect": "", "dev": "",
+                "qa": "", "devops": "", "worker": ""
+            },
+            "pins": []
+        },
+        "observations": {"harnesses": {}, "models": {}, "profiles": {}},
+        "catalogs": {},
+        "history": [],
+        "retiredSources": []
+    })
+}
+
+fn settings_receipt_unknown(operation: &str, payload: Value, receipt: Value) {
+    let (result, requests) = run(
+        vec![(200, "", receipt.clone())],
+        "settings_agents",
+        settings_args(operation, payload),
+        10,
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), "unknown", "{operation} {receipt}: {error}");
+    let text = error.to_string();
+    assert!(
+        !text.contains("retry later"),
+        "{operation} {receipt}: {text}"
+    );
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "{operation} must not replay a write whose receipt did not prove it"
+    );
+}
+
+/// CAD-2009: a settings answer that does not prove the write must name an
+/// executable read for that operation class, with the same --org, and never
+/// invite a blind retry. It stays an unknown outcome.
+#[test]
+fn cad2009_settings_unknown_guidance_names_an_executable_read() {
+    for (operation, payload, read) in [
+        (
+            "harness.put",
+            json!({"id": "pi", "label": "Pi", "cli": "pi"}),
+            "settings agents show",
+        ),
+        (
+            "grant.revoke",
+            json!({"grant_id": "sg_1"}),
+            "settings agents grant list",
+        ),
+        ("master.resume", json!({}), "master status"),
+    ] {
+        let (result, requests) = run(
+            vec![(200, "", json!({}))],
+            "settings_agents",
+            settings_args(operation, payload),
+            10,
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), "unknown", "{operation}: {error}");
+        let text = error.to_string();
+        assert!(text.contains(read), "{operation}: {text}");
+        assert!(text.contains("--org"), "{operation}: {text}");
+        assert!(!text.contains("retry later"), "{operation}: {text}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{operation}");
+    }
+}
+
+/// CAD-2009: `grant.revoke` answers `{grant_id, status:"revoked"}`. A 2xx
+/// that omits the id, names another grant, claims another status or carries
+/// a different operation family proves nothing about this revocation.
+#[test]
+fn cad2009_settings_grant_revoke_requires_the_grant_it_revoked() {
+    let payload = json!({"grant_id": "sg_1"});
+    let revoked = json!({"grant_id": "sg_1", "status": "revoked"});
+    let (result, requests) = run(
+        vec![(200, "", revoked.clone())],
+        "settings_agents",
+        settings_args("grant.revoke", payload.clone()),
+        10,
+    );
+    assert_eq!(result.unwrap(), revoked);
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+
+    for receipt in [
+        json!({}),
+        json!({"grant_id": "sg_2", "status": "revoked"}),
+        json!({"grant_id": "sg_1", "status": "active"}),
+        config_snapshot("rev-2"),
+    ] {
+        settings_receipt_unknown("grant.revoke", payload.clone(), receipt);
+    }
+}
+
+/// CAD-2009: a config write answers the whole config snapshot (`revision`
+/// plus `config`). A bare object, a decision result or a revision without
+/// the document is not that receipt.
+#[test]
+fn cad2009_settings_config_writes_require_a_config_snapshot() {
+    let payload = json!({"id": "pi", "label": "Pi", "cli": "pi"});
+    let mut snapshot = config_snapshot("rev-2");
+    snapshot["config"]["harnesses"] = json!([
+        {"id": "pi", "label": "Pi", "cli": "pi", "note": ""}
+    ]);
+    let (result, requests) = run(
+        vec![(200, "", snapshot.clone())],
+        "settings_agents",
+        settings_args("harness.put", payload.clone()),
+        10,
+    );
+    assert_eq!(result.unwrap(), snapshot);
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+
+    for receipt in [
+        json!({}),
+        json!({"grant_id": "sg_1", "status": "revoked"}),
+        json!({"revision": "rev-2"}),
+        // A snapshot that omits the harness this call wrote contradicts it.
+        config_snapshot("rev-2"),
+    ] {
+        settings_receipt_unknown("harness.put", payload.clone(), receipt);
+    }
+
+    // harness.remove: a full snapshot without the removed row is the
+    // documented answer; a truncated `config:{}` is not proof the row is
+    // absent, so it stays unknown.
+    let remove_payload = json!({"id": "pi"});
+    settings_receipt_ok(
+        "harness.remove",
+        remove_payload.clone(),
+        config_snapshot("rev-3"),
+    );
+    settings_receipt_unknown(
+        "harness.remove",
+        remove_payload,
+        json!({"revision": "rev-2", "config": {}}),
+    );
+
+    // harness.put binds the fields it wrote: a snapshot that still names
+    // the old cli contradicts the request.
+    let cli_payload = json!({"id": "claude", "label": "Claude", "cli": "tmux"});
+    let mut cli_saved = config_snapshot("rev-3");
+    cli_saved["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}
+    ]);
+    settings_receipt_ok("harness.put", cli_payload.clone(), cli_saved);
+    let mut stale_cli = config_snapshot("rev-3");
+    stale_cli["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "claude", "note": ""}
+    ]);
+    settings_receipt_unknown("harness.put", cli_payload, stale_cli);
+
+    // provider.remove: a full snapshot without the provider is the answer;
+    // a malformed row is not proof of absence.
+    let provider_payload = json!({"id": "synthetic"});
+    settings_receipt_ok(
+        "provider.remove",
+        provider_payload.clone(),
+        config_snapshot("rev-3"),
+    );
+    let mut malformed_providers = config_snapshot("rev-3");
+    malformed_providers["config"]["providers"] = json!([null]);
+    settings_receipt_unknown("provider.remove", provider_payload, malformed_providers);
+
+    // pin.put: the snapshot must carry the requested pin, not another version.
+    let pin_payload = json!({"pkg": "synthetic", "pinned": "1.2.3"});
+    let mut pinned = config_snapshot("rev-3");
+    pinned["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "1.2.3"}]);
+    settings_receipt_ok("pin.put", pin_payload.clone(), pinned);
+    let mut stale_pin = config_snapshot("rev-3");
+    stale_pin["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "9.9.9"}]);
+    settings_receipt_unknown("pin.put", pin_payload, stale_pin);
+
+    // model.put trims the id at the native boundary: `" m1 "` persists as
+    // `m1`, and that documented snapshot row must remain a usable receipt.
+    let model_payload = json!({
+        "id": " m1 ", "provider": "synthetic", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    });
+    let mut model_snapshot = config_snapshot("rev-3");
+    model_snapshot["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "native CLI",
+        "pin": "", "gate": false, "paid": false, "note": ""
+    }]);
+    model_snapshot["config"]["models"] = json!([{
+        "id": "m1", "provider": "synthetic", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    }]);
+    settings_receipt_ok("model.put", model_payload, model_snapshot);
+}
+
+/// CAD-2009: `apply` commits the whole config document, so its snapshot must
+/// still carry the rows the request wrote; policy-projected extras are
+/// allowed, but a contradicting requested row is unknown.
+#[test]
+fn cad2009_settings_apply_binds_the_requested_config() {
+    let role_defaults = json!({
+        "pm": "", "research": "", "architect": "", "dev": "",
+        "qa": "", "devops": "", "worker": ""
+    });
+    let config = json!({
+        "harnesses": [{"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}],
+        "providers": [{
+            "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+            "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+        }],
+        "models": [],
+        "profiles": [],
+        "scope": {},
+        "roleDefaults": role_defaults.clone(),
+        "pins": []
+    });
+    let payload = json!({"config": config});
+    let mut applied = config_snapshot("rev-3");
+    applied["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}
+    ]);
+    // The sent explicit pins stay empty; the Pi-extension provider's pin is
+    // projected into the snapshot as the derived extra pin.
+    applied["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+        "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+    }]);
+    applied["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "1.2.3"}]);
+    applied["observations"]["harnesses"] = json!({
+        "claude": {"installed": null, "version": null, "live": 0}
+    });
+    settings_receipt_ok("apply", payload.clone(), applied);
+
+    let mut contradicted = config_snapshot("rev-3");
+    contradicted["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "claude", "note": ""}
+    ]);
+    settings_receipt_unknown("apply", payload.clone(), contradicted);
+
+    // An unchanged empty document is the documented apply answer.
+    let empty_config = json!({
+        "harnesses": [],
+        "providers": [],
+        "models": [],
+        "profiles": [],
+        "scope": {},
+        "roleDefaults": role_defaults,
+        "pins": []
+    });
+    let empty_payload = json!({"config": empty_config});
+    settings_receipt_ok("apply", empty_payload.clone(), config_snapshot("rev-3"));
+
+    // `present_overlay` never adds harnesses or profiles, so retaining an
+    // omitted one contradicts the applied document.
+    let mut retained_harness = config_snapshot("rev-3");
+    retained_harness["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}
+    ]);
+    retained_harness["observations"]["harnesses"] = json!({
+        "claude": {"installed": null, "version": null, "live": 0}
+    });
+    settings_receipt_unknown("apply", empty_payload.clone(), retained_harness);
+
+    let mut retained_profile = config_snapshot("rev-3");
+    retained_profile["config"]["profiles"] = json!([{
+        "id": "p1", "role": "dev", "model": "inherit", "job": "Synthetic job"
+    }]);
+    retained_profile["observations"]["profiles"] = json!({
+        "p1": {"version": "abcdef123456", "usedBy": [], "history": [], "files": []}
+    });
+    settings_receipt_unknown("apply", empty_payload.clone(), retained_profile);
+
+    // Two returned pins may share a package with different versions; the
+    // requested full (pkg,pinned) spec must match, not the first entry with
+    // that package.
+    let two_pin_config = json!({
+        "harnesses": [{"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}],
+        "providers": [{
+            "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+            "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+        }],
+        "models": [],
+        "profiles": [],
+        "scope": {},
+        "roleDefaults": role_defaults.clone(),
+        "pins": [{"pkg": "synthetic", "pinned": "9.9.9"}]
+    });
+    let two_pin_payload = json!({"config": two_pin_config});
+    let mut two_pins = config_snapshot("rev-3");
+    two_pins["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}
+    ]);
+    two_pins["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+        "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+    }]);
+    two_pins["config"]["pins"] = json!([
+        {"pkg": "synthetic", "pinned": "1.2.3"},
+        {"pkg": "synthetic", "pinned": "9.9.9"}
+    ]);
+    two_pins["observations"]["harnesses"] = json!({
+        "claude": {"installed": null, "version": null, "live": 0}
+    });
+    settings_receipt_ok("apply", two_pin_payload, two_pins);
+
+    // An extra pin with no sent explicit pin and no provider source is not a
+    // documented projection.
+    let mut unsourced_pin = config_snapshot("rev-3");
+    unsourced_pin["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "1.2.3"}]);
+    settings_receipt_unknown("apply", empty_payload.clone(), unsourced_pin);
+
+    // A provider pin with the same package but a different version is not
+    // proof of the requested full spec.
+    let mut wrong_version = config_snapshot("rev-3");
+    wrong_version["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+        "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+    }]);
+    wrong_version["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "9.9.9"}]);
+    settings_receipt_unknown("apply", payload.clone(), wrong_version);
+
+    // Exact apply: the returned document may not add a provider, model,
+    // role default or scope entry the sent document did not carry.
+    let exact_config = json!({
+        "harnesses": [{"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}],
+        "providers": [{
+            "id": "synthetic", "label": "Synthetic", "kind": "native CLI",
+            "pin": "", "gate": false, "paid": false, "note": ""
+        }],
+        "models": [{
+            "id": "m1", "provider": "synthetic", "ctx": "", "out": "",
+            "thinking": null, "images": null
+        }],
+        "profiles": [],
+        "scope": {},
+        "roleDefaults": role_defaults.clone(),
+        "pins": []
+    });
+    let exact_payload = json!({"config": exact_config});
+    let mut exact = config_snapshot("rev-3");
+    exact["config"]["harnesses"] = json!([
+        {"id": "claude", "label": "Claude", "cli": "tmux", "note": ""}
+    ]);
+    exact["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "native CLI",
+        "pin": "", "gate": false, "paid": false, "note": ""
+    }]);
+    exact["config"]["models"] = json!([{
+        "id": "m1", "provider": "synthetic", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    }]);
+    exact["observations"]["harnesses"] = json!({
+        "claude": {"installed": null, "version": null, "live": 0}
+    });
+    exact["observations"]["models"] = json!({"m1": {"live": 0}});
+    settings_receipt_ok("apply", exact_payload.clone(), exact.clone());
+
+    let mut extra_provider = exact.clone();
+    extra_provider["config"]["providers"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "other", "label": "Other", "kind": "native CLI",
+            "pin": "", "gate": false, "paid": false, "note": ""
+        }));
+    settings_receipt_unknown("apply", exact_payload.clone(), extra_provider);
+
+    let mut extra_model = exact.clone();
+    extra_model["config"]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "m2", "provider": "synthetic", "ctx": "", "out": "",
+            "thinking": null, "images": null
+        }));
+    settings_receipt_unknown("apply", exact_payload.clone(), extra_model);
+
+    let mut wrong_role = exact.clone();
+    wrong_role["config"]["roleDefaults"]["worker"] = json!("m1");
+    settings_receipt_unknown("apply", exact_payload.clone(), wrong_role);
+
+    let mut extra_scope = exact;
+    extra_scope["config"]["scope"] = json!({"m1": "off"});
+    settings_receipt_unknown("apply", exact_payload, extra_scope);
+
+    // Every provider-sourced pin must appear; a duplicate of one spec cannot
+    // stand in for the missing one.
+    let two_provider_config = json!({
+        "harnesses": [],
+        "providers": [
+            {"id": "alpha", "label": "Alpha", "kind": "Pi extension",
+             "pin": "alpha@1", "gate": true, "paid": false, "note": ""},
+            {"id": "beta", "label": "Beta", "kind": "Pi extension",
+             "pin": "beta@2", "gate": true, "paid": false, "note": ""}
+        ],
+        "models": [],
+        "profiles": [],
+        "scope": {},
+        "roleDefaults": role_defaults.clone(),
+        "pins": []
+    });
+    let two_provider_payload = json!({"config": two_provider_config});
+    let mut both_pins = config_snapshot("rev-3");
+    both_pins["config"]["providers"] = json!([
+        {"id": "alpha", "label": "Alpha", "kind": "Pi extension",
+         "pin": "alpha@1", "gate": true, "paid": false, "note": ""},
+        {"id": "beta", "label": "Beta", "kind": "Pi extension",
+         "pin": "beta@2", "gate": true, "paid": false, "note": ""}
+    ]);
+    both_pins["config"]["pins"] = json!([
+        {"pkg": "alpha", "pinned": "1"},
+        {"pkg": "beta", "pinned": "2"}
+    ]);
+    settings_receipt_ok("apply", two_provider_payload.clone(), both_pins);
+
+    let mut duplicated_pin = config_snapshot("rev-3");
+    duplicated_pin["config"]["providers"] = json!([
+        {"id": "alpha", "label": "Alpha", "kind": "Pi extension",
+         "pin": "alpha@1", "gate": true, "paid": false, "note": ""},
+        {"id": "beta", "label": "Beta", "kind": "Pi extension",
+         "pin": "beta@2", "gate": true, "paid": false, "note": ""}
+    ]);
+    duplicated_pin["config"]["pins"] = json!([
+        {"pkg": "alpha", "pinned": "1"},
+        {"pkg": "alpha", "pinned": "1"}
+    ]);
+    settings_receipt_unknown("apply", two_provider_payload, duplicated_pin);
+}
+
+/// CAD-2009: `pin.remove` proves the pin is gone, or that a provider row
+/// still sources it; a leftover pin with no source contradicts the removal.
+#[test]
+fn cad2009_settings_pin_remove_proves_absence_or_a_provider_source() {
+    let payload = json!({"pkg": "synthetic"});
+
+    // The documented removal answer: the pin is absent.
+    settings_receipt_ok("pin.remove", payload.clone(), config_snapshot("rev-3"));
+
+    // A provider row carrying the same pin sources a legitimate retention.
+    let mut sourced = config_snapshot("rev-3");
+    sourced["config"]["providers"] = json!([{
+        "id": "synthetic", "label": "Synthetic", "kind": "Pi extension",
+        "pin": "synthetic@1.2.3", "gate": true, "paid": false, "note": ""
+    }]);
+    sourced["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "1.2.3"}]);
+    settings_receipt_ok("pin.remove", payload.clone(), sourced);
+
+    // A leftover pin with no provider source is not proof of removal.
+    let mut unsourced = config_snapshot("rev-3");
+    unsourced["config"]["pins"] = json!([{"pkg": "synthetic", "pinned": "1.2.3"}]);
+    settings_receipt_unknown("pin.remove", payload, unsourced);
+}
+
+/// CAD-2009: the non-snapshot families are distinct — `profile.sync` nests
+/// its snapshot beside `files`, so a bare snapshot or a bare `files` array
+/// proves nothing about the sync.
+#[test]
+fn cad2009_settings_nested_and_decision_results_are_distinct_families() {
+    let payload = json!({});
+    let synced = json!({"snapshot": config_snapshot("rev-3"), "files": []});
+    let (result, requests) = run(
+        vec![(200, "", synced.clone())],
+        "settings_agents",
+        settings_args("profile.sync", payload.clone()),
+        10,
+    );
+    assert_eq!(result.unwrap(), synced);
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+
+    for receipt in [json!({}), json!({"files": []}), config_snapshot("rev-3")] {
+        settings_receipt_unknown("profile.sync", payload.clone(), receipt);
+    }
+
+    // A named profile must exist and yield exactly its pi and claude file
+    // rows; an empty or single-harness file list proves nothing.
+    let named_payload = json!({"profile": "p1"});
+    let mut named_snapshot = config_snapshot("rev-3");
+    named_snapshot["config"]["profiles"] = json!([{
+        "id": "p1", "role": "dev", "model": "inherit", "job": "Synthetic job"
+    }]);
+    named_snapshot["observations"]["profiles"] = json!({
+        "p1": {"version": "abcdef123456", "usedBy": [], "history": [], "files": []}
+    });
+    let named = json!({
+        "snapshot": named_snapshot.clone(),
+        "files": [
+            {"profile": "p1", "harness": "pi",
+             "path": "/tmp/synthetic/pi/p1/AGENT.md", "status": "unmanaged"},
+            {"profile": "p1", "harness": "claude",
+             "path": "/tmp/synthetic/claude/p1/CLAUDE.md", "status": "in sync"}
+        ]
+    });
+    settings_receipt_ok("profile.sync", named_payload.clone(), named);
+
+    settings_receipt_unknown(
+        "profile.sync",
+        named_payload.clone(),
+        json!({"snapshot": config_snapshot("rev-3"), "files": []}),
+    );
+    settings_receipt_unknown(
+        "profile.sync",
+        named_payload,
+        json!({
+            "snapshot": named_snapshot,
+            "files": [{"profile": "p1", "harness": "pi",
+                "path": "/tmp/synthetic/pi/p1/AGENT.md", "status": "unmanaged"}]
+        }),
+    );
+
+    // An all-profile receipt cannot duplicate a profile row or its file rows:
+    // duplicated totals must not stand in for distinct target coverage.
+    let mut duplicated_profiles = config_snapshot("rev-3");
+    duplicated_profiles["config"]["profiles"] = json!([
+        {"id": "p1", "role": "dev", "model": "inherit", "job": "Synthetic job"},
+        {"id": "p1", "role": "dev", "model": "inherit", "job": "Synthetic job"}
+    ]);
+    duplicated_profiles["observations"]["profiles"] = json!({
+        "p1": {"version": "abcdef123456", "usedBy": [], "history": [], "files": []}
+    });
+    settings_receipt_unknown(
+        "profile.sync",
+        json!({}),
+        json!({
+            "snapshot": duplicated_profiles,
+            "files": [
+                {"profile": "p1", "harness": "pi",
+                 "path": "/tmp/synthetic/pi/p1/AGENT.md", "status": "unmanaged"},
+                {"profile": "p1", "harness": "claude",
+                 "path": "/tmp/synthetic/claude/p1/CLAUDE.md", "status": "in sync"},
+                {"profile": "p1", "harness": "pi",
+                 "path": "/tmp/synthetic/pi/p1/AGENT.md", "status": "unmanaged"},
+                {"profile": "p1", "harness": "claude",
+                 "path": "/tmp/synthetic/claude/p1/CLAUDE.md", "status": "in sync"}
+            ]
+        }),
+    );
+}
+
+fn settings_receipt_ok(operation: &str, payload: Value, receipt: Value) {
+    let (result, requests) = run(
+        vec![(200, "", receipt.clone())],
+        "settings_agents",
+        settings_args(operation, payload),
+        10,
+    );
+    assert_eq!(result.unwrap(), receipt, "{operation}");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{operation}");
+}
+
+/// CAD-2009: the remaining native settings families answer their own
+/// documented shapes. A 2xx from another family proves nothing about the
+/// operation it answered, so it stays unknown.
+#[test]
+fn cad2009_settings_remaining_native_result_families_are_distinct() {
+    // grant.request: the server allocates the request id, so only its shape
+    // is provable.
+    let request_payload = json!({
+        "operation": "harness.put", "expected_revision": null,
+        "payload": {"id": "pi"}, "reason": "synthetic"
+    });
+    settings_receipt_ok(
+        "grant.request",
+        request_payload.clone(),
+        json!({"request_id": "sr_1"}),
+    );
+    settings_receipt_unknown("grant.request", request_payload, json!({}));
+
+    // grant.allow: native echoes the new grant id, its expiry and the bound
+    // operation/digest — never the request id it was asked under.
+    let allow_payload = json!({"request_id": "sr_1"});
+    settings_receipt_ok(
+        "grant.allow",
+        allow_payload.clone(),
+        json!({
+            "grant_id": "sg_1",
+            "expires_at": 1_800_000_000u64,
+            "bound": {
+                "operation": "harness.put",
+                "payload_sha256": "0".repeat(64),
+                "expected_revision": null,
+                "subject": {"kind": "agent", "alias": "synthetic", "generation": "g1", "uid": 1},
+                "org": "local"
+            }
+        }),
+    );
+    settings_receipt_unknown("grant.allow", allow_payload, json!({"grant_id": "sg_1"}));
+
+    // grant.reject: the answer echoes the request id it rejected.
+    let reject_payload = json!({"request_id": "sr_1"});
+    settings_receipt_ok(
+        "grant.reject",
+        reject_payload.clone(),
+        json!({"request_id": "sr_1", "status": "rejected"}),
+    );
+    settings_receipt_unknown(
+        "grant.reject",
+        reject_payload,
+        json!({"request_id": "sr_2", "status": "rejected"}),
+    );
+
+    // catalog.refresh: a listing, or the documented error-shaped answer the
+    // daemon returns when the provider catalog is unavailable.
+    let refresh_payload = json!({"provider": "synthetic"});
+    for receipt in [
+        json!({
+            "source": "omp models synthetic --json --no-extensions",
+            "fetchedAt": "2026-01-01T00:00:00Z",
+            "models": [{"id": "m1"}]
+        }),
+        json!({
+            "source": "omp models synthetic --json --no-extensions",
+            "fetchedAt": "2026-01-01T00:00:00Z",
+            "models": [],
+            "error": "no supported native catalog"
+        }),
+    ] {
+        settings_receipt_ok("catalog.refresh", refresh_payload.clone(), receipt);
+    }
+    // The source names the provider the call asked for; another provider's
+    // catalog is not this refresh's answer.
+    settings_receipt_unknown(
+        "catalog.refresh",
+        refresh_payload.clone(),
+        json!({
+            "source": "omp models other --json --no-extensions",
+            "fetchedAt": "2026-01-01T00:00:00Z",
+            "models": []
+        }),
+    );
+    settings_receipt_unknown(
+        "catalog.refresh",
+        refresh_payload,
+        json!({"source": "omp models synthetic --json --no-extensions"}),
+    );
+
+    // catalog.import: the saved snapshot plus the ids it added.
+    let import_payload = json!({"provider": "synthetic", "models": ["m1"]});
+    let mut imported_snapshot = config_snapshot("rev-4");
+    imported_snapshot["config"]["models"] = json!([{
+        "id": "m1", "provider": "synthetic", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    }]);
+    settings_receipt_ok(
+        "catalog.import",
+        import_payload.clone(),
+        json!({"snapshot": imported_snapshot, "imported": ["m1"]}),
+    );
+    // The ids it claims must be in the snapshot it returns, under the
+    // requested provider; a valid snapshot without the row proves nothing.
+    settings_receipt_unknown(
+        "catalog.import",
+        import_payload.clone(),
+        json!({"snapshot": config_snapshot("rev-4"), "imported": ["m1"]}),
+    );
+    let mut foreign_provider = config_snapshot("rev-4");
+    foreign_provider["config"]["models"] = json!([{
+        "id": "m1", "provider": "other", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    }]);
+    settings_receipt_unknown(
+        "catalog.import",
+        import_payload.clone(),
+        json!({"snapshot": foreign_provider, "imported": ["m1"]}),
+    );
+
+    // An id the request did not ask for is not this import's answer.
+    let mut wrong_import = config_snapshot("rev-4");
+    wrong_import["config"]["models"] = json!([{
+        "id": "m2", "provider": "synthetic", "ctx": "", "out": "",
+        "thinking": null, "images": null
+    }]);
+    settings_receipt_unknown(
+        "catalog.import",
+        import_payload.clone(),
+        json!({"snapshot": wrong_import, "imported": ["m2"]}),
+    );
+    settings_receipt_unknown(
+        "catalog.import",
+        import_payload,
+        json!({"imported": ["m1"]}),
+    );
+
+    // master.resume: the canonical alias, either a start or the documented
+    // attention answer (a failed start is still a definite answer).
+    let resume_payload = json!({});
+    for receipt in [
+        json!({"alias": "master", "state": "starting"}),
+        json!({"alias": "master", "state": "attention"}),
+    ] {
+        settings_receipt_ok("master.resume", resume_payload.clone(), receipt);
+    }
+    settings_receipt_unknown(
+        "master.resume",
+        resume_payload,
+        json!({"alias": "other", "state": "starting"}),
+    );
+}
+
+// CAD-2009: independently authored by the ticket author; implementers must not edit.
+#[test]
+fn cad2009_lost_responses_to_issue_and_wiki_writes_remain_unknown() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = target(&listener);
+    let server = listener.try_clone().unwrap();
+    let worker = thread::spawn(move || {
+        let mut paths = Vec::new();
+        for _ in 0..6 {
+            let (socket, _) = server.accept().unwrap();
+            let (socket, req) = read_request(socket);
+            paths.push(req.path.clone());
+            match req.path.as_str() {
+                "/__platform/cli/authorize" => answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                ),
+                "/__platform/wiki/authorize" => answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": WIKI_VERSION, "envelope": "h.e.1"}),
+                ),
+                "/__platform/cli/call" | "/__platform/wiki/call" => drop(socket),
+                path => panic!("unexpected request: {path}"),
+            }
+        }
+        paths
+    });
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    store_credential(root.path(), &target.endpoint);
+    for (verb, args) in [
+        (
+            "issue_new",
+            json!({"project": "synthetic", "title": "Synthetic"}),
+        ),
+        ("issue_comment", json!({"id": "SYN-1", "body": "Synthetic"})),
+        (
+            "write",
+            json!({"path": "global/synthetic.md", "text": "Synthetic", "if_rev": "none"}),
+        ),
+    ] {
+        let error = call_verb_in(
+            &target,
+            verb,
+            args.as_object().unwrap().clone(),
+            10,
+            root.path(),
+            |_| {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), "unknown", "{verb}: {error}");
+    }
+    assert_eq!(
+        worker.join().unwrap(),
+        [
+            "/__platform/cli/authorize",
+            "/__platform/cli/call",
+            "/__platform/cli/authorize",
+            "/__platform/cli/call",
+            "/__platform/wiki/authorize",
+            "/__platform/wiki/call",
+        ]
+    );
+}
+
+// CAD-2009: a reply that proves neither success nor a pre-effect refusal
+// must not be reported as success or a definite rejection.
+#[test]
+fn cad2009_unconfirmed_issue_writes_are_unknown_and_not_replayed() {
+    for (verb, args) in [
+        (
+            "issue_new",
+            json!({"project": "synthetic", "title": "Synthetic"}),
+        ),
+        ("issue_comment", json!({"id": "SYN-1", "body": "Synthetic"})),
+    ] {
+        for (status, body) in [(200, Value::Null), (200, json!({})), (503, json!({}))] {
+            let (result, requests) = run(
+                vec![(status, "", body)],
+                verb,
+                args.as_object().unwrap().clone(),
+                10,
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), "unknown", "{verb} HTTP {status}: {error}");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+        }
+    }
+}
+
+#[test]
+fn cad2009_project_mutation_capability_failure_remains_unknown() {
+    let body = json!({"ok": false, "error": {"code": "capability_unavailable"}});
+    let args = json!({
+        "project": "synthetic", "issue": "SYN-1", "repo": "example/synthetic",
+        "pr": 7, "head": "0123456789abcdef0123456789abcdef01234567", "source": "synthetic"
+    });
+    let (result, requests) = run(
+        vec![(503, "", body)],
+        "audit_approve_project",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), "unknown", "{error}");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+/// CAD-2001: a tenant that cannot serve a project-scoped *read* (503
+/// capability_unavailable) is a release-order refusal — never "no evidence"
+/// and never a fallback to the older repo-scoped verb. The matching write
+/// stays unknown (above), because it may already have run.
+#[test]
+fn cad2009_project_read_capability_failure_names_the_release_order() {
+    let body = json!({"ok": false, "error": {"code": "capability_unavailable"}});
+    let args = json!({"project": "synthetic"});
+    for verb in [
+        "audit_approval_project",
+        "audit_verdicts_project",
+        "audit_reviewers_project",
+        "audit_identities",
+    ] {
+        let (result, requests) = run(
+            vec![(503, "", body.clone())],
+            verb,
+            args.as_object().unwrap().clone(),
+            10,
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), "rejected", "{verb}: {error}");
+        let text = error.to_string();
+        assert!(text.contains("Release order"), "{verb}: {text}");
+        assert!(text.contains("repo-scoped"), "{verb}: {text}");
+        assert!(!text.contains("no evidence"), "{verb}: {text}");
+        assert!(!text.contains("retry later"), "{verb}: {text}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb}");
+        for request in &requests {
+            if request["path"] == json!("/__platform/cli/call") {
+                assert_eq!(
+                    request["body"]["verb"].as_str(),
+                    Some(verb),
+                    "never fall back to the older repo-scoped verb"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cad2009_foreign_issue_receipt_does_not_confirm_a_comment() {
+    let receipt = json!({"issue": {"id": "SYN-2"}, "card": {"id": "SYN-2"}, "warnings": []});
+    let args = json!({"id": "SYN-1", "body": "Synthetic"});
+    let (result, requests) = run(
+        vec![(200, "", receipt)],
+        "issue_comment",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), "unknown", "{error}");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn cad2009_native_and_tenant_issue_receipts_remain_compatible() {
+    let comment = json!({"id": "SYN-1", "body": "Synthetic"});
+    for receipt in [
+        json!({"issue": {"id": "SYN-1"}, "card": {"id": "SYN-1"}, "warnings": []}),
+        json!({"issue": {"id": "SYN-1"}, "comment": {"body": "Synthetic"}}),
+    ] {
+        let (result, requests) = run(
+            vec![(200, "", receipt.clone())],
+            "issue_comment",
+            comment.as_object().unwrap().clone(),
+            10,
+        );
+        assert_eq!(result.unwrap(), receipt);
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+    let unchanged =
+        json!({"issue": {"id": "SYN-1"}, "card": {"id": "SYN-1", "rev": "same"}, "warnings": []});
+    let args = json!({"ids": ["SYN-1"], "set": ["status=ready"], "if_rev": "same"});
+    let (result, requests) = run(
+        vec![(200, "", unchanged.clone())],
+        "issue_set",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    assert_eq!(result.unwrap(), unchanged);
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn cad2009_policy_receipts_must_match_the_requested_policy() {
+    let args = json!({"project": "synthetic", "visibility": "workspace-visible",
+        "grants": ["users/synthetic"]});
+    let args = args.as_object().unwrap();
+    let tenant = json!({"state": "recorded", "project": "synthetic",
+        "visibility": "workspace-visible", "grants": ["users/synthetic"], "revision": 1});
+    let native = json!({"project": "synthetic", "committed": true, "policy": {
+        "visibility": "workspace_visible", "members": ["users/synthetic"], "version": 1}});
+    assert!(policy_receipt_correlates(&tenant, args));
+    assert!(policy_receipt_correlates(&native, args));
+    let mut wrong_visibility = tenant.clone();
+    wrong_visibility["visibility"] = json!("private");
+    assert!(!policy_receipt_correlates(&wrong_visibility, args));
+    let mut wrong_grants = native.clone();
+    wrong_grants["policy"]["members"] = json!(["users/other"]);
+    assert!(!policy_receipt_correlates(&wrong_grants, args));
+    let empty = json!({"project": "synthetic", "visibility": "workspace-visible", "grants": []});
+    let native_empty = json!({"project": "synthetic", "committed": true,
+        "policy": {"visibility": "workspace_visible", "version": 1}});
+    assert!(policy_receipt_correlates(
+        &native_empty,
+        empty.as_object().unwrap()
+    ));
+}
+
+#[test]
+fn cad2009_tracker_unavailable_before_write_is_definite() {
+    let body = json!({"ok": false, "error": {"code": "tracker_unavailable"}});
+    let args = json!({"id": "SYN-1", "body": "Synthetic"});
+    let (result, requests) = run(
+        vec![(503, "", body)],
+        "issue_comment",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), "rejected", "{error}");
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+// CAD-2009: independently authored by the fresh-session Standards reviewer.
+#[test]
+fn cad2009_unproved_issue_write_5xx_markers_are_unknown_without_replay() {
+    let args = json!({"id": "SYN-1", "body": "Synthetic guard acceptance"});
+    for (status, body) in [
+        (503, json!({"state": "mystery"})),
+        (500, json!({"state": "waking"})),
+        (
+            500,
+            json!({"ok": false, "error": {"code": "tracker_unavailable"}}),
+        ),
+    ] {
+        let (result, requests) = run(
+            vec![(status, "", body.clone())],
+            "issue_comment",
+            args.as_object().unwrap().clone(),
+            10,
+        );
+        let error = result.expect_err("an unproved 5xx cannot confirm a write or its refusal");
+        assert_eq!(error.kind(), "unknown", "HTTP {status} {body}: {error}");
+        let text = error.to_string();
+        assert!(text.contains("issue show"), "HTTP {status} {body}: {text}");
+        assert!(
+            !text.contains("retry later"),
+            "HTTP {status} {body}: {text}"
+        );
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "HTTP {status} {body}: an unproved write must not be replayed"
+        );
+    }
+}
+
+// The recognized pre-forward wake keeps its authorized retry and fresh envelope.
+#[test]
+fn cad2009_proven_issue_write_wake_still_retries_to_correlated_success() {
+    let args = json!({"id": "SYN-1", "body": "Synthetic guard acceptance"});
+    let receipt = json!({
+        "issue": {"id": "SYN-1"},
+        "comment": {"body": "Synthetic guard acceptance"}
+    });
+    let (result, requests) = run(
+        vec![
+            (503, "", json!({"state": "waking", "retry_after_s": 0})),
+            (200, "", receipt.clone()),
+        ],
+        "issue_comment",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    assert_eq!(
+        result.expect("a proven pre-forward wake may retry"),
+        receipt
+    );
+    assert_eq!(hits(&requests, "/__platform/cli/call"), 2);
+    assert_eq!(hits(&requests, "/__platform/cli/authorize"), 2);
+    let envelopes: Vec<&str> = requests
+        .iter()
+        .filter(|request| request["path"] == json!("/__platform/cli/call"))
+        .map(|request| request["body"]["envelope"].as_str().unwrap())
+        .collect();
+    assert_ne!(
+        envelopes[0], envelopes[1],
+        "a wake retry must mint a fresh envelope"
+    );
+}
+
+// CAD-2009: independently authored by the fresh-session Standards reviewer.
+#[test]
+fn cad2009_explicit_issue_write_uncertainty_overrides_a_wake_hint() {
+    let args = json!({"id": "SYN-1", "body": "Synthetic uncertainty acceptance"});
+    let receipt = json!({
+        "issue": {"id": "SYN-1"},
+        "comment": {"body": "Synthetic uncertainty acceptance"}
+    });
+    let (result, requests) = run(
+        vec![
+            (
+                503,
+                "",
+                json!({
+                    "state": "waking",
+                    "retry_after_s": 0,
+                    "error": {"code": "mutation_outcome_uncertain"}
+                }),
+            ),
+            // A forbidden replay gets a valid answer so the failure is bounded.
+            (200, "", receipt),
+        ],
+        "issue_comment",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    assert_eq!(
+        hits(&requests, "/__platform/cli/call"),
+        1,
+        "explicit mutation uncertainty must prevent a wake replay"
+    );
+    let error = result.expect_err("explicit mutation uncertainty cannot confirm a comment");
+    assert_eq!(error.kind(), "unknown", "{error}");
+    let text = error.to_string();
+    assert!(text.contains("issue show"), "{text}");
+    assert!(!text.contains("retry later"), "{text}");
+}
+
+#[test]
+fn cad2009_upload_receipts_bind_destination_and_bytes() {
+    let digest = Sha256::digest(b"abc");
+    let hex = format!("{digest:x}");
+    let path = "global/synthetic.txt";
+    let valid_blob = json!({"path": path, "sha256": hex, "size": 3});
+    let valid_text = json!({"path": path, "kind": "text", "rev": "r1", "size": 3});
+    let valid_native = json!({"path": path, "committed": true, "rev": "r1"});
+    for receipt in [valid_blob, valid_text, valid_native] {
+        assert!(upload_receipt_correlates(&receipt, path, &digest, 3));
+    }
+    for receipt in [
+        json!({"committed": true, "rev": "r1"}),
+        json!({"path": "global/other.txt", "sha256": hex}),
+        json!({"path": path, "kind": "text", "rev": "r1", "size": 3, "sha256": "00"}),
+        json!({"path": path, "kind": "text", "rev": "r1", "size": 3, "sha256": 3}),
+        json!({"path": path, "committed": true, "rev": "r1", "size": 4}),
+    ] {
+        assert!(!upload_receipt_correlates(&receipt, path, &digest, 3));
+    }
+}
+
+#[test]
+fn cad2009_wiki_receipts_accept_server_normalized_paths() {
+    let input = "global/cafe\u{301}.md";
+    let canonical = "global/caf\u{e9}.md";
+    let args = json!({"path": input, "text": "abc"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let receipt = json!({"path": canonical, "rev": "r1", "committed": true});
+    assert!(wiki_write_receipt_correlates(&receipt, &args));
+    let digest = Sha256::digest(b"abc");
+    assert!(upload_receipt_correlates(&receipt, input, &digest, 3));
+    let foreign = json!({"path": "global/other.md", "rev": "r1", "committed": true});
+    assert!(!wiki_write_receipt_correlates(&foreign, &args));
+    assert!(!upload_receipt_correlates(&foreign, input, &digest, 3));
 }
 
 /// A generic 5xx with no worker `state` and no board hop follows a
@@ -3599,5 +5049,616 @@ mod cad2083_acceptance {
             assert!(err.to_string().contains("hosted"), "{err}");
             assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
         }
+    }
+}
+
+/// CAD-2009: the platform-call seam keeps the two answers that prove the funded
+/// dispatch never ran a *definite* refusal. `501 not_implemented` means the
+/// tenant does not serve the verb, and `503 tracker_unavailable` is the native
+/// route's `pm_at` gate, opened before any verb runs — both precede the provider
+/// call, so neither may become the possible-charge unknown of a dispatched but
+/// unanswered call, and neither may be replayed.
+#[test]
+fn hosted_platform_call_pre_forward_refusals_stay_definite() {
+    const KEY: &str = "cad2009-pre-forward-acceptance-1";
+    for (status, line, code) in [
+        (501_u16, "501 Not Implemented", "not_implemented"),
+        (503, "503 Service Unavailable", "tracker_unavailable"),
+    ] {
+        let body = json!({"ok": false, "error": {"code": code}});
+        let (listener, seen, server) = finite_worker(2, move |i, socket, _req| {
+            if i == 0 {
+                write_answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                );
+            } else {
+                write_answer(socket, line, "", &body);
+            }
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let args = json!({
+            "operation": "call",
+            "tool": "generate_image",
+            "body": {"prompt": "synthetic pre-forward acceptance input"},
+            "key": KEY
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let out = call_verb_in(
+            &target,
+            "platform_call",
+            args,
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("a pre-forward refusal must not be automatically retried"),
+        );
+        server.join().unwrap();
+        let reqs = seen.lock().unwrap();
+        assert_eq!(
+            reqs.iter()
+                .filter(|req| req.path == "/__platform/cli/call")
+                .count(),
+            1,
+            "HTTP {status} ({code}): one forwarding attempt, never a replay"
+        );
+
+        let err = out.expect_err("a pre-effect refusal is not a successful tool receipt");
+        assert_eq!(
+            err.kind(),
+            "rejected",
+            "HTTP {status} ({code}) proves the dispatch never ran, so it is definite: {err}"
+        );
+        let text = err.to_string();
+        assert!(
+            !text.contains("charg"),
+            "an undispatched call cannot have charged: {text}"
+        );
+        assert!(
+            !text.contains("outcome_unknown") && !text.contains("may already have committed"),
+            "a proven pre-forward refusal is not an unknown outcome: {text}"
+        );
+    }
+}
+
+/// Exercise the real credential, authorize and multipart upload orchestration.
+/// Client completion ends the fixture; timeouts are loud failure bounds only.
+fn cad2009_artifact_upload_answer(status: &'static str, answer: Value) -> Result<Value> {
+    use std::os::fd::AsRawFd;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let worker = listener.try_clone().unwrap();
+    let (complete_tx, complete_rx) = std::sync::mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let mut paths = Vec::new();
+        for _ in 0..2 {
+            let mut pending = libc::pollfd {
+                fd: worker.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pending is one initialized pollfd, and the count is one.
+            let ready = unsafe { libc::poll(&mut pending, 1, 5000) };
+            assert_eq!(
+                ready, 1,
+                "expected artifact request did not arrive within 5s"
+            );
+            assert_ne!(pending.revents & libc::POLLIN, 0);
+            let (socket, _) = worker.accept().unwrap();
+            let (mut socket, path, raw) = read_raw_request(socket);
+            match path.as_str() {
+                "/__platform/cli/authorize" => {
+                    let request: Value = serde_json::from_slice(&raw).unwrap();
+                    assert_eq!(request["version"], CLI_VERSION);
+                    assert_eq!(request["requested_scopes"], json!(["cli.write"]));
+                    write_answer(
+                        &mut socket,
+                        "200 OK",
+                        "",
+                        &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                    );
+                }
+                "/__platform/artifacts/upload" => {
+                    let multipart = std::str::from_utf8(&raw).unwrap();
+                    assert!(
+                        multipart.contains("name=\"id\"\r\n\r\nart-A\r\n"),
+                        "the actual upload must explicitly request art-A: {multipart}"
+                    );
+                    assert!(multipart.contains("name=\"file\"; filename=\"acceptance.txt\""));
+                    assert!(
+                        multipart.contains("\r\n\r\nabc\r\n--"),
+                        "the receipt's known digest must describe the transmitted bytes"
+                    );
+                    write_answer(&mut socket, status, "", &answer);
+                }
+                _ => panic!("unexpected artifact upload request: {path}"),
+            }
+            paths.push(path);
+        }
+        complete_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("artifact client did not finish within 5s of the response");
+        match worker.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("artifact upload attempted an extra request after its final answer"),
+            Err(error) => panic!("checking for an artifact replay failed: {error}"),
+        }
+        paths
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let upload = ArtifactUpload {
+        kind: "md",
+        title: "Synthetic acceptance document",
+        id: Some("art-A"),
+        issue: None,
+        label: None,
+        customer: None,
+        file_name: "acceptance.txt",
+        bytes: b"abc",
+    };
+    let result = upload_artifact_in(&dir, &target, &upload, 2, |_| {
+        panic!("a final artifact receipt or refusal must never trigger a wake retry")
+    });
+    complete_tx.send(()).unwrap();
+    let paths = server.join().unwrap();
+    assert_eq!(
+        paths.as_slice(),
+        ["/__platform/cli/authorize", "/__platform/artifacts/upload"],
+        "authorize then exactly one upload, with no automatic replay"
+    );
+    result
+}
+
+#[test]
+fn cad2009_artifact_upload_wrong_requested_id_is_unknown_without_replay() {
+    // SHA-256 of the literal payload "abc", independent of the production hash.
+    let answer = json!({"file": {
+        "id": "art-B",
+        "version": 1,
+        "digest": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    }});
+    let error = cad2009_artifact_upload_answer("200 OK", answer)
+        .expect_err("a receipt for art-B cannot prove the explicitly requested art-A upload");
+    assert_eq!(
+        error.kind(),
+        "unknown",
+        "matching bytes alone cannot turn a mismatched id into success or definite refusal: {error}"
+    );
+    assert!(
+        error.to_string().contains("artifact find"),
+        "an ambiguous upload must name its reconciliation read: {error}"
+    );
+}
+
+#[test]
+fn cad2009_artifact_upload_matching_requested_id_succeeds_once() {
+    let answer = json!({"file": {
+        "id": "art-A",
+        "version": 1,
+        "digest": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    }});
+    let result = cad2009_artifact_upload_answer("200 OK", answer.clone())
+        .expect("a receipt naming art-A and its transmitted bytes must succeed");
+    assert_eq!(result, answer);
+}
+
+#[test]
+fn cad2009_artifact_upload_board_hop_503_is_definite_without_replay() {
+    let answer = json!({"ok": false, "error": {
+        "code": "capability_unavailable",
+        "hop": "board",
+        "request_id": "9cb6440e-f363-4dca-8f85-bc652696bc6a"
+    }});
+    let error = cad2009_artifact_upload_answer("503 Service Unavailable", answer)
+        .expect_err("a board gate refusal cannot produce an artifact receipt");
+    assert_eq!(
+        error.kind(),
+        "rejected",
+        "the board hop proves this upload was refused before forwarding: {error}"
+    );
+}
+
+#[test]
+fn cad2009_artifact_upload_unproven_tracker_503_is_unknown_without_replay() {
+    // Native /cli/call's tracker gate is not proof for /artifacts/upload.
+    let answer = json!({"ok": false, "error": {"code": "tracker_unavailable"}});
+    let error = cad2009_artifact_upload_answer("503 Service Unavailable", answer)
+        .expect_err("an unproven 503 cannot produce an artifact receipt");
+    assert_eq!(
+        error.kind(),
+        "unknown",
+        "this endpoint provides no proof that tracker_unavailable preceded storage: {error}"
+    );
+}
+
+#[test]
+fn cad2009_artifact_upload_unproven_worker_states_are_unknown_without_replay() {
+    for (status, state) in [
+        ("503 Service Unavailable", "wake_failed"),
+        ("503 Service Unavailable", "board_unreachable"),
+        ("503 Service Unavailable", "runtime_unavailable"),
+        ("503 Service Unavailable", "mystery"),
+        ("500 Internal Server Error", "waking"),
+    ] {
+        let answer = json!({"state": state});
+        let error = cad2009_artifact_upload_answer(status, answer)
+            .expect_err("an unproven worker state cannot establish an artifact upload outcome");
+        assert_eq!(
+            error.kind(),
+            "unknown",
+            "{status} with state {state} is not pre-forward proof for the artifact endpoint: {error}"
+        );
+    }
+}
+
+// Independently authored CAD-2009 acceptance by the fresh-session Standards
+// reviewer. Append to src/remote_cli/tests.rs; reuse its existing strict
+// loopback HTTP `run` helper, not the private receipt predicate.
+// Producer evidence: AgenticOS apps/api/src/tenant-board/cli.ts:
+// requiredText (396-403), PROJECT_KEY (66), and issue_new (614-641).
+// The producer trims project input but does not lowercase it.
+// Formatting-only changes to this independently authored test are authorized;
+// changing its cases, expectations, seam, or assertions is not authorized.
+#[test]
+fn cad2009_issue_create_accepts_trimmed_project_but_not_a_foreign_project() {
+    for sent_project in [" synthetic ", "\u{feff}synthetic\u{feff}"] {
+        for (received_project, confirmed) in [("synthetic", true), ("foreign", false)] {
+            let args = json!({"project": sent_project, "title": "Synthetic receipt acceptance"});
+            let receipt = json!({
+                "issue": {"id": "SYN-1"},
+                "card": {
+                    "id": "SYN-1",
+                    "project": received_project,
+                    "title": "Synthetic receipt acceptance"
+                },
+                "warnings": []
+            });
+            let (result, requests) = run(
+                vec![(200, "", receipt.clone())],
+                "issue_new",
+                args.as_object().unwrap().clone(),
+                10,
+            );
+            // Both branches use the real authorize/call transport and the
+            // original credential-bound fixture; neither may bypass auth or
+            // replay a mutation after receiving its synthetic server answer.
+            assert_eq!(hits(&requests, "/__platform/cli/authorize"), 1);
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+            let authorize = requests
+                .iter()
+                .find(|request| request["path"] == "/__platform/cli/authorize")
+                .unwrap();
+            assert_eq!(authorize["body"]["organization_id"], ORG_ID);
+            assert!(authorize["body"]["requested_scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|scope| scope == "cli.write"));
+            if confirmed {
+                assert_eq!(
+                    result.unwrap(),
+                    receipt,
+                    "the producer-normalized project must confirm this create: {sent_project:?}"
+                );
+            } else {
+                let error = result.expect_err("a foreign project cannot confirm this create");
+                assert_eq!(error.kind(), "unknown", "{error}");
+                assert!(error.to_string().contains("issue ls"), "{error}");
+            }
+        }
+    }
+}
+
+// JS String.trim removes U+FEFF but not U+0085. The native IssueNew path
+// passes req.title to issue_write::new_issue (src/ui/cli_route.rs:704-719),
+// then Front::new stores title.to_string() (src/issue/model.rs:154-157).
+// Preserve that exact-title receipt too; do not impose tenant-only title
+// normalization on the native producer. These are synthetic native-shaped
+// replies at the HTTP client seam, not an execution of the native route.
+#[test]
+fn cad2009_issue_create_correlates_producer_title_without_overtrimming() {
+    for (case, sent_project, sent_title, received_title, confirmed) in [
+        (
+            "tenant trims BOM title",
+            "synthetic",
+            "\u{feff}Synthetic receipt acceptance\u{feff}",
+            "Synthetic receipt acceptance",
+            true,
+        ),
+        (
+            "NEL project cannot correlate with a trimmed project",
+            "\u{0085}synthetic\u{0085}",
+            "Synthetic receipt acceptance",
+            "Synthetic receipt acceptance",
+            false,
+        ),
+        (
+            "NEL title cannot correlate with a trimmed title",
+            "synthetic",
+            "\u{0085}Synthetic receipt acceptance\u{0085}",
+            "Synthetic receipt acceptance",
+            false,
+        ),
+        (
+            "native preserves exact BOM title",
+            "synthetic",
+            "\u{feff}Synthetic receipt acceptance\u{feff}",
+            "\u{feff}Synthetic receipt acceptance\u{feff}",
+            true,
+        ),
+        (
+            "native and tenant preserve exact NEL title",
+            "synthetic",
+            "\u{0085}Synthetic receipt acceptance\u{0085}",
+            "\u{0085}Synthetic receipt acceptance\u{0085}",
+            true,
+        ),
+    ] {
+        let args = json!({"project": sent_project, "title": sent_title});
+        let receipt = json!({
+            "issue": {"id": "SYN-1"},
+            "card": {
+                "id": "SYN-1",
+                "project": "synthetic",
+                "title": received_title
+            },
+            "warnings": []
+        });
+        let (result, requests) = run(
+            vec![(200, "", receipt.clone())],
+            "issue_new",
+            args.as_object().unwrap().clone(),
+            10,
+        );
+        assert_eq!(hits(&requests, "/__platform/cli/authorize"), 1, "{case}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{case}");
+        let authorize = requests
+            .iter()
+            .find(|request| request["path"] == "/__platform/cli/authorize")
+            .unwrap();
+        assert_eq!(authorize["body"]["organization_id"], ORG_ID, "{case}");
+        assert!(
+            authorize["body"]["requested_scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|scope| scope == "cli.write"),
+            "{case}"
+        );
+        if confirmed {
+            assert_eq!(result.unwrap(), receipt, "{case}");
+        } else {
+            let error = result.expect_err(case);
+            assert_eq!(error.kind(), "unknown", "{case}: {error}");
+            assert!(error.to_string().contains("issue ls"), "{case}: {error}");
+        }
+    }
+}
+
+// Independently authored CAD-2009 Spec/security acceptance.
+// Append to src/remote_cli/tests.rs beside the existing hosted receipt tests.
+// Formatting-only changes are authorized. Do not change cases, expectations,
+// transport seam, scope checks, or no-replay assertions without reviewer agreement.
+//
+// Producer evidence read from the available local AgenticOS source:
+// packages/contracts/src/members.ts:47-51 applies JS trim().toLowerCase()
+// before z.email(); hosted-cadence-auth.ts:1240-1243 reuses that email schema;
+// apps/api/src/board/team-cli.ts:200-215 passes parsed.data.email to the write.
+// ECMAScript trim removes U+FEFF but does not remove U+0085. The latter is
+// neither part of the producer's canonical ASCII address nor a valid address
+// wrapper. These synthetic replies exercise the real authorize/call client,
+// not a live producer or the private receipt predicate.
+#[test]
+fn cad2009_team_invite_receipts_match_ecmascript_whitespace_without_overtrimming() {
+    let canonical = "new@example.test";
+    for (case, sent_email, received_email, confirmed) in [
+        (
+            "canonical ASCII control",
+            "New@Example.TEST",
+            canonical,
+            true,
+        ),
+        (
+            "producer strips surrounding BOM",
+            "\u{feff}New@Example.TEST\u{feff}",
+            canonical,
+            true,
+        ),
+        (
+            "producer trims spaces and BOM together",
+            " \u{feff} New@Example.TEST \u{feff} ",
+            canonical,
+            true,
+        ),
+        (
+            "foreign address cannot confirm BOM-wrapped input",
+            "\u{feff}New@Example.TEST\u{feff}",
+            "other@example.test",
+            false,
+        ),
+        (
+            "NEL-wrapped receipt is not the producer canonical address",
+            "New@Example.TEST",
+            "\u{0085}new@example.test\u{0085}",
+            false,
+        ),
+    ] {
+        // Cover the producer's two success statuses: 201 allocates a pending
+        // invite; 200 returns an existing pending invite. Use the requested
+        // role in both, so this test changes no role-correlation expectations.
+        for status in [200_u16, 201] {
+            let args = json!({"email": sent_email, "role": "member"});
+            let receipt = json!({"invite": {
+                "id": "inv_cad2009_unicode",
+                "email": received_email,
+                "role": "member",
+                "status": "pending",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "expiresAt": "2026-01-08T00:00:00.000Z"
+            }});
+            let (result, requests) = run(
+                vec![(status, "", receipt.clone())],
+                "team_invite",
+                args.as_object().unwrap().clone(),
+                10,
+            );
+            assert_eq!(
+                requests.len(),
+                2,
+                "{case}/HTTP {status}: no extra reads or replay"
+            );
+            assert_eq!(
+                hits(&requests, "/__platform/cli/authorize"),
+                1,
+                "{case}/HTTP {status}"
+            );
+            assert_eq!(
+                hits(&requests, "/__platform/cli/call"),
+                1,
+                "{case}/HTTP {status}"
+            );
+            let authorize = &requests[0];
+            assert_eq!(authorize["path"], "/__platform/cli/authorize", "{case}");
+            assert_eq!(authorize["body"]["version"], CLI_VERSION, "{case}");
+            assert_eq!(authorize["body"]["organization_id"], ORG_ID, "{case}");
+            assert_eq!(
+                authorize["body"]["requested_scopes"],
+                json!(["cli.write"]),
+                "{case}"
+            );
+            assert!(
+                authorize["body"]["audience"]
+                    .as_str()
+                    .is_some_and(|audience| audience.starts_with("http://127.0.0.1:")),
+                "{case}"
+            );
+            assert!(
+                authorize["body"]["ttl_seconds"]
+                    .as_u64()
+                    .is_some_and(|ttl| (1..=300).contains(&ttl)),
+                "{case}"
+            );
+            assert_eq!(authorize["body"].as_object().unwrap().len(), 5, "{case}");
+            let call = &requests[1];
+            assert_eq!(call["path"], "/__platform/cli/call", "{case}");
+            assert_eq!(call["body"]["version"], CLI_VERSION, "{case}");
+            assert_eq!(call["body"]["verb"], "team_invite", "{case}");
+            assert_eq!(
+                call["body"]["arguments"], args,
+                "{case}: outgoing input changed"
+            );
+            assert_eq!(
+                call["body"].as_object().unwrap().len(),
+                4,
+                "{case}: authority-shaped extra field"
+            );
+            assert!(
+                call["body"]["envelope"].as_str().is_some_and(|envelope| {
+                    envelope.split('.').count() == 3
+                        && envelope.split('.').all(|part| {
+                            !part.is_empty()
+                                && part.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric() || b"_-".contains(&byte)
+                                })
+                        })
+                }),
+                "{case}: missing single-use authorization envelope"
+            );
+            if confirmed {
+                assert_eq!(result.expect(case), receipt, "{case}/HTTP {status}");
+            } else {
+                let error = result.expect_err(case);
+                assert_eq!(error.kind(), "unknown", "{case}/HTTP {status}: {error}");
+                assert_eq!(crate::error::exit_code_for_kind(error.kind()), 1, "{case}");
+                let guidance = error.to_string();
+                assert!(
+                    guidance.contains("team list") || guidance.contains("team invites"),
+                    "{case}: {guidance}"
+                );
+                assert!(!guidance.contains("retry later"), "{case}: {guidance}");
+            }
+        }
+    }
+}
+
+// U+0085 input never reaches the producer: it is a control character under
+// the existing client team_argument_shape. Keep that predispatch guard; do
+// not "fix" normalization by trimming invalid input before admission.
+#[test]
+fn cad2009_team_invite_nel_input_keeps_definite_predispatch_refusal() {
+    let args = json!({
+        "email": "\u{0085}New@Example.TEST\u{0085}",
+        "role": "member"
+    });
+    let (result, requests) = run(
+        Vec::new(),
+        "team_invite",
+        args.as_object().unwrap().clone(),
+        10,
+    );
+    assert!(
+        requests.is_empty(),
+        "NEL input must send neither authorization nor mutation"
+    );
+    let error = result.expect_err("the existing control-character guard must reject NEL input");
+    assert_eq!(error.kind(), "rejected", "{error}");
+    assert_eq!(crate::error::exit_code_for_kind(error.kind()), 3);
+    assert!(!error.to_string().contains("outcome is unknown"), "{error}");
+}
+
+// CAD-2009: a sync can update one export before another fails. Only a
+// documented pre-effect refusal proves that the dispatched sync did not apply.
+#[test]
+fn cad2009_profile_sync_postdispatch_503_is_unknown_but_invalid_request_is_definite() {
+    for (status, code, expected_kind) in [
+        (503, "capability_unavailable", "unknown"),
+        // cli_route::rpc maps a native rejected error to this pre-effect
+        // refusal (for example, selecting a profile that does not exist).
+        (400, "invalid_request", "rejected"),
+    ] {
+        let arguments = settings_args("profile.sync", json!({"profile": "p1"}));
+        let (result, requests) = run(
+            vec![(status, "", json!({"ok": false, "error": {"code": code}}))],
+            "settings_agents",
+            arguments.clone(),
+            10,
+        );
+        let error = result.expect_err("the failed sync must not return success");
+        assert_eq!(error.kind(), expected_kind, "HTTP {status}: {error}");
+        assert_eq!(
+            crate::error::exit_code_for_kind(error.kind()),
+            if status == 503 { 1 } else { 3 },
+            "HTTP {status}"
+        );
+        let guidance = error.to_string();
+        if status == 503 {
+            for read in ["settings agents show", "settings agents history", "--org"] {
+                assert!(guidance.contains(read), "HTTP {status}: {guidance}");
+            }
+            assert!(!guidance.contains("retry later"), "{guidance}");
+        } else {
+            assert!(!guidance.contains("settings agents show"), "{guidance}");
+            assert!(!guidance.contains("settings agents history"), "{guidance}");
+        }
+        assert_eq!(
+            hits(&requests, "/__platform/cli/authorize"),
+            1,
+            "HTTP {status}: must not reauthorize: {requests:?}"
+        );
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "HTTP {status}: must not replay the sync: {requests:?}"
+        );
+        assert_eq!(requests.len(), 2, "HTTP {status}: {requests:?}");
+        assert_eq!(requests[0]["path"], "/__platform/cli/authorize");
+        assert_eq!(requests[1]["path"], "/__platform/cli/call");
+        assert_eq!(requests[1]["body"]["verb"], "settings_agents");
+        assert_eq!(requests[1]["body"]["arguments"], json!(arguments));
     }
 }

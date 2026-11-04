@@ -300,9 +300,19 @@ fn sweep_with_hooks(
     // the notice RPC goes out after the commit, outside the lock. A
     // pass with no eligible candidate takes no lock.
     let issues = board::load_all(&pm.dir, None)?;
-    let jobs = jobs_override
-        .unwrap_or_else(|| state_dir.map(board::fetch_job_outcomes).unwrap_or_default());
-    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    // A tracker-only caller (tests, an explicit opt-out) passes no
+    // state dir and keeps pre-job derivation. With a runtime in hand,
+    // the sweep is a decision: unknown job state cannot be read as
+    // "no job is blocked" — a parked job-blocked lane would be
+    // unparked as if it were free.
+    let jobs = match jobs_override {
+        Some(jobs) => board::JobState::Known(jobs),
+        None => state_dir
+            .map(board::fetch_job_state)
+            .unwrap_or_else(board::JobState::tracker_only),
+    };
+    jobs.require("the blocked sweep")?;
+    let views = board::views_with_job_state(&pm.config.notes_dir(), issues, &jobs);
     let candidates: Vec<String> = views
         .iter()
         .filter(|v| {
@@ -321,7 +331,7 @@ fn sweep_with_hooks(
     'candidates: for id in candidates {
         for _attempt in 0..SNAPSHOT_ATTEMPTS {
             let head = line_times::tracker_head(&pm.dir, HEAD_BUDGET).ok();
-            let current = board::views_with_jobs(
+            let current = board::views_with_job_state(
                 &pm.config.notes_dir(),
                 board::load_all(&pm.dir, None)?,
                 &jobs,

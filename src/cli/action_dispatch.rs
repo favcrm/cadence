@@ -12,15 +12,27 @@ mod issues;
 mod providers;
 
 pub(super) fn show_login_code(url: &str, code: &str, no_open: bool) -> Result<()> {
-    eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
+    cadence_agent::output::eprint_format_line(format_args!(
+        "Approve hosted Cadence access at: {url}\nCode: {code}"
+    ));
     open_login_url(url, no_open);
     Ok(())
 }
 
 pub(super) fn show_register_code(url: &str, code: &str, no_open: bool) -> Result<()> {
-    eprintln!("Complete registration and approve this CLI at: {url}\nDevice code: {code}");
+    cadence_agent::output::eprint_format_line(format_args!(
+        "Complete registration and approve this CLI at: {url}\nDevice code: {code}"
+    ));
     open_login_url(url, no_open);
     Ok(())
+}
+pub(super) fn issued_session_persistence_error(workspace: &str, dir: &Path, error: Error) -> Error {
+    Error::unknown(format!(
+        "a remote session was issued for workspace {workspace}, but local registration \
+         could not be confirmed in {}: {error}. Inspect that directory and \
+         reconcile with the issuer owner before requesting new consent",
+        dir.display()
+    ))
 }
 
 fn show_workspace_handover(slug: &str, stored: &Value, explicit_auth_dir: bool) {
@@ -68,15 +80,14 @@ fn report_register_error(error: &Error, json: bool) {
     if !json {
         return;
     }
-    println!(
-        "{}",
-        serde_json::json!({
-            "registered": false,
-            "authenticated": false,
-            "code": error.code(),
-            "message": error.to_string()
-        })
-    );
+    print_json(&serde_json::json!({
+        "registered": (error.kind() != "unknown").then_some(false),
+        "authenticated": false,
+        "credential_stored": false,
+        "kind": error.kind(),
+        "code": error.code(),
+        "message": error.to_string()
+    }));
 }
 
 /// Open one server-selected browser URL through the host opener. The URL
@@ -109,14 +120,14 @@ pub(crate) fn run() -> Result<i32> {
     // CAD-1432: the master's help is bounded and refuses malformed or
     // disallowed forms with a usage error, so it runs before the others.
     if let Some(text) = help::master_help(&argv) {
-        print!("{}", text?);
+        cadence_agent::output::print_text(&text?);
         return Ok(0);
     }
     // CAD-1432: the master never gets the unfiltered legacy help; its
     // leading-global or aliased help forms fall through to the Clap parser.
     if !cadence_agent::master::caller_is_master() {
         if let Some(text) = help::help_section(&argv) {
-            print!("{text}");
+            cadence_agent::output::print_text(&text);
             return Ok(0);
         }
     }
@@ -333,25 +344,23 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 *use_,
                 || grant.save_credential(&dir),
             )
+            .map_err(|error| issued_session_persistence_error(&grant.organization_id, &dir, error))
             .inspect_err(|error| report_register_error(error, *json))?;
             if *json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "registered": true,
-                        "authenticated": true,
-                        "slug": grant.slug,
-                        "endpoint": grant.endpoint,
-                        "organization_id": grant.organization_id,
-                        "expires_at": grant.expires_at,
-                        "credential_stored": true
-                    })
-                );
+                print_json(&serde_json::json!({
+                    "registered": true,
+                    "authenticated": true,
+                    "slug": grant.slug,
+                    "endpoint": grant.endpoint,
+                    "organization_id": grant.organization_id,
+                    "expires_at": grant.expires_at,
+                    "credential_stored": true
+                }));
             } else {
-                println!(
+                cadence_agent::output::print_format_line(format_args!(
                     "Registered and signed in to {} ({})",
                     grant.slug, grant.endpoint
-                );
+                ));
                 show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
             }
             return Ok(0);
@@ -379,7 +388,9 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             )?;
             let line = cadence_agent::github_connect::outcome_line(&poll)
                 .unwrap_or_else(|| "The connection did not settle in time.".to_string());
-            eprintln!("{line}");
+            // The outcome line precedes a possible exit 1: a closed stderr
+            // must not panic the verdict into success.
+            eprint_line(&line);
             return Ok(match poll {
                 cadence_agent::github_connect::Poll::Connected(_) => 0,
                 _ => 1,
@@ -455,8 +466,14 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 &grant.organization_id,
                 *use_,
                 || grant.save_credential(&dir),
-            )?;
-            println!("Signed in to {} ({})", grant.slug, grant.endpoint);
+            )
+            .map_err(|error| {
+                issued_session_persistence_error(&grant.organization_id, &dir, error)
+            })?;
+            cadence_agent::output::print_format_line(format_args!(
+                "Signed in to {} ({})",
+                grant.slug, grant.endpoint
+            ));
             show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
             return Ok(0);
         }

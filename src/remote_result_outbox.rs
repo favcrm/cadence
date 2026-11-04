@@ -826,8 +826,8 @@ fn validate_queued(receipt: &QueuedReceipt, local: &LocalReceipt) -> Result<()> 
 }
 
 /// Send only the stored canonical command to its stored board origin. The
-/// transport receives no caller-selected URL or actor fields. A failed or
-/// ambiguous HTTP exchange leaves local custody pending for an explicit retry.
+/// transport receives no caller-selected URL or actor fields. An unconfirmed
+/// exchange keeps the original custody for inspection, not blind replay.
 pub fn deliver_with<F>(
     outbox: &ResultOutbox,
     command_id: &str,
@@ -868,23 +868,36 @@ where
         pin.audience(),
         pin.organization_id()
     );
-    let (status, body) = post(&url, child_bearer, pending.command().canonical_json())
-        .map_err(|_| Error::rejected("Hosted result send uncertain; local custody retained"))?;
+    let unknown = || {
+        Error::unknown(format!(
+            "hosted result outcome is unknown for command {} (digest {}) in workspace {} \
+             at {}; local custody is retained. Inspect `cadence remote result status \
+             --outbox-dir <same-directory> --command-id {}` and verify the original \
+             destination before deciding whether to retry; local pending does not prove \
+             remote absence and no automatic replay was made",
+            pending.receipt().command_id(),
+            pending.receipt().digest(),
+            pin.organization_id(),
+            pin.audience(),
+            pending.receipt().command_id()
+        ))
+    };
+    let (status, body) =
+        post(&url, child_bearer, pending.command().canonical_json()).map_err(|_| unknown())?;
     if status != 202 || body.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err(Error::rejected(
-            "Hosted result was not acknowledged; local custody retained",
-        ));
+        return Err(unknown());
     }
-    let parsed: QueuedResponse = serde_json::from_slice(&body).map_err(|_| {
-        Error::rejected("Hosted result returned an invalid receipt; local custody retained")
-    })?;
+    let parsed: QueuedResponse = serde_json::from_slice(&body).map_err(|_| unknown())?;
     if !parsed.ok {
-        return Err(Error::rejected(
-            "Hosted result was not acknowledged; local custody retained",
-        ));
+        return Err(unknown());
     }
-    validate_queued(&parsed.receipt, pending.receipt())?;
-    outbox.record_queued(&parsed.receipt)
+    validate_queued(&parsed.receipt, pending.receipt()).map_err(|_| unknown())?;
+    outbox.record_queued(&parsed.receipt).map_err(|error| {
+        Error::internal(format!(
+            "hosted result {} was confirmed queued, but its local receipt could not be saved: {error}",
+            pending.receipt().command_id()
+        ))
+    })
 }
 fn private_metadata(meta: &fs::Metadata, directory: bool) -> Result<()> {
     let safe = meta.uid() == unsafe { libc::geteuid() }
@@ -1116,5 +1129,225 @@ mod journal_race_tests {
             .unwrap();
         fs::remove_file(&fifo).unwrap();
         assert!(journal_needs_recheck(&fifo, &fifo_file).is_err());
+    }
+}
+
+// Independent CAD-2009 negative acceptance at the public deliver_with seam.
+// No network, production credentials, timing assumptions, or task application.
+// Counterpart evidence is pinned to AgenticOS 36dd174ea668e30cebe92a6fd0f6a57cc1902e98:
+// the old results ingress/inbox is retired there, so these tests deliberately
+// do not claim that a hosted GET, reconcile command, or safe resend is available.
+#[cfg(test)]
+mod cad2009_result_outcome_acceptance {
+    use super::{deliver_with, DestinationPin, ResultCommand, ResultOutbox};
+    use crate::Error;
+    use serde_json::json;
+    use std::cell::Cell;
+
+    const COMMAND_ID: &str = "cmd-cad2009-answer-lost";
+    const ORGANIZATION: &str = "org-cad2009-original";
+    const AUDIENCE: &str = "https://original.board.example.invalid";
+    const SUBJECT: &str = "subject-cad2009-original";
+    const AGENT: &str = "agent-cad2009-original";
+    const CHILD: &str = "hct_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+    const RESULT_URL: &str = "https://original.board.example.invalid/__platform/hosted-cadence/org-cad2009-original/results";
+
+    fn retained_command() -> ResultCommand {
+        ResultCommand::parse_json(
+            &json!({
+                "version": "hosted-cadence-result.v1",
+                "commandId": COMMAND_ID,
+                "kind": "agent_result",
+                "assignmentId": "assignment-cad2009",
+                "taskId": "task-cad2009",
+                "taskRevision": 7,
+                "turnId": "turn-cad2009",
+                "reportedHeadSha": "0123456789abcdef0123456789abcdef01234567",
+                "text": "Retained result for independent outcome acceptance"
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum UnconfirmedAnswer {
+        LostAfterDispatch,
+        Malformed202,
+        Oversized202,
+        False202,
+        ForeignCommandReceipt,
+        ForeignDigestReceipt,
+        Unproven403,
+        Unproven503,
+    }
+
+    #[test]
+    fn dispatched_result_without_matching_ack_is_unknown_and_keeps_original_custody() {
+        for answer in [
+            UnconfirmedAnswer::LostAfterDispatch,
+            UnconfirmedAnswer::Malformed202,
+            UnconfirmedAnswer::Oversized202,
+            UnconfirmedAnswer::False202,
+            UnconfirmedAnswer::ForeignCommandReceipt,
+            UnconfirmedAnswer::ForeignDigestReceipt,
+            UnconfirmedAnswer::Unproven403,
+            UnconfirmedAnswer::Unproven503,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("original-outbox");
+            let command = retained_command();
+            let destination = DestinationPin::new(ORGANIZATION, AUDIENCE, SUBJECT, AGENT).unwrap();
+            let outbox = ResultOutbox::open(&directory).unwrap();
+            let original = outbox.enqueue(&destination, &command).unwrap();
+            let dispatches = Cell::new(0usize);
+
+            let error = deliver_with(
+                &outbox,
+                COMMAND_ID,
+                ORGANIZATION,
+                AUDIENCE,
+                CHILD,
+                |url, bearer, body| {
+                    dispatches.set(dispatches.get() + 1);
+                    assert_eq!(url, RESULT_URL);
+                    assert_eq!(bearer, CHILD);
+                    assert_eq!(body, command.canonical_json());
+                    // The callback has now received the complete outgoing request.
+                    // None of these answers carries proof of pre-effect refusal.
+                    // A lost answer models an effect that may already have committed;
+                    // it is not an assertion that current staging accepts results.
+                    let mut acknowledgement = json!({
+                        "ok": true,
+                        "receipt": {
+                            "commandId": COMMAND_ID,
+                            "state": "queued",
+                            "acceptedAt": 100,
+                            "expiresAt": 200,
+                            "digest": command.digest()
+                        }
+                    });
+                    match answer {
+                        UnconfirmedAnswer::LostAfterDispatch => {
+                            Err(Error::internal("synthetic answer lost after dispatch"))
+                        }
+                        UnconfirmedAnswer::Malformed202 => Ok((202, b"{\"ok\":".to_vec())),
+                        UnconfirmedAnswer::Oversized202 => Ok((202, vec![b'x'; 4097])),
+                        UnconfirmedAnswer::False202 => {
+                            acknowledgement["ok"] = json!(false);
+                            Ok((202, acknowledgement.to_string().into_bytes()))
+                        }
+                        UnconfirmedAnswer::ForeignCommandReceipt => {
+                            acknowledgement["receipt"]["commandId"] = json!("cmd-not-ours");
+                            Ok((202, acknowledgement.to_string().into_bytes()))
+                        }
+                        UnconfirmedAnswer::ForeignDigestReceipt => {
+                            acknowledgement["receipt"]["digest"] = json!("0".repeat(64));
+                            Ok((202, acknowledgement.to_string().into_bytes()))
+                        }
+                        UnconfirmedAnswer::Unproven403 => {
+                            Ok((403, br#"{"ok":false,"code":"unauthorized"}"#.to_vec()))
+                        }
+                        UnconfirmedAnswer::Unproven503 => Ok((
+                            503,
+                            br#"{"ok":false,"code":"capability_unavailable"}"#.to_vec(),
+                        )),
+                    }
+                },
+            )
+            .expect_err("an unconfirmed result must not acquire a queued acknowledgement");
+
+            assert_eq!(dispatches.get(), 1, "no automatic replay: {answer:?}");
+            assert_eq!(error.kind(), "unknown", "{answer:?}: {error}");
+            assert_eq!(
+                crate::error::exit_code_for_kind(error.kind()),
+                1,
+                "{answer:?}: unknown must not exit as a definite rejection"
+            );
+            // Stable identifiers, rather than a prose-only 'uncertain', let the
+            // caller identify the exact retained operation for local inspection
+            // and operator-assisted readback without inventing a hosted API.
+            let diagnostic = error.to_string();
+            for identity in [COMMAND_ID, command.digest(), ORGANIZATION, AUDIENCE] {
+                assert!(
+                    diagnostic.contains(identity),
+                    "{answer:?}: diagnostic must identify {identity}: {diagnostic}"
+                );
+            }
+            assert!(
+                !diagnostic.contains("cadence remote result reconcile"),
+                "do not invent a hosted reconciliation command: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&format!("{RESULT_URL}/{COMMAND_ID}")),
+                "do not advertise the retired result-status endpoint: {diagnostic}"
+            );
+
+            // Reopen the actual outbox instead of inspecting internal SQL: the
+            // original bytes and pin must survive the failure durably, but the
+            // absence of a saved acknowledgement is not remote absence proof.
+            drop(outbox);
+            let reopened = ResultOutbox::open(&directory).unwrap();
+            let retained = reopened.get(COMMAND_ID).unwrap();
+            assert_eq!(retained.state(), "local_pending", "{answer:?}");
+            assert_eq!(retained.receipt(), &original, "{answer:?}");
+            assert_eq!(retained.receipt().destination(), &destination, "{answer:?}");
+            assert_eq!(retained.command(), &command, "{answer:?}");
+            assert_eq!(
+                retained.command().canonical_json(),
+                command.canonical_json()
+            );
+            assert!(retained.queued_receipt().is_none(), "{answer:?}");
+            let pending = reopened.pending_for(&destination).unwrap();
+            assert_eq!(pending.len(), 1, "no replacement command: {answer:?}");
+            assert_eq!(pending[0].receipt().command_id(), COMMAND_ID);
+            assert_eq!(
+                dispatches.get(),
+                1,
+                "local readback never posts: {answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proven_predispatch_credential_or_pin_refusal_remains_rejected_without_posting() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("original-outbox");
+        let command = retained_command();
+        let destination = DestinationPin::new(ORGANIZATION, AUDIENCE, SUBJECT, AGENT).unwrap();
+        let outbox = ResultOutbox::open(&directory).unwrap();
+        let original = outbox.enqueue(&destination, &command).unwrap();
+
+        for (organization, audience, bearer) in [
+            (ORGANIZATION, AUDIENCE, "not-an-enrolled-child"),
+            ("org-not-the-original", AUDIENCE, CHILD),
+            (
+                ORGANIZATION,
+                "https://different.board.example.invalid",
+                CHILD,
+            ),
+        ] {
+            let dispatches = Cell::new(0usize);
+            let error = deliver_with(
+                &outbox,
+                COMMAND_ID,
+                organization,
+                audience,
+                bearer,
+                |_, _, _| {
+                    dispatches.set(dispatches.get() + 1);
+                    panic!("a proven local refusal must not dispatch");
+                },
+            )
+            .expect_err("invalid credential or destination is refused before dispatch");
+            assert_eq!(dispatches.get(), 0);
+            assert_eq!(error.kind(), "rejected", "{error}");
+            assert_eq!(crate::error::exit_code_for_kind(error.kind()), 3);
+            let retained = outbox.get(COMMAND_ID).unwrap();
+            assert_eq!(retained.state(), "local_pending");
+            assert_eq!(retained.receipt(), &original);
+            assert_eq!(retained.command(), &command);
+            assert!(retained.queued_receipt().is_none());
+        }
     }
 }

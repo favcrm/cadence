@@ -1991,3 +1991,4395 @@ mod cad2081_workflow_verdicts {
         refused(&f, case, "cannot read the workspace identity map");
     }
 }
+
+// CAD-2009: independently authored by the ticket author; implementers must not edit.
+#[test]
+fn cad2009_broken_org_registry_never_routes_implicit_work_to_local_tracker() {
+    use std::os::unix::fs::symlink;
+    use std::process::{Command, Output};
+
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config");
+    let state = home.path().join("state");
+    let tracker = home.path().join("pm");
+    let issue = tracker.join("synthetic").join("SYN-1");
+    let notes = home.path().join("notes");
+    std::fs::create_dir_all(&issue).unwrap();
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::create_dir_all(config.join("cadence")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        tracker.join("pm.yaml"),
+        format!("schema: 1\nnotes_dir: '{}'\n", notes.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        tracker.join("synthetic").join("project.yaml"),
+        "key: synthetic\nprefix: SYN\n",
+    )
+    .unwrap();
+    std::fs::write(
+        issue.join("issue.md"),
+        "---\nid: SYN-1\ntitle: Synthetic issue\nstatus: ready\npriority: P2\ncreated: '2026-01-01T00:00:00Z'\n---\n\nSynthetic.\n",
+    )
+    .unwrap();
+
+    let run = |prefix: &[&str]| -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", &state)
+            .env("PATH", "/usr/bin:/bin")
+            .args(prefix)
+            .args(["issue", "ls", "--json"]);
+        cadence_agent::reaper::output(&mut cmd).unwrap()
+    };
+    let local = |out: Output| {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(body["issues"][0]["id"], "SYN-1");
+    };
+    local(run(&[]));
+
+    symlink("missing-registry", config.join("cadence").join("orgs.json")).unwrap();
+    let refused = run(&[]);
+    assert!(
+        !refused.status.success(),
+        "broken registry selected the local tracker"
+    );
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("SYN-1"));
+
+    // An explicitly pinned local instance does not depend on the saved selection.
+    local(run(&["--state-dir", state.to_str().unwrap()]));
+
+    std::fs::remove_file(config.join("cadence").join("orgs.json")).unwrap();
+    std::fs::write(config.join("cadence").join("orgs.json"), "{invalid").unwrap();
+    let refused = run(&[]);
+    assert!(
+        !refused.status.success(),
+        "invalid registry selected the local tracker"
+    );
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("SYN-1"));
+
+    let dangling_root = home.path().join("dangling-config");
+    symlink("missing-root", &dangling_root).unwrap();
+    let dangling_parent = home.path().join("config-with-dangling-parent");
+    std::fs::create_dir(&dangling_parent).unwrap();
+    symlink("missing-parent", dangling_parent.join("cadence")).unwrap();
+    symlink("missing-default-config", home.path().join(".config")).unwrap();
+    for config_root in [Some(&dangling_root), Some(&dangling_parent), None] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", &state)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["issue", "ls", "--json"]);
+        if let Some(root) = config_root {
+            cmd.env("XDG_CONFIG_HOME", root);
+        }
+        let refused = cadence_agent::reaper::output(&mut cmd).unwrap();
+        assert!(
+            !refused.status.success(),
+            "broken config ancestor selected local"
+        );
+        assert!(!String::from_utf8_lossy(&refused.stdout).contains("SYN-1"));
+    }
+
+    let real_config = home.path().join("real-config");
+    let linked_config = home.path().join("linked-config");
+    std::fs::create_dir(&real_config).unwrap();
+    symlink(&real_config, &linked_config).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.env_clear()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", &linked_config)
+        .env("XDG_STATE_HOME", &state)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["issue", "ls", "--json"]);
+    local(cadence_agent::reaper::output(&mut cmd).unwrap());
+}
+
+// CAD-2009: a consumer closing stdout must not turn a refusal into success.
+// CAD-2009: independently authored; do not add tracker/state to this fixture.
+#[test]
+fn cad2009_fresh_broken_config_ancestry_cannot_return_local_verdicts() {
+    use std::process::Command;
+
+    for case in ["xdg-root", "xdg-cadence", "default-config"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let xdg = root.path().join("xdg");
+        let notes = root.path().join("notes");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&notes).unwrap();
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sentinel = "cad2009-ancestry-sentinel";
+        std::fs::write(
+            notes.join("20261101-120000-synthetic-verdict.md"),
+            format!(
+                "# Verdict: CAD-999 Standards review — pass\n\
+                 > Issue: CAD-999\n\
+                 > From: {sentinel}\n\n\
+                 ## Verdict\n\
+                 pass — PR #5, head {head}\n\n\
+                 Risk: auto\n"
+            ),
+        )
+        .unwrap();
+        let command = || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+            command
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(root.path())
+                .stdin(std::process::Stdio::null())
+                .args([
+                    "audit", "verdicts", "--issue", "CAD-999", "--pr", "5", "--head", head,
+                ])
+                .arg("--notes-dir")
+                .arg(&notes);
+            if case != "default-config" {
+                command.env("XDG_CONFIG_HOME", &xdg);
+            }
+            command
+        };
+        let positive = cadence_agent::reaper::output(&mut command()).unwrap();
+        assert!(
+            positive.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&positive.stderr)
+        );
+        assert!(String::from_utf8_lossy(&positive.stdout).contains(sentinel));
+        assert!(!home.join(".cadence").exists());
+        assert!(!home.join("pm").exists());
+        assert!(!home.join(".local/state/cadence").exists());
+
+        let link = match case {
+            "xdg-root" => xdg.clone(),
+            "xdg-cadence" => {
+                std::fs::create_dir(&xdg).unwrap();
+                xdg.join("cadence")
+            }
+            "default-config" => home.join(".config"),
+            _ => unreachable!(),
+        };
+        let missing = root.path().join("missing-target");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        let refused = cadence_agent::reaper::output(&mut command()).unwrap();
+        assert!(
+            !refused.status.success(),
+            "{case}: broken ancestor returned {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        assert!(!String::from_utf8_lossy(&refused.stdout).contains(sentinel));
+        assert_eq!(std::fs::read_link(&link).unwrap(), missing);
+        assert!(
+            !missing.exists(),
+            "{case}: materialized the dangling target"
+        );
+        assert!(!home.join(".cadence").exists(), "{case}");
+        assert!(!home.join("pm").exists(), "{case}");
+        assert!(!home.join(".local/state/cadence").exists(), "{case}");
+        assert!(!xdg.join("cadence/orgs.lock").exists(), "{case}");
+    }
+}
+
+// CAD-2009: independently authored stale-profile host-isolation acceptance.
+#[test]
+fn cad2009_stale_profile_cannot_read_or_switch_the_host_registry() {
+    use std::process::Command;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let config = home.join(".cadence/config");
+    let base = root.path().join("sandboxes");
+    std::fs::create_dir_all(&config).unwrap();
+    let registry = config.join("orgs.json");
+    let connections = ["host-a", "host-b"].map(|name| {
+        serde_json::json!({
+            "selection": {"org": name},
+            "destination": {
+                "mode": "local",
+                "state_dir": root.path().join("unused-state"),
+                "tracker_dir": root.path().join("unused-tracker")
+            }
+        })
+    });
+    let raw = serde_json::to_vec(&serde_json::json!({
+        "selected": {"org": "host-a"},
+        "connections": connections
+    }))
+    .unwrap();
+    std::fs::write(&registry, &raw).unwrap();
+    let command = |args: &[&str], stale: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(root.path())
+            .stdin(std::process::Stdio::null())
+            .args(args);
+        if stale {
+            command
+                .env("CADENCE_PROFILE", "sandbox:gone")
+                .env("CADENCE_SANDBOX_ROOT", &base);
+        }
+        command
+    };
+    // Prove the synthetic host registry is valid before testing isolation.
+    let positive = cadence_agent::reaper::output(&mut command(&["org", "inspect"], false)).unwrap();
+    assert!(
+        positive.status.success(),
+        "{}",
+        String::from_utf8_lossy(&positive.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&positive.stdout).unwrap();
+    assert_eq!(value["org"], "host-a");
+    assert_eq!(std::fs::read(&registry).unwrap(), raw);
+    // The positive org read legitimately creates its lock; remove only this
+    // test-owned fixture lock so each stale command must refuse before open.
+    std::fs::remove_file(config.join("orgs.lock")).unwrap();
+
+    for args in [
+        vec!["org", "list"],
+        vec!["org", "inspect"],
+        vec!["org", "switch", "host-b"],
+    ] {
+        let refused = cadence_agent::reaper::output(&mut command(&args, true)).unwrap();
+        assert!(
+            !refused.status.success(),
+            "{args:?}: stale profile returned {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let stdout = String::from_utf8_lossy(&refused.stdout);
+        assert!(!stdout.contains("host-a"), "{args:?}: read host selection");
+        assert!(!stdout.contains("host-b"), "{args:?}: read host selection");
+        assert_eq!(std::fs::read(&registry).unwrap(), raw, "{args:?}");
+        assert!(!config.join("orgs.lock").exists(), "{args:?}");
+        assert!(!base.exists(), "{args:?}");
+        assert!(!root.path().join("unused-state").exists(), "{args:?}");
+        assert!(!root.path().join("unused-tracker").exists(), "{args:?}");
+    }
+}
+
+#[test]
+fn cad2009_closed_stdout_preserves_offline_app_check_refusal() {
+    use std::os::unix::net::UnixStream;
+    use std::process::{Command, Stdio};
+
+    let home = tempfile::tempdir().unwrap();
+    let command = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .args(["app", "check", "https://example.invalid/package"]);
+        cmd
+    };
+    let normal = cadence_agent::reaper::output(&mut command()).unwrap();
+    assert_eq!(normal.status.code(), Some(3));
+    let report: serde_json::Value = serde_json::from_slice(&normal.stdout).unwrap();
+    assert_eq!(report["ok"], false);
+
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let mut closed = command();
+    let writer: std::os::fd::OwnedFd = writer.into();
+    closed.stdout(Stdio::from(writer)).stderr(Stdio::piped());
+    let output = cadence_agent::reaper::spawn(&mut closed)
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "closed stdout changed the refusal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let writer: std::os::fd::OwnedFd = writer.into();
+    let mut closed_stderr = command();
+    closed_stderr
+        .env("CADENCE_JSON", "invalid-format")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(writer));
+    let output = cadence_agent::reaper::spawn(&mut closed_stderr)
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["ok"], false);
+}
+
+#[test]
+fn cad2009_org_list_respects_requested_json_format() {
+    use std::process::Command;
+
+    let home = tempfile::tempdir().unwrap();
+    let run = |format: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .env("CADENCE_JSON", format)
+            .args(["org", "list"]);
+        cadence_agent::reaper::output(&mut cmd).unwrap()
+    };
+    let compact = run("compact");
+    let pretty = run("pretty");
+    assert!(compact.status.success());
+    assert!(pretty.status.success());
+    let compact_text = String::from_utf8(compact.stdout).unwrap();
+    let pretty_text = String::from_utf8(pretty.stdout).unwrap();
+    assert_eq!(compact_text.lines().count(), 1);
+    assert!(pretty_text.lines().count() > 1);
+    let compact_value: serde_json::Value = serde_json::from_str(&compact_text).unwrap();
+    let pretty_value: serde_json::Value = serde_json::from_str(&pretty_text).unwrap();
+    assert_eq!(compact_value, pretty_value);
+}
+
+// CAD-2009: independently authored by the ticket author; implementers must not edit.
+#[test]
+fn cad2009_unavailable_job_snapshot_never_claims_blocked_issue_is_ready() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::process::Command;
+
+    fn accept_request(listener: UnixListener) -> UnixStream {
+        let mut descriptor = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to one initialized pollfd for this call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 5_000) };
+        assert_eq!(ready, 1, "CLI did not connect to the synthetic daemon");
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream
+    }
+
+    let home = tempfile::Builder::new()
+        .prefix("cad2009-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let tracker = home.path().join("pm");
+    let state = home.path().join("state");
+    let notes = home.path().join("notes");
+    let issue = tracker.join("synthetic").join("SYN-1");
+    std::fs::create_dir_all(&issue).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        tracker.join("pm.yaml"),
+        format!("schema: 1\nnotes_dir: '{}'\n", notes.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        tracker.join("synthetic").join("project.yaml"),
+        "key: synthetic\nprefix: SYN\n",
+    )
+    .unwrap();
+    std::fs::write(
+        issue.join("issue.md"),
+        "---\nid: SYN-1\ntitle: Synthetic issue\nstatus: ready\npriority: P2\ncreated: '2026-01-01T00:00:00Z'\n---\n\nSynthetic.\n",
+    )
+    .unwrap();
+    let run = |ready: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_STATE_HOME", home.path().join("xdg-state"))
+            .env("CADENCE_STATE_DIR", &state)
+            .env("CADENCE_PM_DIR", &tracker)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["issue", "ls", "--json"]);
+        if ready {
+            cmd.arg("--ready");
+        }
+        cadence_agent::reaper::output(&mut cmd).unwrap()
+    };
+
+    let socket = state.join("cadence.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let daemon = std::thread::spawn(move || {
+        let mut stream = accept_request(listener);
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "job_list");
+        let response = serde_json::json!({"ok": true, "result": {"jobs": [{
+            "id": "synthetic-job", "issue": "SYN-1", "state": "open",
+            "created": 1, "tasks": {"blocked": 1}
+        }]}});
+        writeln!(stream, "{response}").unwrap();
+    });
+    let known = run(true);
+    daemon.join().unwrap();
+    assert!(
+        known.status.success(),
+        "{}",
+        String::from_utf8_lossy(&known.stderr)
+    );
+    let known: serde_json::Value = serde_json::from_slice(&known.stdout).unwrap();
+    assert_eq!(known["job_state"]["state"], "known");
+    assert!(known["issues"].as_array().unwrap().is_empty());
+    std::fs::remove_file(&socket).unwrap();
+
+    let listener = UnixListener::bind(&socket).unwrap();
+    let daemon = std::thread::spawn(move || {
+        let mut stream = accept_request(listener);
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        let response = serde_json::json!({"ok": true, "result": {"jobs": [{
+            "id": "synthetic-job", "issue": "SYN-1", "state": "open",
+            "created": 1, "tasks": "not-a-task-summary"
+        }]}});
+        writeln!(stream, "{response}").unwrap();
+    });
+    let malformed = run(false);
+    daemon.join().unwrap();
+    assert!(
+        malformed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&malformed.stderr)
+    );
+    let malformed: serde_json::Value = serde_json::from_slice(&malformed.stdout).unwrap();
+    assert_eq!(malformed["job_state"]["state"], "malformed");
+    assert_eq!(malformed["issues"][0]["ready"], false);
+    std::fs::remove_file(&socket).unwrap();
+
+    // CAD-2009: reviewer-authored malformed-reply acceptance. Unusable
+    // bytes and jobs with unproved identity or lifecycle are malformed,
+    // not an absent runtime or an authoritative empty task snapshot.
+    let mut malformed_replies = vec![
+        b"{invalid-json}\n".to_vec(),
+        b"\xff\n".to_vec(),
+        // Syntactically valid JSON that is still not a job_list answer.
+        b"[]\n".to_vec(),
+        b"{ }\n".to_vec(),
+        b"{\"ok\":false,\"error\":{}}\n".to_vec(),
+    ];
+    for job in [
+        serde_json::json!({"id": "z", "issue": "SYN-1", "state": null,
+            "created": 2, "tasks": {}}),
+        serde_json::json!({"id": "z", "issue": "SYN-1", "created": 2, "tasks": {}}),
+        serde_json::json!({"id": "z", "issue": "SYN-1", "state": "unknown-state",
+            "created": 2, "tasks": {}}),
+        serde_json::json!({"issue": "SYN-1", "state": "open", "created": 2, "tasks": {}}),
+        serde_json::json!({"id": null, "issue": "SYN-1", "state": "open",
+            "created": 2, "tasks": {}}),
+        serde_json::json!({"id": 3, "issue": "SYN-1", "state": "open",
+            "created": 2, "tasks": {}}),
+        serde_json::json!({"id": "", "issue": "SYN-1", "state": "open",
+            "created": 2, "tasks": {}}),
+        serde_json::json!({"id": "z", "issue": "SYN-1", "state": "open",
+            "created": null, "tasks": {}}),
+        serde_json::json!({"id": "z", "issue": "SYN-1", "state": "open",
+            "tasks": {}}),
+        serde_json::json!({"id": "z", "issue": "SYN-1", "state": "open",
+            "created": "garbage", "tasks": {}}),
+    ] {
+        let reply = serde_json::json!({"ok": true, "result": {"jobs": [job, {
+            "id": "a", "issue": "SYN-1", "state": "open", "created": 1,
+            "tasks": {"blocked": 1}
+        }]}});
+        let mut response = serde_json::to_vec(&reply).unwrap();
+        response.push(b'\n');
+        malformed_replies.push(response);
+    }
+    for response in malformed_replies {
+        for ready in [false, true] {
+            let response = response.to_vec();
+            let listener = UnixListener::bind(&socket).unwrap();
+            let daemon = std::thread::spawn(move || {
+                let mut stream = accept_request(listener);
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                assert_eq!(request["method"], "job_list");
+                stream.write_all(&response).unwrap();
+            });
+            let output = run(ready);
+            daemon.join().unwrap();
+            std::fs::remove_file(&socket).unwrap();
+            if ready {
+                assert_eq!(output.status.code(), Some(70));
+                assert!(
+                    output.stdout.is_empty(),
+                    "malformed job state must not emit an authoritative ready list"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("malformed"),
+                    "the refusal must distinguish a malformed reply from an absent daemon"
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(body["job_state"]["state"], "malformed");
+                let issue = body["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["id"] == "SYN-1")
+                    .expect("a malformed daemon reply must preserve the tracker read");
+                assert_eq!(issue["ready"], false);
+            }
+        }
+    }
+
+    // A valid daemon error envelope is unavailable, not malformed: the
+    // reply is well-formed but carries no job table.
+    let refusal =
+        b"{\"ok\":false,\"error\":{\"kind\":\"internal\",\"message\":\"synthetic refusal\"}}\n"
+            .to_vec();
+    for ready in [false, true] {
+        let response = refusal.clone();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let mut stream = accept_request(listener);
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "job_list");
+            stream.write_all(&response).unwrap();
+        });
+        let output = run(ready);
+        daemon.join().unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        if ready {
+            assert!(
+                !output.status.success(),
+                "an unavailable job state must not produce a ready list"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("job state"),
+                "the refusal must explain that job state is unavailable"
+            );
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(body["job_state"]["state"], "unavailable");
+            let issue = body["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == "SYN-1")
+                .expect("an unavailable daemon still returns the tracker issue");
+            assert_eq!(issue["ready"], false);
+        }
+    }
+
+    let unknown = run(true);
+    assert!(
+        !unknown.status.success(),
+        "unknown job state must not produce an authoritative ready list"
+    );
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("job state"),
+        "the refusal must explain that job state is unavailable"
+    );
+    let offline = run(false);
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&offline.stdout).unwrap();
+    assert_eq!(body["job_state"]["state"], "unavailable");
+    let issue = body["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "SYN-1")
+        .expect("offline reads still return the tracker issue");
+    assert_eq!(issue["ready"], false);
+}
+
+// CAD-2009: independently authored by the fresh-session Spec/security reviewer.
+// Implementers must not edit or weaken these acceptance checks.
+#[cfg(unix)]
+mod cad2009_closed_output_acceptance {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use serde_json::{json, Value};
+
+    fn cli(home: &Path, state: &Path, tracker: &Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_STATE_HOME", home.join("xdg-state"))
+            .env("CADENCE_STATE_DIR", state)
+            .env("CADENCE_PM_DIR", tracker)
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(Stdio::null());
+        command
+    }
+
+    fn closed_stream() -> Stdio {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        Stdio::from(writer)
+    }
+
+    fn project_fixture(home: &Path) {
+        let tracker = home.join("pm");
+        let notes = home.join("notes");
+        std::fs::create_dir_all(tracker.join("synthetic")).unwrap();
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::create_dir_all(home.join("state")).unwrap();
+        std::fs::write(
+            tracker.join("pm.yaml"),
+            format!("schema: 1\nnotes_dir: '{}'\n", notes.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            tracker.join("synthetic/project.yaml"),
+            "key: synthetic\nprefix: SYN\n",
+        )
+        .unwrap();
+    }
+
+    fn git(home: &Path, repo: &Path, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "-c",
+                "user.name=Synthetic",
+                "-c",
+                "user.email=synthetic@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .stdin(Stdio::null());
+        let output = cadence_agent::reaper::output(&mut command).unwrap();
+        assert!(
+            output.status.success(),
+            "fixture git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn cad2009_flagged_audit_keeps_exit_one_with_closed_stdout() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-audit-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        project_fixture(home.path());
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(home.path(), &repo, &["init", "-q", "-b", "master"]);
+        git(
+            home.path(),
+            &repo,
+            &["commit", "--allow-empty", "-q", "-m", "Synthetic root"],
+        );
+        git(
+            home.path(),
+            &repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "Synthetic other (#2)",
+            ],
+        );
+        let other = git(home.path(), &repo, &["rev-parse", "HEAD"]);
+        git(
+            home.path(),
+            &repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "Synthetic self review (#1)",
+            ],
+        );
+        let flagged = git(home.path(), &repo, &["rev-parse", "HEAD"]);
+
+        let report = home.path().join("merge-report.json");
+        let mut statuses = serde_json::Map::new();
+        statuses.insert(
+            flagged.clone(),
+            json!({"statuses": [{
+                "context": "qa-verdict", "state": "success",
+                "creator": {"login": "synthetic-self"},
+                "created_at": "2025-12-31T23:59:00Z"
+            }]}),
+        );
+        statuses.insert(
+            other.clone(),
+            json!({"statuses": [{
+                "context": "qa-verdict", "state": "success",
+                "creator": {"login": "synthetic-reviewer"},
+                "created_at": "2025-12-31T23:59:00Z"
+            }]}),
+        );
+        std::fs::write(
+            &report,
+            serde_json::to_vec(&json!({
+                "prs": [
+                    {
+                        "number": 1,
+                        "title": "Synthetic self review",
+                        "mergedBy": {"login": "synthetic-self"},
+                        "mergeCommit": {"oid": flagged},
+                        "headRefOid": flagged,
+                        "mergedAt": "2026-01-01T00:00:00Z"
+                    },
+                    {
+                        "number": 2,
+                        "title": "Synthetic other",
+                        "mergedBy": {"login": "synthetic-merger"},
+                        "mergeCommit": {"oid": other},
+                        "headRefOid": other,
+                        "mergedAt": "2026-01-01T00:00:00Z"
+                    }
+                ],
+                "statuses": statuses
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let command = |json_mode: bool| {
+            let mut command = cli(
+                home.path(),
+                &home.path().join("state"),
+                &home.path().join("pm"),
+            );
+            command
+                .current_dir(&repo)
+                .arg("audit")
+                .arg("--repo")
+                .arg(&repo)
+                .arg("--notes-dir")
+                .arg(home.path().join("notes"))
+                .arg("--merge-report")
+                .arg(&report);
+            if json_mode {
+                command.arg("--json");
+            }
+            command
+        };
+
+        let baseline = cadence_agent::reaper::output(&mut command(true)).unwrap();
+        assert_eq!(baseline.status.code(), Some(1), "{baseline:?}");
+        let body: Value = serde_json::from_slice(&baseline.stdout).unwrap();
+        assert_eq!(body["schema"], "cadence.audit/1");
+        assert_eq!(body["summary"]["flagged"], 1);
+        assert!(body["merges"].as_array().unwrap().iter().any(|row| {
+            row["pr"] == 1
+                && row["flags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|flag| flag == "reviewer==merger")
+        }));
+
+        for json_mode in [false, true] {
+            let mut command = command(json_mode);
+            command.stdout(closed_stream()).stderr(Stdio::piped());
+            let output = cadence_agent::reaper::spawn(&mut command)
+                .unwrap()
+                .wait_with_output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "closed stdout changed flagged audit status (json={json_mode}): {output:?}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("Broken pipe"),
+                "closed audit output must remain quiet: {output:?}"
+            );
+        }
+    }
+
+    // Exercise the real CLI launch/wait/status path, not daemon recipe execution.
+    // The isolated RPC peer supplies a terminal runner receipt; it runs no recipe.
+    fn terminal_runner(home: &Path, close_stderr: bool) -> (std::process::Output, Vec<String>) {
+        let state = home.join("state");
+        let listener = UnixListener::bind(state.join("cadence.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (mut completed, completion) = UnixStream::pair().unwrap();
+        let log = home.join("runner.log");
+        std::fs::write(&log, b"synthetic runner output\n").unwrap();
+        let server_log = log.clone();
+        let server = std::thread::spawn(move || {
+            let mut methods = Vec::new();
+            loop {
+                let mut descriptors = [
+                    libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: completion.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: descriptors contains exactly two initialized pollfd values.
+                let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, 5_000) };
+                assert!(
+                    ready > 0,
+                    "runner fixture received neither a request nor CLI completion"
+                );
+                if descriptors[0].revents & libc::POLLIN != 0 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let result = match methods.len() {
+                        0 => {
+                            assert_eq!(method, "slot_launch");
+                            assert_eq!(request["params"]["project"], "synthetic");
+                            assert_eq!(request["params"]["recipe"], "synthetic-check");
+                            json!({
+                                "runner_id": "synthetic-runner",
+                                "kind": "check",
+                                "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                                "digest": "synthetic-intent",
+                                "log_path": server_log
+                            })
+                        }
+                        1 => {
+                            assert_eq!(method, "slot_runner");
+                            assert_eq!(request["params"]["runner_id"], "synthetic-runner");
+                            json!({"state": "exited", "exit_code": 37, "signal": null})
+                        }
+                        _ => panic!("unexpected additional runner request: {request}"),
+                    };
+                    methods.push(method.to_string());
+                    writeln!(stream, "{}", json!({"ok": true, "result": result})).unwrap();
+                } else if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                    return methods;
+                } else {
+                    panic!("unexpected runner fixture poll events");
+                }
+            }
+        });
+        let mut command = cli(home, &state, &home.join("pm"));
+        command.current_dir(home).args([
+            "build-slot",
+            "launch",
+            "synthetic-check",
+            "--project",
+            "synthetic",
+            "--wait-secs",
+            "0",
+        ]);
+        command.stdout(Stdio::piped());
+        if close_stderr {
+            command.stderr(closed_stream());
+        } else {
+            command.stderr(Stdio::piped());
+        }
+        // reaper::output deliberately overwrites both stream configurations.
+        // Use spawn so the deliberately closed stderr actually reaches the CLI.
+        let output = cadence_agent::reaper::spawn(&mut command)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        completed.write_all(b"done").unwrap();
+        let methods = server.join().unwrap();
+        std::fs::remove_file(state.join("cadence.sock")).unwrap();
+        (output, methods)
+    }
+
+    #[test]
+    fn cad2009_terminal_runner_keeps_its_status_with_closed_stderr() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-slot-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        project_fixture(home.path());
+        for close_stderr in [false, true] {
+            let (output, methods) = terminal_runner(home.path(), close_stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(37),
+                "closed stderr={close_stderr}: {output:?}"
+            );
+            assert_eq!(methods, ["slot_launch", "slot_runner"]);
+            assert_eq!(output.stdout, b"synthetic runner output\n");
+        }
+    }
+
+    #[test]
+    fn cad2009_successful_trailer_read_stays_quiet_with_closed_stdout() {
+        let home = tempfile::tempdir().unwrap();
+        project_fixture(home.path());
+        let issue = home.path().join("pm/synthetic/SYN-1");
+        std::fs::create_dir_all(&issue).unwrap();
+        std::fs::write(
+            issue.join("issue.md"),
+            "---\nid: SYN-1\ntitle: Synthetic\nstatus: ready\npriority: P2\ncreated: '2026-01-01T00:00:00Z'\n---\n\nSynthetic.\n",
+        )
+        .unwrap();
+        let command = || {
+            let mut command = cli(
+                home.path(),
+                &home.path().join("state"),
+                &home.path().join("pm"),
+            );
+            command
+                .current_dir(home.path())
+                .args(["issue", "trailer", "SYN-1"]);
+            command
+        };
+        let baseline = cadence_agent::reaper::output(&mut command()).unwrap();
+        assert_eq!(baseline.status.code(), Some(0), "{baseline:?}");
+        assert_eq!(baseline.stdout, b"Issue: SYN-1\n");
+        let mut command = command();
+        command.stdout(closed_stream()).stderr(Stdio::piped());
+        let output = cadence_agent::reaper::spawn(&mut command)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(
+            output.stderr.is_empty(),
+            "successful closed output must be quiet: {output:?}"
+        );
+    }
+}
+
+// CAD-2009: independently authored by the fresh-session Spec/security reviewer.
+// Implementers must not edit or weaken these acceptance checks.
+#[cfg(unix)]
+mod cad2009_follow_closed_stdout_acceptance {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use serde_json::{json, Value};
+
+    fn run_case(home: &Path, job_events: bool, after: Option<i64>) {
+        let state = home.join("state");
+        let tracker = home.join("pm");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&tracker).unwrap();
+        let listener = UnixListener::bind(state.join("cadence.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (mut completed, completion) = UnixStream::pair().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                let mut descriptors = [
+                    libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: completion.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: descriptors contains exactly two initialized pollfd values.
+                let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, 5_000) };
+                assert!(
+                    ready > 0,
+                    "event fixture received neither a request nor CLI completion"
+                );
+                if descriptors[0].revents & libc::POLLIN != 0 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    if job_events {
+                        assert_eq!(request["method"], "job_events");
+                        assert_eq!(request["params"]["job"], "synthetic-job");
+                    } else {
+                        assert_eq!(request["method"], "agent_events");
+                        assert_eq!(request["params"]["alias"], "SYNTHETIC");
+                    }
+                    let response = match requests.len() {
+                        0 => {
+                            match after {
+                                None => assert_eq!(request["params"]["tail"], true),
+                                Some(cursor) => {
+                                    assert_eq!(request["params"]["after"], cursor);
+                                    assert_eq!(request["params"]["wait"], 25);
+                                }
+                            }
+                            json!({"ok": true, "result": {
+                                "events": [{
+                                    "seq": 1,
+                                    "kind": "synthetic-event",
+                                    "at": 1,
+                                    "data": {}
+                                }],
+                                "cursor": 1,
+                                "has_older": false
+                            }})
+                        }
+                        1 => {
+                            assert_eq!(request["params"]["after"], 1);
+                            // A regression gets a final refusal instead of
+                            // hanging forever. The test still requires exit 0
+                            // and exactly one request, so this cannot pass it.
+                            json!({"ok": false, "error": {
+                                "kind": "internal",
+                                "message": "synthetic second-page sentinel"
+                            }})
+                        }
+                        _ => panic!("unexpected additional event request: {request}"),
+                    };
+                    requests.push(request);
+                    writeln!(stream, "{response}").unwrap();
+                } else if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                    return requests;
+                } else {
+                    panic!("unexpected event fixture poll events");
+                }
+            }
+        });
+
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_STATE_HOME", home.join("xdg-state"))
+            .env("CADENCE_STATE_DIR", &state)
+            .env("CADENCE_PM_DIR", &tracker)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(home);
+        if job_events {
+            command.args(["job", "events", "synthetic-job", "--follow"]);
+        } else {
+            command.args(["events", "SYNTHETIC", "--follow"]);
+        }
+        if let Some(cursor) = after {
+            command.arg("--after").arg(cursor.to_string());
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::piped());
+        // reaper::output would overwrite the deliberately closed stdout.
+        let output = cadence_agent::reaper::spawn(&mut command)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        completed.write_all(b"done").unwrap();
+        let requests = server.join().unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "closed stdout must terminate the read-only follower successfully \
+             (job_events={job_events}, after={after:?}): {output:?}"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "closed stdout must terminate the follower quietly \
+             (job_events={job_events}, after={after:?}): {output:?}"
+        );
+        assert_eq!(
+            requests.len(),
+            1,
+            "the follower requested another page after its first output encountered EPIPE \
+             (job_events={job_events}, after={after:?}): {requests:?}"
+        );
+    }
+
+    #[test]
+    fn cad2009_events_follow_stops_after_closed_initial_tail_output() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-events-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        run_case(home.path(), false, None);
+    }
+
+    #[test]
+    fn cad2009_events_follow_stops_after_closed_explicit_cursor_output() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-events-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        run_case(home.path(), false, Some(0));
+    }
+
+    #[test]
+    fn cad2009_job_events_follow_stops_after_closed_initial_tail_output() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-events-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        run_case(home.path(), true, None);
+    }
+
+    #[test]
+    fn cad2009_job_events_follow_stops_after_closed_explicit_cursor_output() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-events-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        run_case(home.path(), true, Some(0));
+    }
+}
+
+// CAD-2009 acceptance: independently authored; implementers must not weaken it.
+#[cfg(unix)]
+mod cad2009_inbox_output_acceptance {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
+    use std::process::{Child, Command, Output, Stdio};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{json, Value};
+
+    fn poll_until(descriptors: &mut [libc::pollfd], deadline: Instant) -> i32 {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return 0;
+            }
+            let timeout = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+            // SAFETY: the slice contains initialized pollfd values for this call.
+            let ready = unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as libc::nfds_t,
+                    timeout,
+                )
+            };
+            if ready >= 0 {
+                return ready;
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+        }
+    }
+
+    fn command(home: &Path, closed_stdout: bool) -> Command {
+        let state = home.join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(home.join("pm")).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_STATE_HOME", home.join("xdg-state"))
+            .env("CADENCE_STATE_DIR", &state)
+            .env("CADENCE_SOCKET", state.join("cadence.sock"))
+            .env("CADENCE_PM_DIR", home.join("pm"))
+            .env("CADENCE_JSON", "pretty")
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(home)
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped());
+        if closed_stdout {
+            let (reader, writer) = UnixStream::pair().unwrap();
+            drop(reader);
+            let writer: OwnedFd = writer.into();
+            command.stdout(Stdio::from(writer));
+        } else {
+            command.stdout(Stdio::piped());
+        }
+        command
+    }
+
+    fn sentinel() -> Value {
+        json!({"ok": false, "error": {
+            "kind": "internal",
+            "message": "synthetic unexpected next-unit sentinel"
+        }})
+    }
+
+    struct OwnedCli(Option<Child>);
+
+    impl Drop for OwnedCli {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                // A fixture panic must not leave its own CLI running.
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn exercise(
+        home: &Path,
+        mut command: Command,
+        mut response: impl FnMut(usize, &Value) -> Value,
+    ) -> (Output, Vec<Value>) {
+        let listener = UnixListener::bind(home.join("state/cadence.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (completion, mut completed) = UnixStream::pair().unwrap();
+        // reaper::output would replace the deliberately closed stdout.
+        let mut child = OwnedCli(Some(cadence_agent::reaper::spawn(&mut command).unwrap()));
+        let pid = child.0.as_ref().unwrap().id();
+        let notifier = std::thread::spawn(move || -> std::io::Result<()> {
+            // The same blocking waitid(WNOWAIT) seam is used by slots_rpc.
+            // Unlike Child::wait, it observes exit without reaping: OwnedCli
+            // retains the child and its PID until after this thread joins.
+            // There is no periodic wakeup and no signal handler/global state.
+            // SAFETY: zero initializes the output buffer passed to waitid.
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            loop {
+                // SAFETY: pid identifies our unreaped child and info is writable.
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if result == 0 {
+                    return completed.write_all(b"done");
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut requests = Vec::new();
+        let timed_out = loop {
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: completion.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            if poll_until(&mut descriptors, deadline) == 0 {
+                // The notifier never reaps. Even if exit races the deadline,
+                // this Child still owns its PID; cancellation cannot hit a
+                // different process through PID reuse.
+                let _ = child.0.as_mut().unwrap().kill();
+                break true;
+            }
+            // Drain an already-queued request even when completion is also ready.
+            if descriptors[0].revents & libc::POLLIN != 0 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let reply = response(requests.len(), &request);
+                requests.push(request);
+                writeln!(stream, "{reply}").unwrap();
+            } else if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                break false;
+            } else {
+                panic!("unexpected synthetic transport poll events");
+            }
+        };
+        // Join the non-reaping observer before the sole owner finally reaps.
+        notifier.join().unwrap().unwrap();
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        assert!(
+            !timed_out,
+            "CLI did not settle within the bounded fixture: {requests:?}; {output:?}"
+        );
+        (output, requests)
+    }
+
+    fn messages() -> Value {
+        json!([
+            {"seq": 11, "id": "synthetic-first", "content": "first\nrecord"},
+            {"seq": 12, "id": "synthetic-second", "content": "second record"}
+        ])
+    }
+
+    fn assert_success(output: &Output) {
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    fn inbox_page_case(peek: bool, follow: bool, closed_stdout: bool) {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-inbox-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let mut command = command(home.path(), closed_stdout);
+        command.args([
+            "inbox",
+            "SYNTHETIC",
+            "--reader",
+            "synthetic-reader",
+            "--after",
+            "10",
+        ]);
+        if peek {
+            command.arg("--peek");
+        }
+        if follow {
+            command.arg("--follow");
+        }
+        let (output, requests) = exercise(home.path(), command, |index, request| {
+            if index != 0 {
+                return sentinel();
+            }
+            assert_eq!(request["method"], "agent_inbox");
+            let mut params = json!({
+                "alias": "SYNTHETIC",
+                "reader": "synthetic-reader",
+                "after": 10,
+                "wait": if follow { 25 } else { 0 }
+            });
+            if peek {
+                params["peek"] = json!(true);
+            }
+            assert_eq!(request["params"], params);
+            // A draining daemon has already settled this entire page. The CLI
+            // must neither fetch another page nor invent a compensating ack.
+            json!({"ok": true, "result": {"messages": messages(), "cursor": 12}})
+        });
+        assert_success(&output);
+        assert_eq!(requests.len(), 1, "unexpected next unit: {requests:?}");
+        if !closed_stdout {
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout.ends_with('\n'),
+                "missing record terminator: {stdout:?}"
+            );
+            let lines: Vec<_> = stdout.lines().collect();
+            assert_eq!(lines.len(), 2, "expected one compact line per message");
+            for (line, expected) in lines.iter().zip(messages().as_array().unwrap()) {
+                assert_eq!(serde_json::from_str::<Value>(line).unwrap(), *expected);
+                assert_eq!(*line, serde_json::to_string(expected).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_inbox_follow_stops_after_the_settled_drain_page() {
+        inbox_page_case(false, true, true);
+    }
+
+    #[test]
+    fn cad2009_inbox_follow_peek_stops_before_another_fetch() {
+        inbox_page_case(true, true, true);
+    }
+
+    #[test]
+    fn cad2009_inbox_finite_drain_and_peek_keep_compact_message_records() {
+        inbox_page_case(false, false, false);
+        inbox_page_case(true, false, false);
+    }
+
+    fn inbox_exec_case(page_size: usize, refuse_ack: bool) {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-inbox-exec-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let consumed = home.path().join("consumed.jsonl");
+        let script = home.path().join("consume.sh");
+        std::fs::write(
+            &script,
+            "set -eu\n/bin/cat >> \"$1\"\nprintf '\\n' >> \"$1\"\n",
+        )
+        .unwrap();
+        let mut command = command(home.path(), true);
+        command
+            .args([
+                "inbox",
+                "SYNTHETIC",
+                "--reader",
+                "synthetic-reader",
+                "--exec-timeout-ms",
+                "2000",
+                "--exec",
+                "/bin/sh",
+            ])
+            .arg(&script)
+            .arg(&consumed);
+        let first = messages()[0].clone();
+        let page: Vec<_> = messages()
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(page_size)
+            .cloned()
+            .collect();
+        let (output, requests) = exercise(home.path(), command, |index, request| match index {
+            0 => {
+                assert_eq!(request["method"], "agent_inbox");
+                assert_eq!(
+                    request["params"],
+                    json!({"alias": "SYNTHETIC", "reader": "synthetic-reader",
+                           "peek": true, "wait": 25})
+                );
+                json!({"ok": true, "result": {"messages": page, "cursor": 12}})
+            }
+            1 => {
+                // The real child must have finished its work before the ack.
+                let bytes = std::fs::read_to_string(&consumed).unwrap();
+                assert_eq!(
+                    bytes,
+                    format!("{}\n", serde_json::to_string(&first).unwrap())
+                );
+                assert_eq!(request["method"], "agent_inbox_ack");
+                assert_eq!(
+                    request["params"],
+                    json!({"alias": "SYNTHETIC", "reader": "synthetic-reader", "through": 11})
+                );
+                if refuse_ack {
+                    json!({"ok": false, "error": {
+                        "kind": "internal", "message": "synthetic required ack refusal"
+                    }})
+                } else {
+                    json!({"ok": true, "result": {"through": 11}})
+                }
+            }
+            _ => sentinel(),
+        });
+        assert_eq!(requests.len(), 2, "unexpected next unit: {requests:?}");
+        assert_eq!(
+            std::fs::read_to_string(&consumed).unwrap(),
+            format!("{}\n", serde_json::to_string(&first).unwrap()),
+            "closed stdout must not execute the next pending message"
+        );
+        if refuse_ack {
+            assert_eq!(output.status.code(), Some(70), "{output:?}");
+            let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(error["kind"], "internal");
+            assert!(error["error"]
+                .as_str()
+                .unwrap()
+                .contains("synthetic required ack refusal"));
+        } else {
+            assert_success(&output);
+        }
+    }
+
+    #[test]
+    fn cad2009_inbox_exec_finishes_child_and_ack_before_stopping_next_fetch() {
+        inbox_exec_case(1, false);
+    }
+
+    #[test]
+    fn cad2009_inbox_exec_does_not_execute_the_next_message_in_the_same_page() {
+        inbox_exec_case(2, false);
+    }
+
+    #[test]
+    fn cad2009_inbox_exec_preserves_a_required_ack_failure_with_closed_stdout() {
+        inbox_exec_case(2, true);
+    }
+
+    #[test]
+    fn cad2009_delivery_watch_stops_after_an_isolated_empty_sync_pass() {
+        let home = tempfile::Builder::new()
+            .prefix("cad2009-delivery-watch-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let mut command = command(home.path(), true);
+        command.args(["delivery", "sync", "--watch", "0"]);
+        let (output, requests) = exercise(home.path(), command, |index, request| {
+            if index != 0 {
+                // A bad next pass gets a refusal rather than hanging in an RPC.
+                // The overall deadline also bounds a watcher that retries errors.
+                return sentinel();
+            }
+            assert_eq!(request["method"], "delivery_list");
+            assert_eq!(request["params"], json!({}));
+            // sync() invokes gh only for eligible PR records. An empty list is
+            // a genuine local-only pass, not a fake GitHub executable or echo.
+            json!({"ok": true, "result": {"records": []}})
+        });
+        assert_success(&output);
+        assert_eq!(requests.len(), 1, "unexpected next sync pass: {requests:?}");
+    }
+}
+
+#[cfg(unix)]
+mod cad2009_finite_output_acceptance {
+    use std::io::{self, Write};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output, Stdio};
+
+    use cadence_agent::agent_uid::{
+        provision::{self, Report, Spec},
+        AclEntry, Group, Host, Meta, NewUser, User, View,
+    };
+
+    fn closed_stream() -> Stdio {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        Stdio::from(writer)
+    }
+
+    fn cli(root: &Path, state: &Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .env("HOME", root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("xdg-state"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("CADENCE_STATE_DIR", state)
+            .env("CADENCE_PM_DIR", root.join("pm"))
+            .env("PATH", root.join("bin"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Synthetic Acceptance")
+            .env("GIT_AUTHOR_EMAIL", "synthetic@example.test")
+            .env("GIT_COMMITTER_NAME", "Synthetic Acceptance")
+            .env("GIT_COMMITTER_EMAIL", "synthetic@example.test")
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .env("GIT_CONFIG_KEY_1", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_1", "/dev/null")
+            .arg("--state-dir")
+            .arg(state)
+            .current_dir(root)
+            .stdin(Stdio::null());
+        command
+    }
+
+    fn output(command: &mut Command, close_stdout: bool, close_stderr: bool) -> Output {
+        command.stdout(if close_stdout {
+            closed_stream()
+        } else {
+            Stdio::piped()
+        });
+        command.stderr(if close_stderr {
+            closed_stream()
+        } else {
+            Stdio::piped()
+        });
+        cadence_agent::reaper::spawn(command)
+            .unwrap()
+            .wait_with_output()
+            .unwrap()
+    }
+
+    #[test]
+    fn setup_keeps_exact_failure_and_initializes_tracker_after_closed_output() {
+        for json in [false, true] {
+            for close_stdout in [false, true] {
+                let root = tempfile::Builder::new()
+                    .prefix("cad2009-finite-")
+                    .tempdir_in("/tmp")
+                    .unwrap();
+                let bin = root.path().join("bin");
+                std::fs::create_dir(&bin).unwrap();
+                std::os::unix::fs::symlink("/usr/bin/git", bin.join("git")).unwrap();
+                let state = root.path().join("s".repeat(108));
+                assert!(cadence_agent::client::socket_path(&state).as_os_str().len() > 107);
+                assert!(!root.path().join("pm").exists());
+                let mut command = cli(root.path(), &state);
+                command
+                    .env("CADENCE_PROFILE", "sandbox:cad2009-acceptance")
+                    .arg("setup");
+                if json {
+                    command.arg("--json");
+                }
+                let result = output(&mut command, close_stdout, false);
+                assert_eq!(
+                    result.status.code(),
+                    Some(1),
+                    "json={json}, closed={close_stdout}: {result:?}"
+                );
+                assert!(
+                    result.stderr.is_empty(),
+                    "json={json}, closed={close_stdout}: {result:?}"
+                );
+                let tracker = root.path().join("pm");
+                assert!(tracker.join("pm.yaml").is_file());
+                assert!(tracker.join("README.md").is_file());
+                assert!(tracker.join(".gitignore").is_file());
+                let mut git = Command::new("/usr/bin/git");
+                git.env_clear()
+                    .env("HOME", root.path())
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .arg("-C")
+                    .arg(&tracker)
+                    .args(["show", "HEAD:pm.yaml"])
+                    .stdin(Stdio::null());
+                let committed = cadence_agent::reaper::output(&mut git).unwrap();
+                assert!(committed.status.success(), "{committed:?}");
+                assert_eq!(
+                    committed.stdout,
+                    std::fs::read(tracker.join("pm.yaml")).unwrap()
+                );
+                assert!(
+                    !state.exists(),
+                    "the failed state prerequisite must prevent daemon/UI startup"
+                );
+                assert!(!root.path().join(".claude").exists());
+                if !close_stdout && json {
+                    let rows: Vec<serde_json::Value> = result
+                        .stdout
+                        .split(|byte| *byte == b'\n')
+                        .filter(|line| !line.is_empty())
+                        .map(|line| serde_json::from_slice(line).unwrap())
+                        .collect();
+                    let row = |name: &str| {
+                        rows.iter()
+                            .find(|row| row["check"] == name)
+                            .unwrap_or_else(|| panic!("missing {name}: {rows:?}"))
+                    };
+                    assert_eq!(row("state_dir")["status"], "failed");
+                    assert_eq!(row("tracker")["status"], "created");
+                    assert_eq!(row("daemon")["status"], "missing");
+                    assert_eq!(row("ui")["status"], "missing");
+                    assert_eq!(row("scope")["changed_org"], false);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unshared_stop_is_quietly_successful_without_any_tailnet_capability() {
+        for close_stdout in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let state = root.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            std::fs::create_dir(root.path().join("bin")).unwrap();
+            let mut command = cli(root.path(), &state);
+            command.args(["ui", "tailscale", "stop"]);
+            let result = output(&mut command, close_stdout, false);
+            assert_eq!(result.status.code(), Some(0), "{result:?}");
+            assert!(result.stderr.is_empty(), "{result:?}");
+            assert!(!state.join("ui.json").exists());
+            assert!(!cadence_agent::client::socket_path(&state).exists());
+            if !close_stdout {
+                let body: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+                assert_eq!(body["state"], "not_sharing");
+            }
+        }
+    }
+
+    #[test]
+    fn restart_preserves_restore_refusal_without_connecting_or_replacing_state() {
+        for closed in [false, true] {
+            let root = tempfile::Builder::new()
+                .prefix("cad2009-restart-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let state = root.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            std::fs::create_dir(root.path().join("bin")).unwrap();
+            let aside = state.join("cadence.sqlite3.replaced-synthetic");
+            std::fs::write(&aside, b"synthetic previous store").unwrap();
+            let listener = UnixListener::bind(cadence_agent::client::socket_path(&state)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut command = cli(root.path(), &state);
+            command.args(["daemon", "restart"]);
+            let result = output(&mut command, closed, closed);
+            assert_eq!(result.status.code(), Some(3), "{result:?}");
+            assert_eq!(std::fs::read(&aside).unwrap(), b"synthetic previous store");
+            assert!(!state.join("cadence.sqlite3").exists());
+            match listener.accept() {
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+                Ok(_) => panic!("restart contacted the daemon despite restore leftovers"),
+            }
+            if !closed {
+                let body: serde_json::Value = serde_json::from_slice(&result.stderr).unwrap();
+                assert_eq!(body["kind"], "rejected");
+                assert!(body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("daemon restart refused before shutdown"));
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RefusingHost {
+        attempts: Vec<String>,
+    }
+
+    impl View for RefusingHost {
+        fn user(&self, _: &str) -> io::Result<Option<User>> {
+            panic!("a refused first account action must stop further assessment")
+        }
+
+        fn group(&self, _: &str) -> io::Result<Option<Group>> {
+            Ok(None)
+        }
+
+        fn user_name(&self, _: u32) -> io::Result<Option<String>> {
+            panic!("unexpected reverse user lookup")
+        }
+
+        fn group_name(&self, _: u32) -> io::Result<Option<String>> {
+            panic!("unexpected reverse group lookup")
+        }
+
+        fn stat(&self, _: &str) -> io::Result<Option<Meta>> {
+            panic!("refused accounts must prevent filesystem assessment")
+        }
+
+        fn acls(&self, _: &str) -> io::Result<Vec<AclEntry>> {
+            panic!("refused accounts must prevent preflight")
+        }
+
+        fn users(&self) -> io::Result<Vec<User>> {
+            panic!("refused accounts must prevent preflight")
+        }
+
+        fn member_gids(&self, _: &User) -> io::Result<Vec<u32>> {
+            panic!("unexpected membership lookup")
+        }
+
+        fn read_file(&self, _: &str) -> io::Result<Vec<u8>> {
+            panic!("unexpected host file read")
+        }
+
+        fn read_link(&self, _: &str) -> io::Result<PathBuf> {
+            panic!("unexpected host symlink read")
+        }
+
+        fn git_config(&self, _: &str) -> io::Result<Vec<(String, String)>> {
+            panic!("unexpected host git config read")
+        }
+
+        fn file_sha256(&self, _: &str) -> io::Result<[u8; 32]> {
+            panic!("unexpected installed helper read")
+        }
+
+        fn helper_source(&self, _: &Path) -> io::Result<[u8; 32]> {
+            panic!("unexpected helper source read")
+        }
+
+        fn walk(&self, _: &str, _: usize) -> io::Result<(Vec<String>, bool)> {
+            panic!("unexpected host walk")
+        }
+
+        fn env(&self, _: &str) -> Option<String> {
+            panic!("unexpected host environment read")
+        }
+    }
+
+    impl Host for RefusingHost {
+        fn as_view(&self) -> &dyn View {
+            self
+        }
+
+        fn create_group(&mut self, name: &str, _: bool) -> io::Result<()> {
+            self.attempts.push(name.to_string());
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "synthetic account capability refusal",
+            ))
+        }
+
+        fn create_user(&mut self, _: &NewUser) -> io::Result<()> {
+            panic!("must not create a user after a group refusal")
+        }
+
+        fn repair_user(&mut self, _: &NewUser) -> io::Result<()> {
+            panic!("must not repair a user after a group refusal")
+        }
+
+        fn add_member(&mut self, _: &str, _: &str) -> io::Result<()> {
+            panic!("must not add membership after a group refusal")
+        }
+
+        fn mkdir(&mut self, _: &str) -> io::Result<()> {
+            panic!("must not provision filesystem after a group refusal")
+        }
+
+        fn set_meta(&mut self, _: &str, _: &str, _: &str, _: u32) -> io::Result<()> {
+            panic!("must not change metadata after a group refusal")
+        }
+
+        fn install(&mut self, _: &Path, _: &str, _: &str, _: &str, _: u32) -> io::Result<()> {
+            panic!("must not install a helper after a group refusal")
+        }
+
+        fn set_default_group_acl(&mut self, _: &str, _: &str, _: u8) -> io::Result<()> {
+            panic!("must not set ACLs after a group refusal")
+        }
+    }
+
+    struct FailingWriter {
+        kind: io::ErrorKind,
+        lines_before_failure: usize,
+        failures: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.lines_before_failure == 0 {
+                self.failures += 1;
+                return Err(io::Error::new(self.kind, "synthetic output failure"));
+            }
+            self.lines_before_failure = self
+                .lines_before_failure
+                .saturating_sub(bytes.iter().filter(|byte| **byte == b'\n').count());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn provision_spec() -> Spec {
+        Spec {
+            operator: "synthetic-operator".to_string(),
+            helper: Some(PathBuf::from("/synthetic/helper")),
+            dry_run: false,
+        }
+    }
+
+    fn report_steps(report: &Report) -> Vec<(String, String, bool)> {
+        report
+            .steps
+            .iter()
+            .map(|step| {
+                (
+                    step.action.render(),
+                    format!("{:?}", step.assess),
+                    step.applied,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn production_provision_adapter_preserves_real_refusal_after_closed_output() {
+        let mut baseline_host = RefusingHost::default();
+        let baseline =
+            provision::run(&mut baseline_host, &provision_spec(), &mut Vec::new()).unwrap();
+        assert!(baseline.failed);
+        assert!(baseline.refused());
+        assert_eq!(baseline_host.attempts.len(), 1);
+        assert!(!baseline.steps[0].applied);
+        for lines_before_failure in [0, 1] {
+            let mut host = RefusingHost::default();
+            let mut writer = FailingWriter {
+                kind: io::ErrorKind::BrokenPipe,
+                lines_before_failure,
+                failures: 0,
+            };
+            let report = provision::run(
+                &mut host,
+                &provision_spec(),
+                &mut cadence_agent::output::tolerate_closed(&mut writer),
+            )
+            .unwrap();
+            assert!(writer.failures > 0);
+            assert_eq!(host.attempts, baseline_host.attempts);
+            assert_eq!(report.failed, baseline.failed);
+            assert_eq!(report.refused(), baseline.refused());
+            assert_eq!(report.preflight, baseline.preflight);
+            assert_eq!(report_steps(&report), report_steps(&baseline));
+        }
+    }
+
+    #[test]
+    fn provisioning_keeps_unwrapped_broken_pipe_and_other_io_errors_fallible() {
+        let mut host = RefusingHost::default();
+        let mut writer = FailingWriter {
+            kind: io::ErrorKind::BrokenPipe,
+            lines_before_failure: 0,
+            failures: 0,
+        };
+        assert!(provision::run(&mut host, &provision_spec(), &mut writer).is_err());
+        assert!(host.attempts.is_empty());
+        let mut writer = FailingWriter {
+            kind: io::ErrorKind::PermissionDenied,
+            lines_before_failure: 0,
+            failures: 0,
+        };
+        assert!(provision::run(
+            &mut host,
+            &provision_spec(),
+            &mut cadence_agent::output::tolerate_closed(&mut writer),
+        )
+        .is_err());
+        assert!(host.attempts.is_empty());
+        assert!(writer.failures > 0);
+    }
+}
+
+// CAD-2009: independently authored acceptance; implementers must not weaken it.
+// The real packaged CLI, saved-login reader, TLS agent, request body and reply
+// classifier run unchanged. Only the remote service is a disposable simulator.
+#[cfg(all(feature = "test-seam", target_os = "linux"))]
+mod cad2009_hosted_app_acceptance {
+    use serde_json::{json, Value};
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::net::TcpListener;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::process::{Command, Output, Stdio};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    const ORG: &str = "cad2009-synthetic";
+    const WORKSPACE: &str = "ws_cad2009_synthetic";
+    const ENDPOINT: &str = "https://lc.cadencecloud.app";
+    const OP: &str = "00000000-0000-4000-8000-000000002009";
+    const TOKEN: &str = "hct_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    const INSTALL: &str = "install_synthetic";
+    const LISTING: &str = "synthetic-app";
+    const VERSION: &str = "1.2.3";
+    const GENERATION: &str = "synthetic-generation-1";
+
+    fn digest(old: bool) -> String {
+        format!("sha256:{}", if old { "b" } else { "a" }.repeat(64))
+    }
+
+    // Real producer: contracts/src/marketplace.ts::hostedAppReviewSchema.
+    fn review() -> Value {
+        json!({
+            "readiness": {"ready": true, "reason": null},
+            "structural": {"added": [], "removed": [], "changed": []},
+            "access": {"connections": {"added": [], "removed": []}, "capabilities": {}},
+            "compatibility": {
+                "schema": 1, "ok": true, "compatible": true, "unmet": null,
+                "declared": false, "core": null, "contracts": {},
+                "host": {"core": "1.0.0", "contracts": {}}, "checks": []
+            },
+            "notes": [], "secret_warnings": []
+        })
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Mutation {
+        Install,
+        Update,
+        Revoke,
+        Reconcile,
+    }
+
+    impl Mutation {
+        fn suffix(self) -> &'static str {
+            match self {
+                Self::Reconcile => "/operations/00000000-0000-4000-8000-000000002009/reconcile",
+                Self::Revoke => "/revoke",
+                _ => "/action",
+            }
+        }
+
+        // Exact closed request envelopes from hosted-cadence/app-lifecycle.ts
+        // and contracts/src/{marketplace,hosted-app-lifecycle}.ts.
+        fn body(self) -> Value {
+            if matches!(self, Self::Reconcile) {
+                return json!({});
+            }
+            if matches!(self, Self::Revoke) {
+                return json!({"install_id": INSTALL, "expected_digest": digest(true),
+                    "expected_generation": GENERATION, "operation_id": OP});
+            }
+            let mut action = json!({"listing_id": LISTING, "version": VERSION,
+                "digest": digest(false), "intent": "apply", "operation_id": OP});
+            if matches!(self, Self::Update) {
+                action["install_id"] = json!(INSTALL);
+                action["expected_digest"] = json!(digest(true));
+                action["expected_generation"] = json!(GENERATION);
+            }
+            json!({"action": action, "review": review()})
+        }
+
+        // Real release-check producer's proposed() response. The CLI consumes
+        // this file through checked_review(), rather than bypassing that guard.
+        fn checked(self) -> Value {
+            let update = matches!(self, Self::Update);
+            json!({"ok": true, "data": {
+                "state": "proposed", "operation": if update { "update" } else { "install" },
+                "listing_id": LISTING, "version": VERSION, "digest": digest(false),
+                "install_id": if update { Some(INSTALL) } else { None },
+                "expected_digest": if update { Some(digest(true)) } else { None },
+                "expected_generation": if update { Some(GENERATION) } else { None },
+                "catalogue": {"id": LISTING, "version": VERSION, "digest": digest(false)},
+                "review": review()
+            }})
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReceiptFault {
+        None,
+        MissingHeader,
+        ForeignHeader,
+        ForeignOperation,
+        ForeignWorkspace,
+        ForeignKind,
+        ForeignConsentDigest,
+        ForeignActor,
+        ForeignRefusalOperation,
+        ForeignRefusalKind,
+        ForeignInstall,
+        ForeignInstallDigest,
+        ForeignGeneration,
+        StillApproved,
+        MissingInstallation,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReceiptDisposition {
+        RefusedNotStarted,
+        CancelledBeforeDispatch,
+        ExpiredUnknown,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum RefusalFault {
+        ForeignHeader,
+        MalformedHeader,
+        MissingMessage,
+        NonStringMessage,
+        EmptyMessage,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum ReconcileFault {
+        None,
+        IncompleteEnvelope,
+        ForeignOperation,
+        ForeignWorkspace,
+        MissingHeader,
+        ForeignHeader,
+        MissingVersion,
+        ForeignVersion,
+        MissingKind,
+        InvalidKind,
+        MissingConsent,
+        MissingActor,
+        IncompleteConsent,
+        MalformedConsentDigest,
+        MissingInstallation,
+        MissingInstallationVersion,
+        ForeignInstallationApp,
+        ForeignInstallationDigest,
+        RevokeStillApproved,
+        RefusalOnSuccess,
+        MissingUpdatedAt,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum RefusalContradiction {
+        DataSucceeded,
+        OperationDispatched,
+        OperationExpired,
+        UnknownMutation,
+        UnknownOutcome,
+    }
+    const BLOCKER_OP: &str = "00000000-0000-4000-8000-000000002008";
+
+    #[derive(Clone, Copy, Debug)]
+    enum BlockerFault {
+        None,
+        Plain,
+        Incomplete,
+        ForeignWorkspace,
+        ForeignApp,
+        HeaderMismatch,
+        MissingHeader,
+        MalformedHeader,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum Action4xxReply {
+        PostDispatch(&'static str),
+        Unrecognized(u16),
+        EmptyObject,
+        Array,
+        Null,
+        MissingError,
+        MissingCode,
+        NonStringCode,
+        MissingMessage,
+        NonStringMessage,
+        EmptyMessage,
+        WrongOk,
+        WrongStatus,
+        ForeignHeader,
+        MalformedHeader,
+        PreEffect(u16, &'static str),
+        PreEffectAuth(u16, &'static str),
+        Blocking(&'static str, BlockerFault),
+        Contradictory(RefusalContradiction, bool),
+        TenantRevokeUnsupported,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum Reply {
+        Dropped,
+        NonJson,
+        Truncated,
+        Oversized,
+        Redirect,
+        UnprovedJson,
+        ProducerUncertain,
+        RevokeReceipt(ReceiptFault),
+        RevokeTerminal(ReceiptDisposition, ReceiptFault),
+        ReconcileReceipt(&'static str, ReconcileFault),
+        ReconcileTerminal(ReceiptDisposition),
+        ReconcilePending,
+        Action4xx(Action4xxReply),
+        PreEffect503(&'static str, bool),
+        PreEffect503Fault(&'static str, RefusalFault),
+        Unproved503(&'static str),
+    }
+
+    // Exact successful operation-view envelope from the pre-retirement CLI
+    // producer, not the browser-only route. Installation is a complete
+    // appInstallationRowSchema row, and every request pin is represented.
+    fn successful_revoke_receipt() -> Value {
+        json!({
+            "ok": true,
+            "data": {
+                "version": "hosted-app-lifecycle.v1",
+                "operation_id": OP,
+                "workspace_id": WORKSPACE,
+                "app": LISTING,
+                "kind": "revoke",
+                "state": "succeeded",
+                "consent": {
+                    "actor_id": "user_cad2009_synthetic",
+                    "digest": digest(true),
+                    "artifact_sha256": null,
+                    "artifact_version": null,
+                    "at": 1
+                },
+                "installation": {
+                    "installId": INSTALL,
+                    "app": LISTING,
+                    "title": "Synthetic app",
+                    "version": VERSION,
+                    "digest": digest(true),
+                    "generation": GENERATION,
+                    "storageKind": "workspace",
+                    "source": null,
+                    "catalogue": null,
+                    "project": null,
+                    "installedAt": null,
+                    "approval": {
+                        "state": "unapproved",
+                        "approvedBy": null,
+                        "approvedAt": null,
+                        "epoch": 1
+                    },
+                    "capabilities": [],
+                    "connectionSlots": []
+                },
+                "refusal": null,
+                "updated_at": 2
+            }
+        })
+    }
+
+    fn successful_reconcile_receipt(kind: &str) -> Value {
+        assert!(matches!(kind, "install" | "update" | "revoke"));
+        let mut receipt = successful_revoke_receipt();
+        receipt["data"]["kind"] = json!(kind);
+        // Recovery is available to a different current owner; the receipt
+        // must retain the creator rather than falsely restamping the caller.
+        receipt["data"]["consent"]["actor_id"] = json!("user_previous_owner");
+        if kind != "revoke" {
+            receipt["data"]["consent"]["artifact_sha256"] = json!("a".repeat(64));
+            receipt["data"]["consent"]["artifact_version"] = json!(VERSION);
+            receipt["data"]["installation"]["approval"]["state"] = json!("approved");
+            receipt["data"]["installation"]["catalogue"] = json!({
+                "id": LISTING, "version": VERSION, "digest": digest(true)
+            });
+        }
+        receipt
+    }
+    fn blocking_operation_response(state: &str) -> Value {
+        assert!(matches!(state, "prepared" | "dispatched"));
+        let mut operation = successful_reconcile_receipt("update")["data"].clone();
+        operation["operation_id"] = json!(BLOCKER_OP);
+        operation["state"] = json!(state);
+        operation["installation"] = Value::Null;
+        operation["refusal"] = Value::Null;
+        json!({
+            "ok": false,
+            "error": {
+                "code": "operation_in_progress",
+                "message": "Reconcile the pending app operation before another change."
+            },
+            "operation": operation
+        })
+    }
+    fn terminal_revoke_receipt(disposition: ReceiptDisposition) -> Value {
+        let mut receipt = successful_revoke_receipt();
+        receipt["data"]["state"] = json!("refused");
+        receipt["data"]["installation"] = Value::Null;
+        receipt["data"]["refusal"] = match disposition {
+            ReceiptDisposition::RefusedNotStarted => json!({
+                "version": "hosted-app-mutation.v1",
+                "operation_id": OP,
+                "operation": "revoke",
+                "outcome": "refused",
+                "mutation": "not_started",
+                "code": "native_precondition_refused"
+            }),
+            ReceiptDisposition::CancelledBeforeDispatch => Value::Null,
+            ReceiptDisposition::ExpiredUnknown => json!({
+                "version": "hosted-app-mutation.v1",
+                "operation_id": OP,
+                "operation": "revoke",
+                "outcome": "expired",
+                "mutation": "unknown",
+                "code": "dispatch_expired"
+            }),
+        };
+        receipt
+    }
+    fn private_file(path: &Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    // No sleep/polling loop and no pipe deadlock. pidfd also avoids signalling a
+    // reused PID. A timed-out subprocess is killed and reaped before failing.
+    fn bounded_output(command: &mut Command) -> Output {
+        let mut stdout = tempfile::tempfile().unwrap();
+        let mut stderr = tempfile::tempfile().unwrap();
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout.try_clone().unwrap()))
+            .stderr(Stdio::from(stderr.try_clone().unwrap()));
+        let mut child = cadence_agent::reaper::spawn(command).unwrap();
+        // SAFETY: pidfd_open receives this process's still-unreaped child PID.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("pidfd_open is required for bounded acceptance: {error}");
+        }
+        // SAFETY: fd is a new owned descriptor returned by pidfd_open.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+        let mut descriptor = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to exactly one initialized pollfd.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 15_000) };
+        if ready != 1 || descriptor.revents & libc::POLLIN == 0 {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("subprocess failed to finish within the acceptance deadline: {command:?}");
+        }
+        let status = child.wait().unwrap();
+        fn collected(file: &mut File) -> Vec<u8> {
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut bytes = Vec::new();
+            file.take(262_145).read_to_end(&mut bytes).unwrap();
+            assert!(
+                bytes.len() <= 262_144,
+                "unexpectedly large subprocess output"
+            );
+            bytes
+        }
+        Output {
+            status,
+            stdout: collected(&mut stdout),
+            stderr: collected(&mut stderr),
+        }
+    }
+
+    struct Fixture {
+        root: tempfile::TempDir,
+        tls: Arc<rustls::ServerConfig>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let openssl = |args: &[&str]| {
+                let mut command = Command::new("openssl");
+                command.current_dir(root.path()).args(args);
+                let output = bounded_output(&mut command);
+                assert!(
+                    output.status.success(),
+                    "fixture PKI failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            openssl(&[
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-nodes",
+                "-keyout",
+                "ca.key",
+                "-out",
+                "ca.pem",
+                "-days",
+                "2",
+                "-subj",
+                "/CN=CAD-2009 disposable CA",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
+            ]);
+            openssl(&[
+                "req",
+                "-new",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-nodes",
+                "-keyout",
+                "leaf.key",
+                "-out",
+                "leaf.csr",
+                "-subj",
+                "/CN=lc.cadencecloud.app",
+            ]);
+            private_file(&root.path().join("leaf.ext"), b"subjectAltName=DNS:lc.cadencecloud.app\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n");
+            openssl(&[
+                "x509",
+                "-req",
+                "-in",
+                "leaf.csr",
+                "-CA",
+                "ca.pem",
+                "-CAkey",
+                "ca.key",
+                "-CAcreateserial",
+                "-days",
+                "2",
+                "-extfile",
+                "leaf.ext",
+                "-out",
+                "leaf.pem",
+            ]);
+            for name in ["ca.pem", "ca.key", "leaf.key"] {
+                fs::set_permissions(root.path().join(name), fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+                File::open(root.path().join("leaf.pem")).unwrap(),
+            ))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+            let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+                File::open(root.path().join("leaf.key")).unwrap(),
+            ))
+            .unwrap()
+            .unwrap();
+            let tls = Arc::new(
+                rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+            );
+            let fixture = Self { root, tls };
+            let config = fixture.root.path().join("config/cadence");
+            fs::create_dir_all(config.join("remote-auth")).unwrap();
+            fs::set_permissions(
+                config.join("remote-auth"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            private_file(&config.join("orgs.json"), &serde_json::to_vec(&json!({
+                "selected": {"org": ORG}, "connections": [{"selection": {"org": ORG},
+                    "destination": {"mode": "remote", "endpoint": ENDPOINT, "org_id": WORKSPACE}}]
+            })).unwrap());
+            fixture.credential(true);
+            fixture
+        }
+
+        fn credential(&self, issuer_pin: bool) {
+            let path = self
+                .root
+                .path()
+                .join(format!("config/cadence/remote-auth/cli-{ORG}.json"));
+            if path.exists() {
+                fs::remove_file(&path).unwrap();
+            }
+            let expires = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600;
+            let mut credential = json!({"version": "hosted-cadence-auth.v1",
+                "organization_id": WORKSPACE, "organization_slug": ORG, "audience": ENDPOINT,
+                "subject_id": "user_cad2009_synthetic", "capabilities": ["cli.read", "cli.write"],
+                "access_token": TOKEN, "expires_at": expires});
+            if issuer_pin {
+                credential["issuer"] = json!("https://issuer.board.localhost");
+            }
+            private_file(&path, &serde_json::to_vec(&credential).unwrap());
+        }
+
+        fn command(&self, mutation: Mutation, address: std::net::SocketAddr) -> Command {
+            let review_path = self.root.path().join("review.json");
+            if review_path.exists() {
+                fs::remove_file(&review_path).unwrap();
+            }
+            private_file(
+                &review_path,
+                &serde_json::to_vec(&mutation.checked()).unwrap(),
+            );
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+            command
+                .env_clear()
+                .current_dir(self.root.path())
+                .env("HOME", self.root.path())
+                .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+                .env("XDG_STATE_HOME", self.root.path().join("state"))
+                .env("CADENCE_TEST_TLS_CA", self.root.path().join("ca.pem"))
+                .env("CADENCE_TEST_TLS_CONNECT", address.to_string())
+                .env("CADENCE_JSON", "compact")
+                .args(["--org", ORG, "app", "catalog"]);
+            match mutation {
+                Mutation::Install => {
+                    command.args(["release-install", LISTING]);
+                }
+                Mutation::Update => {
+                    command.args(["release-update", INSTALL, LISTING]);
+                }
+                Mutation::Reconcile => {
+                    command.args(["reconcile", OP]);
+                    return command;
+                }
+                Mutation::Revoke => {
+                    command.args(["release-revoke", INSTALL]);
+                }
+            }
+            command.args([
+                "--operation-id",
+                OP,
+                "--digest",
+                &digest(matches!(mutation, Mutation::Revoke)),
+            ]);
+            if !matches!(mutation, Mutation::Revoke) {
+                command
+                    .args(["--version", VERSION, "--review"])
+                    .arg(review_path);
+            }
+            if !matches!(mutation, Mutation::Install) {
+                command.args(["--expected-generation", GENERATION]);
+            }
+            if matches!(mutation, Mutation::Update) {
+                command.args(["--expected-digest", &digest(true)]);
+            }
+            command
+        }
+
+        fn exercise(&self, mutation: Mutation, reply: Reply) -> (Output, Vec<Value>) {
+            let (output, _requests, effects) = self.exercise_counted(mutation, reply);
+            (output, effects)
+        }
+
+        fn exercise_counted(
+            &self,
+            mutation: Mutation,
+            reply: Reply,
+        ) -> (Output, Vec<Value>, Vec<Value>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (mut stop, wake) = UnixStream::pair().unwrap();
+            let tls = Arc::clone(&self.tls);
+            let worker = thread::spawn(move || {
+                let mut requests = Vec::new();
+                let mut effects = Vec::new();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    let mut descriptors = [
+                        libc::pollfd {
+                            fd: listener.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: wake.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    let remaining = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis();
+                    assert!(remaining > 0, "fixture exceeded its finite deadline");
+                    // SAFETY: descriptors is an initialized two-element pollfd array.
+                    let ready = unsafe {
+                        libc::poll(descriptors.as_mut_ptr(), 2, remaining.min(20_000) as i32)
+                    };
+                    assert!(ready > 0, "fixture did not finish before its deadline");
+                    // Drain connections already queued before honouring stop, so an
+                    // automatic replay cannot hide behind subprocess termination.
+                    if descriptors[0].revents & libc::POLLIN != 0 {
+                        let (tcp, _) = listener.accept().unwrap();
+                        tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                        tcp.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                        let conn = rustls::ServerConnection::new(Arc::clone(&tls)).unwrap();
+                        let mut stream = rustls::StreamOwned::new(conn, tcp);
+                        let mut header = Vec::new();
+                        while !header.ends_with(b"\r\n\r\n") {
+                            assert!(header.len() < 16_384, "oversized request header");
+                            let mut byte = [0];
+                            stream.read_exact(&mut byte).unwrap();
+                            header.push(byte[0]);
+                        }
+                        let header = String::from_utf8(header).unwrap();
+                        let mut lines = header.split("\r\n");
+                        assert_eq!(lines.next().unwrap(), format!(
+                            "POST /__platform/hosted-cadence/{WORKSPACE}/app-installations{} HTTP/1.1", mutation.suffix()));
+                        let mut length = None;
+                        let mut authorization = None;
+                        for line in lines.filter(|line| !line.is_empty()) {
+                            let (name, value) = line.split_once(':').unwrap();
+                            if name.eq_ignore_ascii_case("content-length") {
+                                length = Some(value.trim().parse::<usize>().unwrap());
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                authorization = Some(value.trim().to_owned());
+                            }
+                            assert!(
+                                !name.eq_ignore_ascii_case("transfer-encoding"),
+                                "fixture expects the existing send_json content-length framing"
+                            );
+                        }
+                        assert_eq!(
+                            authorization.as_deref(),
+                            Some(format!("Bearer {TOKEN}").as_str())
+                        );
+                        let length = length.expect("missing request body length");
+                        assert!(length <= 131_072);
+                        let mut bytes = vec![0; length];
+                        stream.read_exact(&mut bytes).unwrap();
+                        let body: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(
+                            body,
+                            mutation.body(),
+                            "the actual CLI must dispatch the exact supported envelope"
+                        );
+                        requests.push(body.clone());
+                        // The two proven /action refusals occur before any
+                        // authoritative effect. Every existing negative case
+                        // still commits before replying. For reconcile, the
+                        // synthetic effect models a journal cancel/observe
+                        // whose response is lost, not an app mutation.
+                        if !matches!(
+                            reply,
+                            Reply::PreEffect503(_, _)
+                                | Reply::ReconcileTerminal(_)
+                                | Reply::ReconcilePending
+                                | Reply::PreEffect503Fault(_, _)
+                                | Reply::Action4xx(Action4xxReply::PreEffect(_, _))
+                                | Reply::Action4xx(Action4xxReply::PreEffectAuth(_, _))
+                                | Reply::Action4xx(Action4xxReply::TenantRevokeUnsupported)
+                                | Reply::RevokeTerminal(
+                                    ReceiptDisposition::RefusedNotStarted
+                                        | ReceiptDisposition::CancelledBeforeDispatch,
+                                    _
+                                )
+                        ) {
+                            effects.push(body);
+                        }
+                        if matches!(reply, Reply::Dropped) {
+                            continue;
+                        }
+                        let (status, bytes, advertised, extra) = match reply {
+                            Reply::NonJson => (200, b"not-json".to_vec(), 8, String::new()),
+                            Reply::Truncated => (200, b"{\"ok\":".to_vec(), 64, String::new()),
+                            Reply::Oversized => {
+                                (200, vec![b'x'; 1_048_577], 1_048_577, String::new())
+                            }
+                            Reply::Redirect => (
+                                307,
+                                b"{}".to_vec(),
+                                2,
+                                format!("Location: {ENDPOINT}/must-not-follow\r\n"),
+                            ),
+                            Reply::UnprovedJson => {
+                                let bytes = br#"{"ok":true,"data":{}}"#.to_vec();
+                                let length = bytes.len();
+                                (200, bytes, length, String::new())
+                            }
+                            Reply::ProducerUncertain => {
+                                // hosted-app-installations.ts fail(202, "outcome_uncertain", ...).
+                                let bytes = serde_json::to_vec(&json!({"ok": false, "error": {
+                                    "code": "outcome_uncertain", "message": "Read and reconcile this operation before another app change."
+                                }})).unwrap();
+                                let length = bytes.len();
+                                (202, bytes, length, String::new())
+                            }
+                            Reply::RevokeReceipt(fault) | Reply::RevokeTerminal(_, fault) => {
+                                assert!(matches!(mutation, Mutation::Revoke));
+                                let mut receipt = match reply {
+                                    Reply::RevokeTerminal(disposition, _) => {
+                                        terminal_revoke_receipt(disposition)
+                                    }
+                                    _ => successful_revoke_receipt(),
+                                };
+                                match fault {
+                                    ReceiptFault::ForeignOperation => {
+                                        receipt["data"]["operation_id"] =
+                                            json!("00000000-0000-4000-8000-000000009999");
+                                    }
+                                    ReceiptFault::ForeignWorkspace => {
+                                        receipt["data"]["workspace_id"] = json!("ws_foreign");
+                                    }
+                                    ReceiptFault::ForeignKind => {
+                                        receipt["data"]["kind"] = json!("install");
+                                    }
+                                    ReceiptFault::ForeignConsentDigest => {
+                                        receipt["data"]["consent"]["digest"] = json!(digest(false));
+                                    }
+                                    ReceiptFault::ForeignActor => {
+                                        receipt["data"]["consent"]["actor_id"] =
+                                            json!("user_foreign");
+                                    }
+                                    ReceiptFault::ForeignRefusalOperation => {
+                                        receipt["data"]["refusal"]["operation_id"] =
+                                            json!("00000000-0000-4000-8000-000000009999");
+                                    }
+                                    ReceiptFault::ForeignRefusalKind => {
+                                        receipt["data"]["refusal"]["operation"] = json!("install");
+                                    }
+                                    ReceiptFault::ForeignInstall => {
+                                        receipt["data"]["installation"]["installId"] =
+                                            json!("install_foreign");
+                                    }
+                                    ReceiptFault::ForeignInstallDigest => {
+                                        receipt["data"]["installation"]["digest"] =
+                                            json!(digest(false));
+                                    }
+                                    ReceiptFault::ForeignGeneration => {
+                                        receipt["data"]["installation"]["generation"] =
+                                            json!("foreign-generation");
+                                    }
+                                    ReceiptFault::StillApproved => {
+                                        receipt["data"]["installation"]["approval"]["state"] =
+                                            json!("approved");
+                                    }
+                                    ReceiptFault::MissingInstallation => {
+                                        receipt["data"]["installation"] = Value::Null;
+                                    }
+                                    ReceiptFault::None
+                                    | ReceiptFault::MissingHeader
+                                    | ReceiptFault::ForeignHeader => {}
+                                }
+                                let extra = match fault {
+                                    ReceiptFault::MissingHeader => String::new(),
+                                    ReceiptFault::ForeignHeader => format!(
+                                        "X-Hosted-App-Operation-Id: {}\r\n",
+                                        "00000000-0000-4000-8000-000000009999"
+                                    ),
+                                    _ => format!("X-Hosted-App-Operation-Id: {OP}\r\n"),
+                                };
+                                let bytes = serde_json::to_vec(&receipt).unwrap();
+                                let length = bytes.len();
+                                (200, bytes, length, extra)
+                            }
+                            Reply::PreEffect503(code, _) | Reply::PreEffect503Fault(code, _) => {
+                                assert!(matches!(mutation, Mutation::Install | Mutation::Update));
+                                assert!(matches!(
+                                    code,
+                                    "release_unavailable" | "check_unavailable"
+                                ));
+                                let message = if code == "release_unavailable" {
+                                    "This app release could not be verified. Nothing was changed."
+                                } else {
+                                    "The release review was incomplete."
+                                };
+                                let mut body = json!({
+                                    "ok": false,
+                                    "error": {"code": code, "message": message}
+                                });
+                                match reply {
+                                    Reply::PreEffect503Fault(_, RefusalFault::MissingMessage) => {
+                                        body["error"].as_object_mut().unwrap().remove("message");
+                                    }
+                                    Reply::PreEffect503Fault(_, RefusalFault::NonStringMessage) => {
+                                        body["error"]["message"] = json!(7);
+                                    }
+                                    Reply::PreEffect503Fault(_, RefusalFault::EmptyMessage) => {
+                                        body["error"]["message"] = json!("");
+                                    }
+                                    _ => {}
+                                }
+                                let bytes = serde_json::to_vec(&body).unwrap();
+                                let length = bytes.len();
+                                let extra = match reply {
+                                    Reply::PreEffect503(_, false) => String::new(),
+                                    Reply::PreEffect503Fault(_, RefusalFault::ForeignHeader) => {
+                                        format!(
+                                            "X-Hosted-App-Operation-Id: {}\r\n",
+                                            "00000000-0000-4000-8000-000000009999"
+                                        )
+                                    }
+                                    Reply::PreEffect503Fault(_, RefusalFault::MalformedHeader) => {
+                                        // Valid HTTP value, invalid operation identifier.
+                                        "X-Hosted-App-Operation-Id: invalid.operation.id\r\n"
+                                            .to_string()
+                                    }
+                                    _ => format!("X-Hosted-App-Operation-Id: {OP}\r\n"),
+                                };
+                                (503, bytes, length, extra)
+                            }
+                            Reply::Action4xx(case) => {
+                                if matches!(
+                                    case,
+                                    Action4xxReply::PostDispatch(_)
+                                        | Action4xxReply::PreEffect(_, _)
+                                        | Action4xxReply::PreEffectAuth(_, _)
+                                ) {
+                                    assert!(matches!(
+                                        mutation,
+                                        Mutation::Install | Mutation::Update
+                                    ));
+                                }
+                                let mut status = 400;
+                                let mut header = format!("X-Hosted-App-Operation-Id: {OP}\r\n");
+                                let mut envelope = json!({
+                                    "ok": false,
+                                    "error": {
+                                        "code": "invalid_request",
+                                        "message": "Enter a valid app action."
+                                    }
+                                });
+                                match case {
+                                    Action4xxReply::PostDispatch(code) => {
+                                        status = 409;
+                                        assert!(matches!(
+                                            code,
+                                            "install_refused"
+                                                | "update_refused"
+                                                | "host_incompatible"
+                                        ));
+                                        envelope["error"]["code"] = json!(code);
+                                        envelope["error"]["message"] = json!(if code
+                                            == "host_incompatible"
+                                        {
+                                            "This release is not compatible with this workspace's Cadence."
+                                        } else {
+                                            "The app could not be changed. Nothing was confirmed."
+                                        });
+                                    }
+                                    Action4xxReply::Unrecognized(code_status) => {
+                                        status = code_status;
+                                        envelope["error"]["code"] =
+                                            json!("future_unproved_failure");
+                                    }
+                                    Action4xxReply::EmptyObject => envelope = json!({}),
+                                    Action4xxReply::Array => envelope = json!([]),
+                                    Action4xxReply::Null => envelope = Value::Null,
+                                    Action4xxReply::MissingError => envelope = json!({"ok": false}),
+                                    Action4xxReply::MissingCode => {
+                                        envelope["error"].as_object_mut().unwrap().remove("code");
+                                    }
+                                    Action4xxReply::NonStringCode => {
+                                        envelope["error"]["code"] = json!(17);
+                                    }
+                                    Action4xxReply::MissingMessage => {
+                                        envelope["error"]
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .remove("message");
+                                    }
+                                    Action4xxReply::NonStringMessage => {
+                                        envelope["error"]["message"] = json!(17);
+                                    }
+                                    Action4xxReply::EmptyMessage => {
+                                        envelope["error"]["message"] = json!("");
+                                    }
+                                    Action4xxReply::WrongOk => envelope["ok"] = json!(true),
+                                    Action4xxReply::WrongStatus => status = 409,
+                                    Action4xxReply::ForeignHeader => {
+                                        header = "X-Hosted-App-Operation-Id: 00000000-0000-4000-8000-000000009999\r\n".into();
+                                    }
+                                    Action4xxReply::MalformedHeader => {
+                                        header =
+                                            "X-Hosted-App-Operation-Id: invalid.operation.id\r\n"
+                                                .into();
+                                    }
+                                    Action4xxReply::PreEffect(code_status, code) => {
+                                        status = code_status;
+                                        let message = match (status, code) {
+                                            (400, "invalid_request") => "Enter a valid app action.",
+                                            (403, "owner_only") => "Current owner authority is required.",
+                                            (404, "not_found") => "This app is not available.",
+                                            (409, "operation_not_dispatched") => "The operation was cancelled or workspace authority changed.",
+                                            (409, "release_unavailable") => "This app release is not available to install.",
+                                            _ => panic!("not a source-proven pre-effect control"),
+                                        };
+                                        envelope = json!({"ok": false, "error": {
+                                            "code": code, "message": message
+                                        }});
+                                    }
+                                    Action4xxReply::PreEffectAuth(code_status, code) => {
+                                        status = code_status;
+                                        assert!(matches!(
+                                            (status, code),
+                                            (401, "unauthorized")
+                                                | (403, "forbidden" | "human_session_required")
+                                        ));
+                                        // The real humanActor middleware emits this flat family,
+                                        // before parsing an action or assigning its header.
+                                        envelope = json!({"ok": false, "code": code});
+                                        header.clear();
+                                    }
+                                    Action4xxReply::Contradictory(conflict, flat) => {
+                                        if flat {
+                                            status = 401;
+                                            envelope = json!({"ok": false, "code": "unauthorized"});
+                                        }
+                                        // Otherwise retain the source-proven nested
+                                        // 400 invalid_request envelope constructed above.
+                                        // Every case keeps the correct OP header.
+                                        let kind = match mutation {
+                                            Mutation::Install => "install",
+                                            Mutation::Update | Mutation::Reconcile => "update",
+                                            Mutation::Revoke => "revoke",
+                                        };
+                                        let mut operation =
+                                            successful_reconcile_receipt(kind)["data"].clone();
+                                        match conflict {
+                                            RefusalContradiction::DataSucceeded => {
+                                                envelope["data"] = operation;
+                                            }
+                                            RefusalContradiction::OperationDispatched => {
+                                                operation["state"] = json!("dispatched");
+                                                operation["installation"] = Value::Null;
+                                                envelope["operation"] = operation;
+                                            }
+                                            RefusalContradiction::OperationExpired => {
+                                                operation["state"] = json!("refused");
+                                                operation["installation"] = Value::Null;
+                                                operation["refusal"] = json!({
+                                                    "version": "hosted-app-mutation.v1",
+                                                    "operation_id": OP,
+                                                    "operation": kind,
+                                                    "outcome": "expired",
+                                                    "mutation": "unknown",
+                                                    "code": "dispatch_expired"
+                                                });
+                                                envelope["operation"] = operation;
+                                            }
+                                            RefusalContradiction::UnknownMutation => {
+                                                envelope["mutation"] = json!("unknown");
+                                            }
+                                            RefusalContradiction::UnknownOutcome => {
+                                                envelope["outcome"] = json!("expired");
+                                            }
+                                        }
+                                    }
+                                    Action4xxReply::Blocking(state, fault) => {
+                                        assert!(matches!(
+                                            mutation,
+                                            Mutation::Install | Mutation::Update | Mutation::Revoke
+                                        ));
+                                        status = 409;
+                                        envelope = blocking_operation_response(state);
+                                        header =
+                                            format!("X-Hosted-App-Operation-Id: {BLOCKER_OP}\r\n");
+                                        match fault {
+                                            BlockerFault::None => {}
+                                            BlockerFault::Plain => {
+                                                envelope
+                                                    .as_object_mut()
+                                                    .unwrap()
+                                                    .remove("operation");
+                                                // Even a header equal to this request's UUID is
+                                                // not proof when the blocker body is absent.
+                                                header =
+                                                    format!("X-Hosted-App-Operation-Id: {OP}\r\n");
+                                            }
+                                            BlockerFault::Incomplete => {
+                                                envelope["operation"]
+                                                    .as_object_mut()
+                                                    .unwrap()
+                                                    .remove("consent");
+                                            }
+                                            BlockerFault::ForeignWorkspace => {
+                                                envelope["operation"]["workspace_id"] =
+                                                    json!("ws_another_company");
+                                            }
+                                            BlockerFault::ForeignApp => {
+                                                envelope["operation"]["app"] = json!("another-app");
+                                            }
+                                            BlockerFault::HeaderMismatch => {
+                                                // Header is valid but disagrees with the blocker.
+                                                header =
+                                                    format!("X-Hosted-App-Operation-Id: {OP}\r\n");
+                                            }
+                                            BlockerFault::MissingHeader => header.clear(),
+                                            BlockerFault::MalformedHeader => {
+                                                header =
+                                                    "X-Hosted-App-Operation-Id: not-a-uuid\r\n"
+                                                        .into();
+                                            }
+                                        }
+                                    }
+                                    Action4xxReply::TenantRevokeUnsupported => {
+                                        assert!(matches!(mutation, Mutation::Revoke));
+                                        status = 409;
+                                        // The current tenant producer does not assign an
+                                        // operation header when it refuses unsupported revoke.
+                                        header.clear();
+                                        envelope = json!({"ok": false, "error": {
+                                            "code": "revoke_unsupported",
+                                            "message": "This board has no package approval to revoke. Nothing was changed. Disable the app on the board instead."
+                                        }});
+                                    }
+                                }
+                                let bytes = serde_json::to_vec(&envelope).unwrap();
+                                let length = bytes.len();
+                                (status, bytes, length, header)
+                            }
+                            Reply::Unproved503(code) => {
+                                let bytes = serde_json::to_vec(&json!({
+                                    "ok": false,
+                                    "error": {
+                                        "code": code,
+                                        "message": "The authoritative response was lost."
+                                    }
+                                }))
+                                .unwrap();
+                                let length = bytes.len();
+                                (
+                                    503,
+                                    bytes,
+                                    length,
+                                    format!("X-Hosted-App-Operation-Id: {OP}\r\n"),
+                                )
+                            }
+                            Reply::ReconcileReceipt(kind, fault) => {
+                                assert!(matches!(mutation, Mutation::Reconcile));
+                                let mut receipt = successful_reconcile_receipt(kind);
+                                match fault {
+                                    ReconcileFault::IncompleteEnvelope => {
+                                        receipt = json!({"ok": true, "data": {
+                                            "operation_id": OP,
+                                            "workspace_id": WORKSPACE,
+                                            "state": "succeeded"
+                                        }});
+                                    }
+                                    ReconcileFault::ForeignOperation => {
+                                        receipt["data"]["operation_id"] =
+                                            json!("00000000-0000-4000-8000-000000009999");
+                                    }
+                                    ReconcileFault::ForeignWorkspace => {
+                                        receipt["data"]["workspace_id"] = json!("ws_foreign");
+                                    }
+                                    ReconcileFault::MissingVersion => {
+                                        receipt["data"].as_object_mut().unwrap().remove("version");
+                                    }
+                                    ReconcileFault::ForeignVersion => {
+                                        receipt["data"]["version"] = json!("unrelated-protocol.v1");
+                                    }
+                                    ReconcileFault::MissingKind => {
+                                        receipt["data"].as_object_mut().unwrap().remove("kind");
+                                    }
+                                    ReconcileFault::InvalidKind => {
+                                        receipt["data"]["kind"] = json!("unrelated-mutation");
+                                    }
+                                    ReconcileFault::MissingConsent => {
+                                        receipt["data"].as_object_mut().unwrap().remove("consent");
+                                    }
+                                    ReconcileFault::MissingActor => {
+                                        receipt["data"]["consent"]
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .remove("actor_id");
+                                    }
+                                    ReconcileFault::IncompleteConsent => {
+                                        receipt["data"]["consent"] = json!({
+                                            "actor_id": "user_previous_owner",
+                                            "digest": digest(true)
+                                        });
+                                    }
+                                    ReconcileFault::MalformedConsentDigest => {
+                                        receipt["data"]["consent"]["digest"] =
+                                            json!("not-a-digest");
+                                    }
+                                    ReconcileFault::MissingInstallation => {
+                                        receipt["data"]["installation"] = Value::Null;
+                                    }
+                                    ReconcileFault::MissingInstallationVersion => {
+                                        receipt["data"]["installation"]
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .remove("version");
+                                    }
+                                    ReconcileFault::ForeignInstallationApp => {
+                                        receipt["data"]["installation"]["app"] =
+                                            json!("foreign-app");
+                                    }
+                                    ReconcileFault::ForeignInstallationDigest => {
+                                        receipt["data"]["installation"]["digest"] =
+                                            json!(digest(false));
+                                    }
+                                    ReconcileFault::RevokeStillApproved => {
+                                        assert_eq!(kind, "revoke");
+                                        receipt["data"]["installation"]["approval"]["state"] =
+                                            json!("approved");
+                                    }
+                                    ReconcileFault::RefusalOnSuccess => {
+                                        receipt["data"]["refusal"] = json!({
+                                            "version": "hosted-app-mutation.v1",
+                                            "operation_id": OP,
+                                            "operation": kind,
+                                            "outcome": "refused",
+                                            "mutation": "not_started",
+                                            "code": "native_precondition_refused"
+                                        });
+                                    }
+                                    ReconcileFault::MissingUpdatedAt => {
+                                        receipt["data"]
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .remove("updated_at");
+                                    }
+                                    ReconcileFault::None
+                                    | ReconcileFault::MissingHeader
+                                    | ReconcileFault::ForeignHeader => {}
+                                }
+                                let extra = match fault {
+                                    ReconcileFault::MissingHeader => String::new(),
+                                    ReconcileFault::ForeignHeader => format!(
+                                        "X-Hosted-App-Operation-Id: {}\r\n",
+                                        "00000000-0000-4000-8000-000000009999"
+                                    ),
+                                    _ => format!("X-Hosted-App-Operation-Id: {OP}\r\n"),
+                                };
+                                let bytes = serde_json::to_vec(&receipt).unwrap();
+                                let length = bytes.len();
+                                (200, bytes, length, extra)
+                            }
+                            Reply::ReconcileTerminal(_) | Reply::ReconcilePending => {
+                                assert!(matches!(mutation, Mutation::Reconcile));
+                                let (mut receipt, status) = match reply {
+                                    Reply::ReconcileTerminal(disposition) => {
+                                        (terminal_revoke_receipt(disposition), 200)
+                                    }
+                                    Reply::ReconcilePending => {
+                                        let mut receipt = successful_reconcile_receipt("revoke");
+                                        receipt["data"]["state"] = json!("dispatched");
+                                        receipt["data"]["installation"] = Value::Null;
+                                        receipt["data"]["refusal"] = Value::Null;
+                                        (receipt, 202)
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                receipt["data"]["consent"]["actor_id"] =
+                                    json!("user_previous_owner");
+                                let bytes = serde_json::to_vec(&receipt).unwrap();
+                                let length = bytes.len();
+                                (
+                                    status,
+                                    bytes,
+                                    length,
+                                    format!("X-Hosted-App-Operation-Id: {OP}\r\n"),
+                                )
+                            }
+                            Reply::Dropped => unreachable!(),
+                        };
+                        // Existing unusable-response cases omit the header;
+                        // new controls select their explicit correlation header.
+                        let _ = write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {advertised}\r\nConnection: close\r\n{extra}\r\n");
+                        let _ = stream.write_all(&bytes);
+                        let _ = stream.flush();
+                    } else if descriptors[1].revents != 0 {
+                        break;
+                    } else {
+                        panic!("unexpected fixture socket readiness");
+                    }
+                }
+                (requests, effects)
+            });
+            let output = bounded_output(&mut self.command(mutation, address));
+            stop.write_all(b"x").unwrap();
+            let (requests, effects) = worker.join().unwrap();
+            (output, requests, effects)
+        }
+    }
+
+    fn assert_unknown(output: &Output, mutation: Mutation, reply: Reply) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{mutation:?}/{reply:?}: stdout={stdout}; stderr={stderr}"
+        );
+        // main.rs emits the error object after the operation-id diagnostic.
+        let start = stderr
+            .find('{')
+            .expect("unknown must have a structured CLI diagnostic");
+        let error: Value = serde_json::from_str(&stderr[start..]).unwrap();
+        assert_eq!(error["kind"], "unknown", "{mutation:?}/{reply:?}: {error}");
+        let guidance = format!("{stderr}\n{stdout}").to_lowercase();
+        assert!(
+            guidance.contains(OP),
+            "lost recovery operation identity: {guidance}"
+        );
+        assert!(
+            guidance.contains(&format!("--org {ORG}")),
+            "recovery must pin the same selected workspace: {guidance}"
+        );
+        assert!(
+            guidance.contains("app catalog operation"),
+            "missing operation readback guidance: {guidance}"
+        );
+        assert!(
+            guidance.contains("reconcile"),
+            "missing reconciliation guidance: {guidance}"
+        );
+        assert!(
+            guidance.contains("never redispatch")
+                || guidance.contains("do not redispatch")
+                || guidance.contains("do not retry"),
+            "missing no-blind-replay warning: {guidance}"
+        );
+    }
+
+    // Independently authored CAD-2009 registration persistence acceptance.
+
+    #[test]
+    fn cad2009_register_issued_session_protected_save_is_unknown_without_new_consent() {
+        const ISSUED_WORKSPACE: &str = "ws_registration_issued";
+        const ISSUED_SLUG: &str = "lc";
+        const SESSION: &str = "hcs_00000000-0000-4000-8000-000000002009";
+        let fixture = Fixture::new();
+        let authority = fixture.root.path().join("registration-authority");
+        fs::create_dir(&authority).unwrap();
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o700)).unwrap();
+        private_file(
+            &authority.join("trusted-issuer"),
+            format!("{ENDPOINT}\n").as_bytes(),
+        );
+        let sentinel = fixture.root.path().join("protected-credential-target");
+        private_file(
+            &sentinel,
+            b"must not overwrite this protected destination\n",
+        );
+        let protected = authority.join(format!("cli-{ISSUED_SLUG}.json"));
+        std::os::unix::fs::symlink(&sentinel, &protected).unwrap();
+        let registry = fixture.root.path().join("config/cadence/orgs.json");
+        let registry_before = fs::read(&registry).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (mut stop, wake) = UnixStream::pair().unwrap();
+        let tls = Arc::clone(&fixture.tls);
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut requests = Vec::new();
+            let mut issued = 0usize;
+            loop {
+                let mut descriptors = [
+                    libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: wake.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
+                assert!(remaining > 0, "registration fixture deadline");
+                // SAFETY: descriptors is an initialized two-element pollfd array.
+                let ready = unsafe {
+                    libc::poll(descriptors.as_mut_ptr(), 2, remaining.min(20_000) as i32)
+                };
+                assert!(ready > 0, "registration fixture did not terminate");
+                if descriptors[0].revents & libc::POLLIN != 0 {
+                    let (tcp, _) = listener.accept().unwrap();
+                    tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    tcp.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let connection = rustls::ServerConnection::new(Arc::clone(&tls)).unwrap();
+                    let mut stream = rustls::StreamOwned::new(connection, tcp);
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        assert!(header.len() < 16_384, "oversized registration header");
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).unwrap();
+                        header.push(byte[0]);
+                    }
+                    let header = String::from_utf8(header).unwrap();
+                    let mut lines = header.split("\r\n");
+                    let first = lines.next().unwrap();
+                    let path = first
+                        .strip_prefix("POST ")
+                        .unwrap()
+                        .strip_suffix(" HTTP/1.1")
+                        .unwrap()
+                        .to_owned();
+                    let length = lines
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                        .unwrap();
+                    assert!(length <= 65_536);
+                    let mut bytes = vec![0; length];
+                    stream.read_exact(&mut bytes).unwrap();
+                    let body: Value = serde_json::from_slice(&bytes).unwrap();
+                    requests.push(path.clone());
+                    let (status, reply) = match path.as_str() {
+                        "/v1/hosted-cadence/device/code" => {
+                            assert_eq!(
+                                requests.len(),
+                                1,
+                                "new consent was requested after issuance"
+                            );
+                            assert_eq!(body["cli_session"], "renewable");
+                            assert!(body.get("organization_id").is_none());
+                            assert!(body.get("organization_slug").is_none());
+                            assert!(body["code_challenge"]
+                                .as_str()
+                                .is_some_and(|value| value.len() == 43));
+                            (
+                                200,
+                                json!({
+                                    "version":"hosted-cadence-device.v1",
+                                    "device_code":format!("hcd_{}", "D".repeat(43)),
+                                    "user_code":"K7PM-2QNF",
+                                    "verification_uri":format!("{ENDPOINT}/device/hosted-cadence"),
+                                    "verification_uri_complete":format!("{ENDPOINT}/device/hosted-cadence?code=K7PM-2QNF"),
+                                    "expires_in":600,"interval":5
+                                }),
+                            )
+                        }
+                        "/v1/hosted-cadence/device/token" => {
+                            assert_eq!(body["device_code"], format!("hcd_{}", "D".repeat(43)));
+                            assert!(body["code_verifier"]
+                                .as_str()
+                                .is_some_and(|value| value.len() == 43));
+                            issued += 1;
+                            if issued > 1 {
+                                (400, json!({"error":"invalid_grant"}))
+                            } else {
+                                let at = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
+                                (
+                                    200,
+                                    json!({
+                                        "version":"hosted-cadence-auth.v1",
+                                        "organization_id":ISSUED_WORKSPACE,"organization_slug":ISSUED_SLUG,
+                                        "audience":ENDPOINT,
+                                        "principal":{"kind":"user","subject_id":"user_registration_issued","current_role":"owner"},
+                                        "capabilities":["cli.read","cli.write"],
+                                        "credential":{"credential_id":"hcp_registration_issued","access_token":TOKEN,
+                                            "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"},
+                                        "cli_session":{"session_id":SESSION,"refresh_token":format!("hcr_{}", "R".repeat(43)),
+                                            "generation":1,"device_label":"cadence-cli",
+                                            "idle_expires_at":at+2_592_000,"absolute_expires_at":at+7_776_000}
+                                    }),
+                                )
+                            }
+                        }
+                        _ => panic!("unexpected post-issuance operation: {path}"),
+                    };
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+                    stream.write_all(&bytes).unwrap();
+                    stream.flush().unwrap();
+                } else if descriptors[1].revents != 0 {
+                    break;
+                } else {
+                    panic!("unexpected registration socket readiness");
+                }
+            }
+            (issued, requests)
+        });
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        command
+            .env_clear()
+            .current_dir(fixture.root.path())
+            .env("HOME", fixture.root.path())
+            .env("XDG_CONFIG_HOME", fixture.root.path().join("config"))
+            .env("XDG_STATE_HOME", fixture.root.path().join("state"))
+            .env("CADENCE_TEST_TLS_CA", fixture.root.path().join("ca.pem"))
+            .env("CADENCE_TEST_TLS_CONNECT", address.to_string())
+            .env("CADENCE_JSON", "compact")
+            .args([
+                "register",
+                "--issuer",
+                ENDPOINT,
+                "--name",
+                "Prefilled Name",
+                "--slug",
+                "prefill-only",
+                "--no-open",
+                "--use",
+                "--json",
+                "--auth-dir",
+            ])
+            .arg(&authority);
+        let output = bounded_output(&mut command);
+        stop.write_all(b"x").unwrap();
+        let (issued, requests) = worker.join().unwrap();
+        assert_eq!(
+            issued, 1,
+            "the one-shot session was not issued exactly once"
+        );
+        assert_eq!(requests, ["/v1/hosted-cadence/device/code", "/v1/hosted-cadence/device/token"],
+        "registration must neither request fresh consent nor replay/renew/revoke the issued grant");
+        assert!(
+            fs::symlink_metadata(&protected)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "destination guard was bypassed"
+        );
+        assert_eq!(fs::read_link(&protected).unwrap(), sentinel);
+        assert_eq!(
+            fs::read(&sentinel).unwrap(),
+            b"must not overwrite this protected destination\n"
+        );
+        assert_eq!(
+            fs::read(&registry).unwrap(),
+            registry_before,
+            "failed persistence changed the saved selection"
+        );
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let start = stderr.find('{').expect("missing structured CLI error");
+        let error: Value =
+            serde_json::from_str(&stderr[start..]).expect("invalid structured CLI error");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "stdout={stdout}; stderr={stderr}"
+        );
+        assert_eq!(
+            error["kind"], "unknown",
+            "issued-session persistence loss is not a pre-effect rejection"
+        );
+        let report: Value =
+            serde_json::from_str(&stdout).expect("--json must emit exactly one JSON document");
+        assert_eq!(report["authenticated"], false);
+        assert_eq!(report["credential_stored"], false);
+        assert_ne!(
+            report["registered"],
+            json!(false),
+            "a local save refusal cannot disprove remote registration"
+        );
+        for rendered in [report.to_string(), error.to_string()] {
+            assert!(
+                rendered.contains(ISSUED_WORKSPACE),
+                "missing actual issuer-selected workspace: {rendered}"
+            );
+            assert!(
+                rendered.contains(authority.to_str().unwrap()),
+                "missing actual protected authority directory: {rendered}"
+            );
+            assert!(
+                rendered.to_lowercase().contains("issued"),
+                "lost issued-session fact: {rendered}"
+            );
+            assert!(
+                rendered.to_lowercase().contains("reconcil"),
+                "missing reconciliation guidance: {rendered}"
+            );
+        }
+        assert!(!stdout.contains(TOKEN) && !stderr.contains(TOKEN));
+        assert!(
+            !stdout.contains(&format!("hcr_{}", "R".repeat(43)))
+                && !stderr.contains(&format!("hcr_{}", "R".repeat(43)))
+        );
+    }
+
+    #[test]
+    fn cad2009_hosted_app_matching_historical_cli_revoke_receipt_is_success() {
+        let fixture = Fixture::new();
+        let mutation = Mutation::Revoke;
+        let (output, requests, effects) =
+            fixture.exercise_counted(mutation, Reply::RevokeReceipt(ReceiptFault::None));
+        assert_eq!(
+            requests,
+            vec![mutation.body()],
+            "exactly one original request"
+        );
+        assert_eq!(
+            effects,
+            vec![mutation.body()],
+            "exactly one original effect"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: Value = serde_json::from_slice(&output.stdout)
+            .expect("the complete confirmed receipt must be printed as JSON");
+        assert_eq!(receipt, successful_revoke_receipt());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("\"kind\":\"unknown\""));
+    }
+
+    #[test]
+    fn cad2009_hosted_app_foreign_or_unusable_revoke_receipts_remain_unknown() {
+        let fixture = Fixture::new();
+        for fault in [
+            ReceiptFault::MissingHeader,
+            ReceiptFault::ForeignHeader,
+            ReceiptFault::ForeignOperation,
+            ReceiptFault::ForeignWorkspace,
+            ReceiptFault::ForeignKind,
+            ReceiptFault::ForeignConsentDigest,
+            ReceiptFault::ForeignActor,
+            ReceiptFault::ForeignInstall,
+            ReceiptFault::ForeignInstallDigest,
+            ReceiptFault::ForeignGeneration,
+            ReceiptFault::StillApproved,
+            ReceiptFault::MissingInstallation,
+        ] {
+            let mutation = Mutation::Revoke;
+            let reply = Reply::RevokeReceipt(fault);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(requests, vec![mutation.body()], "{fault:?}: no replay");
+            assert_eq!(
+                effects,
+                vec![mutation.body()],
+                "{fault:?}: original effect retained"
+            );
+            assert_unknown(&output, mutation, reply);
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_proven_action_503_refusals_remain_definite() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update] {
+            for code in ["release_unavailable", "check_unavailable"] {
+                // Historical human CLI replies include the header; current
+                // tenant reviewed() refusals may return before adding one.
+                for include_header in [false, true] {
+                    let reply = Reply::PreEffect503(code, include_header);
+                    let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                    assert_eq!(
+                        requests,
+                        vec![mutation.body()],
+                        "{mutation:?}/{code}: one request, not a local bypass"
+                    );
+                    assert!(
+                        effects.is_empty(),
+                        "{mutation:?}/{code}: source-proven refusal must precede the effect"
+                    );
+                    assert_eq!(
+                        output.status.code(),
+                        Some(3),
+                        "{mutation:?}/{code}/{include_header}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let body: Value = serde_json::from_slice(&output.stdout)
+                        .expect("the original definite refusal must remain inspectable");
+                    assert_eq!(body["ok"], false);
+                    assert_eq!(body["error"]["code"], code);
+                    assert!(
+                        !String::from_utf8_lossy(&output.stderr).contains("\"kind\":\"unknown\"")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_unproved_503s_and_reconcile_journal_failures_stay_unknown() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update, Mutation::Revoke] {
+            for code in [
+                "capability_unavailable",
+                "owner_unavailable",
+                "temporary_backend_failure",
+            ] {
+                let reply = Reply::Unproved503(code);
+                let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                assert_eq!(
+                    requests,
+                    vec![mutation.body()],
+                    "{mutation:?}/{code}: no replay"
+                );
+                assert_eq!(
+                    effects,
+                    vec![mutation.body()],
+                    "{mutation:?}/{code}: a lost acknowledgement can follow commit"
+                );
+                assert_unknown(&output, mutation, reply);
+            }
+        }
+        // The two /action-only proof codes must not become a global whitelist.
+        // In particular, current reconcile can persist cancel/observe and then
+        // emit capability_unavailable/owner_unavailable when its reply is lost.
+        for code in [
+            "capability_unavailable",
+            "owner_unavailable",
+            "release_unavailable",
+            "check_unavailable",
+        ] {
+            let mutation = Mutation::Reconcile;
+            let reply = Reply::Unproved503(code);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(requests, vec![json!({})], "reconcile/{code}: no replay");
+            assert_eq!(
+                effects,
+                vec![json!({})],
+                "reconcile/{code}: journal effect committed before lost acknowledgement"
+            );
+            assert_unknown(&output, mutation, reply);
+        }
+    }
+    #[test]
+    fn cad2009_hosted_app_correlated_terminal_revoke_refusals_exit_three() {
+        let fixture = Fixture::new();
+        for disposition in [
+            ReceiptDisposition::RefusedNotStarted,
+            ReceiptDisposition::CancelledBeforeDispatch,
+        ] {
+            let mutation = Mutation::Revoke;
+            let reply = Reply::RevokeTerminal(disposition, ReceiptFault::None);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(
+                requests,
+                vec![mutation.body()],
+                "{disposition:?}: one request"
+            );
+            assert!(
+                effects.is_empty(),
+                "{disposition:?}: no app effect was started"
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "{disposition:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let receipt: Value = serde_json::from_slice(&output.stdout)
+                .expect("the complete correlated refusal must remain inspectable");
+            assert_eq!(receipt, terminal_revoke_receipt(disposition));
+            assert_eq!(receipt["data"]["operation_id"], OP);
+            assert_eq!(receipt["data"]["workspace_id"], WORKSPACE);
+            assert_eq!(receipt["data"]["consent"]["digest"], digest(true));
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_uncorrelated_terminal_revoke_refusals_stay_unknown() {
+        let fixture = Fixture::new();
+        for disposition in [
+            ReceiptDisposition::RefusedNotStarted,
+            ReceiptDisposition::CancelledBeforeDispatch,
+        ] {
+            for fault in [
+                ReceiptFault::MissingHeader,
+                ReceiptFault::ForeignHeader,
+                ReceiptFault::ForeignOperation,
+                ReceiptFault::ForeignWorkspace,
+                ReceiptFault::ForeignKind,
+                ReceiptFault::ForeignConsentDigest,
+                ReceiptFault::ForeignActor,
+            ] {
+                let mutation = Mutation::Revoke;
+                let reply = Reply::RevokeTerminal(disposition, fault);
+                let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                assert_eq!(
+                    requests,
+                    vec![mutation.body()],
+                    "{disposition:?}/{fault:?}: no replay"
+                );
+                assert!(
+                    effects.is_empty(),
+                    "{disposition:?}/{fault:?}: refused original effect"
+                );
+                assert_unknown(&output, mutation, reply);
+            }
+        }
+        // Even a structurally valid not-started marker must name this
+        // operation and this mutation, not a different command's refusal.
+        for fault in [
+            ReceiptFault::ForeignRefusalOperation,
+            ReceiptFault::ForeignRefusalKind,
+        ] {
+            let mutation = Mutation::Revoke;
+            let reply = Reply::RevokeTerminal(ReceiptDisposition::RefusedNotStarted, fault);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(requests, vec![mutation.body()], "{fault:?}: no replay");
+            assert!(effects.is_empty());
+            assert_unknown(&output, mutation, reply);
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_correlated_expired_revoke_is_unknown_not_refused() {
+        let fixture = Fixture::new();
+        let mutation = Mutation::Revoke;
+        let reply = Reply::RevokeTerminal(ReceiptDisposition::ExpiredUnknown, ReceiptFault::None);
+        let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+        assert_eq!(
+            requests,
+            vec![mutation.body()],
+            "one original request, no replay"
+        );
+        assert_eq!(
+            effects,
+            vec![mutation.body()],
+            "expiry is not proof of no original effect"
+        );
+        assert_unknown(&output, mutation, reply);
+    }
+    #[test]
+    fn cad2009_hosted_app_proof_codes_need_correlated_usable_refusal_envelopes() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update] {
+            for code in ["release_unavailable", "check_unavailable"] {
+                for fault in [
+                    RefusalFault::ForeignHeader,
+                    RefusalFault::MalformedHeader,
+                    RefusalFault::MissingMessage,
+                    RefusalFault::NonStringMessage,
+                    RefusalFault::EmptyMessage,
+                ] {
+                    let reply = Reply::PreEffect503Fault(code, fault);
+                    let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                    assert_eq!(
+                        requests,
+                        vec![mutation.body()],
+                        "{mutation:?}/{code}/{fault:?}: exactly one original request"
+                    );
+                    assert!(
+                        effects.is_empty(),
+                        "{mutation:?}/{code}/{fault:?}: source refused before effect"
+                    );
+                    // Knowing the source refused is fixture ground truth, not
+                    // evidence the client can recover from a foreign/unusable
+                    // response. The CLI must not claim definite rejection.
+                    assert_unknown(&output, mutation, reply);
+                }
+            }
+        }
+    }
+    #[test]
+    fn cad2009_hosted_app_reconcile_accepts_complete_receipts_for_another_owner() {
+        let fixture = Fixture::new();
+        for kind in ["install", "update", "revoke"] {
+            let mutation = Mutation::Reconcile;
+            let reply = Reply::ReconcileReceipt(kind, ReconcileFault::None);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(
+                requests,
+                vec![json!({})],
+                "{kind}: exactly one reconcile request"
+            );
+            assert_eq!(
+                effects,
+                vec![json!({})],
+                "{kind}: one journal observation, no replay"
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{kind}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let receipt: Value = serde_json::from_slice(&output.stdout)
+                .expect("the complete confirmed reconciliation must remain inspectable");
+            assert_eq!(receipt, successful_reconcile_receipt(kind));
+            assert_eq!(
+                receipt["data"]["consent"]["actor_id"],
+                "user_previous_owner"
+            );
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_reconcile_rejects_incomplete_or_incoherent_success_receipts() {
+        let fixture = Fixture::new();
+        for fault in [
+            ReconcileFault::IncompleteEnvelope,
+            ReconcileFault::ForeignOperation,
+            ReconcileFault::ForeignWorkspace,
+            ReconcileFault::MissingHeader,
+            ReconcileFault::ForeignHeader,
+            ReconcileFault::MissingVersion,
+            ReconcileFault::ForeignVersion,
+            ReconcileFault::MissingKind,
+            ReconcileFault::InvalidKind,
+            ReconcileFault::MissingConsent,
+            ReconcileFault::MissingActor,
+            ReconcileFault::IncompleteConsent,
+            ReconcileFault::MalformedConsentDigest,
+            ReconcileFault::MissingInstallation,
+            ReconcileFault::MissingInstallationVersion,
+            ReconcileFault::ForeignInstallationApp,
+            ReconcileFault::ForeignInstallationDigest,
+            ReconcileFault::RevokeStillApproved,
+            ReconcileFault::RefusalOnSuccess,
+            ReconcileFault::MissingUpdatedAt,
+        ] {
+            let mutation = Mutation::Reconcile;
+            let reply = Reply::ReconcileReceipt("revoke", fault);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(requests, vec![json!({})], "{fault:?}: no reconcile replay");
+            assert_eq!(
+                effects,
+                vec![json!({})],
+                "{fault:?}: original journal custody retained"
+            );
+            assert_unknown(&output, mutation, reply);
+        }
+    }
+    #[test]
+    fn cad2009_hosted_app_reconcile_preserves_an_earlier_owners_definite_refusals() {
+        let fixture = Fixture::new();
+        for disposition in [
+            ReceiptDisposition::CancelledBeforeDispatch,
+            ReceiptDisposition::RefusedNotStarted,
+        ] {
+            let mutation = Mutation::Reconcile;
+            let reply = Reply::ReconcileTerminal(disposition);
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(
+                requests,
+                vec![json!({})],
+                "{disposition:?}: one receipt read"
+            );
+            assert!(
+                effects.is_empty(),
+                "{disposition:?}: no original mutation redispatched"
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "{disposition:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut expected = terminal_revoke_receipt(disposition);
+            expected["data"]["consent"]["actor_id"] = json!("user_previous_owner");
+            let actual: Value = serde_json::from_slice(&output.stdout)
+                .expect("the complete earlier-owner refusal remains inspectable");
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_reconcile_keeps_earlier_owner_expiry_and_pending_unknown() {
+        let fixture = Fixture::new();
+        for reply in [
+            Reply::ReconcileTerminal(ReceiptDisposition::ExpiredUnknown),
+            Reply::ReconcilePending,
+        ] {
+            let mutation = Mutation::Reconcile;
+            let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+            assert_eq!(
+                requests,
+                vec![json!({})],
+                "{reply:?}: no reconciliation replay"
+            );
+            assert!(
+                effects.is_empty(),
+                "{reply:?}: never redispatch the original app mutation"
+            );
+            assert_unknown(&output, mutation, reply);
+        }
+    }
+    // Independently authored CAD-2009 Spec/security acceptance; do not weaken.
+    #[test]
+    fn cad2009_app_proven_refusal_with_conflicting_evidence_is_unknown_without_replay() {
+        let fixture = Fixture::new();
+        for mutation in [
+            Mutation::Install,
+            Mutation::Update,
+            Mutation::Revoke,
+            Mutation::Reconcile,
+        ] {
+            for flat in [false, true] {
+                for conflict in [
+                    RefusalContradiction::DataSucceeded,
+                    RefusalContradiction::OperationDispatched,
+                    RefusalContradiction::OperationExpired,
+                    RefusalContradiction::UnknownMutation,
+                    RefusalContradiction::UnknownOutcome,
+                ] {
+                    let reply = Reply::Action4xx(Action4xxReply::Contradictory(conflict, flat));
+                    let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                    assert_eq!(
+                        requests,
+                        vec![mutation.body()],
+                        "{mutation:?}/{flat}/{conflict:?}: no replay"
+                    );
+                    assert_eq!(
+                        effects,
+                        vec![mutation.body()],
+                        "conflicting proof must not erase the recorded effect or observation"
+                    );
+                    assert_unknown(&output, mutation, reply);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_app_tenant_revoke_unsupported_is_definite_without_effect_or_replay() {
+        let fixture = Fixture::new();
+        let mutation = Mutation::Revoke;
+        let reply = Reply::Action4xx(Action4xxReply::TenantRevokeUnsupported);
+        let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+        assert_eq!(
+            requests,
+            vec![mutation.body()],
+            "unsupported revoke must not be replayed or replaced with disable"
+        );
+        assert!(
+            effects.is_empty(),
+            "the tenant refuses before journal begin or activation"
+        );
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        let response: Value = serde_json::from_slice(&output.stdout)
+            .expect("a proven tenant refusal must retain the original JSON response");
+        assert_eq!(
+            response,
+            json!({"ok": false, "error": {
+                "code": "revoke_unsupported",
+                "message": "This board has no package approval to revoke. Nothing was changed. Disable the app on the board instead."
+            }})
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("\"kind\":\"unknown\""));
+    }
+    // Independently authored CAD-2009 Spec/security acceptance; do not weaken.
+    #[test]
+    fn cad2009_app_reported_blocker_stays_unknown_and_retains_both_recovery_identities() {
+        let fixture = Fixture::new();
+        assert_ne!(OP, BLOCKER_OP);
+        for mutation in [Mutation::Install, Mutation::Update, Mutation::Revoke] {
+            for state in ["prepared", "dispatched"] {
+                // A changed well-formed app name cannot be proved foreign
+                // from listing_id or install_id in this request schema.
+                for fault in [BlockerFault::None, BlockerFault::ForeignApp] {
+                    let reply = Reply::Action4xx(Action4xxReply::Blocking(state, fault));
+                    let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                    assert_eq!(requests, vec![mutation.body()], "{mutation:?}/{state}/{fault:?}: no replay, substituted action or extra catalogue read");
+                    assert_eq!(
+                        effects,
+                        vec![mutation.body()],
+                        "a reported blocker must not erase a possible current-attempt effect"
+                    );
+                    assert_unknown(&output, mutation, reply);
+                    let guidance = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&output.stderr),
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                    // The existing helper already requires the requested OP,
+                    // same-org scope, exit 1 and no-blind-replay guidance.
+                    // A coherent same-workspace report adds a recovery hint;
+                    // it never replaces OP or proves the blocker had no effect.
+                    assert!(
+                        guidance.contains(BLOCKER_OP),
+                        "retain the reported blocker identity: {guidance}"
+                    );
+                    assert!(
+                        guidance.contains(&format!("app catalog operation {BLOCKER_OP}")),
+                        "reported blocker must be inspectable: {guidance}"
+                    );
+                    assert!(
+                        guidance.contains(&format!("app catalog reconcile {BLOCKER_OP}")),
+                        "reported blocker must be recoverable without replay: {guidance}"
+                    );
+                    let rendered = guidance.to_ascii_lowercase();
+                    for false_claim in [
+                        "nothing was changed",
+                        "not_started",
+                        "blocker was not applied",
+                    ] {
+                        assert!(
+                            !rendered.contains(false_claim),
+                            "unbound pending report proves no no-effect outcome: {guidance}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_app_unproved_blockers_remain_unknown_without_replay() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update, Mutation::Revoke] {
+            for state in ["prepared", "dispatched"] {
+                for fault in [
+                    BlockerFault::Plain,
+                    BlockerFault::Incomplete,
+                    BlockerFault::ForeignWorkspace,
+                    BlockerFault::ForeignApp,
+                    BlockerFault::HeaderMismatch,
+                    BlockerFault::MissingHeader,
+                    BlockerFault::MalformedHeader,
+                ] {
+                    let reply = Reply::Action4xx(Action4xxReply::Blocking(state, fault));
+                    let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                    assert_eq!(
+                        requests,
+                        vec![mutation.body()],
+                        "{mutation:?}/{state}/{fault:?}: no replay"
+                    );
+                    assert_eq!(
+                        effects,
+                        vec![mutation.body()],
+                        "invalid blocker proof must not erase a possible current-attempt effect"
+                    );
+                    assert_unknown(&output, mutation, reply);
+                }
+            }
+        }
+    }
+    // Independently authored CAD-2009 Spec/security acceptance; do not weaken.
+    // Historical producer: AgenticOS head marker
+    // 5f3ba80b2a2760eb3f24c714744d772a72a79bdc.
+    #[test]
+    fn cad2009_app_action_postdispatch_409s_are_unknown_without_replay() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update] {
+            let refused = if matches!(mutation, Mutation::Install) {
+                "install_refused"
+            } else {
+                "update_refused"
+            };
+            for code in [refused, "host_incompatible"] {
+                let reply = Reply::Action4xx(Action4xxReply::PostDispatch(code));
+                let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                assert_eq!(
+                    requests,
+                    vec![mutation.body()],
+                    "{mutation:?}/{code}: no replay"
+                );
+                assert_eq!(
+                    effects,
+                    vec![mutation.body()],
+                    "original effect was recorded before the ambiguous reply"
+                );
+                assert_unknown(&output, mutation, reply);
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_app_action_unusable_or_unrecognized_4xx_are_unknown_without_replay() {
+        let fixture = Fixture::new();
+        let mut cases = vec![
+            Action4xxReply::EmptyObject,
+            Action4xxReply::Array,
+            Action4xxReply::Null,
+            Action4xxReply::MissingError,
+            Action4xxReply::MissingCode,
+            Action4xxReply::NonStringCode,
+            Action4xxReply::MissingMessage,
+            Action4xxReply::NonStringMessage,
+            Action4xxReply::EmptyMessage,
+            Action4xxReply::WrongOk,
+            Action4xxReply::WrongStatus,
+            Action4xxReply::ForeignHeader,
+            Action4xxReply::MalformedHeader,
+        ];
+        cases.extend(
+            [400, 401, 403, 404, 409, 410, 413, 422]
+                .into_iter()
+                .map(Action4xxReply::Unrecognized),
+        );
+        for mutation in [
+            Mutation::Install,
+            Mutation::Update,
+            Mutation::Revoke,
+            Mutation::Reconcile,
+        ] {
+            for &case in &cases {
+                let reply = Reply::Action4xx(case);
+                let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                assert_eq!(
+                    requests,
+                    vec![mutation.body()],
+                    "{mutation:?}/{case:?}: no replay"
+                );
+                assert_eq!(
+                    effects,
+                    vec![mutation.body()],
+                    "unproved answer must not erase the original effect"
+                );
+                assert_unknown(&output, mutation, reply);
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_app_action_source_proven_4xx_stay_definite_without_effect_or_replay() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update] {
+            for case in [
+                Action4xxReply::PreEffect(400, "invalid_request"),
+                Action4xxReply::PreEffect(403, "owner_only"),
+                Action4xxReply::PreEffect(404, "not_found"),
+                Action4xxReply::PreEffect(409, "operation_not_dispatched"),
+                Action4xxReply::PreEffect(409, "release_unavailable"),
+                Action4xxReply::PreEffectAuth(401, "unauthorized"),
+                Action4xxReply::PreEffectAuth(403, "forbidden"),
+                Action4xxReply::PreEffectAuth(403, "human_session_required"),
+            ] {
+                let reply = Reply::Action4xx(case);
+                let (output, requests, effects) = fixture.exercise_counted(mutation, reply);
+                assert_eq!(
+                    requests,
+                    vec![mutation.body()],
+                    "{mutation:?}/{case:?}: no replay"
+                );
+                assert!(
+                    effects.is_empty(),
+                    "source-proven refusal preceded the effect"
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(3),
+                    "{mutation:?}/{case:?}: {output:?}"
+                );
+                let response: Value = serde_json::from_slice(&output.stdout)
+                    .expect("a proven refusal must retain the original JSON response");
+                let code = match case {
+                    Action4xxReply::PreEffect(_, code) => response["error"]["code"] == code,
+                    Action4xxReply::PreEffectAuth(_, code) => response["code"] == code,
+                    _ => unreachable!(),
+                };
+                assert!(code, "wrong refusal returned: {response}");
+                assert_eq!(response["ok"], false);
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("\"kind\":\"unknown\""));
+            }
+        }
+    }
+    // Independently authored CAD-2009 Spec/security acceptance; do not weaken.
+    #[test]
+    fn cad2009_web_status_cli_honors_compact_and_pretty_through_daemon_rpc() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let expected = json!({
+            "phase": "status",
+            "org": ORG,
+            "site": "synthetic-site",
+            "siteId": "site_000000002009",
+            "revision": 4,
+            "state": "ready",
+            "liveUrl": null,
+            "nested": {"ready": true, "values": [1, 2]}
+        });
+        let mut parsed = Vec::new();
+        for format in ["compact", "pretty"] {
+            let root = tempfile::Builder::new()
+                .prefix("cad2009-web-json-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let config = root.path().join("config/cadence");
+            let auth = config.join("remote-auth");
+            let state = root.path().join("state");
+            fs::create_dir_all(&auth).unwrap();
+            fs::create_dir(&state).unwrap();
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o700)).unwrap();
+            private_file(
+                &config.join("orgs.json"),
+                &serde_json::to_vec(&json!({
+                    "selected": {"org": ORG},
+                    "connections": [{"selection": {"org": ORG}, "destination": {
+                        "mode": "remote", "endpoint": ENDPOINT, "org_id": WORKSPACE
+                    }}]
+                }))
+                .unwrap(),
+            );
+            let expires = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600;
+            private_file(&auth.join(format!("cli-{ORG}.json")), &serde_json::to_vec(&json!({
+                "version": "hosted-cadence-auth.v1", "organization_id": WORKSPACE,
+                "organization_slug": ORG, "audience": ENDPOINT,
+                "issuer": "https://issuer.board.localhost", "subject_id": "user_cad2009_synthetic",
+                "capabilities": ["web.read"], "access_token": TOKEN, "expires_at": expires
+            })).unwrap());
+
+            let listener = UnixListener::bind(cadence_agent::client::socket_path(&state)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (mut completion, completed) = UnixStream::pair().unwrap();
+            let document = expected.clone();
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut requests = Vec::new();
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "web JSON CLI fixture did not settle");
+                    let mut fds = [
+                        libc::pollfd {
+                            fd: listener.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: completed.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: both initialized pollfd entries refer to live owned descriptors.
+                    let ready = unsafe {
+                        libc::poll(
+                            fds.as_mut_ptr(),
+                            2,
+                            remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+                        )
+                    };
+                    if ready < 0 {
+                        assert_eq!(
+                            std::io::Error::last_os_error().kind(),
+                            std::io::ErrorKind::Interrupted
+                        );
+                        continue;
+                    }
+                    assert!(ready > 0, "web JSON CLI fixture deadline elapsed");
+                    // Drain a queued extra request before accepting subprocess completion.
+                    if fds[0].revents & libc::POLLIN != 0 {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        let mut line = String::new();
+                        BufReader::new(stream.try_clone().unwrap())
+                            .take(65_537)
+                            .read_line(&mut line)
+                            .unwrap();
+                        assert!(line.len() <= 65_536 && line.ends_with('\n'));
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        assert!(
+                            requests.is_empty(),
+                            "unexpected extra daemon request: {request}"
+                        );
+                        assert_eq!(request["method"], "platform_call");
+                        assert_eq!(
+                            request["params"],
+                            json!({
+                                "platform": "agenticos-web", "tool": "site_status", "account": ORG,
+                                "input": {"org": ORG, "slug": "synthetic-site", "wake_timeout": 3}
+                            })
+                        );
+                        requests.push(request);
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"ok": true, "result": {
+                                "result": "executed", "effect": "read", "platform_result": document
+                            }})
+                        )
+                        .unwrap();
+                    } else if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                        return requests;
+                    } else {
+                        panic!("unexpected web JSON fixture readiness");
+                    }
+                }
+            });
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+            command
+                .env_clear()
+                .current_dir(root.path())
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_STATE_HOME", root.path().join("xdg-state"))
+                .env("CADENCE_JSON", format)
+                .args(["--org", ORG, "--wake-timeout", "3", "--state-dir"])
+                .arg(&state)
+                .args(["web", "status", "synthetic-site"]);
+            let output = bounded_output(&mut command);
+            completion.write_all(b"done").unwrap();
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(output.status.code(), Some(0), "{format}: {output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            let value: Value = serde_json::from_str(&text).expect("exactly one full JSON document");
+            assert_eq!(value, expected, "format selection changed the document");
+            if format == "compact" {
+                assert_eq!(
+                    text.lines().count(),
+                    1,
+                    "compact web JSON was multiline: {text:?}"
+                );
+            } else {
+                assert!(
+                    text.lines().count() > 1,
+                    "pretty web JSON was not pretty: {text:?}"
+                );
+            }
+            assert!(text.ends_with('\n'));
+            parsed.push(value);
+        }
+        assert_eq!(parsed[0], parsed[1]);
+    }
+    #[test]
+    fn cad2009_hosted_app_effectful_unusable_replies_are_unknown_and_not_replayed() {
+        let fixture = Fixture::new();
+        for mutation in [Mutation::Install, Mutation::Update, Mutation::Revoke] {
+            for reply in [
+                Reply::Dropped,
+                Reply::NonJson,
+                Reply::Truncated,
+                Reply::Oversized,
+                Reply::Redirect,
+                Reply::UnprovedJson,
+                Reply::ProducerUncertain,
+            ] {
+                let (output, effects) = fixture.exercise(mutation, reply);
+                assert_eq!(
+                    effects,
+                    vec![mutation.body()],
+                    "{mutation:?}/{reply:?}: mutation retried or never dispatched"
+                );
+                assert_unknown(&output, mutation, reply);
+            }
+        }
+    }
+
+    #[test]
+    fn cad2009_hosted_app_missing_human_issuer_pin_is_definitely_pre_dispatch() {
+        let fixture = Fixture::new();
+        fixture.credential(false);
+        let (output, effects) = fixture.exercise(Mutation::Revoke, Reply::Dropped);
+        assert!(
+            effects.is_empty(),
+            "a locally refused credential dispatched an effect"
+        );
+        assert_eq!(output.status.code(), Some(3));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let start = stderr.find('{').expect("missing local refusal diagnostic");
+        let error: Value = serde_json::from_str(&stderr[start..]).unwrap();
+        assert_eq!(error["kind"], "rejected");
+        assert!(
+            error["error"].as_str().unwrap().contains("issuer"),
+            "wrong local refusal: {error}"
+        );
+    }
+}

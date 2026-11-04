@@ -27,7 +27,9 @@ pub(super) fn run(
             let mut req = key.clone();
             req["tail"] = json!(true);
             let page = client::rpc(&state_dir, method, req)?;
-            print_json(&page);
+            if !cadence_agent::output::stream_json(&page) {
+                return Ok(0);
+            }
             if !follow {
                 return Ok(0);
             }
@@ -43,8 +45,8 @@ pub(super) fn run(
             .get("events")
             .and_then(Value::as_array)
             .is_some_and(Vec::is_empty);
-        if !empty || !follow {
-            print_json(&page);
+        if (!empty || !follow) && !cadence_agent::output::stream_json(&page) {
+            return Ok(0);
         }
         cursor = page.get("cursor").and_then(Value::as_i64).unwrap_or(cursor);
         if !follow {

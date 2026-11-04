@@ -25,8 +25,12 @@
 //! [`crate::remote_cli::PROJECT_SCOPED_GATE_VERBS`] reports that as the
 //! release-order problem it is.
 //!
-//! Every answer is checked strictly. A missing, malformed or foreign
-//! answer is a refusal, never an approval, a pass or a default.
+//! Every answer is checked strictly. A missing, malformed or foreign *read*
+//! answer is a refusal, never an approval, a pass or a default. A write's 2xx
+//! receipt that does not echo the request proves nothing about the write it
+//! answered — the call already ran, so that outcome is unknown and the caller
+//! re-reads the same evidence before repeating the write (see
+//! [`check_receipt`]).
 
 use serde_json::{json, Map, Value};
 use std::time::{Duration, Instant};
@@ -40,6 +44,25 @@ fn refuse(why: impl std::fmt::Display) -> Error {
     Error::rejected(format!("hosted merge gate: {why}"))
 }
 
+/// Run one write's post-dispatch receipt checks. The 2xx answer already
+/// arrived, so a receipt that does not echo the request proves nothing about
+/// the write: it may have committed, and the outcome is unknown. `why` keeps
+/// the specific mismatch and `verb` names the read that reconciles it, so the
+/// caller re-reads that evidence before repeating the write — never a
+/// rejection that reads as "nothing was written".
+///
+/// Only receipt validation uses this. A refusal decided before the request
+/// exists keeps [`refuse`]: it proves no effect.
+fn check_receipt(verb: &str, check: impl FnOnce() -> Result<Value>) -> Result<Value> {
+    check().map_err(|why| {
+        let reconcile = crate::remote_cli::mutation_reconcile(verb).unwrap_or(
+            "the write may or may not have been applied — read the same evidence back \
+             before repeating it",
+        );
+        Error::unknown(format!("{why} — {reconcile}. Nothing was retried"))
+    })
+}
+
 /// One hosted verb. A checked conflict is a refusal here: none of these
 /// calls has a "not written, resync" answer the caller could act on.
 fn call(
@@ -51,9 +74,14 @@ fn call(
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(wake_timeout))
         .ok_or_else(|| refuse("invalid wake timeout"))?;
-    match crate::remote_cli::call_verb(target, verb, args, deadline, wake_timeout, |line| {
-        eprintln!("{line}")
-    })? {
+    match crate::remote_cli::call_verb(
+        target,
+        verb,
+        args,
+        deadline,
+        wake_timeout,
+        crate::output::eprint_line,
+    )? {
         RemoteAnswer::Ok(body) => Ok(body),
         RemoteAnswer::Conflict(body) => Err(refuse(format!(
             "`{verb}` answered a conflict: {}",
@@ -418,7 +446,8 @@ pub fn requirements(
 /// repos and optional `delivery:` section through `delivery_policy_set`.
 /// Each repo must be `owner/name` and the section must parse with the
 /// native parser before anything is sent; the receipt must echo exactly
-/// the project and repos recorded.
+/// the project and repos recorded, or the outcome is unknown and the caller
+/// reads the project's delivery policy again before repeating it.
 pub fn set_delivery(
     target: &RemoteTarget,
     wake_timeout: u64,
@@ -458,32 +487,35 @@ fn set_delivery_repos(repos: &[String]) -> Result<Vec<String>> {
 }
 
 /// The receipt `{state:"recorded", project, repos, delivery, revision}`
-/// must echo exactly what was sent.
+/// must echo exactly what was sent; anything less is an unknown outcome, not
+/// a recorded policy.
 pub(crate) fn set_delivery_answer(
     body: &Value,
     project: &str,
     repos: &[String],
     delivery: Option<&str>,
 ) -> Result<Value> {
-    let echoed = body["repos"].as_array().map(|list| {
-        list.iter()
-            .map(|r| r.as_str().unwrap_or_default().to_ascii_lowercase())
-            .collect::<Vec<_>>()
-    });
-    let asked: Vec<String> = repos.iter().map(|r| r.to_ascii_lowercase()).collect();
-    if body["state"].as_str() != Some("recorded")
-        || body["project"].as_str() != Some(project)
-        || echoed.as_ref() != Some(&asked)
-        || body["delivery"].as_str() != delivery
-        || (delivery.is_none() && !body["delivery"].is_null())
-        || !body["revision"].is_u64()
-    {
-        return Err(refuse(format!(
-            "`delivery_policy_set` receipt does not name exactly project {project} and its repos: {}",
-            short(body)
-        )));
-    }
-    Ok(body.clone())
+    check_receipt("delivery_policy_set", || {
+        let echoed = body["repos"].as_array().map(|list| {
+            list.iter()
+                .map(|r| r.as_str().unwrap_or_default().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        });
+        let asked: Vec<String> = repos.iter().map(|r| r.to_ascii_lowercase()).collect();
+        if body["state"].as_str() != Some("recorded")
+            || body["project"].as_str() != Some(project)
+            || echoed.as_ref() != Some(&asked)
+            || body["delivery"].as_str() != delivery
+            || (delivery.is_none() && !body["delivery"].is_null())
+            || !body["revision"].is_u64()
+        {
+            return Err(refuse(format!(
+                "`delivery_policy_set` receipt does not name exactly project {project} and its repos: {}",
+                short(body)
+            )));
+        }
+        Ok(body.clone())
+    })
 }
 
 // ---- audit approval / scope / approve ---------------------------------------
@@ -740,7 +772,8 @@ pub fn verdict(
 /// The receipt `{state:"recorded", duplicate, project, repo, issue, pr, head,
 /// reviewer_id, github_login, identity_source, verdict}` must name exactly the
 /// binding and verdict that was sent. A receipt that does not is not evidence
-/// this verdict landed, so it refuses instead of printing a success.
+/// this verdict landed: the outcome is unknown, so the caller re-reads the
+/// verdicts for the same head instead of printing a success or repeating it.
 fn verdict_answer(
     body: &Value,
     binding: &GateBinding,
@@ -750,48 +783,50 @@ fn verdict_answer(
     section_outcome: &str,
 ) -> Result<Value> {
     let verb = "audit_verdict_project";
-    if body["state"].as_str() != Some("recorded") {
-        return Err(refuse(format!(
-            "`{verb}` did not record the verdict: {}",
-            short(body)
-        )));
-    }
-    binding.echoes(body, verb, true)?;
-    if !body["duplicate"].is_boolean() {
-        return Err(refuse(format!("`{verb}` receipt has no duplicate flag")));
-    }
-    if body["identity_source"].as_str() != Some("owner-attested") {
-        return Err(refuse(format!(
-            "`{verb}` receipt does not name an owner-attested identity"
-        )));
-    }
-    let login = text(body, "github_login", verb)?;
-    if !valid_login(login) {
-        return Err(refuse(format!(
-            "`{verb}` receipt names github_login {login:?}, which is not a GitHub login"
-        )));
-    }
-    let reviewer = text(body, "reviewer_id", verb)?;
-    let note = body
-        .get("verdict")
-        .filter(|note| note.is_object())
-        .ok_or_else(|| refuse(format!("`{verb}` receipt has no verdict row")))?;
-    // The note row is the tenant's verdict entry: it carries the project and
-    // repo, not the issue/PR/head tuple (those are on the receipt), so only
-    // the fields it does carry are checked.
-    binding.echoes(note, verb, false)?;
-    if note["kind"].as_str() != Some(kind)
-        || note["outcome"].as_str() != Some(outcome)
-        || note["title_outcome"].as_str() != Some(title_outcome)
-        || note["section_outcome"].as_str() != Some(section_outcome)
-        || note["reviewer_id"].as_str() != Some(reviewer)
-    {
-        return Err(refuse(format!(
-            "`{verb}` receipt does not echo the verdict sent: {}",
-            short(note)
-        )));
-    }
-    Ok(body.clone())
+    check_receipt(verb, || {
+        if body["state"].as_str() != Some("recorded") {
+            return Err(refuse(format!(
+                "`{verb}` did not record the verdict: {}",
+                short(body)
+            )));
+        }
+        binding.echoes(body, verb, true)?;
+        if !body["duplicate"].is_boolean() {
+            return Err(refuse(format!("`{verb}` receipt has no duplicate flag")));
+        }
+        if body["identity_source"].as_str() != Some("owner-attested") {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not name an owner-attested identity"
+            )));
+        }
+        let login = text(body, "github_login", verb)?;
+        if !valid_login(login) {
+            return Err(refuse(format!(
+                "`{verb}` receipt names github_login {login:?}, which is not a GitHub login"
+            )));
+        }
+        let reviewer = text(body, "reviewer_id", verb)?;
+        let note = body
+            .get("verdict")
+            .filter(|note| note.is_object())
+            .ok_or_else(|| refuse(format!("`{verb}` receipt has no verdict row")))?;
+        // The note row is the tenant's verdict entry: it carries the project and
+        // repo, not the issue/PR/head tuple (those are on the receipt), so only
+        // the fields it does carry are checked.
+        binding.echoes(note, verb, false)?;
+        if note["kind"].as_str() != Some(kind)
+            || note["outcome"].as_str() != Some(outcome)
+            || note["title_outcome"].as_str() != Some(title_outcome)
+            || note["section_outcome"].as_str() != Some(section_outcome)
+            || note["reviewer_id"].as_str() != Some(reviewer)
+        {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not echo the verdict sent: {}",
+                short(note)
+            )));
+        }
+        Ok(body.clone())
+    })
 }
 
 /// `cadence audit verdicts` (CAD-1946, AOS-473, CAD-2001) for a hosted org:
@@ -1071,8 +1106,9 @@ pub(crate) fn reviewers_answer(body: &Value, project: &str) -> Result<(Value, i3
 /// `cadence audit reviewers set` for a hosted org: replace one project's whole
 /// eligibility map. The tenant checks the live owner and the `audit.approve`
 /// scope; the receipt must name exactly the project and principals sent, or
-/// the command refuses — an eligibility change that was not recorded must
-/// never read as recorded. Zero principals is a real replacement (it clears
+/// the outcome is unknown and the caller re-reads the map before repeating the
+/// write — an eligibility change that was not recorded must never read as
+/// recorded. Zero principals is a real replacement (it clears
 /// the project), not a no-op.
 pub fn set_reviewers(
     target: &RemoteTarget,
@@ -1099,38 +1135,40 @@ pub(crate) fn set_reviewers_answer(
     subjects: &[String],
 ) -> Result<Value> {
     let verb = "audit_reviewers_project_set";
-    if body["state"].as_str() != Some("recorded") {
-        return Err(refuse(format!(
-            "`{verb}` did not record the eligibility map: {}",
-            short(body)
-        )));
-    }
-    if body["project"].as_str() != Some(project) {
-        return Err(refuse(format!(
-            "`{verb}` receipt names another project than {project}"
-        )));
-    }
-    let rows = body["reviewers"]
-        .as_array()
-        .ok_or_else(|| refuse(format!("`{verb}` receipt has no reviewers list")))?
-        .iter()
-        .map(|row| eligibility_row(row, project, verb))
-        .collect::<Result<Vec<_>>>()?;
-    // The receipt proves the map that now stands: exactly the principals sent.
-    let mut recorded: Vec<&str> = rows
-        .iter()
-        .filter_map(|row| row["subject_id"].as_str())
-        .collect();
-    let mut sent: Vec<&str> = subjects.iter().map(String::as_str).collect();
-    recorded.sort_unstable();
-    sent.sort_unstable();
-    if recorded != sent {
-        return Err(refuse(format!(
-            "`{verb}` receipt does not echo the {} principal(s) sent",
-            subjects.len()
-        )));
-    }
-    Ok(json!({"state": "recorded", "project": project, "reviewers": rows}))
+    check_receipt(verb, || {
+        if body["state"].as_str() != Some("recorded") {
+            return Err(refuse(format!(
+                "`{verb}` did not record the eligibility map: {}",
+                short(body)
+            )));
+        }
+        if body["project"].as_str() != Some(project) {
+            return Err(refuse(format!(
+                "`{verb}` receipt names another project than {project}"
+            )));
+        }
+        let rows = body["reviewers"]
+            .as_array()
+            .ok_or_else(|| refuse(format!("`{verb}` receipt has no reviewers list")))?
+            .iter()
+            .map(|row| eligibility_row(row, project, verb))
+            .collect::<Result<Vec<_>>>()?;
+        // The receipt proves the map that now stands: exactly the principals sent.
+        let mut recorded: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| row["subject_id"].as_str())
+            .collect();
+        let mut sent: Vec<&str> = subjects.iter().map(String::as_str).collect();
+        recorded.sort_unstable();
+        sent.sort_unstable();
+        if recorded != sent {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not echo the {} principal(s) sent",
+                subjects.len()
+            )));
+        }
+        Ok(json!({"state": "recorded", "project": project, "reviewers": rows}))
+    })
 }
 
 /// One workspace identity attestation: the principal, the GitHub login the
@@ -1188,8 +1226,9 @@ pub(crate) fn identities_answer(body: &Value) -> Result<(Value, i32)> {
 
 /// `cadence audit identities set` for a hosted org: replace the workspace's
 /// owner-attested identity map. The receipt must echo exactly the rows sent
-/// (the tenant lowercases each login) or the command refuses: an attestation
-/// that was not recorded must never read as recorded.
+/// (the tenant lowercases each login) or the outcome is unknown: the caller
+/// re-reads the map before repeating the write, because an attestation that
+/// was not recorded must never read as recorded.
 pub fn set_identities(
     target: &RemoteTarget,
     wake_timeout: u64,
@@ -1213,41 +1252,43 @@ pub(crate) fn set_identities_answer(
     identities: &[(String, String)],
 ) -> Result<Value> {
     let verb = "audit_identities_set";
-    if body["state"].as_str() != Some("recorded") {
-        return Err(refuse(format!(
-            "`{verb}` did not record the identities: {}",
-            short(body)
-        )));
-    }
-    let rows = body["identities"]
-        .as_array()
-        .ok_or_else(|| refuse(format!("`{verb}` receipt has no identities list")))?
-        .iter()
-        .map(|row| identity_row(row, verb))
-        .collect::<Result<Vec<_>>>()?;
-    let key = |row: &Value| {
-        (
-            row["subject_id"].as_str().unwrap_or_default().to_string(),
-            row["github_login"]
-                .as_str()
-                .unwrap_or_default()
-                .to_ascii_lowercase(),
-        )
-    };
-    let mut recorded: Vec<(String, String)> = rows.iter().map(key).collect();
-    let mut sent: Vec<(String, String)> = identities
-        .iter()
-        .map(|(subject, login)| (subject.clone(), login.to_ascii_lowercase()))
-        .collect();
-    recorded.sort();
-    sent.sort();
-    if recorded != sent {
-        return Err(refuse(format!(
-            "`{verb}` receipt does not echo the {} identity row(s) sent",
-            identities.len()
-        )));
-    }
-    Ok(json!({"state": "recorded", "identities": rows}))
+    check_receipt(verb, || {
+        if body["state"].as_str() != Some("recorded") {
+            return Err(refuse(format!(
+                "`{verb}` did not record the identities: {}",
+                short(body)
+            )));
+        }
+        let rows = body["identities"]
+            .as_array()
+            .ok_or_else(|| refuse(format!("`{verb}` receipt has no identities list")))?
+            .iter()
+            .map(|row| identity_row(row, verb))
+            .collect::<Result<Vec<_>>>()?;
+        let key = |row: &Value| {
+            (
+                row["subject_id"].as_str().unwrap_or_default().to_string(),
+                row["github_login"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            )
+        };
+        let mut recorded: Vec<(String, String)> = rows.iter().map(key).collect();
+        let mut sent: Vec<(String, String)> = identities
+            .iter()
+            .map(|(subject, login)| (subject.clone(), login.to_ascii_lowercase()))
+            .collect();
+        recorded.sort();
+        sent.sort();
+        if recorded != sent {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not echo the {} identity row(s) sent",
+                identities.len()
+            )));
+        }
+        Ok(json!({"state": "recorded", "identities": rows}))
+    })
 }
 
 pub(crate) fn scope_answer(body: &Value, issue: &str) -> Result<(Value, i32)> {
@@ -1288,8 +1329,9 @@ pub(crate) fn scope_answer(body: &Value, issue: &str) -> Result<(Value, i32)> {
 /// `cadence audit approve` (merge, by the operator) for a hosted org. The
 /// project and the issue the approval authorizes both travel with the exact
 /// repo, PR and head, and the hosted org decides who may approve. The receipt
-/// must name exactly that binding, or the command refuses: an approval
-/// recorded for another issue or project is not this head's approval.
+/// must name exactly that binding, or the outcome is unknown: an approval
+/// recorded for another issue or project is not this head's approval, so the
+/// caller re-reads the approval before repeating the write.
 pub fn approve(
     target: &RemoteTarget,
     wake_timeout: u64,
@@ -1304,41 +1346,43 @@ pub fn approve(
 
 pub(crate) fn approve_answer(body: &Value, binding: &GateBinding, source: &str) -> Result<Value> {
     let verb = "audit_approve_project";
-    if body["state"].as_str() != Some("recorded") || body["action"].as_str() != Some("merge") {
-        return Err(refuse(format!(
-            "`{verb}` did not record a merge approval: {}",
-            short(body)
-        )));
-    }
-    binding.echoes(body, verb, false)?;
-    // The issue is part of the approval's identity: a receipt that names
-    // another ticket (or none) does not prove this merge was approved.
-    if body["issue"].as_str() != Some(binding.issue.as_str()) {
-        return Err(refuse(format!(
-            "`{verb}` receipt does not name issue {}",
-            binding.issue
-        )));
-    }
-    if body["head_sha"].as_str() != Some(binding.head.as_str())
-        || body["scope"]["pr"].as_u64() != Some(binding.pr)
-        || !body["scope"]["repo"]
-            .as_str()
-            .is_some_and(|r| r.eq_ignore_ascii_case(&binding.repo))
-    {
-        return Err(refuse(format!(
-            "`{verb}` receipt does not name exactly {}#{} at {}",
-            binding.repo, binding.pr, binding.head
-        )));
-    }
-    if body["source"].as_str() != Some(source) {
-        return Err(refuse(format!("`{verb}` receipt names another source")));
-    }
-    text(body, "approval_id", verb)?;
-    text(body, "recorded_via", verb)?;
-    if !body["duplicate"].is_boolean() {
-        return Err(refuse(format!("`{verb}` receipt has no duplicate flag")));
-    }
-    Ok(body.clone())
+    check_receipt(verb, || {
+        if body["state"].as_str() != Some("recorded") || body["action"].as_str() != Some("merge") {
+            return Err(refuse(format!(
+                "`{verb}` did not record a merge approval: {}",
+                short(body)
+            )));
+        }
+        binding.echoes(body, verb, false)?;
+        // The issue is part of the approval's identity: a receipt that names
+        // another ticket (or none) does not prove this merge was approved.
+        if body["issue"].as_str() != Some(binding.issue.as_str()) {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not name issue {}",
+                binding.issue
+            )));
+        }
+        if body["head_sha"].as_str() != Some(binding.head.as_str())
+            || body["scope"]["pr"].as_u64() != Some(binding.pr)
+            || !body["scope"]["repo"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case(&binding.repo))
+        {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not name exactly {}#{} at {}",
+                binding.repo, binding.pr, binding.head
+            )));
+        }
+        if body["source"].as_str() != Some(source) {
+            return Err(refuse(format!("`{verb}` receipt names another source")));
+        }
+        text(body, "approval_id", verb)?;
+        text(body, "recorded_via", verb)?;
+        if !body["duplicate"].is_boolean() {
+            return Err(refuse(format!("`{verb}` receipt has no duplicate flag")));
+        }
+        Ok(body.clone())
+    })
 }
 
 #[cfg(test)]
@@ -1676,7 +1720,10 @@ mod tests {
         let other = GateBinding::new("other", "favcrm/cadence", "CAD-1", 7, HEAD).unwrap();
         assert!(verdict_answer(&receipt, &other, "standards", "pass", "pass", "pass").is_err());
         // A receipt that does not echo the verdict sent proves nothing landed.
-        assert!(verdict_answer(&receipt, &binding(), "combined", "pass", "pass", "pass").is_err());
+        let error =
+            verdict_answer(&receipt, &binding(), "combined", "pass", "pass", "pass").unwrap_err();
+        assert_eq!(error.kind(), "unknown");
+        assert!(error.to_string().contains("audit verdicts"));
         assert!(
             verdict_answer(&receipt, &binding(), "standards", "revise", "pass", "pass").is_err()
         );

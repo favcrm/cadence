@@ -1152,7 +1152,7 @@ pub(super) fn run_remote(
         args,
         deadline,
         wake_timeout,
-        |line| eprintln!("{line}"),
+        eprint_line,
     ) {
         Ok(cadence_agent::remote_cli::RemoteAnswer::Ok(body)) => {
             print_json(&body);

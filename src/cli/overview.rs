@@ -20,15 +20,21 @@ pub(super) fn run_overview(
         ..cadence_agent::overview::Options::cli()
     };
     loop {
+        if cadence_agent::output::stdout_closed() {
+            return Ok(0);
+        }
         let view = cadence_agent::overview::overview_with(state_dir, &pm_dir, &opts)
             .map_err(Error::rejected)?;
         if json {
-            println!(
-                "{}",
-                cadence_agent::output::observation_body(&view, watch.is_some())?
-            );
+            let body = cadence_agent::output::observation_body(&view, watch.is_some())?;
+            if !cadence_agent::output::stream_line(&body) {
+                return Ok(0);
+            }
         } else {
             print_overview(&view);
+            if cadence_agent::output::stdout_closed() {
+                return Ok(0);
+            }
         }
         let Some(secs) = watch else {
             return Ok(0);

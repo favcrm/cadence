@@ -34,7 +34,7 @@ pub(crate) enum SkillAction {
 pub(super) fn show(name: &str, file: Option<&str>) -> Result<i32> {
     match cadence_agent::skill::show(name, file)? {
         cadence_agent::skill::ShowOutput::Manifest(manifest) => print_json(&manifest),
-        cadence_agent::skill::ShowOutput::File(text) => print!("{text}"),
+        cadence_agent::skill::ShowOutput::File(text) => cadence_agent::output::print_text(text),
     }
     Ok(0)
 }

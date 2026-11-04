@@ -296,7 +296,9 @@ pub(super) fn slot_acquire_loop(
             )));
         }
         if !announced {
-            eprintln!("waiting for a {kind} slot (position {position}, {reason})…");
+            cadence_agent::output::eprint_format_line(format_args!(
+                "waiting for a {kind} slot (position {position}, {reason})…"
+            ));
             announced = true;
         }
         if Instant::now() >= deadline {
@@ -401,10 +403,10 @@ pub(super) fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Resu
                      must declare a non-empty argv",
                 ));
             }
-            eprintln!(
+            eprint_line(&format!(
                 "slot {token} acquired ({kind}, pid {pid}) — running {}",
                 exec_argv[0]
-            );
+            ));
             use std::os::unix::process::CommandExt;
             let err = std::process::Command::new(&exec_argv[0])
                 .args(&exec_argv[1..])
@@ -517,15 +519,15 @@ pub(super) fn run_build_slot_launch(
             .take(12)
             .collect::<String>()
     };
-    eprintln!(
+    cadence_agent::output::eprint_format_line(format_args!(
         "runner {id} queued — {key}/{recipe} ({}) at {}, intent {} — log {}",
         r["kind"].as_str().unwrap_or("?"),
         short("head_sha"),
         short("digest"),
         r["log_path"].as_str().unwrap_or("?")
-    );
+    ));
     if detach {
-        println!("{id}");
+        print_line(&id);
         return Ok(0);
     }
     let log = PathBuf::from(r["log_path"].as_str().unwrap_or_default());
@@ -561,11 +563,15 @@ pub(super) fn run_build_slot_launch(
             receipt["signal"].as_i64(),
         ) {
             ("exited", Some(code), _) => {
-                eprintln!("runner {id} exited {code}");
+                cadence_agent::output::eprint_format_line(format_args!(
+                    "runner {id} exited {code}"
+                ));
                 Ok(code as i32)
             }
             ("exited", None, Some(sig)) => {
-                eprintln!("runner {id} killed by signal {sig}");
+                cadence_agent::output::eprint_format_line(format_args!(
+                    "runner {id} killed by signal {sig}"
+                ));
                 Ok(128 + sig as i32)
             }
             _ => Err(Error::rejected(format!(

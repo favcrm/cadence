@@ -1152,7 +1152,7 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
         AgentAction::Capture { alias } => {
             let out = client::rpc(&state_dir, "agent_capture", json!({"alias": alias}))?;
             if let Some(text) = out["capture"].as_str() {
-                println!("{text}");
+                print_line(text);
                 return Ok(0);
             }
             out

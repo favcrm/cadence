@@ -482,14 +482,20 @@ pub(super) fn run_status(
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let json = cadence_agent::output::json_selected(json_out);
     loop {
+        if cadence_agent::output::stdout_closed() {
+            return Ok(0);
+        }
         let view = status_view(state_dir, group, all, placement)?;
         if json {
-            println!(
-                "{}",
-                cadence_agent::output::observation_body(&view, watch.is_some())?
-            );
+            let body = cadence_agent::output::observation_body(&view, watch.is_some())?;
+            if !cadence_agent::output::stream_line(&body) {
+                return Ok(0);
+            }
         } else {
             print_status_table(&view);
+            if cadence_agent::output::stdout_closed() {
+                return Ok(0);
+            }
         }
         let Some(secs) = watch else {
             return Ok(0);

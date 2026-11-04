@@ -671,18 +671,10 @@ fn parse_profile(raw: Option<&str>) -> Option<String> {
     raw?.strip_prefix(PROFILE_PREFIX).map(str::to_string)
 }
 
-/// The root of the sandbox this process is pinned to, when that sandbox
-/// exists and still holds its marker. `home::layout` uses it so a sandbox
-/// is its own home without exporting `CADENCE_HOME`, which the overlap
-/// guard must be free to read as production evidence.
-///
-/// Answers only *which root*, never *may this run*: it runs no overlap
-/// guard, no marker policy beyond existence and no daemon check.
+/// The selected sandbox home, or `None` only when no sandbox profile is set.
+/// A stale or invalid profile refuses rather than selecting the host's home.
 pub fn active_home() -> Result<Option<PathBuf>> {
-    let Some(name) = profile() else {
-        return Ok(None);
-    };
-    home_of(Sandbox::open(&name)?)
+    pinned_home(|name| std::env::var(name).ok())
 }
 
 /// The sandbox home an instance is pinned to, from the instance's own

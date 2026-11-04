@@ -168,8 +168,18 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
             None => delivery::sync(state_dir, issue.as_deref(), delivery::GH)?,
             Some(secs) => loop {
                 match delivery::sync(state_dir, issue.as_deref(), delivery::GH) {
-                    Ok(v) => println!("{v}"),
-                    Err(e) => eprintln!("delivery sync: {e}"),
+                    Ok(v) => {
+                        println!("{v}");
+                        if cadence_agent::output::stdout_closed() {
+                            return Ok(0);
+                        }
+                    }
+                    Err(e) => {
+                        if cadence_agent::output::stdout_closed() {
+                            return Err(e);
+                        }
+                        eprintln!("delivery sync: {e}");
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_secs(secs.max(5)));
             },

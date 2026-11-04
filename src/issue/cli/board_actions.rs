@@ -106,20 +106,48 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             if !LS_SORTS.contains(&sort_key.as_str()) {
                 return Err(crate::filter::unknown("sort", &sort_spec, LS_SORTS));
             }
-            let need_updated =
-                since.is_some() || until.is_some() || sort_key == "updated" || *json_flag;
+            // `--updated` is a full-history `git log`; pay for it only
+            // when the output reads it — a since/until window, an
+            // `updated` sort, or a projection that still carries the
+            // field. No cutoff: the walk is skipped, never truncated.
+            let need_updated = since.is_some()
+                || until.is_some()
+                || sort_key == "updated"
+                || (*json_flag
+                    && !*summary
+                    && (fields.is_empty() || fields.iter().any(|f| f == "updated")));
+            let mut job_state: Option<board::JobState> = None;
             let (views, at_meta) = match at {
                 Some(rev) => {
                     let (meta, views) = history::ls_at(&pm.dir, rev, None)?;
                     (views, Some(meta))
                 }
                 None => {
-                    let issues = board::load_all(&pm.dir, None)?;
-                    let jobs = board::fetch_job_outcomes(state_dir);
-                    (
-                        board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs),
-                        None,
-                    )
+                    let state = board::fetch_job_state(state_dir);
+                    // A readiness/blocked filter is a decision, not a
+                    // display: unknown job state cannot decide it, and
+                    // an empty page would read as "nothing is ready".
+                    if *ready || *blocked {
+                        state.require(if *ready {
+                            "issue ls --ready"
+                        } else {
+                            "issue ls --blocked"
+                        })?;
+                    }
+                    // Comment bodies and artifact sizes are only read
+                    // for a document that can emit `counts`; every
+                    // other list reads fronts and bodies for derivation.
+                    let needs_counts = *json_flag
+                        && !*summary
+                        && (fields.is_empty() || fields.iter().any(|f| f == "counts"));
+                    let issues = if needs_counts {
+                        board::load_all(&pm.dir, None)?
+                    } else {
+                        board::load_all_for_detail(&pm.dir, None, None)?
+                    };
+                    let views = board::views_with_job_state(&pm.config.notes_dir(), issues, &state);
+                    job_state = Some(state);
+                    (views, None)
                 }
             };
             let updated = if need_updated {
@@ -149,12 +177,18 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             if *blocked {
                 views.retain(|v| v.blocked);
             }
-            // Stage/health filters run on the work block — one ctx.
+            // Stage/health filters run on the work block — one ctx. A
+            // JSON projection that drops `work` needs none of it, so
+            // the per-row health/progress build is skipped with the
+            // approvals read it would have made.
             let by_id: std::collections::HashMap<String, &board::View> =
                 all.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
             let want_work = !stage.is_empty()
                 || !health.is_empty()
-                || (*json_flag && !*summary && at_meta.is_none());
+                || (*json_flag
+                    && !*summary
+                    && at_meta.is_none()
+                    && (fields.is_empty() || fields.iter().any(|f| f == "work")));
             let ctx = want_work
                 .then(|| work::Ctx::new(&pm.dir, &by_id, now, &work::fetch_approvals(state_dir)));
             if let Some(ctx) = &ctx {
@@ -217,6 +251,9 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 if let Some(meta) = at_meta {
                     out["at"] = meta;
                 }
+                if let Some(state) = &job_state {
+                    out["job_state"] = state.json();
+                }
                 print_json(&out);
                 return Ok(0);
             }
@@ -245,6 +282,9 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 if let Some(meta) = at_meta {
                     out["at"] = meta;
                 }
+                if let Some(state) = &job_state {
+                    out["job_state"] = state.json();
+                }
                 print_json(&out);
             } else {
                 if let Some(meta) = &at_meta {
@@ -253,6 +293,14 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                         meta["sha"].as_str().unwrap_or("?"),
                         meta["time"].as_str().unwrap_or("?")
                     );
+                }
+                if let Some(state) = &job_state {
+                    if let Some(reason) = state.reason() {
+                        eprint_line(&format!(
+                            "job state {} ({reason}); readiness cannot be established",
+                            state.state_name()
+                        ));
+                    }
                 }
                 print_ls_table(&views);
             }
@@ -287,7 +335,7 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
         IssueAction::Trailer { id } => {
             let pm = open_pm()?;
             let issue = board::find_issue(&pm.dir, id)?;
-            println!("Issue: {}", issue.front.id);
+            crate::output::print_format_line(format_args!("Issue: {}", issue.front.id));
             Ok(0)
         }
         IssueAction::Retro { id, json } => {
@@ -303,9 +351,11 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
         IssueAction::Show { id, json } => {
             let pm = open_pm()?;
             model::check_id(id)?;
-            let issues = board::load_all(&pm.dir, None)?;
-            let jobs = board::fetch_job_outcomes(state_dir);
-            let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+            let state = board::fetch_job_state(state_dir);
+            // Cross-project links still need every issue; only this
+            // drawer's comments and artifacts are read.
+            let issues = board::load_all_for_detail(&pm.dir, None, Some(id.as_str()))?;
+            let views = board::views_with_job_state(&pm.config.notes_dir(), issues, &state);
             let by_id: std::collections::HashMap<String, &board::View> = views
                 .iter()
                 .map(|v| (v.issue.front.id.clone(), v))
@@ -322,8 +372,16 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 &work::fetch_approvals(state_dir),
             );
             if *json {
-                print_json(&work::detail_json(&pm.dir, &ctx, view));
+                let mut out = work::detail_json(&pm.dir, &ctx, view);
+                out["job_state"] = state.json();
+                print_json(&out);
             } else {
+                if let Some(reason) = state.reason() {
+                    eprint_line(&format!(
+                        "job state {} ({reason}); readiness cannot be established",
+                        state.state_name()
+                    ));
+                }
                 print_show(view, &by_id);
                 let w = work::item_json(&ctx, view);
                 let mut line = format!("type: {}", w["type"].as_str().unwrap_or("?"));

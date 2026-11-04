@@ -14,6 +14,18 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::proto;
+// Distinguish a locally decoded invalid frame from a transport failure without
+// deriving the answer from error text.
+pub(crate) const MALFORMED_DAEMON_RESPONSE: &str = "malformed_daemon_response";
+
+fn malformed_daemon_response() -> Error {
+    Error::Structured(crate::error::Structured {
+        kind: "internal",
+        code: MALFORMED_DAEMON_RESPONSE.to_string(),
+        message: "Daemon returned a malformed response".to_string(),
+        revision: None,
+    })
+}
 
 /// State directory: `$CADENCE_STATE_DIR`, else the resolved home's
 /// `state/` — `$XDG_STATE_HOME/cadence` or `~/.local/state/cadence`
@@ -527,9 +539,9 @@ impl MetaBudget {
 
 /// One request/response frame under a single absolute `deadline`
 /// covering connect, the request write and the reply read together.
-/// Only [`MetaBudget`] uses this: a courtesy metadata answer must
-/// degrade inside seconds even when the dependency's listen backlog
-/// is full (a blocking `UnixStream::connect` has no timeout), when the
+/// Used for bounded metadata and issue reads, which must return even
+/// when the dependency's listen backlog is full (a blocking
+/// `UnixStream::connect` has no timeout), when the
 /// peer accepts no bytes (the general path's write is unbounded), or
 /// when the reply trickles (a per-read timeout resets on every byte).
 /// The wire frames are identical to [`rpc_frame_on`]'s; the deadline
@@ -571,7 +583,26 @@ fn rpc_deadline_frame_on(
     let fd = stream.as_raw_fd();
     write_bounded(fd, body.as_bytes(), deadline)?;
     let line = read_line_bounded(fd, deadline)?;
-    serde_json::from_str(&line).map_err(|_| Error::internal("Daemon returned a malformed response"))
+    let frame: Value = serde_json::from_str(&line).map_err(|_| malformed_daemon_response())?;
+    let valid = match frame.get("ok").and_then(Value::as_bool) {
+        Some(true) => frame.get("result").is_some(),
+        Some(false) => {
+            frame
+                .pointer("/error/kind")
+                .and_then(Value::as_str)
+                .is_some()
+                && frame
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .is_some()
+        }
+        None => false,
+    };
+    if valid {
+        Ok(frame)
+    } else {
+        Err(malformed_daemon_response())
+    }
 }
 
 /// Poll `fd` for `events` until it signals or `deadline` passes.
@@ -908,7 +939,7 @@ pub(crate) fn read_line_bounded(fd: RawFd, deadline: Instant) -> Result<String> 
             _ => return Err(e.into()),
         }
     }
-    String::from_utf8(line).map_err(|_| Error::internal("Daemon returned a malformed response"))
+    String::from_utf8(line).map_err(|_| malformed_daemon_response())
 }
 
 /// Query the daemon bound to this private state directory, ignoring

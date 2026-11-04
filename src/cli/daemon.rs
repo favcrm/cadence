@@ -99,13 +99,13 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
             // A sandbox shares $HOME with production, so it never
             // writes the skill there.
             if cadence_agent::sandbox::profile().is_some() {
-                eprintln!("skill: skipped (sandbox profile)");
+                eprint_line("skill: skipped (sandbox profile)");
             } else {
                 match home_dir().map(|h| cadence_agent::skill::sync(&h, false, None)) {
                     Ok(Ok(report)) if report["wrote"].as_bool().unwrap_or(false) => {
-                        eprintln!("skill: refreshed {}", report["root"])
+                        eprint_line(&format!("skill: refreshed {}", report["root"]))
                     }
-                    Ok(Err(e)) => eprintln!("skill: refresh failed: {e}"),
+                    Ok(Err(e)) => eprint_line(&format!("skill: refresh failed: {e}")),
                     _ => {}
                 }
             }
@@ -422,12 +422,12 @@ pub(crate) fn daemon_restart(
                     )));
                 }
                 if !stale_noted {
-                    eprintln!(
+                    eprint_line(&format!(
                         "when-idle: ignoring {} stale turn(s) on stopped or \
                          dead agents: {}",
                         stale.len(),
                         stale.join(", ")
-                    );
+                    ));
                     stale_noted = true;
                 }
                 for p in pairs {
@@ -447,7 +447,7 @@ pub(crate) fn daemon_restart(
                 )));
             }
             if Instant::now() >= next_report {
-                eprintln!("when-idle: waiting on {}", busy.join(", "));
+                eprint_line(&format!("when-idle: waiting on {}", busy.join(", ")));
                 next_report = Instant::now() + Duration::from_secs(30);
             }
             std::thread::sleep(Duration::from_secs(2));
@@ -536,12 +536,12 @@ pub(crate) fn daemon_restart(
     let started_instance = started_instance(&started);
     let start_unbound = started["state"].as_str() != Some("started");
     if start_unbound {
-        eprintln!(
+        eprint_line(&format!(
             "restart: the start answered {} instead of `started` — that daemon is not \
              the one this restart spawned, so its recovery evidence is not bound to \
              this restart",
             started["state"].as_str().unwrap_or("without a state")
-        );
+        ));
     }
     // Wait until every agent that was live before leaves the
     // transitional states — `starting` (actor up, endpoint not open)
@@ -624,7 +624,7 @@ pub(crate) fn daemon_restart(
                 as_identity: None,
             },
         )?;
-        println!("ui: restarted");
+        print_line("ui: restarted");
     }
     // Before/after table: state then, state now, and for pty agents
     // whether the pane pid survived and whether an in-flight turn was
@@ -647,12 +647,14 @@ pub(crate) fn daemon_restart(
     // would only repeat that, so it is judged only for a spawned start.
     if !start_unbound {
         if let Some(reason) = recovery_record_verdict(state_dir, started_instance.as_deref()) {
-            eprintln!("restart: {reason}");
+            eprint_line(&format!("restart: {reason}"));
             bad = true;
         }
     }
     for alias in &cursor_misses {
-        eprintln!("restart: no pre-stop event cursor for {alias} — its verdict is unverified");
+        eprint_line(&format!(
+            "restart: no pre-stop event cursor for {alias} — its verdict is unverified"
+        ));
         bad = true;
     }
     let mut existing_fences = Vec::new();
@@ -715,9 +717,9 @@ pub(crate) fn daemon_restart(
                     }
                 }
                 if pages_failed {
-                    eprintln!(
+                    eprint_line(&format!(
                         "restart: event history unread for {alias} — its verdict is unverified"
-                    );
+                    ));
                     bad = true;
                 }
                 if kinds.iter().any(|k| k == "turn_adopt_refused") {
@@ -753,7 +755,9 @@ pub(crate) fn daemon_restart(
                     }
                 }
                 Err(e) => {
-                    eprintln!("restart: could not verify carried stale turn {sal}/{mid}: {e}");
+                    eprint_line(&format!(
+                        "restart: could not verify carried stale turn {sal}/{mid}: {e}"
+                    ));
                     bad = true;
                 }
             }
@@ -772,23 +776,28 @@ pub(crate) fn daemon_restart(
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     let w = rows.iter().map(|r| r.0.len()).max().unwrap_or(5).max(5);
-    println!(
+    // The table is the report the failure verdict below refers to: a
+    // closed stdout must not panic that verdict into success.
+    print_line(&format!(
         "{:<w$}  {:<12}  {:<12}  {:<18}  TURN",
         "AGENT",
         "BEFORE",
         "AFTER",
         "PANE",
         w = w
-    );
+    ));
     for (alias, before_state, after_state, pane, turn) in &rows {
-        println!(
+        print_line(&format!(
             "{alias:<w$}  {before_state:<12}  {after_state:<12}  {pane:<18}  {turn}",
             w = w
-        );
+        ));
     }
     if !existing_fences.is_empty() {
         existing_fences.sort();
-        println!("Existing fences retained: {}", existing_fences.join(", "));
+        print_line(&format!(
+            "Existing fences retained: {}",
+            existing_fences.join(", ")
+        ));
     }
     if bad {
         Err(Error::rejected(

@@ -320,17 +320,14 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
             since,
         );
     } else {
-        print!(
-            "{}",
-            render_text(
-                &repo,
-                &default_ref,
-                &rows,
-                flagged,
-                structural.as_ref(),
-                opts
-            )
-        );
+        crate::output::print_text(&render_text(
+            &repo,
+            &default_ref,
+            &rows,
+            flagged,
+            structural.as_ref(),
+            opts,
+        ));
     }
     Ok(if flagged > 0 { 1 } else { 0 })
 }

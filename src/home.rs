@@ -340,14 +340,25 @@ enum Installation {
     Ambiguous,
 }
 
-/// Whether `path` exists as anything at all — a directory, a file or a
-/// dangling symlink. A probe that fails for any other reason (permission,
-/// I/O) counts as present: resolution then stays on the legacy branch
-/// rather than switching an installation it could not inspect.
+/// Whether a path is present or cannot safely be proved absent.
 fn legacy_present(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for ancestor in path.ancestors().skip(1) {
+                match std::fs::symlink_metadata(ancestor) {
+                    Ok(metadata) if metadata.is_dir() => return false,
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return !matches!(std::fs::metadata(ancestor), Ok(target) if target.is_dir());
+                    }
+                    Ok(_) => return true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return true,
+                }
+            }
+            true
+        }
+        Err(_) => true,
     }
 }
 
@@ -487,12 +498,14 @@ pub fn config_dir() -> Result<PathBuf> {
         // Hosted-only use needs no home: with `HOME` unnamed and an
         // absolute `XDG_CONFIG_HOME`, the legacy config root is fully
         // spelled by the environment, exactly as it was before the
-        // consolidated home. The layout cannot be probed without a home, so
-        // none is claimed. This applies only when `HOME` is unnamed; with
-        // `HOME` set, or with no usable `XDG_CONFIG_HOME`, the layout's own
-        // refusal is returned unchanged.
+        // consolidated home. This fallback applies only when `HOME`,
+        // `CADENCE_HOME` and a sandbox profile are all absent; a declared
+        // but invalid root keeps the layout's refusal.
         Err(error) => {
-            if user_home().is_err() {
+            if std::env::var_os("HOME").is_none()
+                && std::env::var_os("CADENCE_HOME").is_none()
+                && crate::sandbox::profile().is_none()
+            {
                 if let Ok(legacy) = legacy_config_dir() {
                     if std::env::var_os("XDG_CONFIG_HOME").is_some_and(|v| !v.is_empty()) {
                         return Ok(legacy);
@@ -530,22 +543,22 @@ pub fn config_default() -> Result<PathBuf> {
 /// so it is refused rather than followed.
 fn config_root(layout: &Layout) -> Result<PathBuf> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME").is_some_and(|value| !value.is_empty());
-    let legacy = legacy_config_dir()?;
+    let home_config = || layout.root.join("config");
     let chosen = match layout.source {
         // No `CADENCE_HOME` and no legacy evidence: a first run or an
         // installation already living in the consolidated home. Both keep
         // their config inside it; a legacy config root present at the same
         // time would have made the layout `Ambiguous` and been refused
         // before this point. A sandbox is its own install the same way.
-        Source::Fresh | Source::Sandbox => layout.root.join("config"),
-        Source::Legacy => legacy,
-        Source::Env => {
-            if xdg || legacy_present(&legacy) {
-                legacy
-            } else {
-                layout.root.join("config")
-            }
-        }
+        Source::Fresh | Source::Sandbox => home_config(),
+        Source::Legacy => legacy_config_dir()?,
+        Source::Env if xdg => legacy_config_dir()?,
+        Source::Env => match legacy_config_dir() {
+            Ok(legacy) if legacy_present(&legacy) => legacy,
+            Ok(_) => home_config(),
+            Err(_) if std::env::var_os("HOME").is_none() => home_config(),
+            Err(error) => return Err(error),
+        },
     };
     if chosen.starts_with(&layout.root) {
         refuse_symlinked_under(&layout.root, &chosen)?;

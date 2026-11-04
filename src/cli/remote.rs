@@ -1354,18 +1354,14 @@ fn upload(
         &bytes,
         overwrite,
         wake_timeout,
-        |line| eprintln!("{line}"),
+        eprint_line,
     )
     .inspect_err(|error| {
         if error.kind() == "busy" && error.code() == Some("waking") {
-            eprintln!(
-                "{}",
-                serde_json::to_string(&json!({"kind": "busy", "state": "waking"}))
-                    .unwrap_or_default()
-            );
+            eprint_line(&json!({"kind": "busy", "state": "waking"}).to_string());
         }
     })?;
-    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    print_json(&out);
     Ok(0)
 }
 
@@ -1385,9 +1381,7 @@ fn artifact(
         .checked_add(std::time::Duration::from_secs(wake_timeout))
         .ok_or_else(|| Error::usage("invalid wake timeout"))?;
     let read = |verb: &str, args: serde_json::Map<String, Value>| -> Result<Value> {
-        match call_verb(target, verb, args, deadline, wake_timeout, |line| {
-            eprintln!("{line}")
-        })? {
+        match call_verb(target, verb, args, deadline, wake_timeout, eprint_line)? {
             RemoteAnswer::Ok(body) => Ok(body),
             RemoteAnswer::Conflict(_) => Err(Error::rejected("remote read answered a conflict")),
         }
@@ -1426,9 +1420,9 @@ fn artifact(
                     bytes: &bytes,
                 },
                 wake_timeout,
-                |line| eprintln!("{line}"),
+                eprint_line,
             )?;
-            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            print_json(&out);
             Ok(0)
         }
         ArtifactAction::Find {
@@ -1453,7 +1447,7 @@ fn artifact(
                 args.insert("limit".into(), json!(limit));
             }
             let out = read("artifact_find", args)?;
-            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            print_json(&out);
             Ok(0)
         }
         ArtifactAction::Show { id, version, out } => {
@@ -1466,10 +1460,7 @@ fn artifact(
                 let mut args = serde_json::Map::new();
                 args.insert("id".into(), json!(id));
                 let found = read("artifact_show", args)?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&found).unwrap_or_default()
-                );
+                print_json(&found);
                 return Ok(0);
             };
             let mut bytes = Vec::new();
@@ -1530,14 +1521,10 @@ fn artifact(
                     path.display()
                 )));
             }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "file": file,
-                    "written": path.display().to_string(),
-                }))
-                .unwrap_or_default()
-            );
+            print_json(&json!({
+                "file": file,
+                "written": path.display().to_string(),
+            }));
             Ok(0)
         }
     }
@@ -1586,12 +1573,21 @@ fn stream_remote_blob(
     deadline: std::time::Instant,
     wake_timeout: u64,
 ) -> Result<()> {
+    use std::io::Write as _;
     let mut spool = collect_remote_blob(discovered, |offset, rev| {
         remote_blob_range(target, path, offset, rev, deadline, wake_timeout)
     })?;
-    std::io::copy(&mut spool, &mut std::io::stdout())
-        .map_err(|e| Error::rejected(format!("remote wiki cat: cannot write stdout: {e}")))?;
-    Ok(())
+    // The spool stays bounded in memory by streaming through `io::copy`.
+    // A reader that stopped early (`| head -c …`) is a success: the bytes
+    // it wanted were already written, so the download is not retried.
+    let mut stdout = std::io::stdout().lock();
+    match std::io::copy(&mut spool, &mut stdout).and_then(|_| stdout.flush()) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(Error::rejected(format!(
+            "remote wiki cat: cannot write stdout: {error}"
+        ))),
+    }
 }
 
 fn collect_remote_blob(
@@ -1781,7 +1777,7 @@ fn remote_blob_range(
         args,
         deadline,
         wake_timeout,
-        |line| eprintln!("{line}"),
+        eprint_line,
     )? {
         cadence_agent::remote_cli::RemoteAnswer::Ok(body) => Ok(body),
         cadence_agent::remote_cli::RemoteAnswer::Conflict(_) => Err(Error::rejected(
@@ -1812,22 +1808,24 @@ fn wiki_text(command: &Commands, body: &Value) -> Result<bool> {
             offset, bytes, rev, ..
         } if offset.is_some() || bytes.is_some() || rev.is_some() => {
             // The daemon already bounded this compact line. Pretty-printing
-            // it could push one line over the native tool bound.
-            println!("{}", serde_json::to_string(body).unwrap_or_default());
+            // it could push one line over the native tool bound, so this is
+            // a deliberate exception to the stdout JSON policy.
+            print_line(&serde_json::to_string(body).unwrap_or_default());
             true
         }
         WikiAction::Cat { meta: false, .. } if body["kind"] == "text" => {
-            print!("{}", body["text"].as_str().unwrap_or(""));
+            // Raw text: verbatim bytes, no policy, no added newline.
+            print_text(body["text"].as_str().unwrap_or(""));
             true
         }
         WikiAction::Search { json: false, .. } => {
             for m in body["matches"].as_array().cloned().unwrap_or_default() {
-                println!(
+                print_line(&format!(
                     "{}:{}: {}",
                     m["path"].as_str().unwrap_or(""),
                     m["line"].as_u64().unwrap_or(0),
                     m["text"].as_str().unwrap_or("")
-                );
+                ));
             }
             true
         }
@@ -1925,7 +1923,6 @@ fn placement_of(command: &Commands) -> Option<registry::Placement> {
 fn print_issue_artifact(command: &Commands, body: &Value) -> Result<bool> {
     use base64::Engine;
     use sha2::{Digest, Sha256};
-    use std::io::Write;
 
     let Commands::Issue {
         action: cadence_agent::issue::cli::IssueAction::Artifact { id, name },
@@ -1963,7 +1960,10 @@ fn print_issue_artifact(command: &Commands, body: &Value) -> Result<bool> {
     {
         return Err(bad());
     }
-    std::io::stdout().write_all(&bytes)?;
+    // Raw artifact bytes: no JSON policy, no re-encoding. A reader that
+    // stopped early already has what it asked for, so it is not a failed
+    // download; any other stdout fault still fails the command.
+    write_stdout(&bytes)?;
     Ok(true)
 }
 
@@ -2261,19 +2261,19 @@ where
         args,
         deadline,
         wake_timeout,
-        |line| eprintln!("{line}"),
+        eprint_line,
     ) {
         Ok(out) => out,
         Err(error) => {
             if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
-                eprintln!(
+                eprint_line(&format!(
                     "remote send `{id}` was not confirmed — it may or may not have \
                      been recorded. Reconcile before resubmitting: `cadence message \
                      read {id} --org {}` returns your durable message and its state. \
                      If nothing is recorded, retry `send` with the same --message {id} \
                      — the same id and content does not enqueue another message.",
                     target.org
-                );
+                ));
             }
             return remote_failure(error);
         }
@@ -2297,21 +2297,19 @@ where
             if wiki_text(&command, &body)? {
                 return Ok(0);
             }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&body).unwrap_or_default()
-            );
+            // The ordinary hosted answer is one JSON document under the
+            // shared stdout policy, like a local verb's.
+            print_json(&body);
             Ok(0)
         }
         cadence_agent::remote_cli::RemoteAnswer::Conflict(body) => {
             // A checked conflict is the remote's "not written" verdict:
             // print the whole body so the caller resyncs from
             // `current_rev`/`card`, and exit 5 — the same conflict code
-            // the local write path exits (see `error::EXIT_TABLE`).
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&body).unwrap_or_default()
-            );
+            // the local write path exits (see `error::EXIT_TABLE`). The
+            // report cannot change that verdict: `print_json` absorbs a
+            // closed consumer instead of panicking.
+            print_json(&body);
             Ok(5)
         }
     }
@@ -2699,7 +2697,7 @@ fn remote_restore(
             ));
         }
     }
-    let note = |line: &str| eprintln!("{line}");
+    let note = eprint_line;
     let digests = expected_package_digest.is_some()
         || expected_destination_digest.is_some()
         || expected_generation.is_some();
@@ -2839,7 +2837,10 @@ fn migration_outcome_exit_code(receipt: &Value) -> i32 {
 
 pub(super) fn remote_failure(error: Error) -> Result<i32> {
     if error.kind() == "busy" && error.code() == Some("waking") {
-        eprintln!("{}", json!({"kind": "busy", "state": "waking"}));
+        // The wake verdict is a nonzero status (75): print it through the
+        // closed-consumer-tolerant writer so a closed stderr cannot turn
+        // it into a panic that exits 0.
+        eprint_line(&json!({"kind": "busy", "state": "waking"}).to_string());
         Ok(75)
     } else {
         Err(error)

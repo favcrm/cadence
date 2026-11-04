@@ -834,7 +834,10 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 crate::issue::cli::print_json(&out);
                 Ok(0)
             } else {
-                eprintln!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                // The failure report precedes the nonzero status: a closed
+                // stderr must not panic it into success.
+                let report = serde_json::to_string_pretty(&out).unwrap_or_default();
+                crate::output::eprint_line(&report);
                 Ok(1)
             }
         }

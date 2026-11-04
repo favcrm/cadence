@@ -261,6 +261,13 @@ impl BoardHttp {
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(1))
         });
+        let failed_response = |message: &str| {
+            if method == "POST" {
+                assignment_unknown(&self.org_id, path, body)
+            } else {
+                Error::rejected(message)
+            }
+        };
         let response = match method {
             "GET" => {
                 let request = self
@@ -294,28 +301,39 @@ impl BoardHttp {
             }
             _ => return Err(Error::rejected("unsupported coordination method")),
         }
-        .map_err(|_| Error::rejected("remote request failed"))?;
+        .map_err(|_| failed_response("remote request failed"))?;
         let status = response.status().as_u16();
         let mut bytes = Vec::new();
         response
             .into_body()
             .as_reader()
             .take(MAX_BODY + 1)
-            .read_to_end(&mut bytes)?;
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                if method == "POST" {
+                    assignment_unknown(&self.org_id, path, body)
+                } else {
+                    error.into()
+                }
+            })?;
         if bytes.len() as u64 > MAX_BODY {
-            return Err(Error::rejected("coordination response is too large"));
+            return Err(failed_response("coordination response is too large"));
         }
         if (300..400).contains(&status) {
-            return Err(Error::invalid(
-                "redirect",
-                "remote redirect refused; nothing was followed and nothing ran locally",
-            ));
+            return Err(if method == "POST" {
+                assignment_unknown(&self.org_id, path, body)
+            } else {
+                Error::invalid(
+                    "redirect",
+                    "remote redirect refused; nothing was followed and nothing ran locally",
+                )
+            });
         }
         let body = if bytes.is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(&bytes)
-                .map_err(|_| Error::rejected("coordination response was not JSON"))?
+                .map_err(|_| failed_response("coordination response was not JSON"))?
         };
         Ok(Reply { status, body })
     }
