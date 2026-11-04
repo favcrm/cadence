@@ -61,6 +61,23 @@
       ]
     },
     {
+      "description": "The same app tag under the host-owned operation admission\n(CAD-2118/AOS-479); no operation membership is implied.",
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "app.screen.asset-integrity"
+        },
+        "value": {
+          "$ref": "#/$defs/ScreenIntegrityValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "op": {
@@ -721,7 +738,7 @@
       "additionalProperties": false
     },
     "ScreenIntegrityValue": {
-      "description": "Success value of `app.screen.integrity`: the declared app tag of the one\ndeclaration that passed.\n\n`ok: true` on the envelope only says the check ran; this value says the\ndeclaration and the supplied facts agreed under the native screen contract.\nIt is integrity evidence, not install, mount, execution or effect authority,\nand it covers the facts the caller supplied — the caller must have hashed\nthe exact bytes it installed.",
+      "description": "Success value of `app.screen.integrity` and\n`app.screen.asset-integrity`: the declared app tag of the one declaration\nthat passed.\n\n`ok: true` on the envelope only says the check ran; this value says the\ndeclaration and the supplied facts agreed under the shared screen\ncontract. It is integrity evidence, not install, mount, execution or\neffect authority, and it covers the facts the caller supplied — the caller\nmust have hashed the exact bytes it installed. Under\n`app.screen.asset-integrity` it likewise says nothing about operation\nmembership or CALL/SLOT permission: the caller checks those itself.",
       "type": "object",
       "properties": {
         "app": {

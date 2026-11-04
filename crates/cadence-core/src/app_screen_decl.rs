@@ -4,9 +4,11 @@
 //! This module is the single implementation of the screen declaration rules.
 //! The native host calls [`validate_map`] with the asset bodies it holds; the
 //! bounded `app.screen.integrity` operation calls [`validate_facts`] with the
-//! size/sha256 facts its host computed from the exact installed bytes. Both
-//! enter the same private pipeline — one grammar, one bound set, one
-//! declared↔supplied comparison — so the two hosts cannot drift into
+//! size/sha256 facts its host computed from the exact installed bytes; the
+//! additive `app.screen.asset-integrity` operation calls
+//! [`validate_facts_asset_integrity`] when its host owns the operation
+//! vocabulary. All three enter the same private pipeline — one grammar, one
+//! bound set, one declared↔supplied comparison — so hosts cannot drift into
 //! different answers for the same declaration. The app-level screen *count*
 //! bound ([`MAX_SCREENS`]) is stated here too, so the native bundle scan and
 //! the hosted count check agree on how many packages one app may declare.
@@ -19,6 +21,39 @@
 //! bracket depth before parsing, node count after a bounded
 //! `serde_json::Value` pass, then a closed typed decode that keeps
 //! duplicate JSON keys refused at every level, map-valued fields included.
+//!
+//! ## Shared structure, host-owned operation vocabulary
+//!
+//! A declaration's `operations` list carries host operation names. Two
+//! admission modes share this one parser, one bound set and one
+//! declared↔supplied comparison, and differ *only* in who owns that
+//! vocabulary:
+//!
+//! * [`validate_map`] / [`validate_facts`] resolve each operation against
+//!   the closed native [`ScreenOperation`] set and require the matching
+//!   `records.call`/`records.slot` `may` grant. This is the native
+//!   admission and the existing strict `app.screen.integrity` answer;
+//!   it is unchanged.
+//! * [`validate_facts_asset_integrity`] checks the same declaration,
+//!   assets and `screen_count`, but treats each operation as a bounded,
+//!   typed, duplicate-free *host token*: no vocabulary is consulted. Which
+//!   operations a host serves, and whether each is a CALL or a host-confirmed
+//!   SLOT, is that host's own closed vocabulary and its own permission
+//!   classification — this crate neither knows nor infers it. Its result is
+//!   the narrower [`AssetIntegrityChecked`] (the app tag only), so it can
+//!   never be mistaken for an [`IntegrityCheckedScreen`] carrying a resolved
+//!   operation list.
+//!
+//! The admission is chosen by the decoded list's type, not by a runtime flag:
+//! the native paths decode [`ScreenOperation`] inside the one typed decode, so
+//! the closed vocabulary is resolved by serde exactly as before and no
+//! operation name is ever allocated as a string.
+//!
+//! Both modes prove shared structure and exact declared↔supplied bytes.
+//! Neither mode grants operation permission: an admitted host token is a
+//! well-formed declaration, never an authorized call or slot, and the
+//! host must still apply its closed operation set and its grant checks
+//! before publishing, installing or re-validating a package.
 //!
 //! ## What this proves — and what it does not
 //!
@@ -62,6 +97,13 @@ const MAX_DEPTH: usize = 32;
 const MAX_NODES: usize = 4_096;
 /// Most assets, declared and supplied alike.
 pub const MAX_ASSETS: usize = 32;
+/// Most operations one declaration may list — the same bound under both
+/// admission modes.
+const MAX_OPERATIONS: usize = 64;
+/// Longest operation token, bytes. The longest canonical host operation is
+/// well under this; the cap keeps a declaration's operation list small
+/// whatever vocabulary a host serves.
+const MAX_OPERATION_BYTES: usize = 64;
 /// Most screen packages one app may declare. The native bundle scan
 /// (`app_screen_pkg::tags_in`) and the hosted `app.screen.integrity` count
 /// check both read this one number, so a package set is bounded identically on
@@ -583,6 +625,9 @@ pub struct IntegrityCheckedScreen {
     /// The alias is app-owned vocabulary the frame calls; the slot is
     /// the `needs.capabilities` key it resolves through. Empty on v1.
     tools: BTreeMap<String, String>,
+    /// v2 `screen-records.v1` only: the declared operations resolved
+    /// against the closed native vocabulary. Always fully resolved: this
+    /// value is only ever produced by the native-vocabulary admissions.
     operations: Vec<ScreenOperation>,
     navigation: Option<ScreenNavigation>,
     startup: Option<Vec<String>>,
@@ -612,6 +657,8 @@ impl IntegrityCheckedScreen {
     pub fn tools(&self) -> &BTreeMap<String, String> {
         &self.tools
     }
+    /// The declared `screen-records.v1` operations, resolved against the
+    /// closed native vocabulary.
     pub fn operations(&self) -> &[ScreenOperation] {
         &self.operations
     }
@@ -648,15 +695,54 @@ impl IntegrityCheckedScreen {
     pub fn toolchain_digest(&self) -> &str {
         &self.toolchain_digest
     }
+    /// Consume the value for its app tag — the only field an ABI success
+    /// value carries, so the encoded result never clones it.
+    pub fn into_app(self) -> String {
+        self.app
+    }
+}
+
+/// The proven facts of [`validate_facts_asset_integrity`] — the declared app
+/// tag, and nothing else.
+///
+/// Deliberately *not* an [`IntegrityCheckedScreen`]. The host-owned admission
+/// never resolves the declaration's `operations` against any vocabulary, so
+/// there is no operation list this admission could honestly publish: handing
+/// back a screen value with an empty list would read as a verified empty set.
+/// A caller therefore cannot confuse the host-owned result with a native one,
+/// and this value grants no operation, call, slot, install, mount, execution
+/// or effect authority.
+#[derive(Debug)]
+pub struct AssetIntegrityChecked {
+    app: String,
+}
+
+impl AssetIntegrityChecked {
+    /// The declared app tag (`valid_tag` grammar) — the same value
+    /// `app.screen.integrity` returns for a declaration it admits.
+    pub fn app(&self) -> &str {
+        &self.app
+    }
+    /// Consume the value for its app tag, moving the one String it holds.
+    pub fn into_app(self) -> String {
+        self.app
+    }
 }
 
 /// The closed top-level `app-screens/v1` shape. `deny_unknown_fields`
 /// refuses stray keys; serde's own duplicate-field error refuses
 /// repeated ones. `may` is the optional method list — the contract
 /// carries none, so only absence or `[]` passes the explicit check.
+///
+/// `O` is the declaration's operation-list type, and it *is* the admission:
+/// the native paths instantiate [`ScreenOperation`] so serde resolves the
+/// closed vocabulary during the one typed decode (no name strings, no second
+/// parse, unchanged parse-time refusal of an unknown operation), while
+/// [`validate_facts_asset_integrity`] instantiates `String` so a host token is
+/// bounded and typed but never resolved against this build's vocabulary.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawDecl {
+struct RawDecl<O> {
     contract: String,
     app: String,
     entry: String,
@@ -682,12 +768,133 @@ struct RawDecl {
     /// the last slot and hide the shadowed one.
     #[serde(default, deserialize_with = "unique_map")]
     tools: BTreeMap<String, String>,
+    /// v2 `screen-records.v1` only; see [`DeclaredOperations`].
     #[serde(default)]
-    operations: Vec<ScreenOperation>,
+    operations: O,
     #[serde(default)]
     navigation: Option<ScreenNavigation>,
     #[serde(default)]
     startup: Option<Vec<String>>,
+}
+
+/// The `may` grants a declaration actually carries, reduced to the two facts
+/// the native operation rule needs. Computed once while `may` is validated, so
+/// the admission never re-borrows (or re-allocates) the declaration's `may`
+/// list after the declaration is consumed.
+#[derive(Default)]
+struct MayGrants {
+    records_call: bool,
+    records_slot: bool,
+}
+
+/// One declaration's `operations` list under the admission its host runs.
+///
+/// The type of the decoded list chooses the implementation, so a host-owned
+/// list can never be mistaken for a native one. The two methods match the two
+/// points the declaration is needed: [`validate`](Self::validate) applies the
+/// admission's operation rules where the original validator applied them —
+/// before asset grammar and before any body is hashed — and
+/// [`into_checked`](Self::into_checked) consumes the declaration at the end to
+/// assemble only the fields that admission publishes.
+trait DeclaredOperations: Sized {
+    /// The published result of this admission.
+    type Checked;
+    /// How many operations the declaration lists.
+    fn len(&self) -> usize;
+    /// Whether the declaration lists none.
+    fn is_empty(&self) -> bool;
+    /// Apply this admission's operation rules. Borrowed: the list stays in the
+    /// declaration until the result is assembled.
+    fn validate(&self, grants: MayGrants) -> Result<()>;
+    /// Assemble the published result, consuming the declaration so each
+    /// admission moves only the fields it actually carries.
+    fn into_checked(decl: RawDecl<Self>) -> Self::Checked;
+}
+
+impl DeclaredOperations for Vec<ScreenOperation> {
+    type Checked = IntegrityCheckedScreen;
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+    /// The native rule, unchanged: a repeated operation or an operation whose
+    /// CALL/SLOT class is not granted in `may` refuses.
+    fn validate(&self, grants: MayGrants) -> Result<()> {
+        let mut seen = HashSet::with_capacity(self.len());
+        for operation in self {
+            let granted = if operation.is_slot() {
+                grants.records_slot
+            } else {
+                grants.records_call
+            };
+            if !seen.insert(*operation) || !granted {
+                return Err(Error::rejected(
+                    "duplicate operation or missing records permission",
+                ));
+            }
+        }
+        Ok(())
+    }
+    /// Moves the already-validated list and the rest of the metadata straight
+    /// into the result — no clone, no per-operation allocation.
+    fn into_checked(decl: RawDecl<Self>) -> IntegrityCheckedScreen {
+        IntegrityCheckedScreen {
+            contract: decl.contract,
+            asset_count: decl.assets.len(),
+            app: decl.app,
+            entry: decl.entry,
+            source_digest: decl.provenance.source_digest,
+            sdk_digest: decl.provenance.sdk_digest,
+            toolchain_digest: decl.provenance.toolchain_digest,
+            remote_images: decl.remote_images,
+            may: decl
+                .may
+                .into_iter()
+                .filter_map(|value| match value {
+                    Value::String(value) => Some(value),
+                    _ => None,
+                })
+                .collect(),
+            host_contract: decl.host_contract,
+            tools: decl.tools,
+            operations: decl.operations,
+            navigation: decl.navigation,
+            startup: decl.startup,
+        }
+    }
+}
+
+impl DeclaredOperations for Vec<String> {
+    type Checked = AssetIntegrityChecked;
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+    /// The host-owned rule: bounded, typed and duplicate-free tokens only. No
+    /// grant or membership check exists here to run — the caller applies its
+    /// own closed operation set and its own CALL/SLOT classification.
+    fn validate(&self, _grants: MayGrants) -> Result<()> {
+        let mut seen: HashSet<&str> = HashSet::with_capacity(self.len());
+        for name in self {
+            if !seen.insert(name.as_str()) {
+                return Err(Error::rejected(format!(
+                    "operation {name:?} is declared twice"
+                )));
+            }
+            check_host_operation(name)?;
+        }
+        Ok(())
+    }
+    /// Only the app tag is moved out; nothing else is assembled.
+    fn into_checked(decl: RawDecl<Self>) -> AssetIntegrityChecked {
+        AssetIntegrityChecked { app: decl.app }
+    }
 }
 
 /// One declared asset member — closed, all four fields required.
@@ -805,7 +1012,7 @@ pub fn validate_map(
     manifest: &str,
     assets: &BTreeMap<String, String>,
 ) -> Result<IntegrityCheckedScreen> {
-    validate_with(manifest, &SuppliedBodies(assets))
+    validate_with::<_, Vec<ScreenOperation>>(manifest, &SuppliedBodies(assets))
 }
 
 /// Validate one declaration against host-reported facts for the exact bytes
@@ -818,12 +1025,53 @@ pub fn validate_facts(
     manifest: &str,
     facts: &BTreeMap<String, ScreenAssetFact>,
 ) -> Result<IntegrityCheckedScreen> {
-    validate_with(manifest, &SuppliedFacts(facts))
+    validate_with::<_, Vec<ScreenOperation>>(manifest, &SuppliedFacts(facts))
 }
 
-/// The one pipeline both entry points run: one bound set, one grammar, one
+/// Validate one declaration against host-reported facts under the
+/// **host-owned operation admission** — the shared body-integrity half of
+/// `app.screen.asset-integrity`.
+///
+/// It runs the identical pipeline as [`validate_facts`]: same byte, depth,
+/// node, asset, grammar, `may`/`tools`/navigation/startup and
+/// declared↔supplied checks, so a malformed declaration, a duplicated JSON
+/// field or operation, a wrong size or digest refuses exactly as before. The
+/// single difference is the `operations` list: each name must be a bounded,
+/// typed, duplicate-free host token, but the core does **not** resolve it
+/// against [`ScreenOperation`] and does **not** require a `records.call` or
+/// `records.slot` grant, because which operations a host serves and how it
+/// classifies them is that host's own closed vocabulary.
+///
+/// The result is the narrower [`AssetIntegrityChecked`] — the proven app tag
+/// only, moved out of the decoded declaration. No screen metadata is
+/// assembled: the host path never builds a `may` list or any other field it
+/// would immediately drop. The value cannot be passed off as an
+/// [`IntegrityCheckedScreen`], so an operation set this crate never resolved
+/// can never read as a verified one. It authorizes nothing: a host that
+/// admits a package must still check each token against its own operation set
+/// and its own permission classification at every publication, install and
+/// revalidation entry point.
+pub fn validate_facts_asset_integrity(
+    manifest: &str,
+    facts: &BTreeMap<String, ScreenAssetFact>,
+) -> Result<AssetIntegrityChecked> {
+    validate_with::<_, Vec<String>>(manifest, &SuppliedFacts(facts))
+}
+
+/// The one pipeline every entry point runs: one bound set, one grammar, one
 /// declared↔supplied comparison.
-fn validate_with<S: Supplied>(manifest: &str, supplied: &S) -> Result<IntegrityCheckedScreen> {
+///
+/// `O` selects the operation admission at compile time: [`ScreenOperation`]
+/// resolves the closed native vocabulary inside the typed decode, `String`
+/// leaves a host token unresolved. `O::Checked` is that admission's own
+/// result, assembled by moving only the fields it publishes — the native path
+/// keeps every screen field, the host path keeps the app tag.
+fn validate_with<S, O>(manifest: &str, supplied: &S) -> Result<O::Checked>
+where
+    S: Supplied,
+    O: DeclaredOperations,
+    for<'de> O: Deserialize<'de> + Default,
+{
     // Supplied-side bounds first — before anything copies, parses or hashes a
     // byte. Only lengths are read.
     check_supplied_bounds(supplied)?;
@@ -847,7 +1095,9 @@ fn validate_with<S: Supplied>(manifest: &str, supplied: &S) -> Result<IntegrityC
     // The closed typed decode reads the ORIGINAL raw text so duplicate
     // fields at every struct level refuse; a `Value` map would hide them.
     // The one map-valued field (`tools`) carries its own duplicate-key guard.
-    let decl: RawDecl = serde_json::from_str(manifest)
+    // For the native admission the operation vocabulary is resolved here, by
+    // serde, exactly as before.
+    let decl: RawDecl<O> = serde_json::from_str(manifest)
         .map_err(|e| Error::rejected(format!("manifest declaration: {e}")))?;
 
     // Preserve the exact old v1/screen-actions schema floors: even empty
@@ -864,32 +1114,7 @@ fn validate_with<S: Supplied>(manifest: &str, supplied: &S) -> Result<IntegrityC
     if value.get("startup").is_some() && decl.startup.is_none() {
         return Err(Error::rejected("startup must be a non-null array"));
     }
-    check_declaration(&decl)?;
-    check_assets(&decl, supplied)?;
-
-    Ok(IntegrityCheckedScreen {
-        contract: decl.contract,
-        asset_count: decl.assets.len(),
-        app: decl.app,
-        entry: decl.entry,
-        source_digest: decl.provenance.source_digest,
-        sdk_digest: decl.provenance.sdk_digest,
-        toolchain_digest: decl.provenance.toolchain_digest,
-        remote_images: decl.remote_images,
-        may: decl
-            .may
-            .into_iter()
-            .filter_map(|value| match value {
-                Value::String(value) => Some(value),
-                _ => None,
-            })
-            .collect(),
-        host_contract: decl.host_contract,
-        tools: decl.tools,
-        operations: decl.operations,
-        navigation: decl.navigation,
-        startup: decl.startup,
-    })
+    check_declaration(decl, supplied)
 }
 
 /// Supplied-side bounds: count, then each length, then the aggregate — all
@@ -1015,7 +1240,33 @@ fn valid_tool_alias(alias: &str) -> bool {
     })
 }
 
-fn check_declaration(decl: &RawDecl) -> Result<()> {
+/// A host-owned operation token: 1..=64 bytes of printable, non-blank ASCII.
+///
+/// This is the *bound and type* half only — the three properties the shared
+/// contract keeps for a host token: bounded, typed (a JSON string) and
+/// duplicate-free (checked by the caller loop). It deliberately does **not**
+/// impose a vocabulary grammar: which operations a host serves, and whether
+/// each is a CALL or a host-confirmed SLOT, is the caller's closed set and
+/// classification, and a core-side grammar would only re-block a legitimate
+/// host name. No asset byte is compared for a token this bound refuses.
+fn check_host_operation(name: &str) -> Result<()> {
+    let shaped = (1..=MAX_OPERATION_BYTES).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_graphic());
+    if !shaped {
+        return Err(Error::rejected(format!(
+            "operation {name:?} — 1 to {MAX_OPERATION_BYTES} printable ASCII bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// The grammar and declared↔supplied match for one decoded declaration,
+/// consumed so the admission can assemble its own result from moved fields.
+fn check_declaration<S, O>(decl: RawDecl<O>, supplied: &S) -> Result<O::Checked>
+where
+    S: Supplied,
+    O: DeclaredOperations,
+{
     let is_v2 = match decl.contract.as_str() {
         c if c == CONTRACT_V1 => false,
         c if c == CONTRACT_V2 => true,
@@ -1046,37 +1297,45 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
     // `media.read` and `media.publish` are the granted media members;
     // publish is a separate declaration — read never implies mutation.
     let media_contract = decl.host_contract.as_deref() == Some(HOST_CONTRACT_MEDIA);
-    let mut may_seen = HashSet::new();
-    for member in &decl.may {
-        let Some(name) = member.as_str() else {
-            return Err(Error::rejected("`may` members are strings"));
-        };
-        let records = decl.host_contract.as_deref() == Some(HOST_CONTRACT_RECORDS);
-        let granted = is_v2
-            && if records {
-                matches!(name, MAY_RECORDS_CALL | MAY_RECORDS_SLOT)
-            } else {
-                name == MAY_TOOLS_INVOKE
-                    || (media_contract
-                        && matches!(
-                            name,
-                            MAY_MEDIA_READ
-                                | MAY_MEDIA_PUBLISH
-                                | MAY_MEDIA_IMPORT
-                                | MAY_MEDIA_CHAT_ATTACH
-                        ))
+    // Scoped so the duplicate-detection set's borrow of `decl.may` ends before
+    // the declaration is consumed by its admission.
+    let grants = {
+        let mut may_seen = HashSet::new();
+        let mut grants = MayGrants::default();
+        for member in &decl.may {
+            let Some(name) = member.as_str() else {
+                return Err(Error::rejected("`may` members are strings"));
             };
-        if !granted {
-            return Err(Error::rejected(format!(
-                "`may` method {name:?} is not a method this contract grants"
-            )));
+            let records = decl.host_contract.as_deref() == Some(HOST_CONTRACT_RECORDS);
+            let granted = is_v2
+                && if records {
+                    matches!(name, MAY_RECORDS_CALL | MAY_RECORDS_SLOT)
+                } else {
+                    name == MAY_TOOLS_INVOKE
+                        || (media_contract
+                            && matches!(
+                                name,
+                                MAY_MEDIA_READ
+                                    | MAY_MEDIA_PUBLISH
+                                    | MAY_MEDIA_IMPORT
+                                    | MAY_MEDIA_CHAT_ATTACH
+                            ))
+                };
+            if !granted {
+                return Err(Error::rejected(format!(
+                    "`may` method {name:?} is not a method this contract grants"
+                )));
+            }
+            if !may_seen.insert(name) {
+                return Err(Error::rejected(format!(
+                    "`may` method {name:?} is declared twice"
+                )));
+            }
+            grants.records_call |= name == MAY_RECORDS_CALL;
+            grants.records_slot |= name == MAY_RECORDS_SLOT;
         }
-        if !may_seen.insert(name) {
-            return Err(Error::rejected(format!(
-                "`may` method {name:?} is declared twice"
-            )));
-        }
-    }
+        grants
+    };
     // `host_contract`/`tools` are v2-only action declarations. Declaring
     // either under v1 refuses — a v1 screen stays read-only and cannot
     // smuggle a contract it was not reviewed against.
@@ -1108,25 +1367,18 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
             "a screen declaring may/tools must pin host_contract",
         ));
     }
+    // Contract-level operation rules and the admission's own operation rules
+    // run here, before `tools`/`remote_images`/asset grammar and before
+    // `check_assets` — so a declaration already known invalid is refused
+    // before any supplied body is compared (or hashed). Result assembly
+    // happens at the end, from the moved declaration.
     if decl.host_contract.as_deref() == Some(HOST_CONTRACT_RECORDS) {
-        if !decl.tools.is_empty() || decl.operations.len() > 64 {
-            return Err(Error::rejected(
-                "records screens require empty tools and at most 64 operations",
-            ));
+        if !decl.tools.is_empty() || decl.operations.len() > MAX_OPERATIONS {
+            return Err(Error::rejected(format!(
+                "records screens require empty tools and at most {MAX_OPERATIONS} operations"
+            )));
         }
-        let mut operations = HashSet::new();
-        for op in &decl.operations {
-            let permission = if op.is_slot() {
-                MAY_RECORDS_SLOT
-            } else {
-                MAY_RECORDS_CALL
-            };
-            if !operations.insert(op) || !may_seen.contains(permission) {
-                return Err(Error::rejected(
-                    "duplicate operation or missing records permission",
-                ));
-            }
-        }
+        decl.operations.validate(grants)?;
         if let Some(nav) = &decl.navigation {
             nav.validate()?;
         }
@@ -1249,7 +1501,8 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
         &decl.provenance.toolchain_digest,
         "provenance.toolchain_digest",
     )?;
-    Ok(())
+    check_assets(&decl.assets, supplied)?;
+    Ok(O::into_checked(decl))
 }
 
 /// A flat leaf `<stem>.<ext>`: the stem is `valid_tag` (which
@@ -1322,8 +1575,8 @@ fn check_digest(digest: &str, what: &str) -> Result<()> {
 /// the declared UTF-8 byte length and sha256, and every supplied name is
 /// declared — no undeclared asset passes. The digest is compared last, so a
 /// declaration that is invalid for any other reason never hashes a body.
-fn check_assets<S: Supplied>(decl: &RawDecl, supplied: &S) -> Result<()> {
-    for asset in &decl.assets {
+fn check_assets<S: Supplied>(assets: &[RawAsset], supplied: &S) -> Result<()> {
+    for asset in assets {
         let Some(len) = supplied.length(&asset.name) else {
             return Err(Error::rejected(format!(
                 "declared asset {:?} is not supplied",
@@ -1349,7 +1602,7 @@ fn check_assets<S: Supplied>(decl: &RawDecl, supplied: &S) -> Result<()> {
             )));
         }
     }
-    let declared: HashSet<&str> = decl.assets.iter().map(|a| a.name.as_str()).collect();
+    let declared: HashSet<&str> = assets.iter().map(|a| a.name.as_str()).collect();
     for (name, _) in supplied.lengths() {
         if !declared.contains(name) {
             return Err(Error::rejected(format!(
@@ -1527,5 +1780,167 @@ mod tests {
         let broken = manifest.replacen("\"app\":\"demo\"", "\"app\":\"Demo\"", 1);
         assert!(validate_map(&broken, &bodies).is_err());
         assert!(validate_facts(&broken, &facts(BODY)).is_err());
+    }
+
+    /// A `screen-records.v1` declaration — the one contract that carries an
+    /// operations list — for exactly `body` as `client.js`.
+    fn records_declaration(body: &str, may: &[&str], operations: &[&str]) -> String {
+        serde_json::json!({
+            "contract": "app-screens/v2",
+            "app": "demo",
+            "entry": "client.js",
+            "assets": [{
+                "name": "client.js",
+                "media_type": "text/javascript",
+                "sha256": digest(body),
+                "size": body.len(),
+            }],
+            "provenance": {
+                "source_digest": digest("source"),
+                "sdk_digest": digest("sdk"),
+                "toolchain_digest": digest("toolchain"),
+            },
+            "host_contract": "screen-records.v1",
+            "may": may,
+            "operations": operations,
+        })
+        .to_string()
+    }
+
+    /// The seam this operation exists for: a host-only operation passes the
+    /// host-owned asset-integrity admission while every native/strict
+    /// admission still refuses it. The admitted value is the narrow
+    /// [`AssetIntegrityChecked`] — the app tag and nothing else, so no
+    /// operation list can be read as verified — and it grants nothing.
+    #[test]
+    fn a_host_only_operation_passes_only_the_asset_integrity_admission() {
+        let manifest = records_declaration(BODY, &[MAY_RECORDS_CALL], &["sends.cancel"]);
+        let checked = validate_facts_asset_integrity(&manifest, &facts(BODY))
+            .expect("a well-formed host operation token is admitted");
+        assert_eq!(checked.app(), "demo");
+
+        assert!(
+            validate_facts(&manifest, &facts(BODY)).is_err(),
+            "the strict fact admission still refuses an operation this core does not serve"
+        );
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        assert!(
+            validate_map(&manifest, &bodies).is_err(),
+            "the native body admission still refuses it"
+        );
+
+        // The same declaration with a native operation passes both: the
+        // host-owned admission decides the token bound only, never membership.
+        let native = records_declaration(BODY, &[MAY_RECORDS_CALL], &["records.list"]);
+        assert!(validate_facts_asset_integrity(&native, &facts(BODY)).is_ok());
+        assert!(validate_facts(&native, &facts(BODY)).is_ok());
+
+        // Deferring the CALL/SLOT grant to the caller does not widen the
+        // `may` vocabulary or any other declaration rule.
+        let ungranted_may = records_declaration(BODY, &["records.nope"], &["sends.cancel"]);
+        assert!(validate_facts_asset_integrity(&ungranted_may, &facts(BODY)).is_err());
+        let slot_on_actions = records_declaration(BODY, &[MAY_RECORDS_SLOT], &["sends.cancel"])
+            .replacen("\"screen-records.v1\"", "\"screen-actions.v1\"", 1);
+        assert!(validate_facts_asset_integrity(&slot_on_actions, &facts(BODY)).is_err());
+    }
+
+    /// The host-owned admission compares bytes exactly as the strict one
+    /// does: a same-length body swap, a wrong size, a missing fact and an
+    /// undeclared fact all refuse.
+    #[test]
+    fn asset_integrity_still_compares_the_supplied_bytes_exactly() {
+        let manifest = records_declaration(BODY, &[MAY_RECORDS_CALL], &["sends.cancel"]);
+        assert!(validate_facts_asset_integrity(&manifest, &facts(BODY)).is_ok());
+
+        let swapped = BODY.replace('1', "2");
+        assert_eq!(swapped.len(), BODY.len());
+
+        let mut tampered = facts(BODY);
+        tampered.get_mut("client.js").unwrap().sha256 = digest(&swapped);
+        assert!(validate_facts_asset_integrity(&manifest, &tampered).is_err());
+
+        let mut sized = facts(BODY);
+        sized.get_mut("client.js").unwrap().size += 1;
+        assert!(validate_facts_asset_integrity(&manifest, &sized).is_err());
+
+        assert!(validate_facts_asset_integrity(&manifest, &BTreeMap::new()).is_err());
+
+        let mut extra = facts(BODY);
+        extra.insert(
+            "styles.css".to_string(),
+            ScreenAssetFact {
+                size: 0,
+                sha256: digest(""),
+            },
+        );
+        assert!(validate_facts_asset_integrity(&manifest, &extra).is_err());
+    }
+
+    /// Deferring the vocabulary does not weaken the shared parser:
+    /// malformed and duplicated declarations still refuse, operation tokens
+    /// stay typed, bounded and duplicate-free, and an unknown contract or
+    /// field still refuses.
+    #[test]
+    fn asset_integrity_still_refuses_malformed_and_duplicate_declarations() {
+        let manifest = records_declaration(BODY, &[MAY_RECORDS_CALL], &["sends.cancel"]);
+        assert!(validate_facts_asset_integrity(&manifest, &facts(BODY)).is_ok());
+
+        // A repeated operation entry, in the list and as a JSON field.
+        let duplicate =
+            records_declaration(BODY, &[MAY_RECORDS_CALL], &["sends.cancel", "sends.cancel"]);
+        assert!(validate_facts_asset_integrity(&duplicate, &facts(BODY)).is_err());
+        let repeated_field = manifest.replacen('{', "{\"app\":\"other\",", 1);
+        assert!(validate_facts_asset_integrity(&repeated_field, &facts(BODY)).is_err());
+
+        // The token bound stays enforced: non-empty, printable ASCII, at most
+        // 64 bytes. The vocabulary grammar is the caller's, so a name like
+        // `Sends.cancel` is a well-formed token here and the host's own
+        // closed set is what refuses it.
+        for bad in [
+            "",
+            "sends cancel",
+            "sends\tcancel",
+            "sends\ncancel",
+            "sends.cancél",
+        ] {
+            let malformed = records_declaration(BODY, &[MAY_RECORDS_CALL], &[bad]);
+            assert!(
+                validate_facts_asset_integrity(&malformed, &facts(BODY)).is_err(),
+                "operation {bad:?} must refuse"
+            );
+        }
+        let too_long = "a".repeat(MAX_OPERATION_BYTES + 1);
+        let malformed = records_declaration(BODY, &[MAY_RECORDS_CALL], &[too_long.as_str()]);
+        assert!(validate_facts_asset_integrity(&malformed, &facts(BODY)).is_err());
+
+        // A non-string member refuses through the typed decode.
+        let non_string = manifest.replacen("\"sends.cancel\"", "1", 1);
+        assert!(validate_facts_asset_integrity(&non_string, &facts(BODY)).is_err());
+
+        // The operation count keeps its bound, at 64 accepted and 65 refused.
+        {
+            let names: Vec<String> = (0..MAX_OPERATIONS).map(|i| format!("sends.o{i}")).collect();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let full = records_declaration(BODY, &[MAY_RECORDS_CALL], &refs);
+            assert!(validate_facts_asset_integrity(&full, &facts(BODY)).is_ok());
+        }
+        {
+            let mut names: Vec<String> =
+                (0..MAX_OPERATIONS).map(|i| format!("sends.o{i}")).collect();
+            names.push("sends.overflow".to_string());
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let oversized = records_declaration(BODY, &[MAY_RECORDS_CALL], &refs);
+            assert!(validate_facts_asset_integrity(&oversized, &facts(BODY)).is_err());
+        }
+
+        // Operations still require the records host contract, the exact
+        // provenance/digest grammar, and valid JSON.
+        let actions = manifest.replacen("\"screen-records.v1\"", "\"screen-actions.v1\"", 1);
+        assert!(validate_facts_asset_integrity(&actions, &facts(BODY)).is_err());
+        let v1 = manifest.replacen("\"app-screens/v2\"", "\"app-screens/v1\"", 1);
+        assert!(validate_facts_asset_integrity(&v1, &facts(BODY)).is_err());
+        let bad_digest = manifest.replacen(&digest(BODY), "sha256:short", 1);
+        assert!(validate_facts_asset_integrity(&bad_digest, &facts(BODY)).is_err());
+        assert!(validate_facts_asset_integrity("{", &facts(BODY)).is_err());
     }
 }

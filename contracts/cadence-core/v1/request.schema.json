@@ -64,6 +64,23 @@
       ]
     },
     {
+      "description": "Check the same declaration, facts and `screen_count` with the host\nowning the `operations` vocabulary (CAD-2118/AOS-479). Shared\nstructure and byte facts only; the caller still decides operation\nmembership and CALL/SLOT grants.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ScreenIntegrityInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "app.screen.asset-integrity"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
+    },
+    {
       "description": "Check an issue id, project key, tags, status and priority.",
       "type": "object",
       "properties": {
@@ -531,7 +548,7 @@
       ]
     },
     "ScreenIntegrityInput": {
-      "description": "Input of `app.screen.integrity`.\n\nThe declaration is the exact `screens.json` text of one `screens/<tag>/`\npackage, and `assets` carries host-computed *facts* for the bytes that host\ninstalled — never bodies. `screen_count` is the app-level package count the\nsame host verified, bounded by the one [`MAX_SCREENS`] the native bundle\nscan enforces. The whole envelope is bounded by [`MAX_INPUT_BYTES`] before\nany JSON work, and the declaration by the screen contract's own 32 KiB and\n32-asset limits, so no multi-megabyte asset can be encoded through the ABI.\n\n**Authority**: the facts and the count are the caller's report. A caller\nmust compute `size`/`sha256` over the exact installed bytes and count the\n`screens/<tag>/` packages it actually installed; the op proves the\ndeclaration agrees with what it was told, and nothing here installs,\nmounts, executes or grants effect authority.",
+      "description": "Input of `app.screen.integrity` and `app.screen.asset-integrity`.\n\nThe declaration is the exact `screens.json` text of one `screens/<tag>/`\npackage, and `assets` carries host-computed *facts* for the bytes that host\ninstalled — never bodies. `screen_count` is the app-level package count the\nsame host verified, bounded by the one [`MAX_SCREENS`] the native bundle\nscan enforces. The whole envelope is bounded by [`MAX_INPUT_BYTES`] before\nany JSON work, and the declaration by the screen contract's own 32 KiB and\n32-asset limits, so no multi-megabyte asset can be encoded through the ABI.\n\nBoth operations take exactly this shape and run the same checks. They\ndiffer only in who owns the declaration's `operations` vocabulary:\n`app.screen.integrity` resolves each name against the native set and\nrequires its `records.call`/`records.slot` grant, while\n`app.screen.asset-integrity` checks the token bound only and leaves\nmembership and CALL/SLOT classification to the caller.\n\n**Authority**: the facts and the count are the caller's report. A caller\nmust compute `size`/`sha256` over the exact installed bytes and count the\n`screens/<tag>/` packages it actually installed; the op proves the\ndeclaration agrees with what it was told, and nothing here installs,\nmounts, executes or grants effect — or operation — authority.",
       "type": "object",
       "properties": {
         "assets": {
