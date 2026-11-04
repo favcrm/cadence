@@ -156,7 +156,8 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
     // A board that answered with a live session does not lose its browser: this
     // is a failed read, so the tab, Stop and polling stay.
     if (state.everLive) {
-      readFailed();
+      if (state.session?.state === "active" || state.session?.state === "handoff" || state.stop !== "idle") readFailed();
+      else retrying = false; // a definite answer, with nothing live to lose sight of
       return;
     }
     set({ ...state, availability: "unavailable", session: null, loadError: false, probeFailed: false, open: false, focused: false, stop: "idle" });

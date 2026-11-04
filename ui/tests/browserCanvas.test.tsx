@@ -1706,6 +1706,22 @@ for (const turn of [1, 4]) {
   delete (document as any).hidden;
 }
 
+// ===== an unavailable or 404 answer, once nothing is live, ends polling and the retry =====
+for (const mode of ["404", "unavailable"] as const) {
+  const m = await start({ state: "active", signedIn: false, url: "https://portal.example.test/orders" });
+  board.body = { state: "ended", signedIn: false, url: null, instructions: null };
+  await advance(3000);
+  equal(store.browserSnapshot().session?.state, "ended", `${mode}: the session ended`);
+  board.mode = mode;
+  await React.act(async () => { await store.refreshBrowser(); });
+  await settle();
+  assert(store.tabVisible(store.browserSnapshot()), `${mode}: the tab stays`);
+  const after = board.gets;
+  await advance(10 * 60_000);
+  equal(board.gets, after, `${mode}: zero further reads over ten minutes`);
+  await m.unmount();
+}
+
 console.log("browser canvas tests passed");
 }
 main().then(() => process.exit(0), (e) => { console.error(e); process.exit(1); });
