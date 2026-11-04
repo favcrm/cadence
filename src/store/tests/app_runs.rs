@@ -1931,10 +1931,9 @@ fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
             crate::store::app_capabilities::SOURCE_PAGE_AFTER_SQL
         ))
         .unwrap()
-        .query_map(
-            params![install, &context_id, fence, 0.0f64, "zzzz", 5i64],
-            |row| row.get::<_, String>(3),
-        )
+        .query_map(params![install, &context_id, 0.0f64, "zzzz", 5i64], |row| {
+            row.get::<_, String>(3)
+        })
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
@@ -2072,4 +2071,65 @@ fn cad2042_pre_v62_writer_still_produces_a_pageable_receipt() {
     assert_eq!(row.0, 1, "the trigger marks a source read");
     assert_eq!(row.1.as_deref(), Some("install-old"));
     assert_eq!(row.2.as_deref(), Some("ctx-old"));
+}
+
+/// CAD-2120: the cursor is opaque, not authenticated, so a caller can name any
+/// scan-start fence. A low fence must cost a bounded index range, not the
+/// scoped history, and must end in a restart rather than a silent empty scan.
+#[test]
+fn cad2120_low_run_fence_is_bounded_and_restarts_the_scan() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("fence.sqlite3");
+    drop(Store::open(&path).unwrap());
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3000)
+             INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema,install_id,context_id,source_post_read)
+               SELECT 'c'||i,'r','s','','','source'||i,'q'||i,'b','i','{}','d',i,2,'inst','ctx',1 FROM n;",
+        )
+        .unwrap();
+    }
+    let s = Store::open_for_schema_tests(&path).unwrap();
+    let watermark = s.app_source_run_watermark().unwrap();
+    // An honest fence returns the page.
+    let page = s
+        .app_source_run_candidates("inst", "ctx", None, watermark, 10)
+        .unwrap();
+    assert_eq!(page.len(), 10);
+    // A forged low fence would hide all 3000 rows. It must be refused after a
+    // bounded look, not answered empty after walking the scope.
+    let err = s
+        .app_source_run_candidates("inst", "ctx", None, 0, 10)
+        .unwrap_err();
+    assert_eq!(err.code(), Some("stale_cursor"), "{err}");
+    // A fence that only hides a few recent rows still pages.
+    let some = s
+        .app_source_run_candidates("inst", "ctx", None, watermark - 5, 10)
+        .unwrap();
+    assert_eq!(some.len(), 10);
+    assert_eq!(some[0].0, "c2995");
+}
+
+/// CAD-2120: a concurrent opener that already completed v62 deletes the
+/// progress row; a late opener must see v62 and succeed, not error.
+#[test]
+fn cad2120_backfill_after_a_concurrent_opener_finished_succeeds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("race.sqlite3");
+    drop(Store::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let progress: i64 = conn
+        .query_row("SELECT COUNT(*) FROM app_schema_progress", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(progress, 0, "the first opener finished and cleared it");
+    assert!(
+        Store::source_scope_batch(&conn).unwrap(),
+        "a late opener sees v62 and is done"
+    );
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert!(version >= 62);
 }

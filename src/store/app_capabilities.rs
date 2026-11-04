@@ -135,20 +135,31 @@ pub(crate) struct AppCapabilityClaim<'a> {
 
 /// CAD-2042: the first page of run-bound source reads. The order matches the
 /// partial index, so `LIMIT` stops the index walk.
-pub(crate) const SOURCE_PAGE_FIRST_SQL: &str = "SELECT id,created,run_id
+///
+/// CAD-2120: the scan-start rowid fence is NOT a SQL predicate. As a residual
+/// filter before `LIMIT` it let a cursor naming a low fence (the cursor is
+/// opaque, not authenticated) walk the whole scoped history for one page.
+/// The fence is applied to the rowid column of the bounded index range
+/// instead, see `app_source_run_candidates`.
+pub(crate) const SOURCE_PAGE_FIRST_SQL: &str = "SELECT id,created,run_id,rowid
    FROM app_capability_results
   WHERE install_id=? AND context_id=? AND source_post_read=1
-    AND rowid<=?
   ORDER BY created DESC,id DESC LIMIT ?";
 
 /// CAD-2042: the continuation page. The cursor is one composite row value so
 /// that `(created,id)<(?,?)` is an index range start, not a disjunction
 /// evaluated while walking the scope from its newest entry.
-pub(crate) const SOURCE_PAGE_AFTER_SQL: &str = "SELECT id,created,run_id
+pub(crate) const SOURCE_PAGE_AFTER_SQL: &str = "SELECT id,created,run_id,rowid
    FROM app_capability_results
   WHERE install_id=? AND context_id=? AND source_post_read=1
-    AND rowid<=? AND (created,id)<(?,?)
+    AND (created,id)<(?,?)
   ORDER BY created DESC,id DESC LIMIT ?";
+
+/// CAD-2120: receipts recorded in this scope while one scan runs are skipped
+/// by the fence; a page examines at most this many index entries beyond its
+/// own size to find its rows. More skipped entries than this means the scope
+/// moved too far for the scan to continue, so it restarts.
+const SOURCE_PAGE_FENCE_SLACK: usize = 1024;
 
 impl Store {
     /// Reserve the one paid operation for this run slot before provider I/O.
@@ -571,19 +582,34 @@ impl Store {
             Some(_) => SOURCE_PAGE_AFTER_SQL,
             None => SOURCE_PAGE_FIRST_SQL,
         })?;
-        let rows = match after {
+        let examine = limit.saturating_add(SOURCE_PAGE_FENCE_SLACK);
+        let map = |r: &rusqlite::Row<'_>| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get(2)?),
+                r.get::<_, i64>(3)?,
+            ))
+        };
+        let scanned = match after {
             Some((at, id)) => stmt
-                .query_map(
-                    params![install, context, fence, at, id, limit as i64],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )?
+                .query_map(params![install, context, at, id, examine as i64], map)?
                 .collect::<rusqlite::Result<Vec<_>>>()?,
             None => stmt
-                .query_map(params![install, context, fence, limit as i64], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })?
+                .query_map(params![install, context, examine as i64], map)?
                 .collect::<rusqlite::Result<Vec<_>>>()?,
         };
+        let exhausted = scanned.len() < examine;
+        let rows: Vec<_> = scanned
+            .into_iter()
+            .filter(|(_, rowid)| *rowid <= fence)
+            .map(|(row, _)| row)
+            .take(limit)
+            .collect();
+        if rows.len() < limit && !exhausted {
+            return Err(Error::invalid(
+                "stale_cursor",
+                "the retained source library changed during the scan — restart it",
+            ));
+        }
         Ok(rows)
     }
 
