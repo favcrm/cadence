@@ -8097,9 +8097,9 @@ if (mode === 'keys') {
         )
     }
 
-    // A streamed reply in OpenRouter's chat-completions chunk shape: a role chunk, a usage-only
-    // chunk, a reasoning chunk, the text in two content deltas, the finish reason on its own
-    // chunk, a usage chunk and the [DONE] sentinel.
+    // A streamed reply in OpenRouter's chat-completions chunk shape: a role chunk, a ping, a
+    // reasoning chunk, the text in two content deltas, the finish reason on its own chunk, a
+    // usage chunk and the [DONE] sentinel.
     fn or_chunk(delta: Value, finish: Value) -> Value {
         json!({ "type": "chunk", "id": "gen-1", "object": "chat.completion.chunk", "model": "deepseek/deepseek-v4.1-flash-1017", "provider": "Stub", "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }] })
     }
@@ -8121,6 +8121,13 @@ if (mode === 'keys') {
         }
         ev.push(json!({ "type": "usage", "choices": [], "usage": { "prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0 } }));
         ev.push(json!({ "type": "done", "raw": "[DONE]" }));
+        ev
+    }
+
+    // What the provider sends for a refusal: the refusal text in `delta.refusal`, content that may
+    // still be well-formed, and `finish_reason: stop` (not a refusal finish reason).
+    fn with_refusal(mut ev: Vec<Value>, refusal: &str) -> Vec<Value> {
+        ev.insert(3, or_chunk(json!({ "refusal": refusal }), Value::Null));
         ev
     }
 
@@ -8975,27 +8982,29 @@ if (mode === 'keys') {
             let mut bad_event = model_events(&good, Some("stop"));
             bad_event.insert(4, json!({ "type": "x", "raw": "{not json" }));
             let truncated = model_events(&good, None)[..4].to_vec();
+            let mut other_choice = model_events(&good, Some("stop"));
+            other_choice[4]["choices"][0]["index"] = json!(1);
             let cases: Vec<(&str, Value, &str, usize)> = vec![
                 (
                     "refusal",
-                    json!([model_reply(&revise, "refusal")]),
+                    json!([{ "status": 200, "sse": with_refusal(model_events(&revise, Some("stop")), "I can't help with that.") }]),
                     "stopped with refusal",
                     1,
                 ),
                 (
-                    "max tokens",
+                    "finish length",
                     json!([model_reply(&good, "length")]),
                     "stopped with length",
                     1,
                 ),
                 (
-                    "pause turn",
+                    "finish content filter",
                     json!([model_reply(&good, "content_filter")]),
                     "stopped with content_filter",
                     1,
                 ),
                 (
-                    "tool use stop",
+                    "finish tool calls",
                     json!([model_reply(&good, "tool_calls")]),
                     "model stopped early",
                     1,
@@ -9021,6 +9030,18 @@ if (mode === 'keys') {
                 (
                     "error event mid-stream",
                     json!([{ "status": 200, "sse": mid_error }]),
+                    "stream failed",
+                    1,
+                ),
+                (
+                    "choice index other than 0",
+                    json!([{ "status": 200, "sse": other_choice }]),
+                    "stream failed",
+                    1,
+                ),
+                (
+                    "finish reason error",
+                    json!([model_reply(&good, "error")]),
                     "stream failed",
                     1,
                 ),
@@ -9118,6 +9139,17 @@ if (mode === 'keys') {
             )
             .unwrap();
             assert_eq!(body["stream"], true, "the call must stream");
+            // The data-handling controls and the schema constraint ride on every request.
+            assert_eq!(
+                (
+                    &body["provider"]["zdr"],
+                    &body["provider"]["data_collection"],
+                    &body["response_format"]["type"]
+                ),
+                (&json!(true), &json!("deny"), &json!("json_schema")),
+                "{}: provider controls",
+                wf.file
+            );
         }
     }
 
@@ -9326,7 +9358,11 @@ if (mode === 'keys') {
                     json!([model_reply(&poisoned_ok.to_string(), "stop")]),
                     true,
                 ),
-                ("refusal text", json!([model_reply(&p, "refusal")]), false),
+                (
+                    "refusal text",
+                    json!([{ "status": 200, "sse": with_refusal(model_events("{}", Some("stop")), &p) }]),
+                    false,
+                ),
                 ("odd stop reason", json!([model_reply("{}", &p)]), false),
                 ("not json", json!([model_reply(&p, "stop")]), false),
                 (
@@ -11144,7 +11180,7 @@ if (mode === 'keys') {
                 ),
                 (
                     "over then a refusal stop",
-                    chunked_events(&long, 1_000, Some("refusal")),
+                    with_refusal(chunked_events(&long, 1_000, Some("stop")), "no"),
                     false,
                 ),
                 (
@@ -11326,8 +11362,8 @@ if (mode === 'keys') {
             assert!(r.read("out/review-output.json").is_some());
             // Two reasons that differ, in either order, even when the last would be fine.
             for stops in [
-                ["refusal", "stop"],
-                ["stop", "refusal"],
+                ["content_filter", "stop"],
+                ["stop", "content_filter"],
                 ["stop", "length"],
                 ["length", "stop"],
             ] {
