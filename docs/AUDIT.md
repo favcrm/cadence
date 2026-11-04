@@ -307,10 +307,14 @@ peer proof also refuse a caller with a known coding-agent runtime variable on
 its ancestry (CAD-2059). This is a guardrail against accidents, not a boundary:
 an agent that scrubs its environment and leaves the marked ancestry (`setsid -f
 env -i`), or starts through `systemd-run`, cron or `ssh localhost`, still passes.
-Other stores are not covered. The check compares a service's state dir with the
-default in that service's own environment, so a service started with `HOME`,
-`XDG_STATE_HOME` or `CADENCE_HOME` moved is unguarded for every caller until it
-restarts from the normal environment. `cadence daemon
+Other stores are not covered. The check compares the store with the default in
+the environment of the process that runs it. For daemon verbs and the board that
+is the service, as set when it started: a service pinned to the real store but
+started with `HOME` or `CADENCE_HOME` moved (`XDG_STATE_HOME` on the legacy
+layout) is unguarded on those paths until it restarts from the normal
+environment. For rollout verbs and `cadence update` it is the caller: moving
+those variables on the call while pinning the real store skips the guard.
+`cadence daemon
 start` and `cadence ui start` strip these variables from the service they start,
 because a service started from an agent's shell is not that agent, so a board
 started that way still passes. A direct `cadence ui run` from an agent's shell is
