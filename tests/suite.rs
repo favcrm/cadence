@@ -6519,7 +6519,11 @@ mod cad2100_classifier_merge_base {
             std::fs::create_dir(&work).unwrap();
             let d = work.as_path();
             git(d, &["init", "-q", "-b", "main"]);
-            put(d, ".github/workflows/ci.yml", "jobs:\n  ci:\n    runs-on: x\n");
+            put(
+                d,
+                ".github/workflows/ci.yml",
+                "jobs:\n  ci:\n    runs-on: x\n",
+            );
             put(d, RISK_PATHS, &real(RISK_PATHS));
             put(d, ONE_REVIEW, &real(ONE_REVIEW));
             put(d, "docs/guide.md", "guide\n");
@@ -6619,7 +6623,9 @@ mod cad2100_classifier_merge_base {
 
         /// Main after it dropped `file`.
         fn main_without(&self, name: &str, file: &str) -> String {
-            self.branch(name, &self.tip, |d| std::fs::remove_file(d.join(file)).unwrap())
+            self.branch(name, &self.tip, |d| {
+                std::fs::remove_file(d.join(file)).unwrap()
+            })
         }
 
         fn changed_files(&self, base: &str, head: &str) -> u64 {
@@ -6632,7 +6638,13 @@ mod cad2100_classifier_merge_base {
         }
 
         /// The scenario both halves share; callers add their own knobs.
-        fn scenario(&self, head: &str, base_ref: &str, base_oid: &str, tip: &str) -> Map<String, Value> {
+        fn scenario(
+            &self,
+            head: &str,
+            base_ref: &str,
+            base_oid: &str,
+            tip: &str,
+        ) -> Map<String, Value> {
             let Value::Object(map) = json!({
                 "repo": REPO, "pr": 7, "title": "CAD-1: add the thing", "head": head,
                 "base": base_ref, "base_oid": base_oid, "tip": tip,
@@ -6653,13 +6665,31 @@ mod cad2100_classifier_merge_base {
     }
 
     fn combined() -> Value {
-        owner("20261103-000100-c.md", "20261103-000100", "usr_alice", "alice", "combined")
+        owner(
+            "20261103-000100-c.md",
+            "20261103-000100",
+            "usr_alice",
+            "alice",
+            "combined",
+        )
     }
 
     fn owner_pair() -> Vec<Value> {
         vec![
-            owner("20261103-000100-a.md", "20261103-000100", "usr_alice", "alice", "standards"),
-            owner("20261103-000200-b.md", "20261103-000200", "usr_bob", "bob", "spec-security"),
+            owner(
+                "20261103-000100-a.md",
+                "20261103-000100",
+                "usr_alice",
+                "alice",
+                "standards",
+            ),
+            owner(
+                "20261103-000200-b.md",
+                "20261103-000200",
+                "usr_bob",
+                "bob",
+                "spec-security",
+            ),
         ]
     }
 
@@ -6735,9 +6765,9 @@ mod cad2100_classifier_merge_base {
             install_stub(&bin, &["gh", "cadence"]);
             let comment = root.join(".comment");
             let _ = std::fs::remove_file(&comment);
-            let mut scenario = self
-                .repo
-                .scenario(&self.head, &self.base_ref, &self.base_oid, &self.tip);
+            let mut scenario =
+                self.repo
+                    .scenario(&self.head, &self.base_ref, &self.base_oid, &self.tip);
             scenario.extend(self.knobs.clone());
             scenario.insert("verdicts".into(), json!(self.rows));
             scenario.insert("class".into(), json!(self.class));
@@ -6884,10 +6914,18 @@ mod cad2100_classifier_merge_base {
     fn a_lean_class_whose_diff_qualifies_still_passes_for_the_right_reviews() {
         let repo = Repo::new();
         let doc = repo.touching("doc", &repo.tip, &["docs/y.md"]);
-        gate(&repo, &doc).class("routine", vec![]).unapproved().run().passes();
+        gate(&repo, &doc)
+            .class("routine", vec![])
+            .unapproved()
+            .run()
+            .passes();
         let run = gate(&repo, &doc).run();
         run.passes();
-        assert!(run.stdout.contains("reviews required: one"), "{}", run.show());
+        assert!(
+            run.stdout.contains("reviews required: one"),
+            "{}",
+            run.show()
+        );
         assert!(run.stdout.contains("class: auto"), "{}", run.show());
         // Ordinary one-review code is consequential, not routine, and passes as such.
         let code = repo.touching("code", &repo.tip, &["src/area/new.rs"]);
@@ -6949,7 +6987,11 @@ mod cad2100_classifier_merge_base {
             .unapproved()
             .run();
         run.refused(&[NO_APPROVAL]);
-        assert!(run.stdout.contains("class: human (src/zone/lib.rs"), "{}", run.show());
+        assert!(
+            run.stdout.contains("class: human (src/zone/lib.rs"),
+            "{}",
+            run.show()
+        );
         // A list that was looser at the PR's recorded base does not outvote main's tip.
         let head = repo.restoring("restore-peer", "src/peer.rs", "docs/y.md");
         gate(&repo, &head)
@@ -7008,7 +7050,11 @@ mod cad2100_classifier_merge_base {
         ];
         for (key, value) in broken {
             for class in ["consequential", "strict"] {
-                let rows = if class == "strict" { owner_pair() } else { vec![combined()] };
+                let rows = if class == "strict" {
+                    owner_pair()
+                } else {
+                    vec![combined()]
+                };
                 gate(&repo, &head)
                     .class(class, rows)
                     .knob(key, value.clone())
@@ -7077,15 +7123,25 @@ mod cad2100_classifier_merge_base {
             .clone()
             .unwrap_or_else(|| panic!("no evidence comment was posted\n{}", run.show()));
         let lines: Vec<&str> = comment.lines().collect();
-        assert!(lines.contains(&format!("Base: {}", repo.base).as_str()), "{comment}");
+        assert!(
+            lines.contains(&format!("Base: {}", repo.base).as_str()),
+            "{comment}"
+        );
         assert!(
             lines.contains(&format!("Merge base judged: {}", repo.mid).as_str()),
             "{comment}"
         );
-        assert!(lines.contains(&format!("Main tip: {}", repo.tip).as_str()), "{comment}");
+        assert!(
+            lines.contains(&format!("Main tip: {}", repo.tip).as_str()),
+            "{comment}"
+        );
         // The comment it posted satisfies the gate's own re-read: only the signature, which
         // this fixture has no key for, is left.
-        assert!(run.stderr.contains("delivery-gate signature failed"), "{}", run.show());
+        assert!(
+            run.stderr.contains("delivery-gate signature failed"),
+            "{}",
+            run.show()
+        );
         // A comment written before these lines existed still counts (the stub's own does not
         // have them), and the exception path is unchanged.
         gate(&repo, &head).run().passes();
@@ -7100,7 +7156,11 @@ mod cad2100_classifier_merge_base {
         .map(String::from)
         .to_vec();
         let run = case.run();
-        assert!(run.stdout.contains("review EXCEPTION until"), "{}", run.show());
+        assert!(
+            run.stdout.contains("review EXCEPTION until"),
+            "{}",
+            run.show()
+        );
         assert!(!run.stderr.contains(LEAN), "{}", run.show());
     }
 
@@ -7149,13 +7209,13 @@ mod cad2100_classifier_merge_base {
             let log = std::fs::File::create(r.join("daemon.log")).unwrap();
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
             daemon_env(r, &mut cmd);
-            let child = cmd
-                .args(["daemon", "run"])
-                .stdin(Stdio::null())
-                .stdout(log.try_clone().unwrap())
-                .stderr(log)
-                .spawn()
-                .unwrap();
+            let child = cadence_agent::reaper::spawn(
+                cmd.args(["daemon", "run"])
+                    .stdin(Stdio::null())
+                    .stdout(log.try_clone().unwrap())
+                    .stderr(log),
+            )
+            .unwrap();
             let mut daemon = Daemon { child, root };
             let socket = daemon.root.path().join("s/cadence.sock");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -7263,12 +7323,20 @@ mod cad2100_classifier_merge_base {
         assert_eq!(class_of(&answer), "strict", "{answer}");
         assert_eq!(paths_of(&answer), ["docs/y.md", "src/peer.rs"], "{answer}");
         assert_eq!(answer["merge_base"], json!(repo.tip), "{answer}");
-        assert_eq!(answer["base"], json!(repo.base), "the recorded base is reported as is");
+        assert_eq!(
+            answer["base"],
+            json!(repo.base),
+            "the recorded base is reported as is"
+        );
         // A clean update of the branch, with GitHub still counting from the old base, is not
         // refused over the count.
         let head = repo.touching("clean", &repo.tip, &["docs/y.md"]);
         let case = scenario(&head, &repo.tip);
-        assert_ne!(case["changed_files"], json!(1), "the stale count must differ");
+        assert_ne!(
+            case["changed_files"],
+            json!(1),
+            "the stale count must differ"
+        );
         let (code, answer, stderr) = daemon.classify(&case, json!({}));
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(class_of(&answer), "routine", "{answer}");
@@ -7385,7 +7453,12 @@ mod cad2100_classifier_merge_base {
         assert_eq!(answer["merge_base"], json!(repo.base), "{answer}");
         assert_eq!(
             paths_of(&answer),
-            ["docs/y.md", "src/area/lib.rs", "src/peer.rs", "src/review.rs"],
+            [
+                "docs/y.md",
+                "src/area/lib.rs",
+                "src/peer.rs",
+                "src/review.rs"
+            ],
             "{answer}"
         );
         // And GitHub's file count is still checked against the list for it.
