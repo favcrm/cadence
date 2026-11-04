@@ -251,13 +251,18 @@ pub(crate) fn route_client_only(cli: Cli) -> Result<i32> {
         .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
         .transpose()?;
     match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
-        org::Resolved::Remote(target) => remote::run(
-            target,
-            cli.command,
-            cli.wake_timeout,
-            cli.state_dir.clone(),
-            cli.command_path,
-        ),
+        org::Resolved::Remote(target) => {
+            // CAD-2101: the same refusal as the full install; a saved default
+            // is not naming the org for a profile command.
+            super::agent_profile::require_named_org(cli.org.as_deref(), &cli.command, &target.org)?;
+            remote::run(
+                target,
+                cli.command,
+                cli.wake_timeout,
+                cli.state_dir.clone(),
+                cli.command_path,
+            )
+        }
         org::Resolved::Local(_) => Err(local_command_refusal()),
     }
 }

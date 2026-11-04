@@ -46,6 +46,7 @@ reviewer identity or approval:
 ```bash
 cadence --org <org> agent profiles
 cadence --org <org> agent context <profile-id>
+cadence --org <org> agent profile get <profile-id>   # owner-only writes: create, edit, archive
 cadence --org <org> issue show <issue-id>
 ```
 

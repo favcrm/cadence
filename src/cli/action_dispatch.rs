@@ -809,6 +809,11 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     let state_dir = match resolved {
         org::Resolved::Local(state_dir) => state_dir,
         org::Resolved::Remote(target) => {
+            // CAD-2101: a profile command acts on one workspace's agents, so
+            // the org must be named on this command line. A saved default or
+            // `CADENCE_ORG` is not naming it: it could point at another
+            // workspace than the caller means. Refused before any request.
+            agent_profile::require_named_org(cli.org.as_deref(), &cli.command, &target.org)?;
             // CAD-1019 slice 2: a remote org never opens local state or
             // adopts a sandbox profile — the allowlisted verb goes over
             // HTTPS; everything else refuses inside `remote::run`.
