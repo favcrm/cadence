@@ -389,6 +389,13 @@ scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA> --dry-run
 scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA>
 ```
 
+The gate refuses (dry run: warns) when `scripts/enqueue-reviewed` or
+`scripts/delivery-gate` differs from `origin/main`'s (CAD-2108), and its first
+line names the gate's content hash. Recover by writing both files from
+`git show origin/main:scripts/<name>` into a scratch directory and running that
+copy from inside the repo; fetch `origin/main` first, since a stale ref is not
+detected. A PR that edits the gate is enqueued from main's copy.
+
 Temporary path (CAD-1946; remove this note when it ends): while the hosted
 reviewer attestation cannot be produced, add `--exception --advisory
 standards=<url> --advisory spec-security=<url>` (plus `--advisory

@@ -2011,6 +2011,75 @@ def self_test():
     return 0 if not failures else 1
 
 
+def git_main_blob(name):
+    """(state, bytes): `ok`, `no-ref` (origin/main unreadable here: not a repo, no such
+    ref, no git) or `unreadable` (the ref is there but the file is not)."""
+    try:
+        ref = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "origin/main^{commit}"],
+                             capture_output=True)
+    except OSError:
+        return "no-ref", b""
+    if ref.returncode != 0:
+        return "no-ref", b""
+    try:
+        blob = subprocess.run(["git", "show", f"origin/main:scripts/{name}"], capture_output=True)
+    except OSError:
+        return "unreadable", b""
+    return ("ok", blob.stdout) if blob.returncode == 0 else ("unreadable", b"")
+
+
+def check_gate_copy(dry_run):
+    """CAD-2108: a gate that differs from main's must not sign. Returns refusal lines.
+
+    Compares this script and its sibling delivery-gate, byte for byte, with
+    origin/main's, read by local git from the CURRENT directory (not the script's:
+    a copy of main's gate run from a scratch directory inside the repo must pass).
+    No network. A stale local origin/main is not detected. No origin/main here means
+    no opinion; origin/main present but the file unreadable cannot prove equality."""
+    files = {}
+    for path in (os.path.abspath(__file__), GATE_SCRIPT):
+        try:
+            with open(path, "rb") as fh:
+                files[os.path.basename(path)] = fh.read()
+        except OSError:
+            files[os.path.basename(path)] = None
+    digest = hashlib.sha256()
+    for name in sorted(files):
+        digest.update(name.encode() + b"\0" + (files[name] or b"") + b"\0")
+    short = digest.hexdigest()[:12]
+    problems = []
+    unchecked = False
+    for name in sorted(files):
+        state, main_bytes = git_main_blob(name)
+        if state == "no-ref":
+            unchecked = True
+            break
+        if files[name] is None:
+            problems.append(f"{name} cannot be read here, so it cannot be compared with origin/main")
+        elif state == "unreadable":
+            problems.append(f"scripts/{name} cannot be read from origin/main, so equality is unproven")
+        elif files[name] != main_bytes:
+            problems.append(f"{name} differs from origin/main:scripts/{name}")
+    if unchecked:
+        print(f"{ME}: gate {short}: not compared with origin/main (no origin/main in the current directory)",
+              file=sys.stderr)
+        print(f"{ME}: gate {short} (unchecked)")
+        return []
+    if not problems:
+        print(f"{ME}: gate {short} (same as origin/main)")
+        return []
+    how = ("run main's copy from inside the repo: d=$(mktemp -d) && for f in enqueue-reviewed delivery-gate; do "
+           "git show origin/main:scripts/$f > $d/$f; done && chmod +x $d/enqueue-reviewed && "
+           "$d/enqueue-reviewed <args> (git fetch origin main first if your origin/main is old)")
+    if dry_run:
+        print(f"{ME}: gate {short} (differs from origin/main; dry run continues)")
+        for p in problems:
+            print(f"{ME}: warning: {p}; a real enqueue refuses; {how}", file=sys.stderr)
+        return []
+    print(f"{ME}: gate {short} (differs from origin/main)")
+    return [f"{p}; this gate would sign with rules main does not have; {how}" for p in problems]
+
+
 def main(argv):
     if "--self-test" in argv:
         return self_test()
@@ -2039,6 +2108,11 @@ def main(argv):
     if args.pr < 1 or not FULL_SHA.match(args.head):
         print(f"{ME}: --head must be the full 40-hex SHA and <pr> a positive number", file=sys.stderr)
         return 2
+    gate_refusals = check_gate_copy(args.dry_run)
+    if gate_refusals:
+        for r in gate_refusals:
+            print(f"{ME}: refused: {r}", file=sys.stderr)
+        return 1
     repo = args.repo
     try:
         if not repo:
