@@ -66,8 +66,8 @@ async function advance(ms: number) {
 }
 
 const JOB = "med_vid0000000000000000000000000001";
-const host = { job: { state: "running" } as Record<string, unknown>, statusReads: 0, byteReads: 0, bytesStatus: 200 };
-const finished = { state: "finished", bytes: 8_800_000, mime: "video/mp4", digest: "a".repeat(64), duration: 12 };
+const host = { job: { state: "running" } as Record<string, unknown>, statusReads: 0, byteReads: 0, bytesStatus: 200, bodyLen: 16, bodyMime: "video/mp4" };
+const finished = { state: "finished", bytes: 16, mime: "video/mp4", digest: "a".repeat(64), duration: 12 };
 globalThis.fetch = (async (input: unknown) => {
   const url = new URL(String(input), "http://localhost");
   equal(url.searchParams.get("conversation"), "c1", "every read names the conversation in view");
@@ -78,7 +78,7 @@ globalThis.fetch = (async (input: unknown) => {
   if (url.pathname === `/api/video-jobs/${JOB}/bytes`) {
     host.byteReads++;
     if (host.bytesStatus !== 200) return new Response("{}", { status: host.bytesStatus });
-    return new Response(new Uint8Array(16), { status: 200, headers: { "Content-Type": "video/mp4" } });
+    return new Response(new Uint8Array(host.bodyLen), { status: 200, headers: { "Content-Type": host.bodyMime } });
   }
   throw new Error(`Unexpected request ${url.pathname}`);
 }) as typeof fetch;
@@ -86,6 +86,12 @@ globalThis.fetch = (async (input: unknown) => {
 const made: Blob[] = [];
 (URL as any).createObjectURL = (b: Blob) => { made.push(b); return "blob:video-1"; };
 (URL as any).revokeObjectURL = () => {};
+const downloads: string[] = [];
+const origAppend = document.body.appendChild.bind(document.body);
+document.body.appendChild = ((n: any) => {
+  if (n?.tagName === "A" && n.download) { downloads.push(n.download + "|" + n.href); n.click = () => {}; }
+  return origAppend(n);
+}) as typeof document.body.appendChild;
 Object.defineProperty(globalThis, "IntersectionObserver", { get: () => undefined, configurable: true });
 
 const entry = (over: Record<string, unknown> = {}) => ({
@@ -101,7 +107,7 @@ async function mount(node: any) {
   return { host: hostEl, unmount: async () => { await React.act(async () => { root.unmount(); }); hostEl.remove(); } };
 }
 const el = (root: ParentNode, sel: string) => root.querySelector(sel) as HTMLElement | null;
-const reset = () => { host.job = { state: "running" }; host.statusReads = 0; host.byteReads = 0; host.bytesStatus = 200; made.length = 0; timers.clear(); };
+const reset = () => { host.job = { state: "running" }; host.statusReads = 0; host.byteReads = 0; host.bytesStatus = 200; host.bodyLen = 16; host.bodyMime = "video/mp4"; made.length = 0; timers.clear(); };
 
 // malformed entries render nothing and ask nothing
 reset();
@@ -130,7 +136,7 @@ reset();
   await advance(POLL_MS);
   assert(el(m.host, ".vidopen"), "finished shows the poster with a play button");
   assert(m.host.textContent!.includes("0:12"), "and the duration");
-  assert(m.host.textContent!.includes("16:9 · MP4 · 0:12 · 8.4 MB"), `the caption carries shape, format, duration, size: ${m.host.textContent}`);
+  assert(m.host.textContent!.includes("16:9 · MP4 · 0:12 · 16 B"), `the caption carries shape, format, duration, size: ${m.host.textContent}`);
   equal(host.byteReads, 0, "no bytes are fetched on load");
   await React.act(async () => { el(m.host, ".vidopen")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
@@ -163,6 +169,101 @@ reset();
   const m = await mount(React.createElement(VideoBlock, { entry: entry() }));
   assert(!el(m.host, ".vidopen"), "a malformed finished answer shows no player");
   await m.unmount();
+}
+
+const click = async (m: { host: HTMLElement }, sel: string) => {
+  await React.act(async () => { el(m.host, sel)!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await settle();
+};
+const LOAD_ERROR = "Couldn't load the video. Try again.";
+
+// download fetches once and saves a named file
+reset();
+{
+  host.job = finished;
+  const m = await mount(React.createElement(VideoBlock, { entry: entry() }));
+  await click(m, ".imgtool");
+  equal(host.byteReads, 1, "download fetches the bytes");
+  equal(downloads, ["Storefront.mp4|blob:video-1"], "and saves a named mp4");
+  await click(m, ".vidopen");
+  equal(host.byteReads, 1, "play after download reuses the bytes");
+  await m.unmount();
+}
+
+// a temporary fault shows the line and the next click tries again
+reset();
+{
+  host.job = finished;
+  host.bytesStatus = 503;
+  const m = await mount(React.createElement(VideoBlock, { entry: entry() }));
+  await click(m, ".vidopen");
+  assert(m.host.textContent!.includes(LOAD_ERROR), "a temporary fault shows the load-error line");
+  assert(!el(m.host, "video"), "and no player");
+  host.bytesStatus = 200;
+  await click(m, ".vidopen");
+  equal(host.byteReads, 2, "the next click asks again");
+  assert(el(m.host, "video"), "and plays");
+  await m.unmount();
+}
+
+// bytes that are not the video: wrong type is final, empty or short is retryable
+reset();
+{
+  host.job = finished;
+  host.bodyMime = "text/html";
+  const m = await mount(React.createElement(VideoBlock, { entry: entry() }));
+  await click(m, ".vidopen");
+  assert(m.host.textContent!.includes("This video isn't available."), "a mime mismatch reads as unavailable");
+  assert(!el(m.host, "video"), "with no player");
+  await m.unmount();
+  host.bodyMime = "video/mp4";
+  host.bodyLen = 0;
+  const e = await mount(React.createElement(VideoBlock, { entry: entry() }));
+  await click(e, ".vidopen");
+  assert(e.host.textContent!.includes(LOAD_ERROR), "empty bytes show the load-error line");
+  assert(!el(e.host, "video"), "and no dead player");
+  await e.unmount();
+}
+
+// bytes the browser cannot decode: the player's error brings the line back
+reset();
+{
+  host.job = finished;
+  const m = await mount(React.createElement(VideoBlock, { entry: entry() }));
+  await click(m, ".vidopen");
+  await React.act(async () => { el(m.host, "video")!.dispatchEvent(new win.Event("error")); });
+  await settle();
+  assert(!el(m.host, "video"), "an undecodable video drops the player");
+  assert(m.host.textContent!.includes(LOAD_ERROR), "and shows the load-error line");
+  await click(m, ".vidopen");
+  equal(host.byteReads, 2, "and a click fetches afresh");
+  await m.unmount();
+}
+
+// give-up and cap
+reset();
+{
+  const old = entry();
+  old.created = new Date(now - 25 * 3600_000).toISOString();
+  const m = await mount(React.createElement(VideoBlock, { entry: old }));
+  assert(m.host.textContent!.includes("We can't confirm this video yet"), "a job running past 24 h reads as unconfirmed");
+  await m.unmount();
+  host.job = { ...finished, bytes: 100 * 1024 * 1024 + 1 };
+  const c = await mount(React.createElement(VideoBlock, { entry: entry() }));
+  assert(c.host.textContent!.includes("too large"), "a finished video over the cap reads as too large");
+  assert(!el(c.host, ".vidopen"), "with no player");
+  await c.unmount();
+}
+
+// a finished answer without a valid digest is malformed
+reset();
+{
+  for (const bad of [undefined, "abc", "A".repeat(64)]) {
+    host.job = { ...finished, digest: bad };
+    const m = await mount(React.createElement(VideoBlock, { entry: entry() }));
+    assert(!el(m.host, ".vidopen"), `digest ${String(bad).slice(0, 6)} is not finished`);
+    await m.unmount();
+  }
 }
 
 console.log("video block tests passed");

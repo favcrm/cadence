@@ -140,24 +140,34 @@ type Media = { status: "idle" | "loading" | "retry" | "failed" } | { status: "re
 
 /** The video's bytes as a blob URL, fetched only when asked for (play or
  *  download), never on load. The board CSP allows `media-src blob:`. */
-function useVideoMedia(jobId: string, conversation: string | null, mime: string | undefined) {
+function useVideoMedia(jobId: string, conversation: string | null, mime: string | undefined, size: number | undefined) {
   const [media, setMedia] = useState<Media>({ status: "idle" });
   const urlRef = useRef<string | null>(null);
   const pending = useRef<Promise<string | null> | null>(null);
   const mounted = useRef(true);
+  const abort = useRef<AbortController | null>(null);
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
+      abort.current?.abort();
       if (urlRef.current) URL.revokeObjectURL(urlRef.current);
     };
+  }, []);
+  /** The browser could not decode what was fetched: drop it so a retry fetches again. */
+  const reject = useCallback(() => {
+    if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+    urlRef.current = null;
+    setMedia({ status: "retry" });
   }, []);
   const load = useCallback((): Promise<string | null> => {
     if (urlRef.current) return Promise.resolve(urlRef.current);
     if (pending.current) return pending.current;
     if (conversation === null || !mime) return Promise.resolve(null);
     setMedia({ status: "loading" });
-    const run = videoBytes(jobId, conversation)
+    const ctl = new AbortController();
+    abort.current = ctl;
+    const run = videoBytes(jobId, conversation, ctl.signal)
       .then((data) => {
         if (!mounted.current) return null;
         // No video without bytes that are one.
@@ -165,7 +175,12 @@ function useVideoMedia(jobId: string, conversation: string | null, mime: string 
           setMedia({ status: "failed" });
           return null;
         }
-        const url = URL.createObjectURL(new Blob([data.bytes], { type: mime }));
+        // The status said how large it is; anything else (empty, cut short) is not it.
+        if (data.blob.size !== size) {
+          setMedia({ status: "retry" });
+          return null;
+        }
+        const url = URL.createObjectURL(data.blob.slice(0, data.blob.size, mime));
         urlRef.current = url;
         setMedia({ status: "ready", url });
         return url;
@@ -180,8 +195,8 @@ function useVideoMedia(jobId: string, conversation: string | null, mime: string 
       });
     pending.current = run;
     return run;
-  }, [conversation, jobId, mime]);
-  return { media, load };
+  }, [conversation, jobId, mime, size]);
+  return { media, load, reject };
 }
 
 const PLAY_ICON = (
@@ -218,8 +233,14 @@ function Block({ entry, job }: { entry: ThreadEntry; job: VideoJob }) {
   const near = useNear(boxRef);
   const { view, announced, checking, recheck } = useVideoJob(job.jobId, conversation, near, entry.created);
   const { phase } = view;
-  const { media, load } = useVideoMedia(job.jobId, conversation, view.mime);
+  const { media, load, reject } = useVideoMedia(job.jobId, conversation, view.mime, view.bytes);
   const [playing, setPlaying] = useState(false);
+  const playerRef = useRef<HTMLVideoElement | null>(null);
+  const showPlayer = playing && media.status === "ready";
+  // The button that was pressed is gone once the player replaces it.
+  useEffect(() => {
+    if (showPlayer) playerRef.current?.focus();
+  }, [showPlayer]);
   const elapsed = useElapsed(entry.created, phase === "running");
   const title = job.title.trim() || t("Video");
   const length = clock((view.duration ?? job.duration) * 1000);
@@ -301,8 +322,8 @@ function Block({ entry, job }: { entry: ThreadEntry; job: VideoJob }) {
     const details = [job.aspect === "auto" ? "" : job.aspect, formatLabel(view.mime ?? ""), length, sizeLabel(view.bytes ?? 0)].filter(Boolean).join(" · ");
     inner = (
       <>
-        {media.status === "ready" && playing ? (
-          <video className="vidplayer" src={media.url} controls autoPlay playsInline preload="metadata" aria-label={title} />
+        {showPlayer ? (
+          <video ref={playerRef} className="vidplayer" src={media.url} onError={() => { setPlaying(false); reject(); }} controls autoPlay playsInline preload="metadata" aria-label={title} />
         ) : (
           <button type="button" className="vidopen" aria-label={`${t("Play")} ${title}`} aria-busy={media.status === "loading" || undefined} disabled={media.status === "loading"} onClick={play}>
             <span className="vidplay">{PLAY_ICON}</span>
@@ -325,7 +346,7 @@ function Block({ entry, job }: { entry: ThreadEntry; job: VideoJob }) {
 
   return (
     <div className="imgblock vidblock" data-kind="video-job" data-job={job.jobId} data-shape={job.aspect} data-state={phase}>
-      <div ref={boxRef} className="imgbox vidbox" data-compact={card || undefined} data-playing={(playing && media.status === "ready") || undefined}>
+      <div ref={boxRef} className="imgbox vidbox" data-compact={card || undefined} data-playing={showPlayer || undefined}>
         {inner}
       </div>
       <span className="sr-only" role="status">

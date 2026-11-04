@@ -43,12 +43,13 @@ export type VideoRead = { kind: "status"; status: VideoStatus } | { kind: "missi
  *  `finished` without a playable video's size, type and length is malformed. */
 export function parseVideoStatus(body: unknown): VideoStatus | null {
   if (typeof body !== "object" || body === null) return null;
-  const { state, bytes, mime, duration } = body as Record<string, unknown>;
+  const { state, bytes, mime, duration, digest } = body as Record<string, unknown>;
   if (state === "running" || state === "failed" || state === "unclear" || state === "too_large") return { state };
   if (state !== "finished") return null;
   if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 1) return null;
   if (mime !== "video/mp4" && mime !== "video/webm") return null;
   if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0) return null;
+  if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) return null;
   return { state, bytes, mime, duration };
 }
 
@@ -76,15 +77,15 @@ export function videoBytes(
   jobId: string,
   conversation: string,
   signal?: AbortSignal,
-): Promise<{ bytes: ArrayBuffer; mime: string }> {
+): Promise<{ blob: Blob; mime: string }> {
   return usingPrivateOperation(undefined, async (op) => {
     const resp = await privateFetch(jobUrl(jobId, conversation, "/bytes"), { headers: sessionHeaders(), signal }, op);
     if (!resp.ok) {
       const body = await resp.json().catch(() => null);
       throw new ApiError(errorMessage(body, `${resp.status} ${resp.statusText}`), resp.status);
     }
-    const bytes = await resp.arrayBuffer();
+    const blob = await resp.blob();
     op.assertCurrent();
-    return { bytes, mime: (resp.headers.get("Content-Type") ?? "").split(";")[0].trim() };
+    return { blob, mime: (resp.headers.get("Content-Type") ?? "").split(";")[0].trim() };
   });
 }
