@@ -96,8 +96,9 @@ checks that the advisory links are separate https URLs; it proves neither head
 binding nor that Browser QA ran, and a verdict filed under the author's identity
 still refuses under it. The `solo_operator` delivery-profile
 field still exists in code; it is not this standard. A workflow-issued reviewer
-identity (CAD-2081) is counted by the gate, but its workflows are not shipped yet;
-see AGENTS.md "Review".
+identity (CAD-2081) is counted by the gate and its workflows are live, a first pass
+on gate, security, schema and release PRs under the operator's working rule, not
+enforced by the gate; see AGENTS.md "Review".
 
 ### Review count by diff (CAD-957)
 A PR whose every change qualifies under the one-review allowlist

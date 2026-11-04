@@ -136,10 +136,12 @@ the code you just wrote.
   since CAD-2049, refuses the author's principal; local notes count by their
   self-declared `From:` alias, which is not attested. It cannot tell a fresh
   session from the author when both act under one login. Two routes exist.
-  Workflow-issued reviews (below) are the intended one; their workflows are in
-  `.github/workflows/` (CAD-2088) but are not live until the `cadence-review`
-  environment and its keys are set up and the first run files a verdict. Until
-  then, merge through the temporary exception (`--exception --advisory
+  Workflow-issued reviews (below) are live (CAD-2088; the `cadence-review`
+  environment and keys are set up, and they ran end to end on 2026-11-04): a
+  first pass on gate, security, schema and release PRs under the operator's
+  working rule, not enforced by the gate. `routine` and `ui/**` PRs have no
+  route without the temporary exception
+  (`--exception --advisory
   standards=<url> --advisory spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
   at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31). Of the advisory
   links, it checks only that they are separate https URLs; it proves
@@ -175,7 +177,7 @@ the code you just wrote.
   evidence comment's `Base:` stays the PR's recorded base commit; `Merge base
   judged:` and `Main tip:` record what was judged. A PR on another base keeps the
   PR's base.
-- **Workflow-issued reviews (CAD-2081; workflows in CAD-2088, not live until set up).** The
+- **Workflow-issued reviews (CAD-2081; workflows in CAD-2088, live).** The
   gate counts a hosted row whose `identity_source` is `workflow-oidc` only when
   all of these hold, each read at gate time: its principal is in
   `docs/roles/review-workflow-principals.toml` at the live tip of `main` (not the

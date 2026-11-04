@@ -606,7 +606,7 @@ the author's principal (local notes count by their self-declared `From:`
 alias, which is not attested), so a profile or separate session alone does not make a
 gate-counted verdict, and in-chat findings are not one either. Until the gate
 can tell a fresh session from the author (the workflow-issued reviews of
-CAD-2081, not shipped yet; AGENTS.md "Review"), merges use the temporary
+CAD-2081 are live as a first pass on gate, security, schema and release PRs, not enforced by the gate; AGENTS.md "Review"), merges use the temporary
 `--exception --advisory ...` path (exact-head operator approval and two
 advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change, even where the board asks for fewer or no approval. A hosted `routine`
@@ -652,7 +652,7 @@ gate also runs whichever `cadence` you point it at: set
 missing hosted verb will read like a gate refusal.
 
 A hosted verdict counts only on the owner's attestations (AOS-473, CAD-2001),
-except a workflow-issued row (CAD-2081; the workflows are not shipped yet), which
+except a workflow-issued row (CAD-2081; the workflows are live), which
 has no login and counts only for a principal in
 `docs/roles/review-workflow-principals.toml` at main's tip (AGENTS.md "Review"):
 the workspace owner binds each principal's GitHub login once for the workspace,
