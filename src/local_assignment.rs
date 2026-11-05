@@ -279,7 +279,7 @@ struct Assignment {
     unsupported_kind: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Attempt {
     operation_id: String,
@@ -1086,8 +1086,11 @@ fn stamp(attempt: &mut Attempt, assignment: &Assignment) {
     if attempt.claim_id != assignment.claim_id {
         // A record may only be reported through the claim this session took.
         // Once the observed claim moves, a later holder must never become
-        // reportable through the retired marker.
+        // reportable through the retired marker. A kickoff reserved for the
+        // replaced claim is not authority for the new one either.
         attempt.session_profile = None;
+        attempt.kickoff_message = None;
+        attempt.kickoff_reserved = None;
     }
     attempt.assignment_id = Some(assignment.assignment_id.clone());
     attempt.generation = Some(assignment.generation);
@@ -1518,6 +1521,27 @@ impl<H: CoordHttp> Coordinator<H> {
         self.claim_with_profile(assignment, client_agent_id, None)
     }
 
+    /// CAD-2061/CAD-2195: a board-recorded session is never copied into a
+    /// claim. This client cannot independently prove it is the runtime that
+    /// session names — a profile's client id is `session-<profile>` and is
+    /// shared by every session of that profile — so a row that carries one is
+    /// refused by name instead of replaying under a key we did not prove. An
+    /// explicit, reasoned take-over is the board-authorized replacement.
+    fn refuse_unverified_claim_session(&self, assignment: &Assignment) -> Result<()> {
+        if assignment.session_key.is_some() && self.take_over.is_none() {
+            return Err(Error::invalid(
+                "claim_held",
+                format!(
+                    "the hosted claim for {} was recorded for a session this client cannot \
+                     verify; nothing was claimed. Claim it from the session that holds it, or \
+                     replace it explicitly with `--take-over \"<reason>\"`",
+                    assignment.issue_id
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Claim naming the profile the session runs under. The profile is
     /// descriptive: the board still authorizes the human subject, the target
     /// and this generation, and a claim made without one keeps the existing
@@ -1536,23 +1560,7 @@ impl<H: CoordHttp> Coordinator<H> {
         // sent. The board checks that it agrees with the row it queued.
         let work_kind = assignment.non_code_kind();
 
-        // CAD-2061: a board-recorded session is never copied into a claim.
-        // This client cannot independently prove it is the runtime that
-        // session names — a profile's client id is `session-<profile>` and is
-        // shared by every session of that profile — so a row that carries one
-        // is refused by name instead of replaying under a key we did not prove.
-        // An explicit, reasoned take-over is the board-authorized replacement.
-        if assignment.session_key.is_some() && self.take_over.is_none() {
-            return Err(Error::invalid(
-                "claim_held",
-                format!(
-                    "the hosted claim for {} was recorded for a session this client cannot \
-                     verify; nothing was claimed. Claim it from the session that holds it, or \
-                     replace it explicitly with `--take-over \"<reason>\"`",
-                    assignment.issue_id
-                ),
-            ));
-        }
+        self.refuse_unverified_claim_session(assignment)?;
         if assignment.session_key.is_none() {
             eprintln!(
                 "cadence: no verified runtime session is available here, so this claim records \
@@ -1574,8 +1582,41 @@ impl<H: CoordHttp> Coordinator<H> {
             body["profile_id"] = json!(profile);
         }
         if let Some(reason) = &self.take_over {
-            body["take_over"] = json!({"reason": reason});
+            let observed_claim = assignment
+                .claim_id
+                .as_deref()
+                .filter(|_| matches!(assignment.state.as_str(), "running" | "blocked"))
+                .ok_or_else(|| {
+                    Error::invalid(
+                        "fenced",
+                        "there is no observed live claim to replace; nothing was claimed",
+                    )
+                })?;
+            body["take_over"] = json!({
+                "reason": reason,
+                "expected_claim_id": observed_claim,
+            });
         }
+        // An observed board claim and this machine's last local claim may
+        // differ after another machine has taken over. Snapshot local custody
+        // before the request; replace it only if it has not changed meanwhile.
+        let custody_before = if self.take_over.is_some() {
+            Some(self.with_ledger(|ledger| {
+                Ok(ledger
+                    .attempts
+                    .iter()
+                    .filter(|(_, attempt)| {
+                        attempt.assignment_id.as_deref() == Some(assignment.assignment_id.as_str())
+                            || (attempt.assignment_id.is_none()
+                                && attempt.issue_id == assignment.issue_id
+                                && attempt.action == assignment.action)
+                    })
+                    .map(|(key, attempt)| (key.clone(), attempt.clone()))
+                    .collect::<BTreeMap<_, _>>())
+            })?)
+        } else {
+            None
+        };
         let path = format!("{}/{}/claim", self.base(), assignment.assignment_id);
         let value = match self.exchange("POST", &path, Some(&body)) {
             Ok(value) => value,
@@ -1669,6 +1710,29 @@ impl<H: CoordHttp> Coordinator<H> {
         {
             return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
         }
+        // Some older boards accept the take-over field but replay a legacy
+        // claim for the same profile instead of replacing it. Never start
+        // work on that unchanged claim or call it a successful take-over.
+        if self.take_over.is_some()
+            && matches!(assignment.state.as_str(), "running" | "blocked")
+            && assignment.claim_id.is_some()
+            && claimed.claim_id == assignment.claim_id
+        {
+            return Err(Error::invalid(
+                "unsupported_feature",
+                "the board returned the existing claim instead of confirming its replacement; \
+                 no local work was started",
+            ));
+        }
+        // Acceptance alone is not enough: a board that ignored the observed
+        // claim fence might have replaced somebody else. Require the server's
+        // receipt of the exact displaced claim before starting local work.
+        if self.take_over.is_some()
+            && value.get("replaced_claim_id").and_then(Value::as_str)
+                != assignment.claim_id.as_deref()
+        {
+            return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
+        }
         // A confirmed claim must name the kind this client agreed to run. A
         // board answering with another kind, or none, is an unrecorded
         // outcome rather than permission to run something else.
@@ -1690,14 +1754,50 @@ impl<H: CoordHttp> Coordinator<H> {
             ));
         }
         self.with_ledger(|ledger| {
+            if custody_before.as_ref().is_some_and(|before| {
+                before
+                    .iter()
+                    .any(|(key, attempt)| ledger.attempts.get(key) != Some(attempt))
+            }) {
+                return Err(Error::rejected(
+                    "local custody changed while the claim was in flight; no local work was started",
+                ));
+            }
             let mut found = false;
-            for attempt in ledger.attempts.values_mut() {
+            for (key, attempt) in ledger.attempts.iter_mut() {
                 if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
                     || (attempt.assignment_id.is_none()
                         && attempt.issue_id == claimed.issue_id
                         && attempt.action == claimed.action)
                 {
+                    if let Some(before) = &custody_before {
+                        // Do not let a delayed answer replace a ledger row that
+                        // another local command changed while it was in flight.
+                        if before.get(key) != Some(&*attempt) {
+                            return Err(Error::rejected(
+                                "local custody changed while the claim was in flight; no local work was started",
+                            ));
+                        }
+                        if attempt.generation == Some(claimed.generation)
+                            && attempt.claim_id != claimed.claim_id
+                            && !attempt_ended(&attempt.state)
+                        {
+                            retire_current_claim(attempt);
+                        }
+                    }
                     stamp(attempt, &claimed);
+                    if !claim_still_active(attempt, &claimed) {
+                        return Err(Error::rejected(
+                            "local custody changed while the claim was in flight; no local work was started",
+                        ));
+                    }
+                    // Record the profile with the accepted claim: a report
+                    // made by this invocation names the claim it made. It is
+                    // not a session identity and never authorizes adopting
+                    // another invocation's live claim.
+                    if let Some(profile) = profile {
+                        attempt.session_profile = Some(profile.to_string());
+                    }
                     found = true;
                 }
             }
@@ -1727,6 +1827,9 @@ impl<H: CoordHttp> Coordinator<H> {
                     work_kind: None,
                 };
                 stamp(&mut attempt, &claimed);
+                if let Some(profile) = profile {
+                    attempt.session_profile = Some(profile.to_string());
+                }
                 ledger
                     .attempts
                     .insert(format!("discovered:{}", claimed.assignment_id), attempt);
@@ -2172,24 +2275,40 @@ impl<H: CoordHttp> Coordinator<H> {
     {
         self.ensure_active()?;
         let client_agent_id = self.client_agent_id()?;
+        // A blocked row is adopted only when no unverifiable session was
+        // recorded on it. An explicit take-over replaces that claim at the
+        // board instead of adopting a row this session cannot prove it owns.
+        let replaced_blocked = assignment.state == "blocked" && self.take_over.is_some();
         let claimed = if assignment.state == "blocked" {
             self.remember_discovered(assignment)?;
             if assignment.claim_id.is_none()
-                || assignment.client_agent_id.as_deref() != Some(client_agent_id.as_str())
+                || (!replaced_blocked
+                    && assignment.client_agent_id.as_deref() != Some(client_agent_id.as_str()))
             {
                 return Err(Error::invalid(
                     "fenced",
                     "this blocked assignment is not this machine's claim; nothing was started",
                 ));
             }
-            assignment.clone()
+            if replaced_blocked {
+                self.claim(assignment)?
+            } else {
+                self.refuse_unverified_claim_session(assignment)?;
+                assignment.clone()
+            }
         } else if assignment.state == "running"
             && assignment.client_agent_id.as_deref() != Some(client_agent_id.as_str())
         {
-            return Err(Error::invalid(
-                "fenced",
-                "another local worker of this member already holds the claim; this machine did not start a second one",
-            ));
+            // Another worker holds it. Only an explicit, reasoned take-over
+            // replaces that holder; it is never adopted.
+            if self.take_over.is_some() {
+                self.claim(assignment)?
+            } else {
+                return Err(Error::invalid(
+                    "fenced",
+                    "another local worker of this member already holds the claim; this machine did not start a second one",
+                ));
+            }
         } else {
             // Lists are observations, not execution authority. Replay the
             // live claim even for this machine before any local handoff.
@@ -2201,11 +2320,12 @@ impl<H: CoordHttp> Coordinator<H> {
                 "that assignment already ended; it was not reopened",
             ));
         }
-        // A blocked row is already this claim. Mark it running before the
-        // actor is messaged so a fast completion cannot land first and
-        // then be downgraded. A fresh claim is already running.
+        // A blocked row that was adopted is already this claim. Mark it
+        // running before the actor is messaged so a fast completion cannot
+        // land first and then be downgraded. A fresh claim — including one
+        // that replaced a recorded session — is already running.
         let mut current = claimed.clone();
-        if assignment.state == "blocked" {
+        if assignment.state == "blocked" && !replaced_blocked {
             let (claim_id, generation) = self.resume_binding(&claimed)?;
             current = self.report_claimed(
                 &claimed.assignment_id,
@@ -2772,16 +2892,38 @@ impl<H: CoordHttp> Coordinator<H> {
                 ready.non_code_kind().map_or("non-code", WorkKind::token)
             )));
         }
-        let claimed = if matches!(ready.state.as_str(), "running" | "blocked") {
+        let live = matches!(ready.state.as_str(), "running" | "blocked");
+        // A live row is not this session's merely because the profile-derived
+        // client id matches: every session of the profile shares that id, on
+        // this machine and on any other. A local pid cannot stand in for a
+        // session either — the `cadence issue start` process exits while the
+        // external session continues, and it is never the continuation. With
+        // no board-verifiable identity, a live claim this invocation did not
+        // itself claim is refused; continuing or replacing it is an explicit,
+        // reasoned take-over.
+        let claimed = if !live || self.take_over.is_some() {
+            // An explicit take-over replaces the holder at the board; it is
+            // never an unverified adoption of the row we just observed.
+            self.claim_with_profile(&ready, &client, Some(profile))?
+        } else {
             if ready.client_agent_id.as_deref() != Some(client.as_str()) {
                 return Err(Error::invalid(
                     "fenced",
                     "another worker of this member already holds the claim; this session did not start a second one",
                 ));
             }
-            ready.clone()
-        } else {
-            self.claim_with_profile(&ready, &client, Some(profile))?
+            self.refuse_unverified_claim_session(&ready)?;
+            return Err(Error::invalid(
+                "claim_held",
+                format!(
+                    "the hosted claim for {} is live under the client id shared by every session \
+                     of profile {profile}; this session cannot prove it is the holder, and a \
+                     local process or ledger row is not a runtime identity. Continue from the \
+                     session that holds it, or replace it explicitly with \
+                     `--take-over \"<reason>\"`",
+                    ready.issue_id
+                ),
+            ));
         };
         if self.claim_already_ended(&claimed)? {
             return Err(Error::invalid(
@@ -2795,16 +2937,6 @@ impl<H: CoordHttp> Coordinator<H> {
             .ok_or_else(|| Error::rejected("the claim has no id; no worktree was created"))?;
         // The claim is reportable from the moment it exists: a lane that
         // cannot be opened still leaves this session holding the work.
-        self.with_ledger(|ledger| {
-            for attempt in ledger.attempts.values_mut() {
-                if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
-                    && attempt.claim_id.as_deref() == Some(claim_id.as_str())
-                {
-                    attempt.session_profile = Some(profile.to_string());
-                }
-            }
-            Ok(())
-        })?;
         let non_code = claimed.non_code_kind();
         let lane = match non_code {
             Some(_) => None,
@@ -2843,6 +2975,19 @@ impl<H: CoordHttp> Coordinator<H> {
             "profile": profile,
             "profile_recorded": claimed.profile_id.is_some(),
             "actor": "external_session",
+        });
+        // Never let a receipt imply a runtime identity the board can check.
+        receipt["session_identity"] = json!({
+            "state": if claimed.session_key.is_some() {
+                "unverified_board_recorded"
+            } else {
+                "unverified_legacy"
+            },
+            "detail": if claimed.session_key.is_some() {
+                "the board recorded a claim session this client did not send and cannot verify; it is never reused as proof"
+            } else {
+                "the board identifies this claim by the profile-derived client id, which every session of the profile shares"
+            },
         });
         if let Some(kind) = non_code {
             receipt["work_kind"] = json!(kind.token());
@@ -3873,6 +4018,7 @@ mod assignment_contract_tests {
     // negotiation that keeps dev work exactly as it was.
     const RESULT_ID: &str = "hla_00000000-0000-4000-8000-000000000001";
     const RESULT_CLAIM: &str = "hlc_00000000-0000-4000-8000-000000000001";
+    const REPLACEMENT_CLAIM: &str = "hlc_00000000-0000-4000-8000-000000000002";
     const RESULT_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     type Recorded = std::rc::Rc<std::cell::RefCell<Vec<(String, String, Value)>>>;
@@ -4325,6 +4471,8 @@ mod assignment_contract_tests {
             .unwrap();
         let mut answered = row_in(Some("design"), "running", &format!("session-{profile}"));
         answered["profile_id"] = json!(profile);
+        answered["claim_id"] = json!(REPLACEMENT_CLAIM);
+        answered["replaced_claim_id"] = json!(RESULT_CLAIM);
         answered["session_key"] = json!("s424242-99999");
         coord.http.replies.push_back((200, answered));
         coord
@@ -4332,10 +4480,205 @@ mod assignment_contract_tests {
             .expect("take-over claim");
         let body = calls.borrow()[0].2.clone();
         assert_eq!(body["take_over"]["reason"], "the holder stopped answering");
+        assert_eq!(body["take_over"]["expected_claim_id"], RESULT_CLAIM);
         assert!(
             body.get("session_key").is_none(),
             "a take-over does not assert an unverified session"
         );
+    }
+
+    #[test]
+    fn an_unchanged_claim_is_not_accepted_as_a_take_over() {
+        let profile = "ap_00000000-0000-4000-8000-000000000003";
+        let client = format!("session-{profile}");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, _) = recorder(dir.path());
+        let mut observed = row_in(Some("research"), "running", &client);
+        observed["profile_id"] = json!(profile);
+        let assignment = parse_assignment(&observed).unwrap();
+        coord
+            .request_take_over("recover the stopped session")
+            .unwrap();
+        coord.http.replies.push_back((200, observed));
+        let error = coord
+            .claim_with_profile(&assignment, &client, Some(profile))
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_feature"), "{error}");
+        assert!(coord.origin_for_assignment(RESULT_ID).is_err());
+    }
+
+    #[test]
+    fn a_take_over_without_a_bound_receipt_has_unknown_outcome() {
+        let profile = "ap_00000000-0000-4000-8000-000000000003";
+        let client = format!("session-{profile}");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, _) = recorder(dir.path());
+        let observed = parse_assignment(&row_in(Some("research"), "running", &client)).unwrap();
+        let mut answer = row_in(Some("research"), "running", &client);
+        answer["claim_id"] = json!(REPLACEMENT_CLAIM);
+        answer["profile_id"] = json!(profile);
+        coord.request_take_over("recover stalled work").unwrap();
+        coord.http.replies.push_back((200, answer));
+        let error = coord
+            .claim_with_profile(&observed, &client, Some(profile))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("outcome is unknown"), "{error}");
+        assert!(coord.origin_for_assignment(RESULT_ID).is_err());
+    }
+
+    #[test]
+    fn a_delayed_take_over_does_not_mark_a_newer_claim_reportable() {
+        let profile = "ap_00000000-0000-4000-8000-000000000003";
+        let client = format!("session-{profile}");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, _) = recorder(dir.path());
+        let mut newer = row_in(Some("research"), "running", &client);
+        newer["generation"] = json!(2);
+        newer["claim_id"] = json!(REPLACEMENT_CLAIM);
+        coord
+            .remember_discovered(&parse_assignment(&newer).unwrap())
+            .unwrap();
+
+        let observed = parse_assignment(&row_in(Some("research"), "running", &client)).unwrap();
+        let mut delayed = row_in(Some("research"), "running", &client);
+        delayed["profile_id"] = json!(profile);
+        delayed["claim_id"] = json!("hlc_00000000-0000-4000-8000-000000000003");
+        delayed["replaced_claim_id"] = json!(RESULT_CLAIM);
+        coord
+            .request_take_over("recover the stopped session")
+            .unwrap();
+        coord.http.replies.push_back((200, delayed));
+        assert!(coord
+            .claim_with_profile(&observed, &client, Some(profile))
+            .is_err());
+        assert!(coord.origin_for_assignment(RESULT_ID).is_err());
+        coord
+            .with_ledger(|ledger| {
+                let attempt = ledger
+                    .attempts
+                    .values()
+                    .find(|attempt| attempt.assignment_id.as_deref() == Some(RESULT_ID))
+                    .unwrap();
+                assert_eq!(attempt.generation, Some(2));
+                assert_eq!(attempt.claim_id.as_deref(), Some(REPLACEMENT_CLAIM));
+                assert!(attempt.session_profile.is_none());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn take_over_replaces_stale_local_custody_without_adopting_it() {
+        let profile = "ap_00000000-0000-4000-8000-000000000003";
+        let client = format!("session-{profile}");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        let old = row_in(Some("research"), "running", &client);
+        coord
+            .remember_discovered(&parse_assignment(&old).unwrap())
+            .unwrap();
+
+        let mut observed = old.clone();
+        observed["claim_id"] = json!(REPLACEMENT_CLAIM);
+        let observed = parse_assignment(&observed).unwrap();
+        let third = "hlc_00000000-0000-4000-8000-000000000003";
+        let mut answered = old;
+        answered["claim_id"] = json!(third);
+        answered["replaced_claim_id"] = json!(REPLACEMENT_CLAIM);
+        answered["profile_id"] = json!(profile);
+        coord
+            .request_take_over("recover after another machine")
+            .unwrap();
+        coord.http.replies.push_back((200, answered));
+        coord
+            .claim_with_profile(&observed, &client, Some(profile))
+            .unwrap();
+        assert_eq!(
+            calls.borrow()[0].2["take_over"]["expected_claim_id"],
+            REPLACEMENT_CLAIM,
+        );
+        assert_eq!(
+            coord.origin_for_assignment(RESULT_ID).unwrap(),
+            (third.to_string(), 1)
+        );
+    }
+
+    #[test]
+    fn take_over_does_not_overwrite_custody_changed_during_the_request() {
+        struct InterruptingHttp {
+            ledger: PathBuf,
+            response: Value,
+            newer: Assignment,
+            remove: bool,
+        }
+        impl CoordHttp for InterruptingHttp {
+            fn send(&mut self, _: &str, _: &str, _: Option<&Value>) -> Result<Reply> {
+                let (other, _) = recorder(&self.ledger);
+                if self.remove {
+                    other.with_ledger(|ledger| {
+                        ledger.attempts.clear();
+                        Ok(())
+                    })?;
+                } else {
+                    other.remember_discovered(&self.newer)?;
+                }
+                Ok(Reply {
+                    status: 200,
+                    body: self.response.clone(),
+                })
+            }
+        }
+        for remove in [false, true] {
+            let profile = "ap_00000000-0000-4000-8000-000000000003";
+            let client = format!("session-{profile}");
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(
+                dir.path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+            let old = row_in(Some("research"), "running", &client);
+            let mut newer = old.clone();
+            newer["generation"] = json!(2);
+            newer["claim_id"] = json!(REPLACEMENT_CLAIM);
+            let mut answer = old.clone();
+            answer["claim_id"] = json!("hlc_00000000-0000-4000-8000-000000000003");
+            answer["replaced_claim_id"] = json!(RESULT_CLAIM);
+            answer["profile_id"] = json!(profile);
+            let http = InterruptingHttp {
+                ledger: dir.path().to_path_buf(),
+                response: answer,
+                newer: parse_assignment(&newer).unwrap(),
+                remove,
+            };
+            let mut coord =
+                Coordinator::new(http, "ws_1".into(), dir.path().to_path_buf()).unwrap();
+            coord.request_take_over("recover stalled work").unwrap();
+            let observed = parse_assignment(&old).unwrap();
+            assert!(coord
+                .claim_with_profile(&observed, &client, Some(profile))
+                .is_err());
+            assert!(coord.origin_for_assignment(RESULT_ID).is_err());
+            coord
+                .with_ledger(|ledger| {
+                    let attempt = ledger
+                        .attempts
+                        .values()
+                        .find(|attempt| attempt.assignment_id.as_deref() == Some(RESULT_ID));
+                    if remove {
+                        assert!(attempt.is_none(), "deleted custody must not be resurrected");
+                    } else {
+                        let attempt = attempt.unwrap();
+                        assert_eq!(attempt.generation, Some(2));
+                        assert_eq!(attempt.claim_id.as_deref(), Some(REPLACEMENT_CLAIM));
+                        assert!(attempt.session_profile.is_none());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
 
     #[test]
@@ -4384,9 +4727,7 @@ mod assignment_contract_tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut coord, calls) = recorder(dir.path());
         let client = coord.client_agent_id().unwrap();
-        let mut observed = row_in(Some("research"), "queued", &client);
-        observed["claim_id"] = Value::Null;
-        observed["client_agent_id"] = Value::Null;
+        let observed = row_in(Some("research"), "running", &client);
         coord.request_take_over("holder stopped answering").unwrap();
         coord
             .http
@@ -4404,6 +4745,213 @@ mod assignment_contract_tests {
             "holder stopped answering"
         );
         assert_eq!(calls.borrow()[0].2["work_kind"], "research");
+    }
+
+    /// A coordinator with the directory subject `start_session` requires.
+    fn session_coordinator(dir: &Path) -> (Coordinator<Recorder>, Recorded) {
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let calls: Recorded = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let http = Recorder {
+            replies: std::collections::VecDeque::new(),
+            calls: calls.clone(),
+        };
+        let coord = Coordinator::open(
+            http,
+            "ws_1".into(),
+            dir.to_path_buf(),
+            Some("usr_1".into()),
+            Some("https://hosted.invalid".into()),
+            "https://hosted.invalid".into(),
+        )
+        .unwrap();
+        (coord, calls)
+    }
+
+    fn list_of(rows: &[Value]) -> Value {
+        json!({"version": VERSION, "assignments": rows})
+    }
+
+    /// The four state pages `live_for_issue` reads, with `row` on one page.
+    fn live_pages(row: &Value, state: &str) -> Vec<(u16, Value)> {
+        ["waiting", "queued", "running", "blocked"]
+            .into_iter()
+            .map(|page| {
+                let rows = if page == state {
+                    vec![row.clone()]
+                } else {
+                    Vec::new()
+                };
+                (200, list_of(&rows))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_live_profile_claim_is_refused_even_when_the_ledger_recorded_it() {
+        // The `cadence issue start` process exits while the external session
+        // continues, so its pid — and a local ledger row — are not a runtime
+        // identity. A live claim is refused in every case; continuing or
+        // replacing it is an explicit, reasoned take-over.
+        let profile = "ap_00000000-0000-4000-8000-000000000003";
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = session_coordinator(dir.path());
+        let client = format!("session-{profile}");
+        let mut observed = row_in(Some("research"), "running", &client);
+        observed["profile_id"] = json!(profile);
+        let assignment = parse_assignment(&observed).ok().unwrap();
+        coord.remember_discovered(&assignment).unwrap();
+        coord
+            .with_ledger(|ledger| {
+                for attempt in ledger.attempts.values_mut() {
+                    if attempt.assignment_id.as_deref() == Some(assignment.assignment_id.as_str()) {
+                        attempt.session_profile = Some(profile.to_string());
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        for reply in live_pages(&observed, "running") {
+            coord.http.replies.push_back(reply);
+        }
+
+        let error = coord
+            .start_session("CAD-1", None, None, profile, None, Some(WorkKind::Research))
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("claim_held"), "{error}");
+        assert!(
+            error.to_string().contains("cannot prove it is the holder")
+                && error.to_string().contains("take-over"),
+            "{error}"
+        );
+        assert_eq!(
+            calls.borrow().len(),
+            4,
+            "four state reads and no claim: a ledger row is not adoption authority"
+        );
+        // Continuing after a restart is the same explicit take-over; it is
+        // not inferred from the ledger row the failed attempt left behind.
+        for reply in live_pages(&observed, "running") {
+            coord.http.replies.push_back(reply);
+        }
+        coord
+            .request_take_over("recovering my own interrupted claim")
+            .unwrap();
+        let mut answered = row_in(Some("research"), "running", &client);
+        answered["profile_id"] = json!(profile);
+        answered["claim_id"] = json!(REPLACEMENT_CLAIM);
+        answered["replaced_claim_id"] = json!(RESULT_CLAIM);
+        coord.http.replies.push_back((200, answered));
+        let receipt = coord
+            .start_session("CAD-1", None, None, profile, None, Some(WorkKind::Research))
+            .expect("take-over recovery");
+        assert_eq!(receipt["session_identity"]["state"], "unverified_legacy");
+        assert_eq!(
+            coord.origin_for_assignment(RESULT_ID).unwrap(),
+            (REPLACEMENT_CLAIM.to_string(), 1),
+            "the replacement, not the retired claim, must remain reportable",
+        );
+        assert_eq!(calls.borrow().len(), 9, "both reads and one claim");
+    }
+
+    #[test]
+    fn a_board_recorded_session_is_refused_before_any_claim() {
+        let profile = "ap_00000000-0000-4000-8000-000000000003";
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = session_coordinator(dir.path());
+        let client = format!("session-{profile}");
+        let mut observed = row_in(Some("research"), "running", &client);
+        observed["profile_id"] = json!(profile);
+        observed["session_key"] = json!("s424242-99999");
+        for reply in live_pages(&observed, "running") {
+            coord.http.replies.push_back(reply);
+        }
+        let error = coord
+            .start_session("CAD-1", None, None, profile, None, Some(WorkKind::Research))
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("claim_held"), "{error}");
+        assert!(
+            error.to_string().contains("cannot verify") && error.to_string().contains("take-over"),
+            "{error}"
+        );
+        assert_eq!(
+            calls.borrow().len(),
+            4,
+            "four state reads; no claim and no session replay"
+        );
+    }
+
+    #[test]
+    fn an_explicit_take_over_replaces_a_recorded_session_through_start_session() {
+        let profile = "ap_00000000-0000-4000-8000-000000000003";
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = session_coordinator(dir.path());
+        let client = format!("session-{profile}");
+        let mut observed = row_in(Some("research"), "running", &client);
+        observed["profile_id"] = json!(profile);
+        observed["session_key"] = json!("s424242-99999");
+        for reply in live_pages(&observed, "running") {
+            coord.http.replies.push_back(reply);
+        }
+        coord
+            .request_take_over("the holder stopped answering")
+            .unwrap();
+        let mut answered = row_in(Some("research"), "running", &client);
+        answered["profile_id"] = json!(profile);
+        answered["claim_id"] = json!(REPLACEMENT_CLAIM);
+        answered["replaced_claim_id"] = json!(RESULT_CLAIM);
+        coord.http.replies.push_back((200, answered));
+
+        let receipt = coord
+            .start_session("CAD-1", None, None, profile, None, Some(WorkKind::Research))
+            .expect("take-over claim");
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 5, "four state reads and one claim");
+        let body = calls[4].2.clone();
+        assert_eq!(body["take_over"]["reason"], "the holder stopped answering");
+        assert_eq!(body["client_agent_id"], client.as_str());
+        assert_eq!(body["expected_generation"], 1);
+        assert!(
+            body.get("session_key").is_none(),
+            "a take-over does not assert a session this client cannot verify"
+        );
+        assert_eq!(receipt["claim_id"], REPLACEMENT_CLAIM);
+        assert_eq!(receipt["session_identity"]["state"], "unverified_legacy");
+    }
+
+    #[test]
+    fn an_alias_blocked_row_with_a_recorded_session_is_not_adopted() {
+        // The alias path resumes blocked work, but a blocked row that names a
+        // board-recorded session is not this machine's merely because its
+        // client id matches: it is refused before any delivery.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = session_coordinator(dir.path());
+        let client = coord.client_agent_id().unwrap();
+        coord.bind_alias("worker").unwrap();
+        let mut observed = row_in(Some("research"), "blocked", &client);
+        observed["session_key"] = json!("s424242-99999");
+        for reply in live_pages(&observed, "blocked") {
+            coord.http.replies.push_back(reply);
+        }
+        let error = coord
+            .start_here(
+                "CAD-1",
+                None,
+                Some("work"),
+                Some(WorkKind::Research),
+                &mut |_: &Kickoff| -> Result<Value> {
+                    Err(Error::rejected("the actor must not be messaged"))
+                },
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("claim_held"), "{error}");
+        assert_eq!(
+            calls.borrow().len(),
+            4,
+            "the blocked row is refused before a claim or a delivery"
+        );
     }
 
     #[test]
@@ -4427,6 +4975,32 @@ mod assignment_contract_tests {
         }
         let long = format!("link:https://docs.example.test/{}", "a".repeat(500));
         assert!(Deliverable::parse(&long).is_err(), "over the wire bound");
+    }
+
+    #[test]
+    fn an_alias_take_over_replaces_a_foreign_blocked_legacy_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        let client = coord.client_agent_id().unwrap();
+        let observed = parse_assignment(&row_in(Some("research"), "blocked", "other-worker"))
+            .ok()
+            .unwrap();
+        let mut answered = row_in(Some("research"), "running", &client);
+        answered["claim_id"] = json!(REPLACEMENT_CLAIM);
+        answered["replaced_claim_id"] = json!(RESULT_CLAIM);
+        coord.http.replies.push_back((200, answered));
+        coord.request_take_over("recover stalled work").unwrap();
+        let mut delivered = None;
+        coord
+            .activate(&observed, None, None, "worker", &mut |kickoff: &Kickoff| {
+                delivered = Some(kickoff.claim_id.to_string());
+                Ok(json!({"message": kickoff.message_id}))
+            })
+            .expect("blocked claim takeover");
+        assert_eq!(delivered.as_deref(), Some(REPLACEMENT_CLAIM));
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2["take_over"]["reason"], "recover stalled work");
     }
 
     #[test]

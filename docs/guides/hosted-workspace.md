@@ -533,15 +533,38 @@ characters.
 The board can store a session key as claim-contest metadata, but this client has
 no verified per-runtime identity of its own. A POSIX session is shared by
 nested runtimes and by every command in one terminal, so it is never sent as
-the claim session. A brand-new claim therefore records no session and keeps the
-board's legacy client/profile and generation fence; the client says so on
-stderr. Two sessions sharing that legacy client/profile are not distinguished.
+the claim session. The daemon's caller identity (`SO_PEERCRED` plus `/proc`
+ancestry) and its per-turn token are local evidence for daemon RPC, not a
+credential the hosted board can verify; the member's saved login is the only
+authority a hosted claim carries. A brand-new claim therefore records no
+session and keeps the board's legacy client/profile and generation fence; the
+client says so on stderr.
+
+Matching `session-<profile>` proves nothing: every session of that profile has
+it, here and on any other machine. A local pid or ledger row is not a session
+identity either: the `cadence issue start` process exits while the external
+session continues, and it cannot name that session after a restart. A live
+claim this invocation did not itself claim is therefore refused, never adopted;
+the receipt marks its identity as `unverified_legacy` (or
+`unverified_board_recorded` when the board echoed a key) and says the board
+cannot verify it. Continuing or replacing a live claim is an explicit,
+reasoned `--take-over "<reason>"`. Changing this needs a board-verifiable
+per-execution credential; none exists today.
+Two starts that race on a queued legacy claim can still receive the same claim,
+and commands sharing the local ledger can use its report binding. Do not treat
+the present fence as proof that exactly one runtime can report.
 
 The client never copies a key out of an existing claim to impersonate its holder.
 It refuses a key-bearing claim unless a person explicitly supplies
-`--take-over "<reason>"`; a board that cannot record the take-over is refused
-rather than silently dropping it. `claim_last_seen_at` is the time of the last
-accepted claim or report receipt, not proof of execution.
+`--take-over "<reason>"`. The request names the live claim that was observed;
+the board refuses if it has since changed and returns the replaced claim ID in
+its receipt. An older board that refuses the field cannot be retried without
+that fence. If it answers without the bound receipt, the result is unknown and
+must be reconciled rather than assumed to have failed. If local custody
+changes while the request is in flight, the client preserves the newer ledger
+and does not start work; inspect the recorded board claim before recovery.
+`claim_last_seen_at` is the time of the last accepted claim or report receipt,
+not proof of execution.
 
 `--kind` is accepted on hosted `issue start` and `dispatch`; it is only sent
 when it is not `dev`, so a default create body is unchanged. A local (lane)
