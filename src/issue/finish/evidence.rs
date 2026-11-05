@@ -193,9 +193,20 @@ pub(crate) fn survivability(
                 .remote_tip
                 .as_deref()
                 .is_some_and(|r| ancestor(root, tip, r));
-            if pushed {
-                // Every commit on the branch is on the remote —
-                // deleting the local ref loses nothing.
+            // CAD-2181 acceptance 3: a squash merge that dropped no
+            // content still releases. The final trees are identical, so
+            // every file and mode the branch holds is already in the
+            // default ref and a delete loses history, never work. This
+            // decomposes no patches — the shapes that fooled `git cherry`
+            // (repeated lines, a mode-only change, a net-zero edit, a
+            // merge driver) leave two different trees, which refuse.
+            let landed = ev
+                .into
+                .as_deref()
+                .is_some_and(|into| same_tree(root, tip, into));
+            if pushed || landed {
+                // The work is on the remote or already in the default
+                // ref — deleting the local ref loses nothing.
                 (None, Some(tip.clone()), None)
             } else {
                 (
@@ -356,10 +367,30 @@ mod tests {
         assert!(block.is_none(), "{:?}", block.map(|b| b.tag));
     }
 
-    /// The one case now kept: a squash merge whose tip survives nowhere.
+    /// CAD-2181 acceptance 3, the plain case: a lane squashed into the
+    /// default ref with nothing of its own left to lose releases even
+    /// though it was never pushed and has no PR — its tree is already
+    /// the default ref's.
     #[test]
-    fn an_unpushed_squash_merged_lane_is_kept() {
+    fn a_squash_merged_lane_with_no_unique_content_releases() {
         let (_tmp, root, tip) = squash_merged_lane();
+        let ev = evidence(&tip, None);
+        let (how, deletable, block) = survivability(&ev, &root, "cadence/lane");
+        assert_eq!(how, None);
+        assert_eq!(deletable.as_deref(), Some(tip.as_str()));
+        assert!(block.is_none(), "{:?}", block.map(|b| b.tag));
+    }
+
+    /// The one case kept: content the default ref does not have, and
+    /// nothing durable holding it.
+    #[test]
+    fn a_lane_with_unique_content_and_no_durable_copy_is_kept() {
+        let (_tmp, root, _) = squash_merged_lane();
+        git(&root, &["switch", "cadence/lane"]).unwrap();
+        fs::write(root.join("only-here.txt"), "unique\n").unwrap();
+        git(&root, &["add", "only-here.txt"]).unwrap();
+        git(&root, &["commit", "-m", "work only on the lane"]).unwrap();
+        let tip = git(&root, &["rev-parse", "HEAD"]).unwrap();
         let ev = evidence(&tip, None);
         let (how, deletable, block) = survivability(&ev, &root, "cadence/lane");
         assert_eq!(how, None);

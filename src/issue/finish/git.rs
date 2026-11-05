@@ -78,6 +78,17 @@ pub(crate) fn ancestor(root: &Path, branch: &str, into: &str) -> bool {
     git(root, &["merge-base", "--is-ancestor", branch, into]).is_ok()
 }
 
+/// The tip's tree is identical to `into`'s: every tracked file and mode
+/// the branch holds is already there, so deleting the ref drops history
+/// only. Unlike `git cherry` or a reverse-applying diff this decomposes
+/// no patches, so the shapes that fooled those (repeated lines, a
+/// mode-only change, a net-zero edit, a merge driver) leave two
+/// different trees and refuse.
+pub(crate) fn same_tree(root: &Path, tip: &str, into: &str) -> bool {
+    git_out(root, &["diff", "--quiet", "--no-ext-diff", tip, into], &[])
+        .is_ok_and(|out| out.status.success())
+}
+
 /// Why `tip` survives deletion, checked in order: plain ancestry of
 /// the default ref, or a merged GitHub PR on origin's own repository
 /// whose recorded head is exactly `tip` (GitHub keeps

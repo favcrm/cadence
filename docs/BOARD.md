@@ -1242,11 +1242,14 @@ checkout is not guessed at. It refuses, naming what it found, while:
   merged GitHub PR on origin's own repository whose head is exactly
   the tip (CAD-2181). Content inference (`git cherry`, a diff that
   reverse-applies) is never evidence — it is forgeable by content
-  shape. A squash-merged lane whose tip is on origin still releases:
-  the delete takes a local ref, not the work. One whose tip survives
-  nowhere — no PR, no push, a non-GitHub origin — is kept, and the
-  refusal says to push it or `--force`. The output's `merged_by`
-  reports which merge rule matched, if any.
+  shape. A squash-merged lane still releases when it has nothing of
+  its own left to lose: its tip is on origin, or its tree is identical
+  to the default ref's — every file and mode already there, so the
+  delete drops history only. One whose content survives nowhere (no
+  PR, no push, a different tree, a non-GitHub origin) is kept, and the
+  refusal says to push it or `--force`. The tree comparison decomposes
+  no patches, so the shapes that fooled `git cherry` refuse. The
+  output's `merged_by` reports which merge rule matched, if any.
 
 Then it runs `git worktree remove`, deletes the local branch (with
 `--remote` the remote one too), and lands one tracker commit
