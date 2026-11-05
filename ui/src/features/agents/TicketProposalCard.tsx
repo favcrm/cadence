@@ -6,6 +6,17 @@ import Button from "../../ui/Button";
 import type { ThreadEntry } from "../home/thread";
 import { createAndAssign, parseTicketProposal, type CreateAndAssignOutcome } from "./ticketProposal";
 
+/** The ended run states the board joins onto the card (CAD-2190), in words.
+ *  A state this map does not know shows the agent without a claim. */
+const RUN_LABEL: Record<string, string> = {
+  finished: "finished",
+  no_report: "finished without a report",
+  failed: "failed",
+  refused: "refused",
+  stopped: "stopped",
+  parked: "paused",
+};
+
 /** Master's start card (AOS-517): the whole ticket it proposes, the agent that
  *  would run it, the tools that agent gets, and who can read the result. One
  *  click creates the ticket and assigns it; nothing exists before the click and
@@ -74,7 +85,23 @@ export default function TicketProposalCard({
           <dt className="text-ink-400">{t("Visible to")}</dt>
           <dd className="text-ink-200">{t("Everyone in the company")}</dd>
         </dl>
-        {created ? (
+        {proposal.ticket ? (
+          <div className="mt-3" role="status">
+            <p className="text-label text-ink-200">
+              {t("Created {id}.").replace("{id}", () => proposal.ticket!)}{" "}
+              {proposal.run && RUN_LABEL[proposal.run.state] && (
+                <span className="text-ink-300">
+                  {proposal.agent.name} {t(RUN_LABEL[proposal.run.state])}
+                </span>
+              )}
+            </p>
+            {onOpenIssue && (
+              <Button variant="ghost" size="sm" onClick={() => onOpenIssue(proposal.ticket!)}>
+                {t("Open ticket")}
+              </Button>
+            )}
+          </div>
+        ) : created ? (
           <div className="mt-3" role="status">
             <p className={`text-label ${created.state === "unconfirmed" ? "text-warn" : "text-ok"}`}>
               {created.state === "assigned" &&

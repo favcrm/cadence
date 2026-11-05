@@ -16,6 +16,9 @@ export type TicketProposal = {
   tools: string[];
   /** Who can read the ticket once it exists. Only the company-wide card is known. */
   visibility: "company";
+  /** Set by the board once the card's ticket exists; `run` once its run ended. */
+  ticket?: string;
+  run?: { state: string; reason: string | null };
 };
 
 const text = (value: unknown): string | null =>
@@ -40,6 +43,16 @@ export function parseTicketProposal(
   if (!agentId || !agentName) return null;
   // An audience this card did not design for is not drawn as company-visible.
   if (payload.visibility !== "company") return null;
+  // The board's read-time join: a ticket id and an ended run state, both or
+  // neither. A running job sends no state and the card stays actionable.
+  const ticket = text(payload.ticket);
+  const run = payload.run;
+  let outcome: { state: string; reason: string | null } | undefined;
+  if (run !== null && typeof run === "object" && !Array.isArray(run)) {
+    const record = run as { state?: unknown; reason?: unknown };
+    if (typeof record.state === "string" && record.state !== "")
+      outcome = { state: record.state, reason: typeof record.reason === "string" ? record.reason : null };
+  }
   // The tool list is part of what the person authorises: a list that is not
   // all names would make the card claim capabilities it cannot state, so no
   // card at all. An empty list is a real answer and is shown as none.
@@ -57,6 +70,7 @@ export function parseTicketProposal(
     agent: { id: agentId, name: agentName },
     tools,
     visibility: "company",
+    ...(ticket !== null && outcome !== undefined ? { ticket, run: outcome } : {}),
   };
 }
 

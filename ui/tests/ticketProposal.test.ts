@@ -49,6 +49,13 @@ check(parseTicketProposal({ ...proposal, tools: [] })?.tools.length === 0, "an e
 check(parseTicketProposal({ ...proposal, visibility: "private" }) === null, "an audience the card cannot state makes no proposal");
 check(parseTicketProposal(null) === null, "no payload, no proposal");
 
+// The board's read-time join: a ticket and its ended run, both or neither.
+const joined = parseTicketProposal({ ...proposal, ticket: "CAD-2188", run: { state: "finished", reason: null } });
+check(joined?.ticket === "CAD-2188" && joined.run?.state === "finished", "an ended run is carried on the card");
+check(parseTicketProposal({ ...proposal, run: { state: "finished", reason: null } })?.ticket === undefined, "a run without a ticket is not shown");
+check(parseTicketProposal({ ...proposal, ticket: "CAD-2188" })?.run === undefined, "a ticket without a run is not shown");
+check(parseTicketProposal({ ...proposal, ticket: "CAD-2188", run: { state: 7 } })?.run === undefined, "a malformed run is dropped");
+
 // The action is create (idempotency key = the card id) then assign at the
 // created revision. A replay of the create is answered by the board with the
 // ticket's current revision and `replayed`, so it must not patch again.
