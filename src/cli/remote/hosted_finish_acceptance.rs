@@ -568,20 +568,28 @@ fn assert_refused_keeping_tip(fx: &Fx) -> String {
     message
 }
 
-/// Data loss: the lane adds one more identical row to a run of repeated
-/// lines. Reverse-applying the patch "works" by removing a different row.
+/// Data loss: the lane adds identical rows to a long run of repeated lines.
+/// Reverse-applying the patch "works" by removing different, identical rows
+/// from main (a 3-to-4 run does not exercise this; 9-to-10 and 10-to-12 do).
 #[test]
 fn repeated_line_is_not_taken_for_merged() {
-    let fx = Fx::build(|repo, lane| {
-        fs::write(repo.join("rows"), "x\nx\nx\n").unwrap();
-        git(repo, &["add", "rows"]);
-        git(repo, &["commit", "-m", "rows"]);
-        git(lane, &["merge", "--ff-only", "main"]);
-        fs::write(lane.join("rows"), "x\nx\nx\nx\n").unwrap();
-        git(lane, &["commit", "-am", "one more row"]);
-    });
-    assert_refused_keeping_tip(&fx);
-    assert_eq!(git(&fx.repo, &["show", "cadence/test:rows"]), "x\nx\nx\nx");
+    for (from, to) in [(9usize, 10usize), (10, 12)] {
+        let fx = Fx::build(|repo, lane| {
+            fs::write(repo.join("rows"), "x\n".repeat(from)).unwrap();
+            git(repo, &["add", "rows"]);
+            git(repo, &["commit", "-m", "rows"]);
+            git(lane, &["merge", "--ff-only", "main"]);
+            fs::write(lane.join("rows"), "x\n".repeat(to)).unwrap();
+            git(lane, &["commit", "-am", "more rows"]);
+        });
+        assert_refused_keeping_tip(&fx);
+        assert_eq!(
+            git(&fx.repo, &["show", "cadence/test:rows"])
+                .lines()
+                .count(),
+            to
+        );
+    }
 }
 
 /// Data loss: a mode-only commit (`chmod +x`).
@@ -659,26 +667,16 @@ fn normal_squash_shapes_release() {
     single.gone();
 }
 
-/// A squash whose file later changed on main. Direction is not asserted:
-/// refusal is the safe direction; either outcome must leave a consistent
-/// state. The outcome is printed for the report.
+/// A squash whose file later changed on main cannot be proven merged without
+/// the PR: refused, and nothing is removed.
 #[test]
-fn squash_then_file_changed_on_main_is_consistent() {
+fn squash_then_file_changed_on_main_is_refused() {
     let fx = Fx::build(|repo, lane| {
         lane_work(repo, lane, Shape::Squash);
         fs::write(repo.join("a"), "a changed later on main\n").unwrap();
         git(repo, &["commit", "-am", "later change"]);
     });
-    match fx.release() {
-        Ok(v) => {
-            eprintln!("LATER-CHANGE OUTCOME: released via {}", v["merged_by"]);
-            fx.gone();
-        }
-        Err(e) => {
-            eprintln!("LATER-CHANGE OUTCOME: refused: {e}");
-            fx.intact();
-        }
-    }
+    assert_refused_keeping_tip(&fx);
 }
 
 /// Only build output may be deleted with the worktree.
@@ -697,9 +695,168 @@ fn ignored_files_decide_release() {
         fs::write(&path, "operator data").unwrap();
         let message = assert_refused_keeping_tip(&fx);
         // `git status --ignored` collapses a wholly ignored directory, so the
-        // refusal names `docs/` rather than `docs/x.md` (reported as a defect).
+        // refusal names `docs/` rather than `docs/x.md`.
         let named = file.split_once('/').map_or(file, |(top, _)| top);
         assert!(message.contains(named), "{file}: {message}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "operator data");
     }
+}
+
+fn commit_file(repo: &Path, name: &str, body: &str) {
+    fs::write(repo.join(name), body).unwrap();
+    git(repo, &["add", name]);
+    git(repo, &["commit", "-m", name]);
+}
+
+/// A merge driver that always keeps "ours" (what a `merge=ours` attribute
+/// does) makes git's own merge look clean.
+fn install_ours_driver(repo: &Path, file: &str) {
+    git(repo, &["config", "merge.ours.driver", "true"]);
+    fs::write(
+        repo.join(".git/info/attributes"),
+        format!("{file} merge=ours\n"),
+    )
+    .unwrap();
+}
+
+/// Net-zero: add unique work, drop it, never pushed. The tip is reachable from
+/// nothing else, so deleting the branch loses the history.
+#[test]
+fn net_zero_unpushed_branch_is_refused() {
+    let mut added = String::new();
+    let fx = Fx::build(|_, lane| {
+        commit_file(lane, "unique", "unique work\n");
+        added = git(lane, &["rev-parse", "HEAD"]);
+        git(lane, &["revert", "--no-edit", "HEAD"]);
+    });
+    assert_refused_keeping_tip(&fx);
+    assert!(
+        git_ok(&fx.repo, &["cat-file", "-e", &added]),
+        "work commit lost"
+    );
+    assert_eq!(
+        git(
+            &fx.repo,
+            &["branch", "--contains", &added, "--format=%(refname:short)"]
+        ),
+        "cadence/test"
+    );
+}
+
+/// A lane exactly at the merge-base: no regression. Either outcome must leave
+/// a consistent state.
+#[test]
+fn lane_at_the_merge_base_is_consistent() {
+    let fx = Fx::build(|_, _| {});
+    match fx.release() {
+        Ok(_) => fx.gone(),
+        Err(_) => fx.intact(),
+    }
+}
+
+/// `merge=ours` driver, cherry arm: every non-merge commit is on main, the
+/// merge commit holds a hand edit, and main has since changed those lines.
+#[test]
+fn merge_driver_hides_a_merge_commit_hand_edit() {
+    let fx = Fx::build(|repo, lane| {
+        install_ours_driver(repo, "cfg");
+        commit_file(repo, "cfg", "l1\nl2\nl3\nl4\nl5\n");
+        git(lane, &["merge", "--ff-only", "main"]);
+        fs::write(lane.join("cfg"), "l1\nlane2\nl3\nl4\nl5\n").unwrap();
+        git(lane, &["commit", "-am", "lane edit"]);
+        let lane_commit = git(lane, &["rev-parse", "HEAD"]);
+        git(repo, &["cherry-pick", &lane_commit]);
+        fs::write(repo.join("cfg"), "l1\nlane2\nl3\nmain4\nl5\n").unwrap();
+        git(repo, &["commit", "-am", "main edit"]);
+        git(lane, &["merge", "--no-ff", "--no-commit", "main"]);
+        fs::write(lane.join("cfg"), "l1\nlane2\nl3\nl4\nl5\nhand edit\n").unwrap();
+        git(lane, &["commit", "-am", "merge with hand edit"]);
+        fs::write(repo.join("cfg"), "l1\nmain later\nl3\nmain4\nl5\n").unwrap();
+        git(repo, &["commit", "-am", "main later"]);
+    });
+    assert_refused_keeping_tip(&fx);
+    assert!(git(&fx.repo, &["show", "cadence/test:cfg"]).contains("hand edit"));
+}
+
+/// The driver on the patch arm: repeated rows added on the lane while main
+/// edits other lines of the same file.
+#[test]
+fn merge_driver_hides_repeated_rows_on_the_patch_arm() {
+    let fx = Fx::build(|repo, lane| {
+        install_ours_driver(repo, "cfg");
+        commit_file(repo, "cfg", &format!("head\n{}", "x\n".repeat(9)));
+        git(lane, &["merge", "--ff-only", "main"]);
+        fs::write(lane.join("cfg"), format!("head\n{}", "x\n".repeat(10))).unwrap();
+        git(lane, &["commit", "-am", "one more row"]);
+        fs::write(repo.join("cfg"), format!("HEAD\n{}", "x\n".repeat(9))).unwrap();
+        git(repo, &["commit", "-am", "main edits another line"]);
+    });
+    assert_refused_keeping_tip(&fx);
+    assert_eq!(
+        git(&fx.repo, &["show", "cadence/test:cfg"])
+            .matches('x')
+            .count(),
+        10
+    );
+}
+
+/// `status.showUntrackedFiles=no` must not hide files from the guard.
+#[test]
+fn hidden_untracked_and_ignored_files_still_refuse() {
+    let fx = Fx::build(|repo, lane| {
+        git(repo, &["config", "status.showUntrackedFiles", "no"]);
+        lane_work(repo, lane, Shape::Squash);
+    });
+    fs::write(fx.lane.join("scratch.txt"), "mine").unwrap();
+    age(&fx.lane);
+    let message = assert_refused_keeping_tip(&fx);
+    assert!(message.contains("uncommitted"), "{message}");
+    assert_eq!(
+        fs::read_to_string(fx.lane.join("scratch.txt")).unwrap(),
+        "mine"
+    );
+
+    let fx = Fx::build(|repo, lane| {
+        git(repo, &["config", "status.showUntrackedFiles", "no"]);
+        lane_work(repo, lane, Shape::Squash);
+    });
+    fs::write(fx.lane.join(".env"), "secret").unwrap();
+    let message = assert_refused_keeping_tip(&fx);
+    assert!(message.contains(".env"), "{message}");
+    assert_eq!(fs::read_to_string(fx.lane.join(".env")).unwrap(), "secret");
+}
+
+/// An ignored `target/` below the top level is the operator's; the top-level
+/// one is build output.
+#[test]
+fn nested_target_refuses_and_top_level_target_releases() {
+    let fx = Fx::new(Shape::Squash);
+    let nested = fx.lane.join("docs/target/out");
+    fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    fs::write(&nested, "keep").unwrap();
+    let message = assert_refused_keeping_tip(&fx);
+    assert!(message.contains("docs/"), "{message}");
+    assert_eq!(fs::read_to_string(&nested).unwrap(), "keep");
+
+    let fx = Fx::new(Shape::Squash);
+    fs::create_dir_all(fx.lane.join("target/debug")).unwrap();
+    fs::write(fx.lane.join("target/debug/out"), "bin").unwrap();
+    fx.release().expect("top-level target/ releases");
+    fx.gone();
+}
+
+/// Without `origin/HEAD`, native would take the main checkout's current
+/// branch as the default branch; hosted refuses.
+#[test]
+fn missing_origin_head_with_checkout_on_a_feature_branch_is_refused() {
+    let fx = Fx::build(|repo, lane| {
+        lane_work(repo, lane, Shape::Squash);
+        git(
+            repo,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        );
+        git(repo, &["switch", "-c", "feature"]);
+    });
+    let message = assert_refused_keeping_tip(&fx);
+    assert!(message.contains("origin/HEAD"), "{message}");
 }

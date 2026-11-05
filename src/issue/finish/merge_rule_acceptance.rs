@@ -31,12 +31,12 @@ fn multi_commit_squash_is_merged_by_patch_and_repeated_line_is_not() {
     git(r, &["commit", "-m", "squashed"]).unwrap();
     assert_eq!(merge_rule(r, "side", &tip, "main"), Some("patch"));
 
-    // Not merged: one more identical row on top of a run of repeated lines.
-    std::fs::write(r.join("rows"), "x\nx\nx\n").unwrap();
+    // Not merged: identical rows added to a long run of repeated lines.
+    std::fs::write(r.join("rows"), "x\n".repeat(9)).unwrap();
     git(r, &["add", "rows"]).unwrap();
     git(r, &["commit", "-m", "rows"]).unwrap();
     git(r, &["switch", "-c", "rows", "main"]).unwrap();
-    std::fs::write(r.join("rows"), "x\nx\nx\nx\n").unwrap();
+    std::fs::write(r.join("rows"), "x\n".repeat(10)).unwrap();
     git(r, &["commit", "-am", "more"]).unwrap();
     let tip = git(r, &["rev-parse", "HEAD"]).unwrap();
     git(r, &["switch", "main"]).unwrap();
