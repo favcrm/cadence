@@ -3473,6 +3473,9 @@ pub(super) fn remote_failure(error: Error) -> Result<i32> {
 }
 
 #[cfg(test)]
+mod hosted_finish_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
