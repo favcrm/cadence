@@ -899,6 +899,9 @@ mod tests {
         sig[0] ^= 1;
         let head = token.rsplit_once('.').unwrap().0;
         let bad_sig = parse(&format!("{head}.{}", b64(&sig))).unwrap();
-        assert!(verify(&bad_sig, &config, &key, now).is_err());
+        assert_eq!(
+            verify(&bad_sig, &config, &key, now).unwrap_err().code,
+            "assertion_invalid"
+        );
     }
 }
