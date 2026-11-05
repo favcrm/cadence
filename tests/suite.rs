@@ -943,8 +943,10 @@ mod cad2081_workflow_verdicts {
                 "repo": REPO, "pr": 7, "title": "CAD-1: add the thing", "head": head,
                 "base": case.base_ref, "base_oid": self.base, "tip": self.tip, "author": "authorlogin",
                 "files_by_ref": by_ref, "verdicts": case.rows, "class": case.class, "approved": case.approved,
-                "no_readiness": case.no_readiness, "native": case.native,
+                "no_readiness": case.no_readiness, "qa_comments": case.qa_comments, "native": case.native,
                 "tip_fails": case.tip_fails, "tip_sha": case.tip_sha,
+                "approved_head": case.approved_head, "no_qa_evidence": case.no_qa_evidence,
+                "board_asks_qa": case.board_asks_qa, "qa_evidence_url": case.qa_evidence_url,
                 "identities": if case.no_identity_map { Value::Null } else {
                     case.identities.clone().unwrap_or_else(Self::identities) },
             });
@@ -998,7 +1000,12 @@ mod cad2081_workflow_verdicts {
         tip_sha: Option<String>,
         no_identity_map: bool,
         no_readiness: bool,
+        qa_comments: Option<Value>,
         native: bool,
+        approved_head: Option<String>,
+        no_qa_evidence: bool,
+        board_asks_qa: bool,
+        qa_evidence_url: Option<String>,
     }
 
     fn scenario(rows: Vec<Value>) -> Scenario {
@@ -1017,7 +1024,12 @@ mod cad2081_workflow_verdicts {
             tip_sha: None,
             no_identity_map: false,
             no_readiness: false,
+            qa_comments: None,
             native: false,
+            approved_head: None,
+            no_qa_evidence: false,
+            board_asks_qa: false,
+            qa_evidence_url: None,
         }
     }
 
@@ -1268,6 +1280,50 @@ mod cad2081_workflow_verdicts {
             }
             refused(&f, scenario(vec![row, f.spec()]), "records no base_sha");
         }
+    }
+
+    #[test]
+    fn a_ui_change_can_name_its_browser_qa_comment_with_the_workflow_reviews() {
+        // CAD-2173: the implementer's check of the route. It binds the claim to the head.
+        let f = Fixture::new();
+        let head = f.touch("ui/app.txt");
+        let url = "https://github.com/favcrm/cadence/pull/7#issuecomment-55";
+        let comment = |body: String| {
+            json!({"55": {
+                "issue_url": "https://api.github.com/repos/favcrm/cadence/issues/7",
+                "created_at": "2026-11-05T00:00:00Z",
+                "updated_at": "2026-11-05T00:00:00Z",
+                "author_association": "MEMBER",
+                "body": body,
+            }})
+        };
+        let run = |rows: Vec<Value>, body: String| {
+            let mut case = scenario(rows);
+            case.head = Some(head.clone());
+            case.qa_comments = Some(comment(body));
+            case.extra_args = vec!["--browser-qa".into(), url.into()];
+            f.gate(&case)
+        };
+        let (code, stdout, stderr) = run(
+            vec![f.std(), f.spec()],
+            format!("Browser QA: pass\nHead: {head}\n"),
+        );
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("Browser QA by PR comment"), "{stdout}");
+
+        let (code, _, stderr) = run(
+            vec![f.std(), f.spec()],
+            "Browser QA: pass\nHead: 0000\n".into(),
+        );
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stderr.contains("must be exactly the two lines"), "{stderr}");
+
+        let (code, _, stderr) = run(vec![f.std()], format!("Browser QA: pass\nHead: {head}\n"));
+        assert_eq!(code, 1, "{stderr}");
+        assert!(
+            stderr.contains("needs a pass from both review workflows"),
+            "{stderr}"
+        );
     }
 
     #[test]
@@ -2461,6 +2517,1165 @@ mod cad2081_workflow_verdicts {
         let mut case = routine(vec![f.std(), f.spec()]);
         case.native = true;
         refused_for_exactly(&f, "a local org with no readiness", case, &[NATIVE]);
+    }
+
+    /// What is wrong with a refusal, in `refused_for_exactly`'s terms: the exit code and
+    /// the exact set of refusal lines. It answers rather than panics, so one bad case
+    /// that gets through cannot hide the cases after it.
+    fn refusal_mismatch(
+        f: &Fixture,
+        label: &str,
+        case: &Scenario,
+        whys: &[&str],
+    ) -> Option<String> {
+        let (code, stdout, stderr) = f.gate(case);
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains(": refused: "))
+            .collect();
+        println!("[{label}] exit {code}");
+        for line in &lines {
+            println!("    {line}");
+        }
+        let wrong = if code != 1 || stdout.contains("every rule holds") {
+            Some(format!("NOT REFUSED (exit {code})"))
+        } else if let Some(line) = lines.iter().find(|l| !whys.iter().any(|w| l.contains(w))) {
+            Some(format!("an unrelated refusal: {line}"))
+        } else {
+            whys.iter()
+                .find(|w| !lines.iter().any(|l| l.contains(**w)))
+                .map(|w| format!("no refusal containing {w:?}"))
+        };
+        wrong.map(|w| format!("{label}: {w}\n  stderr: {stderr}"))
+    }
+
+    // CAD-2173: independent acceptance check, written from the ticket by someone other than the implementer.
+    #[test]
+    fn a_hosted_ui_pr_reaches_the_queue_off_the_exception_only_on_a_bound_comment_both_workflows_and_the_operator(
+    ) {
+        const URL: &str = "https://github.com/favcrm/cadence/pull/7#issuecomment-55";
+        const NOT_THIS_PR: &str = "--browser-qa must name a comment on this PR";
+        const NOT_ON_PR: &str = "the --browser-qa comment 55 is not on this PR";
+        const UNREADABLE: &str = "cannot read the --browser-qa comment 55";
+        const EDITED: &str = "the --browser-qa comment 55 was edited after posting";
+        const EXACT: &str = "the --browser-qa comment 55 must be exactly the two lines";
+        const NOT_MEMBER: &str = "the --browser-qa comment 55 is not by a repository member";
+        // A comment that does not hold leaves the PR where it was: it needs a Browser QA row.
+        const NO_QA: &str = "a ui/ change needs a pass Browser QA verdict";
+        const BOTH: &str = "--browser-qa also needs a pass from both review workflows at this head";
+        const NO_STD: &str = "no pass Standards verdict";
+        const NO_SPEC: &str = "no pass Spec/security verdict";
+        const LOCAL: &str = "--browser-qa is for a hosted org";
+        const NOT_UI: &str = "--browser-qa is for a ui/ change, and this PR has none";
+        const NO_EVIDENCE: &str = "no ticket comment names head";
+
+        let f = Fixture::new();
+        let head = f.touch("ui/app.txt");
+        let good = format!("Browser QA: pass\nHead: {head}\n");
+        let posted = |issue_url: &str, body: &str| {
+            json!({"55": {"issue_url": issue_url, "created_at": "2026-11-05T00:00:00Z",
+                          "updated_at": "2026-11-05T00:00:00Z", "body": body,
+                          "author_association": "MEMBER"}})
+        };
+        let comment =
+            |body: &str| posted("https://api.github.com/repos/favcrm/cadence/issues/7", body);
+        // Every bad case below is this, with one thing changed.
+        let routed = |rows: Vec<Value>, qa: Value, url: &str| {
+            let mut case = scenario(rows);
+            case.head = Some(head.clone());
+            case.qa_comments = Some(qa);
+            case.extra_args = vec!["--browser-qa".into(), url.into()];
+            case
+        };
+        let two = || vec![f.std(), f.spec()];
+        let good_case = || routed(two(), comment(&good), URL);
+        let saying = |body: &str| routed(two(), comment(body), URL);
+        let alice = || {
+            f.owner(
+                "20261103-000100-a.md",
+                "20261103-000100",
+                "usr_alice",
+                "alice",
+                "standards",
+            )
+        };
+        let bob = || {
+            f.owner(
+                "20261103-000200-b.md",
+                "20261103-000200",
+                "usr_bob",
+                "bob",
+                "spec-security",
+            )
+        };
+        let qa_row = || {
+            f.owner(
+                "20261103-000300-q.md",
+                "20261103-000300",
+                "usr_alice",
+                "alice",
+                "browser-qa",
+            )
+        };
+
+        let failures = std::cell::RefCell::new(Vec::<String>::new());
+        let fail = |wrong: Option<String>| failures.borrow_mut().extend(wrong);
+        let exactly = |label: &str, case: Scenario, whys: &[&str]| {
+            fail(refusal_mismatch(&f, label, &case, whys))
+        };
+        let passes = |label: &str, case: Scenario| {
+            let (code, stdout, stderr) = f.gate(&case);
+            println!("[{label}] exit {code}");
+            let wrong = code != 0
+                || [
+                    "every rule holds",
+                    "Browser QA by PR comment",
+                    "approval in force",
+                    "svc_std standards",
+                    "svc_spec spec-security",
+                ]
+                .iter()
+                .any(|said| !stdout.contains(said))
+                || stdout.contains("EXCEPTION");
+            if wrong {
+                fail(Some(format!(
+                    "{label}: the good case did not pass\n  stdout: {stdout}\n  stderr: {stderr}"
+                )));
+            }
+        };
+
+        // The good case, as GitHub's web form stores it, and with the report around it.
+        passes("the good case", good_case());
+        passes(
+            "CRLF line endings",
+            saying(&format!("Browser QA: pass\r\nHead: {head}\r\n")),
+        );
+        passes(
+            "no trailing newline",
+            saying(&format!("Browser QA: pass\nHead: {head}")),
+        );
+        passes(
+            "many trailing newlines, which render as nothing",
+            saying(&format!(
+                "Browser QA: pass\nHead: {head}{}",
+                "\n".repeat(50)
+            )),
+        );
+        passes(
+            "many trailing CRLFs",
+            saying(&format!(
+                "Browser QA: pass\r\nHead: {head}{}",
+                "\r\n".repeat(50)
+            )),
+        );
+        passes(
+            "CRLF in the middle, LF at the end",
+            saying(&format!("Browser QA: pass\r\nHead: {head}\n")),
+        );
+
+        // Without the flag nothing changes: two workflow passes and the approval refuse.
+        let mut case = scenario(two());
+        case.head = Some(head.clone());
+        exactly("a ui PR without the flag", case, &[NO_QA]);
+        // A comment on the PR is not read unless it is named.
+        let mut case = scenario(two());
+        case.head = Some(head.clone());
+        case.qa_comments = Some(comment(&good));
+        exactly("a good comment, not named", case, &[NO_QA]);
+
+        // The URL. Each of these is refused before anything is read.
+        for (label, url) in [
+            (
+                "another PR's URL",
+                "https://github.com/favcrm/cadence/pull/8#issuecomment-55",
+            ),
+            (
+                "a PR number extending this one",
+                "https://github.com/favcrm/cadence/pull/77#issuecomment-55",
+            ),
+            (
+                "another repo's URL",
+                "https://github.com/favcrm/other/pull/7#issuecomment-55",
+            ),
+            (
+                "a fork's URL",
+                "https://github.com/someone/cadence/pull/7#issuecomment-55",
+            ),
+            (
+                "a repo name extending this one",
+                "https://github.com/favcrm/cadence-x/pull/7#issuecomment-55",
+            ),
+            (
+                "a lookalike host",
+                "https://github.com.example.org/favcrm/cadence/pull/7#issuecomment-55",
+            ),
+            (
+                "plain http",
+                "http://github.com/favcrm/cadence/pull/7#issuecomment-55",
+            ),
+            ("the PR itself", "https://github.com/favcrm/cadence/pull/7"),
+            (
+                "a files tab",
+                "https://github.com/favcrm/cadence/pull/7/files#issuecomment-55",
+            ),
+            (
+                "a review comment",
+                "https://github.com/favcrm/cadence/pull/7#discussion_r55",
+            ),
+            (
+                "a review",
+                "https://github.com/favcrm/cadence/pull/7#pullrequestreview-55",
+            ),
+            (
+                "the issues path",
+                "https://github.com/favcrm/cadence/issues/7#issuecomment-55",
+            ),
+            (
+                "an API URL",
+                "https://api.github.com/repos/favcrm/cadence/issues/comments/55",
+            ),
+            (
+                "a query string",
+                "https://github.com/favcrm/cadence/pull/7?x=1#issuecomment-55",
+            ),
+            (
+                "text after the id",
+                "https://github.com/favcrm/cadence/pull/7#issuecomment-55x",
+            ),
+            (
+                "no id",
+                "https://github.com/favcrm/cadence/pull/7#issuecomment-",
+            ),
+            ("a wiki page", "https://example.org/qa"),
+        ] {
+            exactly(
+                label,
+                routed(two(), comment(&good), url),
+                &[NOT_THIS_PR, NO_QA],
+            );
+        }
+
+        // The URL says this PR; what GitHub answers about the comment does not.
+        for (label, issue_url) in [
+            (
+                "this PR's URL, another PR's comment",
+                "https://api.github.com/repos/favcrm/cadence/issues/8",
+            ),
+            (
+                "this PR's URL, a longer PR number",
+                "https://api.github.com/repos/favcrm/cadence/issues/77",
+            ),
+            (
+                "this PR's URL, another repo's comment",
+                "https://api.github.com/repos/favcrm/other/issues/7",
+            ),
+            ("this PR's URL, no issue_url", ""),
+        ] {
+            exactly(
+                label,
+                routed(two(), posted(issue_url, &good), URL),
+                &[NOT_ON_PR, NO_QA],
+            );
+        }
+
+        // Unreadable, or not a comment at all.
+        exactly(
+            "an unreadable comment",
+            routed(two(), json!({"56": {"body": good}}), URL),
+            &[UNREADABLE, NO_QA],
+        );
+        exactly(
+            "a comment with no body",
+            routed(
+                two(),
+                json!({"55": {"issue_url": "https://api.github.com/repos/favcrm/cadence/issues/7",
+                              "created_at": "2026-11-05T00:00:00Z",
+                              "updated_at": "2026-11-05T00:00:00Z"}}),
+                URL,
+            ),
+            &[UNREADABLE, NO_QA],
+        );
+        exactly(
+            "an answer that is not a comment",
+            routed(two(), json!({"55": []}), URL),
+            &[UNREADABLE, NO_QA],
+        );
+
+        // Edited, or not known to be unedited.
+        let stamped = |created: Value, updated: Value| {
+            let mut qa = comment(&good);
+            qa["55"]["created_at"] = created;
+            qa["55"]["updated_at"] = updated;
+            routed(two(), qa, URL)
+        };
+        exactly(
+            "an edited comment",
+            stamped(json!("2026-11-05T00:00:00Z"), json!("2026-11-05T00:00:01Z")),
+            &[EDITED, NO_QA],
+        );
+        exactly(
+            "no updated_at",
+            stamped(json!("2026-11-05T00:00:00Z"), Value::Null),
+            &[EDITED, NO_QA],
+        );
+        exactly(
+            "no timestamps at all",
+            stamped(Value::Null, Value::Null),
+            &[EDITED, NO_QA],
+        );
+
+        // The result line.
+        for (label, line) in [
+            ("a failed result", "Browser QA: fail".to_string()),
+            ("no result line", "Browser QA run on Chrome".to_string()),
+            (
+                "two result lines, both pass",
+                "Browser QA: pass\nBrowser QA: pass".to_string(),
+            ),
+            (
+                "a pass and a fail",
+                "Browser QA: pass\nBrowser QA: fail".to_string(),
+            ),
+            (
+                "a fail then a pass",
+                "Browser QA: fail\nBrowser QA: pass".to_string(),
+            ),
+            (
+                "a fail in other case beside a pass",
+                "Browser QA: pass\nBROWSER QA: FAIL".to_string(),
+            ),
+            ("lower case", "browser qa: pass".to_string()),
+            ("upper case", "Browser QA: PASS".to_string()),
+            (
+                "a hedged pass",
+                "Browser QA: pass (login screen only)".to_string(),
+            ),
+            ("passed", "Browser QA: passed".to_string()),
+        ] {
+            exactly(
+                label,
+                saying(&format!("{line}\nHead: {head}\n")),
+                &[EXACT, NO_QA],
+            );
+        }
+
+        // The head line.
+        let upper = head.to_uppercase();
+        let short = &head[..12];
+        let other = &f.head;
+        for (label, lines) in [
+            ("a missing head line", String::new()),
+            ("a stale head", format!("Head: {other}")),
+            ("a short head", format!("Head: {short}")),
+            ("an upper-case head", format!("Head: {upper}")),
+            ("a placeholder head", "Head: <full sha>".to_string()),
+            (
+                "two head lines, the same",
+                format!("Head: {head}\nHead: {head}"),
+            ),
+            (
+                "two head lines, one stale",
+                format!("Head: {head}\nHead: {other}"),
+            ),
+            (
+                "a head in other case beside it",
+                format!("Head: {head}\nHEAD: {other}"),
+            ),
+            ("a hedged head", format!("Head: {head} (or close to it)")),
+            (
+                "a head only in prose",
+                format!("Tested at {head} this morning."),
+            ),
+            (
+                "a head label only in prose",
+                format!("The Head: {head} is what I would have tested."),
+            ),
+        ] {
+            exactly(
+                label,
+                saying(&format!("Browser QA: pass\n{lines}\n")),
+                &[EXACT, NO_QA],
+            );
+        }
+
+        // A body that merely mentions the words.
+        for (label, body) in [
+            ("an empty comment", String::new()),
+            (
+                "both on one line",
+                format!("Browser QA: pass, Head: {head}"),
+            ),
+            (
+                "the words in a sentence",
+                format!("Not run: the gate wants Browser QA: pass and Head: {head} here."),
+            ),
+            (
+                "quoted",
+                format!("> Browser QA: pass\n> Head: {head}\n\nI did not run this."),
+            ),
+        ] {
+            exactly(label, saying(&body), &[EXACT, NO_QA]);
+        }
+
+        // Text a person cannot see, around otherwise perfect lines.
+        for (label, extra) in [
+            ("an HTML comment", "<!-- Browser QA: fail -->"),
+            ("a multi-line HTML comment", "<!--\nsecond thoughts\n-->"),
+            ("a hidden element", "<span hidden>Browser QA: fail</span>"),
+            ("display none", "<div style=\"display: none\">failed</div>"),
+            ("a zero-width space", "Looks\u{200b} fine"),
+            ("a soft hyphen", "Looks\u{ad} fine"),
+            ("a bidi override", "\u{202e}liaf"),
+            ("a tag character", "\u{e0066}\u{e0061}\u{e0069}\u{e006c}"),
+            ("a byte order mark", "\u{feff}"),
+            ("a character reference", "&#8203;"),
+            ("a named character reference", "&nbsp;"),
+        ] {
+            exactly(label, saying(&format!("{good}{extra}\n")), &[EXACT, NO_QA]);
+        }
+        exactly(
+            "a zero-width character inside the result line",
+            saying(&format!("Browser\u{200b} QA: pass\nHead: {head}\n")),
+            &[EXACT, NO_QA],
+        );
+
+        // Lines a person does not read as those lines. Each is a second label beside
+        // a perfect pair, which must count however it is dressed.
+        let result_then = |extra: &str| format!("{extra}\n{good}");
+        for (label, extra) in [
+            ("a bold fail beside the pass", "**Browser QA: fail**"),
+            ("a listed fail beside the pass", "- Browser QA: fail"),
+            ("a quoted fail beside the pass", "> Browser QA: fail"),
+            ("a heading fail beside the pass", "## Browser QA: fail"),
+            ("a spaced fail beside the pass", "Browser QA : fail"),
+            ("a lookalike fail beside the pass", "\u{412}rowser QA: fail"),
+            (
+                "a fullwidth colon fail beside the pass",
+                "Browser QA\u{ff1a} fail",
+            ),
+            // CAD-2173 second pass: labels split or padded to slip past the loose match.
+            ("a label split by an asterisk", "Bro*wser QA: fail"),
+            ("a label split by an underscore", "Bro_wser QA: fail"),
+            ("a label split by a backtick", "Bro`wser QA: fail"),
+            ("a struck-through fail", "~~Browser QA: fail~~"),
+            ("a label with no space", "BrowserQA: fail"),
+            ("a hyphenated label", "Browser-QA: fail"),
+            ("a tab-indented fail", "\tBrowser QA: fail"),
+            ("a space-indented fail", " Browser QA: fail"),
+            ("a no-break space in a fail label", "Browser\u{a0}QA: fail"),
+            ("an em space in a fail label", "Browser\u{2003}QA: fail"),
+            (
+                "an ideographic space in a fail label",
+                "Browser\u{3000}QA: fail",
+            ),
+            (
+                "a no-break space before the colon",
+                "Browser QA\u{a0}: fail",
+            ),
+            ("a composed accent in a fail label", "Br\u{f6}wser QA: fail"),
+            ("math letters in a fail label", "\u{1d401}rowser QA: fail"),
+            (
+                "a fail in a blockquote with a list",
+                ">- **Browser QA: fail**",
+            ),
+            ("an escaped colon", "Browser QA\\: fail"),
+            // Formatting that is not on the gate's list of markers.
+            ("a numbered fail beside the pass", "1. Browser QA: fail"),
+            ("a ticked fail beside the pass", "- [x] Browser QA: fail"),
+            ("a table cell fail beside the pass", "| Browser QA: fail |"),
+            (
+                "a linked fail beside the pass",
+                "[Browser QA: fail](https://example.org/)",
+            ),
+            (
+                "an HTML bold fail beside the pass",
+                "<b>Browser QA: fail</b>",
+            ),
+            (
+                "an HTML paragraph fail beside the pass",
+                "<p>Browser QA: fail</p>",
+            ),
+            (
+                "a summary fail beside the pass",
+                "<details><summary>Browser QA: fail</summary></details>",
+            ),
+            ("a bracketed fail beside the pass", "(Browser QA: fail)"),
+            (
+                "a double-quoted fail beside the pass",
+                "\"Browser QA: fail\"",
+            ),
+            ("an emoji before a fail", "\u{274c} Browser QA: fail"),
+            ("a shortcode before a fail", ":x: Browser QA: fail"),
+            ("a backslash before a marker", "\\*Browser QA: fail"),
+            ("an escaped marker inside the label", "Bro\\*wser QA: fail"),
+            ("a modifier colon lookalike", "Browser QA\u{a789} fail"),
+            ("a ratio colon lookalike", "Browser QA\u{2236} fail"),
+            (
+                "a variation selector inside the label",
+                "B\u{fe0f}rowser QA: fail",
+            ),
+            (
+                "a combining stroke inside the label",
+                "Bro\u{336}wser QA: fail",
+            ),
+            ("a label spaced out by letter", "B r o w s e r  Q A: fail"),
+            ("a result with no colon, by a dash", "Browser QA - fail"),
+            (
+                "a result with a word before the colon",
+                "Browser QA result: fail",
+            ),
+        ] {
+            exactly(label, saying(&result_then(extra)), &[EXACT, NO_QA]);
+        }
+        for (label, extra) in [
+            (
+                "a bold stale head beside the head",
+                format!("**Head: {other}**"),
+            ),
+            ("a split stale head", format!("He*ad: {other}")),
+            ("a lookalike stale head", format!("\u{397}ead: {other}")),
+            ("a spaced stale head", format!("Head : {other}")),
+            ("a tab-indented stale head", format!("\tHead: {other}")),
+            ("a numbered stale head", format!("1. Head: {other}")),
+            ("a table cell stale head", format!("| Head: {other} |")),
+            ("an HTML bold stale head", format!("<b>Head: {other}</b>")),
+        ] {
+            exactly(label, saying(&result_then(&extra)), &[EXACT, NO_QA]);
+        }
+
+        // The one line itself, not quite as written.
+        for (label, line) in [
+            (
+                "a no-break space in the pass label",
+                "Browser\u{a0}QA: pass",
+            ),
+            ("a no-break space after the colon", "Browser QA:\u{a0}pass"),
+            ("two spaces in the pass label", "Browser  QA: pass"),
+            ("no space after the colon", "Browser QA:pass"),
+            ("a tab after the colon", "Browser QA:\tpass"),
+            ("a tab-indented pass", "\tBrowser QA: pass"),
+            ("a space-indented pass", " Browser QA: pass"),
+            ("a bold pass", "**Browser QA: pass**"),
+            ("a listed pass", "- Browser QA: pass"),
+            ("a lookalike pass", "Browser QA: p\u{430}ss"),
+        ] {
+            exactly(
+                label,
+                saying(&format!("{line}\nHead: {head}\n")),
+                &[EXACT, NO_QA],
+            );
+        }
+        for (label, line) in [
+            (
+                "a no-break space in the head line",
+                format!("Head:\u{a0}{head}"),
+            ),
+            ("two spaces in the head line", format!("Head:  {head}")),
+            ("a tab in the head line", format!("Head:\t{head}")),
+            ("a tab-indented head", format!("\tHead: {head}")),
+            ("a bold head", format!("**Head: {head}**")),
+            ("a head in backticks", format!("Head: `{head}`")),
+        ] {
+            exactly(
+                label,
+                saying(&format!("Browser QA: pass\n{line}\n")),
+                &[EXACT, NO_QA],
+            );
+        }
+
+        // A code fence, as CommonMark reads one. Inside it, the lines are only quoted.
+        for (label, body) in [
+            (
+                "the lines in a code fence",
+                format!("Not run. The gate wants:\n```\n{good}```\n"),
+            ),
+            (
+                "the lines in an indented block",
+                format!("Not run. The gate wants:\n\n    Browser QA: pass\n    Head: {head}\n"),
+            ),
+            ("a fence that never closes", format!("```\nlog\n{good}")),
+            (
+                "a tilde fence that never closes",
+                format!("~~~\nlog\n{good}"),
+            ),
+            (
+                "a backtick fence, a tilde does not close it",
+                format!("```\nlog\n~~~\n{good}"),
+            ),
+            (
+                "a tilde fence, a backtick does not close it",
+                format!("~~~\nlog\n```\n{good}"),
+            ),
+            (
+                "a fence indented three spaces",
+                format!("   ```\n{good}   ```\n"),
+            ),
+            (
+                "a closer indented four spaces does not close",
+                format!("```\nlog\n    ```\n{good}"),
+            ),
+            // A line the gate takes for a closer or an opener, and Markdown does not.
+            (
+                "a shorter closer does not close",
+                format!("````\nlog\n```\n{good}````\n"),
+            ),
+            (
+                "a tilde shorter closer does not close",
+                format!("~~~~\nlog\n~~~\n{good}~~~~\n"),
+            ),
+            (
+                "a closer with an info string does not close",
+                format!("```\nlog\n```text\n{good}```\n"),
+            ),
+            (
+                "a closer with words does not close",
+                format!("```\nlog\n``` done\n{good}```\n"),
+            ),
+            (
+                "one line of inline code is no opener",
+                format!("```x```\n```\n{good}```\n"),
+            ),
+            (
+                "a backtick in the info string is no opener",
+                format!("``` a`b\nlog\n```\n{good}```\n"),
+            ),
+        ] {
+            exactly(label, saying(&body), &[EXACT, NO_QA]);
+        }
+        exactly(
+            "a fenced fail beside the pass",
+            saying(&format!("```\nBrowser QA: fail\n```\n{good}")),
+            &[EXACT, NO_QA],
+        );
+
+        // Text a person cannot see, or lines that do not render as lines at all.
+        for (label, body) in [
+            (
+                "a record separator making lines of prose",
+                format!("I did not run this.\u{1e}Browser QA: pass\u{1e}Head: {head}"),
+            ),
+            (
+                "a vertical tab making lines of prose",
+                format!("I did not run this.\u{b}Browser QA: pass\u{b}Head: {head}"),
+            ),
+            (
+                "a form feed making lines of prose",
+                format!("I did not run this.\u{c}Browser QA: pass\u{c}Head: {head}"),
+            ),
+            (
+                "a next-line control making lines of prose",
+                format!("I did not run this.\u{85}Browser QA: pass\u{85}Head: {head}"),
+            ),
+            (
+                "a line separator making lines of prose",
+                format!("I did not run this.\u{2028}Browser QA: pass\u{2028}Head: {head}"),
+            ),
+            (
+                "a paragraph separator making lines of prose",
+                format!("I did not run this.\u{2029}Browser QA: pass\u{2029}Head: {head}"),
+            ),
+            (
+                "a lone carriage return making lines of prose",
+                format!("I did not run this.\rBrowser QA: pass\rHead: {head}"),
+            ),
+            ("a control character", format!("{good}\u{7}failed\n")),
+            (
+                "a Markdown reference that renders as nothing",
+                format!("{good}\n[//]: # (Browser QA failed)\n"),
+            ),
+            (
+                "an indented Markdown reference",
+                format!("{good}\n   [//]: # (failed)\n"),
+            ),
+        ] {
+            exactly(label, saying(&body), &[EXACT, NO_QA]);
+        }
+        for (label, body) in [
+            (
+                "a reference with no space after the colon",
+                format!("{good}\n[//]:# (failed)\n"),
+            ),
+            (
+                "a reference with its target on the next line",
+                format!("{good}\n[x]:\nhttps://example.org/ \"failed\"\n"),
+            ),
+            (
+                "a reference in a blockquote",
+                format!("{good}\n> [//]: # (failed)\n"),
+            ),
+            (
+                "a reference in a list",
+                format!("{good}\n- [//]: # (failed)\n"),
+            ),
+            (
+                "an empty link with a title",
+                format!("{good}\n[](https://example.org/ \"failed\")\n"),
+            ),
+            (
+                "an empty HTML anchor with a title",
+                format!("{good}\n<a title=\"failed\"></a>\n"),
+            ),
+            (
+                "the lines inside a link title",
+                format!("[Not run](https://example.org/ \"\n{good}\")\n"),
+            ),
+            (
+                "the lines inside an HTML attribute",
+                format!("Not run <a title=\"\n{good}\">here</a>\n"),
+            ),
+            (
+                "the lines inside a multi-line code span",
+                format!("Not run: `\n{good}`\n"),
+            ),
+            (
+                "the lines struck through",
+                format!("~~Not run\n{good}really~~\n"),
+            ),
+            (
+                "the lines in an HTML strike",
+                format!("<del>\n{good}</del>\n"),
+            ),
+            ("the lines in a pre block", format!("<pre>\n{good}</pre>\n")),
+            (
+                "the lines collapsed",
+                format!("<details>\n\n{good}\n</details>\n"),
+            ),
+        ] {
+            exactly(label, saying(&body), &[EXACT, NO_QA]);
+        }
+
+        // The rule is the whole body: what the first pass allowed around the lines, and
+        // anything at the edges of the exact string, now refuses.
+        for (label, body) in [
+            (
+                "a report around the two lines",
+                format!("Drove the panel in Chrome.\n\n{good}"),
+            ),
+            (
+                "a report after the two lines",
+                format!("{good}\nDrove the panel in Chrome.\n"),
+            ),
+            (
+                "a closed fence before the lines",
+                format!("```text\nsome log\n```\n{good}"),
+            ),
+            (
+                "a closed tilde fence before the lines",
+                format!("~~~\nsome log\n~~~\n{good}"),
+            ),
+            (
+                "a closer longer than its opener",
+                format!("```\nsome log\n`````\n{good}"),
+            ),
+            (
+                "a trailing space on the pass line",
+                format!("Browser QA: pass \nHead: {head}\n"),
+            ),
+            (
+                "a trailing space on the head line",
+                format!("Browser QA: pass\nHead: {head} \n"),
+            ),
+            (
+                "two trailing spaces, a hard break",
+                format!("Browser QA: pass  \nHead: {head}\n"),
+            ),
+            (
+                "a trailing tab",
+                format!("Browser QA: pass\nHead: {head}\t"),
+            ),
+            (
+                "a trailing no-break space",
+                format!("Browser QA: pass\nHead: {head}\u{a0}"),
+            ),
+            ("spaces on a last line", format!("{good}  \n")),
+            ("a last line of one space", format!("{good} \n")),
+            ("a leading newline", format!("\n{good}")),
+            ("a leading CRLF", format!("\r\n{good}")),
+            ("a leading space", format!(" {good}")),
+            (
+                "a blank line between the lines",
+                format!("Browser QA: pass\n\nHead: {head}\n"),
+            ),
+            (
+                "a blank CRLF line between the lines",
+                format!("Browser QA: pass\r\n\r\nHead: {head}\r\n"),
+            ),
+            (
+                "the lines in the wrong order",
+                format!("Head: {head}\nBrowser QA: pass\n"),
+            ),
+            (
+                "the first line repeated last",
+                format!("{good}Browser QA: pass\n"),
+            ),
+            ("the whole comment twice", format!("{good}{good}")),
+            (
+                "the lines joined by a lone CR",
+                format!("Browser QA: pass\rHead: {head}"),
+            ),
+            (
+                "a lone CR at the end",
+                format!("Browser QA: pass\nHead: {head}\r"),
+            ),
+            (
+                "LF then CR at the end",
+                format!("Browser QA: pass\nHead: {head}\n\r"),
+            ),
+            (
+                "CR CR LF at the end",
+                format!("Browser QA: pass\nHead: {head}\r\r\n"),
+            ),
+            (
+                "CR CR LF between the lines",
+                format!("Browser QA: pass\r\r\nHead: {head}"),
+            ),
+            (
+                "newlines, then text far below",
+                format!("{good}{}failed\n", "\n".repeat(200)),
+            ),
+            (
+                "CRLFs, then text far below",
+                format!("{good}{}failed\r\n", "\r\n".repeat(200)),
+            ),
+            (
+                "a vertical tab at the end",
+                format!("Browser QA: pass\nHead: {head}\u{b}"),
+            ),
+            (
+                "a form feed at the end",
+                format!("Browser QA: pass\nHead: {head}\u{c}"),
+            ),
+            (
+                "a next-line control at the end",
+                format!("Browser QA: pass\nHead: {head}\u{85}"),
+            ),
+            (
+                "a line separator at the end",
+                format!("Browser QA: pass\nHead: {head}\u{2028}"),
+            ),
+            (
+                "a NUL at the end",
+                format!("Browser QA: pass\nHead: {head}\u{0}"),
+            ),
+            (
+                "a zero-width space at the end",
+                format!("Browser QA: pass\nHead: {head}\u{200b}"),
+            ),
+            (
+                "a variation selector at the end",
+                format!("Browser QA: pass\nHead: {head}\u{fe0f}"),
+            ),
+            ("a byte order mark at the start", format!("\u{feff}{good}")),
+            (
+                "a lookalike letter in the pass",
+                format!("Browser QA: p\u{430}ss\nHead: {head}"),
+            ),
+            (
+                "a head of the wrong length",
+                format!("Browser QA: pass\nHead: {head}0"),
+            ),
+        ] {
+            exactly(label, saying(&body), &[EXACT, NO_QA]);
+        }
+        // A lookalike the case-insensitive match lets through: the gate reads the real
+        // comment, but what it records, and what a person would follow, is this URL.
+        for (label, url) in [
+            (
+                "a dotless i in the host",
+                "https://g\u{131}thub.com/favcrm/cadence/pull/7#issuecomment-55",
+            ),
+            (
+                "a long s in the scheme",
+                "http\u{17f}://github.com/favcrm/cadence/pull/7#issuecomment-55",
+            ),
+            (
+                "a long s in the fragment",
+                "https://github.com/favcrm/cadence/pull/7#i\u{17f}\u{17f}uecomment-55",
+            ),
+        ] {
+            let mut case = routed(two(), comment(&good), url);
+            case.qa_evidence_url = Some(url.to_string());
+            exactly(label, case, &[NOT_THIS_PR, NO_QA]);
+        }
+
+        // Who wrote it: the repository is public, so anyone can comment.
+        let by = |association: Value| {
+            let mut qa = comment(&good);
+            qa["55"]["author_association"] = association;
+            routed(two(), qa, URL)
+        };
+        passes("a comment by the owner", by(json!("OWNER")));
+        passes("a comment by a collaborator", by(json!("COLLABORATOR")));
+        for (label, association) in [
+            ("a comment by nobody in particular", json!("NONE")),
+            (
+                "a comment by a first-time contributor",
+                json!("FIRST_TIME_CONTRIBUTOR"),
+            ),
+            ("a comment by a first-timer", json!("FIRST_TIMER")),
+            ("a comment by a contributor", json!("CONTRIBUTOR")),
+            ("a comment by a mannequin", json!("MANNEQUIN")),
+            ("an association in lower case", json!("member")),
+            ("no association", Value::Null),
+            ("an association that is a list", json!(["MEMBER"])),
+        ] {
+            exactly(label, by(association), &[NOT_MEMBER, NO_QA]);
+        }
+        let mut qa = comment(&good);
+        qa["55"]
+            .as_object_mut()
+            .unwrap()
+            .remove("author_association");
+        exactly(
+            "an association not in the answer",
+            routed(two(), qa, URL),
+            &[NOT_MEMBER, NO_QA],
+        );
+
+        // The reviews: both workflows, counted, at this head.
+        exactly(
+            "no reviews",
+            routed(vec![], comment(&good), URL),
+            &[NO_STD, NO_SPEC, BOTH],
+        );
+        exactly(
+            "one workflow review, standards",
+            routed(vec![f.std()], comment(&good), URL),
+            &[NO_SPEC, BOTH],
+        );
+        exactly(
+            "one workflow review, spec",
+            routed(vec![f.spec()], comment(&good), URL),
+            &[NO_STD, BOTH],
+        );
+        exactly(
+            "owner rows instead of workflow rows",
+            routed(vec![alice(), bob()], comment(&good), URL),
+            &[BOTH],
+        );
+        exactly(
+            "a workflow standards, an owner spec",
+            routed(vec![f.std(), bob()], comment(&good), URL),
+            &[BOTH],
+        );
+        exactly(
+            "an owner standards, a workflow spec",
+            routed(vec![alice(), f.spec()], comment(&good), URL),
+            &[BOTH],
+        );
+        exactly(
+            "an owner Browser QA row does not make up the count",
+            routed(vec![f.std(), qa_row()], comment(&good), URL),
+            &[NO_SPEC, BOTH],
+        );
+        let revise = |mut row: Value| {
+            row["outcome"] = json!("revise");
+            row["section_outcome"] = json!("revise");
+            row
+        };
+        const NOT_A_PASS: &str = "is not a pass (outcome 'revise'";
+        exactly(
+            "a workflow standards revise",
+            routed(vec![revise(f.std()), f.spec()], comment(&good), URL),
+            &[NOT_A_PASS, NO_STD, BOTH],
+        );
+        exactly(
+            "a workflow spec revise",
+            routed(vec![f.std(), revise(f.spec())], comment(&good), URL),
+            &[NOT_A_PASS, NO_SPEC, BOTH],
+        );
+        exactly(
+            "an owner revise beside both passes",
+            routed(
+                vec![revise(alice()), f.std(), f.spec()],
+                comment(&good),
+                URL,
+            ),
+            &[NOT_A_PASS],
+        );
+        let later = f.wrow(
+            "20261103-000900-std2.md",
+            "20261103-000900",
+            "svc_std",
+            "standards",
+        );
+        exactly(
+            "a workflow revise, then a later pass",
+            routed(vec![revise(f.std()), later, f.spec()], comment(&good), URL),
+            &[NOT_A_PASS],
+        );
+        let mut at_earlier = f.spec();
+        at_earlier["at_head"] = json!(f.head);
+        exactly(
+            "a spec pass filed at an earlier head",
+            routed(vec![f.std(), at_earlier], comment(&good), URL),
+            &[NO_SPEC, BOTH],
+        );
+        let both_kinds = f.wrow(
+            "20261103-000300-x.md",
+            "20261103-000300",
+            "svc_std",
+            "spec-security",
+        );
+        exactly(
+            "one principal filing both kinds",
+            routed(vec![f.std(), both_kinds], comment(&good), URL),
+            &["may file only standards", NO_SPEC, BOTH],
+        );
+        let mut unlisted = f.spec();
+        unlisted["reviewer_id"] = json!("svc_other");
+        unlisted["reviewer"] = json!("svc_other");
+        exactly(
+            "an unlisted principal",
+            routed(vec![f.std(), unlisted], comment(&good), URL),
+            &[
+                "principal svc_other is not in docs/roles/review-workflow-principals.toml",
+                NO_SPEC,
+                BOTH,
+            ],
+        );
+        let mut foreign = f.spec();
+        foreign["repo"] = json!("favcrm/other");
+        exactly(
+            "a row of another repository",
+            routed(vec![f.std(), foreign], comment(&good), URL),
+            &["it names repo 'favcrm/other'", NO_SPEC, BOTH],
+        );
+        let mut combined = alice();
+        combined["kind"] = json!("combined");
+        let mut case = routed(vec![combined], comment(&good), URL);
+        case.class = "consequential";
+        exactly(
+            "one combined owner review on the consequential class",
+            case,
+            &["class does not hold for this script's diff", BOTH],
+        );
+        // A Browser QA row does not excuse a comment that was named and does not hold.
+        exactly(
+            "a Browser QA row beside a failed comment",
+            routed(
+                vec![f.std(), f.spec(), qa_row()],
+                comment(&format!("Browser QA: fail\nHead: {head}\n")),
+                URL,
+            ),
+            &[EXACT],
+        );
+
+        // The approval: this head, from the operator, and nothing in its place.
+        let fallback = "scope approval not used";
+        let mut case = good_case();
+        case.approved = false;
+        exactly("no approval", case, &[NO_APPROVAL]);
+        let mut case = good_case();
+        case.approved_head = Some(f.head.clone());
+        exactly("an approval of another head", case, &[NO_APPROVAL]);
+        // Its paths on the auto list, at main's tip and at the PR's own head and base.
+        let mut case = good_case();
+        case.approved = false;
+        case.tip_files = Some(f.listed("ui/**"));
+        exactly("paths on the auto list", case, &[NO_APPROVAL]);
+        let mut case = good_case();
+        case.approved = false;
+        case.tip_files = Some(f.listed("ui/**"));
+        let (_, stdout, _) = f.gate(&case);
+        if !stdout.contains("Browser QA by PR comment") {
+            fail(Some(format!(
+                "paths on the auto list: the route did not ask for the operator: {stdout}"
+            )));
+        }
+        let mut case = good_case();
+        case.approved = false;
+        case.head_files = Some(f.listed("ui/**"));
+        case.base_files = Some(f.listed("ui/**"));
+        case.tip_files = Some(f.base_files());
+        exactly(
+            "paths on the auto list at the PR's head and base",
+            case,
+            &[NO_APPROVAL],
+        );
+        // No scope approval is even looked for on this route. Without the flag the
+        // fallback runs and says so, so its silence here is the route's doing.
+        let mut case = good_case();
+        case.approved = false;
+        let (_, stdout, _) = f.gate(&case);
+        if stdout.contains(fallback) {
+            fail(Some(format!("the route read a scope approval: {stdout}")));
+        }
+        let mut case = scenario(vec![f.std(), f.spec(), qa_row()]);
+        case.head = Some(head.clone());
+        case.approved = false;
+        let (_, stdout, _) = f.gate(&case);
+        if !stdout.contains(fallback) {
+            fail(Some(format!(
+                "without the flag the scope fallback did not run: {stdout}"
+            )));
+        }
+
+        // The evidence comment must name the Browser QA comment the gate read.
+        let mut case = good_case();
+        case.no_qa_evidence = true;
+        exactly("no evidence comment naming it", case, &[NO_EVIDENCE]);
+
+        // Not a hosted org, not a ui change, not with the exception.
+        let mut case = good_case();
+        case.native = true;
+        exactly("a local org", case, &[LOCAL, NO_QA]);
+        // Its comment holds for its own head, so only the missing ui change can refuse.
+        let not_ui = f.touch("notes/x.md");
+        let not_ui_case = || {
+            let mut case = routed(
+                two(),
+                comment(&format!("Browser QA: pass\nHead: {not_ui}\n")),
+                URL,
+            );
+            case.head = Some(not_ui.clone());
+            case
+        };
+        exactly("a PR with no ui change", not_ui_case(), &[NOT_UI]);
+        // The board asking for Browser QA does not make a PR a ui change.
+        let mut case = not_ui_case();
+        case.board_asks_qa = true;
+        exactly(
+            "no ui change, the board asking for Browser QA",
+            case,
+            &[NOT_UI, NO_QA],
+        );
+        for extra in [
+            vec!["--exception"],
+            vec![
+                "--exception",
+                "--advisory",
+                "standards=https://github.com/favcrm/cadence/pull/7#issuecomment-1",
+                "--advisory",
+                "spec-security=https://github.com/favcrm/cadence/pull/7#issuecomment-2",
+                "--advisory",
+                "browser-qa=https://github.com/favcrm/cadence/pull/7#issuecomment-3",
+            ],
+        ] {
+            let mut case = good_case();
+            case.extra_args.extend(extra.iter().map(|a| a.to_string()));
+            let (code, stdout, stderr) = f.gate(&case);
+            println!(
+                "[--exception too, {} args] exit {code}: {stderr}",
+                extra.len()
+            );
+            if code != 2
+                || !stderr.contains("are separate routes")
+                || stdout.contains("every rule holds")
+            {
+                fail(Some(format!(
+                    "--browser-qa with --exception: exit {code}\n  stderr: {stderr}"
+                )));
+            }
+        }
+
+        let failures = failures.into_inner();
+        assert!(
+            failures.is_empty(),
+            "{} bad case(s) not refused as the rule says:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     #[test]

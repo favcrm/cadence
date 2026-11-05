@@ -69,8 +69,9 @@ attested principal and, since CAD-2049, refuses the author's principal; local
 notes count by their self-declared `From:` alias, which is not attested. It
 cannot tell a fresh session from the author under one login. A hosted `routine` PR
 takes two workflow reviews, and operator approval while `workflow-auto-paths.toml`
-does not list its paths, because a hosted board has no readiness record (CAD-2135). Until the gate can tell, a hosted
-`ui/**` PR merges with the temporary exception (`--exception --advisory ...`: exact-head
+does not list its paths, because a hosted board has no readiness record (CAD-2135). A hosted `ui/**` PR takes those two reviews, operator
+approval and a `--browser-qa` comment naming its exact head (CAD-2173), or until it ends, the
+temporary exception (`--exception --advisory ...`: exact-head
 operator approval and two advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change; ends at
 `EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31). The exception only
