@@ -362,6 +362,24 @@ jobs:
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name == 'pull_request' }}
       - run: cargo build --profile ci --locked
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
+      # CAD-2153: the one test `ci.yml` runs (AGENTS.md). The fixture is a copy of what agenticos-v2 mints; this
+      # test is what fails a Cadence PR if verification stops accepting it
+      # (v2's own check covers the other side). One test, run in the `ci`
+      # profile so the cached dependency artifacts are reused. Do not widen
+      # it to a suite.
+      - name: Verify the platform-minted board assertion fixture
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
+        # A filter that matches nothing exits 0, so count first and fail
+        # unless exactly one test matches: a rename or move must not go green.
+        run: |
+          set -euo pipefail
+          filter=board_identity::tests::the_platform_minted_fixture
+          count=$(cargo test --profile ci --locked --lib "$filter" -- --list | grep -c ': test$' || true)
+          if [ "$count" != 1 ]; then
+            echo "expected exactly one test matching $filter, found $count" >&2
+            exit 1
+          fi
+          cargo test --profile ci --locked --lib "$filter" -- --test-threads 2
       - name: Package and clean-consumer check for the app toolchain
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
         run: scripts/app-toolchain-acceptance.sh "$GITHUB_WORKSPACE/target/ci/cadence"
