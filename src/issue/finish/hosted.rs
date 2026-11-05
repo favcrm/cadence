@@ -29,7 +29,7 @@ pub(crate) fn release_hosted_lane(
         front: Front::new(issue, "hosted lane", "now"),
         dir: PathBuf::new(),
         wt_dir: Some(path.to_path_buf()),
-        wt_name: None,
+        wt_name: path.file_name().map(|n| n.to_string_lossy().into_owned()),
         branch: branch.to_string(),
         root: root.to_path_buf(),
         msg_refs: std::collections::HashSet::new(),
@@ -42,6 +42,14 @@ pub(crate) fn release_hosted_lane(
     blocks.extend(survivability_block);
     if let Some(block) = blocks.into_iter().next() {
         return Err(refuse(&block.reason));
+    }
+    // Removing the worktree deletes ignored files silently (this repo ignores
+    // `docs/*`, `.env`, `claudedocs/`). Only build output and lane state may go.
+    if let Some(sample) = unexpected_ignored(path)? {
+        return Err(refuse(&format!(
+            "Worktree {} holds ignored files that removal would delete: {sample}",
+            path.display()
+        )));
     }
     let (how, tip) = match (&ev.state, tip) {
         (Branch::Merged { how, .. }, Some(tip)) => (*how, tip),
@@ -70,6 +78,7 @@ pub(crate) fn release_hosted_lane(
         }
         Ok(_) => {}
     }
+    verify_checkout_ownership(root, path, issue, Some(branch))?;
     let mut lifecycle = crate::worktree::lifecycle::begin_release(
         root,
         path,
@@ -99,9 +108,40 @@ pub(crate) fn release_hosted_lane(
         "branch": branch,
         "removed_worktree": true,
         "deleted_branch": deleted_branch,
+        "branch_note": (!deleted_branch).then_some(
+            "branch tip moved during release - kept; its evidence covered the old tip"
+        ),
         "merged_by": how,
         "warning": warning,
     }))
+}
+
+/// Ignored paths a hosted release may delete without asking: build output and
+/// the lane's own `.cadence/` state. Anything else ignored (`.env`, `docs/*`,
+/// `claudedocs/`) is the operator's.
+const ALLOWED_IGNORED: [&str; 3] = ["target/", "node_modules/", ".cadence/"];
+
+/// A short sample of ignored paths outside [`ALLOWED_IGNORED`], or `None`.
+fn unexpected_ignored(path: &Path) -> Result<Option<String>> {
+    let status = git(path, &["status", "--porcelain", "--ignored"])?;
+    let rest: Vec<&str> = status
+        .lines()
+        .filter_map(|l| l.strip_prefix("!! "))
+        .filter(|p| {
+            !ALLOWED_IGNORED
+                .iter()
+                .any(|a| p.starts_with(a) || p.contains(&format!("/{a}")))
+        })
+        .collect();
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    let more = rest.len().saturating_sub(5);
+    let mut sample = rest.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+    if more > 0 {
+        sample.push_str(&format!(" (and {more} more)"));
+    }
+    Ok(Some(sample))
 }
 
 /// A native block reason ends by offering `--force`; hosted release has none.
@@ -117,6 +157,7 @@ fn refuse(reason: &str) -> Error {
         );
     Error::rejected(format!(
         "Hosted issue finish did not release the lane: {reason}. Hosted release has no \
-         --force; resolve this and run `issue finish` again. Nothing was removed"
+         --force; resolve this (pushing the branch alone does not release it) and run \
+         `issue finish` again. Nothing was removed"
     ))
 }

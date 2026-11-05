@@ -715,7 +715,7 @@ After the increment merges, follow the selected workspace's supported ticket
 reconciliation and the repository's completion rules; report an unavailable
 hosted operation rather than switching trackers or claiming completion. Delete
 your scratch, stop the processes you started and close abandoned PRs with a
-link. Leave worktrees to their authorized sweep; never force `issue finish`.
+link. Release a merged lane with `issue finish <ID>` (on a hosted org: `cadence --org <name> issue finish <ID>`, which has no `--force`); leave other worktrees to their authorized sweep and never force `issue finish`.
 
 At a completed increment, QA revision, incident or repeated blocker, append a
 compact reflection to the existing task: **expected outcome; observed evidence;

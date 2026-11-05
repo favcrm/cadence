@@ -19,9 +19,11 @@ pub fn refusal<H: CoordHttp>(
     Error::rejected(format!(
         "Hosted issue finish did not release the lane; {detail}. Nothing was removed. \
          Release needs this machine's recorded lane for the issue, a finished assignment, \
-         a clean idle worktree and a merged branch. If the lane cannot be bound, check it \
-         is clean and merged yourself, then remove it with `git worktree remove <path>` and \
-         `git branch -d <branch>` from the repository"
+         a clean idle worktree and a merged branch (pushing alone does not release it). If \
+         the lane cannot be bound, verify yourself that it is merged, that nothing is using \
+         it and that you do not need its ignored files (removal deletes them), then run \
+         `git worktree remove <path>` and `git branch -d <branch>` from the repository; a \
+         squash-merged branch needs `-D`, only after you have verified the merge"
     ))
 }
 
@@ -42,7 +44,7 @@ pub fn release<H: CoordHttp>(
     if !lane.ended {
         return Err(Error::rejected(format!(
             "Hosted issue finish did not release the lane for {issue}; its assignment has not \
-             ended (report it `result`, `failed` or cancel it first). Nothing was removed"
+             ended (report it `result` or `failed`, or cancel it with `reassign --cancel`, first). Nothing was removed"
         )));
     }
     crate::issue::finish::release_hosted_lane(
@@ -85,7 +87,11 @@ fn bound_lane<H: CoordHttp>(
         if attempt.worktree.is_none() && attempt.claim_id.is_none() {
             continue;
         }
-        if attempt.fenced
+        // `reassign --cancel` fences an assignment as it ends it, so an ended
+        // row may be fenced; every other binding field must still match. A
+        // live row must also be unfenced.
+        let row_ended = matches!(attempt.state.as_str(), "result" | "failed" | "cancelled");
+        if (attempt.fenced && !row_ended)
             || attempt.claim_id.is_none()
             || attempt.lane_claim != attempt.claim_id
             || attempt.generation.is_none()
@@ -157,13 +163,6 @@ fn observe<H: CoordHttp>(
         &["rev-parse", "--verify", &format!("{into}^{{commit}}")],
     )?;
     let evidence = merge_rule(&root, &branch, &tip, &into);
-    // `git cherry` ignores merge commits, which can contain unique resolution
-    // work even when every non-merge commit is patch-equivalent upstream.
-    if evidence == Some("cherry")
-        && !git(&root, &["rev-list", "--merges", &format!("{into}..{tip}")])?.is_empty()
-    {
-        return Ok(Some(LaneState::CleanUnverified));
-    }
     Ok(Some(if evidence.is_some() {
         LaneState::CleanMerged
     } else {

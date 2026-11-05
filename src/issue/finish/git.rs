@@ -97,19 +97,45 @@ pub(crate) fn merge_rule(
         return Some("ancestry");
     }
     // `+` = a commit with no patch-equivalent upstream; a listing
-    // with none means everything up to `tip` already landed.
+    // with none means everything up to `tip` already landed. `git cherry`
+    // skips merge commits and `patch_applied` can reverse-apply by removing
+    // a different identical row or ignore a mode-only change, so both arms
+    // also need `adds_nothing_to`: merging `tip` into `into` must change
+    // nothing.
     if let Ok(marks) = git(root, &["cherry", into, tip]) {
-        if !marks.lines().any(|l| l.starts_with('+')) {
+        if !marks.lines().any(|l| l.starts_with('+')) && adds_nothing_to(root, tip, into) {
             return Some("cherry");
         }
     }
-    if patch_applied(root, tip, into) {
+    if patch_applied(root, tip, into) && adds_nothing_to(root, tip, into) {
         return Some("patch");
     }
     if pr_merged(root, pr_head, tip, into) {
         return Some("pr");
     }
     None
+}
+
+/// Does merging `tip` into `into` leave `into`'s tree unchanged? A clean
+/// three-way merge (`git merge-tree --write-tree`, git 2.38+) whose result
+/// equals `into^{tree}` proves `into` already holds everything `tip` adds,
+/// including merge-commit resolutions, mode changes and repeated lines that
+/// `git cherry` and a reverse apply miss. Any failure refuses: a conflict, or
+/// a git without the command. A squash whose file later changed differently
+/// on `into` also fails here; refusing is the safe direction, and the merged
+/// PR (`pr` arm) can still prove it.
+pub(crate) fn adds_nothing_to(root: &Path, tip: &str, into: &str) -> bool {
+    let Ok(out) = git_out(root, &["merge-tree", "--write-tree", into, tip], &[]) else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let merged = String::from_utf8_lossy(&out.stdout);
+    let Some(merged) = merged.lines().next().map(str::trim) else {
+        return false;
+    };
+    git(root, &["rev-parse", "--verify", &format!("{into}^{{tree}}")]).is_ok_and(|t| t == merged)
 }
 
 /// Squash-merge test: if the branch's combined diff against its

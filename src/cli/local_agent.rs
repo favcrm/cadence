@@ -113,8 +113,10 @@ pub(super) fn hosted_finish(
     let coord = coordinator(target).map_err(|e| {
         Error::rejected(format!(
             "Hosted lane release is unavailable: the coordinator ledger could not be opened ({e}). \
-             Nothing was removed. If the lane's work is merged, remove it yourself with \
-             `git worktree remove <path>` and `git branch -d <branch>`"
+             Nothing was removed. If the lane's work is merged and nothing is using it, remove it \
+             yourself with `git worktree remove <path>` (this deletes its ignored files) and \
+             `git branch -d <branch>`, which refuses a squash-merged branch: use `-D` only \
+             after verifying the merge"
         ))
     })?;
     let state = match local_state {

@@ -510,9 +510,12 @@ uncommitted or recently modified files, a process or agent is inside it, the
 branch has not started, or the branch is not shown merged into the default
 branch (ancestry, patch-equivalent commits, a squash, or a merged PR with that
 tip). Merged is stricter than the native finish: pushed alone does not release a
-hosted lane. When the ledger cannot identify the lane, the refusal says so and
-names the manual path: check it is clean and merged, then `git worktree remove
-<path>` and `git branch -d <branch>`. `issue reconcile` stays native-only.
+hosted lane. The merge check also needs `git merge-tree --write-tree` (git 2.38+) to show
+the default branch already holds the branch's changes; an older git, or a squash whose
+file later changed differently on the default branch, refuses. The release also refuses
+when the worktree holds gitignored files other than `target/`, `node_modules/` and
+`.cadence/` (for example `.env`, `docs/*`), naming a sample, because removal deletes them. When the ledger cannot identify the lane, the refusal says so and
+names the manual path: verify the merge, that nothing is using the lane and that you do not need its ignored files, then `git worktree remove <path>` and `git branch -d <branch>` (a squash-merged branch refuses `-d`; use `-D` only after verifying the merge). `issue reconcile` stays native-only.
 
 ### Managing agent profiles from the CLI (CAD-2101)
 
