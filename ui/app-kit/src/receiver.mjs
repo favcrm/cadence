@@ -94,7 +94,7 @@ export function readBoot(documentRef = globalThis.document) {
 const isPlain = (value) => !!value && typeof value === "object" && !Array.isArray(value);
 
 /** A plain-object args bag within the host's byte bound, or `null`. */
-function validArgs(args) {
+function validArgs(args, limit = ACTION_ARGS_BYTES) {
   if (!isPlain(args)) return null;
   let text;
   try {
@@ -102,7 +102,7 @@ function validArgs(args) {
   } catch {
     return null;
   }
-  return text !== undefined && byteLength(text) <= ACTION_ARGS_BYTES ? args : null;
+  return text !== undefined && byteLength(text) <= limit ? args : null;
 }
 
 /** CAD-1365: the optional revision the host binds a generation tool to.
@@ -170,6 +170,7 @@ export function createScreenReceiver(options = {}) {
     onPresentation,
     onSurface,
     accepts = ["screen.v2"],
+    maxArgsBytes = ACTION_ARGS_BYTES,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     onSlotState,
     document: documentRef = globalThis.document,
@@ -178,14 +179,14 @@ export function createScreenReceiver(options = {}) {
     MessageChannel: Channel = globalThis.MessageChannel,
   } = options;
   if (typeof onPush !== "function") throw new TypeError("onPush is required");
-  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-presentation.v1", "screen-surfaces.v1"]);
+  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-presentation.v1", "screen-surfaces.v1", "screen-records.v1", "crm-locale.v1"]);
   if (
     !Array.isArray(accepts) ||
     accepts.length === 0 ||
     accepts.some((value) => !ACCEPTED.has(value)) ||
     !accepts.some((value) => value === "screen.v1" || value === "screen.v2")
   ) {
-    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1, screen-presentation.v1 or screen-surfaces.v1");
+    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1, screen-presentation.v1, screen-surfaces.v1, screen-records.v1 or crm-locale.v1");
   }
   const actionsAccepted = accepts.includes("screen-actions.v1");
   if (actionsAccepted && !accepts.includes("screen.v2")) {
@@ -202,11 +203,28 @@ export function createScreenReceiver(options = {}) {
   if (surfacesAccepted && !accepts.includes("screen.v2")) {
     throw new TypeError("screen-surfaces.v1 needs screen.v2");
   }
+  const recordsAccepted = accepts.includes("screen-records.v1");
+  if (recordsAccepted && !accepts.includes("screen.v2")) {
+    throw new TypeError("screen-records.v1 needs screen.v2");
+  }
+  const localeAccepted = accepts.includes("crm-locale.v1");
+  if (localeAccepted && !recordsAccepted) {
+    throw new TypeError("crm-locale.v1 needs screen-records.v1");
+  }
   // `screen.v1` is a local PUSH filter. The host's ready envelope admits only
-  // v2 contract names, and a v1-only mount sends the bare ready.
-  const ready = accepts.includes("screen.v2")
-    ? { v: 1, op: "ready", accepts: ["screen.v2", ...(actionsAccepted ? ["screen-actions.v1"] : []), ...(presentationAccepted ? ["screen-presentation.v1"] : []), ...(surfacesAccepted ? ["screen-surfaces.v1"] : [])] }
-    : { v: 1, op: "ready" };
+  // v2 contract names, and a v1-only mount sends the bare ready. The host
+  // accepts at most four ready capabilities; refuse here rather than let the
+  // host close a mount for an envelope it never admits.
+  const readyAccepts = ["screen.v2",
+    ...(actionsAccepted ? ["screen-actions.v1"] : []),
+    ...(presentationAccepted ? ["screen-presentation.v1"] : []),
+    ...(surfacesAccepted ? ["screen-surfaces.v1"] : []),
+    ...(recordsAccepted ? ["screen-records.v1"] : []),
+    ...(localeAccepted ? ["crm-locale.v1"] : [])];
+  if (readyAccepts.length > 4) throw new TypeError("the host admits at most four ready capabilities");
+  const ready = accepts.includes("screen.v2") ? { v: 1, op: "ready", accepts: readyAccepts } : { v: 1, op: "ready" };
+  if (!Number.isSafeInteger(maxArgsBytes) || maxArgsBytes <= 0) throw new TypeError("maxArgsBytes must be a positive safe integer");
+  const argsLabel = maxArgsBytes === ACTION_ARGS_BYTES ? "16 KiB" : `${maxArgsBytes} bytes`;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError("timeoutMs must be positive");
   if (!parent || typeof parent.postMessage !== "function") throw new TypeError("a parent window is required");
   if (typeof Channel !== "function") throw new TypeError("MessageChannel is unavailable");
@@ -478,8 +496,8 @@ export function createScreenReceiver(options = {}) {
       if (typeof verb !== "string" || verb.length === 0 || verb.length > 128) {
         return Promise.reject(new TypeError("verb must be a non-empty string of at most 128 characters"));
       }
-      if (validArgs(args) === null) {
-        return Promise.reject(new TypeError("args must be a plain object within 16 KiB"));
+      if (validArgs(args, maxArgsBytes) === null) {
+        return Promise.reject(new TypeError(`args must be a plain object within ${argsLabel}`));
       }
       return request("call", { verb, args });
     },
@@ -524,8 +542,8 @@ export function createScreenReceiver(options = {}) {
       if (typeof verb !== "string" || verb.length === 0 || verb.length > 128) {
         return Promise.reject(new TypeError("verb must be a non-empty string of at most 128 characters"));
       }
-      if (validArgs(args) === null) {
-        return Promise.reject(new TypeError("args must be a plain object within 16 KiB"));
+      if (validArgs(args, maxArgsBytes) === null) {
+        return Promise.reject(new TypeError(`args must be a plain object within ${argsLabel}`));
       }
       if (validAnchor(anchor) === null) {
         return Promise.reject(new TypeError('anchor must be "footer" or exactly {x,y,w,h}'));
@@ -539,8 +557,8 @@ export function createScreenReceiver(options = {}) {
       if (typeof alias !== "string" || !TOOL_ALIAS.test(alias)) {
         return Promise.reject(new TypeError("tool alias is malformed"));
       }
-      if (validArgs(input) === null) {
-        return Promise.reject(new TypeError("input must be a plain object within 16 KiB"));
+      if (validArgs(input, maxArgsBytes) === null) {
+        return Promise.reject(new TypeError(`input must be a plain object within ${argsLabel}`));
       }
       if (typeof requestId !== "string" || !TOOL_REQUEST_ID.test(requestId)) {
         return Promise.reject(new TypeError("tool request_id is required and bounded"));

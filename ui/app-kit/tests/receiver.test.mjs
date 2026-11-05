@@ -404,6 +404,54 @@ test("request shapes are bounded at send time", async () => {
   assert.equal(inbox.filter((m) => m.op === "call" || m.op === "slot" || m.op === "tool").length, 0);
 });
 
+test("records and CRM locale are advertised together", async () => {
+  const { inbox } = connect({ accepts: ["screen.v2", "screen-records.v1", "crm-locale.v1"] });
+  await tick();
+  assert.deepEqual(inbox[0], {
+    v: 1,
+    op: "ready",
+    accepts: ["screen.v2", "screen-records.v1", "crm-locale.v1"],
+  });
+});
+
+test("records capabilities require their base and fit the host's ready bound", () => {
+  const base = { boot, parent: { postMessage() {} }, onPush() {}, timeoutMs: 100 };
+  assert.throws(
+    () => createScreenReceiver({ ...base, accepts: ["screen.v1", "screen-records.v1"] }),
+    /screen-records\.v1 needs screen\.v2/,
+  );
+  assert.throws(
+    () => createScreenReceiver({ ...base, accepts: ["screen.v2", "crm-locale.v1"] }),
+    /crm-locale\.v1 needs screen-records\.v1/,
+  );
+  assert.throws(
+    () =>
+      createScreenReceiver({
+        ...base,
+        accepts: ["screen.v2", "screen-actions.v1", "screen-surfaces.v1", "screen-records.v1", "crm-locale.v1"],
+      }),
+    /at most four ready capabilities/,
+  );
+});
+
+test("maxArgsBytes admits a records CSV-sized call", async () => {
+  const { host, inbox, pushes, receiver } = connect({
+    accepts: ["screen.v2", "screen-records.v1"],
+    maxArgsBytes: 327680,
+  });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const csvText = "x".repeat(200 * 1024);
+  const reply = receiver.call("records.csv.preview", { csv_text: csvText });
+  const request = await waitFor(
+    () => inbox.find((m) => m.op === "call" && m.verb === "records.csv.preview"),
+    "the CSV call",
+  );
+  assert.equal(request.args.csv_text.length, csvText.length);
+  host.postMessage({ v: 2, op: "reply", id: request.id, ok: true, data: { rows: 1 } });
+  assert.deepEqual(await reply, { rows: 1 });
+});
+
 test("a slot resolves the host's event, not just its state", async () => {
   const { host, inbox, pushes, receiver } = connect();
   host.postMessage(push());
