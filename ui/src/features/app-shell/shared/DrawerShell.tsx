@@ -41,7 +41,7 @@ export interface DrawerShellProps {
   scrim?: "outlet" | "board";
   /** The host traps focus inside the drawer (CAD-2186); announce it as modal. */
   modal?: boolean;
-  title: string;
+  title: ReactNode;
   subtitle?: ReactNode;
   avatar?: ReactNode;
   pills?: ReactNode;

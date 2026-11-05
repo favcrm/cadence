@@ -404,7 +404,7 @@ function DecidedLine({ write }: { write: StagedWrite }) {
   if (outcome === "failed") {
     return (
       <li data-fail>
-        <span>{write.title}</span>
+        <span><bdi>{write.title}</bdi></span>
         <span className="text-ink-500">
           <span className="dx-bad">{t("Did not apply")}</span> · {when}
         </span>
@@ -433,7 +433,7 @@ function DecidedLine({ write }: { write: StagedWrite }) {
         : t("Applied");
   return (
     <li>
-      <span>{write.title}</span>
+      <span><bdi>{write.title}</bdi></span>
       <span className="text-ink-500">
         {label} · {when}
       </span>

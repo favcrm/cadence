@@ -312,3 +312,15 @@ export function ageText(fromMs: number, t: Say = same, nowMs = Date.now()): stri
   if (s < 86400) return t("{n} h").replace("{n}", String(Math.floor(s / 3600)));
   return t("{n} d").replace("{n}", String(Math.floor(s / 86400)));
 }
+
+/** The keys the call itself sent (`profile` in the stored args), or null when they cannot be read. */
+export function sentFields(write: StagedWrite): Set<string> | null {
+  if (write.kind !== "app_call") return null;
+  try {
+    const call: unknown = JSON.parse(write.raw);
+    const profile = isRecord(call) ? call.profile : null;
+    return isRecord(profile) ? new Set(Object.keys(profile)) : null;
+  } catch {
+    return null;
+  }
+}

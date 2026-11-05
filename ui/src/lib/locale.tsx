@@ -1961,4 +1961,7 @@ Object.assign(zhTW, {
   "the app does not offer this operation": "該應用程式未提供此操作",
   "the record store could not be reached": "無法連接記錄儲存庫",
   "the app refused it": "應用程式拒絕了此操作",
+  "Empty": "空白",
+  "{n} default also set": "另設定 {n} 項預設值",
+  "{n} defaults also set": "另設定 {n} 項預設值",
 });

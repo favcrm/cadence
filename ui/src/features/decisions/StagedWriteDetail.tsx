@@ -3,7 +3,7 @@ import DrawerShell from "../app-shell/shared/DrawerShell";
 import { useWriteBlock } from "../auth/WriteGate";
 import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
-import { askedBy, ageText, type StagedChange, type StagedWrite } from "./stagedWrite";
+import { ageText, sentFields, type StagedChange, type StagedWrite } from "./stagedWrite";
 import { checkDecision, clearNotice, currentDecisions, decide, type DecisionNotice, type DecisionsState, type Verb } from "./useDecisions";
 import "./decisions.css";
 
@@ -16,12 +16,27 @@ function safeLink(href: string | null): string | null {
   return href.startsWith("https://") ? href : null;
 }
 
-/** A value shown as data: wrapped, never cut, never styled as UI. */
-function Data({ v, t }: { v: string | null | undefined; t: Say }) {
-  if (v === null) return <em className="dx-none">{t("(cleared)")}</em>;
+/** Text from the API is isolated: a bidi override in it cannot reach the words around it. */
+const B = ({ children }: { children: ReactNode }) => <bdi>{children}</bdi>;
+
+/** Fill `{name}` in a translated template with a node. */
+function fill(template: string, values: Record<string, ReactNode>): ReactNode[] {
+  return template.split(/(\{\w+\})/).map((part, i) => {
+    const key = /^\{(\w+)\}$/.exec(part)?.[1];
+    return key !== undefined && key in values ? <span key={i}>{values[key]}</span> : part;
+  });
+}
+
+/** A value shown as data: wrapped, never cut, never styled as UI. `empty`: nothing was there to clear. */
+function Data({ v, t, empty = false }: { v: string | null | undefined; t: Say; empty?: boolean }) {
+  if (v === null) return <em className="dx-none">{empty ? t("Empty") : t("(cleared)")}</em>;
   if (v === "") return <em className="dx-none">{t("(empty text)")}</em>;
   if (v === undefined) return null;
-  return <span className="dx-v">{v}</span>;
+  return (
+    <span className="dx-v">
+      <B>{v}</B>
+    </span>
+  );
 }
 
 function ChangeRow({ change, update, t }: { change: StagedChange; update: boolean; t: Say }) {
@@ -29,7 +44,9 @@ function ChangeRow({ change, update, t }: { change: StagedChange; update: boolea
   const compared = change.kind !== "added" || update;
   return (
     <div className="dx-row">
-      <dt>{change.label}</dt>
+      <dt>
+        <B>{change.label}</B>
+      </dt>
       <dd>
         {compared && (
           <>
@@ -43,24 +60,27 @@ function ChangeRow({ change, update, t }: { change: StagedChange; update: boolea
             <span aria-hidden="true">→</span>{" "}
           </>
         )}
-        <span className="dx-now">{change.after === undefined ? "—" : <Data v={change.after} t={t} />}</span>
+        <span className="dx-now">{change.after === undefined ? "—" : <Data v={change.after} t={t} empty={change.kind === "added"} />}</span>
       </dd>
     </div>
   );
 }
 
+/** FSI…PDI: the title cannot bleed into the sentence around it. */
+const iso = (text: string) => `\u2068${text}\u2069`;
+
 export function noticeText(n: DecisionNotice, t: Say): string {
   switch (n.outcome) {
     case "applied":
-      return `${t("Applied")} · ${n.title}`;
+      return `${t("Applied")} · ${iso(n.title)}`;
     case "denied":
-      return `${t("Denied")} · ${n.title} · ${t("nothing ran")}`;
+      return `${t("Denied")} · ${iso(n.title)} · ${t("nothing ran")}`;
     case "failed":
       return t("{title} was approved but did not apply: {reason}. See Updates.")
-        .replace("{title}", n.title)
+        .replace("{title}", iso(n.title))
         .replace("{reason}", t(n.reason ?? "the reason is not recognised"));
     case "unconfirmed":
-      return t("{title}: the result could not be confirmed. See Updates.").replace("{title}", n.title);
+      return t("{title}: the result could not be confirmed. See Updates.").replace("{title}", iso(n.title));
     case "still-waiting":
       return t("It is still waiting. Nothing was recorded, so you can decide again.");
     default:
@@ -77,6 +97,12 @@ function Body({ write, notice, state, t }: { write: StagedWrite; notice: Decisio
   const heading = update ? t("Changes compared with the current record") : write.target !== null ? t("Values sent") : t("Fields");
   const name = write.origin?.label ?? t("The assistant");
   const unchanged = write.unchangedCount;
+  // A create lists what the call sent; the store's own defaults fold into one closed disclosure.
+  const sent = update ? null : sentFields(write);
+  const main = sent === null ? write.changes : write.changes.filter((c) => sent.has(c.field));
+  const folded = sent === null || main.length === 0 ? [] : write.changes.filter((c) => !sent.has(c.field));
+  const shown = folded.length === 0 ? write.changes : main;
+  const [defaults, setDefaults] = useState(false);
   return (
     <div className="wi-panel dx-panel">
       {notice && (
@@ -94,11 +120,27 @@ function Body({ write, notice, state, t }: { write: StagedWrite; notice: Decisio
         <section aria-label={heading}>
           <h4 className="rv-h">{heading}</h4>
           {write.changes.length > 0 ? (
-            <dl className="dx-chg">
-              {write.changes.map((c) => (
-                <ChangeRow key={`${c.kind}:${c.field}`} change={c} update={update} t={t} />
-              ))}
-            </dl>
+            <>
+              <dl className="dx-chg">
+                {shown.map((c) => (
+                  <ChangeRow key={`${c.kind}:${c.field}`} change={c} update={update} t={t} />
+                ))}
+              </dl>
+              {folded.length > 0 && (
+                <>
+                  <button type="button" className="rv-dlnk dx-rawbtn dx-defaults" aria-expanded={defaults} onClick={() => setDefaults((d) => !d)}>
+                    {(folded.length === 1 ? t("{n} default also set") : t("{n} defaults also set")).replace("{n}", String(folded.length))}
+                  </button>
+                  {defaults && (
+                    <dl className="dx-chg dx-folded">
+                      {folded.map((c) => (
+                        <ChangeRow key={`${c.kind}:${c.field}`} change={c} update={update} t={t} />
+                      ))}
+                    </dl>
+                  )}
+                </>
+              )}
+            </>
           ) : (
             <p className="rv-note">{t("No fields change.")}</p>
           )}
@@ -111,8 +153,10 @@ function Body({ write, notice, state, t }: { write: StagedWrite; notice: Decisio
       )}
       {write.reason !== null && (
         <div>
-          <p className="rv-note dx-qh">{t("{name}'s note · not verified").replace("{name}", name)}</p>
-          <blockquote className="dx-quote">{write.reason}</blockquote>
+          <p className="rv-note dx-qh">{fill(t("{name}'s note · not verified"), { name: <B>{name}</B> })}</p>
+          <blockquote className="dx-quote">
+            <B>{write.reason}</B>
+          </blockquote>
         </div>
       )}
       {write.consent !== null && (
@@ -120,12 +164,21 @@ function Body({ write, notice, state, t }: { write: StagedWrite; notice: Decisio
           <span>{t("Consent supplied with this write · reported, not verified")}</span>
           {write.consent.map(([k, v]) => (
             <span key={k} className="dx-kv">
-              {k.replace(/_/g, " ")}: {v}
+              <B>{k.replace(/_/g, " ")}</B>: <B>{v}</B>
             </span>
           ))}
         </p>
       )}
-      {write.effects.length > 0 && <p className="rv-note dx-eff">{write.effects.join(" ")}</p>}
+      {write.effects.length > 0 && (
+        <p className="rv-note dx-eff">
+          {write.effects.map((e, i) => (
+            <span key={i}>
+              {i > 0 && " · "}
+              <B>{e}</B>
+            </span>
+          ))}
+        </p>
+      )}
       <div>
         <button type="button" className="rv-dlnk dx-rawbtn" aria-expanded={raw} onClick={() => setRaw((r) => !r)}>
           {raw ? t("Hide raw") : t("Show raw")}
@@ -141,7 +194,7 @@ function Body({ write, notice, state, t }: { write: StagedWrite; notice: Decisio
 }
 
 /** How long a newly shown item ignores Approve and Deny. */
-const ARM_MS = 400;
+const ARM_MS = 800;
 
 const TABBABLE = 'button:not([disabled]), a[href], pre[tabindex="0"], [tabindex]:not([tabindex="-1"])';
 
@@ -337,11 +390,11 @@ export default function StagedWriteDetail({
       modal
       scrim="board"
       label={label}
-      title={write.title}
+      title={<B>{write.title}</B>}
       subtitle={
         <>
-          {where}
-          {write.target?.id ? <span className="dx-id">{where ? " · " : ""}{write.target.id}</span> : null}
+          <B>{where}</B>
+          {write.target?.id ? <span className="dx-id">{where ? " · " : ""}<B>{write.target.id}</B></span> : null}
           {link && (
             <>
               {" · "}
@@ -351,7 +404,9 @@ export default function StagedWriteDetail({
             </>
           )}
           <div className="dx-asked">
-            {t("Asked by")} {askedBy(write, t) ?? t("the assistant")}, {via} · {ageText(write.createdAt, t)}
+            {t("Asked by")}{" "}
+            <B>{write.origin === null ? t("the assistant") : `${write.origin.label} (${write.origin.kind === "agent" || write.origin.kind === "person" ? t(write.origin.kind) : write.origin.kind})`}</B>
+            , <B>{via}</B> · {ageText(write.createdAt, t)}
           </div>
         </>
       }

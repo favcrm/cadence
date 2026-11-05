@@ -116,7 +116,7 @@ const sleep = (ms: number) => React.act(async () => { await new Promise((resolve
 async function click(element: Element | undefined | null, opts: { detail?: number; quick?: boolean } = {}) {
   assert(element, "click target exists");
   const label = element.textContent?.trim();
-  if (!opts.quick && element.closest('[data-drawer="staged"]') && (label === "Approve" || label === "Deny")) await sleep(450);
+  if (!opts.quick && element.closest('[data-drawer="staged"]') && (label === "Approve" || label === "Deny")) await sleep(850);
   await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: opts.detail ?? 1 } as any)); });
   await flush();
 }
@@ -124,7 +124,8 @@ const buttons = (scope: ParentNode) => Array.from(scope.querySelectorAll("button
 const labelled = (scope: ParentNode, text: string) => buttons(scope).find((b) => b.textContent?.trim() === text);
 const drawerEl = () => document.querySelector('.crm-drawer[data-drawer="staged"]') as HTMLElement | null;
 const sent = (): number => posts.length;
-const text = (el: Element | null) => el?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+// FSI/PDI isolates around a title inside a sentence are invisible; compare the words.
+const text = (el: Element | null) => el?.textContent?.replace(/[\u2068\u2069]/g, "").replace(/\s+/g, " ").trim() ?? "";
 
 function Badge({ needs, owner }: { needs: unknown[]; owner: boolean }) {
   const decisions = useDecisions(owner);
@@ -482,7 +483,7 @@ listStatus = 200;
   await click(labelled(v.cards()[0], "Review"));
   await settle(() => assert(drawerEl(), "open"));
   const approve = labelled(drawerEl()!, "Approve")!;
-  await sleep(450);
+  await sleep(850);
   // The exact probe: the first click decides a1 and the list is re-read before the second lands.
   await click(approve, { quick: true, detail: 1 });
   await settle(() => assert(text(drawerEl()!.querySelector(".crm-drawer-title")) === "Update Harbour Tea", "advanced"));
@@ -651,6 +652,74 @@ listStatus = 200;
   assert(listCalls === before, "hidden: no read");
   Object.defineProperty(win.document, "visibilityState", { value: "visible", configurable: true });
   await w.done();
+}
+
+// ---- 16. API text is isolated; creates fold their defaults; Empty vs (cleared); effects apart; arming ----
+{
+  const RLO = "\u202E";
+  const evil = (w: string) => `${RLO}${w}`;
+  actions = [customer("a1", {
+    title: evil("title"), reason: evil("reason"), origin: { via: "cli", kind: "person", label: evil("origin") },
+    consent: { channel: evil("consent") },
+    changes: [{ field: "stage", label: evil("label"), kind: "changed", before: evil("before"), after: evil("after") }],
+    effects: [evil("effect one"), "Nothing is sent to anyone"],
+  })];
+  const v = await render();
+  await settle(() => assert(v.cards().length === 1, "one card"));
+  const card = v.cards()[0];
+  const bare = (root: Element) => Array.from(root.querySelectorAll("*")).filter((e) => Array.from(e.childNodes).some((n) => n.nodeType === 3 && (n.textContent ?? "").includes(RLO)) && !e.closest("bdi"));
+  assert(bare(card).length === 0, `the card isolates API text (${bare(card).map((e) => e.className).join(",")})`);
+  await click(labelled(card, "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  const unwrapped = bare(drawerEl()!);
+  assert(unwrapped.length === 0, `every API string in the drawer is isolated (${unwrapped.map((e) => e.tagName + "." + e.className).join(",")})`);
+  for (const w of ["title", "reason", "origin", "consent", "label", "before", "after", "effect one"]) assert(drawerEl()!.textContent!.includes(evil(w)), `${w} is shown`);
+  assert(text(drawerEl()!.querySelector(".dx-eff")).includes("effect one · Nothing is sent to anyone"), "effects are separated");
+  await v.done();
+
+  const createRow = (id: string, args: string) => customer(id, {
+    title: "Add E2E Synthetic Customer", target: null, unchanged_count: 0, reason: null, consent: null, effects: ["Runs as you"],
+    args,
+    changes: [
+      { field: "display_name", label: "Display name", kind: "added", after: "E2E Synthetic Customer" },
+      { field: "email", label: "Email", kind: "added", after: "e2e@example.invalid" },
+      ...["phone", "notes", "tags", "stage", "owner", "source"].map((f) => ({ field: f, label: f, kind: "added", after: f === "notes" ? null : "x" })),
+    ],
+  });
+  actions = [createRow("c1", JSON.stringify({ profile: { display_name: "E2E Synthetic Customer", email: "e2e@example.invalid" }, record_id: "rec-1" }))];
+  const w = await render();
+  await settle(() => assert(w.cards().length === 1, "one card"));
+  await click(labelled(w.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  const rowsOf = () => Array.from(drawerEl()!.querySelectorAll(".dx-row"));
+  assert(rowsOf().length === 2, `a create lists what was sent (${rowsOf().length})`);
+  const more = labelled(drawerEl()!, "6 defaults also set");
+  assert(more && more.getAttribute("aria-expanded") === "false", "defaults are one closed disclosure");
+  const dlg = drawerEl();
+  await click(more);
+  assert(rowsOf().length === 8 && drawerEl() === dlg, "expanding shows all of them in place");
+  const notes = rowsOf().map((r) => text(r)).find((r) => r.startsWith("notes"))!;
+  assert(notes.includes("Empty") && !notes.includes("(cleared)"), `an added null reads Empty (${notes})`);
+  await w.done();
+
+  actions = [createRow("c2", "not json")];
+  const x = await render();
+  await settle(() => assert(x.cards().length === 1, "one card"));
+  await click(labelled(x.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  assert(drawerEl()!.querySelectorAll(".dx-row").length === 8 && !labelled(drawerEl()!, "6 defaults also set"), "unparseable args show the flat list");
+  await x.done();
+
+  // A just-shown item is not armed yet.
+  actions = [customer("a1"), customer("a2", { title: "Update Harbour Tea" })];
+  const y = await render();
+  await settle(() => assert(y.cards().length === 2, "two"));
+  await click(labelled(y.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  await sleep(300);
+  await click(labelled(drawerEl()!, "Approve"), { quick: true });
+  assert(sent() === 0, "inside the arming window a click does nothing");
+  await y.done();
 }
 
 console.log("staged decision checks passed");

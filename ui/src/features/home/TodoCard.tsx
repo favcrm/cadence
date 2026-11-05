@@ -323,7 +323,7 @@ export default function TodoCard({
       title={spec.place !== "drawer" && block ? t(READ_ONLY_COPY) : undefined}
       onClick={control}
     >
-      {spec.control}
+      {t(spec.control)}
     </button>
   );
 
@@ -347,9 +347,9 @@ export default function TodoCard({
             onKeyDown={onKey}
           >
             <div className="todo-title" title={title}>
-              {title}
+              {action.type === "staged" ? <bdi>{title}</bdi> : title}
             </div>
-            <div className="todo-meta">{done ? doneText : metaLine(need)}</div>
+            <div className="todo-meta">{done ? doneText : action.type === "staged" ? <bdi>{metaLine(need)}</bdi> : metaLine(need)}</div>
           </div>
           {inside}
           {!done && quickRow}
