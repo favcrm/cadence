@@ -77,16 +77,18 @@ pub(crate) fn ancestor(root: &Path, branch: &str, into: &str) -> bool {
     git(root, &["merge-base", "--is-ancestor", branch, into]).is_ok()
 }
 
-/// Why `tip` counts as merged into `into`, checked in order: plain
-/// ancestry; every commit up to `tip` already applied upstream
-/// (`git cherry` — the rebase/cherry-pick case); the combined diff
-/// up to `tip` reverse-applying onto `into` (a squash merge); or a
-/// merged GitHub PR whose recorded head covers `tip`. All four are
-/// pinned to the SHA, never re-resolved by name — the evidence and
-/// the commit a `branch -D` deletes cannot disagree. `pr_head` is
-/// the head branch name the `pr` arm filters on (a remote-tracking
-/// tip still names the local head it was pushed from). The first
-/// match wins and is reported as `merged_by`.
+/// Why `tip` survives deletion, checked in order: plain ancestry of
+/// the default ref, or a merged GitHub PR on origin's own repository
+/// whose recorded head is exactly `tip` (GitHub keeps
+/// `refs/pull/N/head` after a squash). Both are pinned to the SHA, so
+/// the evidence and the commit a `branch -D` deletes cannot disagree.
+/// CAD-2181: content inference (`git cherry`, a reverse-applying
+/// diff) is NOT evidence here — repeated lines, mode-only changes,
+/// merge commits, net-zero edits and merge drivers each fooled it
+/// into deleting the only copy of unpushed work. That guess lives in
+/// [`content_hint`], for messages and status only. `pr_head` is the
+/// head branch name the `pr` arm filters on. The first match wins and
+/// is reported as `merged_by`.
 pub(crate) fn merge_rule(
     root: &Path,
     pr_head: &str,
@@ -96,20 +98,37 @@ pub(crate) fn merge_rule(
     if ancestor(root, tip, into) {
         return Some("ancestry");
     }
-    // `+` = a commit with no patch-equivalent upstream; a listing
-    // with none means everything up to `tip` already landed.
+    if pr_merged(root, pr_head, tip, into) {
+        return Some("pr");
+    }
+    None
+}
+
+/// Strict evidence, else the content guess. For callers that only
+/// report or change tracker status and never delete: `issue
+/// reconcile` classification and the dirty-lane label. Never use it
+/// to authorize a delete.
+pub(crate) fn merged_claim(
+    root: &Path,
+    pr_head: &str,
+    tip: &str,
+    into: &str,
+) -> Option<&'static str> {
+    merge_rule(root, pr_head, tip, into).or_else(|| content_hint(root, tip, into))
+}
+
+/// Content looks landed on `into`: every commit up to `tip` has a
+/// patch-equivalent upstream (`git cherry`), or the combined diff
+/// reverse-applies (a squash merge). A guess, forgeable by content
+/// shape — a message, never a delete.
+pub(crate) fn content_hint(root: &Path, tip: &str, into: &str) -> Option<&'static str> {
+    // `+` = a commit with no patch-equivalent upstream.
     if let Ok(marks) = git(root, &["cherry", into, tip]) {
         if !marks.lines().any(|l| l.starts_with('+')) {
             return Some("cherry");
         }
     }
-    if patch_applied(root, tip, into) {
-        return Some("patch");
-    }
-    if pr_merged(root, pr_head, tip, into) {
-        return Some("pr");
-    }
-    None
+    patch_applied(root, tip, into).then_some("patch")
 }
 
 /// Squash-merge test: if the branch's combined diff against its
@@ -162,30 +181,27 @@ pub(crate) fn patch_applied(root: &Path, tip: &str, into: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// A merged GitHub PR counts as merged only when its recorded head
-/// commit covers `tip` — the name alone is not evidence: a branch
-/// name reused after its PR merged would otherwise report new
-/// unmerged commits as merged and the sweep would `branch -D` them
-/// away. The head SHA must equal the tip, or the tip must be an
-/// ancestor of it (a local branch behind the merged head). When the
-/// PR's head commit is not a local object only equality can prove
-/// coverage — anything else falls through to the other evidence.
-/// The PR's `baseRefName` must be the default ref — a PR merged into
-/// a stacked base is not merged into the default branch. `gh` needs
-/// a GitHub origin and a successful answer; any failure falls
-/// through: gh is a hint, never the only authority.
+/// A merged GitHub PR counts only when its recorded head commit is
+/// exactly `tip` — the name alone is not evidence (a reused branch
+/// name), and a head that merely descends from or precedes `tip` does
+/// not prove `tip` itself was merged. The lookup is pinned to
+/// origin's own GitHub repository (`-R <slug>`), never gh's default
+/// repo, and the PR's `baseRefName` must be the default ref. Any
+/// failure falls through: gh is a hint, never the only authority.
 pub(crate) fn pr_merged(root: &Path, branch: &str, tip: &str, into: &str) -> bool {
     let Ok(url) = git(root, &["remote", "get-url", "origin"]) else {
         return false;
     };
-    if !url.contains("github.com") {
+    let Some(slug) = github_slug(&url) else {
         return false;
-    }
+    };
     // `into` may be a remote-tracking name ("origin/main") — the PR
     // base is a bare branch name.
     let base_name = into.strip_prefix("origin/").unwrap_or(into);
     let mut cmd = Command::new("gh");
     cmd.args([
+        "-R",
+        &slug,
         "pr",
         "list",
         "--head",
@@ -193,7 +209,7 @@ pub(crate) fn pr_merged(root: &Path, branch: &str, tip: &str, into: &str) -> boo
         "--state",
         "merged",
         "--json",
-        "number,headRefOid,baseRefName",
+        "number,headRefOid,baseRefName,mergedAt",
         "--limit",
         "10",
     ])
@@ -208,17 +224,42 @@ pub(crate) fn pr_merged(root: &Path, branch: &str, tip: &str, into: &str) -> boo
         return false;
     };
     prs.as_array().is_some_and(|prs| {
-        prs.iter()
-            .filter(|pr| pr["baseRefName"].as_str() == Some(base_name))
-            .filter_map(|pr| pr["headRefOid"].as_str())
-            .any(|oid| oid == tip || object_has(root, oid) && ancestor(root, tip, oid))
+        prs.iter().any(|pr| {
+            pr["headRefOid"].as_str() == Some(tip)
+                && pr["baseRefName"].as_str() == Some(base_name)
+                && pr["mergedAt"].as_str().is_some_and(|t| !t.is_empty())
+        })
     })
 }
 
-/// Is `oid` present in the local object store? Ancestry against a
-/// commit we do not have cannot be checked.
-pub(crate) fn object_has(root: &Path, oid: &str) -> bool {
-    git_out(root, &["cat-file", "-e", oid], &[])
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// `owner/repo` of an `origin` url on exactly `github.com`
+/// (`git@github.com:o/r`, `ssh://[user@]github.com/o/r`,
+/// `https://[user@]github.com/o/r`, with or without `.git`); `None`
+/// for any other host, including `github.com.evil.example` and
+/// `corp.test/github.com/o/r`. TODO(CAD-2178/#1645): that PR adds
+/// `github_slug` in `hosted.rs`; keep one copy once both land.
+pub(crate) fn github_slug(url: &str) -> Option<String> {
+    let url = url.trim();
+    let path = if let Some(rest) = url.strip_prefix("git@github.com:") {
+        rest
+    } else {
+        let (scheme, rest) = url.split_once("://")?;
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        let host = host.split_once(':').map_or(host, |(h, _)| h);
+        if !matches!(scheme, "https" | "ssh") || !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        path
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let (owner, repo) = (parts.next()?, parts.next()?);
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    };
+    (parts.next().is_none() && ok(owner) && ok(repo)).then(|| format!("{owner}/{repo}"))
 }

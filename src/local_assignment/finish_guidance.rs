@@ -95,13 +95,6 @@ fn observe<H: CoordHttp>(
         &["rev-parse", "--verify", &format!("{into}^{{commit}}")],
     )?;
     let evidence = merge_rule(&root, &branch, &tip, &into);
-    // `git cherry` ignores merge commits, which can contain unique resolution
-    // work even when every non-merge commit is patch-equivalent upstream.
-    if evidence == Some("cherry")
-        && !git(&root, &["rev-list", "--merges", &format!("{into}..{tip}")])?.is_empty()
-    {
-        return Ok(Some(LaneState::CleanUnverified));
-    }
     Ok(Some(if evidence.is_some() {
         LaneState::CleanMerged
     } else {
