@@ -1181,22 +1181,26 @@ def two_workflow_reviews(counted, hosted):
 REVIEW_WORKFLOWS = (("standards", "review-standards.yml"), ("spec-security", "review-spec.yml"))
 
 
-def hosted_routine_reasons(counted, hosted, repo, pr, head):
+def hosted_routine_reasons(verdicts, counted, hosted, repo, pr, head):
     """Why a hosted routine PR's reviews do not yet stand in for readiness (CAD-2135).
 
     A hosted board has no delivery record, so it cannot prove what native readiness
     proves. The two workflow reviews are the evidence this gate already trusts on
     other classes; an owner row does not stand in for them. The refusal names what to
-    dispatch for each review still missing."""
+    dispatch for a review not yet filed. The board keeps the first row per head, kind
+    and principal, so a filed review is not dispatched again: it takes a new head."""
     if two_workflow_reviews(counted, hosted):
         return []
-    have = {n["kind"] for n in counted if is_workflow_row(n)}
+    filed = {v["kind"] for v in verdicts if is_workflow_row(v)}
     commands = [f"gh workflow run {name} -R {shlex.quote(repo)} --ref main "
                 f"-f pr={shlex.quote(str(pr))} -f head_sha={shlex.quote(head)}"
-                for kind, name in REVIEW_WORKFLOWS if kind not in have]
+                for kind, name in REVIEW_WORKFLOWS if kind not in filed]
+    stuck = filed - {n["kind"] for n in counted if is_workflow_row(n)}
     return ["active routine delivery on a hosted org has no readiness record and needs "
             "a pass from both review workflows at this head"
-            + (": " + "; ".join(commands) if commands else "")]
+            + (": " + "; ".join(commands) if commands else "")
+            + (f"; the filed {', '.join(sorted(stuck))} review does not count and cannot be "
+               "filed again at this head, so it takes a new commit" if stuck else "")]
 
 
 ADVISORY_KINDS = ("standards", "spec-security", "browser-qa")
@@ -1792,7 +1796,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             if authority["readiness"] is None and origin == "hosted":
                 rs, counted = check_reviews(verdicts, False, need_qa, authors, issue, hosted)
                 reasons += rs
-                reasons += hosted_routine_reasons(counted, hosted, repo, pr, head)
+                reasons += hosted_routine_reasons(verdicts, counted, hosted, repo, pr, head)
             elif authority["readiness"] is None:
                 reasons.append("active routine delivery has no fresh native readiness proof for this exact binding")
             else:
@@ -1802,7 +1806,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             if need_qa:
                 reasons += check_reviews(verdicts, True, True, authors, issue, hosted)[0]
             # A workflow row that is not a pass refuses whatever the class, so it
-            # stays true when hosted readiness ships. Owner rows are unchanged here.
+            # stays true when hosted readiness ships. With readiness, owner rows are not
+            # read here; without it on hosted, check_reviews above reads them.
             reasons += [f"workflow verdict {v['name']} is not a pass (outcome '{v['outcome']}'): "
                         "a workflow review that is not a pass always refuses"
                         for v in verdicts if is_workflow_row(v) and v["outcome"] != "pass"]

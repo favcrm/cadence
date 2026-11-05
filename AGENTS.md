@@ -141,7 +141,8 @@ the code you just wrote.
   that gate, security, schema and release PRs keep fresh-session Opus reviews and
   the workflow rows are a cheap first pass; on other PRs two workflow rows
   satisfy the requirement. A hosted `routine` PR has no readiness record, so it
-  takes those two workflow rows and the operator approval they carry (CAD-2135).
+  takes those two workflow rows and the operator approval they carry under the
+  auto-paths rule below (CAD-2135).
   On hosted today `ui/**` PRs still need
   the temporary exception (`--exception --advisory standards=<url> --advisory
   spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends

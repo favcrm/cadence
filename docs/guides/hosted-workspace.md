@@ -627,7 +627,9 @@ and the repository's path lists (`docs/roles/risk-paths.toml` and
 `docs/roles/one-review-paths.toml`), which are read at the PR's base commit so a PR
 cannot weaken its own rules. The merge gate can add an operator approval: when a
 head-pinned verdict's Risk is not `auto`, and under the workflow auto-paths rule
-(AGENTS.md "Review").
+(AGENTS.md "Review"). On a hosted org, an active `routine` class reports zero
+reviews and no approval here, but the merge gate also requires a pass from both
+review workflows, and those rows carry the auto-paths rule.
 
 The review standard (operator decision 2026-11-03) is a
 fresh-session review: a session that is not the author and inherits no

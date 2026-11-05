@@ -88,8 +88,8 @@ for send, publish, spend or deploy. It never stands in for a review pass and nev
 attested principal and, since CAD-2049, refuses the author's principal; local
 notes count by their self-declared `From:` alias, which is not attested. It
 cannot tell a fresh session from the author under one login. A hosted `routine` PR
-takes two workflow reviews and operator approval, because a hosted board has no
-readiness record (CAD-2135). Until the gate can tell, a hosted
+takes two workflow reviews, and operator approval while `workflow-auto-paths.toml`
+does not list its paths, because a hosted board has no readiness record (CAD-2135). Until the gate can tell, a hosted
 `ui/**` PR merges with the temporary exception (`--exception --advisory ...`: exact-head
 operator approval and two advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change; ends at

@@ -924,7 +924,7 @@ mod cad2081_workflow_verdicts {
                 "repo": REPO, "pr": 7, "title": "CAD-1: add the thing", "head": head,
                 "base": case.base_ref, "base_oid": self.base, "tip": self.tip, "author": "authorlogin",
                 "files_by_ref": by_ref, "verdicts": case.rows, "class": case.class, "approved": case.approved,
-            "no_readiness": case.no_readiness,
+                "no_readiness": case.no_readiness,
                 "tip_fails": case.tip_fails, "tip_sha": case.tip_sha,
                 "identities": if case.no_identity_map { Value::Null } else {
                     case.identities.clone().unwrap_or_else(Self::identities) },
@@ -1994,6 +1994,7 @@ mod cad2081_workflow_verdicts {
         unapproved.approved = false;
         let (code, stdout, stderr) = f.gate(&unapproved);
         assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stderr.contains("approval"), "{stderr}");
 
         // No reviews: the refusal names both dispatches, exactly.
         refused_all(
@@ -2022,11 +2023,15 @@ mod cad2081_workflow_verdicts {
         let mut revise = f.std();
         revise["outcome"] = json!("revise");
         revise["section_outcome"] = json!("revise");
-        refused(
-            &f,
-            routine(vec![revise, f.spec()]),
-            "a workflow review that is not a pass always refuses",
+        let (code, stdout, stderr) = f.gate(&routine(vec![revise, f.spec()]));
+        assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stderr.contains("a workflow review that is not a pass always refuses"),
+            "{stderr}"
         );
+        // It takes a new head: the board would not file that review again here.
+        assert!(!stderr.contains("gh workflow run"), "{stderr}");
+        assert!(stderr.contains("takes a new commit"), "{stderr}");
 
         // Owner rows do not stand in for the workflow reviews.
         let owner = |name: &str, stamp: &str, id: &str, login: &str, kind: &str| {
