@@ -531,7 +531,7 @@ pub(crate) fn inspect_rest(
     }
     // Survivability: the branch's work must survive somewhere — merged
     // into the repo's default branch or pushed.
-    if let (_, _, Some(b)) = survivability(ev, t) {
+    if let (_, _, Some(b)) = survivability(ev, &t.root, &t.branch) {
         blocks.push(b);
     }
     // Meta-failures last: a named owner, message, pid, dirty path or

@@ -12,7 +12,8 @@
 //! - a `branch`/worktree ref whose branch a merged GitHub PR covered
 //!   (`gh pr list --head`), head-commit checked like `pr_merged`
 //! - a branch tip `merge_rule` proves landed on the default branch
-//!   (ancestry | cherry | patch — the no-PR paths `finish` trusts)
+//!   (ancestry | pr, or a cherry/patch content guess — which closes the
+//!   issue only; `finish` never deletes on a guess, CAD-2181)
 //!
 //! A close additionally requires: no OPEN PR on any of the issue's
 //! branches or pr refs (a post-merge revision in flight means the
@@ -358,7 +359,7 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
             saw_not_started = true;
         } else if let (Some(t), Some(into)) = (&tip, &into) {
             // Local merge evidence — ancestry | cherry | patch | pr.
-            if let Some(how) = finish::merge_rule(root, branch, t, into) {
+            if let Some(how) = finish::merged_claim(root, branch, t, into) {
                 row["local"] = json!(how);
                 merged.get_or_insert((how, branch.clone(), None, None));
             } else {
