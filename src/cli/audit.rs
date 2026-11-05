@@ -78,6 +78,32 @@ pub(crate) enum AuditAction {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Hosted only (CAD-2201): the findings text a workflow review filed for
+    /// exactly this full `--head`. Owner-only: the stored body is returned to
+    /// the live human owner and to nobody else, because it is the operator's
+    /// to read before accepting a `revise`. The gate's own verdict read keeps
+    /// returning no body.
+    Findings {
+        /// PR number.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head SHA the findings are pinned to.
+        #[arg(long)]
+        head: String,
+        /// The ticket whose review is read.
+        #[arg(long)]
+        issue: String,
+        /// The issue's project. Never inferred from the repo or the cwd.
+        #[arg(long)]
+        project: String,
+        /// One kind only (`standards`, `spec-security`, `combined`,
+        /// `browser-qa`); omitted means every row at this head.
+        #[arg(long)]
+        kind: Option<String>,
+        /// `owner/name` (default: the cwd checkout's github.com origin).
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Read-only (CAD-1106): the ticket scope pre-approvals recorded for
     /// `--issue` (id, body digest, how recorded, revoked or not). Prints one
     /// JSON object; exits 0 when the store answered. Never records.

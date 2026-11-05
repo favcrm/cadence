@@ -1528,6 +1528,58 @@ pub(crate) fn approve_answer(body: &Value, binding: &GateBinding, source: &str) 
     })
 }
 
+/// `cadence audit findings` (CAD-2201) for a hosted org: the text a workflow
+/// review filed at exactly this head. Owner-only on the tenant; this side
+/// only refuses an answer that names another binding or carries a body the
+/// terminal must not print verbatim.
+pub fn findings(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    binding: &GateBinding,
+    kind: Option<&str>,
+) -> Result<Value> {
+    let mut call_args = binding.arguments();
+    if let Some(kind) = kind {
+        call_args.insert("kind".into(), json!(kind));
+    }
+    let body = call(target, wake_timeout, "audit_findings_project", call_args)?;
+    findings_answer(&body, binding)
+}
+
+pub(crate) fn findings_answer(body: &Value, binding: &GateBinding) -> Result<Value> {
+    let verb = "audit_findings_project";
+    check_receipt(verb, || {
+        if body["state"].as_str() != Some("ok") {
+            return Err(refuse(format!(
+                "`{verb}` did not answer with findings: {}",
+                short(body)
+            )));
+        }
+        binding.echoes(body, verb, true)?;
+        let rows = body["findings"]
+            .as_array()
+            .ok_or_else(|| refuse(format!("`{verb}` answer has no findings list")))?;
+        for row in rows {
+            for key in ["kind", "name", "outcome", "body"] {
+                row_text(row, key, verb)?;
+            }
+            // The stored body is already sanitised where it was filed; refuse
+            // one that would still drive the terminal rather than print it.
+            let body_text = row["body"].as_str().unwrap_or_default();
+            if body_text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+            {
+                return Err(refuse(format!(
+                    "`{verb}` row {} carries control characters",
+                    row["name"].as_str().unwrap_or("?")
+                )));
+            }
+        }
+        Ok(body.clone())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1593,6 +1645,39 @@ mod tests {
         foreign["project"] = json!("other");
         let err = approval_answer(&foreign, &binding()).unwrap_err();
         assert!(err.to_string().contains("other"), "{err}");
+    }
+
+    #[test]
+    fn findings_must_name_this_binding_and_carry_a_printable_body() {
+        let body = json!({"state": "ok", "project": "cadence", "issue": "CAD-1",
+                          "repo": "favcrm/cadence", "pr": 7, "head": HEAD,
+                          "findings": [{"kind": "standards", "name": "20261105-150317-standards-verdict.md",
+                                        "outcome": "revise", "reviewer": "svc_review_standards",
+                                        "recorded_at": "2026-11-05T15:03:17Z",
+                                        "body": "Workflow review (standards) - scope: FAIL - note [src/x.rs:1]"}]});
+        let doc = findings_answer(&body, &binding()).unwrap();
+        assert_eq!(doc["findings"][0]["kind"], "standards");
+        assert_eq!(doc["findings"][0]["outcome"], "revise");
+
+        // Another head, project or issue is another call's answer.
+        for (key, value) in [
+            ("head", json!(OTHER)),
+            ("project", json!("other")),
+            ("issue", json!("CAD-2")),
+            ("pr", json!(8)),
+        ] {
+            let mut bad = body.clone();
+            bad[key] = value;
+            assert!(findings_answer(&bad, &binding()).is_err(), "{key}");
+        }
+        // A body must not drive the terminal it is printed on.
+        let mut escape = body.clone();
+        escape["findings"][0]["body"] = json!("ok\u{1b}[2J");
+        assert!(findings_answer(&escape, &binding()).is_err());
+        // A missing body is not an empty finding.
+        let mut empty = body.clone();
+        empty["findings"][0]["body"] = json!("  ");
+        assert!(findings_answer(&empty, &binding()).is_err());
     }
 
     #[test]

@@ -206,6 +206,9 @@ pub const REMOTE_VERBS: &[&str] = &[
     // the gate or the operator, and a tenant that predates these names is
     // refused with the release order named — never a silent fallback.
     "audit_approval_project",
+    // CAD-2201: the owner-only findings read. A read scope is enough to ask;
+    // the tenant admits only the live human owner.
+    "audit_findings_project",
     "audit_verdicts_project",
     "audit_verdict_project",
     "audit_approve_project",
@@ -228,6 +231,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_reviewers"
         | "audit_scope"
         | "audit_approval_project"
+        | "audit_findings_project"
         | "audit_verdicts_project"
         | "audit_reviewers_project"
         | "audit_identities"
