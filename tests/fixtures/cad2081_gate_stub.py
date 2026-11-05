@@ -86,7 +86,7 @@ def cadence():
                      + "\nOutcome report: CAD-1/reports/x\nNative CI run: 101 " + RUN_URL + "\n")
         if S.get("class") == "consequential":
             body += "Delivery class: consequential\nPolicy digest: sha256:" + "0" * 64 + "\n"
-        for comment_id in S.get("qa_comments") or {}:
+        for comment_id in () if S.get("no_qa_evidence") else (S.get("qa_comments") or {}):
             body += (f"Browser QA comment: https://github.com/{S['repo']}/pull/{S['pr']}"
                      f"#issuecomment-{comment_id}\n")
         out({"id": "CAD-1", "project": "cadence", "owner": None, "claim": None,
@@ -111,6 +111,8 @@ def cadence():
                    "review_kind": "standards_and_spec", "security_capable": False,
                    "operator_approval": False, "browser_qa": False, "full_checks": True}
         req.update({"policy_digest": digest, "reasons": []})
+        if S.get("board_asks_qa"):
+            req["browser_qa"] = True
         readiness = None
         if kind == "routine" and not S.get("no_readiness"):
             readiness = {"repo": S["repo"].lower(), "pr": S["pr"], "head": S["head"],
@@ -138,7 +140,8 @@ def cadence():
             fail("the workspace identity map is not readable by this caller")
         out({"identities": S["identities"]})
     if ARGS[:2] == ["audit", "approval"]:
-        if S.get("approved"):
+        # A set `approved_head` is the one head the operator approved.
+        if S.get("approved") and S.get("approved_head") in (None, ARGS[ARGS.index("--head") + 1]):
             out({"state": "in-force", "approval_id": "ap-1", "recorded_via": "operator-connection",
                  "source": "operator", "action": "merge"})
         print(json.dumps({"state": "missing", "reason": "no approval recorded"}))
