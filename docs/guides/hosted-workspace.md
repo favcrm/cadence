@@ -598,6 +598,9 @@ head, even when the issue has no pull-request reference. These records do not
 verify the current head, approval requirements, revocation or delivery.
 Acceptance counts are shown as unavailable when the board cannot count them;
 they are not treated as zero.
+Artifact review summaries are unavailable when review details are malformed
+or a claimed pass has no valid recorded pass; other readable review rows remain
+visible. These summaries do not determine a project's review requirements.
 
 A `--state result` report ends the assignment but moves nothing else. Once
 the work meets the project's acceptance and completion rules, use the
