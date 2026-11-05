@@ -12,7 +12,8 @@
 
 export type StagedStatus = "pending" | "approved" | "denied";
 /** What the owner sees: a failed apply is `approved` with `result.ok === false`. */
-export type StagedOutcome = "pending" | "applied" | "failed" | "denied";
+/** `unconfirmed`: approved, but the row carries no `result.ok === true` to say it applied. */
+export type StagedOutcome = "pending" | "applied" | "failed" | "denied" | "unconfirmed";
 
 export interface StagedChange {
   field: string;
@@ -261,17 +262,26 @@ export function parseStagedList(body: unknown): StagedWrite[] | null {
 export function outcomeOf(write: StagedWrite): StagedOutcome {
   if (write.status === "pending") return "pending";
   if (write.status === "denied") return "denied";
-  return write.result?.ok === false ? "failed" : "applied";
+  if (write.result?.ok === false) return "failed";
+  // Success is only ever what the row says: ok === true (or the ticket a create made).
+  if (write.result?.ok === true || (write.kind === "create_issue" && write.result?.ticket)) return "applied";
+  return "unconfirmed";
 }
 
 /** Plain reasons for the closed set of apply codes; anything else says so. */
 const REASONS: Readonly<Record<string, string>> = {
   record_not_found: "the record no longer exists",
   revision_conflict: "the record changed after it was staged",
-  conflict: "the record changed after it was staged",
-  forbidden: "the app's connection lacks permission",
+  record_exists: "a record with that id already exists",
+  record_too_large: "the record would be too large",
   validation_failed: "the app rejected a value",
+  invalid: "the app rejected the request",
+  owner_required: "only the workspace owner can run this",
+  screen_access_denied: "the app's connection lacks permission",
+  operation_not_declared: "the app does not offer this operation",
   app_unavailable: "the app could not be reached",
+  storage_unavailable: "the record store could not be reached",
+  refused: "the app refused it",
 };
 
 export function failureReason(write: StagedWrite): string {

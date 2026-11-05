@@ -737,6 +737,7 @@ export default function Home({
   overview,
   onOpenIssue,
   onOpenDecision,
+  decisions = false,
   overviewHref,
   permissionsHref,
   resolveAppPath,
@@ -766,6 +767,8 @@ export default function Home({
   onOpenIssue: (id: string) => void;
   /** Open a reading item in the shared work-item detail (App owns the mount). */
   onOpenDecision: (open: HomeDecisionOpen) => void;
+  /** Read the owner's staged decisions (App's predicate: signed in, hosted, not a member). */
+  decisions?: boolean;
   overviewHref: string;
   /** Settings → Master permissions (the standing "Always" rules). */
   permissionsHref: string;
@@ -803,6 +806,7 @@ export default function Home({
       overview={overview}
       onOpenIssue={onOpenIssue}
       onOpenDecision={onOpenDecision}
+      decisions={decisions}
       overviewHref={overviewHref}
       permissionsHref={permissionsHref}
       resolveAppPath={resolveAppPath}
@@ -820,6 +824,7 @@ function MasterHome({
   overview,
   onOpenIssue,
   onOpenDecision,
+  decisions = false,
   overviewHref,
   permissionsHref,
   resolveAppPath,
@@ -832,6 +837,8 @@ function MasterHome({
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
   onOpenDecision: (open: HomeDecisionOpen) => void;
+  /** Read the owner's staged decisions (App's predicate: signed in, hosted, not a member). */
+  decisions?: boolean;
   overviewHref: string;
   permissionsHref: string;
   resolveAppPath: (installId: string) => string | null;
@@ -1458,7 +1465,7 @@ function MasterHome({
           permissionsHref={permissionsHref}
           onAsk={onAsk}
           onOpenDecision={onOpenDecision}
-          decisions={hosted === true}
+          decisions={decisions}
           onAskAgent={(agent, update) => setSeed((s) => ({
             text: `Check in with ${agent.alias}${agentOn(agent).length ? ` on ${agentOn(agent).join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,
             refs: [], n: s.n + 1,

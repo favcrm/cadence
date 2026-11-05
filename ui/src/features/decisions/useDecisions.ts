@@ -85,6 +85,8 @@ let generation = 0;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let holders = 0;
 let stopMaster: (() => void) | null = null;
+let stopPoll: (() => void) | null = null;
+const POLL_MS = 30_000;
 
 const UNAVAILABLE_STATUSES = new Set([401, 403, 404, 501]);
 
@@ -136,6 +138,22 @@ function acquire() {
   stopMaster = subscribeMasterChanged(() => {
     if (state.phase === "ready") void reloadDecisions();
   });
+  // Hosted boards have no stream that names a new staged write, so the list
+  // is also re-read on a timer, on focus and when the tab becomes visible.
+  // A failed re-read keeps the known list (see `reloadDecisions`).
+  const again = () => {
+    if (document.visibilityState === "hidden") return;
+    if (state.phase === "unavailable") return;
+    void reloadDecisions();
+  };
+  const timer = setInterval(again, POLL_MS);
+  addEventListener("focus", again);
+  document.addEventListener("visibilitychange", again);
+  stopPoll = () => {
+    clearInterval(timer);
+    removeEventListener("focus", again);
+    document.removeEventListener("visibilitychange", again);
+  };
 }
 
 function release() {
@@ -145,6 +163,8 @@ function release() {
   generation += 1;
   stopMaster?.();
   stopMaster = null;
+  stopPoll?.();
+  stopPoll = null;
   if (retryTimer !== null) clearTimeout(retryTimer);
   retryTimer = null;
   // Not holding the list means not trusting it: the next holder reads afresh.
@@ -267,6 +287,18 @@ export function resetDecisions() {
 }
 
 onPrivateSessionReset(resetDecisions);
+
+/**
+ * Whether this viewer is asked for owner decisions at all: signed in, on a
+ * hosted board, and not a member. One predicate for the badge and the rail.
+ */
+export function ownerDecisionsOn(meta: {
+  signed_in?: boolean | null;
+  hosted?: boolean | null;
+  session?: { origin?: string; user?: { role?: string } | null } | null;
+} | null | undefined): boolean {
+  return meta?.signed_in === true && (meta.hosted === true || meta.session?.origin === "public") && meta.session?.user?.role !== "member";
+}
 
 /**
  * The shared decisions. With `enabled` false the caller holds nothing and

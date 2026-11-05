@@ -106,9 +106,13 @@ async function settle(check: () => void) {
   await flush();
   check();
 }
-async function click(element: Element | undefined | null) {
+const sleep = (ms: number) => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, ms)); });
+/** `detail` is the click count; a deciding click waits out the arming delay unless `quick`. */
+async function click(element: Element | undefined | null, opts: { detail?: number; quick?: boolean } = {}) {
   assert(element, "click target exists");
-  await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  const label = element.textContent?.trim();
+  if (!opts.quick && element.closest('[data-drawer="staged"]') && (label === "Approve" || label === "Deny")) await sleep(450);
+  await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: opts.detail ?? 1 } as any)); });
   await flush();
 }
 const buttons = (scope: ParentNode) => Array.from(scope.querySelectorAll("button")) as HTMLButtonElement[];
@@ -432,6 +436,149 @@ listStatus = 200;
   await React.act(async () => { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
   await settle(() => assert(!drawerEl(), "Escape closes"));
   await r.done();
+}
+
+// ---- 10. new rows appear without a reload; a failed re-read keeps the list ----
+{
+  actions = [customer("a1")];
+  const v = await render();
+  await settle(() => assert(v.cards().length === 1 && v.badge() === "1", "one waiting"));
+  actions = [...actions, customer("a2", { title: "Update Harbour Tea" })];
+  await React.act(async () => { win.dispatchEvent(new win.Event("focus")); });
+  await settle(() => assert(v.cards().length === 2 && v.badge() === "2", "a row added on the server appears on focus, count and badge too"));
+  actions = [...actions, customer("a3", { title: "Update Third" })];
+  await React.act(async () => { win.document.dispatchEvent(new win.Event("visibilitychange")); });
+  await settle(() => assert(v.cards().length === 3 && v.badge() === "3", "and on visibility"));
+  listStatus = 500;
+  await React.act(async () => { win.dispatchEvent(new win.Event("focus")); });
+  await flush(); await flush();
+  assert(v.cards().length === 3 && v.badge() === "3" && !/Nothing needs you/.test(text(v.host)), "a failed re-read keeps the known list");
+  listStatus = 200;
+  await v.done();
+
+  // A first read that fails is not "nothing".
+  listStatus = 500;
+  actions = [];
+  const w = await render();
+  await flush(); await flush();
+  assert(!/Nothing needs you/.test(text(w.host)) && /Reading what needs you/.test(text(w.host)), "an unread list is not Nothing needs you");
+  listStatus = 200;
+  await w.done();
+}
+
+// ---- 11. a double-click cannot approve the next row; a refresh cannot retarget Approve ----
+{
+  actions = [customer("a1"), customer("a2", { title: "Update Harbour Tea" })];
+  onDecide = (id) => {
+    actions = actions.map((a: any) => a.id === id ? { ...a, status: "approved", decidedAt: Date.now(), result: { ok: true } } : a);
+  };
+  const v = await render();
+  await settle(() => assert(v.cards().length === 2, "two cards"));
+  await click(labelled(v.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  const approve = labelled(drawerEl()!, "Approve")!;
+  await sleep(450);
+  // The exact probe: the first click decides a1 and the list is re-read before the second lands.
+  await click(approve, { quick: true, detail: 1 });
+  await settle(() => assert(text(drawerEl()!.querySelector(".crm-drawer-title")) === "Update Harbour Tea", "advanced"));
+  await click(labelled(drawerEl()!, "Approve"), { quick: true, detail: 2 });
+  await click(labelled(drawerEl()!, "Approve"), { quick: true, detail: 1 });
+  assert(sent() === 1 && posts[0].path.endsWith("/a1/approve"), `the second click did not approve a2 (${posts.map((p) => p.path).join(",")})`);
+  onDecide = null;
+  await v.done();
+
+  // A refresh while open that puts a new row first cannot change what Approve acts on.
+  actions = [customer("a1"), customer("a2", { title: "Update Harbour Tea" })];
+  const w = await render();
+  await settle(() => assert(w.cards().length === 2, "two cards"));
+  await click(labelled(w.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  actions = [customer("a0", { title: "Newest", createdAt: Date.now() - 10 * AGO }), ...actions];
+  await React.act(async () => { win.dispatchEvent(new win.Event("focus")); });
+  await settle(() => assert(w.cards().length === 3, "the refresh arrived"));
+  assert(text(drawerEl()!.querySelector(".crm-drawer-title")) === "Update Marlow Books", "the drawer still shows a1");
+  await click(labelled(drawerEl()!, "Approve"));
+  assert(sent() === 1 && posts[0].path.endsWith("/a1/approve"), "Approve acts on the displayed row");
+  await w.done();
+}
+
+// ---- 12. approved without a result is not success ----
+{
+  const row = customer("a1", { status: "approved", decidedAt: Date.now(), result: null });
+  assert(parseStagedRow(row) !== null, "it parses");
+  actions = [row, customer("a2", { status: "approved", decidedAt: Date.now(), result: { ok: true } })];
+  const v = await render();
+  await settle(() => assert(listCalls > 0, "read"));
+  await click(labelled(v.host, "Updates"));
+  const lines = Array.from(v.host.querySelectorAll("[data-todo-decisions] li")).map((l) => text(l));
+  assert(lines.length === 2 && lines.filter((l) => l.includes("Applied")).length === 1 && lines.some((l) => l.includes("Result not confirmed")), `only ok === true reads Applied (${lines.join("|")})`);
+  await v.done();
+  actions = [customer("a1")];
+  onDecide = (id) => { actions = actions.map((a: any) => a.id === id ? { ...a, status: "approved", decidedAt: Date.now() } : a); };
+  const w = await render();
+  await settle(() => assert(w.cards().length === 1, "one"));
+  await click(labelled(w.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  await click(labelled(drawerEl()!, "Approve"));
+  await settle(() => assert(!drawerEl(), "closed"));
+  assert(/could not be confirmed/.test(text(w.host)) && !/Applied/.test(text(w.host.querySelector(".todo-note"))), "the rail does not claim it applied");
+  onDecide = null;
+  await w.done();
+}
+
+// ---- 13. narrow: focus is not left on the button behind the scrim ----
+{
+  actions = [customer("a1")];
+  const v = await render();
+  await settle(() => assert(v.cards().length === 1, "one card"));
+  const needBtn = v.host.querySelector(".needbtn") as HTMLElement;
+  await click(needBtn);
+  const slide = v.host.querySelector(".needsdrawer") as HTMLElement;
+  assert(slide, "the slide-over opens");
+  await click(labelled(slide.querySelector('[data-need="staged_write"]')!, "Review"));
+  await settle(() => assert(drawerEl(), "the detail opens"));
+  await tick();
+  assert(document.activeElement !== needBtn, "focus is not put on the button behind the scrim");
+  await click(labelled(drawerEl()!, "Not now"));
+  await settle(() => assert(!drawerEl(), "closed"));
+  await tick(); await tick();
+  assert(document.activeElement === needBtn, "narrow: focus returns to the visible floating button");
+  await v.done();
+  win.innerWidth = 1400;
+  actions = [customer("a1")];
+  const w = await render();
+  await settle(() => assert(w.cards().length === 1, "one"));
+  await click(labelled(w.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  await click(labelled(drawerEl()!, "Not now"));
+  await settle(() => assert(!drawerEl(), "closed"));
+  await tick(); await tick();
+  assert(document.activeElement?.closest(".needsrail") !== null && document.activeElement !== w.host.querySelector(".needbtn"), "wide: focus returns into the rail column");
+  win.innerWidth = 1024;
+  await w.done();
+}
+
+// ---- 14. members are never asked; the note names who asked; a removed kind degrades plainly ----
+{
+  const { ownerDecisionsOn } = require("../src/features/decisions/useDecisions") as typeof import("../src/features/decisions/useDecisions");
+  const owner = { signed_in: true, hosted: true, session: { user: { role: "owner" } } };
+  assert(ownerDecisionsOn(owner), "an owner on a hosted board is asked");
+  assert(!ownerDecisionsOn({ ...owner, session: { user: { role: "member" } } }), "a member is not");
+  assert(!ownerDecisionsOn({ ...owner, signed_in: false }) && !ownerDecisionsOn({ ...owner, hosted: false }) && !ownerDecisionsOn(null), "nor an unsigned or unhosted viewer");
+  const m = await render({ decisions: ownerDecisionsOn({ ...owner, session: { user: { role: "member" } } }) });
+  assert(listCalls === 0 && m.cards().length === 0 && m.badge() === "0", "a member makes no query; badge and rail agree");
+  await m.done();
+
+  actions = [customer("a1", { origin: { via: "cli", kind: "person", label: "Priya Nair" } })];
+  const v = await render();
+  await settle(() => assert(v.cards().length === 1, "one"));
+  await click(labelled(v.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  assert(text(drawerEl()).includes("Priya Nair's note · not verified") && !text(drawerEl()).includes("The assistant's note"), "the note is labelled by who asked");
+  await v.done();
+
+  const odd = parseStagedRow(customer("z", { changes: [{ field: "notes", label: "Notes", kind: "removed", before: "x" }] }));
+  assert(odd !== null && odd.changes[0].kind === "removed", "a removed kind is tolerated");
 }
 
 console.log("staged decision checks passed");

@@ -25,24 +25,8 @@ function Data({ v, t }: { v: string | null | undefined; t: Say }) {
 }
 
 function ChangeRow({ change, update, t }: { change: StagedChange; update: boolean; t: Say }) {
-  if (change.kind === "removed") {
-    return (
-      <div className="dx-row">
-        <dt>{t("Removed")}</dt>
-        <dd>
-          <span className="dx-v">{change.label}</span>
-          {change.before !== undefined && change.before !== null && change.before !== "" && (
-            <>
-              {" "}
-              <span className="dx-was">({change.before})</span>
-            </>
-          )}
-        </dd>
-      </div>
-    );
-  }
   // A create has nothing to compare with: its fields are just the values.
-  const compared = change.kind === "changed" || update;
+  const compared = change.kind !== "added" || update;
   return (
     <div className="dx-row">
       <dt>{change.label}</dt>
@@ -59,9 +43,7 @@ function ChangeRow({ change, update, t }: { change: StagedChange; update: boolea
             <span aria-hidden="true">→</span>{" "}
           </>
         )}
-        <span className="dx-now">
-          <Data v={change.after} t={t} />
-        </span>
+        <span className="dx-now">{change.after === undefined ? "—" : <Data v={change.after} t={t} />}</span>
       </dd>
     </div>
   );
@@ -77,6 +59,8 @@ export function noticeText(n: DecisionNotice, t: Say): string {
       return t("{title} was approved but did not apply: {reason}. See Updates.")
         .replace("{title}", n.title)
         .replace("{reason}", t(n.reason ?? "the reason is not recognised"));
+    case "unconfirmed":
+      return t("{title}: the result could not be confirmed. See Updates.").replace("{title}", n.title);
     case "still-waiting":
       return t("It is still waiting. Nothing was recorded, so you can decide again.");
     default:
@@ -91,12 +75,12 @@ function Body({ write, notice, state, t }: { write: StagedWrite; notice: Decisio
   // No comparison was made when the summary is incomplete: `added` then means "value sent".
   const update = write.target !== null && write.changesComplete;
   const heading = update ? t("Changes compared with the current record") : write.target !== null ? t("Values sent") : t("Fields");
-  const name = write.origin?.kind === "agent" ? write.origin.label : t("The assistant");
+  const name = write.origin?.label ?? t("The assistant");
   const unchanged = write.unchangedCount;
   return (
     <div className="wi-panel dx-panel">
       {notice && (
-        <p className="issue-peek-note ok m-0" role="status">
+        <p className={`issue-peek-note ${notice.outcome === "applied" || notice.outcome === "denied" ? "ok" : "warn"} m-0`} role="status">
           {noticeText(notice, t)}
         </p>
       )}
@@ -155,6 +139,9 @@ function Body({ write, notice, state, t }: { write: StagedWrite; notice: Decisio
     </div>
   );
 }
+
+/** How long a newly shown item ignores Approve and Deny. */
+const ARM_MS = 400;
 
 const TABBABLE = 'button:not([disabled]), a[href], pre[tabindex="0"], [tabindex]:not([tabindex="-1"])';
 
@@ -258,9 +245,18 @@ export default function StagedWriteDetail({
     if (result === "decided") advance();
     else mine.current = null;
   };
-  const act = (verb: Verb) => {
+  // A new item is not armed at once: a second click of a double-click that
+  // decided the previous item must not land on this one.
+  const armedAt = useRef(0);
+  useEffect(() => {
+    armedAt.current = Date.now() + ARM_MS;
+  }, [id]);
+  const act = (verb: Verb, forId: string, clicks: number) => {
+    if (clicks > 1 || Date.now() < armedAt.current) return;
+    // The click is for the row that was on screen when the handler was made.
+    if (forId !== idRef.current) return;
     if (block !== null || !pending || busy !== undefined || lost || uncertain) return;
-    void run(() => decide(idRef.current, verb));
+    void run(() => decide(forId, verb));
   };
   const check = () => {
     if (busy !== undefined) return;
@@ -374,7 +370,7 @@ export default function StagedWriteDetail({
                   aria-disabled={off || undefined}
                   aria-busy={spin("approve") || undefined}
                   title={block !== null ? t(READ_ONLY_COPY) : undefined}
-                  onClick={() => act("approve")}
+                  onClick={(e) => act("approve", write.id, e.detail)}
                 >
                   {spin("approve") ? (
                     <>
@@ -391,7 +387,7 @@ export default function StagedWriteDetail({
                   aria-disabled={off || undefined}
                   aria-busy={spin("deny") || undefined}
                   title={block !== null ? t(READ_ONLY_COPY) : undefined}
-                  onClick={() => act("deny")}
+                  onClick={(e) => act("deny", write.id, e.detail)}
                 >
                   {spin("deny") ? (
                     <>

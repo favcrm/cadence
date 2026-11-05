@@ -1952,4 +1952,13 @@ Object.assign(zhTW, {
   "the reason is not recognised": "原因無法辨識",
   "person": "人員",
   "Values sent": "已傳送的值",
+  "{title}: the result could not be confirmed. See Updates.": "{title}：無法確認結果。請見「更新」。",
+  "Result not confirmed": "結果未能確認",
+  "a record with that id already exists": "已有相同編號的記錄",
+  "the record would be too large": "記錄會過大",
+  "the app rejected the request": "應用程式拒絕了該請求",
+  "only the workspace owner can run this": "只有工作區擁有者可執行此操作",
+  "the app does not offer this operation": "該應用程式未提供此操作",
+  "the record store could not be reached": "無法連接記錄儲存庫",
+  "the app refused it": "應用程式拒絕了此操作",
 });

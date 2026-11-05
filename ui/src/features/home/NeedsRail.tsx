@@ -78,6 +78,7 @@ export default function NeedsRail({
   const needBtn = useRef<HTMLButtonElement | null>(null);
   const drawerEl = useRef<HTMLElement | null>(null);
   const wasOpen = useRef(false);
+  const reviewOpening = useRef(false);
   // The <1100px drawer is a dialog: it lands focus on itself, Escape
   // closes it, and closing hands focus back to the button that opened
   // it. An Ask hand-off is unaffected — the composer's own focus lands
@@ -92,7 +93,10 @@ export default function NeedsRail({
     return () => removeEventListener("keydown", onKey);
   }, [drawer]);
   useEffect(() => {
-    if (!drawer && wasOpen.current) needBtn.current?.focus();
+    // Opening a review closes the slide-over on purpose: the button behind
+    // the scrim is not where focus belongs then.
+    if (!drawer && wasOpen.current && !reviewOpening.current) needBtn.current?.focus();
+    reviewOpening.current = false;
     wasOpen.current = drawer;
   }, [drawer]);
   // An issue opened from the slide-over leaves Home — drop the drawer so
@@ -119,7 +123,10 @@ export default function NeedsRail({
       const back =
         opener instanceof HTMLElement && opener !== document.body && opener.isConnected && !opener.closest("[data-drawer]")
           ? opener
-          : (document.querySelector<HTMLElement>(".needsrail .todo-tabs > button") ?? needBtn.current);
+          : // Only the rail that is on screen: the column at >= 1100px, else the floating button.
+            window.innerWidth >= 1100
+            ? document.querySelector<HTMLElement>(".needsrail .todo-tabs > button")
+            : needBtn.current;
       back?.focus({ preventScroll: true });
     }, 20);
   };
@@ -156,6 +163,7 @@ export default function NeedsRail({
       const queue = cards.flatMap((n) => (n.action.type === "staged" ? [n.action.id] : []));
       stagedOpener.current = document.activeElement;
       clearNotice();
+      reviewOpening.current = true;
       setDrawer(false);
       setReview({ queue, at: Math.max(queue.indexOf(stagedCard.action.type === "staged" ? stagedCard.action.id : ""), 0) });
       return;
@@ -183,7 +191,11 @@ export default function NeedsRail({
       {!overview.data && overview.status !== "failed" && (
         <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
       )}
-      {overview.data && cards.length === 0 && (
+      {/* Not read yet is not "nothing": a failed first read of the decisions says nothing. */}
+      {overview.data && cards.length === 0 && decisionsOn && (staged.phase === "idle" || staged.phase === "loading") && (
+        <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
+      )}
+      {overview.data && cards.length === 0 && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading")) && (
         <p className="px-3 py-3 text-label text-ink-400">{t("Nothing needs you. The team is working.")}</p>
       )}
       <ul className="todo-list">
@@ -412,7 +424,9 @@ function DecidedLine({ write }: { write: StagedWrite }) {
     );
   }
   const label =
-    outcome === "denied"
+    outcome === "unconfirmed"
+      ? t("Result not confirmed")
+      : outcome === "denied"
       ? t("Denied")
       : write.kind === "create_issue" && write.result?.ticket
         ? `${t("Created")} ${write.result.ticket}`

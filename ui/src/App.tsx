@@ -51,7 +51,7 @@ import Outbox from "./features/outbox/Outbox";
 import ThreadsPage from "./features/threads/ThreadsPage";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
-import { useDecisions } from "./features/decisions/useDecisions";
+import { ownerDecisionsOn, useDecisions } from "./features/decisions/useDecisions";
 import MyWork from "./features/home/MyWork";
 import { useHomeCount } from "./features/home/todoLocal";
 import Context from "./features/projects/Context";
@@ -252,9 +252,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // CAD-2186: the owner's staged decisions count here too. Only a signed-in
   // viewer of a hosted board who is not a member is asked; every other board
   // is never queried.
-  const decisions = useDecisions(
-    meta?.signed_in === true && (meta.hosted === true || meta.session?.origin === "public") && meta.session?.user?.role !== "member",
-  );
+  const decisionsOn = ownerDecisionsOn(meta);
+  const decisions = useDecisions(decisionsOn);
   const homeCount = useHomeCount(overviewState.data?.needs_me, decisions.pending.length);
   const issues = issuesState.data ?? [];
   const projects = projectsState.data ?? [];
@@ -1199,6 +1198,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             overview={overviewState}
             onOpenIssue={openHomeWork}
             onOpenDecision={openDecision}
+            decisions={decisionsOn}
             overviewHref={hrefFor({ screen: "overview" })}
             permissionsHref={hrefFor({ screen: "settings", section: "permissions" })}
             resolveAppPath={resolveAppPath}
