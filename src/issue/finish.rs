@@ -69,6 +69,9 @@ pub use sweep::sweep;
 pub(crate) use sweep::{lexical_path, registered_branch_path, same_path, sweep_selected};
 
 #[cfg(test)]
+mod merge_rule_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
