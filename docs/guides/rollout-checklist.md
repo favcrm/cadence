@@ -27,21 +27,6 @@ publish to a live account to prove a release.
 - **Verify:** run the read-only route smoke first. Any optional canary is only
   on the test account, never a live account; do not publish to prove a release.
 
-## Runtime image (pins a Cadence build)
-
-- **Runner:** authorized operator; repin PR, promotion and deploy.
-- **Blast radius:** every tenant that takes the new image on cold start; awake
-  tenants require a planned restart.
-- **Order:** review the repin, promote and deploy; review pending migrations and
-  take the required backup before applying them. Restart only the planned test
-  tenant first, then expand in stages. Batch layers that share this restart.
-- **Rollback trigger / decision:** failed tenant probe, failed smoke, or a
-  migration/deploy failure; operator decides, and pauses expansion on failure.
-- **Rollback:** redeploy the coupled previous image and Worker versions; restore
-  migrated store data from the recorded backup when needed.
-- **Verify:** require a real tenant probe and read-only smoke before expanding
-  to the next tenant; a running/listed state is not proof that it answers.
-
 ## Cadence host binary
 
 - **Runner:** operator, using the supported `cadence update` flow.

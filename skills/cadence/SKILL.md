@@ -113,7 +113,9 @@ If you are sent a `[review]` kickoff, judge exactly the head it names and
 file your verdict as a report: `cadence report file --task <ID> --kind
 verdict --file <f>`, frontmatter `verdict: pass` or `verdict: revise` and
 `sha: <the head you reviewed>`, the findings as the body. Only the
-assigned reviewer can file it, and only for the head under review.
+assigned reviewer can file it, and only for the head under review. This is a
+native job-report verdict; the merge gate counts only hosted verdicts, and
+agents file none.
 
 ## Peers and your group
 

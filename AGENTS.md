@@ -67,7 +67,7 @@ ticket per step. When two approaches both meet the ticket, pick the smaller
 one and say why in the PR. Before review, simplify your own diff: drop dead
 code, duplication and abstractions the change does not need, in the lines
 you changed only. If expansion is necessary to meet acceptance, explain why
-and ask first; otherwise defer it. Stop once acceptance and required
+and explain why in the PR; otherwise defer it. Stop once acceptance and required
 verification are complete. Scope never waives a check, a review, an
 approval or a production-safety rule.
 
@@ -225,12 +225,11 @@ the code you just wrote.
   needs a countable Browser QA verdict, which no agent here files, and refuses
   without it. `--exception` is otherwise unchanged, but a workflow row that does not hold refuses under it
   too.
-- One fresh-session review by default, covering standards and spec, when
-  every changed path qualifies under `docs/roles/one-review-paths.toml`. A
-  path that does not (trust boundary, identity, secrets, `ui/**`) needs
-  two reviews, Standards and Spec/security, as separate passes by two fresh
-  sessions. No reviewer
-  may be the author.
+- Under `strict`, one fresh-session review covering standards and spec when
+  every changed path qualifies under `docs/roles/one-review-paths.toml`; a
+  path that does not (trust boundary, identity, secrets, `ui/**`) needs two,
+  Standards and Spec/security, as separate passes by two fresh sessions. Other
+  classes: `cadence delivery requirements` says. No reviewer may be the author.
 - A reviewer who sees auth, identity, credential, signature, secret or
   confinement logic in a one-review PR returns REVISE, names the trigger in
   `Risk:`, and asks for the second pass. When unsure, two.
@@ -255,7 +254,7 @@ the code you just wrote.
   PASS, the reviewer blocks on or refutes each severe bug and each critical
   security finding. Never make a bot's check a required check, and never
   let a bot push to a PR branch.
-- Each review files one verdict note in `notes_dir` (`pm.yaml`, default
+- Native only: each review files one verdict note in `notes_dir` (`pm.yaml`, default
   `/var/www/agent-notes`), named `YYYYMMDD-HHMMSS-<slug>-verdict.md` (UTC):
 
   ```markdown
@@ -275,10 +274,11 @@ the code you just wrote.
   - <blocking / should-fix / nits>
   ```
 
-  `Risk:` is `auto`, `human (<triggers>)` or `delegated (<triggers>)`. The
+  `Risk:` is `auto` or `human (<triggers>)`. The
   `>` header lines follow the title directly; a bare `Issue:` line does not
   link the note to the ticket. The title and the section must say the same
-  thing. Link the note from the ticket.
+  thing. Link the note from the ticket. Hosted: one PR comment per review axis,
+  linked in the ticket comment (no verdict note).
 - Before enqueueing, post one ticket comment for that head: every required
   verdict note, the green CI run and, for a `human` PR, the approval id. A
   new head voids every verdict on the old head.
@@ -437,11 +437,6 @@ Do not substitute a comment or another identity for the required proof.
   gets no scope approval; a diff touching a trigger 1/3 path always needs
   the per-head approval; and every counted verdict must carry
   `Scope: in-scope <ID>`. `cadence audit revoke <id>` withdraws it.
-- A `delegated` PR is approved by the designated agent from its own pane:
-  `cadence audit approve --pr <n> --head <full-sha> --delegated --source
-  "<notes>"`. Triggers 1, 3, 4, 6 and 7 are never delegated, and the
-  running daemon must support `--delegated` (`cadence audit approve
-  --help`); where it does not, the operator approves.
 
 ### Merging
 
