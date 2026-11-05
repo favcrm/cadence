@@ -506,29 +506,27 @@ org with nothing removed. The lane is found in this machine's coordinator ledger
 its claim, generation and lane fields must match the recorded lane, and its
 assignment must have ended (`result`, `failed` or cancelled). An ended row may be
 fenced (`reassign --cancel` fences it); a live row must not be. The command uses
-the native finish evidence and in-use guard and refuses, naming the cause, when
-the worktree is dirty (untracked files count whatever `status.showUntrackedFiles`
-says), has recently modified files, a process or agent is inside it, the branch
-has not started, or the branch is not shown merged into the default branch.
-`origin/HEAD` must be set; hosted release will not treat the main checkout's
-current branch as the default. Merged is stricter than native finish: pushed alone
-does not release a hosted lane. Evidence is ancestry; patch-equivalent commits
-or a squash, which need git 2.38+ (`git merge-tree --write-tree`) to show the
-default branch already holds the branch's changes and no configured merge driver
-and no merge commit on the branch for the cherry-pick case; or a merged GitHub PR
-with that tip (`gh`, against `origin`'s repository). An older git, a configured
-`merge.*.driver`, a branch whose commits cancel out, or a squash whose file later
-changed differently on the default branch is not evidence by itself; only a merged
-PR can then release it. The release also refuses when the worktree holds
-gitignored files other than top-level `target/` and `node_modules/` (for example
-`.env`, `docs/*`, `docs/target/`), naming a sample, because removal deletes them;
-git reports an ignored directory as one entry, so a file kept inside `target/` or
-`node_modules/` is deleted with it. When the refusal will not change (the ledger
-cannot identify the lane, or the evidence can never qualify), take the manual
-path: verify the merge, that nothing is using the lane and that you do not need
-its ignored files, then `git worktree remove <path>` and `git branch -d <branch>`
-(a squash-merged branch refuses `-d`; use `-D` only after verifying the merge).
-`issue reconcile` stays native-only.
+the native finish in-use guard and refuses, naming the cause, when the worktree
+is dirty (untracked files count whatever `status.showUntrackedFiles` says), has
+recently modified files, a process or agent is inside it, or the branch has not
+started. It never judges whether the content is in the default branch; it asks
+whether the exact tip survives after deletion. Only two things count: the tip is
+an ancestor of `origin/<default branch>` (`origin/HEAD` must be set), or a
+merged PR on `origin`'s own `github.com` repository has a head commit exactly
+equal to the tip, a merge time, and the default branch as its base (GitHub keeps
+that head after a squash). A branch pushed but not merged does not release, and
+neither does a lane merged without a PR, a non-GitHub `origin`, or a case where
+`gh` is missing, not signed in or times out. The release also refuses
+when the worktree holds gitignored files other than top-level `target/` and
+`node_modules/` (for example `.env`, `docs/*`, `docs/target/`), naming a sample,
+because removal deletes them; git reports an ignored directory as one entry, so a
+file kept inside `target/` or `node_modules/` is deleted with it. When the
+refusal will not change (the ledger cannot identify the lane, or no PR or
+ancestry evidence can exist), take the manual path: verify the merge, that
+nothing is using the lane and that you do not need its ignored files, then
+`git worktree remove <path>` and `git branch -d <branch>` (a squash-merged branch
+refuses `-d`; use `-D` only after verifying the merge). `issue reconcile` stays
+native-only.
 
 ### Managing agent profiles from the CLI (CAD-2101)
 

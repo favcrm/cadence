@@ -63,7 +63,7 @@ pub(crate) use activity::{comm_of, daemon_view, lane_in_use, with_probe_timeout,
 pub(crate) use evidence::{branch_tip, not_started};
 pub(crate) use git::{default_ref, git, git_branch, merge_rule};
 pub(crate) use guard::cwd_holder_aliases;
-pub(crate) use hosted::release_hosted_lane;
+pub(crate) use hosted::{gh_merged_prs, release_hosted_lane};
 pub(crate) use run::{run, FinishArgs};
 pub use sweep::sweep;
 pub(crate) use sweep::{lexical_path, registered_branch_path, same_path, sweep_selected};

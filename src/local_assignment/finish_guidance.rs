@@ -27,6 +27,11 @@ pub fn refusal<H: CoordHttp>(
     ))
 }
 
+/// How hosted release asks GitHub for merged PRs: `(owner/repo, head branch)`
+/// to the `gh pr list --json number,headRefOid,baseRefName,mergedAt` array, or
+/// `None` when it could not ask. Tests pass a fake through [`release_with`].
+pub type PrLookup<'a> = &'a dyn Fn(&str, &str) -> Option<Value>;
+
 /// `issue finish <ID>` on a hosted org (CAD-2178): release this machine's
 /// lane for the issue through the native finish guard, with no `--force`.
 /// The lane is bound from the coordinator ledger exactly as [`refusal`]
@@ -37,6 +42,23 @@ pub fn release<H: CoordHttp>(
     issue: &str,
     selected: Option<&Path>,
     state_dir: &Path,
+) -> Result<Value> {
+    release_with(
+        coordinator,
+        issue,
+        selected,
+        state_dir,
+        &crate::issue::finish::gh_merged_prs,
+    )
+}
+
+/// [`release`] with the merged-PR lookup supplied (the test seam).
+pub fn release_with<H: CoordHttp>(
+    coordinator: &Coordinator<H>,
+    issue: &str,
+    selected: Option<&Path>,
+    state_dir: &Path,
+    prs: PrLookup<'_>,
 ) -> Result<Value> {
     let Some(lane) = bound_lane(coordinator, issue, selected).ok().flatten() else {
         return Err(refusal(coordinator, Some(issue), selected));
@@ -53,6 +75,7 @@ pub fn release<H: CoordHttp>(
         &lane.path,
         &lane.branch,
         state_dir,
+        prs,
     )
 }
 
@@ -163,6 +186,13 @@ fn observe<H: CoordHttp>(
         &["rev-parse", "--verify", &format!("{into}^{{commit}}")],
     )?;
     let evidence = merge_rule(&root, &branch, &tip, &into);
+    // `git cherry` ignores merge commits, which can contain unique resolution
+    // work even when every non-merge commit is patch-equivalent upstream.
+    if evidence == Some("cherry")
+        && !git(&root, &["rev-list", "--merges", &format!("{into}..{tip}")])?.is_empty()
+    {
+        return Ok(Some(LaneState::CleanUnverified));
+    }
     Ok(Some(if evidence.is_some() {
         LaneState::CleanMerged
     } else {
