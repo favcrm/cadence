@@ -924,7 +924,7 @@ mod cad2081_workflow_verdicts {
                 "repo": REPO, "pr": 7, "title": "CAD-1: add the thing", "head": head,
                 "base": case.base_ref, "base_oid": self.base, "tip": self.tip, "author": "authorlogin",
                 "files_by_ref": by_ref, "verdicts": case.rows, "class": case.class, "approved": case.approved,
-                "no_readiness": case.no_readiness,
+                "no_readiness": case.no_readiness, "native": case.native,
                 "tip_fails": case.tip_fails, "tip_sha": case.tip_sha,
                 "identities": if case.no_identity_map { Value::Null } else {
                     case.identities.clone().unwrap_or_else(Self::identities) },
@@ -979,6 +979,7 @@ mod cad2081_workflow_verdicts {
         tip_sha: Option<String>,
         no_identity_map: bool,
         no_readiness: bool,
+        native: bool,
     }
 
     fn scenario(rows: Vec<Value>) -> Scenario {
@@ -997,6 +998,7 @@ mod cad2081_workflow_verdicts {
             tip_sha: None,
             no_identity_map: false,
             no_readiness: false,
+            native: false,
         }
     }
 
@@ -2066,6 +2068,345 @@ mod cad2081_workflow_verdicts {
             "spec-security",
         );
         refused(&f, routine(vec![f.std(), both]), "may file only standards");
+    }
+
+    /// The gate's refusal lines are exactly `whys`: each line is one of them and each
+    /// of them is said, so a case cannot pass on a reason that has nothing to do with it.
+    fn refused_for_exactly(f: &Fixture, label: &str, case: Scenario, whys: &[&str]) -> String {
+        let (code, stdout, stderr) = f.gate(&case);
+        let ctx = format!("case: {label}\nstdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(code, 1, "expected a refusal\n{ctx}");
+        assert!(!stdout.contains("every rule holds"), "{ctx}");
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains(": refused: "))
+            .collect();
+        for line in &lines {
+            assert!(
+                whys.iter().any(|why| line.contains(why)),
+                "an unrelated refusal: {line}\n{ctx}"
+            );
+        }
+        for why in whys {
+            assert!(
+                lines.iter().any(|line| line.contains(why)),
+                "no refusal containing {why:?}\n{ctx}"
+            );
+        }
+        stderr
+    }
+
+    // CAD-2135: independent acceptance check, written from the ticket by someone other than the implementer.
+    #[test]
+    fn a_hosted_routine_pr_reaches_the_queue_only_on_both_workflow_passes_and_the_operator() {
+        const NEEDS_BOTH: &str =
+            "has no readiness record and needs a pass from both review workflows at this head";
+        const NO_STD: &str = "no pass Standards verdict";
+        const NO_SPEC: &str = "no pass Spec/security verdict";
+        const NOT_A_PASS: &str = "a workflow review that is not a pass always refuses";
+        const NATIVE: &str = "no fresh native readiness proof";
+        let f = Fixture::new();
+        let head = f.touch("docs/x.md");
+        // Every bad case below is this, with one thing changed.
+        let routine = |rows: Vec<Value>| {
+            let mut case = scenario(rows);
+            case.class = "routine";
+            case.no_readiness = true;
+            case.head = Some(head.clone());
+            case
+        };
+        let filed_at = |mut row: Value, at: &str| {
+            row["at_head"] = json!(at);
+            row
+        };
+        let check = |label: &str, case: Scenario, whys: &[&str]| {
+            let stderr = refused_for_exactly(&f, label, case, whys);
+            assert!(!stderr.contains(NATIVE), "{label}: {stderr}");
+            stderr
+        };
+        let alice = f.owner(
+            "20261103-000100-a.md",
+            "20261103-000100",
+            "usr_alice",
+            "alice",
+            "standards",
+        );
+        let bob = f.owner(
+            "20261103-000200-b.md",
+            "20261103-000200",
+            "usr_bob",
+            "bob",
+            "spec-security",
+        );
+        let revised = || {
+            let mut row = f.std();
+            row["outcome"] = json!("revise");
+            row["section_outcome"] = json!("revise");
+            row
+        };
+
+        // The good case: both workflows at this head and the operator's approval, on
+        // the routine branch, with no exception and no readiness.
+        let (code, stdout, stderr) = f.gate(&routine(vec![
+            filed_at(f.std(), &head),
+            filed_at(f.spec(), &head),
+        ]));
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        for said in [
+            "every rule holds",
+            "delivery requirements: routine (active)",
+            "class: human (",
+            OPERATOR,
+            "approval in force",
+            "svc_std standards",
+            "svc_spec spec-security",
+        ] {
+            assert!(stdout.contains(said), "{said}: {stdout}");
+        }
+        assert!(!stdout.contains("EXCEPTION"), "{stdout}");
+        assert!(!stdout.contains("routine outcome:"), "{stdout}");
+
+        // Reviews missing. A dispatch is named only for a review not yet filed.
+        let said = check(
+            "no reviews",
+            routine(vec![]),
+            &[NEEDS_BOTH, NO_STD, NO_SPEC],
+        );
+        assert!(
+            said.contains("gh workflow run review-standards.yml"),
+            "{said}"
+        );
+        assert!(said.contains("gh workflow run review-spec.yml"), "{said}");
+        let said = check(
+            "standards only",
+            routine(vec![f.std()]),
+            &[NEEDS_BOTH, NO_SPEC],
+        );
+        assert!(said.contains("gh workflow run review-spec.yml"), "{said}");
+        assert!(
+            !said.contains("gh workflow run review-standards.yml"),
+            "{said}"
+        );
+        let said = check("spec only", routine(vec![f.spec()]), &[NEEDS_BOTH, NO_STD]);
+        assert!(
+            said.contains("gh workflow run review-standards.yml"),
+            "{said}"
+        );
+        assert!(!said.contains("gh workflow run review-spec.yml"), "{said}");
+
+        // Owner rows satisfy every other class here, and count for nothing on this route.
+        check(
+            "two owner rows",
+            routine(vec![alice.clone(), bob.clone()]),
+            &[NEEDS_BOTH],
+        );
+        check(
+            "workflow standards, owner spec",
+            routine(vec![f.std(), bob.clone()]),
+            &[NEEDS_BOTH],
+        );
+        check(
+            "owner standards, workflow spec",
+            routine(vec![alice.clone(), f.spec()]),
+            &[NEEDS_BOTH],
+        );
+        // A row that only claims or only names the workflow is neither.
+        let mut disguised = f.spec();
+        disguised["identity_source"] = json!("owner-attested");
+        disguised["github_login"] = json!("bob");
+        check(
+            "an owner row naming the reserved principal",
+            routine(vec![f.std(), disguised]),
+            &["names workflow principal svc_spec", NEEDS_BOTH, NO_SPEC],
+        );
+        let mut claimed = f.spec();
+        claimed["reviewer_id"] = json!("usr_bob");
+        claimed["reviewer"] = json!("bob");
+        check(
+            "an owner principal claiming workflow-oidc",
+            routine(vec![f.std(), claimed]),
+            &[
+                "principal usr_bob is not in docs/roles/review-workflow-principals.toml",
+                NEEDS_BOTH,
+                NO_SPEC,
+            ],
+        );
+
+        // A workflow REVISE, alone or followed by a pass: a workflow row is final.
+        let said = check(
+            "a workflow revise",
+            routine(vec![revised(), f.spec()]),
+            &[
+                "is not a pass (outcome 'revise'",
+                NOT_A_PASS,
+                NEEDS_BOTH,
+                NO_STD,
+            ],
+        );
+        assert!(!said.contains("gh workflow run"), "{said}");
+        let later = f.wrow(
+            "20261103-000900-std2.md",
+            "20261103-000900",
+            "svc_std",
+            "standards",
+        );
+        check(
+            "a workflow revise, then a later pass",
+            routine(vec![revised(), later, f.spec()]),
+            &["is not a pass (outcome 'revise'", NOT_A_PASS],
+        );
+
+        // Rows from a principal main's tip does not list, or a superseded workflow.
+        let unlisted = "principal svc_other is not in docs/roles/review-workflow-principals.toml";
+        let mut other = f.spec();
+        other["reviewer_id"] = json!("svc_other");
+        other["reviewer"] = json!("svc_other");
+        check(
+            "an unlisted principal",
+            routine(vec![f.std(), other.clone()]),
+            &[unlisted, NEEDS_BOTH, NO_SPEC],
+        );
+        // A PR cannot list its own reviewer: the list is read at main's tip.
+        let mut own_list = f.base_files();
+        own_list[ALLOWLIST] = json!(format!(
+            "{GOOD_ALLOWLIST}[principals.svc_other]\nkind = \"spec-security\"\n\
+             workflow = \".github/workflows/review-spec.yml\"\n"
+        ));
+        let mut case = routine(vec![f.std(), other]);
+        case.head_files = Some(own_list.clone());
+        case.base_files = Some(own_list);
+        case.tip_files = Some(f.base_files());
+        check(
+            "a principal listed only at the PR's head and base",
+            case,
+            &[unlisted, NEEDS_BOTH, NO_SPEC],
+        );
+        // A revocation on main reaches an open PR.
+        let mut revoked = f.base_files();
+        revoked[ALLOWLIST] = json!(
+            "[principals.svc_std]\nkind = \"standards\"\n\
+             workflow = \".github/workflows/review-standards.yml\"\n"
+        );
+        let mut case = routine(vec![f.std(), f.spec()]);
+        case.tip_files = Some(revoked);
+        check(
+            "a principal revoked at main's tip",
+            case,
+            &[
+                "principal svc_spec is not in docs/roles/review-workflow-principals.toml",
+                NEEDS_BOTH,
+                NO_SPEC,
+            ],
+        );
+        let mut no_list = f.base_files();
+        no_list.as_object_mut().unwrap().remove(ALLOWLIST);
+        let mut case = routine(vec![f.std(), f.spec()]);
+        case.tip_files = Some(no_list);
+        check(
+            "an unreadable principal list",
+            case,
+            &[
+                "cannot read docs/roles/review-workflow-principals.toml",
+                NEEDS_BOTH,
+                NO_STD,
+                NO_SPEC,
+            ],
+        );
+        let mut stale = f.std();
+        stale["workflow_sha"] = json!(f.differs);
+        check(
+            "a stale workflow file",
+            routine(vec![stale, f.spec()]),
+            &["differs from main's live tip", NEEDS_BOTH, NO_STD],
+        );
+        // One principal cannot be both: that is what makes the two distinct.
+        let both = f.wrow(
+            "20261103-000300-x.md",
+            "20261103-000300",
+            "svc_std",
+            "spec-security",
+        );
+        check(
+            "one principal filing both kinds",
+            routine(vec![f.std(), both]),
+            &["may file only standards", NEEDS_BOTH, NO_SPEC],
+        );
+
+        // The rows must be of this head, this repo and this base.
+        let said = check(
+            "a spec pass filed at an earlier head",
+            routine(vec![filed_at(f.std(), &head), filed_at(f.spec(), &f.head)]),
+            &[NEEDS_BOTH, NO_SPEC],
+        );
+        assert!(said.contains("gh workflow run review-spec.yml"), "{said}");
+        let mut foreign = f.spec();
+        foreign["repo"] = json!("favcrm/other");
+        check(
+            "a row of another repository",
+            routine(vec![f.std(), foreign]),
+            &["it names repo 'favcrm/other'", NEEDS_BOTH, NO_SPEC],
+        );
+        let mut retargeted = routine(vec![f.std(), f.spec()]);
+        retargeted.base_ref = "staging".into();
+        check(
+            "a PR retargeted away from main",
+            retargeted,
+            &[
+                "the PR's base is now 'staging', not main",
+                NEEDS_BOTH,
+                NO_STD,
+                NO_SPEC,
+            ],
+        );
+
+        // Approval: missing, not waived by a list that names other paths, and not
+        // read as present when the list cannot be read.
+        let mut case = routine(vec![f.std(), f.spec()]);
+        case.approved = false;
+        check("no approval", case, &[NO_APPROVAL]);
+        let mut case = routine(vec![f.std(), f.spec()]);
+        case.approved = false;
+        case.tip_files = Some(f.listed("design-plans/**/*.md"));
+        check("no approval, other paths listed", case, &[NO_APPROVAL]);
+        let mut no_auto = f.base_files();
+        no_auto.as_object_mut().unwrap().remove(AUTO_PATHS);
+        let mut case = routine(vec![f.std(), f.spec()]);
+        case.approved = false;
+        case.tip_files = Some(no_auto);
+        check("no approval, auto list unreadable", case, &[NO_APPROVAL]);
+        // The list waives the approval and only the approval, and only at main's tip.
+        let mut case = routine(vec![f.std(), f.spec()]);
+        case.approved = false;
+        case.tip_files = Some(f.listed("docs/**"));
+        let (code, stdout, stderr) = f.gate(&case);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("class: auto"), "{stdout}");
+        let mut case = routine(vec![f.std()]);
+        case.approved = false;
+        case.tip_files = Some(f.listed("docs/**"));
+        check("listed, one review", case, &[NEEDS_BOTH, NO_SPEC]);
+        let mut case = routine(vec![f.std(), f.spec()]);
+        case.approved = false;
+        case.head_files = Some(f.listed("docs/**"));
+        case.base_files = Some(f.listed("docs/**"));
+        case.tip_files = Some(f.base_files());
+        check(
+            "listed only at the PR's head and base",
+            case,
+            &[NO_APPROVAL],
+        );
+
+        // The class is not the client's to claim, and the route is not a local org's.
+        let mut case = routine(vec![f.std(), f.spec()]);
+        case.head = Some(f.touch("notes/x.md"));
+        check(
+            "a diff that is not routine",
+            case,
+            &["the evaluator's routine class does not hold"],
+        );
+        let mut case = routine(vec![f.std(), f.spec()]);
+        case.native = true;
+        refused_for_exactly(&f, "a local org with no readiness", case, &[NATIVE]);
     }
 
     #[test]
