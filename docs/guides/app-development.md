@@ -235,26 +235,24 @@ install/update is operator-only.
 
 ## 7. Existing apps
 
-**Social Content** is the closest, but still has an older path:
+**Social Content** (`0.13.0`) uses the pinned `@cadence/app-kit` through
+`src/screens/receiver.mjs`; `screen-v2.mjs` validates its projection, and the
+screen advertises `screen-surfaces.v1` with an app-local drawer fallback. The
+remaining cleanup is a toolchain bump to `v0.3.20` (app-kit `0.2.0`) and a
+decision on whether the local receiver wrapper still earns its keep. It already
+has the `cadence` package contract, so `cadence app dev --package` is the local
+loop.
 
-1. Pin the first toolchain release that carries app-kit 0.1.2.
-2. Replace `src/screens/receiver.mjs` / `screen-v2.mjs` with the pinned
-   app-kit; do not keep a parallel receiver.
-3. Add the `cadence` contract to `package.json` (app, dev, check) so
-   `cadence app dev --package` is the local loop.
-4. Advertise `screen-presentation.v1` and use the host drawer on a presenting
-   host; keep the app-local drawer only as the fallback.
-5. Remove the locally staged app-kit from the preview; the toolchain is the
-   source. Keep one preview harness.
+**CRM** (`0.3.6`) is a records screen on the vendored app-kit `0.2.0` receiver
+from `cadence-app-toolchain-v0.3.20`; `app-kit.lock.json` pins every file.
+`src/bridge/channel.ts` keeps CRM's request/CSV limits, timeout, guards and
+`ApiError` mapping around the shared receiver. Use it as the records reference:
+`screen-records.v1` plus `screen-startup`, with the app owning the projection
+and the host owning effects and approval.
 
-**CRM** is currently a metadata bundle with host-compiled screens, not a
-screen app. Decide explicitly:
-
-- make it a screen app and adopt the template/toolchain/app-kit; or
-- keep it host-native and do not present the lane-only `src/bridge` preview as
-  the shipped model.
-
-Do not ship two bridge protocols for one app.
+Do not ship two bridge protocols for one app. A local adapter around app-kit is
+fine when it carries app-specific policy; a second MessagePort implementation is
+not.
 
 ## 8. Skill packages
 
