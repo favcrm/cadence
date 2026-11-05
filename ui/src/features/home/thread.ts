@@ -16,7 +16,7 @@ import type { SseEvent } from "../../lib/sse";
  */
 
 export type ThreadRole = "operator" | "agent" | "system";
-export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "video_job" | "hire_proposal";
+export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "video_job" | "hire_proposal" | "ticket_proposal";
 
 /** One stored entry (`thread_read` / the stream's `entry` frame). */
 export interface ThreadEntry {
@@ -330,6 +330,7 @@ export type ThreadItem =
   | { type: "image"; key: string; entry: ThreadEntry }
   | { type: "video"; key: string; entry: ThreadEntry }
   | { type: "hire"; key: string; entry: ThreadEntry; reason: string | null }
+  | { type: "ticket"; key: string; entry: ThreadEntry }
   | { type: "pending"; key: string; pending: PendingMessage };
 
 const TOOL_KINDS = new Set(["tool_call", "tool_result"]);
@@ -381,6 +382,10 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
         last?.type === "commentary" && last.entry.message === entry.message ? items.pop() : null;
       const reason = lead?.type === "commentary" ? lead.entry.text.trim() || null : null;
       items.push({ type: "hire", key, entry, reason });
+    } else if (entry.kind === "ticket_proposal") {
+      // AOS-517: Master's inert ticket proposal. Its own payload carries the
+      // card; nothing is created or assigned until the person clicks.
+      items.push({ type: "ticket", key, entry });
     } else if (entry.kind === "artifact") {
       // CAD-1726: a card for a canvas artifact — metadata, never content.
       items.push({ type: "artifact", key, entry });

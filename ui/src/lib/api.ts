@@ -650,6 +650,8 @@ export const api = {
     blocked_by?: string[];
     /** CAD-140: the report/idea description, filed with the issue. */
     body?: string;
+    /** CAD-2188: a retry with the same key answers the ticket the first call made. */
+    idempotency_key?: string;
   }) => write("POST", "/api/issues", req),
 
   patch: (

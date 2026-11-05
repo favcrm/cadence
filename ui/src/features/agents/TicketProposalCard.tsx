@@ -1,0 +1,106 @@
+import { useState } from "react";
+import { api, ApiError } from "../../lib/api";
+import { useTranslate } from "../../lib/locale";
+import { resources } from "../../lib/resources";
+import Button from "../../ui/Button";
+import type { ThreadEntry } from "../home/thread";
+import { createAndAssign, parseTicketProposal } from "./ticketProposal";
+
+/** Master's start card (AOS-517): the whole ticket it proposes, the agent that
+ *  would run it, the tools that agent gets, and who can read the result. One
+ *  click creates the ticket and assigns it; nothing exists before the click and
+ *  a second click starts nothing. */
+export default function TicketProposalCard({
+  entry,
+  onOpenIssue,
+}: {
+  entry: ThreadEntry;
+  onOpenIssue?: (id: string) => void;
+}) {
+  const t = useTranslate();
+  const proposal = parseTicketProposal(entry.payload);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [created, setCreated] = useState<string | null>(null);
+
+  if (!proposal) {
+    return (
+      <p className="text-micro text-ink-500" data-kind="ticket-proposal">
+        · {entry.text}
+      </p>
+    );
+  }
+
+  const run = () => {
+    setBusy(true);
+    setError(null);
+    createAndAssign(api, proposal)
+      .then(({ ticket }) => {
+        setCreated(ticket);
+        void resources.issues.invalidate();
+        void resources.issue(ticket).invalidate();
+      })
+      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="rc-proposal" data-kind="ticket-proposal" data-proposal={proposal.id}>
+      <div className="rounded border border-ink-700 bg-ink-900 px-3 py-2.5">
+        <p className="text-micro text-ink-400">
+          {t("New ticket for {name}").replace("{name}", () => proposal.agent.name)}
+          {" · "}
+          {t("card {id}").replace("{id}", () => proposal.id)}
+        </p>
+        <p className="text-label text-ink-100 break-words mt-1">{proposal.title}</p>
+        <p className="text-secondary text-ink-300 break-words whitespace-pre-wrap mt-1">
+          {proposal.brief}
+        </p>
+        <dl
+          className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-micro mt-2.5"
+          aria-label={t("What this assigns")}
+        >
+          <dt className="text-ink-400">{t("Agent")}</dt>
+          <dd className="text-ink-200 break-words">
+            {proposal.agent.name} · {t("runs as you")}
+          </dd>
+          <dt className="text-ink-400">{t("Tools")}</dt>
+          <dd className="text-ink-300 break-words font-mono text-micro">
+            {proposal.tools.join(", ")}
+          </dd>
+          <dt className="text-ink-400">{t("Visible to")}</dt>
+          <dd className="text-ink-200">{t("Everyone in the company")}</dd>
+        </dl>
+        {created ? (
+          <p className="text-label text-ok mt-3" role="status">
+            {t("Created {id} and assigned it.").replace("{id}", () => created)}{" "}
+            {onOpenIssue && (
+              <Button variant="ghost" size="sm" onClick={() => onOpenIssue(created)}>
+                {t("Open ticket")}
+              </Button>
+            )}
+          </p>
+        ) : (
+          <div className="flex flex-wrap items-center gap-2 mt-3">
+            <Button
+              variant="primary"
+              size="sm"
+              loading={busy}
+              disabled={busy}
+              onClick={run}
+              title={t("Creates the ticket and starts the agent once")}
+            >
+              {t("Create and assign")}
+            </Button>
+            <span className="text-micro text-ink-500">{t("Starts one run. A second click does nothing.")}</span>
+          </div>
+        )}
+        {error && (
+          <p className="text-micro text-fail mt-2" role="alert">
+            {error}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}

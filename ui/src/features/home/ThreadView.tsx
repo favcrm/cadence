@@ -7,6 +7,7 @@ import Md from "../../ui/Md";
 import { attachMeta } from "../app-shell/chat/attach";
 import { askLabel } from "../canvas/askRefs";
 import HireProposalCard from "../agents/HireProposalCard";
+import TicketProposalCard from "../agents/TicketProposalCard";
 import ArtifactCard from "../canvas/ArtifactCard";
 import ImageBlock from "../canvas/ImageBlock";
 import VideoBlock from "../canvas/VideoBlock";
@@ -262,6 +263,8 @@ export function ThreadItemView({
       return <VideoBlock entry={item.entry} />;
     case "hire":
       return <HireProposalCard entry={item.entry} reason={item.reason} />;
+    case "ticket":
+      return <TicketProposalCard entry={item.entry} onOpenIssue={onOpenIssue} />;
     case "answer": {
       // A failed turn carries its reason in payload.error and no text: say
       // why, instead of an empty bubble. No Retry here — the turn ran.
