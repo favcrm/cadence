@@ -112,7 +112,7 @@ export function useTodoLocal(): TodoLocal {
 }
 
 /** The sidebar's Home badge: pending To do items, less what the operator just settled. */
-export function useHomeCount(rows: NeedsMe[] | null | undefined): number {
+export function useHomeCount(rows: NeedsMe[] | null | undefined, staged = 0): number {
   const local = useTodoLocal();
   const needs = rows ? todoSplit(rows).todo : null;
   const sig = needs?.map((n) => `${n.key}\t${needFingerprint(n)}`).join("\n") ?? null;
@@ -120,5 +120,6 @@ export function useHomeCount(rows: NeedsMe[] | null | undefined): number {
   useEffect(() => {
     if (needs) reconcileTodo(needs);
   }, [sig]);
-  return todoCount(rows, (n) => isSettled(local, n));
+  // Staged decisions (CAD-2186) are not in the overview; the caller counts them.
+  return todoCount(rows, (n) => isSettled(local, n)) + staged;
 }

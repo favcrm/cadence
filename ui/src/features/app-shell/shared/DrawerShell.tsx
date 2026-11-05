@@ -39,7 +39,9 @@ export interface DrawerShellProps {
   kicker?: ReactNode;
   /** `board` dims the whole board, not only the outlet. Default `outlet`. */
   scrim?: "outlet" | "board";
-  title: string;
+  /** The host traps focus inside the drawer (CAD-2186); announce it as modal. */
+  modal?: boolean;
+  title: ReactNode;
   subtitle?: ReactNode;
   avatar?: ReactNode;
   pills?: ReactNode;
@@ -195,7 +197,7 @@ export default function DrawerShell(props: DrawerShellProps) {
       <div
         className="crm-drawer crm-drawer-shell"
         role="dialog"
-        aria-modal="false"
+        aria-modal={props.modal === true ? "true" : "false"}
         aria-label={label}
         data-drawer={kind}
         data-scrim={board ? "board" : undefined}

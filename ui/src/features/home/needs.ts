@@ -1,4 +1,5 @@
 import type { NeedsMe, ThreadRef } from "../../lib/types";
+import { sourceLine, type StagedWrite } from "../decisions/stagedWrite";
 
 /**
  * The Home rail's "Needs you" (CAD-328), built from the overview's
@@ -41,6 +42,12 @@ export type NeedAction =
       issue: string;
     }
   | { type: "command"; command: string }
+  | {
+      /** CAD-2186: an owner decision staged by the assistant or the CLI; it
+       *  never comes from `needs_me`, the rail merges it in client-side. */
+      type: "staged";
+      id: string;
+    }
   | {
       type: "permission";
       id: string;
@@ -363,6 +370,8 @@ export const KIND_TABLE: Readonly<Record<string, KindSpec>> = {
     control: "Allow",
     title: fixed("Master wants to run a command"),
   },
+  // CAD-2186: opens the detail drawer; nothing expands in the rail.
+  staged_write: { type: "ok", place: "drawer", control: "Review", title: fixed("A write is waiting for your OK") },
   approval: { type: "ok", place: "inline", control: "Review", title: fixed("An agent is waiting for your OK") },
   approval_menu: { type: "ok", place: "inline", control: "Review", title: fixed("An agent is waiting for your OK") },
   question: {
@@ -399,7 +408,8 @@ const UNKNOWN_KIND: KindSpec = stuck("Something needs your attention");
 export function kindSpec(need: HomeNeed): KindSpec {
   const spec = KIND_TABLE[need.kind] ?? UNKNOWN_KIND;
   const t = need.action.type;
-  if (spec.place === "drawer" && t !== "plan" && t !== "idea" && t !== "merge") return UNKNOWN_KIND;
+  if (spec.place === "drawer" && t !== "plan" && t !== "idea" && t !== "merge" && t !== "staged") return UNKNOWN_KIND;
+  if (need.kind === "staged_write" && t !== "staged") return UNKNOWN_KIND;
   if (need.kind === "master_permission" && t !== "permission") return UNKNOWN_KIND;
   return spec;
 }
@@ -487,8 +497,39 @@ export function needFingerprint(need: HomeNeed): string {
     : a.type === "answer" ? `${a.issue}/${a.report}`
     : a.type === "plan" ? a.epic
     : a.type === "idea" ? a.issue
+    : a.type === "staged" ? a.id
     : need.subject?.id ?? "";
   return `${need.kind}|${id}`;
+}
+
+/** A pending staged decision as a To do card (CAD-2186). Built here, never read from `needs_me`. */
+export function stagedNeed(write: StagedWrite, t: (english: string) => string, nowMs = Date.now()): HomeNeed {
+  return {
+    key: `staged:${write.id}`,
+    kind: "staged_write",
+    label: "write",
+    title: write.title,
+    shortTitle: write.title,
+    why: sourceLine(write, t) || null,
+    owner: "operator",
+    age: Math.max(0, Math.floor((nowMs - write.createdAt) / 1000)),
+    project: null,
+    subject: null,
+    summary: null,
+    escalatedBy: null,
+    command: "",
+    link: null,
+    issue: null,
+    agent: null,
+    action: { type: "staged", id: write.id },
+  };
+}
+
+/** To do with the staged decisions merged in: after the ok items already listed, before questions. */
+export function withStaged(todo: HomeNeed[], staged: HomeNeed[]): HomeNeed[] {
+  if (staged.length === 0) return todo;
+  const rank = (n: HomeNeed) => ["ok", "question", "stuck"].indexOf(kindSpec(n).type);
+  return [...todo, ...staged].sort((a, b) => rank(a) - rank(b));
 }
 
 /** `74` → `just now`, `240` → `4 min`, `7200` → `2 h`, `3 d`. */

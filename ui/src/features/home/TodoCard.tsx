@@ -18,6 +18,7 @@ import {
   type NeedType,
   type UnfenceChoice,
 } from "./needs";
+import { isolate } from "../decisions/stagedWrite";
 import { sendToMaster } from "./send";
 import { useTranslate } from "../../lib/locale";
 import { marksFor, sendingTodo, settleTodo, useTodoLocal } from "./todoLocal";
@@ -323,7 +324,7 @@ export default function TodoCard({
       title={spec.place !== "drawer" && block ? t(READ_ONLY_COPY) : undefined}
       onClick={control}
     >
-      {spec.control}
+      {t(spec.control)}
     </button>
   );
 
@@ -347,9 +348,9 @@ export default function TodoCard({
             onKeyDown={onKey}
           >
             <div className="todo-title" title={title}>
-              {title}
+              {action.type === "staged" ? <bdi>{isolate(title)}</bdi> : title}
             </div>
-            <div className="todo-meta">{done ? doneText : metaLine(need)}</div>
+            <div className="todo-meta">{done ? doneText : action.type === "staged" ? <bdi>{isolate(metaLine(need))}</bdi> : metaLine(need)}</div>
           </div>
           {inside}
           {!done && quickRow}
@@ -362,7 +363,7 @@ export default function TodoCard({
         </div>
         <div className="todo-act">
           {showControl && controlButton}
-          {!done && (
+          {!done && action.type !== "staged" && (
             <button type="button" className="needmore" aria-label={t("more actions")} aria-expanded={menu} onClick={() => setMenu((m) => !m)}>
               ⋯
             </button>
