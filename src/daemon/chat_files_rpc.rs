@@ -398,6 +398,20 @@ impl Shared {
             legacy_workspace_dir: &pm_dir,
             workspace_dir: &self.upload_workspace_dir,
         };
+        // CAD-2162: a visual attachment is only retained when this build can
+        // actually deliver it — an SVG screens and renders, a raster is already
+        // decoded, and the selected model admits image input. This runs inside
+        // custody on the exact bytes about to be published, so a refusal
+        // retains nothing, charges nothing, and never returns a ready chip a
+        // send would then refuse. Delivery re-proves scope, digest and model.
+        let visual = |mime: &str, bytes: &[u8]| -> Result<()> {
+            if !store::chat_visual_kind(mime) {
+                return Ok(());
+            }
+            super::visual_delivery_bytes(mime, bytes)?;
+            let alias = self.resolve_alias(crate::master::ALIAS)?;
+            self.adapter_for(&alias)?.preflight_turn_images()
+        };
         let file = match (app.as_ref(), conversation) {
             (None, selected) => {
                 let thread_id = self.prove_home_conversation(selected)?;
@@ -405,9 +419,12 @@ impl Shared {
                     roots,
                     &tmp,
                     name,
-                    store::CHAT_FILE_SCOPE_HOME,
-                    "",
-                    (&account_id, &thread_id),
+                    store::ChatFileUpload {
+                        scope: store::CHAT_FILE_SCOPE_HOME,
+                        context_id: "",
+                        owner: (&account_id, &thread_id),
+                        deliverable: visual,
+                    },
                 )?
             }
             (Some(_), None) => {
@@ -441,30 +458,16 @@ impl Shared {
                         roots,
                         &tmp,
                         name,
-                        &scope,
-                        &context,
-                        (&account_id, conversation),
+                        store::ChatFileUpload {
+                            scope: &scope,
+                            context_id: &context,
+                            owner: (&account_id, conversation),
+                            deliverable: visual,
+                        },
                     )
                 })?
             }
         };
-        // CAD-2162: a visual attachment is marked ready only when this build
-        // can actually deliver it. Prove the content here — an SVG screen and
-        // render, a raster decode inside the bounds — and the selected model's
-        // image support, so the composer never shows a ready chip that a send
-        // must then refuse. Delivery re-proves scope, digest and the model.
-        if store::chat_visual_kind(&file.mime) {
-            let bytes = self.store.chat_file_ready_checked_in_roots(
-                &pm_dir,
-                &self.upload_workspace_dir,
-                &file,
-                store::CHAT_FILE_MAX_BYTES,
-            )?;
-            let mut visual_bytes = 0u64;
-            super::preflight_attachment_visual(&file, &bytes, &mut visual_bytes)?;
-            let alias = self.resolve_alias(crate::master::ALIAS)?;
-            self.adapter_for(&alias)?.preflight_turn_images()?;
-        }
         Ok(file.to_json())
     }
 

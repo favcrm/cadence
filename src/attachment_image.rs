@@ -263,9 +263,26 @@ pub fn validate_svg_source(source: &str) -> Result<()> {
                 // judge that same joined text: a comment must not split a
                 // forbidden token into two harmless halves.
                 if name == "style" {
+                    // The renderer concatenates a stylesheet's character data
+                    // and strips comments, so judge exactly that: the direct
+                    // text children, joined once. Element children are refused
+                    // rather than descended into, because reading the whole
+                    // subtree per `<style>` would let nested styles duplicate
+                    // the same text until this screen itself became the denial
+                    // of service.
                     let mut stylesheet = String::new();
-                    for child in node.descendants().filter(|child| child.is_text()) {
-                        stylesheet.push_str(child.text().unwrap_or_default());
+                    for child in node.children() {
+                        match child.node_type() {
+                            roxmltree::NodeType::Text => {
+                                stylesheet.push_str(child.text().unwrap_or_default());
+                            }
+                            roxmltree::NodeType::Comment => {}
+                            _ => {
+                                return Err(Error::rejected(
+                                    "the SVG was refused: a stylesheet may not contain elements",
+                                ));
+                            }
+                        }
                     }
                     check_svg_value(&stylesheet)?;
                 }

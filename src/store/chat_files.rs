@@ -687,6 +687,16 @@ pub fn visual_kind(mime: &str) -> bool {
     crate::attachment_image::visual_mime(mime)
 }
 
+/// One `chat_file_put_for_user` call: the scope it lands in, the owner it binds
+/// to, and the caller's own delivery proof for the exact bytes about to be
+/// published. Grouped so the retention call keeps a readable signature.
+pub struct ChatFileUpload<'a, F> {
+    pub scope: &'a str,
+    pub context_id: &'a str,
+    pub owner: (&'a str, &'a str),
+    pub deliverable: F,
+}
+
 impl Store {
     /// Resolve a durable account for a server-verified principal. The principal
     /// is hashed before storage; display names and caller-supplied labels must
@@ -932,15 +942,22 @@ impl Store {
     /// tree. The legacy PM root is used only for the shared quota lock; the
     /// anonymous custody stage and final hard link are on the destination
     /// operational filesystem, and ownership is versioned in SQLite.
-    pub fn chat_file_put_for_user(
+    pub fn chat_file_put_for_user<F>(
         &self,
         roots: ChatFileOperationalRoots<'_>,
         tmp: &Path,
         name: &str,
-        scope: &str,
-        context_id: &str,
-        owner: (&str, &str),
-    ) -> Result<ChatFile> {
+        plan: ChatFileUpload<'_, F>,
+    ) -> Result<ChatFile>
+    where
+        F: Fn(&str, &[u8]) -> Result<()>,
+    {
+        let ChatFileUpload {
+            scope,
+            context_id,
+            owner,
+            deliverable,
+        } = plan;
         let (user_id, thread_id) = owner;
         if !valid_upload_account_id(user_id) || !valid_native_thread_id(thread_id) {
             return Err(Error::rejected(
@@ -976,6 +993,11 @@ impl Store {
             self.chat_file_ready_checked_bytes(&existing, actual)?;
             return Ok(existing);
         }
+        // The caller's own delivery proof runs on the exact bytes about to be
+        // published, before any custody or quota is committed: a visual kind
+        // that cannot be screened, rendered or admitted by the selected model
+        // is refused here, so nothing is retained, charged or reported ready.
+        deliverable(&mime, &bytes)?;
         enforce_workspace_quota(
             self,
             &legacy_root,

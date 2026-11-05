@@ -5102,27 +5102,30 @@ fn thread_attachments(
     ))
 }
 
-/// One visual attachment's pre-send delivery proof: conversion or accepted
-/// bytes, and the exact bytes contributed to the combined turn-image bound.
-/// The same check re-runs at delivery.
+/// One visual attachment's delivery proof: an SVG is screened and rendered, a
+/// raster is already decoded, and the result is the exact byte count it
+/// contributes to the combined turn-image bound. The same proof re-runs at
+/// delivery.
+fn visual_delivery_bytes(mime: &str, bytes: &[u8]) -> Result<u64> {
+    if mime != "image/svg+xml" {
+        return Ok(bytes.len() as u64);
+    }
+    let (_, raster) = crate::attachment_image::rasterize_svg(bytes)
+        .map_err(|e| Error::rejected(format!("the SVG cannot be delivered as an image: {e}")))?;
+    Ok(raster.len() as u64)
+}
+
+/// The aggregate form used on the send path: add one attachment's delivered
+/// bytes to the turn's running total.
 fn preflight_attachment_visual(
     file: &store::ChatFile,
     bytes: &[u8],
     visual_bytes: &mut u64,
 ) -> Result<()> {
-    let delivered: u64 = if file.mime == "image/svg+xml" {
-        let (_, raster) = crate::attachment_image::rasterize_svg(bytes).map_err(|e| {
-            Error::rejected(format!(
-                "attachment '{}' cannot be delivered as an image: {e}",
-                file.id
-            ))
-        })?;
-        raster.len() as u64
-    } else if store::chat_visual_kind(&file.mime) {
-        file.size
-    } else {
+    if !store::chat_visual_kind(&file.mime) {
         return Ok(());
-    };
+    }
+    let delivered = visual_delivery_bytes(&file.mime, bytes)?;
     *visual_bytes = visual_bytes
         .checked_add(delivered)
         .ok_or_else(|| Error::rejected("native image sizes overflow"))?;

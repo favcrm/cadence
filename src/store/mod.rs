@@ -114,7 +114,7 @@ pub use artifacts::{
 mod chat_files;
 pub use chat_files::{
     text_kind as chat_text_kind, valid_id as chat_file_id, visual_kind as chat_visual_kind,
-    ChatFile, ChatFileOperationalRoots, ChatFileStorageRoots, CHAT_FILE_MAX_BYTES,
+    ChatFile, ChatFileOperationalRoots, ChatFileStorageRoots, ChatFileUpload, CHAT_FILE_MAX_BYTES,
     CHAT_FILE_MAX_PER_MESSAGE, CHAT_FILE_SCOPE_HOME, CHAT_FILE_TEXT_CAP, CHAT_QUOTA_CODE,
 };
 mod assistants;
