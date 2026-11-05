@@ -484,6 +484,12 @@ export default function Composer({
     if (refocusAfterSend) box.current?.focus();
   };
 
+  // A bare refused verb is a typo, so the next keystroke replaces it instead of
+  // joining it (`/nosuch/new`). Words after a verb are the person's to edit.
+  const keepRefused = (arg: string) => {
+    if (arg === "") box.current?.select();
+  };
+
   const submit = () => {
     const body = draft.trim();
     // `block` is also "not an operator" in an app pane — the box and
@@ -517,6 +523,7 @@ export default function Composer({
     if (cmd && !menu && onCommand !== undefined) {
       // A compact pane with its own commands (`/new`): exact verb.
       if (onCommand(cmd.name, cmd.arg) !== false) finishCommand();
+      else keepRefused(cmd.arg);
     } else if (cmd && !menu) {
       // An unsupported slash verb is never forwarded as chat — the
       // composer refuses it in place. Full-density menus cannot reach
@@ -525,6 +532,7 @@ export default function Composer({
       return;
     } else if (cmd) {
       if (onCommand?.(cmd.name, cmd.arg) !== false) finishCommand();
+      else keepRefused(cmd.arg);
     } else {
       // Capture the ready rows by key+generation, not by file id: two
       // distinct rows can legitimately share a dedup id, and a later row

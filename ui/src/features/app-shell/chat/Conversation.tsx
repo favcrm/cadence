@@ -2398,8 +2398,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         storeKey={composerKey}
         onSend={({ body, refs, attachments, mediaRefs }) => send(body, refs, attachments, mediaRefs)}
         onSubmitted={engage}
-        onCommand={(name) => {
+        onCommand={(name, arg) => {
           if (name === "new" || name === "clear") {
+            if (arg) {
+              setComposerNotice({ key: 'Command "/{name}" takes nothing after its name — it was not sent', slots: { name } });
+              return false;
+            }
             startNew();
             return true;
           }

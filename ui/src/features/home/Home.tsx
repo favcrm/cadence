@@ -375,6 +375,8 @@ interface CmdResult {
   text?: string;
   /** This board cannot run the command: nothing was sent, and nothing failed. */
   unavailable?: boolean;
+  /** The verb exists, but what was typed was not a use of it: nothing was sent. */
+  notRun?: boolean;
   /** A JSON answer — listed as fields, with raw JSON one toggle away. */
   value?: unknown;
 }
@@ -428,6 +430,8 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
           <span className="steps-running text-ink-500">{t("running…")}</span>
         ) : cmd.unavailable ? (
           <span className="text-ink-500">{t("not available")}</span>
+        ) : cmd.notRun ? (
+          <span className="text-ink-500">{t("not run")}</span>
         ) : cmd.ok === false ? (
           <span className="text-fail">{t("failed")}</span>
         ) : (
@@ -1352,6 +1356,14 @@ function MasterHome({
           { id, name, unavailable: true, text: t("This command isn't available in this workspace. `/help` lists what is.") },
         ]);
         return arg ? false : undefined;
+      }
+      // `/new hire starts Monday` is a sentence, not a request to start over.
+      if (arg && known.arg === undefined) {
+        setCmds((c) => [
+          ...c,
+          { id, name, notRun: true, text: t("This command takes nothing after its name, so it did not run.") },
+        ]);
+        return false;
       }
       setCmds((c) => [...c, { id, name, arg: arg || undefined, running: true }]);
       api

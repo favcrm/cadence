@@ -277,6 +277,34 @@ for (const [state, words] of [["none", "No browser session"], ["ended", "Session
   await React.act(async () => { await store.refreshBrowser(); });
   await settle();
   assert(el(m.host, ".bz-card"), "a session brings the card");
+  board.body = { state: "ended", signedIn: false, url: null, instructions: null };
+  await React.act(async () => { await store.refreshBrowser(); });
+  await settle();
+  assert(!el(m.host, ".bz-card"), "an ended session leaves no card under the live turn");
+  await m.unmount();
+}
+
+// ===== "drafting" belongs to the document being changed, not to any running turn =====
+{
+  const m = await start({ state: "none" });
+  const doc = { id: "art-html1", version: 1, kind: "html" as const, title: "Doc", bytes: 12 };
+  await React.act(async () => { canvasStore.openArtifact(doc); });
+  await settle();
+  const feed = async (updating: string[]) => {
+    await React.act(async () => {
+      canvasStore.feedCanvas({ conversation: "c1", surface: "home", composerKey: "home", cards: [{ key: "art-html1@1", ref: doc, live: false, operatorTurn: false, turn: "t0" }], working: { turn: "t1", updating }, turn: "t1" });
+    });
+    await settle();
+  };
+  const buttons = () => Array.from(m.host.querySelectorAll<HTMLButtonElement>(".cv-tools button")).filter((b) => ["Download", "Ask to change"].includes(b.textContent ?? ""));
+  await feed([]);
+  assert(!el(m.host, "[data-canvas-working]"), "a turn elsewhere draws no bar on this document");
+  assert(text(el(m.host, ".artbadge")!) === "ready", "and it reads ready");
+  assert(buttons().length === 2 && buttons().every((b) => !b.disabled), "and Download and Ask to change stay enabled");
+  await feed(["art-html1"]);
+  assert(el(m.host, "[data-canvas-working]"), "a version on its way draws the bar");
+  assert(text(el(m.host, ".artbadge")!) === "drafting", "and it reads drafting");
+  assert(buttons().every((b) => b.disabled), "and both wait for it");
   await m.unmount();
 }
 
