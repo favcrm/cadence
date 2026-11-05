@@ -235,6 +235,14 @@ impl Deliverable {
     }
 }
 
+struct ReportDetails<'a> {
+    state: &'a str,
+    text: Option<&'a str>,
+    head: Option<&'a str>,
+    work_kind: Option<WorkKind>,
+    deliverable: Option<&'a Deliverable>,
+}
+
 #[derive(Clone)]
 struct Assignment {
     assignment_id: String,
@@ -2033,11 +2041,13 @@ impl<H: CoordHttp> Coordinator<H> {
             &claimed.assignment_id,
             claim_id,
             claimed.generation,
-            "blocked",
-            Some(&text),
-            None,
-            claimed.non_code_kind(),
-            None,
+            ReportDetails {
+                state: "blocked",
+                text: Some(&text),
+                head: None,
+                work_kind: claimed.non_code_kind(),
+                deliverable: None,
+            },
         )
         .map(|_| true)
     }
@@ -2201,11 +2211,13 @@ impl<H: CoordHttp> Coordinator<H> {
                 &claimed.assignment_id,
                 &claim_id,
                 generation,
-                "running",
-                None,
-                None,
-                current.non_code_kind(),
-                None,
+                ReportDetails {
+                    state: "running",
+                    text: None,
+                    head: None,
+                    work_kind: current.non_code_kind(),
+                    deliverable: None,
+                },
             )?;
         }
         // Repo-less work stays repo-less: no lane, no checkout, no head.
@@ -2375,12 +2387,15 @@ impl<H: CoordHttp> Coordinator<H> {
         assignment: &str,
         claim_id: &str,
         generation: u64,
-        state: &str,
-        text: Option<&str>,
-        head: Option<&str>,
-        work_kind: Option<WorkKind>,
-        deliverable: Option<&Deliverable>,
+        report: ReportDetails<'_>,
     ) -> Result<Assignment> {
+        let ReportDetails {
+            state,
+            text,
+            head,
+            work_kind,
+            deliverable,
+        } = report;
         if !prefixed_id(assignment, "hla_") || !prefixed_id(claim_id, "hlc_") {
             return Err(Error::rejected("report is missing its claim"));
         }
@@ -3134,11 +3149,13 @@ impl<H: CoordHttp> Coordinator<H> {
                 assignment,
                 &claim_id,
                 generation,
-                state,
-                text,
-                head,
-                kind,
-                deliverable,
+                ReportDetails {
+                    state,
+                    text,
+                    head,
+                    work_kind: kind,
+                    deliverable,
+                },
             )?
             .to_json())
     }
@@ -3676,11 +3693,13 @@ mod assignment_contract_tests {
                 "hla_00000000-0000-4000-8000-000000000001",
                 "hlc_00000000-0000-4000-8000-000000000001",
                 1,
-                "running",
-                None,
-                None,
-                None,
-                None,
+                ReportDetails {
+                    state: "running",
+                    text: None,
+                    head: None,
+                    work_kind: None,
+                    deliverable: None,
+                },
             )
             .err()
             .unwrap();
@@ -3694,11 +3713,13 @@ mod assignment_contract_tests {
                 "hla_00000000-0000-4000-8000-000000000001",
                 "hlc_00000000-0000-4000-8000-000000000001",
                 1,
-                "running",
-                None,
-                None,
-                None,
-                None,
+                ReportDetails {
+                    state: "running",
+                    text: None,
+                    head: None,
+                    work_kind: None,
+                    deliverable: None,
+                },
             )
             .err()
             .unwrap();
@@ -3754,11 +3775,13 @@ mod assignment_contract_tests {
                 &original.assignment_id,
                 original.claim_id.as_deref().unwrap(),
                 original.generation,
-                "result",
-                Some("Confirmed terminal report"),
-                Some(head),
-                None,
-                None,
+                ReportDetails {
+                    state: "result",
+                    text: Some("Confirmed terminal report"),
+                    head: Some(head),
+                    work_kind: None,
+                    deliverable: None,
+                },
             )
             .err()
             .unwrap();
