@@ -1846,7 +1846,12 @@ impl Pm {
     fn interrupted_error(&self, i: &Interruption, meta: Option<&MarkerMeta>) -> Error {
         const SHOW: usize = 8;
         let more = i.named.len().saturating_sub(SHOW);
-        let named: Vec<&str> = i.named.iter().take(SHOW).map(String::as_str).collect();
+        let named: Vec<String> = i
+            .named
+            .iter()
+            .take(SHOW)
+            .map(|name| interrupted_entry(name))
+            .collect();
         let tail = if more > 0 {
             format!(" (+{more} more)")
         } else {
@@ -1862,22 +1867,42 @@ impl Pm {
         };
         let trailer = match meta {
             Some(m) => format!(
-                " The crashed writer's marker said: {}.",
+                " The marker from the crashed writer said: {}.",
                 describe_holder(&HolderScan::NoneFound, Some(m))
             ),
             None => String::new(),
         };
-        Error::rejected(format!(
-            "the tracker has an interrupted write: a writer exited without \
-             finishing, leaving {}{tail}. Nothing was replayed or committed and \
-             the lock itself is free.{foreign} The write's outcome is uncertain — check \
-             {} and `cadence issue lint`, then commit or discard \
-             those paths yourself; writes touching them resume once they are resolved, \
-             while writes to disjoint paths (via lock_for_paths) proceed.{trailer}",
-            named.join(", "),
-            crate::printed_command::with_path("git -C", &self.dir, " status")
+        Error::rejected(interrupted_text(
+            &self.dir,
+            &named.join(", "),
+            &tail,
+            &foreign,
+            &trailer,
         ))
     }
+}
+
+/// One `"{kind} {path}"` entry for the refusal, each word sanitized on its own so
+/// the label still reads and a checker can still look for it.
+fn interrupted_entry(name: &str) -> String {
+    name.split(' ')
+        .map(crate::printed_command::sanitized)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The refusal for an interrupted write. A person may paste the whole line, so it has
+/// no apostrophe in its fixed words: one would flip the quoting around the path.
+fn interrupted_text(dir: &Path, named: &str, tail: &str, foreign: &str, trailer: &str) -> String {
+    format!(
+        "the tracker has an interrupted write: a writer exited without \
+         finishing, leaving {named}{tail}. Nothing was replayed or committed and \
+         the lock itself is free.{foreign} The outcome of the write is uncertain — check \
+         {} and `cadence issue lint`, then commit or discard \
+         those paths yourself; writes touching them resume once they are resolved, \
+         while writes to disjoint paths (via lock_for_paths) proceed.{trailer}",
+        crate::printed_command::with_path("git -C", dir, " status")
+    )
 }
 
 const LEGACY_GENERATION_FILE: &str = "cadence-legacy-generation";
@@ -2053,5 +2078,45 @@ mod tests {
         let got = pm.lock().expect("an untracked file is not blamed");
         drop(got);
         assert_eq!(std::fs::read(&old).unwrap(), b"foreign/old.txt\0");
+    }
+}
+
+#[cfg(test)]
+mod printed_text_tests {
+    use super::*;
+    use crate::printed_command::tests::{assert_inert_when_pasted, CRAFTED};
+
+    #[test]
+    fn an_interrupted_write_message_is_inert_when_the_whole_line_is_pasted() {
+        for name in CRAFTED {
+            let dir = Path::new("/repo").join(name);
+            let named = interrupted_entry(&format!("untracked {name}/issue.md"));
+            let text = interrupted_text(&dir, &named, "", " extra", " marker");
+            assert_inert_when_pasted(&text);
+            // Without the fixed `(`, which stops a shell before it reads the rest.
+            assert_inert_when_pasted(&text.replace(['(', ')'], ""));
+        }
+    }
+
+    /// An apostrophe in the fixed words would flip the quoting around the path. The
+    /// only two here are the ones quoting the path.
+    #[test]
+    fn the_interrupted_write_message_has_no_apostrophe_of_its_own() {
+        let text = interrupted_text(Path::new("/repo"), "staged a.md", "", "", "");
+        assert_eq!(text.matches('\'').count(), 2, "{text}");
+    }
+
+    /// Labels stay readable, and a check for a blamed path can still fail.
+    #[test]
+    fn an_interrupted_entry_keeps_its_label_and_sanitizes_each_word() {
+        assert_eq!(
+            interrupted_entry("staged crashed/issue.md"),
+            "staged crashed/issue.md"
+        );
+        assert_eq!(
+            interrupted_entry("git state MERGE_HEAD"),
+            "git state MERGE_HEAD"
+        );
+        assert_eq!(interrupted_entry("untracked x;y"), "untracked x?y");
     }
 }

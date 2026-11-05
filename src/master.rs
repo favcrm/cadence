@@ -890,7 +890,8 @@ impl Login {
 }
 
 /// The command that gives the master its own Claude login (operator
-/// decision, 2026-09-24: a separate login is the default).
+/// decision, 2026-09-24: a separate login is the default), or the same in words
+/// when the state dir cannot be printed as a safe command.
 pub fn login_command(state_dir: &Path) -> String {
     use crate::printed_command::{bare_command, Part};
     bare_command(&[
@@ -899,8 +900,8 @@ pub fn login_command(state_dir: &Path) -> String {
         Part::Fixed(" claude auth login"),
     ])
     .unwrap_or_else(|| {
-        "Set CLAUDE_CONFIG_DIR to the master claude directory under the state dir, whose path \
-         cannot be printed as a safe command, then run claude auth login"
+        "Set CLAUDE_CONFIG_DIR to master/claude under the state dir, whose path cannot be \
+         printed as a safe command, then run claude auth login"
             .to_string()
     })
 }
@@ -946,7 +947,8 @@ pub fn has_login_for(provider: &str, state_dir: &Path) -> bool {
     }
 }
 
-/// The command that gives the master its own login for `provider`.
+/// The command that gives the master its own login for `provider`, or the same in
+/// words when the state dir cannot be printed as a safe command.
 /// Pi has no non-interactive login verb — the operator runs the TUI
 /// against the master's config dir and types `/login`.
 pub fn login_command_for(provider: &str, state_dir: &Path) -> String {
@@ -959,8 +961,8 @@ pub fn login_command_for(provider: &str, state_dir: &Path) -> String {
                 Part::Fixed(" pi  # then type /login"),
             ])
             .unwrap_or_else(|| {
-                "Set PI_CODING_AGENT_DIR to the master pi directory under the state dir, whose \
-                 path cannot be printed as a safe command, then run pi and type /login"
+                "Set PI_CODING_AGENT_DIR to master/pi under the state dir, whose path cannot be \
+                 printed as a safe command, then run pi and type /login"
                     .to_string()
             })
         }
@@ -1957,12 +1959,7 @@ mod tests {
                 assert!(!shown.contains("touch owned"), "{shown:?}");
                 assert!(shown.contains("cannot be printed"), "{shown:?}");
 
-                // As a person would paste it: nothing runs but a harmless missing command.
-                let root = tempfile::tempdir().unwrap();
-                let mut shell = std::process::Command::new("sh");
-                shell.arg("-c").arg(&shown).current_dir(root.path());
-                crate::reaper::output(&mut shell).unwrap();
-                assert!(!root.path().join("owned").exists(), "{shown:?}");
+                crate::printed_command::tests::assert_inert_when_pasted(&shown);
             }
         }
     }

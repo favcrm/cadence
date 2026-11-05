@@ -478,7 +478,7 @@ struct ContinuityBindReply {
 }
 
 fn continuity_unknown(dir: &Path) -> Error {
-    let shown = dir.display();
+    let shown = crate::printed_command::shown(dir);
     let command = match crate::printed_command::path_arg(dir) {
         Some(arg) => format!("`cadence remote enrollment bind-continuity --enrollment-dir {arg}`"),
         None => "`cadence remote enrollment bind-continuity` with --enrollment-dir set to that \
@@ -522,7 +522,7 @@ pub fn bind_browser(dir: &Path) -> Result<ContinuityInfo> {
     private_dir(dir, false)?;
     let _guard = lock(dir, true)?;
     let enrollment = read_locked(dir)?;
-    enrollment.valid(now()?)?;
+    valid_for_continuity(dir, &enrollment)?;
     require_trusted_issuer(dir, &enrollment.issuer)?;
     if enrollment.source != EnrollmentSource::Browser {
         return Err(reject(
@@ -665,16 +665,21 @@ fn private_dir(dir: &Path, create: bool) -> Result<()> {
 /// writes a literal backslash-n into the pin. `printed_command` keeps backslashes out
 /// of the values, so `echo` writes them unchanged.
 fn missing_pin_remedy(issuer: &str, file: &Path) -> String {
-    use crate::printed_command::{arg, path_arg};
+    use crate::printed_command::{arg, path_arg, shown};
     match (arg(issuer), path_arg(file)) {
         (Some(issuer), Some(path)) => format!(
             "Trusted issuer pin is missing. Create it yourself, then retry: \
              echo {issuer} > {path} && chmod 600 {path}"
         ),
-        _ => format!(
-            "Trusted issuer pin is missing. Create {} yourself with the issuer as its only \
-             line, mode 600, then retry (this path or issuer cannot be printed as a safe command)",
-            file.display()
+        (Some(issuer), None) => format!(
+            "Trusted issuer pin is missing. Create {} yourself with {issuer} as its only line, \
+             mode 600, then retry (this path cannot be printed as a safe command)",
+            shown(file)
+        ),
+        (None, _) => format!(
+            "Trusted issuer pin is missing. Create {} yourself with the issuer as its only line, \
+             mode 600, then retry (this issuer cannot be printed as a safe command)",
+            shown(file)
         ),
     }
 }
@@ -1822,12 +1827,27 @@ pub fn with_current<T>(
     record.valid(now()?)?;
     record.with_pin(pin, send)?
 }
+/// Check the record. Re-enrolling in a directory with continuity state would spend a
+/// consent and then refuse, because that state belongs to the old child, so say so first.
+fn valid_for_continuity(dir: &Path, enrollment: &Enrollment) -> Result<()> {
+    enrollment.valid(now()?).map_err(|error| {
+        if fs::symlink_metadata(dir.join(CONTINUITY_RECORD)).is_ok() {
+            reject(
+                "Hosted enrollment is invalid or expired and this directory has continuity \
+                 state; repeat `browser` with owner consent in a new private enrollment directory",
+            )
+        } else {
+            error
+        }
+    })
+}
+
 pub fn current(dir: &Path) -> Result<EnrollmentInfo> {
     private_dir(dir, false)?;
     let _guard = lock(dir, false)?;
     let record = read_locked(dir)?;
     require_trusted_issuer(dir, &record.issuer)?;
-    record.valid(now()?)?;
+    valid_for_continuity(dir, &record)?;
     Ok(record.info())
 }
 /// Explicit renewal uses the previously stored service credential. The issuer
@@ -2093,7 +2113,7 @@ fn post_continuity(issuer: &str, path: &str, bearer: &str, body: Value) -> Resul
             reject("Hosted continuity issuer redirect refused")
         });
     }
-    if status != 200 && !matches!(status, 401 | 403 | 409 | 503) {
+    if status != 200 && !matches!(status, 401 | 403 | 404 | 409 | 503) {
         return Err(if bind {
             uncertain()
         } else {
@@ -2113,6 +2133,9 @@ fn post_continuity(issuer: &str, path: &str, bearer: &str, body: Value) -> Resul
         } else {
             ContinuityRefusal::Invalid.error()
         });
+    }
+    if status == 404 && !bind {
+        return Err(reject("This issuer does not serve hosted continuity"));
     }
     if status != 200 {
         let refusal = continuity_refusal(status, &bytes);

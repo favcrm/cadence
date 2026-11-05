@@ -6,7 +6,8 @@
 //! runs the rest of a crafted path. Shell syntax has no readable way to write
 //! `'` inside quotes without one of those characters, so the rule is simple: a
 //! printed command must be unchanged by JSON encoding. A value that cannot meet
-//! that is never printed in or beside the command.
+//! that is never printed in or beside the command, and [`shown`] names a path in the
+//! sentence around it, since a person may paste the whole line.
 
 use std::path::Path;
 
@@ -21,11 +22,12 @@ fn deceptive(c: char) -> bool {
 
 /// One single-quoted argument, or `None` when the value has no safe printed form.
 /// A backtick is safe inside the quotes, but [`command`] wraps its output in backticks
-/// and one in the value would end that span early.
+/// and one in the value would end that span early. `$` is safe too, but a refusal
+/// prints inside the double quotes of a JSON string, where it would expand.
 pub(crate) fn arg(value: &str) -> Option<String> {
     let safe = !value
         .chars()
-        .any(|c| matches!(c, '\'' | '\\' | '"' | '`') || c.is_control() || deceptive(c));
+        .any(|c| matches!(c, '\'' | '\\' | '"' | '`' | '$') || c.is_control() || deceptive(c));
     safe.then(|| format!("'{value}'"))
 }
 
@@ -33,6 +35,28 @@ pub(crate) fn arg(value: &str) -> Option<String> {
 /// would name a different path.
 pub(crate) fn path_arg(path: &Path) -> Option<String> {
     arg(path.to_str()?)
+}
+
+/// A path in a sentence near a command. It reads as the path, quoted, so pasting the
+/// whole line cannot run it unless it is the first word, so do not start a sentence
+/// with it. A path that cannot be quoted safely shows as [`sanitized`].
+pub(crate) fn shown(path: &Path) -> String {
+    path_arg(path).unwrap_or_else(|| sanitized(&path.to_string_lossy()))
+}
+
+/// A value with each character that could mean something to a shell as `?`: close
+/// enough to recognise, and inert without quotes.
+pub(crate) fn sanitized(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || "/._-+@:,%=".contains(c) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 /// One piece of a printed command. Only `Fixed` is emitted as written, and it must
@@ -112,8 +136,44 @@ pub(crate) mod tests {
         serde_json::to_string(text).unwrap() == format!("\"{text}\"")
     }
 
+    /// Run a whole message as a person pasting the whole line would, both bare and in
+    /// the JSON a refusal prints as. Anything crafted to run would create `owned` in the
+    /// working directory. `PATH` holds only `touch`: these messages name real commands,
+    /// such as `cadence ui login --rotate`, which must never run from a test.
+    pub(crate) fn assert_inert_when_pasted(message: &str) {
+        let tools = tempfile::tempdir().unwrap();
+        let touch = ["/usr/bin/touch", "/bin/touch"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .expect("touch");
+        std::os::unix::fs::symlink(touch, tools.path().join("touch")).unwrap();
+        let json = serde_json::to_string_pretty(&serde_json::json!({"error": message})).unwrap();
+        for form in [message, json.as_str()] {
+            let root = tempfile::tempdir().unwrap();
+            let mut shell = std::process::Command::new("/bin/sh");
+            shell
+                .arg("-c")
+                .arg(form)
+                .env("PATH", tools.path())
+                .current_dir(root.path());
+            crate::reaper::output(&mut shell).unwrap();
+            assert!(!root.path().join("owned").exists(), "{form:?}");
+        }
+    }
+
+    /// Names built to run `touch owned` when printed raw in a sentence.
+    pub(crate) const CRAFTED: [&str; 6] = [
+        "x;touch owned;y",
+        "x $(touch owned) y",
+        "x`touch owned`y",
+        "x'; touch owned; '",
+        "x\ntouch owned\ny",
+        "x\\'; touch owned; #",
+    ];
+
     /// Paths with no safe printed form.
-    pub(crate) const UNPRINTABLE: [&str; 10] = [
+    pub(crate) const UNPRINTABLE: [&str; 11] = [
+        "/private/x$(touch owned)",
         "/private/x`touch owned`",
         "/private/it's",
         "/private/a'; touch owned; '",
@@ -130,7 +190,7 @@ pub(crate) mod tests {
     fn a_printable_value_is_quoted_and_survives_json() {
         for value in [
             "/private/has space",
-            "/private/$HOME;x$(y)",
+            "/private/x;y",
             "/private/#hash",
             "/private/-n",
             "/private/&|<>*?[a]",
@@ -191,6 +251,21 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn a_path_in_a_sentence_is_inert_and_still_recognisable() {
+        assert_eq!(shown(Path::new("/repo/has space")), "'/repo/has space'");
+        assert_eq!(shown(Path::new("/repo/it's")), "/repo/it?s");
+        assert_eq!(shown(Path::new("/repo/工作's")), "/repo/工作?s");
+        assert_eq!(
+            shown(Path::new(OsStr::from_bytes(b"/repo/\xff"))),
+            "/repo/?"
+        );
+        for name in CRAFTED {
+            let path = format!("/repo/{name}");
+            assert_inert_when_pasted(&format!("left {} in place", shown(Path::new(&path))));
+        }
+    }
+
     /// A refused value appears nowhere in the output, not only outside the command:
     /// a person copies the whole field or the whole line.
     #[test]
@@ -198,11 +273,11 @@ pub(crate) mod tests {
         for value in UNPRINTABLE {
             let parts = [Part::Fixed("chmod 700 "), Part::Path(Path::new(value))];
             assert_eq!(bare_command(&parts), None, "{value:?}");
-            let shown = command(&parts);
-            assert!(!shown.contains(value), "{shown:?}");
-            assert!(shown.contains("cannot be printed"), "{shown:?}");
-            let shown = with_path("chmod 700", Path::new(value), "");
-            assert!(!shown.contains(value), "{shown:?}");
+            let printed = command(&parts);
+            assert!(!printed.contains(value), "{printed:?}");
+            assert!(printed.contains("cannot be printed"), "{printed:?}");
+            let printed = with_path("chmod 700", Path::new(value), "");
+            assert!(!printed.contains(value), "{printed:?}");
         }
     }
 }

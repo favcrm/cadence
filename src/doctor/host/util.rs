@@ -86,21 +86,22 @@ pub(super) fn dir_size_limited(path: &Path, budget: usize) -> (u64, bool, usize)
 
 /// One kill remedy. `comm` and `cwd` belong to another process. They follow a `#`,
 /// but a line break ends that comment, and some shells do not treat `#` as one when
-/// interactive, which makes each word an argument to `kill`. So each is quoted, or `?`
-/// when it has no safe printed form, and labelled: a process named `-1` must not
+/// interactive, which makes each word an argument to `kill`. So each is quoted, or
+/// `unknown` when it has no safe printed form, and labelled: a process named `-1` must not
 /// reach `kill` as a bare word, where it would signal everything this user can.
 pub(super) fn kill_line(pid: impl std::fmt::Display, comm: &str, cwd: &str, age: &str) -> String {
-    // `?` already means unknown here, so it stays bare.
+    // Not a bare `?`: zsh would read it as a glob and refuse the whole line.
     let shown = |value: &str| {
         Some(value)
             .filter(|value| *value != "?")
             .and_then(crate::printed_command::arg)
-            .unwrap_or_else(|| "?".to_string())
+            .unwrap_or_else(|| "unknown".to_string())
     };
     format!(
         "kill {pid}  # comm={}  cwd={}  age={age}",
         shown(comm),
-        shown(cwd)
+        shown(cwd),
+        age = if age == "?" { "unknown" } else { age },
     )
 }
 
@@ -531,11 +532,11 @@ fn age_label(secs: u64) -> String {
     }
 }
 
-/// One `kill <pid>  # <comm>  cwd=<cwd>  age=<age>` line per pid, read
+/// One `kill <pid>  # comm=<comm>  cwd=<cwd>  age=<age>` line per pid, read
 /// from `<proc_root>/<pid>` at report time — an operator sees what each
 /// pid is before signalling it (CAD-257). `comm` is the kernel's short
 /// executable name, never argv. A pid that vanished is omitted; an
-/// unreadable cwd or age prints `?`.
+/// unreadable cwd or age prints `unknown`.
 pub(super) fn kill_lines(proc_root: &Path, pids: &[u32]) -> Vec<String> {
     let uptime = proc_uptime(proc_root);
     pids.iter()

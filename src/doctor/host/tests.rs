@@ -1037,9 +1037,9 @@ fn orphans_flag_deleted_worktrees_and_old_test_binaries() {
                 repo.join(".cadence/wt/gone").display()
             )
             .as_str(),
-            // No cwd link → `?`, never a guess.
-            "kill 22  # comm='t'  cwd=?  age=3h",
-            "kill 23  # comm='t'  cwd=?  age=2h",
+            // No cwd link → unknown, never a guess.
+            "kill 22  # comm='t'  cwd=unknown  age=3h",
+            "kill 23  # comm='t'  cwd=unknown  age=2h",
         ],
         "{}",
         c.remedy
@@ -4720,7 +4720,7 @@ fn a_kill_line_stays_one_line_for_a_crafted_cwd_or_comm() {
     assert_eq!(line, "kill 7  # comm='-1'  cwd='/repo'  age=1m");
     assert_eq!(
         kill_line(7, "?", "?", "?"),
-        "kill 7  # comm=?  cwd=?  age=?"
+        "kill 7  # comm=unknown  cwd=unknown  age=unknown"
     );
     for (comm, cwd) in [
         ("sleep", "/a\ntouch owned\nb"),
