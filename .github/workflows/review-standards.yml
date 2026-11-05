@@ -55,8 +55,11 @@ run-name: review-standards PR ${{ inputs.pr }} at ${{ inputs.head_sha }} # per a
 permissions: {}
 
 concurrency:
-  group: review-standards-${{ inputs.pr }}-${{ inputs.head_sha }} # per axis
-  cancel-in-progress: false
+  # CAD-2198 (from CAD-2194): keyed by PR, not by head, so a newer head cancels an
+  # older review that has not finished. Dispatch now starts two reviews per push, and
+  # a queued run for a superseded head would otherwise buy a model call the gate never reads.
+  group: review-standards-${{ inputs.pr }} # per axis
+  cancel-in-progress: true
 
 env:
   REPO: favcrm/cadence
