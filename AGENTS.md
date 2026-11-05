@@ -136,8 +136,10 @@ the code you just wrote.
   since CAD-2049, refuses the author's principal; local notes count by their
   self-declared `From:` alias, which is not attested. It cannot tell a fresh
   session from the author when both act under one login. Two routes exist.
-  Workflow-issued reviews (below, CAD-2088) are live: dispatch
-  `review-standards.yml` and `review-spec.yml`. The operator's working rule is
+  Workflow-issued reviews (below, CAD-2088) are live: `review-dispatch.yml`
+  starts `review-standards.yml` and `review-spec.yml` for a non-draft,
+  same-repository PR on `main`, on opening, on leaving draft and on each push,
+  so iterate in draft (CAD-2194). The operator's working rule is
   that gate, security, schema and release PRs keep fresh-session Opus reviews and
   the workflow rows are a cheap first pass; on other PRs two workflow rows
   satisfy the requirement. A hosted `routine` PR has no readiness record, so it

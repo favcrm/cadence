@@ -1,7 +1,7 @@
 use super::*;
 
-/// A hosted finish is always a refusal. Local observations are guidance only;
-/// they never authorize cleanup or a local-tracker operation.
+/// Why a hosted lane was not released when no release was attempted: the
+/// observation is guidance only and never authorizes cleanup.
 pub fn refusal<H: CoordHttp>(
     coordinator: &Coordinator<H>,
     issue: Option<&str>,
@@ -17,8 +17,73 @@ pub fn refusal<H: CoordHttp>(
         None => "the lane state cannot be confirmed",
     };
     Error::rejected(format!(
-        "Hosted issue finish does not release lanes; {detail}; leave it for the reconcile sweep"
+        "Hosted issue finish did not release the lane; {detail}. Nothing was removed. \
+         Release needs this machine's recorded lane for the issue, a finished assignment, \
+         a clean idle worktree and a merged branch (pushing alone does not release it). If \
+         the lane cannot be bound, verify yourself that it is merged, that nothing is using \
+         it and that you do not need its ignored files (removal deletes them), then run \
+         `git worktree remove <path>` and `git branch -d <branch>` from the repository; a \
+         squash-merged branch needs `-D`, only after you have verified the merge"
     ))
+}
+
+/// How hosted release asks GitHub for merged PRs: `(owner/repo, head branch)`
+/// to the `gh pr list --json number,headRefOid,baseRefName,mergedAt` array, or
+/// `None` when it could not ask. Tests pass a fake through [`release_with`].
+pub type PrLookup<'a> = &'a dyn Fn(&str, &str) -> Option<Value>;
+
+/// `issue finish <ID>` on a hosted org (CAD-2178): release this machine's
+/// lane for the issue through the native finish guard, with no `--force`.
+/// The lane is bound from the coordinator ledger exactly as [`refusal`]
+/// observes it, and the assignment must have ended — a running or blocked
+/// assignment is a turn inside the lane.
+pub fn release<H: CoordHttp>(
+    coordinator: &Coordinator<H>,
+    issue: &str,
+    selected: Option<&Path>,
+    state_dir: &Path,
+) -> Result<Value> {
+    release_with(
+        coordinator,
+        issue,
+        selected,
+        state_dir,
+        &crate::issue::finish::gh_merged_prs,
+    )
+}
+
+/// [`release`] with the merged-PR lookup supplied (the test seam).
+pub fn release_with<H: CoordHttp>(
+    coordinator: &Coordinator<H>,
+    issue: &str,
+    selected: Option<&Path>,
+    state_dir: &Path,
+    prs: PrLookup<'_>,
+) -> Result<Value> {
+    let Some(lane) = bound_lane(coordinator, issue, selected).ok().flatten() else {
+        return Err(refusal(coordinator, Some(issue), selected));
+    };
+    if !lane.ended {
+        return Err(Error::rejected(format!(
+            "Hosted issue finish did not release the lane for {issue}; its assignment has not \
+             ended (report it `result` or `failed`, or cancel it with `reassign --cancel`, first). Nothing was removed"
+        )));
+    }
+    crate::issue::finish::release_hosted_lane(
+        issue,
+        &lane.root,
+        &lane.path,
+        &lane.branch,
+        state_dir,
+        prs,
+    )
+}
+
+struct BoundLane {
+    root: PathBuf,
+    path: PathBuf,
+    branch: String,
+    ended: bool,
 }
 
 enum LaneState {
@@ -27,11 +92,11 @@ enum LaneState {
     CleanUnverified,
 }
 
-fn observe<H: CoordHttp>(
+fn bound_lane<H: CoordHttp>(
     coordinator: &Coordinator<H>,
     issue: &str,
     selected: Option<&Path>,
-) -> Result<Option<LaneState>> {
+) -> Result<Option<BoundLane>> {
     let lock = remote_cli::private_lock(
         &coordinator.ledger,
         "local-assign",
@@ -40,11 +105,16 @@ fn observe<H: CoordHttp>(
     let ledger = Ledger::load(&coordinator.ledger, &coordinator.org_id)?;
     drop(lock);
     let mut lane = None;
+    let mut ended = true;
     for attempt in ledger.attempts.values().filter(|a| a.issue_id == issue) {
         if attempt.worktree.is_none() && attempt.claim_id.is_none() {
             continue;
         }
-        if attempt.fenced
+        // `reassign --cancel` fences an assignment as it ends it, so an ended
+        // row may be fenced; every other binding field must still match. A
+        // live row must also be unfenced.
+        let row_ended = matches!(attempt.state.as_str(), "result" | "failed" | "cancelled");
+        if (attempt.fenced && !row_ended)
             || attempt.claim_id.is_none()
             || attempt.lane_claim != attempt.claim_id
             || attempt.generation.is_none()
@@ -59,6 +129,7 @@ fn observe<H: CoordHttp>(
             return Ok(None);
         }
         lane = Some(candidate);
+        ended &= matches!(attempt.state.as_str(), "result" | "failed" | "cancelled");
     }
     let Some((path, lane)) = lane else {
         return Ok(None);
@@ -73,6 +144,26 @@ fn observe<H: CoordHttp>(
     }
     let branch = layout::branch(lane);
     worktree::validate_registered_branch(&root, path, &branch)?;
+    Ok(Some(BoundLane {
+        root,
+        path: path.to_path_buf(),
+        branch,
+        ended,
+    }))
+}
+
+fn observe<H: CoordHttp>(
+    coordinator: &Coordinator<H>,
+    issue: &str,
+    selected: Option<&Path>,
+) -> Result<Option<LaneState>> {
+    let Some(BoundLane {
+        root, path, branch, ..
+    }) = bound_lane(coordinator, issue, selected)?
+    else {
+        return Ok(None);
+    };
+    let path = path.as_path();
     use crate::issue::finish::{git, merge_rule};
     if !git(
         path,
@@ -185,7 +276,7 @@ mod tests {
 
         let clean = refusal(&coord, Some("CAD-1"), None).to_string();
         assert!(
-            clean.contains("reconcile sweep")
+            clean.contains("did not release")
                 && clean.contains("clean")
                 && clean.contains("merged"),
             "{clean}"
@@ -193,21 +284,21 @@ mod tests {
         fs::write(lane.join("file"), "new work\n").unwrap();
         let dirty = refusal(&coord, Some("CAD-1"), None).to_string();
         assert!(
-            dirty.contains("reconcile sweep") && dirty.contains("uncommitted"),
+            dirty.contains("did not release") && dirty.contains("uncommitted"),
             "{dirty}"
         );
         git(&lane, &["add", "file"]);
         git(&lane, &["commit", "-m", "work"]);
         let unmerged = refusal(&coord, Some("CAD-1"), None).to_string();
         assert!(
-            unmerged.contains("reconcile sweep") && unmerged.contains("cannot be confirmed"),
+            unmerged.contains("did not release") && unmerged.contains("cannot be confirmed"),
             "{unmerged}"
         );
         git(&repo, &["merge", "--ff-only", "cadence/test"]);
         git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         let merged = refusal(&coord, Some("CAD-1"), None).to_string();
         assert!(
-            merged.contains("reconcile sweep")
+            merged.contains("did not release")
                 && merged.contains("clean")
                 && merged.contains("merged"),
             "{merged}"
@@ -216,7 +307,7 @@ mod tests {
         assert!(wrong_lane.contains("cannot be confirmed"), "{wrong_lane}");
         let missing = refusal(&coord, Some("CAD-2"), None).to_string();
         assert!(
-            missing.contains("reconcile sweep") && missing.contains("cannot"),
+            missing.contains("did not release") && missing.contains("cannot"),
             "{missing}"
         );
         fs::write(repo.join("main-only"), "main\n").unwrap();

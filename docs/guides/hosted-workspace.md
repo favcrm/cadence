@@ -508,11 +508,35 @@ selected workspace's supported ticket update, for example:
 cadence --org acme issue set <issue-id> status=done --if-rev <issue-rev>
 ```
 
-Hosted `issue finish` never removes a lane or runs the local tracker finish.
-Its refusal directs the worker to the reconcile sweep and reports a local
-lane observation only when it can identify the recorded checkout and verify
-its state. An unavailable or ambiguous observation does not mean the lane
-is clean or merged; leave it intact for reconciliation.
+`cadence --org <name> issue finish <ID> [--worktree <path>]` (CAD-2178) releases
+the lane this machine started for that issue, and only that lane: it removes the
+worktree and deletes the local branch. It takes no other option; `--force`,
+`--keep-branch`, `--remote`, `--merged` and `--dry-run` are refused on a hosted
+org with nothing removed. The lane is found in this machine's coordinator ledger:
+its claim, generation and lane fields must match the recorded lane, and its
+assignment must have ended (`result`, `failed` or cancelled). An ended row may be
+fenced (`reassign --cancel` fences it); a live row must not be. The command uses
+the native finish in-use guard and refuses, naming the cause, when the worktree
+is dirty (untracked files count whatever `status.showUntrackedFiles` says), has
+recently modified files, a process or agent is inside it, or the branch has not
+started. It never judges whether the content is in the default branch; it asks
+whether the exact tip survives after deletion. Only two things count: the tip is
+an ancestor of `origin/<default branch>` (`origin/HEAD` must be set), or a
+merged PR on `origin`'s own `github.com` repository has a head commit exactly
+equal to the tip, a merge time, and the default branch as its base (GitHub keeps
+that head after a squash). A branch pushed but not merged does not release, and
+neither does a lane merged without a PR, a non-GitHub `origin`, or a case where
+`gh` is missing, not signed in or times out. The release also refuses
+when the worktree holds gitignored files other than top-level `target/` and
+`node_modules/` (for example `.env`, `docs/*`, `docs/target/`), naming a sample,
+because removal deletes them; git reports an ignored directory as one entry, so a
+file kept inside `target/` or `node_modules/` is deleted with it. When the
+refusal will not change (the ledger cannot identify the lane, or no PR or
+ancestry evidence can exist), take the manual path: verify the merge, that
+nothing is using the lane and that you do not need its ignored files, then
+`git worktree remove <path>` and `git branch -d <branch>` (a squash-merged branch
+refuses `-d`; use `-D` only after verifying the merge). `issue reconcile` stays
+native-only.
 
 ### Managing agent profiles from the CLI (CAD-2101)
 

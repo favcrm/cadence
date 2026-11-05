@@ -454,7 +454,15 @@ pub(crate) fn inspect_rest(
     // real changes and non-ignored untracked files do. A status that
     // cannot be read refuses too: an unreadable tree is not a clean one.
     if let Some(d) = t.wt_dir.as_deref().filter(|d| d.is_dir()) {
-        match git(d, &["status", "--porcelain", "--ignored"]) {
+        match git(
+            d,
+            &[
+                "status",
+                "--porcelain",
+                "--ignored",
+                "--untracked-files=normal",
+            ],
+        ) {
             Err(e) => blocks.push(Block {
                 tag: format!("dirty-check-failed: {e}"),
                 reason: format!(

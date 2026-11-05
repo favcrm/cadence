@@ -16,6 +16,7 @@ export interface ScreenPush {
 }
 
 export type ScreenPresentationMode = "outlet" | "drawer";
+export type ScreenSurfaceRole = "primary" | "drawer";
 
 export interface ScreenReceiverOptions {
   boot?: ScreenBoot;
@@ -24,7 +25,19 @@ export interface ScreenReceiverOptions {
   onSlotState?(event: SlotState): void;
   /** CAD-1615: the host names the surface this frame is presented in. */
   onPresentation?(mode: ScreenPresentationMode): void;
-  accepts?: readonly ("screen.v1" | "screen.v2" | "screen-actions.v1" | "screen-presentation.v1")[];
+  /** CAD-1777: the host-derived role and closed drawer surface. */
+  onSurface?(role: ScreenSurfaceRole, surface: string | undefined, modal: boolean): void;
+  accepts?: readonly (
+    | "screen.v1"
+    | "screen.v2"
+    | "screen-actions.v1"
+    | "screen-presentation.v1"
+    | "screen-surfaces.v1"
+    | "screen-records.v1"
+    | "crm-locale.v1"
+  )[];
+  /** Largest JSON args/input bag to send. Defaults to 16 KiB; records CSV is 320 KiB. */
+  maxArgsBytes?: number;
   timeoutMs?: number;
   document?: { getElementById(id: string): { textContent: string | null } | null };
   parent?: { postMessage(message: unknown, origin: string, transfer?: unknown[]): void };
@@ -60,6 +73,10 @@ export interface ScreenReceiver {
   state(data: string): boolean;
   /** The surface the host currently presents this frame in. */
   presentation(): ScreenPresentationMode;
+  /** The host-derived role of this mount. */
+  surfaceRole(): ScreenSurfaceRole;
+  /** The closed drawer surface idiom, when the host named one. */
+  surface(): string | undefined;
   /** Ask the host to present the app's surface in the board-wide drawer. */
   openDrawer(surface: string, options?: { size?: "narrow" | "wide" }): Promise<unknown>;
   /** Ask the host to close the board-wide drawer it opened. */
