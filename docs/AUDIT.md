@@ -40,6 +40,10 @@ cadence audit verdicts --project cadence --issue CAD-92 --pr 84 --head <full-sha
 cadence audit scope --issue CAD-92   # CAD-1106: ticket scope pre-approvals (id, body digest, recorded_via, revoked); exit 0 when the store answered
 ```
 
+On a hosted org, `audit verdicts --body` also prints each note's findings for a
+person or agent to read a `REVISE`. The gate does not read that text and it
+never decides a count; see `docs/guides/hosted-workspace.md`.
+
 CAD-2001: on a hosted org the approval and verdict reads are project-scoped.
 `--project` is required and is the issue's own project — never inferred from
 `--repo` or the cwd, and never a repo's first project — and `audit approval`
@@ -327,8 +331,8 @@ operator secret file. The residual carries over: a same-uid process
 that reads `<state>/operator/secret` and passes the proof can mint a
 link. A process cadence launched (a pane, a managed endpoint, a runner,
 anything the daemon started) must evade the proof — `setsid -f` with a
-scrubbed env and stdio (`operator_secret_theft_residual_pinned` pins
-it). **A same-uid process cadence never launched needs little or no
+scrubbed env and stdio. No test pins this.
+**A same-uid process cadence never launched needs little or no
 evasion**: an agent CLI the operator started by hand, outside every
 registered pane, passes the proof as it is when it carries no known
 marker or runs on another store, and otherwise has to scrub its

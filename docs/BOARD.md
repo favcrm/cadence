@@ -1952,7 +1952,7 @@ operator secret can mint its own link. A process cadence did not
 launch — an agent CLI the operator started by hand, outside every
 pane cadence registered — passes the proof with no evasion at all; an
 agent's `setsid -f` child with a scrubbed env and stdio passes by
-evasion. `operator_secret_theft_residual_pinned` pins the second.
+evasion. No test pins the second.
 
 Agent attribution — which agent a request without a session writes
 as — is unchanged:
