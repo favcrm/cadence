@@ -106,15 +106,22 @@ fn coordinator(target: &RemoteTarget) -> Result<Coordinator<BoardHttp>> {
 }
 pub(super) fn hosted_finish(
     target: &RemoteTarget,
-    issue: Option<&str>,
+    issue: &str,
     worktree: Option<&Path>,
-) -> Error {
-    match coordinator(target) {
-        Ok(coord) => cadence_agent::local_assignment::finish_guidance::refusal(&coord, issue, worktree),
-        Err(_) => Error::rejected(
-            "Hosted issue finish does not release lanes; the lane state cannot be confirmed; leave it for the reconcile sweep",
-        ),
-    }
+    local_state: Option<&Path>,
+) -> Result<Value> {
+    let coord = coordinator(target).map_err(|e| {
+        Error::rejected(format!(
+            "Hosted lane release is unavailable: the coordinator ledger could not be opened ({e}). \
+             Nothing was removed. If the lane's work is merged, remove it yourself with \
+             `git worktree remove <path>` and `git branch -d <branch>`"
+        ))
+    })?;
+    let state = match local_state {
+        Some(dir) => dir.to_path_buf(),
+        None => cadence_agent::client::state_dir()?,
+    };
+    cadence_agent::local_assignment::finish_guidance::release(&coord, issue, worktree, &state)
 }
 
 pub(super) fn run(

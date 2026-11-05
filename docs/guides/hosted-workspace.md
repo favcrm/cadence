@@ -498,11 +498,21 @@ selected workspace's supported ticket update, for example:
 cadence --org acme issue set <issue-id> status=done --if-rev <issue-rev>
 ```
 
-Hosted `issue finish` never removes a lane or runs the local tracker finish.
-Its refusal directs the worker to the reconcile sweep and reports a local
-lane observation only when it can identify the recorded checkout and verify
-its state. An unavailable or ambiguous observation does not mean the lane
-is clean or merged; leave it intact for reconciliation.
+`cadence --org <name> issue finish <ID> [--worktree <path>]` (CAD-2178) releases
+the lane this machine started for that issue, and only that lane: it removes the
+worktree and deletes the local branch. It takes no other option; `--force`,
+`--keep-branch`, `--remote`, `--merged` and `--dry-run` are refused on a hosted
+org with nothing removed. The lane is found in this machine's coordinator ledger
+and must be the recorded, unfenced lane of an assignment that has ended
+(`result`, `failed` or cancelled). It uses the native finish evidence and
+in-use guard and refuses, naming the cause, when the worktree is dirty, has
+uncommitted or recently modified files, a process or agent is inside it, the
+branch has not started, or the branch is not shown merged into the default
+branch (ancestry, patch-equivalent commits, a squash, or a merged PR with that
+tip). Merged is stricter than the native finish: pushed alone does not release a
+hosted lane. When the ledger cannot identify the lane, the refusal says so and
+names the manual path: check it is clean and merged, then `git worktree remove
+<path>` and `git branch -d <branch>`. `issue reconcile` stays native-only.
 
 ### Managing agent profiles from the CLI (CAD-2101)
 
