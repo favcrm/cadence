@@ -1,9 +1,9 @@
 # Cadence board
 
-An internal project tracker: one folder per issue in a private directory,
-one writer implementation (`src/issue/write.rs`) shared by the
-`cadence issue` CLI and the board's HTTP write API, and `cadence ui`
-serving a board + JSON API on loopback.
+The native project tracker keeps one folder per issue in a private directory.
+Its CLI and loopback board HTTP API share the native writer implementation
+(`src/issue/write.rs`). Hosted workspaces use their own storage and supported
+operations; see [hosted workspaces](guides/hosted-workspace.md).
 
 - **Tracker dir:** `~/pm` (or `CADENCE_PM_DIR`) for an existing
   installation; `<home>/tracker` (`~/.cadence/tracker`) for a first run
@@ -558,9 +558,10 @@ existing global checks counter remains for compatibility. `dispatch` reads the
 same section-scoped items: an issue with none is warned about, not refused
 (CAD-159 — see Dispatch and finish).
 
-Every write is exactly one git commit in the PM repo, made under a lock
-file (`~/pm/.lock`) with atomic `issue.md` replacement. Field values are
-validated inside `issue::write` itself — on `new`, `set` and the HTTP
+A native tracker write is recorded in the PM Git repository under the
+tracker write lock, with atomic `issue.md` replacement where applicable.
+Hosted workspace writes use their own storage and supported operations.
+The native `issue::write` validates field values — on `new`, `set` and the HTTP
 PATCH alike — so a bad value can never be committed and lint stays the
 safety net: `status` is one of the six, `priority` is P0–P3, `component`
 must be declared by the issue's project (`""` clears it), `tags` are
@@ -650,10 +651,11 @@ any number of segments, a trailing `/` everything under it — no
 leading `/` or `~`, no empty/`.`/`..` segment, `#`, `\`, `,` or
 control characters; validated by `areas::check_path` and, in slice 3,
 matched by `areas::matches`, so the two grammars can't diverge). `heavy` sits strictly
-under `oversized`. And the safety floor: at least one unconditional
-rule must require an `agent` or `operator` review — a `check` is a bot
-and never satisfies the floor, even `required` (it still blocks where
-a rule names it) — so a merge can never need no review at all.
+under `oversized`. The policy schema requires at least one unconditional
+`agent` or `operator` review rule; a `check` cannot satisfy that schema
+floor. The shared requirements evaluator can nevertheless classify an
+eligible routine change with zero mandatory reviews. Required checks, outcome
+evidence and any additional downstream gate still apply.
 
 While the file's section is not the approved one, every reader falls
 back — to the approved policy, else the defaults — and reports the
@@ -666,8 +668,9 @@ agent cannot swap a stricter policy for the defaults silently. The
 notes: `delivery_unapproved: …` when the section changed, was removed
 or is malformed since approval (the approved policy stays in force),
 and `delivery_error: …` when it is malformed with none; `issue lint`
-warns the same. Nothing in the delivery loop consumes the policy until
-CAD-814 slices 2–5.
+warns the same. The shared requirements evaluator consumes the effective
+policy and trusted change evidence; the final enqueue gate can impose further
+requirements. Inspect the actual result for the target and exact head.
 
 ## Multi-host trackers — `issue sync`
 
@@ -694,9 +697,9 @@ lints but leaves the push for a later sync. `issue doctor` reports the
 same ahead/behind counts against `origin/<branch>` and points at
 `issue sync` whenever the local side is behind.
 
-## History — from git alone
+## Native tracker history — from git
 
-Every write is one commit whose subject carries the verb
+A native tracker write is recorded as a commit whose subject carries the verb
 (`CAD-16: set status=review (operator (ui))`), so the tracker's own
 log is the audit trail. Each commit also carries trailers after a
 blank line: `Issue: <ID>` once per issue the write touches (link and
@@ -1863,11 +1866,11 @@ review, verification authorization, or finalization.
 
 ### API — writes
 
-Every issue write goes through `issue::write` — the same functions the
-CLI runs — so the API is a second front door, not a second writer. Memory
-authority is separate: browser HTTP has no native socket/PTY identity and
-is refused after the normal write guards. Each successful issue call is
-exactly one git commit whose subject carries the actor:
+Native board issue writes go through `issue::write` — the same functions
+the native CLI runs — so its API is a second front door, not a second writer.
+Memory authority is separate: browser HTTP has no native socket/PTY identity
+and is refused after the normal write guards. A successful native issue call
+records a Git commit whose subject carries the actor:
 `CAD-16: set status=review (operator (ui))`.
 
 | Route | Body | Returns |
