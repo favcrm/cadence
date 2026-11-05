@@ -8,6 +8,37 @@ Neither path authorizes an agent to approve or restart production. Follow
 [artifact checklist](guides/rollout-checklist.md); image-managed hosts use the runtime
 image path instead of self-update.
 
+## Stable v0.3.19 (published, immutable)
+
+[Cadence 0.3.19](https://github.com/favcrm/cadence/releases/tag/v0.3.19) was
+published as the stable GitHub Release on 2026-11-05 at 01:11:08 UTC
+(`prerelease=false`, `draft=false`, and the repository's latest release). Its
+annotated tag object is `348a2b88c12fdedfbae1267e98e49ddc9c90c3cb`, peeled to source
+`c11fc9668f7f42bc3e8383182c1525202e6668d8`. The producing
+[tag workflow run 41944358277, attempt 1](https://github.com/favcrm/cadence/actions/runs/41944358277)
+completed successfully: the four tag gates (`fmt`, `clippy`, `build`, `ui`),
+`release-gate`, three native release builds and three exact-candidate native
+installation legs passed before the release environment was approved. Tests run in
+their own workflow, not in the tag gates; the full suite passed on that source in
+[run 41942949656](https://github.com/favcrm/cadence/actions/runs/41942949656).
+
+All nine published HTTPS assets were anonymously downloaded, and the four archives'
+bytes matched their published `.sha256` files. The x86_64 archive's manifest names
+`v0.3.19`, target `x86_64-linux`, runner `ubuntu-22.04`, the source digest above,
+that run and attempt, features `["ui"]` and checks
+`["fmt","clippy","build","ui"]`. The installer is byte-identical to the v0.2.0 and
+v0.3.18 one, SHA-256
+`c335171994e89da9d8d86b3cece9a7de8899a52056b6c42904a5f63dfa33c7e5`.
+The public native clean-install workflow ran its three actual published-URL
+installation legs successfully in
+[run 41947040908](https://github.com/favcrm/cadence/actions/runs/41947040908). The
+owned `public-client` catalogue answers `v0.3.19`.
+
+This record covers the public client release only. It does not promote a native-host
+candidate, install or restart a daemon, or establish operational verification; those
+remain separate operator decisions. A real client-only `update --check` selecting
+this version was not exercised.
+
 ## Stable v0.3.18 (published, immutable)
 
 [Cadence 0.3.18](https://github.com/favcrm/cadence/releases/tag/v0.3.18) was
