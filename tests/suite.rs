@@ -2210,6 +2210,41 @@ mod cad2081_workflow_verdicts {
             routine(vec![alice.clone(), f.spec()]),
             &[NEEDS_BOTH],
         );
+        // Yet an owner row can still refuse: two workflow passes do not outvote a
+        // filed non-pass, or a row from the PR's author.
+        let mut owner_revise = alice.clone();
+        owner_revise["outcome"] = json!("revise");
+        owner_revise["section_outcome"] = json!("revise");
+        check(
+            "an unsuperseded owner revise beside two workflow passes",
+            routine(vec![owner_revise, f.std(), f.spec()]),
+            &["verdict by usr_alice on this head is not a pass (outcome 'revise'"],
+        );
+        let by_author = f.owner(
+            "20261103-000300-author.md",
+            "20261103-000300",
+            "usr_author",
+            "authorlogin",
+            "standards",
+        );
+        check(
+            "the author's login beside two workflow passes",
+            routine(vec![by_author, f.std(), f.spec()]),
+            &["verdict by authorlogin (20261103-000300-author.md) is not independent: the owner attested that login as the PR author"],
+        );
+        let by_second_login = f.owner(
+            "20261103-000300-author.md",
+            "20261103-000300",
+            "usr_author",
+            "secondlogin",
+            "standards",
+        );
+        check(
+            "the author's principal under another login beside two workflow passes",
+            routine(vec![by_second_login, f.std(), f.spec()]),
+            &["verdict by secondlogin (20261103-000300-author.md) is not independent: its principal is the PR author's (usr_author)"],
+        );
+
         // A row that only claims or only names the workflow is neither.
         let mut disguised = f.spec();
         disguised["identity_source"] = json!("owner-attested");
