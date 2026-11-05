@@ -1858,11 +1858,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                     orphan_worktree_key(&root, &rel),
                     project,
                     Sev::Warn,
-                    format!(
-                        "orphan worktree {} — no open PR or issue; inspect, then {}",
-                        crate::printed_command::shown(&root.join(&rel)),
-                        orphan_worktree_remedy(&root, &rel)
-                    ),
+                    orphan_worktree_text(&root, &rel),
                 ));
             }
         }
@@ -2606,6 +2602,27 @@ fn orphan_worktree_key(root: &Path, rel: &str) -> String {
     crate::printed_command::sanitized(&format!("worktree:{}/{rel}", root.display()))
 }
 
+/// The finding's text. It prints through `scrub_line`, which can rewrite across a
+/// quoted span and leave part of a name unquoted, so a name the scrubber would change
+/// gets no command.
+fn orphan_worktree_text(root: &Path, rel: &str) -> String {
+    let path = root.join(rel);
+    let text = format!(
+        "orphan worktree {} — no open PR or issue; inspect, then {}",
+        crate::printed_command::shown(&path),
+        orphan_worktree_remedy(root, rel)
+    );
+    if scrub_line(&text) == text {
+        text
+    } else {
+        format!(
+            "orphan worktree {} — no open PR or issue; inspect, then remove it by hand (its name \
+             cannot be printed as a safe command)",
+            crate::printed_command::sanitized(&path.to_string_lossy())
+        )
+    }
+}
+
 /// The command that removes an orphan worktree. Its directory name comes from
 /// `read_dir`, so it is as untrusted as the checkout's path.
 fn orphan_worktree_remedy(root: &Path, rel: &str) -> String {
@@ -2628,16 +2645,25 @@ mod tests {
             super::orphan_worktree_key(root, ".cadence/wt/cad-1-a"),
             "worktree:/repo/.cadence/wt/cad-1-a"
         );
-        for name in CRAFTED {
+        let scrubbed_shape = ["a;touch owned; Authorization: Basic zzzzzz"];
+        for name in CRAFTED.iter().chain(&scrubbed_shape) {
             let rel = format!(".cadence/wt/{name}");
+            // As it prints: the key, then the text through the scrubber.
             let row = format!(
-                "· [{}] orphan worktree {} — no open PR or issue; inspect, then {}",
+                "· [{}] {}",
                 super::orphan_worktree_key(root, &rel),
-                crate::printed_command::shown(&root.join(&rel)),
-                super::orphan_worktree_remedy(root, &rel),
+                super::scrub_line(&super::orphan_worktree_text(root, &rel)),
             );
             assert_inert_when_pasted(&row);
         }
+        let text = super::orphan_worktree_text(root, ".cadence/wt/a;x Authorization: Basic zzzzzz");
+        assert!(text.contains("cannot be printed"), "{text}");
+        assert!(!text.contains("git -C"), "{text}");
+        let text = super::orphan_worktree_text(root, ".cadence/wt/cad-1-a");
+        assert!(
+            text.contains("`git -C '/repo' worktree remove '.cadence/wt/cad-1-a'`"),
+            "{text}"
+        );
     }
 
     #[test]
