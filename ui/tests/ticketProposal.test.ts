@@ -50,8 +50,11 @@ check(parseTicketProposal({ ...proposal, visibility: "private" }) === null, "an 
 check(parseTicketProposal(null) === null, "no payload, no proposal");
 
 // The board's read-time join: a ticket and its ended run, both or neither.
-const joined = parseTicketProposal({ ...proposal, ticket: "CAD-2188", run: { state: "finished", reason: null } });
+const joined = parseTicketProposal({ ...proposal, ticket: "CAD-2188", run: { state: "finished", reason: null, agent: "Research agent" } });
 check(joined?.ticket === "CAD-2188" && joined.run?.state === "finished", "an ended run is carried on the card");
+check(joined?.run?.agent === "Research agent", "the run's own agent is carried, not the proposal's");
+const unnamed = parseTicketProposal({ ...proposal, ticket: "CAD-2188", run: { state: "failed", reason: "turn_failed", agent: null } });
+check(unnamed?.run?.agent === null, "an unresolved run agent stays null rather than borrowing the proposal's");
 check(parseTicketProposal({ ...proposal, run: { state: "finished", reason: null } })?.ticket === undefined, "a run without a ticket is not shown");
 check(parseTicketProposal({ ...proposal, ticket: "CAD-2188" })?.run === undefined, "a ticket without a run is not shown");
 check(parseTicketProposal({ ...proposal, ticket: "CAD-2188", run: { state: 7 } })?.run === undefined, "a malformed run is dropped");

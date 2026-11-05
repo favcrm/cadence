@@ -45,6 +45,7 @@ export default function TicketProposalCard({
     );
   }
 
+  const runLabel = proposal?.run ? RUN_LABEL[proposal.run.state] : undefined;
   const run = () => {
     setBusy(true);
     setError(null);
@@ -89,9 +90,10 @@ export default function TicketProposalCard({
           <div className="mt-3" role="status">
             <p className="text-label text-ink-200">
               {t("Created {id}.").replace("{id}", () => proposal.ticket!)}{" "}
-              {proposal.run && RUN_LABEL[proposal.run.state] && (
+              {proposal.run && runLabel && (
                 <span className="text-ink-300">
-                  {proposal.agent.name} {t(RUN_LABEL[proposal.run.state])}
+                  {/* The run's own agent: a reassignment can differ from the proposal. */}
+                  {proposal.run.agent ? `${proposal.run.agent} ${t(runLabel)}` : t(runLabel)}
                 </span>
               )}
             </p>

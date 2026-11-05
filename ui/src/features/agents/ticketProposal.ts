@@ -18,7 +18,7 @@ export type TicketProposal = {
   visibility: "company";
   /** Set by the board once the card's ticket exists; `run` once its run ended. */
   ticket?: string;
-  run?: { state: string; reason: string | null };
+  run?: { state: string; reason: string | null; agent: string | null };
 };
 
 const text = (value: unknown): string | null =>
@@ -47,11 +47,16 @@ export function parseTicketProposal(
   // neither. A running job sends no state and the card stays actionable.
   const ticket = text(payload.ticket);
   const run = payload.run;
-  let outcome: { state: string; reason: string | null } | undefined;
+  let outcome: { state: string; reason: string | null; agent: string | null } | undefined;
   if (run !== null && typeof run === "object" && !Array.isArray(run)) {
-    const record = run as { state?: unknown; reason?: unknown };
+    const record = run as { state?: unknown; reason?: unknown; agent?: unknown };
     if (typeof record.state === "string" && record.state !== "")
-      outcome = { state: record.state, reason: typeof record.reason === "string" ? record.reason : null };
+      outcome = {
+        state: record.state,
+        reason: typeof record.reason === "string" ? record.reason : null,
+        // The run's own agent; null when the profile no longer resolves.
+        agent: typeof record.agent === "string" && record.agent !== "" ? record.agent : null,
+      };
   }
   // The tool list is part of what the person authorises: a list that is not
   // all names would make the card claim capabilities it cannot state, so no
