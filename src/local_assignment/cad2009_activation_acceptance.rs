@@ -187,10 +187,16 @@ fn cad2009_activation_cleanup_retains_unknown_and_original_local_failure() {
             coord.bind_alias("acceptance-actor").unwrap();
             coord.delivery_guard = Some(Arc::new(move || active.load(Ordering::SeqCst)));
             let mut deliveries = 0;
-            let outcome = coord.start_here("SYN-1", &repo, Some("uncertainty"), &mut |_| {
-                deliveries += 1;
-                Err(Error::internal("delivery must not run after lane refusal"))
-            });
+            let outcome = coord.start_here(
+                "SYN-1",
+                Some(&repo),
+                Some("uncertainty"),
+                None,
+                &mut |_| {
+                    deliveries += 1;
+                    Err(Error::internal("delivery must not run after lane refusal"))
+                },
+            );
             // An explicit read reconciles producer state; never repeat the mutation.
             let readback = coord.status();
             let (posts, committed) = fixture.finish();

@@ -19,10 +19,16 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             by,
             take_over,
             profile,
+            kind,
         } => {
             if profile.is_some() {
                 return Err(Error::rejected(
                     "--profile is a hosted-org session start; a local org claims through the daemon instead",
+                ));
+            }
+            if kind.is_some() {
+                return Err(Error::rejected(
+                    "--kind is a hosted work kind; a local start always opens a dev lane. Nothing was started",
                 ));
             }
             let pm_dir = open_pm()?;

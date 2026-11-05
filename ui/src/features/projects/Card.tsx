@@ -4,6 +4,7 @@ import { PRIORITY_CHIP } from "../issues/chips";
 import type { IssueCard } from "../../lib/types";
 import Link from "../../ui/Link";
 import { useLocale } from "../../lib/locale";
+import { LocalAssignmentBadge } from "../issues/LocalAssignments";
 
 
 function prLabel(issue: IssueCard): string | null {
@@ -54,6 +55,7 @@ export default function Card({
     );
   }
   if (pr) meta.push(<span key="pr">{pr}</span>);
+  if (t.local_assignment !== undefined) meta.push(<LocalAssignmentBadge key="local" value={t.local_assignment} />);
   if (t.checks.total > 0) {
     meta.push(
       <span key="ck" title={tr("checklist")}>

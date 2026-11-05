@@ -2,7 +2,12 @@
 //!
 //! The board accepts at most 8,192 UTF-8 bytes of request JSON and at most
 //! 4,000 Unicode scalar values of `text` (Zod code-point length). Optional
-//! `text` and `reported_head_sha` are omitted, not sent as null.
+//! `text`, `reported_head_sha`, `work_kind` and `deliverable` are omitted, not
+//! sent as null.
+//!
+//! CAD-2195/CAD-2061: `work_kind` and `deliverable` appear only on a report
+//! for non-code work. A dev report keeps exactly the bytes it always had, so
+//! an older board's strict schema still accepts it.
 //!
 //! `BoardHttp` uses ureq 3 `send_json` and `SendBody::from_json`, which
 //! serializes with `serde_json::to_vec_pretty` (two-space indent, space
@@ -15,7 +20,7 @@
 use crate::error::{Error, Result};
 use serde_json::{json, Value};
 
-use super::VERSION;
+use super::{Deliverable, VERSION};
 
 const MAX_BODY_BYTES: usize = 8192;
 const MAX_TEXT_CODEPOINTS: usize = 4_000;
@@ -31,16 +36,18 @@ pub(super) fn report_body(
     state: &str,
     text: Option<&str>,
     sha: Option<&str>,
+    work_kind: Option<&str>,
+    deliverable: Option<&Deliverable>,
 ) -> Result<Value> {
     let text_escaped = match text {
         Some(text) => Some(measured_text(text)?),
         None => None,
     };
-    let encoded = pretty_len(identity, state, text_escaped, sha);
+    let encoded = pretty_len(identity, state, text_escaped, sha, work_kind, deliverable);
     if encoded > MAX_BODY_BYTES {
         return Err(payload_too_large());
     }
-    let body = assemble(identity, state, text, sha);
+    let body = assemble(identity, state, text, sha, work_kind, deliverable);
     debug_assert_eq!(
         encoded,
         serde_json::to_vec_pretty(&body)
@@ -59,10 +66,11 @@ pub(super) fn bounded_report_text(
     identity: &ReportIdentity<'_>,
     state: &str,
     sha: Option<&str>,
+    work_kind: Option<&str>,
     reference: &str,
     text: &str,
 ) -> Result<String> {
-    let fixed = pretty_len(identity, state, Some(0), sha);
+    let fixed = pretty_len(identity, state, Some(0), sha, work_kind, None);
     if fixed > MAX_BODY_BYTES {
         return Err(payload_too_large());
     }
@@ -167,6 +175,8 @@ fn assemble(
     state: &str,
     text: Option<&str>,
     sha: Option<&str>,
+    work_kind: Option<&str>,
+    deliverable: Option<&Deliverable>,
 ) -> Value {
     let mut body = json!({
         "version": VERSION,
@@ -180,6 +190,12 @@ fn assemble(
     }
     if let Some(sha) = sha {
         body["reported_head_sha"] = json!(sha);
+    }
+    if let Some(kind) = work_kind {
+        body["work_kind"] = json!(kind);
+    }
+    if let Some(deliverable) = deliverable {
+        body["deliverable"] = deliverable.to_json();
     }
     body
 }
@@ -238,6 +254,8 @@ fn pretty_len(
     state: &str,
     text_escaped: Option<usize>,
     sha: Option<&str>,
+    work_kind: Option<&str>,
+    deliverable: Option<&Deliverable>,
 ) -> usize {
     let mut fields = 5usize;
     let mut inner = 0usize;
@@ -259,6 +277,16 @@ fn pretty_len(
         inner = inner.saturating_add(str_field("text", escaped));
         fields += 1;
     }
+    if let Some(kind) = work_kind {
+        inner = inner.saturating_add(str_field("work_kind", escaped_len(kind)));
+        fields += 1;
+    }
+    if let Some(deliverable) = deliverable {
+        // A nested object: its own pretty encoding, re-indented one level in,
+        // plus `"deliverable": ` and the closing brace line.
+        inner = inner.saturating_add(deliverable_field_bytes(deliverable));
+        fields += 1;
+    }
     inner = inner.saturating_add(str_field("version", escaped_len(VERSION)));
     // `{` + each field's newline and two-space indent + commas + `\n}`.
     let structural = fields.saturating_mul(4).saturating_add(2);
@@ -267,6 +295,22 @@ fn pretty_len(
 
 fn str_field(key: &str, escaped: usize) -> usize {
     key.len().saturating_add(6).saturating_add(escaped)
+}
+
+/// Bytes a `"deliverable": {...}` field adds to the pretty body: `"deliverable": `
+/// (15 bytes), the nested value re-indented two extra spaces on each of its
+/// `entries + 1` newline lines, and the per-field newline and comma the caller
+/// counts. Saturating arithmetic means a pathological value fails closed as
+/// too large rather than undercounting.
+fn deliverable_field_bytes(deliverable: &Deliverable) -> usize {
+    let value = deliverable.to_json();
+    let entries = value.as_object().map(serde_json::Map::len).unwrap_or(0);
+    let naked = serde_json::to_vec_pretty(&value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    naked
+        .saturating_add(entries.saturating_add(1).saturating_mul(2))
+        .saturating_add(15)
 }
 
 fn num_field(key: &str, digits: usize) -> usize {
@@ -278,9 +322,32 @@ fn posted(body: &Value) -> Vec<u8> {
     serde_json::to_vec_pretty(body).expect("pretty report json")
 }
 
+/// The dev-shaped report body the pinned cases below exercise: no work kind,
+/// no deliverable, exactly the bytes this wire sent before CAD-2195.
+#[cfg(test)]
+fn dev_body(
+    identity: &ReportIdentity<'_>,
+    state: &str,
+    text: Option<&str>,
+    sha: Option<&str>,
+) -> Result<Value> {
+    report_body(identity, state, text, sha, None, None)
+}
+
+#[cfg(test)]
+fn dev_bounded(
+    identity: &ReportIdentity<'_>,
+    state: &str,
+    sha: Option<&str>,
+    reference: &str,
+    text: &str,
+) -> Result<String> {
+    bounded_report_text(identity, state, sha, None, reference, text)
+}
+
 #[cfg(test)]
 fn text_room(identity: &ReportIdentity<'_>, state: &str, sha: Option<&str>) -> usize {
-    let empty = report_body(identity, state, Some(""), sha).expect("empty text fits");
+    let empty = dev_body(identity, state, Some(""), sha).expect("empty text fits");
     MAX_BODY_BYTES - posted(&empty).len()
 }
 
@@ -314,22 +381,22 @@ fn assert_unit_boundary(unit: char, unit_bytes: usize) {
     let count = room / unit_bytes;
     assert!(count <= MAX_TEXT_CODEPOINTS);
     let fit: String = std::iter::repeat_n(unit, count).collect();
-    let body = report_body(&identity, "result", Some(&fit), None).expect("just fits");
+    let body = dev_body(&identity, "result", Some(&fit), None).expect("just fits");
     assert_eq!(posted(&body).len(), MAX_BODY_BYTES);
     assert_eq!(body["text"].as_str(), Some(fit.as_str()));
 
     let over: String = std::iter::repeat_n(unit, count + 1).collect();
-    let rejected = report_body(&identity, "result", Some(&over), None).expect_err("one over");
+    let rejected = dev_body(&identity, "result", Some(&over), None).expect_err("one over");
     assert_eq!(rejected.code(), Some("payload_too_large"));
 
     let message_id = "msg\"\\\u{0001}测";
     assert_eq!(
-        bounded_report_text(&identity, "result", None, message_id, &fit).expect("exact fit"),
+        dev_bounded(&identity, "result", None, message_id, &fit).expect("exact fit"),
         fit
     );
     let source = over.clone();
-    let summary = bounded_report_text(&identity, "result", None, message_id, &source)
-        .expect("truncated summary");
+    let summary =
+        dev_bounded(&identity, "result", None, message_id, &source).expect("truncated summary");
     assert_eq!(source, over, "full local text is not modified");
     let notice = truncation_notice(message_id);
     let prefix = summary
@@ -338,7 +405,7 @@ fn assert_unit_boundary(unit: char, unit_bytes: usize) {
     assert!(source.starts_with(prefix));
     assert!(prefix.len() < source.len());
     assert!(summary.chars().count() <= MAX_TEXT_CODEPOINTS);
-    let accepted = report_body(&identity, "result", Some(&summary), None).expect("summary posts");
+    let accepted = dev_body(&identity, "result", Some(&summary), None).expect("summary posts");
     assert!(posted(&accepted).len() <= MAX_BODY_BYTES);
     let next = source[prefix.len()..]
         .chars()
@@ -348,7 +415,7 @@ fn assert_unit_boundary(unit: char, unit_bytes: usize) {
     longer.push(next);
     longer.push_str(&notice);
     assert!(
-        report_body(&identity, "result", Some(&longer), None).is_err(),
+        dev_body(&identity, "result", Some(&longer), None).is_err(),
         "summary keeps the longest prefix that still fits"
     );
 }
@@ -360,7 +427,7 @@ fn canonical_body_matches_v1_and_omits_absent_fields() {
         claim_id: "hlc_claim",
         generation: 7,
     };
-    let omitted = report_body(&identity, "result", None, None).expect("body");
+    let omitted = dev_body(&identity, "result", None, None).expect("body");
     assert_eq!(
         String::from_utf8(posted(&omitted)).expect("utf-8"),
         format!(
@@ -372,12 +439,12 @@ fn canonical_body_matches_v1_and_omits_absent_fields() {
     assert!(omitted.get("text").is_none());
     assert!(omitted.get("reported_head_sha").is_none());
 
-    let empty = report_body(&identity, "result", Some(""), None).expect("empty text");
+    let empty = dev_body(&identity, "result", Some(""), None).expect("empty text");
     assert_eq!(empty["text"].as_str(), Some(""));
 
     let text = "说\"\\\n\u{0001}";
     let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let full = report_body(&identity, "result", Some(text), Some(sha)).expect("full");
+    let full = dev_body(&identity, "result", Some(text), Some(sha)).expect("full");
     assert_eq!(
         String::from_utf8(posted(&full)).expect("utf-8"),
         "{\n  \"claim_id\": \"hlc_claim\",\n  \"expected_generation\": 7,\n  \
@@ -388,6 +455,48 @@ fn canonical_body_matches_v1_and_omits_absent_fields() {
     );
     assert_eq!(full["text"].as_str(), Some(text));
     assert_eq!(full["reported_head_sha"].as_str(), Some(sha));
+}
+
+#[test]
+fn a_non_code_report_body_pins_its_extra_fields_and_budget() {
+    let identity = ReportIdentity {
+        organization_id: "ws_org",
+        claim_id: "hlc_claim",
+        generation: 7,
+    };
+    let deliverable =
+        Deliverable::parse("link:https://docs.example.test/memo").expect("deliverable");
+    let body = report_body(
+        &identity,
+        "result",
+        Some("memo"),
+        None,
+        Some("research"),
+        Some(&deliverable),
+    )
+    .expect("non-code body");
+    // The byte accounting in `pretty_len` must match serde exactly, and the
+    // body must never carry a commit for repo-less work.
+    assert_eq!(
+        String::from_utf8(posted(&body)).expect("utf-8"),
+        "{\n  \"claim_id\": \"hlc_claim\",\n  \"deliverable\": {\n    \
+         \"ref\": \"https://docs.example.test/memo\",\n    \"type\": \"link\"\n  },\n  \
+         \"expected_generation\": 7,\n  \"organization_id\": \"ws_org\",\n  \
+         \"state\": \"result\",\n  \"text\": \"memo\",\n  \"version\": \"hosted-cadence-local-assignment.v1\",\n  \"work_kind\": \"research\"\n}"
+    );
+    assert!(body.get("reported_head_sha").is_none());
+
+    let dev = posted(&dev_body(&identity, "blocked", Some(""), None).expect("dev body")).len();
+    let kind = posted(
+        &report_body(&identity, "blocked", Some(""), None, Some("research"), None)
+            .expect("kind body"),
+    )
+    .len();
+    assert_eq!(
+        kind - dev,
+        "work_kind".len() + 6 + "research".len() + 4,
+        "one string field: key quotes, colon, value quotes, separators"
+    );
 }
 
 #[test]
@@ -404,26 +513,24 @@ fn manual_limits_hit_exact_byte_and_codepoint_boundaries() {
         claim_id: "c",
         generation: 1,
     };
-    let overhead =
-        posted(&report_body(&identity, "result", Some(""), None).expect("overhead")).len();
+    let overhead = posted(&dev_body(&identity, "result", Some(""), None).expect("overhead")).len();
     assert!(overhead + MAX_TEXT_CODEPOINTS < MAX_BODY_BYTES);
     let fit = "a".repeat(MAX_TEXT_CODEPOINTS);
-    let body = report_body(&identity, "result", Some(&fit), None).expect("4000");
+    let body = dev_body(&identity, "result", Some(&fit), None).expect("4000");
     assert_eq!(posted(&body).len(), overhead + MAX_TEXT_CODEPOINTS);
     assert_eq!(body["text"].as_str().unwrap().chars().count(), 4_000);
     let over = "a".repeat(MAX_TEXT_CODEPOINTS + 1);
     assert_eq!(
-        report_body(&identity, "result", Some(&over), None)
+        dev_body(&identity, "result", Some(&over), None)
             .expect_err("4001")
             .code(),
         Some("payload_too_large")
     );
-    let summary =
-        bounded_report_text(&identity, "result", None, "local-4001", &over).expect("summary");
+    let summary = dev_bounded(&identity, "result", None, "local-4001", &over).expect("summary");
     let notice = truncation_notice("local-4001");
     assert_eq!(&summary[summary.len() - notice.len()..], notice.as_str());
     assert!(summary.chars().count() <= MAX_TEXT_CODEPOINTS);
-    let accepted = report_body(&identity, "result", Some(&summary), None).expect("fits");
+    let accepted = dev_body(&identity, "result", Some(&summary), None).expect("fits");
     assert!(posted(&accepted).len() <= MAX_BODY_BYTES);
     assert_ne!(summary, over);
 }
@@ -439,7 +546,7 @@ fn metadata_and_escaping_consume_the_same_byte_budget() {
     let room = text_room(&identity, "result", None);
     let text = "a".repeat(room);
     assert_eq!(
-        posted(&report_body(&identity, "result", Some(&text), None).expect("gen 9")).len(),
+        posted(&dev_body(&identity, "result", Some(&text), None).expect("gen 9")).len(),
         MAX_BODY_BYTES
     );
     let wider = ReportIdentity {
@@ -448,7 +555,7 @@ fn metadata_and_escaping_consume_the_same_byte_budget() {
         generation: 10,
     };
     assert_eq!(
-        report_body(&wider, "result", Some(&text), None)
+        dev_body(&wider, "result", Some(&text), None)
             .expect_err("extra generation digit")
             .code(),
         Some("payload_too_large")
@@ -459,13 +566,11 @@ fn metadata_and_escaping_consume_the_same_byte_budget() {
     assert_eq!(room - with_sha, 27 + sha.len());
     let sha_text = "a".repeat(with_sha);
     assert_eq!(
-        posted(
-            &report_body(&identity, "result", Some(&sha_text), Some(&sha)).expect("sha just fits")
-        )
-        .len(),
+        posted(&dev_body(&identity, "result", Some(&sha_text), Some(&sha)).expect("sha just fits"))
+            .len(),
         MAX_BODY_BYTES
     );
-    assert!(report_body(&identity, "result", Some(&text), Some(&sha)).is_err());
+    assert!(dev_body(&identity, "result", Some(&text), Some(&sha)).is_err());
 
     let quoted = ReportIdentity {
         organization_id: &org,
@@ -473,7 +578,7 @@ fn metadata_and_escaping_consume_the_same_byte_budget() {
         generation: 9,
     };
     assert_eq!(
-        report_body(&quoted, "result", Some(&text), None)
+        dev_body(&quoted, "result", Some(&text), None)
             .expect_err("escaped claim id")
             .code(),
         Some("payload_too_large")
@@ -484,7 +589,7 @@ fn metadata_and_escaping_consume_the_same_byte_budget() {
         claim_id: "c",
         generation: 9,
     };
-    assert!(report_body(&grown, "result", Some(&text), None).is_err());
+    assert!(dev_body(&grown, "result", Some(&text), None).is_err());
 
     let probe = "o".repeat(7_000);
     let probe_id = ReportIdentity {
@@ -492,7 +597,7 @@ fn metadata_and_escaping_consume_the_same_byte_budget() {
         claim_id: "c",
         generation: 1,
     };
-    let bare = posted(&report_body(&probe_id, "result", None, None).expect("bare")).len();
+    let bare = posted(&dev_body(&probe_id, "result", None, None).expect("bare")).len();
     let exact_org = "o".repeat(7_000 + MAX_BODY_BYTES - bare);
     let exact = ReportIdentity {
         organization_id: &exact_org,
@@ -500,7 +605,7 @@ fn metadata_and_escaping_consume_the_same_byte_budget() {
         generation: 1,
     };
     assert_eq!(
-        posted(&report_body(&exact, "result", None, None).expect("metadata just fits")).len(),
+        posted(&dev_body(&exact, "result", None, None).expect("metadata just fits")).len(),
         MAX_BODY_BYTES
     );
     let mut one_over = exact_org.clone();
@@ -511,14 +616,14 @@ fn metadata_and_escaping_consume_the_same_byte_budget() {
         generation: 1,
     };
     assert_eq!(
-        report_body(&over, "result", None, None)
+        dev_body(&over, "result", None, None)
             .expect_err("metadata one over")
             .code(),
         Some("payload_too_large")
     );
-    assert!(report_body(&exact, "result", Some(""), None).is_err());
+    assert!(dev_body(&exact, "result", Some(""), None).is_err());
     assert_eq!(
-        bounded_report_text(&exact, "result", None, "m", "")
+        dev_bounded(&exact, "result", None, "m", "")
             .expect_err("no room for a text field")
             .code(),
         Some("payload_too_large")
@@ -534,17 +639,17 @@ fn automatic_summary_skips_the_notice_until_text_needs_it() {
     };
     let kept = "  \t说\"\\";
     assert_eq!(
-        bounded_report_text(&identity, "blocked", None, "unused-id", kept).expect("fits"),
+        dev_bounded(&identity, "blocked", None, "unused-id", kept).expect("fits"),
         kept
     );
     let huge_id = "m".repeat(5_000);
     assert_eq!(
-        bounded_report_text(&identity, "blocked", None, &huge_id, kept).expect("notice unused"),
+        dev_bounded(&identity, "blocked", None, &huge_id, kept).expect("notice unused"),
         kept
     );
     let over = "a".repeat(MAX_TEXT_CODEPOINTS + 1);
     assert_eq!(
-        bounded_report_text(&identity, "blocked", None, &huge_id, &over)
+        dev_bounded(&identity, "blocked", None, &huge_id, &over)
             .expect_err("notice cannot fit")
             .code(),
         Some("payload_too_large")

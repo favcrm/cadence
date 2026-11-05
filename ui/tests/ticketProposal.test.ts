@@ -1,5 +1,11 @@
 import { threadItems, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
-import { createAndAssign, parseTicketProposal } from "../src/features/agents/ticketProposal";
+import {
+  createAndAssign,
+  parseTicketProposal,
+  type ProposalReceipt,
+  type ProposalStartAnswer,
+  type TicketProposalClient,
+} from "../src/features/agents/ticketProposal";
 
 function check(condition: boolean, message: string): void {
   if (!condition) throw new Error(`ticketProposal: ${message}`);
@@ -128,6 +134,237 @@ async function main(): Promise<void> {
   };
   const settled = await createAndAssign(landed, parsed!);
   check(settled.state === "assigned", "a lost answer is settled by reading the ticket");
+
+  // ---- CAD-2189: the board's durable receipt decides what the card claims.
+  const receipt = (
+    ticket: string,
+    state: "pending" | "assigned" | "refused",
+    owner: string | null,
+    reason: string | null = null,
+  ): ProposalReceipt => ({
+    proposal: "c-0001",
+    ticket,
+    agent: "agents/ap_1",
+    state,
+    owner,
+    reason,
+    at: 1_000,
+  });
+  const startOnly = (
+    answer: () => ProposalStartAnswer,
+    label: string,
+  ): TicketProposalClient => ({
+    start: async () => answer(),
+    create: async () => {
+      throw new Error(`${label}: the start route exists, so no create is sent`);
+    },
+    patch: async () => {
+      throw new Error(`${label}: a receipt is the evidence, so no patch is sent`);
+    },
+    issue: async () => ({ owner: null }),
+  });
+
+  // A matching receipt is the evidence that the assignment completed.
+  const fresh: TicketProposalClient = {
+    start: async () => {
+      return { issue: { id: "DEMO-5" }, card: { rev: "r1" }, receipt: receipt("DEMO-5", "assigned", "agents/ap_1") };
+    },
+    create: async () => {
+      throw new Error("fresh: the start route exists, so no create is sent");
+    },
+    patch: async () => {
+      throw new Error("fresh: a receipt is the evidence, so no patch is sent");
+    },
+    issue: async () => ({ owner: null }),
+  };
+  const assignedByReceipt = await createAndAssign(fresh, parsed!);
+  check(assignedByReceipt.state === "assigned" && assignedByReceipt.ticket === "DEMO-5", "the receipt assigns");
+
+  // The create committed and the answer was lost: the retry finishes from the
+  // receipt instead of minting or reassigning anything.
+  let attempts = 0;
+  const lostThenFinished = {
+    start: async () => {
+      attempts += 1;
+      if (attempts === 1) throw Object.assign(new Error("network reset"), { status: 0 });
+      return { issue: { id: "DEMO-6" }, receipt: receipt("DEMO-6", "assigned", "agents/ap_1") };
+    },
+    create: async () => {
+      throw new Error("a failed start is retried on the start route, never by a create");
+    },
+    patch: async () => {
+      throw new Error("no patch follows a start");
+    },
+    issue: async () => ({ owner: null }),
+  };
+  let lost: unknown;
+  try {
+    await createAndAssign(lostThenFinished, parsed!);
+  } catch (error) {
+    lost = error;
+  }
+  check(lost !== undefined, "a lost start answer is reported, not invented");
+  const finished = await createAndAssign(lostThenFinished, parsed!);
+  check(
+    finished.state === "assigned" && finished.ticket === "DEMO-6" && attempts === 2,
+    "a retry after a lost answer finishes from the board's receipt",
+  );
+
+  // A second click while the assignment is still pending is the same ticket:
+  // the board proves no owner was written, and the retry completes it.
+  let clicks = 0;
+  const pendingThenDone = startOnly(() => {
+    clicks += 1;
+    return {
+      issue: { id: "DEMO-7" },
+      receipt: receipt("DEMO-7", clicks === 1 ? "pending" : "assigned", clicks === 1 ? null : "agents/ap_1"),
+    };
+  }, "pending");
+  const pending = await createAndAssign(pendingThenDone, parsed!);
+  check(pending.state === "pending" && pending.ticket === "DEMO-7", "a pending proposal is created, not assigned");
+  const completed = await createAndAssign(pendingThenDone, parsed!);
+  check(completed.state === "assigned" && clicks === 2, "a provably pending proposal is finished by a retry");
+
+  // A person moved the card after the assignment: the card reports their
+  // choice and claims nothing of its own.
+  const reassigned = startOnly(
+    () => ({ issue: { id: "DEMO-8" }, receipt: receipt("DEMO-8", "assigned", "user_owner") }),
+    "reassigned",
+  );
+  const moved = await createAndAssign(reassigned, parsed!);
+  check(moved.state === "changed", "a reassignment is reported, not overwritten");
+  check(moved.state === "changed" && moved.owner === "user_owner", "the reported owner is the person's");
+
+  const cleared = startOnly(
+    () => ({ issue: { id: "DEMO-9" }, receipt: receipt("DEMO-9", "assigned", null) }),
+    "cleared",
+  );
+  const emptied = await createAndAssign(cleared, parsed!);
+  check(emptied.state === "changed", "a cleared owner is reported, not restored");
+  check(emptied.state === "changed" && emptied.owner === null, "a cleared owner stays cleared");
+
+  // The board refused the actor: created, refused, and evidence of why.
+  const denied = startOnly(
+    () => ({
+      issue: { id: "DEMO-10" },
+      receipt: receipt("DEMO-10", "refused", null, "agent_not_permitted"),
+    }),
+    "denied",
+  );
+  const deniedOutcome = await createAndAssign(denied, parsed!);
+  check(
+    deniedOutcome.state === "refused" && deniedOutcome.ticket === "DEMO-10",
+    "a denied actor is a recorded refusal, not an assignment",
+  );
+  check(
+    deniedOutcome.state === "refused" && deniedOutcome.reason === "agent_not_permitted",
+    "the refusal names the authority the board applied",
+  );
+
+  const alreadyOwned = startOnly(
+    () => ({ issue: { id: "DEMO-11" }, receipt: receipt("DEMO-11", "refused", "user_owner", "owner_set") }),
+    "owner_set",
+  );
+  check((await createAndAssign(alreadyOwned, parsed!)).state === "owned", "an owner the board already held is reported");
+
+  const oldTicket = startOnly(
+    () => ({ issue: { id: "DEMO-12" }, receipt: receipt("DEMO-12", "refused", null, "untracked_existing") }),
+    "untracked_existing",
+  );
+  const oldOutcome = await createAndAssign(oldTicket, parsed!);
+  check(oldOutcome.state === "unconfirmed" && oldOutcome.error === "untracked_existing",
+    "a pre-receipt ticket does not claim whether assignment happened");
+
+  const changedBeforeStart = startOnly(
+    () => ({ issue: { id: "DEMO-13" }, receipt: receipt("DEMO-13", "refused", null, "ticket_changed") }),
+    "ticket_changed",
+  );
+  const changedOutcome = await createAndAssign(changedBeforeStart, parsed!);
+  check(changedOutcome.state === "refused" && changedOutcome.reason === "ticket_changed",
+    "an intervening ticket change is reported as a refusal");
+
+  // A stale revision is the caller's fence: it surfaces, and is never turned
+  // into a create that would write around the fence.
+  const stale = {
+    start: async () => {
+      throw Object.assign(new Error("if_rev does not match the stored revision"), {
+        status: 409,
+        code: "if_rev_conflict",
+      });
+    },
+    create: async () => {
+      throw new Error("a stale revision is not retried as a create");
+    },
+    patch: async () => {
+      throw new Error("a stale revision is not retried as a patch");
+    },
+    issue: async () => ({ owner: null }),
+  };
+  let staleError: unknown;
+  try {
+    await createAndAssign(stale, parsed!);
+  } catch (error) {
+    staleError = error;
+  }
+  check((staleError as { code?: string } | null)?.code === "if_rev_conflict", "a stale revision surfaces");
+
+  // An answer without a receipt, or a receipt for another ticket, proves
+  // nothing: the card reports creation and stops short of claiming the agent.
+  const noReceipt = startOnly(() => ({ issue: { id: "DEMO-12" } }), "no-receipt");
+  check((await createAndAssign(noReceipt, parsed!)).state === "unconfirmed", "no receipt, no assignment claim");
+  const otherTicket = startOnly(
+    () => ({ issue: { id: "DEMO-13" }, receipt: receipt("DEMO-99", "assigned", "agents/ap_1") }),
+    "other-ticket",
+  );
+  check(
+    (await createAndAssign(otherTicket, parsed!)).state === "unconfirmed",
+    "a receipt bound to another ticket proves nothing",
+  );
+
+  // The board predates the route (501) or lacks it entirely (a bare 404): the
+  // card keeps its create + patch pair. Any other failure is not that cue.
+  for (const status of [501, 404] as const) {
+    let creates = 0;
+    const older = {
+      start: async () => {
+        throw Object.assign(new Error(`${status}`), status === 501 ? { status, code: "unsupported" } : { status });
+      },
+      create: async () => {
+        creates += 1;
+        return { issue: { id: "DEMO-14" }, card: { rev: "r1" } };
+      },
+      patch: async () => ({}),
+      issue: async () => ({ owner: null }),
+    };
+    const fallback = await createAndAssign(older, parsed!);
+    check(
+      fallback.state === "assigned" && fallback.ticket === "DEMO-14" && creates === 1,
+      `an older board (${status}) falls back to create + assign`,
+    );
+  }
+
+  const unavailable = {
+    start: async () => {
+      throw Object.assign(new Error("The board read model is unavailable."), {
+        status: 503,
+        code: "capability_unavailable",
+      });
+    },
+    create: async () => {
+      throw new Error("a 503 is not an older board");
+    },
+    patch: async () => {
+      throw new Error("a 503 is not an older board");
+    },
+    issue: async () => ({ owner: null }),
+  };
+  let unavailableError: unknown;
+  try {
+    await createAndAssign(unavailable, parsed!);
+  } catch (error) {
+    unavailableError = error;
+  }
+  check(unavailableError !== undefined, "a 503 surfaces instead of being retried as an older board");
 }
 
 void main();

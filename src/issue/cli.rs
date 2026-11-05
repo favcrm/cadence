@@ -294,7 +294,9 @@ pub enum IssueAction {
     Start {
         id: String,
         /// Repo path — else the cwd's repo when it is one of the
-        /// project's repos, else the project's only repo.
+        /// project's repos, else the project's only repo. A hosted
+        /// repo-less assignment (research, design, business or manual
+        /// work) needs none and opens no lane.
         #[arg(long)]
         repo: Option<PathBuf>,
         /// Worktree slug — default: the slugified title (≤32 chars).
@@ -336,9 +338,10 @@ pub enum IssueAction {
         /// [default: --pm, else CADENCE_ALIAS, else operator].
         #[arg(long)]
         by: Option<String>,
-        /// Start an issue someone else holds in doing/review (CAD-383).
-        /// The reason is required; the take-over replaces the claim and
-        /// owner and is recorded as a comment in its own commit.
+        /// Start an issue someone else holds in doing/review (CAD-383),
+        /// or on a hosted org replace another session's live local claim.
+        /// The reason is required and must be one line; a hosted board that
+        /// cannot record a take-over refuses the claim instead of dropping it.
         #[arg(long, value_name = "REASON")]
         take_over: Option<String>,
         /// Hosted orgs only: claim this issue for the calling session under
@@ -347,6 +350,14 @@ pub enum IssueAction {
         /// daemon. The profile supplies context, never authority.
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
+        /// Hosted orgs only: the work kind to record, one of research,
+        /// design, business or manual. Repo-less work needs no
+        /// `--repo`, opens no lane and reports text plus an optional
+        /// deliverable instead of a commit; review instead requires the
+        /// `review` is refused as an unsupported capability. `dev` is the
+        /// default and is never sent; a local start refuses any value.
+        #[arg(long, value_name = "KIND")]
+        kind: Option<String>,
     },
     /// Record a claim on an issue (CAD-383) — for a PM whose lanes run
     /// outside cadence (Claude subagents, Codex, humans), so `dispatch`

@@ -313,6 +313,26 @@ export interface WriteResp {
   replayed?: boolean;
 }
 
+/**
+ * CAD-2189: the board's durable receipt for a conversation card's proposal.
+ * `owner` is the card's owner as stored at answer time, so a client can only
+ * claim the assignment when it is `agent`.
+ */
+export interface ProposalStartReceipt {
+  proposal: string;
+  ticket: string;
+  agent: string;
+  state: "pending" | "assigned" | "refused";
+  owner: string | null;
+  reason: string | null;
+  at: number;
+}
+
+/** `POST /api/issues/proposals/<id>/start`; an older board answers 501. */
+export interface ProposalStartResp extends WriteResp {
+  receipt?: ProposalStartReceipt;
+}
+
 /** `GET /api/issues/<id>/kickoff` — enough for the drawer confirm. */
 export interface KickoffOptions {
   defaults: {
@@ -655,6 +675,23 @@ export const api = {
     /** CAD-2188: a retry with the same key answers the ticket the first call made. */
     idempotency_key?: string;
   }) => write("POST", "/api/issues", req),
+
+  /**
+   * `POST /api/issues/proposals/<id>/start` (CAD-2189) — the conversation
+   * card's one confirmed action: create the ticket and assign it, with the
+   * board's durable receipt. The proposal id is the create's retry key, so a
+   * retried click answers the same ticket; a board from before this route
+   * refuses it and the card falls back to `create` + `patch`.
+   */
+  startProposal: (
+    proposal: string,
+    req: { project: string; title: string; body?: string; agent: string; if_rev?: string },
+  ) =>
+    write(
+      "POST",
+      `/api/issues/proposals/${encodeURIComponent(proposal)}/start`,
+      req,
+    ) as Promise<ProposalStartResp>,
 
   patch: (
     id: string,

@@ -65,10 +65,18 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             no_lessons,
             force,
             take_over,
-        } => dispatch::run(
-            state_dir, issue, to, note, name, base, repo, reply_to, summary, job, spec, no_lessons,
-            force, take_over,
-        ),
+            kind,
+        } => {
+            if kind.is_some() {
+                return Err(Error::usage(
+                    "--kind is a hosted repo-less work kind; a local dispatch opens a dev lane. Nothing was sent",
+                ));
+            }
+            dispatch::run(
+                state_dir, issue, to, note, name, base, repo, reply_to, summary, job, spec,
+                no_lessons, force, take_over,
+            )
+        }
         Commands::Join {
             group,
             provider,

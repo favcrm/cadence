@@ -333,7 +333,12 @@ is the standalone board, not "the local agent".
 
 The hosted binding lives under the `agent` noun:
 `agent connect|watch|assignments|disconnect|reassign|report|tool`, each taking
-`--org <hosted>`. `agent report` is the explicit claim reporter.
+`--org <hosted>`. `agent report` is the explicit claim reporter: `--state` is
+`running`, `blocked`, `failed` or `result`; a dev `result` needs `--head`,
+while research, design, business and manual work report `--text` and an optional
+typed `--deliverable artifact:<ref>`/`link:<https url>` and never a commit;
+`review` is a named unsupported capability and is refused until the board
+proves PR/head binding and a self-review refusal.
 `agent connect --fyi-only` registers an extra alias and leaves the
 assignment default in place.
 

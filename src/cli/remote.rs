@@ -2647,7 +2647,14 @@ where
             local_state,
         );
     }
-    if let Commands::Dispatch { issue, to, job, .. } = &command {
+    if let Commands::Dispatch {
+        issue,
+        to,
+        job,
+        kind,
+        ..
+    } = &command
+    {
         if *job {
             return Err(Error::usage(
                 "hosted dispatch does not open a job. Nothing was sent.",
@@ -2656,7 +2663,7 @@ where
         let Some(to) = to.as_deref() else {
             return Err(Error::usage("hosted dispatch requires --to <alias>"));
         };
-        return local_agent::dispatch(&target, issue, to);
+        return local_agent::dispatch(&target, issue, to, kind.as_deref());
     }
     if let Commands::Issue {
         action: cadence_agent::issue::cli::IssueAction::Finish { id, worktree, .. },
@@ -2680,6 +2687,7 @@ where
                 by,
                 take_over,
                 profile,
+                kind,
             },
     } = &command
     {
@@ -2690,11 +2698,10 @@ where
             || assignee.is_some()
             || *force
             || by.is_some()
-            || take_over.is_some()
             || (base.is_some() && profile.is_none())
         {
             return Err(Error::usage(
-                "hosted issue start accepts --repo, --name, --profile and --base (with --profile). It claims this issue for this session and does not open a job. Nothing was sent.",
+                "hosted issue start accepts --repo, --name, --profile, --base (with --profile), --kind and --take-over <reason>. It claims this issue for this session and does not open a job. --repo is required for dev work; repo-less work needs no checkout. Nothing was sent.",
             ));
         }
         return local_agent::start(
@@ -2704,6 +2711,8 @@ where
             name.as_deref(),
             profile.as_deref(),
             base.as_deref(),
+            kind.as_deref(),
+            take_over.as_deref(),
             wake_timeout,
             local_state,
         );

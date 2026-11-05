@@ -781,9 +781,13 @@ pub(crate) enum AgentAction {
         state: String,
         #[arg(long)]
         text: Option<String>,
-        /// 40 or 64 lowercase hex characters. Required for result.
+        /// 40 or 64 lowercase hex characters. Required for dev results; refused for non-code work.
         #[arg(long)]
         head: Option<String>,
+        /// The actual output of non-code work: `artifact:<ref>` or
+        /// `link:<https url>`. Only a `result` carries one.
+        #[arg(long, value_name = "TYPE:REF")]
+        deliverable: Option<String>,
     },
     /// Save one optional legacy tool/publisher credential; does not activate tooling.
     Tool {
@@ -855,11 +859,13 @@ impl AgentAction {
                 state,
                 text,
                 head,
+                deliverable,
             } => L::Report {
                 assignment: assignment.clone(),
                 state: state.clone(),
                 text: text.clone(),
                 head: head.clone(),
+                deliverable: deliverable.clone(),
             },
             Self::Tool { lane } => L::Tool { lane: lane.clone() },
             _ => return None,

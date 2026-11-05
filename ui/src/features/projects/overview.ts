@@ -1,4 +1,5 @@
 import type { IssueCard } from "../../lib/types";
+import { hasVisibleReportedResult } from "../issues/LocalAssignments";
 const closed = new Set(["done", "dropped"]);
 export function projectSummary(cards: IssueCard[], project: string) {
   const scoped = cards.filter((card) => project === "all" || card.project === project);
@@ -13,7 +14,7 @@ export function projectSummary(cards: IssueCard[], project: string) {
     done: tasks.filter((card) => card.status === "done").length,
     epics: epics.filter((card) => !closed.has(card.status)),
     focus: open.slice().sort((a, b) => {
-      const rank = (card: IssueCard) => card.status === "review" ? 0 : card.blocked ? 1 : card.status === "doing" ? 2 : card.status === "ready" ? 3 : 4;
+      const rank = (card: IssueCard) => card.status === "review" ? 0 : card.blocked ? 1 : hasVisibleReportedResult(card.local_assignment) ? 2 : card.status === "doing" ? 3 : card.status === "ready" ? 4 : 5;
       return rank(a) - rank(b) || a.priority.localeCompare(b.priority) || a.id.localeCompare(b.id, undefined, { numeric: true });
     }).slice(0, 6),
   };

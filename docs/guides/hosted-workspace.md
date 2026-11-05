@@ -463,11 +463,13 @@ cadence --org acme issue start <issue-id> --repo /absolute/path/to/checkout --na
 cadence --org acme agent assignments
 ```
 
-Hosted `issue start` requires `--repo`, accepts only its supported local placement
-options, and claims through the hosted assignment coordinator; it is not an
-unrestricted remote operator verb or a job launcher. Existing kickoff/member,
-claim and generation fences remain. A claim/queued receipt is not proof that
-execution or a result happened; inspect assignment/report state.
+Hosted `issue start` accepts only its supported local placement options and
+claims through the hosted assignment coordinator; it is not an unrestricted
+remote operator verb or a job launcher. Dev work requires `--repo`: without one
+the client refuses before claiming. Repo-less work opens no lane and needs no
+checkout (see below). Existing kickoff/member, claim and generation fences
+remain. A claim/queued receipt is not proof that execution or a result
+happened; inspect assignment/report state.
 
 An existing terminal or coding session can work on the named issue instead.
 Check the owning repository's worktree and integration-branch rules first;
@@ -499,6 +501,67 @@ it the lane follows the checkout's own resolution. The alias path refuses
 `--base` rather than ignoring it. A board that predates profile claims refuses
 the field: the claim then proceeds without it, under the same client id and
 fences, and the client says on stderr that the profile was not recorded.
+
+### Repo-less work: research, design, business and manual (CAD-2195)
+
+The board records a `kind` for an assignment. `dev` (and a row with no `kind`,
+which is what a board that predates kinds sends) is checkout work. `research`,
+`design`, `business` and `manual` are repo-less: they are claimed, delivered and
+reported with no lane, no worktree and no Git head.
+
+```sh
+# name the kind on creation; no --repo, no checkout
+cadence --org acme issue start <issue-id> --kind research --profile ap_<profile-id>
+# or claim a row the board already queued with that kind
+cadence --org acme issue start <issue-id> --profile ap_<profile-id>
+cadence --org acme agent report <assignment-id> --state running --text "outline drafted"
+cadence --org acme agent report <assignment-id> --state result \
+  --text "Three interviews and a research memo" \
+  --deliverable link:https://docs.example/<memo>
+cadence --org acme agent report <assignment-id> --state result \
+  --text "Brand audit complete" --deliverable artifact:<artifact-ref>
+```
+
+`--deliverable` is typed as `artifact:<ref>` or `link:<https url>` and is only
+accepted on a `result`; the board stores the reference and reports separately
+whether it resolved it, so an echoed reference is not proof the output exists.
+A digest of a document is not a commit: `--head` is refused for repo-less work,
+and the board refuses a head it was not asked for. The dev contract is
+unchanged: a `dev` result still requires `--head` of 40 or 64 lowercase hex
+characters.
+
+The board can store a session key as claim-contest metadata, but this client has
+no verified per-runtime identity of its own. A POSIX session is shared by
+nested runtimes and by every command in one terminal, so it is never sent as
+the claim session. A brand-new claim therefore records no session and keeps the
+board's legacy client/profile and generation fence; the client says so on
+stderr. Two sessions sharing that legacy client/profile are not distinguished.
+
+The client never copies a key out of an existing claim to impersonate its holder.
+It refuses a key-bearing claim unless a person explicitly supplies
+`--take-over "<reason>"`; a board that cannot record the take-over is refused
+rather than silently dropping it. `claim_last_seen_at` is the time of the last
+accepted claim or report receipt, not proof of execution.
+
+`--kind` is accepted on hosted `issue start` and `dispatch`; it is only sent
+when it is not `dev`, so a default create body is unchanged. A local (lane)
+start or dispatch refuses `--kind`. A board that predates work kinds refuses
+the field and the client says so instead of creating dev work.
+
+A kind this client does not run is still listed and fenced, and refused where
+work would start.
+
+`review` is a named unsupported capability in this client: review work is not
+created, claimed or picked up until the board proves exact PR/head binding and
+a self-review refusal. A `review` row is shown and fenced, and `--kind review`
+is refused with that reason. Approval, a merge and an external effect are
+never inferred from a review, and the client never infers the reviewer from a
+profile name, an alias or ticket text. The client announces the kinds it
+can run in `X-Cadence-Client-Features`. Against a board that does not record
+work kinds, a non-code claim or report is refused with `unsupported_work_kind`
+and nothing local is started: it is never retried as dev work. A board that
+changes a row's kind between listing and claim answers `work_kind_mismatch`,
+which is a refusal, not permission to run the row as something else.
 
 A `--state result` report ends the assignment but moves nothing else. Once
 the work meets the project's acceptance and completion rules, use the

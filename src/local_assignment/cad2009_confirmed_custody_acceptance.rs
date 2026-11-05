@@ -57,7 +57,7 @@ fn cad2009_confirmed_result_names_remote_commit_when_local_admission_fails() {
     let assignment = parse_assignment(&original()).unwrap();
     coord.remember_discovered(&assignment).unwrap();
     coord.reserve_kickoff(&assignment).unwrap();
-    let outcome = coord.report(ID, "result", Some(TEXT), Some(SHA));
+    let outcome = coord.report(ID, "result", Some(TEXT), Some(SHA), None);
     assert_eq!(coord.http.reports, 1);
     assert!(
         fs::symlink_metadata(&lock).unwrap().is_dir(),

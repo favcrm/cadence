@@ -902,6 +902,11 @@ pub(crate) enum Commands {
         /// (requires --spec; the job's PM is --reply-to).
         #[arg(long, requires = "spec")]
         job: bool,
+        /// Hosted work kind: research, design, business or manual. `dev` is the default and is
+        /// never sent on the wire; `review` is refused as an unsupported
+        /// capability, and a local (lane) dispatch refuses any value.
+        #[arg(long, value_name = "KIND")]
+        kind: Option<String>,
         /// Job spec file for --job — hashed at creation.
         #[arg(long)]
         spec: Option<PathBuf>,

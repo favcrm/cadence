@@ -156,6 +156,34 @@ equal(rows.map((r) => r.title), ["set", "op"], "recent tracker events precede ol
 equal(rows[1].markdown, true, "comment bodies are markdown");
 equal(rows[1].detail, "hello <b>there</b>", "comment text is not rewritten");
 
+const hostedComment = { name: "comment", author: "member", at: "2026-09-26T08:00:00Z", body: "The research is ready." };
+equal(
+  timelineRows(detail({ comments: [hostedComment] }), []).map((row) => row.detail),
+  ["The research is ready."],
+  "a hosted comment remains visible when the activity feed omits comments",
+);
+equal(
+  timelineRows(detail({ comments: [hostedComment] }), []).map((row) => row.title),
+  ["member"],
+  "a hosted comment keeps its recorded author",
+);
+equal(
+  timelineRows(detail({
+    comments: [hostedComment],
+    activity: [{ at: hostedComment.at, kind: "comment", author: "member", body: hostedComment.body }],
+  }), []).filter((row) => row.detail === hostedComment.body).length,
+  1,
+  "comments already included in activity are not duplicated",
+);
+equal(
+  timelineRows(detail({
+    comments: [hostedComment, { ...hostedComment, name: "second", author: "another" }],
+    activity: [{ at: hostedComment.at, kind: "comment", author: "member", body: hostedComment.body }],
+  }), []).filter((row) => row.detail === hostedComment.body).length,
+  2,
+  "partial activity does not hide a second identical comment",
+);
+
 const mixed = timelineRows(detail({ reports: [
   { name: "undated", body: "Undated evidence" },
   { name: "bad-date", body: "Invalid-date evidence", at: "not-a-date" },

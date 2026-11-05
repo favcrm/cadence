@@ -301,6 +301,29 @@ export function timelineRows(detail: IssueDetail, history: IssueHistoryEntry[]):
       });
     }
   }
+  // Hosted activity may be missing or partial while comments are returned
+  // separately. Match multiplicities so repeated identical comments survive.
+  const represented = new Map<string, number>();
+  for (const item of detail.activity) {
+    if (item.kind !== "comment") continue;
+    const key = JSON.stringify([item.at, item.author ?? "", item.body ?? ""]);
+    represented.set(key, (represented.get(key) ?? 0) + 1);
+  }
+  for (const comment of detail.comments) {
+    const key = JSON.stringify([comment.at, comment.author ?? "", comment.body]);
+    const count = represented.get(key) ?? 0;
+    if (count > 0) {
+      represented.set(key, count - 1);
+      continue;
+    }
+    events.push({
+      title: comment.author || "Comment",
+      detail: comment.body,
+      at: comment.at,
+      tone: "done",
+      markdown: true,
+    });
+  }
   for (const entry of history) {
     if (entry.kind === "comment") continue;
     events.push({

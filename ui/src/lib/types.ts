@@ -17,7 +17,11 @@ export type MasterIdentity = Api.MasterIdentity;
 
 /** A board card (`GET /api/issues` row): the core card, its work block and
  *  the bound-agent strip. Generated from the daemon's Rust type. */
-export type IssueCard = Api.IssueListItem;
+export type IssueCard = Api.IssueListItem & {
+  /** Optional hosted participant-scoped projection; never a liveness claim. */
+  local_assignment?: unknown;
+  acceptance?: unknown;
+};
 
 /** CAD-405 epic health. `stalled` is time in stage, not child activity. */
 export type HealthState = "on_track" | "at_risk" | "stalled";
@@ -163,6 +167,12 @@ export interface IssueDetail extends Omit<IssueCard, "counts"> {
   plan?: PlanBlock | null;
   /** CAD-341 task reports on the ticket (questions carry `open`). */
   reports?: TaskReport[];
+  /** Hosted watcher facts are optional and independently validated by their view. */
+  agent_run?: unknown;
+  /** Hosted artifact review summary, when the board can read it. */
+  review_state?: unknown;
+  /** Hosted evidence for explicitly recorded heads; current authority may be unknown. */
+  approvals?: unknown;
 }
 
 /** One ticket of a plan, with its derived status. */
@@ -223,6 +233,9 @@ export interface Project {
   default_owner?: string;
   repos: { path?: string; remote?: string }[];
   issues: number;
+  /** Participant-scoped aggregate, when supplied by the hosted board. */
+  local_assignment?: unknown;
+  acceptance?: unknown;
 }
 
 export type ContextRole = "pm" | "dev" | "qa" | "devops";

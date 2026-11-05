@@ -18,6 +18,12 @@ struct KickoffFile {
     generation: u64,
     worktree: String,
     text: String,
+    /// Non-code kind this kickoff runs as. Absent for dev work and for
+    /// bindings written before kinds: the managed completion path then keeps
+    /// the dev contract (a result names a commit). Omitted when `None`, so a
+    /// dev binding stays byte-identical for a reader from before kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work_kind: Option<String>,
     #[serde(default)]
     pending_state: Option<String>,
     #[serde(default)]
@@ -43,6 +49,29 @@ fn pinned_issuer(value: &str) -> bool {
     (1..=300).contains(&value.len())
         && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
         && !value.contains('\\')
+}
+
+/// The work kind a kickoff runs as. Dev and a kickoff from before kinds both
+/// mean the existing dev contract; no other reading is allowed.
+fn kickoff_kind(kickoff: &Kickoff<'_>) -> Option<&'static str> {
+    kickoff
+        .work_kind
+        .filter(|kind| kind.is_non_code())
+        .map(WorkKind::token)
+}
+
+/// The recorded kind of a durable binding. An unreadable token fails closed:
+/// it is never downgraded to dev work or dropped from a report.
+fn binding_kind(file: &KickoffFile) -> Result<Option<WorkKind>> {
+    match file.work_kind.as_deref() {
+        None => Ok(None),
+        Some(token) => WorkKind::parse(token)
+            .filter(|kind| kind.is_non_code())
+            .map(Some)
+            .ok_or_else(|| {
+                Error::rejected("hosted kickoff binding has an invalid work kind; nothing was sent")
+            }),
+    }
 }
 
 /// Original identity only. Missing or malformed pins never become authority.
@@ -174,6 +203,7 @@ fn kickoff_matches(file: &KickoffFile, kickoff: &Kickoff) -> bool {
         && file.claim_id == kickoff.claim_id
         && file.generation == kickoff.generation
         && file.organization_id == kickoff.organization_id
+        && file.work_kind.as_deref() == kickoff_kind(kickoff)
         && file.subject_id.as_deref() == Some(subject_id)
         && file.issuer.as_deref() == Some(issuer)
 }
@@ -301,6 +331,7 @@ pub fn store_kickoff_binding(
             generation: kickoff.generation,
             worktree: kickoff.worktree.to_string(),
             text: text.to_string(),
+            work_kind: kickoff_kind(kickoff).map(str::to_string),
             pending_state: None,
             pending_text: None,
             pending_head: None,
@@ -332,16 +363,27 @@ fn same_binding(existing: &KickoffFile, kickoff: &Kickoff, text: &str) -> Result
 
 /// Hosted state owed by a local terminal row.
 /// `unknown` and anything still in flight return `None`: unresolved never
-/// becomes a result. An explicit accepted SHA is kept; a missing or illegal
-/// SHA on completion is a failure, not a guessed commit.
+/// becomes a result. Dev work keeps the accepted-SHA rule: an explicit
+/// accepted SHA is kept, and a missing or illegal SHA on completion is a
+/// failure, not a guessed commit. Repo-less work has no commit to name, so
+/// its completion is a text result with no head.
 fn completion_outcome<'a>(
     status: &str,
     text: &'a str,
     sha: Option<String>,
+    non_code: bool,
 ) -> Option<(&'static str, Cow<'a, str>, Option<String>)> {
     let explicit = sha.filter(|value| head_sha(value));
     match status {
         "completed" | "result" => {
+            let summary = if text.trim().is_empty() {
+                Cow::Borrowed("local actor completed")
+            } else {
+                Cow::Borrowed(text)
+            };
+            if non_code {
+                return Some(("result", summary, None));
+            }
             let Some(head) = explicit else {
                 return Some((
                     "failed",
@@ -353,15 +395,7 @@ fn completion_outcome<'a>(
                     None,
                 ));
             };
-            Some((
-                "result",
-                if text.trim().is_empty() {
-                    Cow::Borrowed("local actor completed")
-                } else {
-                    Cow::Borrowed(text)
-                },
-                Some(head),
-            ))
+            Some(("result", summary, Some(head)))
         }
         "failed" | "interrupted" | "cancelled" => Some((
             "failed",
@@ -543,6 +577,8 @@ struct Prepared {
     generation: u64,
     pending_state: String,
     pending_head: Option<String>,
+    /// Non-code kind this report is for. `None` is the dev contract.
+    work_kind: Option<WorkKind>,
     body: Value,
     /// Original member, when the binding recorded both pins.
     subject_id: Option<String>,
@@ -567,6 +603,7 @@ fn prepare_pending(
     if binding.reported_state.is_some() || binding.settled {
         return Ok((true, None));
     }
+    let work_kind = binding_kind(&binding)?;
     if binding.pending_state.is_none() {
         let Some(message) = store.message(message_id)? else {
             return Ok((true, None));
@@ -575,6 +612,7 @@ fn prepare_pending(
             &message.state,
             message_text(&message),
             message_sha(&message),
+            work_kind.is_some(),
         ) else {
             return Ok((true, None));
         };
@@ -583,10 +621,13 @@ fn prepare_pending(
             claim_id: &binding.claim_id,
             generation: binding.generation,
         };
+        // A repo-less kickoff keeps its kind on the report and never sends a
+        // commit. A dev kickoff keeps the existing body byte-for-byte.
         let bounded = super::wire::bounded_report_text(
             &identity,
             state,
             head.as_deref(),
+            work_kind.map(WorkKind::token),
             message_id,
             text.as_ref(),
         )?;
@@ -609,6 +650,8 @@ fn prepare_pending(
         &state,
         binding.pending_text.as_deref(),
         binding.pending_head.as_deref(),
+        work_kind.map(WorkKind::token),
+        None,
     )?;
     Ok((
         true,
@@ -621,6 +664,7 @@ fn prepare_pending(
             generation: binding.generation,
             pending_state: state,
             pending_head: binding.pending_head.clone(),
+            work_kind,
             body,
             subject_id: binding.subject_id,
             issuer: binding.issuer,
@@ -661,8 +705,8 @@ fn post_report(prepared: &Prepared, deadline: Instant) -> Result<ReportAck> {
 }
 
 /// `200`/`201` count only when the assignment receipt names this claim,
-/// generation, and hosted state, and a result carries the same SHA.
-/// `409 fenced`/`terminal` settles without becoming an accepted report.
+/// generation, hosted state and work kind, and a dev result carries the same
+/// SHA. `409 fenced`/`terminal` settles without becoming an accepted report.
 fn classify_reply(prepared: &Prepared, status: u16, body: &Value) -> Result<ReportAck> {
     if matches!(status, 200 | 201) {
         let assignment = parse_assignment(body)?;
@@ -675,6 +719,11 @@ fn classify_reply(prepared: &Prepared, status: u16, body: &Value) -> Result<Repo
         {
             return Err(Error::rejected(
                 "hosted report receipt did not match this claim",
+            ));
+        }
+        if assignment.non_code_kind() != prepared.work_kind {
+            return Err(Error::rejected(
+                "hosted report receipt did not carry the work kind that was reported",
             ));
         }
         if prepared.pending_state == "result"
@@ -786,6 +835,7 @@ mod tests {
             audience: "https://hosted-report.invalid",
             subject_id: Some("user_member"),
             issuer: Some("https://hosted-report.invalid"),
+            work_kind: None,
         }
     }
 
@@ -968,6 +1018,61 @@ mod tests {
     }
 
     #[test]
+    fn repo_less_completion_reports_its_kind_and_never_a_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_message(dir.path());
+        register(&store, dir.path());
+        let message = "research-1";
+        let mut binding = kickoff(message, "hlc_00000000000000000000000000000001");
+        binding.work_kind = Some(WorkKind::Research);
+        store_kickoff_binding(
+            dir.path(),
+            "acme",
+            "https://hosted-report.invalid",
+            &binding,
+            "do the research",
+        )
+        .unwrap();
+        assert_eq!(file(dir.path(), message)["work_kind"], "research");
+
+        store
+            .enqueue("worker", "do the research", None, message, "user")
+            .unwrap();
+        let claimed = match store.take_queued("worker").unwrap() {
+            crate::store::Take::Message(claimed) => claimed,
+            _ => panic!("expected a claimed message"),
+        };
+        store.mark_running(message, "turn-1").unwrap();
+        store
+            .finish(
+                &claimed,
+                "completed",
+                &json!({"status": "completed", "text": "pricing memo retained"}),
+                None,
+            )
+            .unwrap();
+        ReportDriver::new(dir.path())
+            .tick(&store, Instant::now())
+            .unwrap();
+
+        let saved = file(dir.path(), message);
+        assert_eq!(saved["pending_state"], "result");
+        assert!(saved["pending_head"].is_null());
+        assert_eq!(saved["pending_text"], "pricing memo retained");
+        assert!(saved["reported_state"].is_null());
+
+        // The body the reporter would send keeps the kind and carries no
+        // commit, so the board can accept the non-code result.
+        let (_, prepared) =
+            prepare_pending(&binding_path(dir.path(), message).unwrap(), &store, message).unwrap();
+        let prepared = prepared.expect("a ready report");
+        assert_eq!(prepared.work_kind, Some(WorkKind::Research));
+        assert_eq!(prepared.body["work_kind"], "research");
+        assert!(prepared.body.get("reported_head_sha").is_none());
+        assert_eq!(prepared.body["state"], "result");
+    }
+
+    #[test]
     fn cancelled_and_reconciled_rows_report_and_unknown_does_not() {
         let dir = tempfile::tempdir().unwrap();
         let store = store_message(dir.path());
@@ -1033,6 +1138,7 @@ mod tests {
             generation: 3,
             pending_state: "result".to_string(),
             pending_head: Some(SHA.to_string()),
+            work_kind: None,
             body: json!({}),
             subject_id: Some("user_member".to_string()),
             issuer: Some("https://hosted-report.invalid".to_string()),

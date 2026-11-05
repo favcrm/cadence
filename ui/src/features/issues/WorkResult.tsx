@@ -8,6 +8,10 @@ import type { IssueDetail, TaskReport } from "../../lib/types";
 import { stageLabel } from "../projects/work";
 import { composerBlocked, type LanePayload } from "./lane";
 import { WriteGate } from "../auth/WriteGate";
+import { HostedRun } from "./HostedRun";
+import { ArtifactReviews } from "./ArtifactReviews";
+import { LocalAssignments } from "./LocalAssignments";
+import { ApprovalRecords } from "./ApprovalRecords";
 import {
   deployRefs,
   mergeState,
@@ -44,7 +48,7 @@ function nextAction({
   t: (s: string) => string;
 }): string {
   if (detail.status === "done" || detail.status === "dropped")
-    return t("The issue is closed; nothing is pending here.");
+    return t("The issue is closed. Check recorded assignments for any work still awaiting reconciliation.");
   if (checksTotal === 0)
     return t("Add at least one acceptance check — kick off stays blocked until one exists.");
   // `blocked` carries the real reason (write gate or dispatch block); show it.
@@ -52,7 +56,7 @@ function nextAction({
   if (lane === null)
     return t("The lane record is unavailable — check the lane card for its state.");
   const view = lane.lane;
-  if (!view) return t("Kick off a lane to start the work.");
+  if (!view) return t("Check recorded assignments before starting another lane.");
   if (view.state === "fenced")
     return t("Unfence or reassign the lane — the controls are on the lane card.");
   if (view.state === "quota" || view.state === "rate-limited")
@@ -123,13 +127,23 @@ export function WorkResult({
         ? `${latest.agent ?? t("unknown agent")} · ${latest.kind ?? "report"}${
             latest.at ? ` · ${fmtTime(latest.at)}` : ""
           }`
-        : t("Nothing reported yet — no completion claim exists."),
+        : detail.reports === undefined ? t("Worker reports are unavailable.") : t("Nothing reported yet — no completion claim exists."),
+    },
+    {
+      title: t("Artifact reviews"),
+      tone: "wait",
+      detail: <ArtifactReviews value={detail.review_state} />,
+    },
+    {
+      title: t("Approval evidence"),
+      tone: "wait",
+      detail: <ApprovalRecords value={detail.approvals} />,
     },
     {
       title: t("Independent review"),
       tone: !verdict ? "wait" : stale || verdict.verdict !== "pass" ? "warn" : "done",
       detail: !verdict ? (
-        t("No revision-bound verdict is recorded.")
+        detail.reports === undefined ? t("Review evidence is unavailable.") : t("No revision-bound verdict is recorded.")
       ) : (
         <>
           {`${verdict.agent ?? t("unknown reviewer")} · ${verdict.verdict ?? "verdict"}${
@@ -144,7 +158,7 @@ export function WorkResult({
         </>
       ),
     },
-    {
+    ...((pr || latest?.pr || (detail.commits?.length ?? 0) > 0) ? [{
       title: t("Merge"),
       tone: merge.tone,
       detail:
@@ -162,15 +176,15 @@ export function WorkResult({
         (merge.skipped.length
           ? ` ${t("Commit scan skipped:")} ${merge.skipped.join(", ")}.`
           : ""),
-    },
-    {
+    }] : []),
+    ...(deploys.length > 0 ? [{
       title: t("Deployment"),
       tone: "wait",
       detail:
         deploys.length > 0
           ? t("Deployment references are recorded; no live deployment check exists here.")
           : t("No deployment evidence is attached — this result is not a live-release claim."),
-    },
+    }] : []),
   ];
 
   return (
@@ -190,6 +204,10 @@ export function WorkResult({
                 ? t("Lane state unavailable")
                 : t("No lane yet")}
           </dd>
+          <dt className="text-ink-500">{t("Hosted run")}</dt>
+          <dd className="min-w-0 m-0"><HostedRun value={detail.agent_run} /></dd>
+          <dt className="text-ink-500">{t("Local assignments")}</dt>
+          <dd className="min-w-0 m-0"><LocalAssignments value={detail.local_assignment} /></dd>
           <dt className="text-ink-500">{t("Next action")}</dt>
           <dd className="min-w-0 m-0">
             {nextAction({
@@ -244,7 +262,9 @@ export function WorkResult({
           </>
         ) : (
           <p className="text-secondary text-ink-400 m-0">
-            {t("No worker report yet. The agent's own statement will appear here when it files one — it is not an operator approval.")}
+            {detail.reports === undefined
+              ? t("Worker reports are unavailable.")
+              : t("No worker report yet. The agent's own statement will appear here when it files one — it is not an operator approval.")}
           </p>
         )}
         {(pr || latest?.pr || artifacts.length > 0 || deploys.length > 0) && (
@@ -294,7 +314,7 @@ export function WorkResult({
               </Button>
             )
           )}
-          <Button href={tabHref("pr")}>{t("Pull request")}</Button>
+          {(pr || latest?.pr || (detail.commits?.length ?? 0) > 0) && <Button href={tabHref("pr")}>{t("Pull request")}</Button>}
           <Button variant="ghost" href={tabHref("evidence")}>
             {t("Open evidence")}
           </Button>

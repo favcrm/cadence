@@ -63,6 +63,176 @@ pub struct Kickoff<'a> {
     /// Both are required together. A missing half is not inferred.
     pub subject_id: Option<&'a str>,
     pub issuer: Option<&'a str>,
+    /// Set for repo-less work: the actor is told to report text and an
+    /// optional deliverable instead of a checkout path and a commit.
+    pub work_kind: Option<WorkKind>,
+}
+
+/// The board's work kind for one assignment (CAD-2195/CAD-2061).
+///
+/// `dev` is checkout work: its result must name the exact commit. Every other
+/// kind runs without a checkout and its result carries text plus, when the
+/// source actually names one, a typed deliverable reference — never a commit.
+/// A row with no `kind` is what a board that predates kinds sends, and it
+/// keeps the dev contract unchanged. A kind this client does not list is kept
+/// as `unsupported_kind` and refused where work would start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkKind {
+    Dev,
+    Research,
+    Design,
+    Business,
+    Manual,
+}
+
+impl WorkKind {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Research => "research",
+            Self::Design => "design",
+            Self::Business => "business",
+            Self::Manual => "manual",
+        }
+    }
+
+    /// The kind a `--kind` value names, or `None` for a token this client
+    /// cannot run. `dev` is the default and is never sent on the wire.
+    pub fn parse(token: &str) -> Option<Self> {
+        Some(match token {
+            "dev" => Self::Dev,
+            "research" => Self::Research,
+            "design" => Self::Design,
+            "business" => Self::Business,
+            "manual" => Self::Manual,
+            _ => return None,
+        })
+    }
+
+    /// Repo-less work. It is claimed, delivered and reported without a lane
+    /// or a checkout.
+    pub fn is_non_code(self) -> bool {
+        !matches!(self, Self::Dev)
+    }
+}
+
+/// A typed reference to the actual output of repo-less work.
+///
+/// The board stores it with the result and remains its authority; this client
+/// checks only the shape the wire defines and that the board echoed it. A
+/// found/verified judgment belongs to the board resolver, so an echoed
+/// reference is not proof the artifact exists. It is not a commit and is
+/// never sent or shown as one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Deliverable {
+    kind: DeliverableKind,
+    reference: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliverableKind {
+    Artifact,
+    Link,
+}
+
+impl DeliverableKind {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Artifact => "artifact",
+            Self::Link => "link",
+        }
+    }
+
+    fn parse(token: &str) -> Option<Self> {
+        match token {
+            "artifact" => Some(Self::Artifact),
+            "link" => Some(Self::Link),
+            _ => None,
+        }
+    }
+}
+
+impl Deliverable {
+    /// `artifact:<ref>` or `link:<https-url>`. The type is explicit so a
+    /// reference is never guessed into the wrong field, and a document digest
+    /// can never be handed over as a commit.
+    pub fn parse(value: &str) -> Result<Self> {
+        let (kind, reference) = value.split_once(':').ok_or_else(|| {
+            Error::rejected(
+                "--deliverable must be artifact:<ref> or link:<https url>; nothing was reported",
+            )
+        })?;
+        let kind = DeliverableKind::parse(kind).ok_or_else(|| {
+            Error::rejected("--deliverable type must be artifact or link; nothing was reported")
+        })?;
+        let deliverable = Self {
+            kind,
+            reference: reference.to_string(),
+        };
+        if !deliverable.valid() {
+            return Err(Error::rejected(
+                "--deliverable reference is not a 1..200 character artifact ref or an https link without userinfo; nothing was reported",
+            ));
+        }
+        Ok(deliverable)
+    }
+
+    fn from_json(value: &Value) -> Result<Self> {
+        let fields = value
+            .as_object()
+            .filter(|fields| fields.len() == 2)
+            .ok_or_else(|| Error::rejected("report deliverable is not the contract"))?;
+        let kind = fields
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(DeliverableKind::parse)
+            .ok_or_else(|| Error::rejected("report deliverable type is not the contract"))?;
+        let reference = fields
+            .get("ref")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("report deliverable has no reference"))?;
+        let deliverable = Self {
+            kind,
+            reference: reference.to_string(),
+        };
+        if !deliverable.valid() {
+            return Err(Error::rejected(
+                "report deliverable reference is not the wire shape",
+            ));
+        }
+        Ok(deliverable)
+    }
+
+    fn valid(&self) -> bool {
+        match self.kind {
+            // The board's own resolver says whether the reference was found,
+            // so this only keeps it a single visible token of bounded size.
+            DeliverableKind::Artifact => {
+                (1..=200).contains(&self.reference.len())
+                    && self
+                        .reference
+                        .chars()
+                        .all(|ch| !ch.is_control() && !ch.is_whitespace())
+            }
+            DeliverableKind::Link => {
+                let reference = &self.reference;
+                let Some(authority) = reference.strip_prefix("https://") else {
+                    return false;
+                };
+                let host = authority.split(['/', '?', '#']).next().unwrap_or_default();
+                (8..=500).contains(&reference.len())
+                    && !host.is_empty()
+                    && !host.contains('@')
+                    && reference
+                        .chars()
+                        .all(|ch| !ch.is_control() && !ch.is_whitespace())
+            }
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({"type": self.kind.token(), "ref": self.reference})
+    }
 }
 
 #[derive(Clone)]
@@ -83,8 +253,21 @@ struct Assignment {
     guidance: Option<Value>,
     reported_head_sha: Option<String>,
     text: Option<String>,
-    /// The board's work kind when it is not dev work. Still parsed, listed and
-    /// fenced; only `claim_with_profile` and `pickup_rows` refuse to start it.
+    /// The kind the board named, when it named one this client runs. `None`
+    /// is the old wire and keeps the dev contract: head-bound result, no
+    /// deliverable.
+    kind: Option<WorkKind>,
+    /// The result's typed output reference, echoed back by the board. Only a
+    /// non-code result carries one.
+    deliverable: Option<Deliverable>,
+    /// The claim session the board recorded (CAD-2061). Present only for a
+    /// claim that announced and sent one; absent for a legacy claim.
+    session_key: Option<String>,
+    /// Second-precision time of the last accepted claim or report receipt for
+    /// this claim. It is a receipt time, not proof of execution.
+    claim_last_seen_at: Option<String>,
+    /// The board's work kind when it is not one this client runs. Still
+    /// parsed, listed and fenced; every place that would start work refuses it.
     unsupported_kind: Option<String>,
 }
 
@@ -136,6 +319,14 @@ struct Attempt {
     /// that has never heard of the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_profile: Option<String>,
+    /// CAD-2195: the work kind the board last recorded for this assignment.
+    /// A report needs it to know whether the result must name a commit or may
+    /// carry text plus a deliverable. It is an observation, never authority:
+    /// the board still checks the claim, generation and kind.
+    ///
+    /// Omitted when unset for the same reason as `session_profile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work_kind: Option<String>,
 }
 
 /// The claim a kickoff message was allowed to report. Keyed by message id
@@ -187,6 +378,10 @@ pub struct Coordinator<H> {
     /// Daemon binding lifetime. Cancellation is not an execution failure and
     /// must never turn a detached context read into a late blocked report.
     delivery_guard: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// CAD-2061: an explicit, reasoned take-over of another session's live
+    /// claim. Never implied, never retried without it once the board has
+    /// refused it.
+    take_over: Option<String>,
     /// Test seam: runs after the delivery check and before reservation,
     /// while the ledger lock is not held.
     #[cfg(test)]
@@ -436,8 +631,28 @@ impl Assignment {
         });
         if let Some(kind) = &self.unsupported_kind {
             row["kind"] = json!(kind);
+        } else if let Some(kind) = self.kind {
+            row["kind"] = json!(kind.token());
+        }
+        if let Some(deliverable) = &self.deliverable {
+            row["deliverable"] = deliverable.to_json();
+        }
+        if let Some(session) = &self.session_key {
+            row["session_key"] = json!(session);
+        }
+        if let Some(seen) = &self.claim_last_seen_at {
+            row["claim_last_seen_at"] = json!(seen);
         }
         row
+    }
+
+    /// The kind this row runs as when it is not dev work. `None` covers both
+    /// dev work and the old wire that never said a kind.
+    fn non_code_kind(&self) -> Option<WorkKind> {
+        if self.unsupported_kind.is_some() {
+            return None;
+        }
+        self.kind.filter(|kind| kind.is_non_code())
     }
 
     fn work_kind_refusal(&self) -> Option<Error> {
@@ -492,6 +707,46 @@ fn parse_guidance(value: &Value) -> Result<Option<Value>> {
     }
 }
 
+/// A claim session key or a second-precision receipt time. Both are board
+/// text shown back to the member, so each is bounded and pattern-checked.
+fn session_key(value: &Value, key: &str) -> Result<Option<String>> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(session))
+            if (1..=200).contains(&session.len())
+                && session.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+                }) =>
+        {
+            Ok(Some(session.clone()))
+        }
+        _ => Err(Error::rejected(
+            "assignment session key is not the contract",
+        )),
+    }
+}
+
+fn claim_last_seen(value: &Value, key: &str) -> Result<Option<String>> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(seen))
+            if seen.len() == 20
+                && seen.bytes().enumerate().all(|(index, byte)| match index {
+                    4 | 7 => byte == b'-',
+                    10 => byte == b'T',
+                    13 | 16 => byte == b':',
+                    19 => byte == b'Z',
+                    _ => byte.is_ascii_digit(),
+                }) =>
+        {
+            Ok(Some(seen.clone()))
+        }
+        _ => Err(Error::rejected(
+            "assignment last-seen time is not a second-precision UTC stamp",
+        )),
+    }
+}
+
 fn parse_references(value: &Value, issue: &str) -> Result<()> {
     match value.get("references") {
         None => Ok(()),
@@ -515,9 +770,17 @@ fn parse_references(value: &Value, issue: &str) -> Result<()> {
 /// fields: an older board ignores a header and would reject anything else.
 const CLIENT_FEATURES_HEADER: &str = "X-Cadence-Client-Features";
 ///
-/// It does not announce work kinds, so a board must not send this client a
-/// non-dev row. `unsupported_kind` is the defence if one arrives anyway.
-const CLIENT_FEATURES: &str = "assignment-unknown-keys,event-unknown-types";
+/// CAD-2195/CAD-2061: the `work-kind.<token>` entries are the kinds this
+/// client can actually run, and `result-deliverable` says a repo-less result
+/// may carry a typed reference instead of a commit. The header is only an
+/// announcement; what the board sent in a row is what the client acts on. A
+/// board that cannot record a work kind has no way to ask for one, and a
+/// non-code row is refused rather than run as dev. `claim-session` says a
+/// claim may name the session that holds it and receive its last accepted
+/// receipt time.
+const CLIENT_FEATURES: &str = "assignment-unknown-keys,event-unknown-types,\
+work-kind.dev,work-kind.research,work-kind.design,work-kind.business,work-kind.manual,\
+result-deliverable,claim-session";
 
 fn parse_assignment(value: &Value) -> Result<Assignment> {
     if forbidden_path_key(value) {
@@ -548,23 +811,30 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
         .as_object()
         .filter(|object| required.iter().all(|key| object.contains_key(*key)))
         .ok_or_else(|| Error::rejected("coordination response is not the assignment contract"))?;
-    // Ignoring a work kind would run review or research as dev work. Refusing
-    // the row here would stop every later event, snapshot and list, so it is
-    // kept and refused where work would start.
-    let unsupported_kind = match object.get("kind") {
-        None => None,
-        Some(kind) if kind == "dev" => None,
+    // Ignoring a work kind would run review or research as dev work. A kind
+    // this client runs is kept and acted on; any other is kept as a refusal
+    // and refused where work would start, because refusing the row here would
+    // stop every later event, snapshot and list.
+    let (kind, unsupported_kind) = match object.get("kind") {
+        None => (None, None),
+        Some(kind) if kind == "dev" => (Some(WorkKind::Dev), None),
+        Some(kind) if kind.as_str().and_then(WorkKind::parse).is_some() => {
+            (kind.as_str().and_then(WorkKind::parse), None)
+        }
         // Board text reaches messages, so only a plain bounded token is shown.
-        Some(kind) => Some(
-            kind.as_str()
-                .filter(|kind| {
-                    kind.len() <= 32
-                        && kind
-                            .bytes()
-                            .all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_')
-                })
-                .unwrap_or("unrecognized")
-                .to_string(),
+        Some(kind) => (
+            None,
+            Some(
+                kind.as_str()
+                    .filter(|kind| {
+                        kind.len() <= 32
+                            && kind
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_')
+                    })
+                    .unwrap_or("unrecognized")
+                    .to_string(),
+            ),
         ),
     };
     if object.get("version").and_then(Value::as_str) != Some(VERSION) {
@@ -658,7 +928,28 @@ fn parse_assignment(value: &Value) -> Result<Assignment> {
             ))
         }
     };
+    let deliverable = match value.get("deliverable") {
+        None | Some(Value::Null) => None,
+        Some(object) => Some(Deliverable::from_json(object)?),
+    };
+    // A non-code result names its output, never a commit; dev work names its
+    // exact commit, never a deliverable. Either mix is a contract break, and
+    // reading it as success would misstate what the board recorded.
+    if deliverable.is_some() && !kind.is_some_and(WorkKind::is_non_code) {
+        return Err(Error::rejected(
+            "a deliverable reference belongs to non-code work; this row is not one",
+        ));
+    }
+    if reported_head_sha.is_some() && kind.is_some_and(WorkKind::is_non_code) {
+        return Err(Error::rejected(
+            "non-code work cannot report a commit; this row names a Git head",
+        ));
+    }
     Ok(Assignment {
+        kind,
+        deliverable,
+        session_key: session_key(value, "session_key")?,
+        claim_last_seen_at: claim_last_seen(value, "claim_last_seen_at")?,
         unsupported_kind,
         assignment_id: assignment_id.to_string(),
         organization_id: organization_id.to_string(),
@@ -742,6 +1033,7 @@ fn retire_current_claim(attempt: &mut Attempt) {
     attempt.kickoff_reserved = None;
     attempt.origin_claim_id = None;
     attempt.origin_generation = None;
+    attempt.work_kind = None;
     attempt.worktree = None;
     attempt.lane = None;
     attempt.lane_claim = None;
@@ -794,6 +1086,14 @@ fn stamp(attempt: &mut Attempt, assignment: &Assignment) {
     attempt.claim_id = assignment.claim_id.clone();
     attempt.state = assignment.state.clone();
     attempt.target = assignment.target.clone();
+    // Recorded only when the board named a non-dev kind. A dev row writes
+    // nothing, so a dev-only ledger stays readable to an older client, whose
+    // `Attempt` refuses unknown fields. The observer keeps the last non-code
+    // kind rather than downgrading a repo-less row to dev on a partial read;
+    // the board still refuses a body whose kind or head does not match.
+    if let Some(kind) = assignment.kind.filter(|kind| kind.is_non_code()) {
+        attempt.work_kind = Some(kind.token().to_string());
+    }
     if assignment.state == "running" {
         attempt.fenced = false;
     }
@@ -835,6 +1135,7 @@ impl<H: CoordHttp> Coordinator<H> {
             issuer,
             audience,
             delivery_guard: None,
+            take_over: None,
             #[cfg(test)]
             before_reservation: None,
         })
@@ -850,6 +1151,21 @@ impl<H: CoordHttp> Coordinator<H> {
         let out = body(&mut ledger)?;
         ledger.save(&self.ledger, &self.org_id)?;
         Ok(out)
+    }
+
+    /// Record an explicit take-over of another session's live claim. A reason
+    /// is required and must be a single line, so a replacement is always
+    /// attributable; a missing or empty reason is refused before any request.
+    pub fn request_take_over(&mut self, reason: &str) -> Result<()> {
+        let reason = reason.trim();
+        if reason.is_empty() || reason.chars().count() > 500 || reason.chars().any(char::is_control)
+        {
+            return Err(Error::rejected(
+                "--take-over needs a single-line reason of 1..500 characters; nothing was claimed",
+            ));
+        }
+        self.take_over = Some(reason.to_string());
+        Ok(())
     }
 
     fn base(&self) -> String {
@@ -966,7 +1282,19 @@ impl<H: CoordHttp> Coordinator<H> {
         })
     }
 
-    fn queue(&mut self, issue: &str, action: &str, target: Option<&str>) -> Result<Assignment> {
+    /// Ask the board to create (or replay) one assignment.
+    ///
+    /// `kind` is the work kind this start asked for. Only a non-dev kind is
+    /// sent, so a dev create body stays byte-identical to the one an older
+    /// board already accepts; the board refuses the field it does not know and
+    /// this client refuses that answer rather than creating dev work instead.
+    fn queue(
+        &mut self,
+        issue: &str,
+        action: &str,
+        target: Option<&str>,
+        kind: Option<WorkKind>,
+    ) -> Result<Assignment> {
         let body = self.with_ledger(|ledger| {
             if !hosted_id(issue) {
                 return Err(Error::rejected("issue id is not a hosted id"));
@@ -1005,6 +1333,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 origin_claim_id: None,
                 origin_generation: None,
                 session_profile: None,
+                work_kind: None,
             });
             let mut body = json!({
                 "version": VERSION,
@@ -1018,15 +1347,48 @@ impl<H: CoordHttp> Coordinator<H> {
             if let Some(target) = target {
                 body["target"] = json!(target);
             }
+            if let Some(kind) = kind {
+                body["work_kind"] = json!(kind.token());
+            }
             Ok(body)
         })?;
         let path = self.base();
-        let value = self.exchange("POST", &path, Some(&body))?;
+        let value = match self.exchange("POST", &path, Some(&body)) {
+            Ok(value) => value,
+            // The board predates work kinds and refused the field before any
+            // effect. Creating dev work instead would be a silent lie.
+            Err(error) if kind.is_some() && error.code() == Some("invalid_request") => {
+                return Err(Error::invalid(
+                    "unsupported_work_kind",
+                    format!(
+                        "this board does not record a work kind, so no {} assignment was \
+                         created for {issue} and no dev assignment was substituted; nothing \
+                         was queued locally",
+                        kind.map_or("non-code", WorkKind::token)
+                    ),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let assignment = self
             .parse_owned(&value)
             .map_err(|_| assignment_unknown(&self.org_id, &path, Some(&body)))?;
         if assignment.issue_id != issue || assignment.target.as_deref() != target {
             return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
+        }
+        // A create that did not record the requested kind is an effect with an
+        // unproven shape: the row exists, so report it as unknown rather than
+        // claiming or replaying it under another kind.
+        if let Some(kind) = kind {
+            if assignment.non_code_kind() != Some(kind) {
+                return Err(Error::unknown(format!(
+                    "the hosted assignment for {issue} was created without the {} work kind \
+                     that was sent; nothing was claimed or started. Inspect `cadence agent \
+                     status` in the same workspace and reconcile the assignment before \
+                     retrying; do not replay blindly",
+                    kind.token()
+                )));
+            }
         }
         let key = attempt_key(issue, action, target);
         self.with_ledger(|ledger| {
@@ -1161,6 +1523,34 @@ impl<H: CoordHttp> Coordinator<H> {
         if let Some(refusal) = assignment.work_kind_refusal() {
             return Err(refusal);
         }
+        // CAD-2195: only a non-code row names its kind on the claim, so a dev
+        // claim body stays byte-identical to the one this client has always
+        // sent. The board checks that it agrees with the row it queued.
+        let work_kind = assignment.non_code_kind();
+
+        // CAD-2061: a board-recorded session is never copied into a claim.
+        // This client cannot independently prove it is the runtime that
+        // session names — a profile's client id is `session-<profile>` and is
+        // shared by every session of that profile — so a row that carries one
+        // is refused by name instead of replaying under a key we did not prove.
+        // An explicit, reasoned take-over is the board-authorized replacement.
+        if assignment.session_key.is_some() && self.take_over.is_none() {
+            return Err(Error::invalid(
+                "claim_held",
+                format!(
+                    "the hosted claim for {} was recorded for a session this client cannot \
+                     verify; nothing was claimed. Claim it from the session that holds it, or \
+                     replace it explicitly with `--take-over \"<reason>\"`",
+                    assignment.issue_id
+                ),
+            ));
+        }
+        if assignment.session_key.is_none() {
+            eprintln!(
+                "cadence: no verified runtime session is available here, so this claim records \
+                 no session and keeps the pre-existing client and generation fence"
+            );
+        }
         self.remember_discovered(assignment)?;
         let mut body = json!({
             "version": VERSION,
@@ -1168,30 +1558,87 @@ impl<H: CoordHttp> Coordinator<H> {
             "expected_generation": assignment.generation,
             "client_agent_id": client_agent_id,
         });
+        if let Some(kind) = work_kind {
+            body["work_kind"] = json!(kind.token());
+        }
         let mut expected_profile = profile.is_some();
         if let Some(profile) = profile {
             body["profile_id"] = json!(profile);
         }
+        if let Some(reason) = &self.take_over {
+            body["take_over"] = json!({"reason": reason});
+        }
         let path = format!("{}/{}/claim", self.base(), assignment.assignment_id);
         let value = match self.exchange("POST", &path, Some(&body)) {
             Ok(value) => value,
-            // A board that predates profile claims refuses the extra field as
-            // an invalid body before any effect. The profile is descriptive,
-            // never authority, so claiming without it is the same claim under
-            // the same client id — say so, and keep the fence.
-            Err(error) if profile.is_some() && error.code() == Some("invalid_request") => {
+            Err(error) if error.code() == Some("invalid_request") => {
+                // A take-over is authoritative. An older board that cannot
+                // record it refuses, and it is never retried without it: that
+                // would not be the claim the member asked for.
+                if self.take_over.is_some() {
+                    return Err(Error::invalid(
+                        "unsupported_feature",
+                        "this board cannot record a claim take-over; nothing was claimed and the \
+                         existing holder was not replaced",
+                    ));
+                }
+                // A board that predates work kinds refuses the field before
+                // any effect. Running the row as dev instead would be a
+                // silent lie about the work, so refuse and say why.
+                if work_kind.is_some() && profile.is_none() {
+                    return Err(Error::invalid(
+                        "unsupported_work_kind",
+                        format!(
+                            "this board does not record a work kind, so {} was not claimed as \
+                             {} work and no dev work was substituted; nothing local was started",
+                            assignment.issue_id,
+                            work_kind.map_or("non-code", WorkKind::token)
+                        ),
+                    ));
+                }
+                // Nothing descriptive was sent, so there is no field to drop:
+                // this is the plain claim body and the refusal stands.
+                if profile.is_none() {
+                    return Err(error);
+                }
+                // A board that predates profile claims refuses the extra field
+                // as an invalid body before any effect. The profile is
+                // descriptive, so retry without it and keep the work kind,
+                // the client id and the generation fence.
                 eprintln!(
-                    "cadence: this board does not accept a profile on a claim; claiming without \
-                     it — the profile is not recorded here"
+                    "cadence: this board does not record a profile on a claim; claiming without \
+                     it — the profile is not recorded here, and the claim keeps its client id, \
+                     generation and work kind"
                 );
                 expected_profile = false;
-                let retry = json!({
+                let mut retry = json!({
                     "version": VERSION,
                     "organization_id": self.org_id,
                     "expected_generation": assignment.generation,
                     "client_agent_id": client_agent_id,
                 });
-                self.exchange("POST", &path, Some(&retry))?
+                if let Some(kind) = work_kind {
+                    retry["work_kind"] = json!(kind.token());
+                }
+                match self.exchange("POST", &path, Some(&retry)) {
+                    // The board refused the kind too: it cannot record this
+                    // work, and it is never retried as dev.
+                    Err(error)
+                        if work_kind.is_some() && error.code() == Some("invalid_request") =>
+                    {
+                        Err(Error::invalid(
+                            "unsupported_work_kind",
+                            format!(
+                                "this board does not record a work kind, so {} was not claimed \
+                                 as {} work and no dev work was substituted; nothing local was \
+                                 started",
+                                assignment.issue_id,
+                                work_kind.map_or("non-code", WorkKind::token)
+                            ),
+                        ))
+                    }
+                    reply => reply,
+                }?
             }
             Err(error) => return Err(error),
         };
@@ -1213,6 +1660,26 @@ impl<H: CoordHttp> Coordinator<H> {
             || claimed.state != "running"
         {
             return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
+        }
+        // A confirmed claim must name the kind this client agreed to run. A
+        // board answering with another kind, or none, is an unrecorded
+        // outcome rather than permission to run something else.
+        if work_kind.is_some() && claimed.non_code_kind() != work_kind {
+            return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
+        }
+        if work_kind.is_none() && claimed.non_code_kind().is_some() {
+            let recorded = claimed
+                .non_code_kind()
+                .map(|kind| kind.token())
+                .unwrap_or("non-code");
+            return Err(Error::invalid(
+                "unsupported_work_kind",
+                format!(
+                    "the hosted claim for {} was recorded as {recorded} work; this claim was not \
+                     a non-code claim, so no local work was started",
+                    claimed.issue_id
+                ),
+            ));
         }
         self.with_ledger(|ledger| {
             let mut found = false;
@@ -1249,6 +1716,7 @@ impl<H: CoordHttp> Coordinator<H> {
                     origin_claim_id: None,
                     origin_generation: None,
                     session_profile: None,
+                    work_kind: None,
                 };
                 stamp(&mut attempt, &claimed);
                 ledger
@@ -1304,6 +1772,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 origin_claim_id: None,
                 origin_generation: None,
                 session_profile: None,
+                work_kind: None,
             };
             stamp(&mut attempt, assignment);
             ledger
@@ -1554,6 +2023,7 @@ impl<H: CoordHttp> Coordinator<H> {
             },
             "blocked",
             None,
+            claimed.non_code_kind().map(WorkKind::token),
             &claimed.assignment_id,
             text,
         ) else {
@@ -1565,6 +2035,8 @@ impl<H: CoordHttp> Coordinator<H> {
             claimed.generation,
             "blocked",
             Some(&text),
+            None,
+            claimed.non_code_kind(),
             None,
         )
         .map(|_| true)
@@ -1672,10 +2144,15 @@ impl<H: CoordHttp> Coordinator<H> {
         })
     }
 
+    /// Claim and hand one assignment to the local actor.
+    ///
+    /// `checkout` is the main checkout a dev lane is cut from. Non-code work
+    /// needs none: it is claimed, delivered and reported without a lane, a
+    /// worktree or a Git head (CAD-2195).
     fn activate<F>(
         &mut self,
         assignment: &Assignment,
-        root: &Path,
+        checkout: Option<&Path>,
         name: Option<&str>,
         alias: &str,
         deliver: &mut F,
@@ -1727,46 +2204,66 @@ impl<H: CoordHttp> Coordinator<H> {
                 "running",
                 None,
                 None,
+                current.non_code_kind(),
+                None,
             )?;
         }
-        let lane = match self.lane_for(&current, name) {
-            Ok(lane) => lane,
-            Err(error) => {
-                return Err(self.activation_failure(&current, error));
+        // Repo-less work stays repo-less: no lane, no checkout, no head.
+        let non_code = current.non_code_kind();
+        let (lane, path) = match non_code {
+            Some(_) => (None, String::new()),
+            None => {
+                let Some(root) = checkout else {
+                    return Err(self.activation_failure(
+                        &current,
+                        Error::invalid(
+                            "config_required",
+                            "dev work needs --repo <local git checkout>; this assignment was \
+                             claimed and is blocked, and no checkout or lane was opened",
+                        ),
+                    ));
+                };
+                let lane = match self.lane_for(&current, name) {
+                    Ok(lane) => lane,
+                    Err(error) => {
+                        return Err(self.activation_failure(&current, error));
+                    }
+                };
+                let pinned = self.with_ledger(|ledger| {
+                    Ok(ledger.attempts.values().find_map(|attempt| {
+                        (attempt.assignment_id.as_deref() == Some(current.assignment_id.as_str())
+                            && attempt.lane_claim.as_deref() == current.claim_id.as_deref()
+                            && attempt.lane_generation == Some(current.generation))
+                        .then(|| attempt.worktree.clone())
+                        .flatten()
+                    }))
+                })?;
+                let opened = match pinned {
+                    Some(path) => worktree::main_root(Path::new(&path))
+                        .and_then(|original_root| ensure_lane(&original_root, &lane, None)),
+                    None => ensure_lane(root, &lane, None),
+                };
+                let dir = match opened {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        return Err(self.activation_failure(&current, error));
+                    }
+                };
+                let path = dir.display().to_string();
+                self.with_ledger(|ledger| {
+                    for attempt in ledger.attempts.values_mut() {
+                        if attempt.assignment_id.as_deref() == Some(current.assignment_id.as_str())
+                            && attempt.lane_claim.as_deref() == current.claim_id.as_deref()
+                            && attempt.lane_generation == Some(current.generation)
+                        {
+                            attempt.worktree = Some(path.clone());
+                        }
+                    }
+                    Ok(())
+                })?;
+                (Some(lane), path)
             }
         };
-        let pinned = self.with_ledger(|ledger| {
-            Ok(ledger.attempts.values().find_map(|attempt| {
-                (attempt.assignment_id.as_deref() == Some(current.assignment_id.as_str())
-                    && attempt.lane_claim.as_deref() == current.claim_id.as_deref()
-                    && attempt.lane_generation == Some(current.generation))
-                .then(|| attempt.worktree.clone())
-                .flatten()
-            }))
-        })?;
-        let opened = match pinned {
-            Some(path) => worktree::main_root(Path::new(&path))
-                .and_then(|original_root| ensure_lane(&original_root, &lane, None)),
-            None => ensure_lane(root, &lane, None),
-        };
-        let dir = match opened {
-            Ok(dir) => dir,
-            Err(error) => {
-                return Err(self.activation_failure(&current, error));
-            }
-        };
-        let path = dir.display().to_string();
-        self.with_ledger(|ledger| {
-            for attempt in ledger.attempts.values_mut() {
-                if attempt.assignment_id.as_deref() == Some(current.assignment_id.as_str())
-                    && attempt.lane_claim.as_deref() == current.claim_id.as_deref()
-                    && attempt.lane_generation == Some(current.generation)
-                {
-                    attempt.worktree = Some(path.clone());
-                }
-            }
-            Ok(())
-        })?;
         let actor = if let Some(message) = self.delivered_kickoff(&current)? {
             json!({"message": message, "state": "already_delivered"})
         } else {
@@ -1789,6 +2286,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 audience: self.audience.as_str(),
                 subject_id: self.subject_id.as_deref(),
                 issuer: self.issuer.as_deref(),
+                work_kind: non_code,
             };
             match deliver(&kickoff) {
                 Ok(value) => {
@@ -1823,8 +2321,18 @@ impl<H: CoordHttp> Coordinator<H> {
             }
         };
         let mut value = current.to_json();
-        value["worktree"] = json!(path);
-        value["lane"] = json!(lane);
+        match (non_code, lane) {
+            (Some(kind), _) => {
+                value["work_kind"] = json!(kind.token());
+                // No checkout was opened, and saying otherwise would imply one.
+                value["worktree"] = Value::Null;
+                value["lane"] = Value::Null;
+            }
+            (None, lane) => {
+                value["worktree"] = json!(path);
+                value["lane"] = json!(lane);
+            }
+        }
         value["actor"] = actor;
         Ok(value)
     }
@@ -1858,6 +2366,10 @@ impl<H: CoordHttp> Coordinator<H> {
         Ok((claim_id, claimed.generation))
     }
 
+    /// `work_kind` is what this client believes it is reporting for: a
+    /// non-code kind adds `work_kind` and an optional `deliverable` to the
+    /// body, and `None` keeps the dev body byte-for-byte. The board remains
+    /// the authority; a receipt of another kind is not success.
     fn report_claimed(
         &mut self,
         assignment: &str,
@@ -1866,6 +2378,8 @@ impl<H: CoordHttp> Coordinator<H> {
         state: &str,
         text: Option<&str>,
         head: Option<&str>,
+        work_kind: Option<WorkKind>,
+        deliverable: Option<&Deliverable>,
     ) -> Result<Assignment> {
         if !prefixed_id(assignment, "hla_") || !prefixed_id(claim_id, "hlc_") {
             return Err(Error::rejected("report is missing its claim"));
@@ -1879,6 +2393,8 @@ impl<H: CoordHttp> Coordinator<H> {
             state,
             text,
             head,
+            work_kind.map(WorkKind::token),
+            deliverable,
         )?;
         let path = format!("{}/{assignment}/report", self.base());
         match self.exchange("POST", &path, Some(&body)) {
@@ -1892,6 +2408,10 @@ impl<H: CoordHttp> Coordinator<H> {
                     || reported.state != state
                     || text.is_some_and(|text| reported.text.as_deref() != Some(text))
                     || head.is_some_and(|head| reported.reported_head_sha.as_deref() != Some(head))
+                    || (work_kind.is_some() && reported.non_code_kind() != work_kind)
+                    || deliverable.is_some_and(|deliverable| {
+                        reported.deliverable.as_ref() != Some(deliverable)
+                    })
                 {
                     return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
                 }
@@ -1936,7 +2456,34 @@ impl<H: CoordHttp> Coordinator<H> {
                 if let Some(refusal) = reported.confirmed_kind_refusal("report") {
                     return Err(refusal);
                 }
+                // A kind this client runs but did not report under is the same
+                // fence: the recorded result is not what was sent.
+                if let (None, Some(kind)) = (work_kind, reported.non_code_kind()) {
+                    return Err(Error::invalid(
+                        "unsupported_work_kind",
+                        format!(
+                            "the hosted report for {} came back as {} work; this report \
+                             was not a non-code result, so nothing more was started",
+                            reported.issue_id,
+                            kind.token()
+                        ),
+                    ));
+                }
                 Ok(reported)
+            }
+            // A board that predates work kinds refuses the field before any
+            // effect. Say that plainly instead of implying the report landed.
+            Err(error) if work_kind.is_some() && error.code() == Some("invalid_request") => {
+                Err(Error::invalid(
+                    "unsupported_work_kind",
+                    format!(
+                        "this board does not record a work kind, so no {} report was \
+                         recorded for {}; nothing was replayed and no dev result was \
+                         substituted",
+                        work_kind.map_or("non-code", WorkKind::token),
+                        assignment
+                    ),
+                ))
             }
             Err(error) if error.code() == Some("fenced") => {
                 self.with_ledger(|ledger| {
@@ -1981,12 +2528,17 @@ impl<H: CoordHttp> Coordinator<H> {
         }
     }
 
-    pub fn dispatch(&mut self, issue: &str, target: Option<&str>) -> Result<Value> {
+    pub fn dispatch(
+        &mut self,
+        issue: &str,
+        target: Option<&str>,
+        kind: Option<WorkKind>,
+    ) -> Result<Value> {
         let target = match target {
             Some(target) => Some(target.to_string()),
             None => self.default_target()?,
         };
-        let assignment = self.queue(issue, "dispatch", target.as_deref())?;
+        let assignment = self.queue(issue, "dispatch", target.as_deref(), kind)?;
         let mut value = assignment.to_json();
         if assignment.state == "waiting" {
             value["guidance"] = json!({
@@ -2037,27 +2589,42 @@ impl<H: CoordHttp> Coordinator<H> {
         Ok(row)
     }
 
+    /// Claim one issue for the connected local actor.
+    ///
+    /// `repo` is required only for dev work: repo-less work is claimed and
+    /// delivered without a checkout (CAD-2195). The board's kind decides,
+    /// which is why the row is read before any claim.
     pub fn start_here<F>(
         &mut self,
         issue: &str,
-        repo: &Path,
+        repo: Option<&Path>,
         name: Option<&str>,
+        kind: Option<WorkKind>,
         deliver: &mut F,
     ) -> Result<Value>
     where
         F: FnMut(&Kickoff) -> Result<Value>,
     {
-        let root = worktree::main_root(repo)?;
+        let root = repo.map(worktree::main_root).transpose()?;
         slug(name)?;
         let alias = self.stored_alias()?;
         let Some(alias) = alias else {
-            let queued = self.queue(issue, "start", None)?;
+            let queued = self.queue(issue, "start", None, kind)?;
             let mut value = queued.to_json();
             value["actor"] = Value::Null;
-            value["guidance"] = json!({
-                "code": "connect_local_agent",
-                "text": "This assignment is waiting for your local agent. Run `cadence agent connect --alias <alias> --repo <checkout>`. It was not sent to a hosted runner.",
-            });
+            value["guidance"] = match queued.non_code_kind() {
+                Some(kind) => json!({
+                    "code": "connect_local_agent",
+                    "text": format!(
+                        "This {} assignment is waiting for your local agent. Run `cadence agent connect --alias <alias>`; no checkout is needed and none will be opened. It was not sent to a hosted runner.",
+                        kind.token()
+                    ),
+                }),
+                None => json!({
+                    "code": "connect_local_agent",
+                    "text": "This assignment is waiting for your local agent. Run `cadence agent connect --alias <alias> --repo <checkout>`. It was not sent to a hosted runner.",
+                }),
+            };
             return Ok(value);
         };
         let subject = self.subject_id.clone().ok_or_else(|| {
@@ -2068,11 +2635,75 @@ impl<H: CoordHttp> Coordinator<H> {
         })?;
         if let Some(existing) = self.live_for_issue(issue)? {
             let ready = self.prepare_owned(existing, &subject)?;
-            return self.activate(&ready, &root, name, &alias, deliver);
+            self.require_start_matches(&ready, kind, root.as_deref())?;
+            self.require_checkout_for(&ready, root.as_deref())?;
+            return self.activate(&ready, root.as_deref(), name, &alias, deliver);
         }
-        let queued = self.queue(issue, "start", Some(&subject))?;
+        let queued = self.queue(issue, "start", Some(&subject), kind)?;
         let ready = self.prepare_owned(queued, &subject)?;
-        self.activate(&ready, &root, name, &alias, deliver)
+        self.require_start_matches(&ready, kind, root.as_deref())?;
+        self.require_checkout_for(&ready, root.as_deref())?;
+        self.activate(&ready, root.as_deref(), name, &alias, deliver)
+    }
+
+    /// Refuse dev work before any claim when this machine has no checkout.
+    /// Non-code work needs none, and asking for one would push every
+    /// research or business claim to invent a repository.
+    fn require_checkout_for(&self, row: &Assignment, checkout: Option<&Path>) -> Result<()> {
+        if checkout.is_some() || row.non_code_kind().is_some() {
+            return Ok(());
+        }
+        Err(Error::invalid(
+            "config_required",
+            "this is dev work and needs --repo <local git checkout>; nothing was claimed",
+        ))
+    }
+
+    /// Refuse a start whose requested kind or checkout the row cannot honour.
+    /// Claiming one kind of work as another, or opening a lane for repo-less
+    /// work, would misstate what the board recorded.
+    fn require_start_matches(
+        &self,
+        row: &Assignment,
+        kind: Option<WorkKind>,
+        checkout: Option<&Path>,
+    ) -> Result<()> {
+        let Some(actual) = row.non_code_kind() else {
+            if let Some(named) = kind {
+                return Err(Error::invalid(
+                    "work_kind_mismatch",
+                    format!(
+                        "the assignment for {} is dev work; --kind {} was not applied and \
+                         nothing was claimed",
+                        row.issue_id,
+                        named.token()
+                    ),
+                ));
+            }
+            return Ok(());
+        };
+        if let Some(named) = kind {
+            if named != actual {
+                return Err(Error::invalid(
+                    "work_kind_mismatch",
+                    format!(
+                        "the assignment for {} is {} work; --kind {} was not applied and \
+                         nothing was claimed",
+                        row.issue_id,
+                        actual.token(),
+                        named.token()
+                    ),
+                ));
+            }
+        }
+        if checkout.is_some() {
+            return Err(Error::rejected(format!(
+                "{} work opens no lane, so --repo is not used for {}; drop --repo to claim it",
+                actual.token(),
+                row.issue_id
+            )));
+        }
+        Ok(())
     }
 
     /// Start one named issue for the calling session under a reusable
@@ -2083,13 +2714,17 @@ impl<H: CoordHttp> Coordinator<H> {
     /// claim is bound to a client id derived from the profile, which the
     /// board re-checks on every report. A profile is configuration, not a
     /// credential — the authenticated login still carries the authority.
+    ///
+    /// `repo` is required only for dev work; repo-less work is claimed with no
+    /// checkout, no lane and no Git head (CAD-2195).
     pub fn start_session(
         &mut self,
         issue: &str,
-        repo: &Path,
+        repo: Option<&Path>,
         name: Option<&str>,
         profile: &str,
         base_ref: Option<&str>,
+        kind: Option<WorkKind>,
     ) -> Result<Value> {
         self.ensure_active()?;
         if !prefixed_id(profile, "ap_") {
@@ -2097,7 +2732,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 "--profile must be a hosted profile id (ap_…)",
             ));
         }
-        let root = worktree::main_root(repo)?;
+        let root = repo.map(worktree::main_root).transpose()?;
         slug(name)?;
         let subject = self.subject_id.clone().ok_or_else(|| {
             Error::invalid(
@@ -2109,10 +2744,19 @@ impl<H: CoordHttp> Coordinator<H> {
         let ready = match self.live_for_issue(issue)? {
             Some(row) => self.prepare_owned(row, &subject)?,
             None => {
-                let queued = self.queue(issue, "start", Some(&subject))?;
+                let queued = self.queue(issue, "start", Some(&subject), kind)?;
                 self.prepare_owned(queued, &subject)?
             }
         };
+        self.require_start_matches(&ready, kind, root.as_deref())?;
+        self.require_checkout_for(&ready, root.as_deref())?;
+        if ready.non_code_kind().is_some() && base_ref.is_some() {
+            return Err(Error::rejected(format!(
+                "--base cuts a dev lane; this assignment is {} work with no checkout, so \
+                 nothing was claimed",
+                ready.non_code_kind().map_or("non-code", WorkKind::token)
+            )));
+        }
         let claimed = if matches!(ready.state.as_str(), "running" | "blocked") {
             if ready.client_agent_id.as_deref() != Some(client.as_str()) {
                 return Err(Error::invalid(
@@ -2146,19 +2790,32 @@ impl<H: CoordHttp> Coordinator<H> {
             }
             Ok(())
         })?;
-        let lane = self.lane_for(&claimed, name)?;
-        let dir = ensure_lane(&root, &lane, base_ref)?;
-        let path = dir.display().to_string();
-        self.with_ledger(|ledger| {
-            for attempt in ledger.attempts.values_mut() {
-                if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
-                    && attempt.claim_id.as_deref() == Some(claim_id.as_str())
-                {
-                    attempt.worktree = Some(path.clone());
-                }
+        let non_code = claimed.non_code_kind();
+        let lane = match non_code {
+            Some(_) => None,
+            None => {
+                let lane = self.lane_for(&claimed, name)?;
+                let root = root.as_deref().ok_or_else(|| {
+                    Error::invalid(
+                        "config_required",
+                        "dev work needs --repo <local git checkout>; the claim is held and no lane was opened",
+                    )
+                })?;
+                let dir = ensure_lane(root, &lane, base_ref)?;
+                let path = dir.display().to_string();
+                self.with_ledger(|ledger| {
+                    for attempt in ledger.attempts.values_mut() {
+                        if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
+                            && attempt.claim_id.as_deref() == Some(claim_id.as_str())
+                        {
+                            attempt.worktree = Some(path.clone());
+                        }
+                    }
+                    Ok(())
+                })?;
+                Some((lane, path))
             }
-            Ok(())
-        })?;
+        };
         let mut receipt = json!({
             "version": VERSION,
             "assignment_id": claimed.assignment_id,
@@ -2170,16 +2827,35 @@ impl<H: CoordHttp> Coordinator<H> {
             "client_agent_id": client,
             "profile": profile,
             "profile_recorded": claimed.profile_id.is_some(),
-            "lane": lane,
-            "worktree": path,
-            "branch": git_line(Path::new(&path), &["rev-parse", "--abbrev-ref", "HEAD"]),
-            "head": git_line(Path::new(&path), &["rev-parse", "HEAD"]),
             "actor": "external_session",
-            "guidance": {
-                "code": "report_from_this_session",
-                "text": "This session holds the claim. Report with `cadence agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
-            },
         });
+        if let Some(kind) = non_code {
+            receipt["work_kind"] = json!(kind.token());
+        }
+        match &lane {
+            Some((lane, path)) => {
+                receipt["lane"] = json!(lane);
+                receipt["worktree"] = json!(path);
+                receipt["branch"] = json!(git_line(
+                    Path::new(path),
+                    &["rev-parse", "--abbrev-ref", "HEAD"]
+                ));
+                receipt["head"] = json!(git_line(Path::new(path), &["rev-parse", "HEAD"]));
+                receipt["guidance"] = json!({
+                    "code": "report_from_this_session",
+                    "text": "This session holds the claim. Report with `cadence agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
+                });
+            }
+            None => {
+                // No checkout was opened; a lane or head here would be invented.
+                receipt["lane"] = Value::Null;
+                receipt["worktree"] = Value::Null;
+                receipt["guidance"] = json!({
+                    "code": "report_from_this_session",
+                    "text": "This session holds the claim. Report with `cadence agent report <assignment> --state running|blocked|failed|result --text '<summary>'`, and for a result add `--deliverable artifact:<ref>` or `--deliverable link:<https url>` for an output that exists. No checkout was opened and no commit is expected.",
+                });
+            }
+        }
         if let Some(base) = base_ref {
             receipt["base"] = json!(base);
         }
@@ -2267,7 +2943,15 @@ impl<H: CoordHttp> Coordinator<H> {
         })?;
         let client_agent_id = self.client_agent_id()?;
         let stored = self.with_ledger(|ledger| Ok(ledger.repo.clone()))?;
-        let Some(stored) = stored else {
+        let root = stored
+            .as_deref()
+            .map(Path::new)
+            .map(worktree::main_root)
+            .transpose()?;
+        // Repo-less work needs no checkout, so a member without one still
+        // takes it. Dev work keeps the existing refusal instead of being
+        // claimed into a lane that cannot exist.
+        if root.is_none() && rows.iter().all(|row| row.non_code_kind().is_none()) {
             return Ok(json!({
                 "configured": true,
                 "target": subject,
@@ -2276,11 +2960,10 @@ impl<H: CoordHttp> Coordinator<H> {
                 "assignments": rows.iter().map(Assignment::to_json).collect::<Vec<_>>(),
                 "guidance": {
                     "code": "repo_required",
-                    "text": "Pass --repo to claim queued work into a local worktree and deliver it to the local agent. Nothing was claimed.",
+                    "text": "Pass --repo to claim queued dev work into a local worktree and deliver it to the local agent. Nothing was claimed.",
                 },
             }));
-        };
-        let root = worktree::main_root(Path::new(&stored))?;
+        }
         let mut claimed = Vec::new();
         let mut refused = Vec::new();
         for row in rows {
@@ -2289,6 +2972,14 @@ impl<H: CoordHttp> Coordinator<H> {
                     "assignment_id": row.assignment_id,
                     "error": refusal.to_string(),
                     "code": refusal.code(),
+                }));
+                continue;
+            }
+            if root.is_none() && row.non_code_kind().is_none() {
+                refused.push(json!({
+                    "assignment_id": row.assignment_id,
+                    "code": "repo_required",
+                    "error": "this is dev work and needs --repo <local git checkout>; nothing was claimed",
                 }));
                 continue;
             }
@@ -2338,7 +3029,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 }));
                 continue;
             }
-            match self.activate(&row, &root, name, &alias, deliver) {
+            match self.activate(&row, root.as_deref(), name, &alias, deliver) {
                 Ok(value) => claimed.push(value),
                 Err(error) => refused.push(json!({
                     "assignment_id": row.assignment_id,
@@ -2389,24 +3080,90 @@ impl<H: CoordHttp> Coordinator<H> {
         state: &str,
         text: Option<&str>,
         head: Option<&str>,
+        deliverable: Option<&Deliverable>,
     ) -> Result<Value> {
         if !matches!(state, "running" | "blocked" | "failed" | "result") {
             return Err(Error::rejected(
                 "report state must be running, blocked, failed, or result",
             ));
         }
-        if state == "result" && !head_sha(head.unwrap_or("")) {
-            return Err(Error::rejected(
-                "result requires --head of 40 or 64 lowercase hex characters",
-            ));
-        }
         if matches!(state, "blocked" | "failed" | "result") && text.unwrap_or("").is_empty() {
             return Err(Error::rejected("this report requires --text"));
         }
         let (claim_id, generation) = self.origin_for_assignment(assignment)?;
+        // What a result must carry depends on the kind, and the kind belongs
+        // to the board: settle it before writing the report, not after.
+        let kind = self
+            .observed_work_kind(assignment)?
+            .filter(|kind| kind.is_non_code());
+        match kind {
+            Some(kind) => {
+                if head.is_some() {
+                    return Err(Error::rejected(format!(
+                        "{} work has no Git head, and a document digest is not a commit; \
+                         report --text{} without --head",
+                        kind.token(),
+                        if state == "result" {
+                            " and optionally --deliverable"
+                        } else {
+                            ""
+                        }
+                    )));
+                }
+                if deliverable.is_some() && state != "result" {
+                    return Err(Error::rejected(
+                        "only a result carries a deliverable reference",
+                    ));
+                }
+            }
+            None => {
+                if deliverable.is_some() {
+                    return Err(Error::rejected(
+                        "--deliverable belongs to non-code work; a dev result names --head instead",
+                    ));
+                }
+                if state == "result" && !head_sha(head.unwrap_or("")) {
+                    return Err(Error::rejected(
+                        "result requires --head of 40 or 64 lowercase hex characters",
+                    ));
+                }
+            }
+        }
         Ok(self
-            .report_claimed(assignment, &claim_id, generation, state, text, head)?
+            .report_claimed(
+                assignment,
+                &claim_id,
+                generation,
+                state,
+                text,
+                head,
+                kind,
+                deliverable,
+            )?
             .to_json())
+    }
+
+    /// The non-dev kind this ledger last observed for the assignment. The
+    /// board names a kind only for non-code work, and only that is stored, so
+    /// an entry without one is dev work or predates kinds.
+    fn ledger_work_kind(&self, assignment: &str) -> Result<Option<WorkKind>> {
+        self.with_ledger(|ledger| {
+            Ok(ledger
+                .attempts
+                .values()
+                .find(|attempt| attempt.assignment_id.as_deref() == Some(assignment))
+                .and_then(|attempt| attempt.work_kind.as_deref().and_then(WorkKind::parse)))
+        })
+    }
+
+    /// The kind this ledger last observed, or dev when it recorded none. A
+    /// client before kinds refused every non-code row, so an entry with no
+    /// stored kind cannot describe non-code work. The board still refuses a
+    /// body whose kind or head does not match the row it holds.
+    fn observed_work_kind(&self, assignment: &str) -> Result<Option<WorkKind>> {
+        Ok(Some(
+            self.ledger_work_kind(assignment)?.unwrap_or(WorkKind::Dev),
+        ))
     }
 
     pub fn reassign(
@@ -2604,6 +3361,39 @@ fn explain_409(body: &Value) -> Error {
         "not_claimable" => Error::invalid(
             "not_claimable",
             "the assignment has no target member to claim yet",
+        ),
+        // CAD-2195: these are refusals before any effect. The event loop keys
+        // on `unsupported_work_kind`, and a kind mismatch is not permission to
+        // run the row as something else.
+        "unsupported_work_kind" => Error::invalid(
+            "unsupported_work_kind",
+            "this board did not agree to the work kind for this assignment; nothing ran locally and no dev work was substituted",
+        ),
+        "work_kind_mismatch" => coded_conflict(
+            "work_kind_mismatch",
+            generation,
+            "the board's recorded work kind for this assignment changed; nothing was claimed or reported under the old kind",
+        ),
+        "head_not_allowed" => Error::invalid(
+            "head_not_allowed",
+            "this work kind cannot report a commit; the board did not record this report",
+        ),
+        // CAD-2061: a second live claim by another session is a refusal, not
+        // permission to replay or to take the claim over.
+        "claim_held" => coded_conflict(
+            "claim_held",
+            generation,
+            "another session already holds this claim; this session did not claim it, and --take-over with a recorded reason is the only way to replace it",
+        ),
+        "unsupported_feature" => Error::invalid(
+            "unsupported_feature",
+            "the board does not accept this claim feature; the claim was not recorded and nothing ran locally",
+        ),
+        // CAD-2061: the board does not enable review, so nothing may be
+        // created, claimed or started from a review request.
+        "review_unavailable" => Error::invalid(
+            "review_unavailable",
+            "this board cannot record a PR/head-bound review; nothing was created, claimed or started",
         ),
         "target_unavailable" => Error::invalid(
             "target_unavailable",
@@ -2878,6 +3668,8 @@ mod assignment_contract_tests {
 
     #[test]
     fn a_non_dev_report_response_is_refused() {
+        // `research` is a kind this client runs, but this dev-shaped report
+        // was not sent as one, so the receipt is still a fence.
         let (mut coord, calls, _state) = coord_with(running(json!("research")));
         let error = coord
             .report_claimed(
@@ -2885,6 +3677,26 @@ mod assignment_contract_tests {
                 "hlc_00000000-0000-4000-8000-000000000001",
                 1,
                 "running",
+                None,
+                None,
+                None,
+                None,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"));
+        assert_eq!(calls.get(), 1, "the report was sent before the refusal");
+
+        // A kind this client cannot run keeps the original refusal.
+        let (mut coord, calls, _state) = coord_with(running(json!("review")));
+        let error = coord
+            .report_claimed(
+                "hla_00000000-0000-4000-8000-000000000001",
+                "hlc_00000000-0000-4000-8000-000000000001",
+                1,
+                "running",
+                None,
+                None,
                 None,
                 None,
             )
@@ -2920,7 +3732,10 @@ mod assignment_contract_tests {
     fn a_non_dev_terminal_report_retains_confirmed_custody() {
         let original = parse_assignment(&running(json!("dev"))).ok().unwrap();
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let mut response = running(json!("research"));
+        // A kind this client cannot run: a runnable non-code row may not carry
+        // a reported head at all, so `review` is the only fixture that still
+        // exercises "the fence stops execution but keeps the receipt".
+        let mut response = running(json!("review"));
         response["state"] = json!("result");
         response["text"] = json!("Confirmed terminal report");
         response["reported_head_sha"] = json!(head);
@@ -2942,6 +3757,8 @@ mod assignment_contract_tests {
                 "result",
                 Some("Confirmed terminal report"),
                 Some(head),
+                None,
+                None,
             )
             .err()
             .unwrap();
@@ -3027,6 +3844,660 @@ mod assignment_contract_tests {
             .is_err());
         assert!(coord.reserve_kickoff(&original).is_err());
         assert_eq!(calls.get(), 1, "custody observation must not send HTTP");
+    }
+
+    // CAD-2195/CAD-2061: repo-less claim and result, and the kind
+    // negotiation that keeps dev work exactly as it was.
+    const RESULT_ID: &str = "hla_00000000-0000-4000-8000-000000000001";
+    const RESULT_CLAIM: &str = "hlc_00000000-0000-4000-8000-000000000001";
+    const RESULT_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    type Recorded = std::rc::Rc<std::cell::RefCell<Vec<(String, String, Value)>>>;
+
+    /// Records every request and answers from a script of (status, body).
+    struct Recorder {
+        replies: std::collections::VecDeque<(u16, Value)>,
+        calls: Recorded,
+    }
+
+    impl CoordHttp for Recorder {
+        fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
+            self.calls.borrow_mut().push((
+                method.to_string(),
+                path.to_string(),
+                body.cloned().unwrap_or(Value::Null),
+            ));
+            let (status, body) = self
+                .replies
+                .pop_front()
+                .ok_or_else(|| Error::rejected("no scripted reply left"))?;
+            Ok(Reply { status, body })
+        }
+    }
+
+    /// A row for this machine's claim. `kind` is absent for dev work, which is
+    /// what a board that names only non-code kinds sends.
+    fn row_in(kind: Option<&str>, state: &str, client: &str) -> Value {
+        let mut value = row();
+        value["state"] = json!(state);
+        value["target"] = json!("usr_1");
+        if let Some(kind) = kind {
+            value["kind"] = json!(kind);
+        }
+        if matches!(state, "running" | "blocked" | "result" | "failed") {
+            value["claim_id"] = json!(RESULT_CLAIM);
+            value["client_agent_id"] = json!(client);
+        }
+        value
+    }
+
+    fn recorder(dir: &Path) -> (Coordinator<Recorder>, Recorded) {
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let calls: Recorded = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let http = Recorder {
+            replies: std::collections::VecDeque::new(),
+            calls: calls.clone(),
+        };
+        (
+            Coordinator::new(http, "ws_1".into(), dir.to_path_buf())
+                .ok()
+                .unwrap(),
+            calls,
+        )
+    }
+
+    /// A coordinator holding a claim for `observed`, ready to report.
+    fn holding(observed: &Value) -> (Coordinator<Recorder>, Recorded, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let (coord, calls) = recorder(dir.path());
+        let assignment = parse_assignment(observed).ok().unwrap();
+        coord.remember_discovered(&assignment).unwrap();
+        let message = coord.reserve_kickoff(&assignment).unwrap();
+        coord
+            .mark_kickoff_delivered(&assignment.assignment_id, &message)
+            .unwrap();
+        (coord, calls, dir)
+    }
+
+    #[test]
+    fn a_repo_less_result_names_its_output_and_never_a_commit() {
+        let observed = row_in(Some("research"), "running", "worker");
+        let (mut coord, calls, _state) = holding(&observed);
+        let mut answered = row_in(Some("research"), "result", "worker");
+        answered["text"] = json!("Three interviews, one pricing memo");
+        answered["deliverable"] = json!({
+            "type": "link",
+            "ref": "https://docs.example.test/research/pricing",
+        });
+        coord.http.replies.push_back((200, answered));
+
+        let deliverable =
+            Deliverable::parse("link:https://docs.example.test/research/pricing").unwrap();
+        let value = coord
+            .report(
+                RESULT_ID,
+                "result",
+                Some("Three interviews, one pricing memo"),
+                None,
+                Some(&deliverable),
+            )
+            .expect("a repo-less result");
+        assert_eq!(value["state"], "result");
+        assert_eq!(value["kind"], "research");
+        assert_eq!(
+            value["deliverable"],
+            json!({"type": "link", "ref": "https://docs.example.test/research/pricing"})
+        );
+
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 1, "one report, no probe or replay");
+        assert!(calls[0].1.ends_with(&format!("/{RESULT_ID}/report")));
+        assert_eq!(
+            calls[0].2,
+            json!({
+                "version": VERSION,
+                "organization_id": "ws_1",
+                "claim_id": RESULT_CLAIM,
+                "expected_generation": 1,
+                "state": "result",
+                "text": "Three interviews, one pricing memo",
+                "work_kind": "research",
+                "deliverable": {
+                    "type": "link",
+                    "ref": "https://docs.example.test/research/pricing",
+                },
+            }),
+            "the non-code body must not carry a commit"
+        );
+    }
+
+    #[test]
+    fn repo_less_work_refuses_a_commit_and_a_digest_is_not_a_head() {
+        let observed = row_in(Some("design"), "running", "worker");
+        let (mut coord, calls, _state) = holding(&observed);
+        let error = coord
+            .report(
+                RESULT_ID,
+                "result",
+                Some("brand audit"),
+                Some(RESULT_SHA),
+                None,
+            )
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("document digest"), "{error}");
+        let deliverable = Deliverable::parse("link:https://docs.example.test/brand").unwrap();
+        let error = coord
+            .report(
+                RESULT_ID,
+                "running",
+                Some("progress"),
+                None,
+                Some(&deliverable),
+            )
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("only a result"), "{error}");
+        assert_eq!(
+            calls.borrow().len(),
+            0,
+            "a refused report reached the board"
+        );
+    }
+
+    #[test]
+    fn dev_results_still_name_their_exact_commit_and_carry_no_deliverable() {
+        let observed = row_in(None, "running", "worker");
+        let (mut coord, calls, _state) = holding(&observed);
+        let error = coord
+            .report(RESULT_ID, "result", Some("fixed the parser"), None, None)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "result requires --head of 40 or 64 lowercase hex characters"
+        );
+        assert_eq!(calls.borrow().len(), 0);
+
+        // A deliverable on dev work is refused while the claim is still live.
+        let deliverable = Deliverable::parse("link:https://docs.example.test/brand").unwrap();
+        let error = coord
+            .report(
+                RESULT_ID,
+                "result",
+                Some("fixed the parser"),
+                Some(RESULT_SHA),
+                Some(&deliverable),
+            )
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("belongs to non-code work"),
+            "{error}"
+        );
+        assert_eq!(
+            calls.borrow().len(),
+            0,
+            "a refused report reached the board"
+        );
+
+        let mut answered = row_in(None, "result", "worker");
+        answered["text"] = json!("fixed the parser");
+        answered["reported_head_sha"] = json!(RESULT_SHA);
+        coord.http.replies.push_back((200, answered));
+        coord
+            .report(
+                RESULT_ID,
+                "result",
+                Some("fixed the parser"),
+                Some(RESULT_SHA),
+                None,
+            )
+            .expect("dev result");
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].2,
+            json!({
+                "version": VERSION,
+                "organization_id": "ws_1",
+                "claim_id": RESULT_CLAIM,
+                "expected_generation": 1,
+                "state": "result",
+                "text": "fixed the parser",
+                "reported_head_sha": RESULT_SHA,
+            }),
+            "the dev body keeps every key it had before kinds"
+        );
+    }
+
+    #[test]
+    fn only_non_code_claims_name_their_kind() {
+        for kind in [None, Some("research")] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut coord, calls) = recorder(dir.path());
+            let client = coord.client_agent_id().unwrap();
+            let mut observed = row_in(kind, "queued", &client);
+            observed["claim_id"] = Value::Null;
+            observed["client_agent_id"] = Value::Null;
+            coord
+                .http
+                .replies
+                .push_back((200, row_in(kind, "running", &client)));
+            let assignment = parse_assignment(&observed).ok().unwrap();
+            coord
+                .claim_with_profile(&assignment, &client, None)
+                .expect("claim");
+            let body = calls.borrow()[0].2.clone();
+            match kind {
+                Some(kind) => assert_eq!(body["work_kind"], kind),
+                None => assert!(
+                    body.get("work_kind").is_none(),
+                    "a dev claim body must stay unchanged"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn an_older_board_refuses_non_code_work_instead_of_running_it_as_dev() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        let client = coord.client_agent_id().unwrap();
+        let mut observed = row_in(Some("research"), "queued", &client);
+        observed["claim_id"] = Value::Null;
+        observed["client_agent_id"] = Value::Null;
+        coord
+            .http
+            .replies
+            .push_back((400, json!({"ok": false, "code": "invalid_request"})));
+        let assignment = parse_assignment(&observed).ok().unwrap();
+        let error = coord
+            .claim_with_profile(&assignment, &client, None)
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"), "{error}");
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 1, "the claim was not retried as dev");
+        assert_eq!(calls[0].2["work_kind"], "research");
+    }
+
+    #[test]
+    fn a_non_code_claim_receipt_must_name_the_kind_it_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        let client = coord.client_agent_id().unwrap();
+        let mut observed = row_in(Some("research"), "queued", &client);
+        observed["claim_id"] = Value::Null;
+        observed["client_agent_id"] = Value::Null;
+        // The board answers without the kind: this is not proof it ran as dev.
+        coord
+            .http
+            .replies
+            .push_back((200, row_in(None, "running", &client)));
+        let assignment = parse_assignment(&observed).ok().unwrap();
+        let error = coord
+            .claim_with_profile(&assignment, &client, None)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), "unknown", "{error}");
+        assert_eq!(calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_row_cannot_mix_a_commit_with_repo_less_work() {
+        let mut research = row_in(Some("design"), "result", "worker");
+        research["text"] = json!("design doc");
+        research["reported_head_sha"] = json!(RESULT_SHA);
+        assert!(
+            parse_assignment(&research).is_err(),
+            "a non-code row naming a commit must fail closed"
+        );
+        let mut dev = row_in(None, "result", "worker");
+        dev["text"] = json!("fixed");
+        dev["reported_head_sha"] = json!(RESULT_SHA);
+        dev["deliverable"] = json!({"type": "artifact", "ref": "med_job.abc"});
+        assert!(
+            parse_assignment(&dev).is_err(),
+            "a dev row carrying a deliverable must fail closed"
+        );
+    }
+
+    #[test]
+    fn a_non_code_create_names_its_kind_and_a_dev_create_stays_unchanged() {
+        for kind in [None, Some(WorkKind::Research)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut coord, calls) = recorder(dir.path());
+            let token = kind.map(WorkKind::token);
+            coord
+                .http
+                .replies
+                .push_back((200, row_in(token, "queued", "unused")));
+            let value = coord
+                .dispatch("CAD-1", Some("usr_1"), kind)
+                .expect("created assignment");
+            let body = calls.borrow()[0].2.clone();
+            match kind {
+                Some(kind) => {
+                    assert_eq!(body["work_kind"], kind.token());
+                    assert_eq!(value["kind"], kind.token());
+                }
+                None => assert!(
+                    body.get("work_kind").is_none(),
+                    "a dev create body must stay unchanged"
+                ),
+            }
+            assert_eq!(body["action"], "dispatch");
+            assert_eq!(body["target"], "usr_1");
+        }
+    }
+
+    #[test]
+    fn an_older_board_refuses_a_non_code_create_instead_of_creating_dev_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        coord
+            .http
+            .replies
+            .push_back((400, json!({"ok": false, "code": "invalid_request"})));
+        let error = coord
+            .dispatch("CAD-1", Some("usr_1"), Some(WorkKind::Business))
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_work_kind"), "{error}");
+        assert_eq!(calls.borrow().len(), 1, "the create was not retried as dev");
+        assert_eq!(calls.borrow()[0].2["work_kind"], "business");
+    }
+
+    #[test]
+    fn a_create_that_drops_the_requested_kind_is_not_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        // The board answers with a dev row: the effect exists without the kind.
+        coord
+            .http
+            .replies
+            .push_back((200, row_in(None, "queued", "unused")));
+        let error = coord
+            .dispatch("CAD-1", Some("usr_1"), Some(WorkKind::Research))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), "unknown", "{error}");
+        assert!(error.to_string().contains("without the research work kind"));
+        assert_eq!(
+            calls.borrow().len(),
+            1,
+            "an unproven create is not replayed"
+        );
+    }
+
+    #[test]
+    fn a_new_claim_invents_no_runtime_session() {
+        // Two nested runtimes share one POSIX session, and so does every
+        // command in one terminal. Sending that as the claim session would
+        // claim a per-runtime fence that does not exist, so a new claim sends
+        // none and the board keeps legacy fencing.
+        let profile = "ap_00000000-0000-4000-8000-000000000003";
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        let client = coord.client_agent_id().unwrap();
+        let mut observed = row_in(Some("research"), "queued", &client);
+        observed["claim_id"] = Value::Null;
+        observed["client_agent_id"] = Value::Null;
+        assert!(
+            parse_assignment(&observed).unwrap().session_key.is_none(),
+            "the fixture is a new claim"
+        );
+        // The board records the descriptive profile, never a session: the
+        // confirmed row carries the profile it accepted and no session key.
+        let mut answered = row_in(Some("research"), "running", &client);
+        answered["profile_id"] = json!(profile);
+        coord.http.replies.push_back((200, answered));
+        let assignment = parse_assignment(&observed).ok().unwrap();
+        let claimed = coord
+            .claim_with_profile(&assignment, &client, Some(profile))
+            .expect("claim");
+        let body = calls.borrow()[0].2.clone();
+        assert!(
+            body.get("session_key").is_none(),
+            "a shared POSIX session must not be presented as a verified runtime session"
+        );
+        assert!(
+            body.get("take_over").is_none(),
+            "a take-over is never implied"
+        );
+        assert!(claimed.session_key.is_none());
+    }
+
+    #[test]
+    fn a_session_claim_is_not_replayed_by_another_session_of_the_same_profile() {
+        // A profile's client id is `session-<profile>` and every session of
+        // that profile shares it, so matching it proves nothing about which
+        // session holds the claim. The recorded session is never copied.
+        let profile = "ap_00000000-0000-4000-8000-000000000003";
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        let mut observed = row_in(Some("design"), "running", &format!("session-{profile}"));
+        observed["profile_id"] = json!(profile);
+        observed["session_key"] = json!(format!("session-{profile}"));
+        observed["claim_last_seen_at"] = json!("2026-11-05T12:00:00Z");
+        let assignment = parse_assignment(&observed).ok().unwrap();
+        let error = coord
+            .claim_with_profile(&assignment, &format!("session-{profile}"), Some(profile))
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("claim_held"), "{error}");
+        assert_eq!(
+            calls.borrow().len(),
+            0,
+            "an unproven session is not replayed"
+        );
+
+        // The board-authorized replacement is an explicit, reasoned take-over.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        let assignment = parse_assignment(&observed).ok().unwrap();
+        coord
+            .request_take_over("the holder stopped answering")
+            .unwrap();
+        let mut answered = row_in(Some("design"), "running", &format!("session-{profile}"));
+        answered["profile_id"] = json!(profile);
+        answered["session_key"] = json!("s424242-99999");
+        coord.http.replies.push_back((200, answered));
+        coord
+            .claim_with_profile(&assignment, &format!("session-{profile}"), Some(profile))
+            .expect("take-over claim");
+        let body = calls.borrow()[0].2.clone();
+        assert_eq!(body["take_over"]["reason"], "the holder stopped answering");
+        assert!(
+            body.get("session_key").is_none(),
+            "a take-over does not assert an unverified session"
+        );
+    }
+
+    #[test]
+    fn an_older_board_keeps_the_legacy_claim_but_never_drops_a_take_over() {
+        // A profile-scoped claim against a board that predates profiles: the
+        // descriptive profile is dropped on the retry, while the work kind,
+        // the client id and the generation fence stay.
+        let profile = "ap_00000000-0000-4000-8000-000000000003";
+        let client = format!("session-{profile}");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        let mut observed = row_in(Some("research"), "queued", &client);
+        observed["claim_id"] = Value::Null;
+        observed["client_agent_id"] = Value::Null;
+        // The legacy answer carries no session key: the retry must not claim
+        // one was recorded.
+        coord
+            .http
+            .replies
+            .push_back((400, json!({"ok": false, "code": "invalid_request"})));
+        coord
+            .http
+            .replies
+            .push_back((200, row_in(Some("research"), "running", &client)));
+        let assignment = parse_assignment(&observed).ok().unwrap();
+        let claimed = coord
+            .claim_with_profile(&assignment, &client, Some(profile))
+            .expect("legacy claim");
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 2, "one retry, no replay loop");
+        assert_eq!(calls[0].2["profile_id"], profile);
+        assert!(
+            calls[1].2.get("profile_id").is_none(),
+            "the retry drops only the descriptive profile"
+        );
+        assert_eq!(calls[1].2["work_kind"], "research");
+        assert_eq!(calls[1].2["client_agent_id"], client.as_str());
+        assert_eq!(calls[1].2["expected_generation"], 1);
+        assert!(
+            calls[1].2.get("session_key").is_none(),
+            "the retry is the legacy claim body"
+        );
+        assert!(claimed.session_key.is_none());
+
+        // A take-over is authoritative; an older board refuses it outright.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        let client = coord.client_agent_id().unwrap();
+        let mut observed = row_in(Some("research"), "queued", &client);
+        observed["claim_id"] = Value::Null;
+        observed["client_agent_id"] = Value::Null;
+        coord.request_take_over("holder stopped answering").unwrap();
+        coord
+            .http
+            .replies
+            .push_back((400, json!({"ok": false, "code": "invalid_request"})));
+        let assignment = parse_assignment(&observed).ok().unwrap();
+        let error = coord
+            .claim_with_profile(&assignment, &client, None)
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), Some("unsupported_feature"), "{error}");
+        assert_eq!(calls.borrow().len(), 1, "a take-over is never retried");
+        assert_eq!(
+            calls.borrow()[0].2["take_over"]["reason"],
+            "holder stopped answering"
+        );
+        assert_eq!(calls.borrow()[0].2["work_kind"], "research");
+    }
+
+    #[test]
+    fn a_deliverable_is_typed_and_bounded() {
+        assert!(Deliverable::parse("artifact:med_job-1.abc").is_ok());
+        assert!(Deliverable::parse("link:https://docs.example.test/a").is_ok());
+        assert_eq!(
+            Deliverable::parse("artifact:abc").unwrap().to_json(),
+            json!({"type": "artifact", "ref": "abc"})
+        );
+        for refused in [
+            "wiki:global/a.md",
+            "https://docs.example.test/a",
+            "artifact:",
+            "artifact:has space",
+            "link:http://docs.example.test/a",
+            "link:https://user:pw@docs.example.test/a",
+            "link:https:///no-host",
+        ] {
+            assert!(Deliverable::parse(refused).is_err(), "{refused}");
+        }
+        let long = format!("link:https://docs.example.test/{}", "a".repeat(500));
+        assert!(Deliverable::parse(&long).is_err(), "over the wire bound");
+    }
+
+    #[test]
+    fn a_repo_less_pickup_opens_no_lane_and_leaves_dev_work_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        // The ledger lives in the private remote credential directory, so the
+        // fixture must be one this process owns with mode 0700.
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let calls: Recorded = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let http = Recorder {
+            replies: std::collections::VecDeque::new(),
+            calls: calls.clone(),
+        };
+        let mut coord = Coordinator::open(
+            http,
+            "ws_1".into(),
+            dir.path().to_path_buf(),
+            Some("usr_1".into()),
+            None,
+            "https://board.test".into(),
+        )
+        .unwrap();
+        let client = coord.client_agent_id().unwrap();
+        let mut research = row_in(Some("research"), "queued", &client);
+        research["claim_id"] = Value::Null;
+        research["client_agent_id"] = Value::Null;
+        let mut dev = row_in(None, "queued", &client);
+        dev["assignment_id"] = json!("hla_00000000-0000-4000-8000-000000000009");
+        dev["claim_id"] = Value::Null;
+        dev["client_agent_id"] = Value::Null;
+        coord
+            .http
+            .replies
+            .push_back((200, row_in(Some("research"), "running", &client)));
+
+        let mut delivered = Vec::new();
+        let value = coord
+            .pickup_rows(
+                vec![
+                    parse_assignment(&research).ok().unwrap(),
+                    parse_assignment(&dev).ok().unwrap(),
+                ],
+                None,
+                false,
+                Some("worker"),
+                &mut |kickoff: &Kickoff| {
+                    delivered.push(kickoff.work_kind);
+                    Ok(json!({"message": kickoff.message_id}))
+                },
+            )
+            .expect("repo-less pickup");
+        assert_eq!(value["claimed"].as_array().unwrap().len(), 1);
+        assert_eq!(value["claimed"][0]["work_kind"], "research");
+        assert!(value["claimed"][0]["worktree"].is_null());
+        assert!(value["claimed"][0]["lane"].is_null());
+        assert_eq!(value["refused"][0]["code"], "repo_required");
+        assert_eq!(delivered, [Some(WorkKind::Research)]);
+        assert_eq!(calls.borrow().len(), 1, "one claim, no lane and no probe");
+    }
+
+    #[test]
+    fn a_repo_less_activation_hands_the_actor_a_text_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut coord, calls) = recorder(dir.path());
+        let client = coord.client_agent_id().unwrap();
+        let mut observed = row_in(Some("business"), "queued", &client);
+        observed["claim_id"] = Value::Null;
+        observed["client_agent_id"] = Value::Null;
+        coord
+            .http
+            .replies
+            .push_back((200, row_in(Some("business"), "running", &client)));
+        let assignment = parse_assignment(&observed).ok().unwrap();
+        let mut seen = None;
+        let value = coord
+            .activate(
+                &assignment,
+                None,
+                None,
+                "worker",
+                &mut |kickoff: &Kickoff| {
+                    seen = Some((kickoff.work_kind, kickoff.worktree.to_string()));
+                    Ok(json!({"message": kickoff.message_id}))
+                },
+            )
+            .expect("repo-less activation");
+        assert_eq!(seen, Some((Some(WorkKind::Business), String::new())));
+        assert_eq!(value["work_kind"], "business");
+        assert!(value["lane"].is_null() && value["worktree"].is_null());
+        assert_eq!(calls.borrow().len(), 1, "one claim and no checkout");
     }
 }
 
@@ -3353,7 +4824,7 @@ mod cad2009_assignment_acceptance {
 
     fn invoke(coord: &mut Coordinator<ObservedHttp>, mutation: Mutation) -> Result<Value> {
         match mutation {
-            Mutation::Report => coord.report(ID, "result", Some(TEXT), Some(SHA)),
+            Mutation::Report => coord.report(ID, "result", Some(TEXT), Some(SHA), None),
             Mutation::Reassign => coord.reassign(ID, Some("user_next"), false),
             Mutation::Cancel => coord.reassign(ID, None, true),
         }

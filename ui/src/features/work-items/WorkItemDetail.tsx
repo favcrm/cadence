@@ -22,6 +22,10 @@ import {
 import { PRIORITY_CHIP, STATUS_CHIP } from "../issues/chips";
 import { noDragReason } from "../projects/Card";
 import { Evidence } from "../issues/Evidence";
+import { HostedRun } from "../issues/HostedRun";
+import { ArtifactReviews } from "../issues/ArtifactReviews";
+import { LocalAssignments } from "../issues/LocalAssignments";
+import { ApprovalRecords, approvalPullRequests } from "../issues/ApprovalRecords";
 import DecisionPanel from "../home/DecisionPanel";
 import AssignmentSummary from "../home/AssignmentSummary";
 import DrawerShell from "../app-shell/shared/DrawerShell";
@@ -249,8 +253,16 @@ function OverviewPanel({
   const body = detail?.body ?? "";
   const items = useMemo(() => acceptanceItems(body), [body]);
   const checksDone = items.reduce((count, item) => count + Number(item.checked), 0);
+  const checks = items.length > 0 ? { done: checksDone, total: items.length } : facts.checks;
+  const countUnavailable = items.length === 0 && detail?.acceptance !== null &&
+    typeof detail?.acceptance === "object" &&
+    (detail.acceptance as Record<string, unknown>).available === false;
   const agents = detail?.agents ?? [];
-  const lane = agents.length === 0 ? t("No lane yet") : agents.map((a) => a.alias).join(", ");
+  const lane = !detail?.agents
+    ? t("Lane state unavailable")
+    : agents.length === 0
+      ? t("No lane yet")
+      : agents.map((agent) => agent.alias).join(", ");
   const owner = myWork && facts.owner === myWork.owner ? t("you") : facts.owner ?? t("unassigned");
   const gone = Boolean(
     myWork &&
@@ -292,7 +304,7 @@ function OverviewPanel({
           <Fact label="Component" value={facts.component} />
           <Fact
             label="Checks"
-            value={`${facts.checks.done}/${facts.checks.total} ${facts.checks.total === 1 ? t("check") : t("checks")}`}
+            value={countUnavailable ? t("Acceptance count unavailable") : `${checks.done}/${checks.total} ${checks.total === 1 ? t("check") : t("checks")}`}
           />
           <Fact label="Comments" value={String(facts.comments)} />
           {detail && (
@@ -302,6 +314,10 @@ function OverviewPanel({
                 {lane}
                 {agents.length > 0 ? ` · ${laneState(agents)}` : ""}
               </dd>
+              <dt className="slabel">{t("Hosted run")}</dt>
+              <dd className="text-secondary text-ink-200 min-w-0"><HostedRun value={detail.agent_run} /></dd>
+              <dt className="slabel">{t("Local assignments")}</dt>
+              <dd className="text-secondary text-ink-200 min-w-0"><LocalAssignments value={detail.local_assignment} /></dd>
             </>
           )}
           {myWork && (
@@ -318,9 +334,9 @@ function OverviewPanel({
       <section className="grid gap-1" aria-label={t("Policy and effect")}>
         <h4 className="rv-h">{t("Policy and effect")}</h4>
         <p className="rv-note">
-          {t("No policy is recorded on this issue. Approvals and merges keep their own pinned-head paths; this detail adds none.")}
+          {t("Approval and delivery requirements are checked by their respective owners; their current policy may be unavailable here.")}
         </p>
-        <p className="rv-note">{t("No external effect is recorded on this issue.")}</p>
+        <p className="rv-note">{t("External-effect status is unavailable here.")}</p>
       </section>
 
       {gone && (
@@ -363,6 +379,7 @@ function CodePanel({ detail }: { detail: IssueDetail | null }) {
   const { t } = useLocale();
   if (!detail) return <p className="issue-peek-note dim m-0">{t("Code is listed once the item loads.")}</p>;
   const pr = prRef(detail.refs);
+  const approvalPrs = approvalPullRequests(detail.approvals);
   const commits = detail.commits ?? [];
   return (
     <div className="wi-panel">
@@ -377,17 +394,18 @@ function CodePanel({ detail }: { detail: IssueDetail | null }) {
               <p className="issue-peek-note dim m-0">{t("This reference has no URL.")}</p>
             )}
           </>
+        ) : approvalPrs.length > 0 ? (
+          <ul className="issue-peek-list">{approvalPrs.map((item) => (
+            <li key={item.href}><SafeLink className="lnk text-secondary break-all" href={item.href}>{item.label}</SafeLink></li>
+          ))}</ul>
         ) : (
-          <p className="issue-peek-note dim m-0">{t("No pull request is recorded on this issue.")}</p>
+          <p className="issue-peek-note dim m-0">{t("No pull request reference is available here.")}</p>
         )}
-        <p className="issue-peek-note dim m-0">
-          {t("Checks")}: {detail.checks.done}/{detail.checks.total}
-        </p>
       </section>
       <section className="grid gap-2" aria-label={t("Commits")}>
         <h4 className="rv-h">{t("Commits")}</h4>
         {commits.length === 0 ? (
-          <p className="issue-peek-note dim m-0">{t("No commits are recorded on this issue.")}</p>
+          <p className="issue-peek-note dim m-0">{t(detail.commits === undefined ? "Commit information is unavailable." : "No commits are recorded on this issue.")}</p>
         ) : (
           <ul className="issue-peek-list">
             {commits.map((commit) => (
@@ -445,7 +463,7 @@ function ApprovalsPanel({ detail }: { detail: IssueDetail | null }) {
       <section className="grid gap-2" aria-label={t("Recorded reviews")}>
         <h4 className="rv-h">{t("Recorded reviews")}</h4>
         {verdicts.length === 0 ? (
-          <p className="issue-peek-note dim m-0">{t("No revision-bound verdict is recorded on this issue.")}</p>
+          <p className="issue-peek-note dim m-0">{t(detail.reports === undefined ? "Review evidence is unavailable." : "No revision-bound verdict is recorded on this issue.")}</p>
         ) : (
           <ul className="issue-peek-list">
             {verdicts.map((verdict) => (
@@ -468,10 +486,18 @@ function ApprovalsPanel({ detail }: { detail: IssueDetail | null }) {
           </p>
         )}
       </section>
+      <section className="grid gap-1" aria-label={t("Artifact reviews")}>
+        <h4 className="rv-h">{t("Artifact reviews")}</h4>
+        <p className="rv-note"><ArtifactReviews value={detail.review_state} /></p>
+      </section>
+      <section className="grid gap-1" aria-label={t("Approval evidence")}>
+        <h4 className="rv-h">{t("Approval evidence")}</h4>
+        <div className="rv-note"><ApprovalRecords value={detail.approvals} /></div>
+      </section>
       <section className="grid gap-1">
         <h4 className="rv-h">{t("Decisions")}</h4>
         <p className="rv-note">
-          {t("Plan, idea and merge decisions open from Home and keep their own operator-only guards. This detail records no approval and adds no approval path.")}
+          {t("Plan, result and delivery decisions are checked by their respective owners.")}
         </p>
       </section>
     </div>
@@ -484,10 +510,14 @@ function ActivityPanel({ detail }: { detail: IssueDetail | null }) {
   const rows = timelineRows(detail, []).slice(0, 30);
   return (
     <div className="wi-panel">
+      {detail.local_assignment !== undefined && <section className="grid gap-1" aria-label={t("Latest local assignment records")}>
+        <h4 className="rv-h">{t("Latest local assignment records")}</h4>
+        <div className="rv-note"><LocalAssignments value={detail.local_assignment} /></div>
+      </section>}
       <section className="grid gap-2" aria-label={t("Recorded activity")}>
         <h4 className="rv-h">{t("Recorded activity")}</h4>
         {rows.length === 0 ? (
-          <p className="issue-peek-note dim m-0">{t("No activity is recorded on this issue.")}</p>
+          <p className="issue-peek-note dim m-0">{t("No comments or tracker changes are available.")}</p>
         ) : (
           <div className="grid gap-1.5">
             {rows.map((row, index) => (

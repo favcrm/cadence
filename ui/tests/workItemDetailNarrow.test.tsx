@@ -37,7 +37,7 @@ async function main() {
 
   const detail: IssueDetail = {
     id: "D-1", project: "demo", title: "Ship the rail", status: "doing", status_source: "direct", priority: "P2",
-    owner: "operator", blocked_by: [], relates: [], refs: [], paths: [], tags: [], container: false, ready: true, blocked: false,
+    owner: "operator", blocked_by: [], relates: [], refs: [{ kind: "pr", url: "https://github.com/example/project/pull/42" }], paths: [], tags: [], container: false, ready: true, blocked: false,
     created: "2026-09-29T00:00:00Z", rev: "fnv1a:0123456789abcdef",
     checks: { done: 0, total: 1 }, work: { type: "task", type_source: "implicit", weight: 1 },
     frontmatter: {}, body: "## Acceptance\n\n- [ ] one", path: "issue.md",

@@ -7,6 +7,16 @@ pub fn refusal<H: CoordHttp>(
     issue: Option<&str>,
     selected: Option<&Path>,
 ) -> Error {
+    // CAD-2195: repo-less work has no lane to release, so a lane observation
+    // would be an invented answer. Say what is true and leave the close to the
+    // ticket's own acceptance rules.
+    if issue.is_some_and(|id| repo_less(coordinator, id)) {
+        return Error::rejected(
+            "Hosted issue finish has no lane to release: this issue's local assignment is \
+             repo-less work with no checkout. Report its result and close the ticket under \
+             the project's own acceptance rules",
+        );
+    }
     let observation = issue.and_then(|id| observe(coordinator, id, selected).ok().flatten());
     let detail = match observation {
         Some(LaneState::Dirty) => "the lane has uncommitted work",
@@ -19,6 +29,38 @@ pub fn refusal<H: CoordHttp>(
     Error::rejected(format!(
         "Hosted issue finish does not release lanes; {detail}; leave it for the reconcile sweep"
     ))
+}
+
+/// Every local attempt for the issue is repo-less work that opened no lane.
+/// A single dev attempt, or any lane, makes this false.
+fn repo_less<H: CoordHttp>(coordinator: &Coordinator<H>, issue: &str) -> bool {
+    let Ok(lock) = remote_cli::private_lock(
+        &coordinator.ledger,
+        "local-assign",
+        Instant::now() + Duration::from_secs(5),
+    ) else {
+        return false;
+    };
+    let ledger = match Ledger::load(&coordinator.ledger, &coordinator.org_id) {
+        Ok(ledger) => ledger,
+        Err(_) => return false,
+    };
+    drop(lock);
+    let mut found = false;
+    for attempt in ledger.attempts.values().filter(|a| a.issue_id == issue) {
+        found = true;
+        if attempt.lane.is_some()
+            || attempt.worktree.is_some()
+            || attempt
+                .work_kind
+                .as_deref()
+                .and_then(WorkKind::parse)
+                .is_none_or(|kind| !kind.is_non_code())
+        {
+            return false;
+        }
+    }
+    found
 }
 
 enum LaneState {

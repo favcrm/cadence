@@ -49,7 +49,16 @@ export default function TicketProposalCard({
   const run = () => {
     setBusy(true);
     setError(null);
-    createAndAssign({ ...api, issue: (id: string) => api.issue(id) }, proposal)
+    createAndAssign(
+      {
+        ...api,
+        issue: (id: string) => api.issue(id),
+        // CAD-2189: one write on a board that has it. An older board refuses
+        // this call and the pair above runs instead.
+        start: (id, req) => api.startProposal(id, req),
+      },
+      proposal,
+    )
       .then((outcome) => {
         setCreated(outcome);
         void resources.issues.invalidate();
@@ -58,6 +67,17 @@ export default function TicketProposalCard({
       .catch((e: ApiError) => setError(e.message ?? String(e)))
       .finally(() => setBusy(false));
   };
+  // Only a provably unfinished assignment is worth another press: the board
+  // recorded that no owner was written. Every other outcome is final here.
+  const retryable = created !== null && created.state === "pending";
+  const tone =
+    created === null || created.state === "assigned"
+      ? "text-ok"
+      : created.state === "pending" ||
+          created.state === "unconfirmed" ||
+          created.state === "refused"
+        ? "text-warn"
+        : "text-ink-200";
 
   return (
     <div className="rc-proposal" data-kind="ticket-proposal" data-proposal={proposal.id}>
@@ -105,9 +125,34 @@ export default function TicketProposalCard({
           </div>
         ) : created ? (
           <div className="mt-3" role="status">
-            <p className={`text-label ${created.state === "unconfirmed" ? "text-warn" : "text-ok"}`}>
+            <p className={`text-label ${tone}`}>
               {created.state === "assigned" &&
                 t("Created {id} and assigned it.").replace("{id}", () => created.ticket)}
+              {created.state === "pending" &&
+                t("Created {id}. No owner is recorded yet: finish assigning it.")
+                  .replace("{id}", () => created.ticket)}
+              {created.state === "changed" &&
+                (created.owner
+                  ? t("Created {id}. Its owner is now {owner}, so it was left as it is.")
+                      .replace("{id}", () => created.ticket)
+                      .replace("{owner}", () => created.owner!)
+                  : t("Created {id}. Its owner was cleared, so it was left as it is.").replace(
+                      "{id}",
+                      () => created.ticket,
+                    ))}
+              {created.state === "refused" &&
+                t("Created {id}. {name} was not assigned: {reason}.")
+                  .replace("{id}", () => created.ticket)
+                  .replace("{name}", () => proposal.agent.name)
+                  .replace("{reason}", () =>
+                    created.reason === "agent_unknown"
+                      ? t("the agent profile is not available")
+                      : created.reason === "agent_not_permitted"
+                        ? t("this board does not allow this assignment")
+                        : created.reason === "ticket_changed"
+                          ? t("the ticket changed before the assignment was confirmed")
+                          : created.reason,
+                  )}
               {created.state === "replayed" &&
                 t("The card already created {id}; nothing was reassigned.").replace(
                   "{id}",
@@ -121,13 +166,33 @@ export default function TicketProposalCard({
               {created.state === "unconfirmed" &&
                 t("Ticket {id} was created. Whether the agent was assigned is not confirmed: {error}")
                   .replace("{id}", () => created.ticket)
-                  .replace("{error}", () => created.error ?? t("no answer from the board"))}
+                  .replace("{error}", () => created.error === "untracked_existing"
+                    ? t("the existing ticket has no assignment receipt")
+                    : created.error ?? t("no answer from the board"))}
             </p>
-            {onOpenIssue && (
-              <Button variant="ghost" size="sm" onClick={() => onOpenIssue(created.ticket)}>
-                {t("Open ticket")}
-              </Button>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              {onOpenIssue && (
+                <Button variant="ghost" size="sm" onClick={() => onOpenIssue(created.ticket)}>
+                  {t("Open ticket")}
+                </Button>
+              )}
+              {retryable && (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  loading={busy}
+                  disabled={busy || readOnly}
+                  onClick={run}
+                  title={
+                    readOnly
+                      ? t("This board is read-only")
+                      : t("Finishes the assignment the board proved is pending")
+                  }
+                >
+                  {t("Finish assigning")}
+                </Button>
+              )}
+            </div>
           </div>
         ) : (
           <div className="flex flex-wrap items-center gap-2 mt-3">

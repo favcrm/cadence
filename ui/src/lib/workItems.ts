@@ -1,6 +1,8 @@
 import type { AssignmentContext, MyWorkIssue, WriteResp } from "./api";
 import type { IssueCard, IssueDetail } from "./types";
 import type { HomeNeed } from "../features/home/needs";
+import { hasVisibleDevAssignment } from "../features/issues/LocalAssignments";
+import { approvalPullRequests } from "../features/issues/ApprovalRecords";
 
 /**
  * CAD-1811 (first slice): one issue-backed work item, opened from Home, My
@@ -198,10 +200,14 @@ export function workItemFacts(
   };
 }
 
-/** Dev work shows Code. Epics are planning records; a missing read is not dev. */
+/** Show code-specific UI only for explicit code work or recorded code evidence. */
 export function isDevWork(detail: IssueDetail | null): boolean {
-  const type = detail?.work?.type;
-  return type !== undefined && type !== "epic";
+  if (!detail) return false;
+  if (detail.refs.some((ref) => ref.kind === "pr" || ref.kind === "commit") ||
+      (detail.commits?.length ?? 0) > 0 ||
+      detail.reports?.some((report) => Boolean(report.pr || report.sha)) ||
+      hasVisibleDevAssignment(detail.local_assignment)) return true;
+  return approvalPullRequests(detail.approvals).length > 0;
 }
 
 /** The shared detail's tabs, in the accepted order. */

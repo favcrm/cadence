@@ -411,6 +411,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   openIdRef.current = openId;
   const pageIssueRef = useRef<string | null>(route.screen === "issue" ? route.id : null);
   pageIssueRef.current = route.screen === "issue" ? route.id : null;
+  const projectViewRef = useRef(route.screen === "projects");
+  projectViewRef.current = route.screen === "projects";
   const loadDetail = useCallback(() => {
     for (const id of refreshIssueIds(openIdRef.current, pageIssueRef.current)) {
       void resources.issue(id).invalidate();
@@ -637,12 +639,30 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     };
   }, []);
 
-  // Full reads are recovery only: suppress them while named heartbeat
-  // frames prove the stream healthy; reconnects resync immediately.
+  // Local-assignment receipts come from a different coordinator than the
+  // board stream. A healthy stream alone does not prove those projections are
+  // current, so refresh only the visible project/detail surfaces as well.
   useEffect(() => {
-    const onFocus = () => { if (!liveUpdates.current?.healthy()) refresh(); };
+    const refreshProjection = () => {
+      if (!projectViewRef.current && !openIdRef.current && !pageIssueRef.current) return;
+      const generation = privateSessionGeneration();
+      void recheck().then((verified) => {
+        if (!verified || !privateReadsAllowed() || generation !== privateSessionGeneration()) return;
+        if (projectViewRef.current) {
+          void resources.projects.refresh();
+          void resources.issues.refresh();
+        }
+        if (openIdRef.current || pageIssueRef.current) loadDetail();
+      });
+    };
+    const onFocus = () => {
+      if (!liveUpdates.current?.healthy()) refresh();
+      else refreshProjection();
+    };
     const tick = () => {
-      if (document.visibilityState === "visible" && !liveUpdates.current?.healthy()) refresh();
+      if (document.visibilityState !== "visible") return;
+      if (!liveUpdates.current?.healthy()) refresh();
+      else refreshProjection();
     };
     const timer = setInterval(tick, 30_000);
     addEventListener("focus", onFocus);
@@ -652,7 +672,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", tick);
     };
-  }, [refresh]);
+  }, [loadDetail, recheck, refresh]);
 
   const say = useCallback((kind: ToastMsg["kind"], text: string) => {
     setToast({ kind, text });

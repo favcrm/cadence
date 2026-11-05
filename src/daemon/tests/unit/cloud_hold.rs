@@ -370,6 +370,7 @@ fn cloud_prewrite_fails_and_preserves_a_hosted_failure_report() {
             audience: "https://hosted-completion-regression.invalid",
             subject_id: Some("user_member"),
             issuer: Some("https://hosted-completion-regression.invalid"),
+            work_kind: None,
         },
         "Synthetic terminal failure",
     )

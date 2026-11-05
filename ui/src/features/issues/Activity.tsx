@@ -9,6 +9,7 @@ import { timelineRows } from "./model";
 import { type IssuePageProps as Props } from "./issuePageProps";
 import { ReadNotice } from "./issuePageShared";
 import { useLocale } from "../../lib/locale";
+import { LocalAssignments } from "./LocalAssignments";
 
 const TONE: Record<string, string> = {
   done: "bg-ok",
@@ -20,6 +21,7 @@ const TONE: Record<string, string> = {
 export function Activity({
   id,
   rows,
+  assignments,
   history,
   retryHistory,
   readOnly,
@@ -30,6 +32,7 @@ export function Activity({
 }: {
   id: string;
   rows: ReturnType<typeof timelineRows>;
+  assignments?: unknown;
   history: ResourceState<IssueHistoryEntry[]>;
   retryHistory: () => void;
   readOnly: boolean;
@@ -73,11 +76,15 @@ export function Activity({
   };
   return (
     <section className="grid gap-4">
+      {assignments !== undefined && <section className="card p-4 grid gap-2" aria-label={t("Latest local assignment records")}>
+        <h2 className="text-cardtitle font-semibold text-ink-100 m-0">{t("Latest local assignment records")}</h2>
+        <LocalAssignments value={assignments} />
+      </section>}
       <ReadNotice name="history" state={history} retry={retryHistory} />
       {rows.length === 0 && history.data !== null && !history.error ? (
         <div className="card px-4 py-8 text-center">
           <div className="text-cardtitle font-semibold text-ink-100">
-            {t("No activity yet")}
+            {t("No comments or tracker changes are available.")}
           </div>
           <p className="text-secondary text-ink-400 mt-1">
             {t("Comments and changes to this issue will appear here.")}

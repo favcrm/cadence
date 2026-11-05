@@ -177,13 +177,25 @@ fn kickoff_line(kickoff: &Kickoff, note: &Path, context: &Value) -> Result<Strin
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .take(180)
         .collect();
-    let line = format!(
-        "Hosted issue {} ({title}). Read {} for this assignment's issue, comments, and wiki index. Use its org selector explicitly for hosted ticket/wiki actions, verify organization_id and audience, and do not change global org selection. Worktree: {}. A managed endpoint ends its final answer with SHA:<40-or-64-lowercase-hex>. A PTY explicit reporter uses cadence message result {} --token <turn_id> --text '<summary>' --sha <40-or-64-lowercase-hex>.",
-        kickoff.issue_id,
-        note.display(),
-        kickoff.worktree,
-        kickoff.message_id
-    );
+    // Repo-less work has no checkout and no commit to name, so it is told to
+    // report text and an optional typed deliverable instead. Asking a managed
+    // endpoint for SHA here would invite a fabricated head.
+    let line = match kickoff.work_kind {
+        Some(kind) => format!(
+            "Hosted issue {} ({title}) is {} work with no checkout: do not open a lane, cut a branch, or name a commit. Read {} for this assignment's issue, comments, and wiki index. Use its org selector explicitly for hosted ticket/wiki actions, verify organization_id and audience, and do not change global org selection. Report with cadence agent report {} --state running|blocked|failed|result --text '<summary>', and for a result add --deliverable artifact:<ref> or --deliverable link:<https url> only for an output that exists. A digest is not a commit and is never reported as one.",
+            kickoff.issue_id,
+            kind.token(),
+            note.display(),
+            kickoff.message_id
+        ),
+        None => format!(
+            "Hosted issue {} ({title}). Read {} for this assignment's issue, comments, and wiki index. Use its org selector explicitly for hosted ticket/wiki actions, verify organization_id and audience, and do not change global org selection. Worktree: {}. A managed endpoint ends its final answer with SHA:<40-or-64-lowercase-hex>. A PTY explicit reporter uses cadence message result {} --token <turn_id> --text '<summary>' --sha <40-or-64-lowercase-hex>.",
+            kickoff.issue_id,
+            note.display(),
+            kickoff.worktree,
+            kickoff.message_id
+        ),
+    };
     if line.chars().any(char::is_control) || line.len() > 4000 {
         return Err(Error::rejected(
             "local actor message was not a single safe line; nothing was sent",

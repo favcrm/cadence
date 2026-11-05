@@ -341,6 +341,7 @@ function PageBody({
               history={history}
               retryHistory={retryHistory}
               rows={rows}
+              assignments={detail.local_assignment}
               readOnly={readOnly}
               rev={detail.rev}
               onWrite={onWrite}

@@ -80,9 +80,16 @@ pub(crate) enum LocalAgentAction {
         state: String,
         #[arg(long)]
         text: Option<String>,
-        /// 40 or 64 lowercase hex characters. Required for result.
+        /// 40 or 64 lowercase hex commit characters. Required for a dev
+        /// result and refused for non-code work, where a digest is not a
+        /// commit.
         #[arg(long)]
         head: Option<String>,
+        /// The actual output of non-code work: `artifact:<ref>` or
+        /// `link:<https url>`. Only a `result` carries one. The board stores
+        /// it as reported and says separately whether it resolved it.
+        #[arg(long, value_name = "TYPE:REF")]
+        deliverable: Option<String>,
     },
     /// Move or cancel a live assignment.
     Reassign {
@@ -254,8 +261,19 @@ pub(super) fn run(
             state,
             text,
             head,
+            deliverable,
         } => {
-            let value = coord.report(assignment, state, text.as_deref(), head.as_deref())?;
+            let deliverable = deliverable
+                .as_deref()
+                .map(cadence_agent::local_assignment::Deliverable::parse)
+                .transpose()?;
+            let value = coord.report(
+                assignment,
+                state,
+                text.as_deref(),
+                head.as_deref(),
+                deliverable.as_ref(),
+            )?;
             if *state == "result" {
                 // The assignment ends here; the ticket does not move on its own.
                 // Say the next step instead of leaving the session to infer it.
@@ -276,8 +294,38 @@ pub(super) fn run(
     finish(&value)
 }
 
-pub(super) fn dispatch(target: &RemoteTarget, issue: &str, to: &str) -> Result<i32> {
-    finish(&coordinator(target)?.dispatch(issue, Some(to))?)
+pub(super) fn dispatch(
+    target: &RemoteTarget,
+    issue: &str,
+    to: &str,
+    kind: Option<&str>,
+) -> Result<i32> {
+    let kind = requested_kind(kind)?;
+    finish(&coordinator(target)?.dispatch(issue, Some(to), kind)?)
+}
+
+/// `--kind` names a kind this client can run. `dev` is the default and is
+/// never sent, so a dev request keeps the create body an older board accepts.
+/// Every other token is refused here, before any request.
+fn requested_kind(kind: Option<&str>) -> Result<Option<cadence_agent::local_assignment::WorkKind>> {
+    use cadence_agent::local_assignment::WorkKind;
+    match kind {
+        None => Ok(None),
+        Some(token) => match WorkKind::parse(token) {
+            Some(WorkKind::Dev) => Ok(None),
+            Some(kind) => Ok(Some(kind)),
+            // Review is a named unsupported capability: the board must first
+            // prove PR/head binding and a self-review refusal, and until it
+            // does this client will not create or pick up review work.
+            None if token == "review" => Err(Error::invalid(
+                "unsupported_work_kind",
+                "review work is not supported by this client: the board does not yet prove exact PR/head binding and a self-review refusal, so nothing was created, claimed or sent",
+            )),
+            None => Err(Error::usage(
+                "--kind must be dev, research, design, business or manual; nothing was sent",
+            )),
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -288,19 +336,27 @@ pub(super) fn start(
     name: Option<&str>,
     profile: Option<&str>,
     base: Option<&str>,
+    kind: Option<&str>,
+    take_over: Option<&str>,
     wake_timeout: u64,
     local_state: Option<PathBuf>,
 ) -> Result<i32> {
-    let Some(repo) = repo else {
-        return Err(Error::usage(
-            "hosted issue start requires --repo <local git checkout>; nothing was sent",
-        ));
-    };
+    // No early --repo refusal: the board's work kind decides, and `--kind`
+    // asks for a repo-less kind on creation. Dev work still needs a checkout
+    // and is refused before any claim; repo-less work opens no lane at all.
+    let kind = requested_kind(kind)?;
+    let mut coord = coordinator(target)?;
+    // CAD-2061: an explicit take-over replaces another session's live claim.
+    // A reason is required, and the claim refuses rather than drop it when the
+    // board cannot record it.
+    if let Some(reason) = take_over {
+        coord.request_take_over(reason)?;
+    }
     if let Some(profile) = profile {
         // CAD-1964: the caller is the actor, so this claims under the
         // profile's session id and opens the lane without a local alias,
         // a daemon handoff or any other waiting assignment.
-        return finish(&coordinator(target)?.start_session(id, repo, name, profile, base)?);
+        return finish(&coord.start_session(id, repo, name, profile, base, kind)?);
     }
     if base.is_some() {
         return Err(Error::usage(
@@ -309,7 +365,7 @@ pub(super) fn start(
     }
     let mut deliver =
         |kickoff: &Kickoff| deliver_kickoff(target, local_state.clone(), kickoff, wake_timeout);
-    let value = coordinator(target)?.start_here(id, repo, name, &mut deliver)?;
+    let value = coord.start_here(id, repo, name, kind, &mut deliver)?;
     if let Some(dir) = local_state.or_else(|| cadence_agent::client::state_dir().ok()) {
         ensure_report_driver(&dir);
     }
@@ -361,6 +417,7 @@ mod context_snapshots {
             audience: "https://board.test",
             subject_id: None,
             issuer: None,
+            work_kind: None,
         };
         let first = write_note(dir.path(), &kickoff, &json!({"issue": "original work"}))
             .expect("first context");
