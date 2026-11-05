@@ -1,12 +1,12 @@
 # Native installation
 
-The current published stable local CLI release is [v0.3.18](https://github.com/favcrm/cadence/releases/tag/v0.3.18),
-the GitHub `latest` tag, published 2026-11-04 from source
-`a294d88e78f6911b293a4e08b5f932564eeda2a8` by
-[tag workflow run 41816256526, attempt 1](https://github.com/favcrm/cadence/actions/runs/41816256526).
+The current published stable local CLI release is [v0.3.19](https://github.com/favcrm/cadence/releases/tag/v0.3.19),
+the GitHub `latest` tag, published 2026-11-05 from source
+`c11fc9668f7f42bc3e8383182c1525202e6668d8` by
+[tag workflow run 41944358277, attempt 1](https://github.com/favcrm/cadence/actions/runs/41944358277).
 Anonymous download of all nine assets and their published checksums was
 verified separately, and the three published-URL installation legs passed in
-[run 41818596207](https://github.com/favcrm/cadence/actions/runs/41818596207);
+[run 41947040908](https://github.com/favcrm/cadence/actions/runs/41947040908);
 full evidence is in [the release record](RELEASING.md). An installed
 client-only copy upgrades with `cadence-client update`.
 
