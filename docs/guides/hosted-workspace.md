@@ -624,8 +624,8 @@ cadence --org acme delivery requirements --issue <issue-id> \
 `requirements.reviews`, `review_kind`, `operator_approval` and `browser_qa` are the
 requirement for that exact head, computed from the policy recorded on the board
 and the repository's path lists (`docs/roles/risk-paths.toml` and
-`docs/roles/one-review-paths.toml`), which are read at the PR's base commit so a PR
-cannot weaken its own rules. The merge gate can add an operator approval: when a
+`docs/roles/one-review-paths.toml`), which are read at main's live tip (the PR's base for a
+non-main PR), so a PR cannot weaken its own rules. The merge gate can add an operator approval: when a
 head-pinned verdict's Risk is not `auto`, and under the workflow auto-paths rule
 (AGENTS.md "Review").
 
