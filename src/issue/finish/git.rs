@@ -1,5 +1,6 @@
 //! Git and merge-evidence probes for `issue finish`.
 
+use super::hosted::github_slug;
 use super::*;
 
 pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -230,38 +231,6 @@ pub(crate) fn pr_merged(root: &Path, branch: &str, tip: &str, into: &str) -> boo
                 && pr["mergedAt"].as_str().is_some_and(|t| !t.is_empty())
         })
     })
-}
-
-/// `owner/repo` of an `origin` url on exactly `github.com`
-/// (`git@github.com:o/r`, `ssh://[user@]github.com/o/r`,
-/// `https://[user@]github.com/o/r`, with or without `.git`); `None`
-/// for any other host, including `github.com.evil.example` and
-/// `corp.test/github.com/o/r`. TODO(CAD-2178/#1645): that PR adds
-/// `github_slug` in `hosted.rs`; keep one copy once both land.
-pub(crate) fn github_slug(url: &str) -> Option<String> {
-    let url = url.trim();
-    let path = if let Some(rest) = url.strip_prefix("git@github.com:") {
-        rest
-    } else {
-        let (scheme, rest) = url.split_once("://")?;
-        let (authority, path) = rest.split_once('/')?;
-        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-        let host = host.split_once(':').map_or(host, |(h, _)| h);
-        if !matches!(scheme, "https" | "ssh") || !host.eq_ignore_ascii_case("github.com") {
-            return None;
-        }
-        path
-    };
-    let path = path.trim_end_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let mut parts = path.split('/');
-    let (owner, repo) = (parts.next()?, parts.next()?);
-    let ok = |s: &str| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-    };
-    (parts.next().is_none() && ok(owner) && ok(repo)).then(|| format!("{owner}/{repo}"))
 }
 
 #[cfg(test)]
