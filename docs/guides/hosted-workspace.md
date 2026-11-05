@@ -627,7 +627,9 @@ and the repository's path lists (`docs/roles/risk-paths.toml` and
 `docs/roles/one-review-paths.toml`), which are read at main's live tip (the PR's base for a
 non-main PR), so a PR cannot weaken its own rules. The merge gate can add an operator approval: when a
 head-pinned verdict's Risk is not `auto`, and under the workflow auto-paths rule
-(AGENTS.md "Review").
+(AGENTS.md "Review"). On a hosted org, an active `routine` class reports zero
+reviews and no approval here, but the merge gate also requires a pass from both
+review workflows, and those rows carry the auto-paths rule.
 
 The review standard (operator decision 2026-11-03) is a
 fresh-session review: a session that is not the author and inherits no
@@ -642,13 +644,15 @@ gate-counted verdict, and in-chat findings are not one either. Until the gate
 can tell a fresh session from the author (the workflow-issued reviews of
 CAD-2081 are live as a cheap first pass beside fresh-session reviews on gate, security,
 schema and release PRs, and two of them satisfy other PRs; AGENTS.md "Review"), a hosted
-`routine` or `ui/**` PR still merges with the temporary
+`ui/**` PR still merges with the temporary
 `--exception --advisory ...` path (exact-head operator approval and two
 advisory links, standards and spec-security, plus browser-qa for a `ui/`
 change, even where the board asks for fewer or no approval; ends at
 `EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31); see AGENTS.md "Review".
-A hosted `routine` PR needs this route too, because a hosted board has no
-readiness record yet. The exception
+A hosted `routine` PR has no readiness record, because a hosted board has no
+delivery record to prove it from. It takes a pass from both review workflows at
+its head and the operator approval a workflow row needs; the gate's refusal names
+what to dispatch. The exception also still waives this until it ends. The exception
 only checks that the advisory links are separate https URLs; it proves neither
 head binding nor that Browser QA ran. Agents in this workspace do
 not run `audit verdict` below: they post findings as a PR comment and use it as

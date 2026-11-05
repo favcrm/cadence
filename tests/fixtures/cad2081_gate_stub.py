@@ -103,19 +103,27 @@ def cadence():
                    "operator_approval": False, "browser_qa": False, "full_checks": True}
         req.update({"policy_digest": digest, "reasons": []})
         readiness = None
-        if kind == "routine":
+        if kind == "routine" and not S.get("no_readiness"):
             readiness = {"repo": S["repo"].lower(), "pr": S["pr"], "head": S["head"],
                          "base": S["base_oid"], "base_ref": S["base"], "policy_digest": digest,
                          "ci_run_id": 101, "ci_run_url": RUN_URL,
                          "outcome_report": "CAD-1/reports/x"}
-        out({"issue": "CAD-1", "project": "cadence", "repo": S["repo"].lower(), "pr": S["pr"],
-             "head": S["head"], "base": S["base_oid"], "base_ref": S["base"],
-             "merge_base": S["base_oid"], "policy_digest": digest, "origin": "hosted",
-             "requirements": req, "readiness": readiness})
+        doc = {"issue": "CAD-1", "project": "cadence", "repo": S["repo"].lower(), "pr": S["pr"],
+               "head": S["head"], "base": S["base_oid"], "base_ref": S["base"],
+               "merge_base": S["base_oid"], "policy_digest": digest, "origin": "hosted",
+               "requirements": req, "readiness": readiness}
+        if S.get("native"):
+            del doc["origin"]  # the daemon's own answer carries no marker
+        out(doc)
     if ARGS[:2] == ["audit", "verdicts"]:
+        # A row with `at_head` was filed at that head: the board answers for the head asked about.
+        asked = ARGS[ARGS.index("--head") + 1]
+        rows = [v for v in S["verdicts"] if v.get("at_head", asked) == asked]
+        if S.get("native"):
+            out({"origin": "local", "verdicts": rows, "skipped": []})
         if ARGS[ARGS.index("--project") + 1] != "cadence":
             fail("stub cadence: verdicts read without the ticket's project", 3)
-        out({"origin": "hosted", "project": "cadence", "verdicts": S["verdicts"], "skipped": []})
+        out({"origin": "hosted", "project": "cadence", "verdicts": rows, "skipped": []})
     if ARGS[:2] == ["audit", "identities"]:
         if S["identities"] is None:
             fail("the workspace identity map is not readable by this caller")
