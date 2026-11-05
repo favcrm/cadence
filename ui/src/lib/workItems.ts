@@ -169,7 +169,7 @@ export interface WorkItemFacts {
   milestone: string | null;
   blocked: boolean;
   blockedReason: string | null;
-  checks: { done: number; total: number };
+  checks: { done: number; total: number } | null;
   comments: number;
   recorded: boolean;
 }
@@ -194,7 +194,7 @@ export function workItemFacts(
     milestone: work?.milestone ?? null,
     blocked: detail?.blocked ?? card?.blocked ?? false,
     blockedReason: detail?.blocked_reason ?? card?.blocked_reason ?? null,
-    checks: detail?.checks ?? card?.checks ?? { done: 0, total: 0 },
+    checks: detail?.checks ?? card?.checks ?? null,
     comments: detail ? detail.comments.length : card?.counts.comments ?? 0,
     recorded: detail !== null,
   };

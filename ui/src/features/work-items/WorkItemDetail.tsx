@@ -12,6 +12,7 @@ import { privateReadsAllowed, privateSessionGeneration } from "../../lib/private
 import { resources } from "../../lib/resources";
 import {
   acceptanceItems,
+  hostedAcceptanceCount,
   laneState,
   peekSummary,
   prRef,
@@ -253,10 +254,10 @@ function OverviewPanel({
   const body = detail?.body ?? "";
   const items = useMemo(() => acceptanceItems(body), [body]);
   const checksDone = items.reduce((count, item) => count + Number(item.checked), 0);
-  const checks = items.length > 0 ? { done: checksDone, total: items.length } : facts.checks;
-  const countUnavailable = items.length === 0 && detail?.acceptance !== null &&
-    typeof detail?.acceptance === "object" &&
-    (detail.acceptance as Record<string, unknown>).available === false;
+  const recordedChecks = hostedAcceptanceCount(detail?.acceptance);
+  const checks = recordedChecks === undefined
+    ? (items.length > 0 ? { done: checksDone, total: items.length } : facts.checks)
+    : recordedChecks;
   const agents = detail?.agents ?? [];
   const lane = !detail?.agents
     ? t("Lane state unavailable")
@@ -304,7 +305,7 @@ function OverviewPanel({
           <Fact label="Component" value={facts.component} />
           <Fact
             label="Checks"
-            value={countUnavailable ? t("Acceptance count unavailable") : `${checks.done}/${checks.total} ${checks.total === 1 ? t("check") : t("checks")}`}
+            value={!checks ? t("Acceptance count unavailable") : `${checks.done}/${checks.total} ${checks.total === 1 ? t("check") : t("checks")}`}
           />
           <Fact label="Comments" value={String(facts.comments)} />
           {detail && (

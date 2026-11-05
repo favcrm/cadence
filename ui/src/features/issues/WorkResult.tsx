@@ -18,6 +18,7 @@ import {
   prRef,
   reportView,
   verdictStale,
+  type AcceptanceCount,
   type IssueTab,
 } from "./model";
 
@@ -34,7 +35,6 @@ function nextAction({
   lane,
   questions,
   verdict,
-  checksTotal,
   blocked,
   t,
 }: {
@@ -43,14 +43,11 @@ function nextAction({
   lane: LanePayload | null;
   questions: TaskReport[];
   verdict: TaskReport | null;
-  checksTotal: number;
   blocked: string | null;
   t: (s: string) => string;
 }): string {
   if (detail.status === "done" || detail.status === "dropped")
     return t("The issue is closed. Check recorded assignments for any work still awaiting reconciliation.");
-  if (checksTotal === 0)
-    return t("Add at least one acceptance check — kick off stays blocked until one exists.");
   // `blocked` carries the real reason (write gate or dispatch block); show it.
   if (blocked) return t(blocked);
   if (lane === null)
@@ -79,8 +76,7 @@ function nextAction({
 export function WorkResult({
   detail,
   lane,
-  checksDone,
-  checksTotal,
+  checks,
   blocked,
   tabHref,
   onCompose,
@@ -89,8 +85,7 @@ export function WorkResult({
 }: {
   detail: IssueDetail;
   lane: LanePayload | null;
-  checksDone: number;
-  checksTotal: number;
+  checks: AcceptanceCount | null;
   blocked: string | null;
   tabHref: (tab: IssueTab) => string;
   onCompose: (mode: "ask" | "instruct") => void;
@@ -114,11 +109,10 @@ export function WorkResult({
   const rows: { title: string; detail: ReactNode; tone: keyof typeof TONE_DOT }[] = [
     {
       title: t("Acceptance checks"),
-      tone: checksTotal === 0 || checksDone < checksTotal ? "wait" : "done",
-      detail:
-        checksTotal === 0
-          ? t("No acceptance checklist on the issue.")
-          : `${formatNumber(checksDone)} ${t("of")} ${formatNumber(checksTotal)} ${t("checked")}`,
+      tone: !checks || checks.total === 0 || checks.done < checks.total ? "wait" : "done",
+      detail: checks
+        ? `${formatNumber(checks.done)} ${t("of")} ${formatNumber(checks.total)} ${t("checked")}`
+        : t("Acceptance count unavailable"),
     },
     {
       title: t("Worker report"),
@@ -215,7 +209,6 @@ export function WorkResult({
               lane,
               questions: view.questions,
               verdict,
-              checksTotal,
               blocked,
               t,
             })}

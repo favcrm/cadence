@@ -85,6 +85,22 @@ export interface AcceptanceItem {
   checked: boolean;
 }
 
+export type AcceptanceCount = { done: number; total: number };
+
+/** Undefined is the native/legacy shape; null is a hosted count we cannot use. */
+export function hostedAcceptanceCount(value: unknown): AcceptanceCount | null | undefined {
+  if (value === undefined || Array.isArray(value)) return undefined;
+  if (value === null || typeof value !== "object") return null;
+  const { available, done, total } = value as Record<string, unknown>;
+  if (
+    available !== true ||
+    typeof done !== "number" || !Number.isSafeInteger(done) || done < 0 ||
+    typeof total !== "number" || !Number.isSafeInteger(total) || total < 0 ||
+    done > total
+  ) return null;
+  return { done, total };
+}
+
 function markdownLine(line: string): string | null {
   let indent = 0;
   while (indent < line.length && line[indent] === " ") indent += 1;

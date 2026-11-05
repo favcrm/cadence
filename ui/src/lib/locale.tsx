@@ -1300,7 +1300,6 @@ Object.assign(zhTW, {
 });
 
 Object.assign(zhTW, {
-  "Add at least one acceptance check — kick off stays blocked until one exists.": "請至少新增一項驗收條件，才能啟動工作。",
   "The lane record is unavailable — check the lane card for its state.": "無法取得通道記錄 — 請查看通道卡片的狀態。",
   "Kick off a lane to start the work.": "啟動通道以展開工作。",
   "Check recorded assignments before starting another lane.": "啟動另一個通道前，請先查看已記錄的指派。",
@@ -1397,7 +1396,6 @@ Object.assign(zhTW, {
   "Verification": "驗證",
   "Acceptance checks": "驗收檢查",
   "Acceptance count unavailable": "無法取得驗收項目數量",
-  "No acceptance checklist on the issue.": "此議題沒有驗收清單。",
   "checked": "已完成",
   "Worker report": "工作者回報",
   "Worker reports are unavailable.": "目前無法取得工作者回報。",

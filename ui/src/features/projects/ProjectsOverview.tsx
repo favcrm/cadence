@@ -7,10 +7,23 @@ import { healthView, progressView } from "./work";
 import { projectSummary } from "./overview";
 import ProjectMilestoneSummary from "./ProjectMilestoneSummary";
 import { hasVisibleOpenAssignment, LocalAssignmentBadge } from "../issues/LocalAssignments";
+import { hostedAcceptanceCount } from "../issues/model";
 import { ProjectAssignments } from "./ProjectAssignments";
 import { useLocale } from "../../lib/locale";
 
 const path = (project: string, section = "overview") => project === "all" ? `/projects${section === "issues" ? "?view=list" : ""}` : `/projects/${encodeURIComponent(project)}${section === "overview" ? "" : `/${section}`}`;
+
+function ProjectAcceptance({ value }: { value: unknown }) {
+  const { t, formatNumber } = useLocale();
+  const checks = hostedAcceptanceCount(value);
+  if (checks === undefined) return null;
+  return <p className="text-label text-ink-500 mb-4">
+    {t("Acceptance checks")}: {checks
+      ? `${formatNumber(checks.done)} ${t("of")} ${formatNumber(checks.total)} ${t("checked")}`
+      : t("Acceptance count unavailable")}
+  </p>;
+}
+
 export default function ProjectsOverview({ project, projects, issues, onOpenIssue, onRetry }: {
   project: string; projects: Project[]; issues: ResourceState<IssueCard[]>; onOpenIssue: (id: string) => void; onRetry: () => void;
 }) {
@@ -34,6 +47,7 @@ export default function ProjectsOverview({ project, projects, issues, onOpenIssu
     </dl>
     <p className="text-micro text-ink-500 mb-6">{t("Issue counts exclude epics. In progress reflects tracker status; it does not mean an agent is currently running.")}</p>
     {!all && <p className="text-label text-ink-500 mb-4"><ProjectAssignments value={selected?.local_assignment} /></p>}
+    {!all && <ProjectAcceptance value={selected?.acceptance} />}
     {!all && <ProjectMilestoneSummary project={project} issuesAsOf={issues.asOf} />}
     {all ? <section aria-label={t("Projects")}><div className="flex items-center justify-between mb-3"><h2 className="text-section font-semibold text-ink-100">{t("Your projects")}</h2><span className="text-label text-ink-500">{formatNumber(projects.length)} {t("projects")}</span></div>
       <div className="project-grid">{projects.map((item) => {
@@ -43,6 +57,7 @@ export default function ProjectsOverview({ project, projects, issues, onOpenIssu
           <div className="project-work-counts"><span><strong>{issues.data ? formatNumber(work.doing) : "—"}</strong> {t("in progress")}</span><span><strong>{issues.data ? formatNumber(work.review) : "—"}</strong> {t("in review")}</span><span className={work.blocked ? "text-warn" : ""}><strong>{issues.data ? formatNumber(work.blocked) : "—"}</strong> {t("blocked")}</span></div>
           <p className="text-label text-ink-500">{issues.data ? `${formatNumber(work.open)} ${t("open issues")} · ${formatNumber(work.epics.length)} ${t("active epics")}` : t("Reading project work…")}</p>
           {item.local_assignment !== undefined && <p className="text-label text-ink-500"><ProjectAssignments value={item.local_assignment} /></p>}
+          <ProjectAcceptance value={item.acceptance} />
           {issues.data && work.focus[0] ? <button className="project-focus-preview" onClick={() => onOpenIssue(work.focus[0].id)}><span className="slabel">{t(work.focus[0].status === "review" ? "In review" : work.focus[0].blocked ? "Blocked work" : "Current focus")}</span><span className="block mt-1 text-ink-200">{work.focus[0].title}</span><span className="num text-micro text-ink-500 mt-1 block">{work.focus[0].id}</span></button> : issues.data && <p className="project-focus-preview text-label text-ink-500">{t("No open tracker issues.")}</p>}
         </article>;
       })}</div>

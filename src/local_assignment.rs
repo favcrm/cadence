@@ -515,9 +515,9 @@ fn assignment_unknown(org: &str, path: &str, body: Option<&Value>) -> Error {
             .expect("writing to a String cannot fail");
     }
     message.push_str(
-        "; the outcome is unknown. Inspect `cadence agent status` in the same \
-         selected workspace and reconcile the original assignment and operation \
-         before deciding whether to retry; do not replay blindly",
+        "; the outcome is unknown. Inspect `cadence --org <workspace-slug> agent assignments` \
+         using the original workspace slug, then reconcile the original assignment and \
+         operation before deciding whether to retry; do not replay blindly",
     );
     Error::unknown(message)
 }
@@ -550,8 +550,9 @@ fn assignment_custody_failed(
             .expect("writing to a String cannot fail");
     }
     message.push_str(
-        "; inspect `cadence agent status` in the same selected workspace and reconcile \
-         the original assignment before deciding whether to retry; do not replay blindly",
+        "; inspect `cadence --org <workspace-slug> agent assignments` using the original \
+         workspace slug and reconcile the original assignment before deciding whether to \
+         retry; do not replay blindly",
     );
     Error::internal(message)
 }

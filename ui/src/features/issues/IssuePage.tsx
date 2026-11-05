@@ -29,6 +29,7 @@ import { useLocale } from "../../lib/locale";
 import { ReadNotice } from "./issuePageShared";
 import {
   acceptanceItems,
+  hostedAcceptanceCount,
   issuePath,
   kickoffBlock,
   laneFenceBanner,
@@ -84,10 +85,10 @@ function IssueWorkspace(props: Props) {
   const dispatchBlock =
     props.kickoffBlock ??
     (props.readOnly ? (props.writeBlock ?? "Writes are off.") : null);
-  const kickoffWhy = kickoffBlock(
-    acceptanceItems(detail?.body ?? ""),
-    dispatchBlock,
-  );
+  const kickoffItems = acceptanceItems(detail?.body ?? "");
+  const kickoffWhy = kickoffItems.length === 0 && hostedAcceptanceCount(detail?.acceptance) === null
+    ? "Acceptance count unavailable"
+    : kickoffBlock(kickoffItems, dispatchBlock);
 
   if (!detail) {
     return (
@@ -180,7 +181,10 @@ function PageBody({
   const items = acceptanceItems(detail.body);
   const rows = timelineRows(detail, history.data ?? []);
   const pr = prRef(detail.refs);
-  const done = items.filter((i) => i.checked).length;
+  const recordedChecks = hostedAcceptanceCount(detail.acceptance);
+  const checks = recordedChecks === undefined
+    ? { done: items.filter((i) => i.checked).length, total: items.length }
+    : recordedChecks;
   const fenced = laneFenceBanner(lane?.lane?.state);
   const images = detail.artifacts.filter((f) => IMG.test(f.name));
   const files = detail.artifacts.filter((f) => !IMG.test(f.name));
@@ -311,8 +315,7 @@ function PageBody({
             <WorkResult
               detail={detail}
               lane={lane}
-              checksDone={done}
-              checksTotal={items.length}
+              checks={checks}
               blocked={blocked}
               tabHref={tabHref}
               onCompose={composeWith}
@@ -322,11 +325,11 @@ function PageBody({
           )}
           {tab === "overview" && (
             <section className="issue-description grid gap-4">
-              {items.length > 0 && (
+              {checks && checks.total > 0 && (
                 <div className="issue-acceptance-progress">
                   <span>{t("Acceptance")}</span>
                   <strong className="num">
-                    {formatNumber(done)} {t("of")} {formatNumber(items.length)} {t("complete")}
+                    {formatNumber(checks.done)} {t("of")} {formatNumber(checks.total)} {t("complete")}
                   </strong>
                 </div>
               )}

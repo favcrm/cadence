@@ -586,6 +586,15 @@ and nothing local is started: it is never retried as dev work. A board that
 changes a row's kind between listing and claim answers `work_kind_mismatch`,
 which is a refusal, not permission to run the row as something else.
 
+On the hosted board, issue details and project overviews show the assignment
+receipts visible to the current participant. A reported result is not an
+acceptance or proof that the work is still running. The issue also shows
+readable hosted approval records for its recorded repository, pull request and
+head, even when the issue has no pull-request reference. These records do not
+verify the current head, approval requirements, revocation or delivery.
+Acceptance counts are shown as unavailable when the board cannot count them;
+they are not treated as zero.
+
 A `--state result` report ends the assignment but moves nothing else. Once
 the work meets the project's acceptance and completion rules, use the
 selected workspace's supported ticket update, for example:
