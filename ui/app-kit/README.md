@@ -60,6 +60,12 @@ not required in the PUSH's `actions`. A host that never opts in — or opts in
 but never sends a presentation — leaves the app in its own drawer; the helpers
 reject with `ScreenClosedError`, which is the intended fallback.
 
+`screen-surfaces.v1` is the independent-overlay variant: the host names each
+mount's role (`"primary"` or `"drawer"`), and the optional `onSurface` callback
+receives `(role, surface, modal)`. `receiver.surfaceRole()` and
+`receiver.surface()` expose the same values after the host message. The drawer
+helpers work under either opt-in; a drawer mount never opens another drawer.
+
 ```js
 import { createScreenReceiver } from "@cadence/app-kit";
 
@@ -76,6 +82,24 @@ const receiver = createScreenReceiver({
 const result = await receiver.call("social.drafts.discard", { draft_id });
 const asset = await receiver.asset("draft-image:d1:0");
 receiver.state(JSON.stringify(localDraft)); // ≤ 32 KiB
+```
+
+### Records screens
+
+A records screen names `screen-records.v1` (with `screen.v2`) in `accepts`; the
+host then sends the records projection, which the app validates in `onPush`.
+`crm-locale.v1` additionally opts into the host-selected CRM locale and needs
+`screen-records.v1`. Records CSV calls are larger than the default action
+budget, so the receiver takes a `maxArgsBytes` limit (the host allows 320 KiB
+for `records.csv.*`; keep the app's own per-verb bounds too).
+
+```js
+const receiver = createScreenReceiver({
+  accepts: ["screen.v2", "screen-records.v1", "crm-locale.v1"],
+  maxArgsBytes: 327680,
+  onPush(push) { validateAndRender(push); },
+});
+await receiver.call("records.csv.preview", { csv_text });
 ```
 
 Wire guarantees the receiver enforces (mirroring the Social Content
@@ -109,9 +133,10 @@ reference receiver and `screenProtocol.ts`):
   `slot`→`slot-state`, `tool`→`tool-reply`); anything else tears the port down.
 - Asset replies carry `data:image/(jpeg|png|webp);base64,…` within the 96 KiB
   image's encoded allowance (`MAX_ASSET_BYTES`).
-- `args`/`input` are plain objects within 16 KiB; `anchor` is exactly
-  `{x,y,w,h}` in frame coordinates (or `"footer"`); ids follow
-  `ACTION_ID`, tool aliases `TOOL_ALIAS`, `request_id` `TOOL_REQUEST_ID`.
+- `args`/`input` are plain objects within 16 KiB by default; `maxArgsBytes`
+  raises that for a host verb with a larger allowance (records CSV is 320 KiB).
+  `anchor` is exactly `{x,y,w,h}` in frame coordinates (or `"footer"`); ids
+  follow `ACTION_ID`, tool aliases `TOOL_ALIAS`, `request_id` `TOOL_REQUEST_ID`.
 - `tool` takes an optional fourth argument, `generation_scope`
   (`{draft_id, operation: "caption"|"image", revision}`), carried on the wire
   so the host binds the generation to that draft revision.
@@ -146,5 +171,7 @@ protocol violation calls `onError` and closes the port.
 ## Tests
 
 ```sh
-pnpm test:app-kit
+bun run test:app-kit
 ```
+
+Run it from `ui/`, where the `test:app-kit` script lives.
