@@ -3503,6 +3503,22 @@ mod hosted_finish_acceptance;
 mod tests {
     use super::*;
     #[test]
+    fn accept_revise_is_refused_before_any_request_for_a_managed_caller() {
+        let target = cadence_agent::remote_cli::RemoteTarget {
+            org: "fav-limited".into(),
+            endpoint: "https://example.invalid".into(),
+            org_id: "org_synthetic".into(),
+            identity: Some(cadence_agent::remote_cli::CliIdentityPin {
+                subject_id: "usr_agent".into(),
+                issuer: "iss_synthetic".into(),
+            }),
+        };
+        let err = refuse_managed(&target, "audit accept-revise").unwrap_err();
+        assert!(err.to_string().contains("managed caller"), "{err}");
+        assert!(err.to_string().contains("Nothing was sent"), "{err}");
+    }
+
+    #[test]
     fn hosted_finish_refuses_through_remote_dispatch_without_tracker_access() {
         use cadence_agent::issue::cli::IssueAction;
         use cadence_agent::local_assignment::{CoordHttp, Coordinator, Reply};

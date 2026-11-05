@@ -1286,6 +1286,49 @@ mod cad2081_workflow_verdicts {
     }
 
     #[test]
+    fn an_unorderable_workflow_revise_is_never_accepted() {
+        let f = Fixture::new();
+        let head = f.touch("docs/x.md");
+        // No stamp: the row cannot be ordered, so it always refuses — an
+        // acceptance cannot make an unorderable row evidence.
+        let mut loose = f.spec();
+        loose["outcome"] = json!("revise");
+        loose["title_outcome"] = json!("revise");
+        loose["section_outcome"] = json!("revise");
+        loose["name"] = json!("spec.md");
+        loose["stamp"] = Value::Null;
+        let mut case = scenario(vec![f.std(), loose]);
+        case.class = "consequential";
+        case.head = Some(head.clone());
+        case.accepts_revise = Some(json!({"head": head}));
+        refused_all(&f, case, &["is not a pass", "cannot be ordered"]);
+    }
+
+    #[test]
+    fn a_refused_workflow_revise_names_the_head_and_the_accept_command() {
+        let f = Fixture::new();
+        let head = f.touch("docs/x.md");
+        let mut revise = f.spec();
+        revise["outcome"] = json!("revise");
+        revise["title_outcome"] = json!("revise");
+        revise["section_outcome"] = json!("revise");
+        revise["name"] = json!("20261103-000150-spec.md");
+        revise["stamp"] = json!("20261103-000150");
+        let mut case = scenario(vec![f.std(), revise]);
+        case.class = "consequential";
+        case.head = Some(head.clone());
+        refused_all(
+            &f,
+            case,
+            &[
+                "no acceptance is recorded",
+                "cadence audit accept-revise",
+                head.as_str(),
+            ],
+        );
+    }
+
+    #[test]
     fn a_settled_workflow_revise_answers_the_routine_route() {
         let f = Fixture::new();
         let mut revise = f.spec();

@@ -1009,7 +1009,7 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
             if (n["stamp"] and not is_workflow_row(n)
                     and any(p["stamp"] > n["stamp"] for p in passes)):
                 continue  # superseded by a later pass of this reviewer; a workflow row is final
-            if accepted is not None and is_workflow_row(n):
+            if accepted is not None and is_workflow_row(n) and n["stamp"]:
                 continue  # CAD-2197: the operator read this finding and accepted it at this head
             why = "" if n["stamp"] else "; the file name has no stamp, so it cannot be ordered"
             reasons.append(
@@ -1150,8 +1150,8 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
         # comparison below and out of `counted`, so nothing reports it as a pass
         # and a forged same-reviewer pair cannot be manufactured by it.
         for n in verdicts:
-            if not is_workflow_row(n) or n["outcome"] == "pass":
-                continue
+            if not is_workflow_row(n) or n["outcome"] == "pass" or not n["stamp"]:
+                continue  # unorderable stays refused: an acceptance never orders a row
             if hosted is not None and workflow_reason(n, hosted):
                 continue
             if n["kind"] == "standards":
@@ -1958,6 +1958,18 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                           + str(accepted_revise.get("approval_id"))
                           + f" at {head[:12]} (source {accepted_revise.get('source')!r})")
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
+
+    # CAD-2197: a workflow revise that was not accepted is final, and the operator
+    # needs the exact head and command to accept or supersede it. This is the
+    # "missing or malformed acceptance names the head it would need" rule: a
+    # failed or absent read answers with the same sentence, never with a lift.
+    if (accepted_revise is None and hosted_project is not None
+            and any(is_workflow_row(v) and v["outcome"] != "pass" for v in verdicts)):
+        reasons.append(
+            f"a workflow review at head {head} is not a pass and no acceptance is recorded for "
+            f"that head; the operator accepts it with `cadence audit accept-revise --pr {pr} "
+            f"--head {head} --issue {issue} --project {hosted_project} --source ...` after "
+            "reading the findings, or a new commit is reviewed again")
 
     # Human class: paths, size, any head-pinned note whose Risk is not exactly `auto`,
     # or (CAD-2081) a workflow-issued review on any change outside the workflow
