@@ -309,6 +309,8 @@ export interface WriteResp {
   issue: IssueDetail;
   card: IssueCard;
   warnings?: string[];
+  /** Create only: the idempotency key answered a ticket an earlier call made. */
+  replayed?: boolean;
 }
 
 /** `GET /api/issues/<id>/kickoff` — enough for the drawer confirm. */
@@ -650,6 +652,8 @@ export const api = {
     blocked_by?: string[];
     /** CAD-140: the report/idea description, filed with the issue. */
     body?: string;
+    /** CAD-2188: a retry with the same key answers the ticket the first call made. */
+    idempotency_key?: string;
   }) => write("POST", "/api/issues", req),
 
   patch: (
