@@ -1188,7 +1188,7 @@ def hosted_routine_reasons(verdicts, counted, hosted, repo, pr, head):
     proves. The two workflow reviews are the evidence this gate already trusts on
     other classes; an owner row does not stand in for them. The refusal names what to
     dispatch for a review not yet filed. The board keeps the first row per head, kind
-    and principal, so a filed review is not dispatched again: it takes a new head."""
+    and principal, so a filed review is not dispatched again at this head."""
     if two_workflow_reviews(counted, hosted):
         return []
     filed = {v["kind"] for v in verdicts if is_workflow_row(v)}
@@ -1199,8 +1199,8 @@ def hosted_routine_reasons(verdicts, counted, hosted, repo, pr, head):
     return ["active routine delivery on a hosted org has no readiness record and needs "
             "a pass from both review workflows at this head"
             + (": " + "; ".join(commands) if commands else "")
-            + (f"; the filed {', '.join(sorted(stuck))} review does not count and cannot be "
-               "filed again at this head, so it takes a new commit" if stuck else "")]
+            + (f"; filed but not counted: {', '.join(sorted(stuck))}. A filed review cannot be "
+               "filed again at this head; a new row takes a new commit" if stuck else "")]
 
 
 ADVISORY_KINDS = ("standards", "spec-security", "browser-qa")
@@ -1806,8 +1806,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             if need_qa:
                 reasons += check_reviews(verdicts, True, True, authors, issue, hosted)[0]
             # A workflow row that is not a pass refuses whatever the class, so it
-            # stays true when hosted readiness ships. With readiness, owner rows are not
-            # read here; without it on hosted, check_reviews above reads them.
+            # stays true when hosted readiness ships. Without readiness on hosted,
+            # check_reviews above also reads owner rows.
             reasons += [f"workflow verdict {v['name']} is not a pass (outcome '{v['outcome']}'): "
                         "a workflow review that is not a pass always refuses"
                         for v in verdicts if is_workflow_row(v) and v["outcome"] != "pass"]
