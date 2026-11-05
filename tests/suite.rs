@@ -7683,6 +7683,10 @@ mod cad2100_classifier_merge_base {
                 .tempdir_in("/tmp")
                 .unwrap();
             let r = root.path();
+            // A group-writable child of sticky /tmp is one the custody check refuses, and
+            // the daemon inherits this root in its chain, so state the mode the root needs
+            // rather than leave it to the umask of whoever runs the suite (CAD-2175).
+            std::fs::set_permissions(r, std::fs::Permissions::from_mode(0o700)).unwrap();
             for dir in ["s", "h", "pm/cadence/CAD-1/reports"] {
                 std::fs::create_dir_all(r.join(dir)).unwrap();
             }
