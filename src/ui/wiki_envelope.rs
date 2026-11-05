@@ -181,6 +181,12 @@ pub(crate) fn handle(
     if action == WikiAction::Write && opts.read_only {
         return refuse(403, "read_only", "board is read-only — writes are disabled");
     }
+    // The wiki ACL cannot see private projects, so the board's policy decides
+    // here too: an envelope grants a prefix, not a right to a project page the
+    // caller's policy withholds. Computed once, from the same spelling the
+    // board uses, and answered exactly as an unknown page so a refused path
+    // cannot probe for a project's existence.
+    let readable = super::wiki::readable_pages(pm_dir, &attribution);
     match action {
         WikiAction::Read if tail == "job_status" => {
             transfer(request, state_dir, &grant, &attribution, false)
@@ -188,8 +194,15 @@ pub(crate) fn handle(
         WikiAction::Write if tail == "transfer" => {
             transfer(request, state_dir, &grant, &attribution, true)
         }
-        WikiAction::Enumerate => enumerate(query, state_dir, &grant, &attribution),
-        WikiAction::Read => read(request.url(), query, state_dir, &grant, &attribution),
+        WikiAction::Enumerate => enumerate(query, state_dir, &grant, &attribution, &readable),
+        WikiAction::Read => read(
+            request.url(),
+            query,
+            state_dir,
+            &grant,
+            &attribution,
+            &readable,
+        ),
         WikiAction::Write if tail == "upload" => {
             upload(request, query, state_dir, pm_dir, &grant, &attribution)
         }
@@ -263,6 +276,7 @@ fn enumerate(
     state_dir: &std::path::Path,
     grant: &WikiGrant,
     attribution: &str,
+    readable: &std::collections::BTreeSet<String>,
 ) -> HttpResp {
     let path = query("path").unwrap_or_default();
     if let Some(q) = query("q") {
@@ -280,9 +294,10 @@ fn enumerate(
             .unwrap_or_default()
             .into_iter()
             .filter(|m| {
-                m["path"]
-                    .as_str()
-                    .is_some_and(|p| grant.contains(WikiAction::Enumerate, p))
+                m["path"].as_str().is_some_and(|p| {
+                    grant.contains(WikiAction::Enumerate, p)
+                        && super::wiki::page_admitted(readable, p)
+                })
             })
             .collect();
         return json_ok(json!({"q": body["q"], "base": body["base"], "matches": hits}));
@@ -301,9 +316,9 @@ fn enumerate(
         .unwrap_or_default()
         .into_iter()
         .filter(|e| {
-            e["path"]
-                .as_str()
-                .is_some_and(|p| grant.contains(WikiAction::Enumerate, p))
+            e["path"].as_str().is_some_and(|p| {
+                grant.contains(WikiAction::Enumerate, p) && super::wiki::page_admitted(readable, p)
+            })
         })
         .collect();
     json_ok(json!({"path": body["path"], "entries": entries}))
@@ -324,6 +339,7 @@ fn read(
     state_dir: &std::path::Path,
     grant: &WikiGrant,
     attribution: &str,
+    readable: &std::collections::BTreeSet<String>,
 ) -> HttpResp {
     let Some(path) = query("path") else {
         return refuse(400, "invalid_request", "wiki file needs ?path=");
@@ -334,6 +350,9 @@ fn read(
             "insufficient_scope",
             "the path is outside this envelope's wiki prefix",
         );
+    }
+    if !super::wiki::page_admitted(readable, path.trim_matches('/')) {
+        return super::wiki::not_a_page(&path);
     }
     let mut params = json!({"path": path, "wiki_as": attribution});
     if let Some(raw) = query("offset") {

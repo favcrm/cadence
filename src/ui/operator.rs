@@ -2966,6 +2966,8 @@ pub(super) fn platform_session(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// A board session's display actor is not the policy key: the named
     /// handle is. Using `Caller::actor()` here made every project
     /// unreadable for a real board session (cad1452).
@@ -2987,7 +2989,6 @@ mod tests {
             "agents/pane-3"
         );
     }
-    use super::*;
 
     #[test]
     fn agent_uid_socket_never_becomes_operator_on_either_fallback_arm() {

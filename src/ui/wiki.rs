@@ -47,6 +47,52 @@ fn wiki_as(caller: &operator::Caller) -> String {
     }
 }
 
+/// The project a wiki path belongs to, when it names one.
+///
+/// The wiki speaks `projects/<key>/<collection>/…` and `global/<collection>`.
+/// Only the first form is project-scoped, so only it can be gated by a project
+/// policy; `global` has no project and must never be filtered by one.
+///
+/// `projects/<key>` alone is a page (or a directory) in its own right, so the
+/// key is taken up to the end as well as up to the next `/`: requiring a tail
+/// left the shallowest page of every project ungated.
+fn wiki_project_of(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("projects/")?;
+    let (key, _) = rest.split_once('/').unwrap_or((rest, ""));
+    (!key.is_empty()).then_some(key)
+}
+
+/// The answer an unknown page gives.
+///
+/// A page the caller may not see must be indistinguishable from one that does
+/// not exist, or the refusal itself answers "does this project exist?" — so the
+/// refused case copies the daemon's missing-page reply rather than inventing a
+/// status of its own. The daemon normalizes to no leading or trailing `/`.
+pub(super) fn not_a_page(path: &str) -> HttpResp {
+    let norm = path.trim_matches('/');
+    err_response(400, &format!("wiki read '{norm}': no such file"))
+}
+
+/// Whether `path` may be served to a caller who can read `readable`.
+///
+/// A page under `projects/<key>` is admitted only when that key is readable;
+/// `global/…` has no project and is never filtered. An empty set — a tracker
+/// that could not be read — therefore refuses every project page and no
+/// `global` one, which is the fail-closed direction.
+pub(super) fn page_admitted(readable: &std::collections::BTreeSet<String>, path: &str) -> bool {
+    match wiki_project_of(path) {
+        Some(project) => readable.contains(project),
+        None => true,
+    }
+}
+
+/// The projects this board caller may read, computed once per request.
+pub(super) fn readable_pages(pm_dir: &Path, spelling: &str) -> std::collections::BTreeSet<String> {
+    Pm::at(pm_dir)
+        .map(|pm| super::project_policy::readable(&pm, spelling))
+        .unwrap_or_default()
+}
+
 /// Relay `method` to the daemon with `wiki_as` folded into the params.
 fn relay(state_dir: &Path, method: &str, mut params: Value, caller: &str) -> HttpResp {
     params["wiki_as"] = json!(caller);
@@ -195,6 +241,9 @@ pub(super) fn read(
         Err(resp) => return resp,
     };
     let wiki_as = wiki_as(&caller);
+    // One policy read per request. A tracker that cannot be read denies every
+    // project-scoped page rather than guessing, while `global` stays readable.
+    let readable = readable_pages(pm_dir, &super::operator::caller_spelling(&caller));
     match tail {
         "ls" => relay(
             state_dir,
@@ -202,7 +251,7 @@ pub(super) fn read(
             json!({"path": query("path").unwrap_or_default()}),
             &wiki_as,
         ),
-        "file" => file_response(request, query, state_dir, pm_dir, &wiki_as),
+        "file" => file_response(request, query, state_dir, pm_dir, &wiki_as, &readable),
         "search" => match query("q") {
             Some(q) => relay(
                 state_dir,
@@ -294,10 +343,16 @@ fn file_response(
     state_dir: &Path,
     pm_dir: &Path,
     wiki_as: &str,
+    readable: &std::collections::BTreeSet<String>,
 ) -> HttpResp {
     let Some(path) = query("path") else {
         return err_response(400, "wiki file needs ?path=");
     };
+    // A project-scoped page inherits that project's policy: the wiki ACL does
+    // not know about private projects, so the board's policy decides here.
+    if !page_admitted(readable, &path) {
+        return not_a_page(&path);
+    }
     let mut params = json!({"path": path, "wiki_as": wiki_as});
     if let Some(raw) = query("offset") {
         match raw.parse::<u64>() {
@@ -1142,6 +1197,70 @@ mod selector_tests {
         assert_eq!(
             historical_at("/api/wiki/file?path=a.md&%61t=%ZZ"),
             Err("wiki file at is malformed")
+        );
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::{not_a_page, page_admitted, wiki_project_of};
+    use std::collections::BTreeSet;
+
+    fn readable(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter().map(|k| (*k).to_string()).collect()
+    }
+
+    #[test]
+    fn only_the_projects_form_is_project_scoped() {
+        // The two shapes the wiki speaks: a project page is gated, a global
+        // page is not — filtering `global` would empty it for everyone.
+        assert_eq!(
+            wiki_project_of("projects/cadence/issues/overview.md"),
+            Some("cadence")
+        );
+        // `projects/<key>` alone is a page (and a directory) in its own right,
+        // so the shallowest page of every project is gated as well.
+        assert_eq!(wiki_project_of("projects/acme"), Some("acme"));
+        assert_eq!(wiki_project_of("projects/acme/"), Some("acme"));
+        assert_eq!(wiki_project_of("global/company/handbook.md"), None);
+        assert_eq!(wiki_project_of("projects/"), None);
+        assert_eq!(wiki_project_of(""), None);
+        // A lookalike segment is not the prefix.
+        assert_eq!(wiki_project_of("xprojects/cadence/a.md"), None);
+    }
+
+    #[test]
+    fn a_page_in_a_project_the_caller_cannot_read_is_refused() {
+        let mine = readable(&["public"]);
+        assert!(page_admitted(&mine, "projects/public/notes.md"));
+        assert!(page_admitted(&mine, "projects/public"));
+        assert!(!page_admitted(&mine, "projects/secret/notes.md"));
+        assert!(!page_admitted(&mine, "projects/secret"));
+        // `global` has no project, so no policy can empty it.
+        assert!(page_admitted(&mine, "global/company/handbook.md"));
+    }
+
+    #[test]
+    fn an_unreadable_tracker_denies_every_project_page_and_no_global_one() {
+        // `readable_pages` yields an empty set when the tracker cannot be read;
+        // the gate must fail closed on projects and still serve `global`.
+        let none = readable(&[]);
+        assert!(!page_admitted(&none, "projects/public/notes.md"));
+        assert!(!page_admitted(&none, "projects/public"));
+        assert!(page_admitted(&none, "global/company/handbook.md"));
+    }
+
+    #[test]
+    fn a_refused_page_answers_as_an_unknown_one() {
+        // The daemon answers a missing page 400 with this text; a refusal that
+        // answered 404 would tell a caller the project exists.
+        let resp = not_a_page("/projects/secret/notes.md/");
+        assert_eq!(resp.status_code().0, 400);
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut resp.into_reader(), &mut body).unwrap();
+        assert!(
+            body.contains("wiki read 'projects/secret/notes.md': no such file"),
+            "unexpected body: {body}"
         );
     }
 }
