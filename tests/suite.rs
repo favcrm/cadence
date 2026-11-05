@@ -1291,6 +1291,7 @@ mod cad2081_workflow_verdicts {
                 "issue_url": "https://api.github.com/repos/favcrm/cadence/issues/7",
                 "created_at": "2026-11-05T00:00:00Z",
                 "updated_at": "2026-11-05T00:00:00Z",
+                "author_association": "MEMBER",
                 "body": body,
             }})
         };

@@ -1229,18 +1229,59 @@ def browser_qa_comment_reasons(url, repo, pr, head):
         return [f"the --browser-qa comment {m.group(1)} is not on this PR"]
     if not comment.get("created_at") or comment.get("updated_at") != comment["created_at"]:
         return [f"the --browser-qa comment {m.group(1)} was edited after posting: post a new one"]
-    body = comment["body"]
-    if hides_text(body):
+    if comment.get("author_association") not in QA_AUTHOR_ASSOCIATIONS:
+        return [f"the --browser-qa comment {m.group(1)} is not by a repository member"]
+    body = comment["body"].replace("\r\n", "\n")
+    if comment_hides_lines(body):
         return [f"the --browser-qa comment {m.group(1)} holds text a person cannot see"]
-    lines = [line.strip() for line in body.splitlines()]
-    results = [line for line in lines if line.lower().startswith("browser qa:")]
-    heads = [line for line in lines if line.lower().startswith("head:")]
+    results, heads = qa_comment_lines(body)
     reasons = []
     if results != ["Browser QA: pass"]:
         reasons.append(f"the --browser-qa comment {m.group(1)} must have one line `Browser QA: pass`")
     if heads != [f"Head: {head}"]:
         reasons.append(f"the --browser-qa comment {m.group(1)} must have one line `Head: {head}`")
     return reasons
+
+
+# The repository is public, so anyone can comment. GitHub states this per comment.
+QA_AUTHOR_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+# Non-ASCII letters read as `?` here, so a lookalike still counts as the label.
+QA_RESULT_LOOSE = re.compile(r"[b?][r?][o?][w?][s?][e?][r?]\W*[q?][a?]\W*:")
+QA_HEAD_LOOSE = re.compile(r"[h?][e?][a?][d?]\W*:")
+MARKDOWN_REFERENCE = re.compile(r" {0,3}\[[^\]]*\]:\s")
+
+
+def comment_hides_lines(body):
+    """`hides_text`, plus what makes one rendered line read as several: control
+    characters and Unicode line separators, and a Markdown reference, which renders
+    as nothing. Lines are split on newline alone, so none of these can make a line."""
+    return (hides_text(body)
+            or any(unicodedata.category(c) in ("Cc", "Zl", "Zp") and c not in "\n\t" for c in body)
+            or any(MARKDOWN_REFERENCE.match(line) for line in body.split("\n")))
+
+
+def qa_comment_lines(body):
+    """(result lines, head lines), counting every line that loosely reads as either
+    label, as `risk_line` does for a ticket: after Markdown markers, NFKC and casefold,
+    with lookalike letters, fenced code included. A line counts as written only if it
+    stands alone at the margin outside a code fence; any other reads as None, so a
+    disguised `fail` or a pass quoted in a fence cannot sit beside the real one."""
+    results, heads = [], []
+    fence = None
+    for raw in body.split("\n"):
+        line = raw.rstrip()
+        marker = re.match(r" {0,3}(`{3,}|~{3,})", line)
+        loose = re.sub(r"[*_`~]", "", line).lstrip(" \t>-+#").strip()
+        loose = re.sub(r"[^\x00-\x7f]", "?", unicodedata.normalize("NFKC", loose).casefold())
+        for pattern, found in ((QA_RESULT_LOOSE, results), (QA_HEAD_LOOSE, heads)):
+            if pattern.match(loose):
+                found.append(line if fence is None else None)
+        if marker:
+            if fence is None:
+                fence = marker.group(1)[0]
+            elif marker.group(1)[0] == fence:
+                fence = None
+    return results, heads
 
 
 ADVISORY_KINDS = ("standards", "spec-security", "browser-qa")
@@ -1815,7 +1856,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         if args.browser_qa:
             if hosted is None:
                 reasons.append("--browser-qa is for a hosted org")
-            elif not need_qa:
+            elif not any(p.startswith("ui/") for p in paths):
                 reasons.append("--browser-qa is for a ui/ change, and this PR has none")
             else:
                 rs = browser_qa_comment_reasons(args.browser_qa, repo, pr, head)
