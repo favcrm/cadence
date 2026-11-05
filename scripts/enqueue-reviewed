@@ -1215,7 +1215,7 @@ def browser_qa_comment_reasons(url, repo, pr, head):
     takes the operator's approval. One edit could turn a fail into a pass after the
     fact, so an edited comment does not count: post a new one."""
     m = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/pull/{pr}#issuecomment-([0-9]+)",
-                     url, re.IGNORECASE)
+                     url, re.IGNORECASE | re.ASCII)
     if not m:
         return [f"--browser-qa must name a comment on this PR: {url!r}"]
     rc, out, _ = run(["gh", "api", f"repos/{repo}/issues/comments/{m.group(1)}"])
