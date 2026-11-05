@@ -76,17 +76,22 @@ let decideStatus: Record<string, number> = {};
 let decideThrows: Record<string, boolean> = {};
 let onDecide: ((id: string, verb: string) => void) | null = null;
 let hold: Promise<void> | null = null;
+let listHold: Promise<void> | null = null;
+/** The server records the decision, then the reply is lost. */
+let lostReply: Record<string, boolean> = {};
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "Content-Type": "application/json" } });
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   if (url.pathname === "/api/assist/actions") {
     listCalls++;
+    await listHold;
     return listStatus === 200 ? json({ actions }) : json({ error: { code: "x" } }, listStatus);
   }
   const m = /^\/api\/assist\/actions\/([^/]+)\/(approve|deny)$/.exec(url.pathname);
   if (m && init?.method === "POST") {
     posts.push({ path: url.pathname, body: JSON.parse(String(init.body ?? "{}")) });
     await hold;
+    if (lostReply[m[1]]) { onDecide?.(m[1], m[2]); throw new TypeError("network"); }
     if (decideThrows[m[1]]) throw new TypeError("network");
     const status = decideStatus[m[1]] ?? 200;
     if (status === 200) onDecide?.(m[1], m[2]);
@@ -579,6 +584,73 @@ listStatus = 200;
 
   const odd = parseStagedRow(customer("z", { changes: [{ field: "notes", label: "Notes", kind: "removed", before: "x" }] }));
   assert(odd !== null && odd.changes[0].kind === "removed", "a removed kind is tolerated");
+}
+
+// ---- 15. a lost reply: unsure wins over "decided elsewhere"; a poll cannot fake a failure ----
+{
+  const decided = (result: unknown) => (id: string) => {
+    actions = actions.map((a: any) => a.id === id ? { ...a, status: "approved", decidedAt: Date.now(), result } : a);
+  };
+  for (const [name, record, expect] of [
+    ["applied", decided({ ok: true }), "Applied"],
+    ["failed", decided({ ok: false, code: "revision_conflict" }), "did not apply: the record changed after it was staged"],
+    ["pending", () => {}, "still waiting"],
+  ] as const) {
+    actions = [customer("a1")];
+    onDecide = record;
+    lostReply = { a1: true };
+    const v = await render();
+    await settle(() => assert(v.cards().length === 1, "one card"));
+    await click(labelled(v.cards()[0], "Review"));
+    await settle(() => assert(drawerEl(), "open"));
+    await click(labelled(drawerEl()!, "Approve"));
+    await settle(() => assert(labelled(drawerEl()!, "Check again"), `${name}: unsure after a lost reply`));
+    lostReply = {};
+    // A poll lands and shows the row decided: still unsure, not "decided elsewhere".
+    await React.act(async () => { win.dispatchEvent(new win.Event("focus")); });
+    await settle(() => assert(listCalls >= 2, "the poll read"));
+    assert(labelled(drawerEl()!, "Check again") && !/decided elsewhere/.test(text(drawerEl())), `${name}: Check again stays; no false "elsewhere"`);
+    const n = sent();
+    await click(labelled(drawerEl()!, "Check again"));
+    if (name === "pending") {
+      await settle(() => assert(labelled(drawerEl()!, "Approve") && text(drawerEl()).includes(expect), "pending: decide again is allowed"));
+    } else {
+      await settle(() => assert(!drawerEl(), `${name}: the queue ends`));
+      assert(text(v.host.querySelector(".todo-note")).includes(expect), `${name}: the row's actual outcome is reported (got "${text(v.host.querySelector(".todo-note"))}")`);
+    }
+    assert(sent() === n, "Check again never resubmits");
+    onDecide = null;
+    await v.done();
+  }
+
+  // A poll that starts while the decision settles is skipped: no false "could not confirm".
+  actions = [customer("a1")];
+  onDecide = decided({ ok: true });
+  const w = await render();
+  await settle(() => assert(w.cards().length === 1, "one card"));
+  await click(labelled(w.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  let release!: () => void;
+  listHold = new Promise<void>((r) => { release = r; });
+  await click(labelled(drawerEl()!, "Approve"));
+  await flush();
+  const reads = listCalls;
+  await React.act(async () => { win.dispatchEvent(new win.Event("focus")); });
+  await flush();
+  assert(listCalls === reads, "no background read while a decision settles");
+  release(); listHold = null;
+  await settle(() => assert(!drawerEl(), "settled and closed"));
+  assert(/Applied/.test(text(w.host.querySelector(".todo-note"))) && !/could not be confirmed/.test(text(w.host)), "reported as applied, not unconfirmed");
+  onDecide = null;
+
+  // A hidden tab is not polled.
+  Object.defineProperty(win.document, "visibilityState", { value: "hidden", configurable: true });
+  const before = listCalls;
+  await React.act(async () => { win.dispatchEvent(new win.Event("focus")); });
+  await flush();
+  assert(listCalls === before, "hidden: no read");
+  Object.defineProperty(win.document, "visibilityState", { value: "visible", configurable: true });
+  await w.done();
 }
 
 console.log("staged decision checks passed");

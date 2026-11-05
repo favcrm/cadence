@@ -87,6 +87,17 @@ let holders = 0;
 let stopMaster: (() => void) | null = null;
 let stopPoll: (() => void) | null = null;
 const POLL_MS = 30_000;
+const RETRY_MS = 5_000;
+const RETRY_MAX_MS = 60_000;
+let failures = 0;
+
+const deciding = (): boolean => [...state.attempts.values()].some((a) => a.phase === "busy");
+
+/** A read nobody asked for (timer, focus, stream, retry): never while a decision is in flight. */
+function backgroundReload() {
+  if (deciding()) return;
+  void reloadDecisions();
+}
 
 const UNAVAILABLE_STATUSES = new Set([401, 403, 404, 501]);
 
@@ -111,6 +122,7 @@ export async function reloadDecisions(): Promise<readonly StagedWrite[] | null> 
     if (mine !== generation) return null;
     const rows = response.ok ? parseStagedList(body) : null;
     if (rows === null) throw new Error("unreadable");
+    failures = 0;
     patch({ phase: "ready", rows });
     return rows;
   } catch {
@@ -118,11 +130,14 @@ export async function reloadDecisions(): Promise<readonly StagedWrite[] | null> 
     // Keep the last good list; a failed refresh is not an empty queue. A
     // first read that failed retries on its own so a 5xx cannot hide the
     // surface until the page is reloaded.
+    // Back off, and do not poll a hidden tab: becoming visible reads at once.
+    failures += 1;
     if (holders > 0 && retryTimer === null)
       retryTimer = setTimeout(() => {
         retryTimer = null;
-        void reloadDecisions();
-      }, 5_000);
+        if (document.visibilityState === "hidden") return;
+        backgroundReload();
+      }, Math.min(RETRY_MS * 2 ** (failures - 1), RETRY_MAX_MS));
     return null;
   }
 }
@@ -136,7 +151,7 @@ function acquire() {
   // write arriving while the queue is empty: the only refresh for an idle
   // queue, with no timer to leak.
   stopMaster = subscribeMasterChanged(() => {
-    if (state.phase === "ready") void reloadDecisions();
+    if (state.phase === "ready") backgroundReload();
   });
   // Hosted boards have no stream that names a new staged write, so the list
   // is also re-read on a timer, on focus and when the tab becomes visible.
@@ -144,7 +159,7 @@ function acquire() {
   const again = () => {
     if (document.visibilityState === "hidden") return;
     if (state.phase === "unavailable") return;
-    void reloadDecisions();
+    backgroundReload();
   };
   const timer = setInterval(again, POLL_MS);
   addEventListener("focus", again);
@@ -222,7 +237,9 @@ export async function decide(id: string, verb: Verb): Promise<DecideResult> {
 
 /** After a reply that says it worked, trust the list, not the reply. */
 async function settle(id: string, verb: Verb): Promise<DecideResult> {
-  const rows = await reloadDecisions();
+  // If this read was superseded, the list that superseded it is as good.
+  const read = await reloadDecisions();
+  const rows = read ?? (state.phase === "ready" ? state.rows : null);
   const row = rows?.find((r) => r.id === id);
   if (row === undefined) {
     // The list did not come back, or the row left it: we cannot say what happened.

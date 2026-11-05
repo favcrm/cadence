@@ -177,8 +177,9 @@ export default function StagedWriteDetail({
   const lost = decisions.phase === "unavailable" || attempt?.phase === "access";
   // Our own decision leaves "pending" a moment before the queue advances.
   const mine = useRef<string | null>(null);
-  const elsewhere = !lost && !pending && mine.current !== id;
   const uncertain = attempt?.phase === "unconfirmed";
+  // Unsure of our own decision wins over "decided elsewhere": Check again reports the real outcome.
+  const elsewhere = !lost && !uncertain && !pending && mine.current !== id;
   const idRef = useRef(id);
   idRef.current = id;
   const atRef = useRef(at);
@@ -285,15 +286,19 @@ export default function StagedWriteDetail({
             label,
             panel: (
               <p className="issue-peek-note warn m-0" role="alert">
-                {lost ? t("Only the workspace owner can decide this request.") : t("Already decided elsewhere. See Updates.")}
+                {lost
+                  ? t("Only the workspace owner can decide this request.")
+                  : uncertain
+                    ? t("We could not confirm the result. It may already have gone through, so do not approve again; check first.")
+                    : t("Already decided elsewhere. See Updates.")}
               </p>
             ),
           },
         ]}
         foot={
           <div className="crm-drawer-actions">
-            <button type="button" className="btn btn-sm btn-primary" onClick={lost ? onClose : advance}>
-              {lost ? t("Close") : t("Continue")}
+            <button type="button" className="btn btn-sm btn-primary" onClick={lost ? onClose : uncertain ? check : advance}>
+              {lost ? t("Close") : uncertain ? t("Check again") : t("Continue")}
             </button>
           </div>
         }
