@@ -309,6 +309,8 @@ export interface WriteResp {
   issue: IssueDetail;
   card: IssueCard;
   warnings?: string[];
+  /** Create only: the idempotency key answered a ticket an earlier call made. */
+  replayed?: boolean;
 }
 
 /** `GET /api/issues/<id>/kickoff` — enough for the drawer confirm. */

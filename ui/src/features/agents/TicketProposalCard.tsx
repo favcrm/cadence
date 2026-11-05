@@ -4,7 +4,7 @@ import { useTranslate } from "../../lib/locale";
 import { resources } from "../../lib/resources";
 import Button from "../../ui/Button";
 import type { ThreadEntry } from "../home/thread";
-import { createAndAssign, parseTicketProposal } from "./ticketProposal";
+import { createAndAssign, parseTicketProposal, type CreateAndAssignOutcome } from "./ticketProposal";
 
 /** Master's start card (AOS-517): the whole ticket it proposes, the agent that
  *  would run it, the tools that agent gets, and who can read the result. One
@@ -24,7 +24,7 @@ export default function TicketProposalCard({
   const proposal = parseTicketProposal(entry.payload);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [created, setCreated] = useState<{ ticket: string; assigned: boolean } | null>(null);
+  const [created, setCreated] = useState<CreateAndAssignOutcome | null>(null);
 
   if (!proposal) {
     return (
@@ -69,25 +69,38 @@ export default function TicketProposalCard({
           </dd>
           <dt className="text-ink-400">{t("Tools")}</dt>
           <dd className="text-ink-300 break-words font-mono text-micro">
-            {proposal.tools.join(", ")}
+            {proposal.tools.length ? proposal.tools.join(", ") : t("None")}
           </dd>
           <dt className="text-ink-400">{t("Visible to")}</dt>
           <dd className="text-ink-200">{t("Everyone in the company")}</dd>
         </dl>
         {created ? (
-          <p className="text-label text-ok mt-3" role="status">
-            {created.assigned
-              ? t("Created {id} and assigned it.").replace("{id}", () => created.ticket)
-              : t("Created {id}; it already has an owner, so nothing was reassigned.").replace(
+          <div className="mt-3" role="status">
+            <p className={`text-label ${created.state === "failed" ? "text-warn" : "text-ok"}`}>
+              {created.state === "assigned" &&
+                t("Created {id} and assigned it.").replace("{id}", () => created.ticket)}
+              {created.state === "replayed" &&
+                t("The card already created {id}; nothing was reassigned.").replace(
                   "{id}",
                   () => created.ticket,
-                )}{" "}
+                )}
+              {created.state === "owned" &&
+                t("{id} already has an owner; nothing was reassigned.").replace(
+                  "{id}",
+                  () => created.ticket,
+                )}
+              {created.state === "failed" &&
+                t("Ticket {id} was created, but the agent was not assigned: {error}").replace(
+                  "{id}",
+                  () => created.ticket,
+                ).replace("{error}", () => created.error ?? t("the board refused the change"))}
+            </p>
             {onOpenIssue && (
               <Button variant="ghost" size="sm" onClick={() => onOpenIssue(created.ticket)}>
                 {t("Open ticket")}
               </Button>
             )}
-          </p>
+          </div>
         ) : (
           <div className="flex flex-wrap items-center gap-2 mt-3">
             <Button
