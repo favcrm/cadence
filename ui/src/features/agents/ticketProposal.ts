@@ -73,6 +73,8 @@ export type TicketProposalClient = {
     replayed?: boolean;
   }>;
   patch: (id: string, patch: { owner: string }, ifRev?: string) => Promise<unknown>;
+  /** Re-read one ticket, to settle an assign whose answer was lost. */
+  issue: (id: string) => Promise<{ owner?: string | null }>;
 };
 
 /** Create the ticket, then assign it to the agent unless the card already did.
@@ -83,7 +85,7 @@ export type TicketProposalClient = {
 export type CreateAndAssignOutcome =
   | { ticket: string; state: "assigned" }
   /** The ticket exists but this card did not (or cannot) assign it. */
-  | { ticket: string; state: "replayed" | "owned" | "failed"; error?: string };
+  | { ticket: string; state: "replayed" | "owned" | "unconfirmed"; error?: string };
 
 export async function createAndAssign(
   client: TicketProposalClient,
@@ -99,16 +101,20 @@ export async function createAndAssign(
   const owner = created.card?.owner ?? created.issue.owner ?? null;
   if (created.replayed === true) return { ticket, state: "replayed" };
   if (owner !== null) return { ticket, state: "owned" };
+  const agentOwner = `agents/${proposal.agent.id}`;
   try {
-    await client.patch(ticket, { owner: `agents/${proposal.agent.id}` }, created.card?.rev);
+    await client.patch(ticket, { owner: agentOwner }, created.card?.rev);
     return { ticket, state: "assigned" };
   } catch (error) {
-    // The ticket is committed and company-visible; say so rather than showing
-    // only the board's refusal and leaving it unmentioned.
-    return {
-      ticket,
-      state: "failed",
-      error: error instanceof Error ? error.message : String(error),
-    };
+    // A rejected call can mean the PATCH committed and its answer was lost, so
+    // the ticket is the only witness: read it before claiming what happened.
+    const message = error instanceof Error ? error.message : String(error);
+    try {
+      const current = await client.issue(ticket);
+      if (current.owner === agentOwner) return { ticket, state: "assigned" };
+    } catch {
+      // Unreadable is unconfirmed, never "not assigned".
+    }
+    return { ticket, state: "unconfirmed", error: message };
   }
 }

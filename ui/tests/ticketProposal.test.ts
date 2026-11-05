@@ -71,6 +71,7 @@ const client = {
     patches.push({ id, owner: patch.owner, ifRev });
     return {};
   },
+  issue: async () => ({ owner: null }),
 };
 
 async function main(): Promise<void> {
@@ -89,21 +90,34 @@ async function main(): Promise<void> {
     patch: async () => {
       throw new Error("an owned ticket must not be patched");
     },
+    issue: async () => ({ owner: "user_owner" }),
   };
   const ownedOutcome = await createAndAssign(owned, parsed!);
   check(ownedOutcome.ticket === "DEMO-2" && ownedOutcome.state === "owned", "an owned ticket is reported");
 
   // The create committed and the assign was refused: the card still names the
-  // ticket instead of hiding it behind the board's error.
+  // ticket and does not claim the agent was not assigned.
   const refused = {
     create: async () => ({ issue: { id: "DEMO-3" }, card: { rev: "r1" } }),
     patch: async () => {
       throw new Error("The owner names an agent profile that does not exist or is archived.");
     },
+    issue: async () => ({ owner: null }),
   };
   const failed = await createAndAssign(refused, parsed!);
-  check(failed.ticket === "DEMO-3" && failed.state === "failed", "a refused assign reports the created ticket");
-  check(failed.state === "failed" && /archived/.test(failed.error ?? ""), "the board's message is kept");
+  check(failed.ticket === "DEMO-3" && failed.state === "unconfirmed", "an unanswered assign reports the created ticket as unconfirmed");
+  check(failed.state === "unconfirmed" && /archived/.test(failed.error ?? ""), "the board's message is kept");
+
+  // The PATCH committed but its answer was lost: the ticket says so.
+  const landed = {
+    create: async () => ({ issue: { id: "DEMO-4" }, card: { rev: "r1" } }),
+    patch: async () => {
+      throw new Error("network reset");
+    },
+    issue: async () => ({ owner: "agents/ap_1" }),
+  };
+  const settled = await createAndAssign(landed, parsed!);
+  check(settled.state === "assigned", "a lost answer is settled by reading the ticket");
 }
 
 void main();

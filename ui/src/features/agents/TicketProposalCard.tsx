@@ -37,7 +37,7 @@ export default function TicketProposalCard({
   const run = () => {
     setBusy(true);
     setError(null);
-    createAndAssign(api, proposal)
+    createAndAssign({ ...api, issue: (id: string) => api.issue(id) }, proposal)
       .then((outcome) => {
         setCreated(outcome);
         void resources.issues.invalidate();
@@ -76,7 +76,7 @@ export default function TicketProposalCard({
         </dl>
         {created ? (
           <div className="mt-3" role="status">
-            <p className={`text-label ${created.state === "failed" ? "text-warn" : "text-ok"}`}>
+            <p className={`text-label ${created.state === "unconfirmed" ? "text-warn" : "text-ok"}`}>
               {created.state === "assigned" &&
                 t("Created {id} and assigned it.").replace("{id}", () => created.ticket)}
               {created.state === "replayed" &&
@@ -89,11 +89,10 @@ export default function TicketProposalCard({
                   "{id}",
                   () => created.ticket,
                 )}
-              {created.state === "failed" &&
-                t("Ticket {id} was created, but the agent was not assigned: {error}").replace(
-                  "{id}",
-                  () => created.ticket,
-                ).replace("{error}", () => created.error ?? t("the board refused the change"))}
+              {created.state === "unconfirmed" &&
+                t("Ticket {id} was created. Whether the agent was assigned is not confirmed: {error}")
+                  .replace("{id}", () => created.ticket)
+                  .replace("{error}", () => created.error ?? t("no answer from the board"))}
             </p>
             {onOpenIssue && (
               <Button variant="ghost" size="sm" onClick={() => onOpenIssue(created.ticket)}>
