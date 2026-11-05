@@ -140,7 +140,9 @@ the code you just wrote.
   `review-standards.yml` and `review-spec.yml`. The operator's working rule is
   that gate, security, schema and release PRs keep fresh-session Opus reviews and
   the workflow rows are a cheap first pass; on other PRs two workflow rows
-  satisfy the requirement. On hosted today `routine` and `ui/**` PRs still need
+  satisfy the requirement. A hosted `routine` PR has no readiness record, so it
+  takes those two workflow rows and the operator approval they carry (CAD-2135).
+  On hosted today `ui/**` PRs still need
   the temporary exception (`--exception --advisory standards=<url> --advisory
   spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
   at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31); the Browser

@@ -924,6 +924,7 @@ mod cad2081_workflow_verdicts {
                 "repo": REPO, "pr": 7, "title": "CAD-1: add the thing", "head": head,
                 "base": case.base_ref, "base_oid": self.base, "tip": self.tip, "author": "authorlogin",
                 "files_by_ref": by_ref, "verdicts": case.rows, "class": case.class, "approved": case.approved,
+            "no_readiness": case.no_readiness,
                 "tip_fails": case.tip_fails, "tip_sha": case.tip_sha,
                 "identities": if case.no_identity_map { Value::Null } else {
                     case.identities.clone().unwrap_or_else(Self::identities) },
@@ -977,6 +978,7 @@ mod cad2081_workflow_verdicts {
         tip_fails: bool,
         tip_sha: Option<String>,
         no_identity_map: bool,
+        no_readiness: bool,
     }
 
     fn scenario(rows: Vec<Value>) -> Scenario {
@@ -994,6 +996,7 @@ mod cad2081_workflow_verdicts {
             tip_fails: false,
             tip_sha: None,
             no_identity_map: false,
+            no_readiness: false,
         }
     }
 
@@ -1967,6 +1970,97 @@ mod cad2081_workflow_verdicts {
         let (code, stdout, stderr) = f.gate(&case);
         assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
         assert!(stdout.contains("approval in force"), "{stdout}");
+    }
+
+    #[test]
+    fn a_hosted_routine_pr_with_no_readiness_takes_both_workflow_reviews() {
+        // CAD-2135: a hosted board has no readiness record. The two workflow reviews
+        // stand in for it, with the approval a workflow row already carries.
+        let f = Fixture::new();
+        let head = f.touch("docs/x.md");
+        let routine = |rows: Vec<Value>| {
+            let mut case = scenario(rows);
+            case.class = "routine";
+            case.no_readiness = true;
+            case.head = Some(head.clone());
+            case
+        };
+        let (code, stdout, stderr) = f.gate(&routine(vec![f.std(), f.spec()]));
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("class: human"), "{stdout}");
+
+        // Without the approval the workflow rows carry, it refuses.
+        let mut unapproved = routine(vec![f.std(), f.spec()]);
+        unapproved.approved = false;
+        let (code, stdout, stderr) = f.gate(&unapproved);
+        assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+
+        // No reviews: the refusal names both dispatches, exactly.
+        refused_all(
+            &f,
+            routine(vec![]),
+            &[
+                "has no readiness record",
+                "gh workflow run review-standards.yml",
+                "gh workflow run review-spec.yml",
+                "-f head_sha=",
+            ],
+        );
+        // One review: it names only the other.
+        let (code, stdout, stderr) = f.gate(&routine(vec![f.std()]));
+        assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stderr.contains("gh workflow run review-spec.yml"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("gh workflow run review-standards.yml"),
+            "{stderr}"
+        );
+
+        // A workflow review that is not a pass refuses.
+        let mut revise = f.std();
+        revise["outcome"] = json!("revise");
+        revise["section_outcome"] = json!("revise");
+        refused(
+            &f,
+            routine(vec![revise, f.spec()]),
+            "a workflow review that is not a pass always refuses",
+        );
+
+        // Owner rows do not stand in for the workflow reviews.
+        let owner = |name: &str, stamp: &str, id: &str, login: &str, kind: &str| {
+            f.owner(name, stamp, id, login, kind)
+        };
+        refused(
+            &f,
+            routine(vec![
+                owner(
+                    "20261103-000100-a.md",
+                    "20261103-000100",
+                    "usr_alice",
+                    "alice",
+                    "standards",
+                ),
+                owner(
+                    "20261103-000200-b.md",
+                    "20261103-000200",
+                    "usr_bob",
+                    "bob",
+                    "spec-security",
+                ),
+            ]),
+            "has no readiness record",
+        );
+
+        // One principal cannot be both reviews.
+        let both = f.wrow(
+            "20261103-000300-x.md",
+            "20261103-000300",
+            "svc_std",
+            "spec-security",
+        );
+        refused(&f, routine(vec![f.std(), both]), "may file only standards");
     }
 
     #[test]

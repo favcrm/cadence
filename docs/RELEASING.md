@@ -667,6 +667,10 @@ proof** bound to that exact head and PR:
 active routine delivery has no fresh native readiness proof for this exact binding
 ```
 
+A hosted org has no delivery record, so this section is for local orgs. A hosted
+routine PR takes a pass from both review workflows at its head, plus the operator
+approval a workflow row needs, and the refusal names what to dispatch (CAD-2135).
+
 That proof is a delivery record whose `outcome_report` names one `done` task
 report on the ticket, and the report must bind the same attempt: `agent` equals
 the record's worker, `sha` is the full PR head, `pr` is the PR URL, it was filed

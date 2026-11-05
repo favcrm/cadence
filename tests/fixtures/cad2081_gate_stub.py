@@ -103,7 +103,7 @@ def cadence():
                    "operator_approval": False, "browser_qa": False, "full_checks": True}
         req.update({"policy_digest": digest, "reasons": []})
         readiness = None
-        if kind == "routine":
+        if kind == "routine" and not S.get("no_readiness"):
             readiness = {"repo": S["repo"].lower(), "pr": S["pr"], "head": S["head"],
                          "base": S["base_oid"], "base_ref": S["base"], "policy_digest": digest,
                          "ci_run_id": 101, "ci_run_url": RUN_URL,

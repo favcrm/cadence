@@ -64,9 +64,10 @@ principal and the author's is refused, local notes count by their self-declared
 `From:` alias (not attested), so it cannot tell a fresh session from the author
 under one login. CAD-2081 adds workflow-issued rows (see AGENTS.md "Review"); their
 workflows (CAD-2088) are live, a cheap first pass beside fresh-session reviews on
-gate, security, schema and release PRs, and two of them satisfy other PRs. On
-hosted today `routine` and `ui/**` PRs still need the temporary exception below,
-which runs to 2026-12-31.
+gate, security, schema and release PRs, and two of them satisfy other PRs. A
+hosted board has no readiness record, so a hosted `routine` PR takes those two
+workflow reviews and the operator approval they carry (CAD-2135). On hosted today
+`ui/**` PRs still need the temporary exception below, which runs to 2026-12-31.
 
 CAD-1946 temporary exception: `--exception --advisory standards=<url> --advisory
 spec-security=<url>` (and `browser-qa=<url>` for a `ui/` change) waives only the
@@ -99,6 +100,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1167,6 +1169,36 @@ def exception_routine(klass, active, origin, readiness, ci_url):
     return [], False
 
 
+def two_workflow_reviews(counted, hosted):
+    """Standards plus Spec/security, counted, from distinct workflow principals."""
+    std = {reviewer_key(n, hosted) for n in counted
+           if is_workflow_row(n) and n["kind"] == "standards"}
+    spec = {reviewer_key(n, hosted) for n in counted
+            if is_workflow_row(n) and n["kind"] == "spec-security"}
+    return any(a != b for a in std for b in spec)
+
+
+REVIEW_WORKFLOWS = (("standards", "review-standards.yml"), ("spec-security", "review-spec.yml"))
+
+
+def hosted_routine_reasons(counted, hosted, repo, pr, head):
+    """Why a hosted routine PR's reviews do not yet stand in for readiness (CAD-2135).
+
+    A hosted board has no delivery record, so it cannot prove what native readiness
+    proves. The two workflow reviews are the evidence this gate already trusts on
+    other classes; an owner row does not stand in for them. The refusal names what to
+    dispatch for each review still missing."""
+    if two_workflow_reviews(counted, hosted):
+        return []
+    have = {n["kind"] for n in counted if is_workflow_row(n)}
+    commands = [f"gh workflow run {name} -R {shlex.quote(repo)} --ref main "
+                f"-f pr={shlex.quote(str(pr))} -f head_sha={shlex.quote(head)}"
+                for kind, name in REVIEW_WORKFLOWS if kind not in have]
+    return ["active routine delivery on a hosted org has no readiness record and needs "
+            "a pass from both review workflows at this head"
+            + (": " + "; ".join(commands) if commands else "")]
+
+
 ADVISORY_KINDS = ("standards", "spec-security", "browser-qa")
 
 
@@ -1757,7 +1789,11 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             rs, counted = check_reviews(verdicts, effective_one, need_qa, authors, issue, hosted)
             reasons += rs
         elif klass == "routine":
-            if authority["readiness"] is None:
+            if authority["readiness"] is None and origin == "hosted":
+                rs, counted = check_reviews(verdicts, False, need_qa, authors, issue, hosted)
+                reasons += rs
+                reasons += hosted_routine_reasons(counted, hosted, repo, pr, head)
+            elif authority["readiness"] is None:
                 reasons.append("active routine delivery has no fresh native readiness proof for this exact binding")
             else:
                 ready = authority["readiness"]
@@ -1776,12 +1812,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             combined = [n for n in counted if n.get("kind") == "combined"]
             # Two counted workflow reviews, Standards plus Spec/security from distinct
             # principals, are stricter than one combined review and satisfy it.
-            std = {reviewer_key(n, hosted) for n in counted
-                   if is_workflow_row(n) and n["kind"] == "standards"}
-            spec = {reviewer_key(n, hosted) for n in counted
-                    if is_workflow_row(n) and n["kind"] == "spec-security"}
-            two_workflow = any(a != b for a in std for b in spec)
-            if len({reviewer_key(n, hosted) for n in combined}) != 1 and not two_workflow:
+            if (len({reviewer_key(n, hosted) for n in combined}) != 1
+                    and not two_workflow_reviews(counted, hosted)):
                 reasons.append(f"active {klass} delivery requires exactly one independent combined review")
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
 
