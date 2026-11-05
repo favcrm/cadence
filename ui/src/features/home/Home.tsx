@@ -1353,6 +1353,14 @@ function MasterHome({
         ]);
         return arg ? false : undefined;
       }
+      // `/new hire starts Monday` is a sentence, not a request to start over.
+      if (arg && known.arg === undefined) {
+        setCmds((c) => [
+          ...c,
+          { id, name, unavailable: true, text: t("This command takes nothing after its name, so it did not run.") },
+        ]);
+        return false;
+      }
       setCmds((c) => [...c, { id, name, arg: arg || undefined, running: true }]);
       api
         .masterCommand(name, arg || undefined)

@@ -422,7 +422,8 @@ export function BrowserCard() {
   const canvas = useCanvas();
   if (b.availability !== "available") return null;
   const phase = b.session?.state ?? "none";
-  if (phase === "none") return null;
+  // An ended session has nothing to open, and the card sits under the live turn.
+  if (phase === "none" || phase === "ended") return null;
   const shown = ((canvas.open && canvas.tabs.length > 0) || b.open) && b.focused && tabVisible(b);
   // Only the real host, never the raw address (a look-alike can hide behind
   // userinfo), on a line of its own and never preceded by words that could push

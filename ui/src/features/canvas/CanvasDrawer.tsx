@@ -90,6 +90,9 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
   // A put still waiting for its result wins, so a second put of the same
   // artifact in one turn shows its own chip.
   const putThisTurn = !!working && tab.turn !== null && tab.turn === working.turn;
+  // Only a put waiting on this artifact touches it: any other running turn
+  // leaves this document finished, downloadable and open to a change request.
+  const changing = !!working && working.updating.includes(tab.id);
   const updating = !working
     ? null
     : working.updating.includes(tab.id)
@@ -135,7 +138,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
         <span className="cv-title">
           <b>{tab.title}</b>
           <span>
-            <span className={`artbadge ${working ? "" : "ok"}`} role="status">{working ? t("drafting") : t("ready")}</span>
+            <span className={`artbadge ${changing ? "" : "ok"}`} role="status">{changing ? t("drafting") : t("ready")}</span>
             {updating ? <span className="artbadge">{updating}</span> : null}
             {tab.kind} · v{tab.selected}
           </span>
@@ -187,10 +190,10 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
           </span>
           {!sheet && !image ? (
             <>
-              <button type="button" className="btn btn-ghost" disabled={!composerKey || !!working} onClick={askToChange}>
+              <button type="button" className="btn btn-ghost" disabled={!composerKey || changing} onClick={askToChange}>
                 {t("Ask to change")}
               </button>
-              <button type="button" className="btn" disabled={!!working} onClick={download}>
+              <button type="button" className="btn" disabled={changing} onClick={download}>
                 {t("Download")}
               </button>
             </>
@@ -199,15 +202,15 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpa
         ) : null}
         {sheet && !image ? (
           <span className="cv-tools">
-            <button type="button" className="btn btn-ghost" disabled={!composerKey || !!working} onClick={askToChange}>
+            <button type="button" className="btn btn-ghost" disabled={!composerKey || changing} onClick={askToChange}>
               {t("Ask to change")}
             </button>
-            <button type="button" className="btn" disabled={!!working} onClick={download}>
+            <button type="button" className="btn" disabled={changing} onClick={download}>
               {t("Download")}
             </button>
           </span>
         ) : null}
-        {working ? (
+        {changing ? (
           <div className="cv-bar" aria-hidden data-canvas-working>
             <i className="cv-bar-run" />
           </div>

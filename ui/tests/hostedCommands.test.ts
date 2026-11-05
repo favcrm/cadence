@@ -139,6 +139,15 @@ async function main() {
     assert(box()?.value === words, `words after a verb that did not run stay in the box: ${words}`);
   }
 
+  // A bare refused verb is replaced by the next keystroke, so `/nosuch` then
+  // `/new` is not sent as `/nosuch/new`. Words are not selected away.
+  await type("/nosuch");
+  await enter();
+  assert(box()?.value === "/nosuch" && box()?.selectionStart === 0 && box()?.selectionEnd === 7, "a bare refused verb is selected");
+  await type(prose);
+  await enter();
+  assert(box()?.value === prose && box()?.selectionStart === box()?.selectionEnd, "a refused line with words is not selected");
+
   await type("/help");
   await enter();
   assert(!host.querySelector('[data-cmd="compact"]'), "the next send clears a command's answer");
@@ -158,6 +167,14 @@ async function main() {
   await type("/new");
   await enter();
   assert(requests.includes("POST /api/master/command"), "an advertised command is sent");
+  // A verb that takes nothing, followed by words, is a sentence and does not run.
+  requests.length = 0;
+  const sentence = "/new hire starts Monday";
+  await type(sentence);
+  await enter();
+  assert(!requests.some((r) => r.startsWith("POST")), `words after a no-argument verb send nothing (got ${requests.join(", ")})`);
+  assert(box()?.value === sentence, "and stay in the box");
+  assert(host.querySelector('[data-cmd="new"]')?.textContent?.includes("takes nothing after its name"), "and the card says why");
 
   // Stopping withdraws what was queued, and the board hands it back.
   await React.act(async () => { root.render(null); });
