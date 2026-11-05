@@ -239,8 +239,7 @@ pub(super) fn run(
                 .clone()
                 .map(Ok)
                 .unwrap_or_else(cadence_agent::client::state_dir)?;
-            value["inbox"] =
-                cadence_agent::local_assignment::events::observe(&state, &target.org_id, false)?;
+            value["inbox"] = assignment_inbox(&state, &target.org_id)?;
             value
         }
         LocalAgentAction::Inbox { clear } => {
@@ -372,6 +371,17 @@ pub(super) fn start(
     finish(&value)
 }
 
+/// An absent local state cannot hide a successful remote assignment read.
+fn assignment_inbox(state: &Path, org: &str) -> Result<Value> {
+    match std::fs::symlink_metadata(state) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(json!({"available": false, "reason": "local_state_not_initialized"}))
+        }
+        Err(error) => Err(error.into()),
+        Ok(_) => cadence_agent::local_assignment::events::observe(state, org, false),
+    }
+}
+
 fn ensure_report_driver(state: &Path) {
     if cadence_agent::client::rpc_timeout(
         state,
@@ -396,6 +406,37 @@ fn finish(value: &Value) -> Result<i32> {
         return Ok(5);
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod assignment_status_tests {
+    use super::*;
+
+    #[test]
+    fn uninitialized_inbox_is_unavailable_without_blocking_assignment_status() {
+        let root = tempfile::tempdir().expect("scratch");
+        let state = root.path().join("state");
+        let unavailable = assignment_inbox(&state, "ws_synthetic").expect("missing inbox");
+        assert_eq!(unavailable["available"], false);
+        assert!(!state.exists(), "a read must not initialize local state");
+
+        fs::create_dir(&state).expect("initialize state");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("private state");
+        }
+        let empty = assignment_inbox(&state, "ws_synthetic").expect("readable empty inbox");
+        assert_eq!(empty["cursor"], 0);
+        assert_eq!(empty["entries"], json!([]));
+
+        #[cfg(unix)]
+        {
+            let link = root.path().join("dangling");
+            std::os::unix::fs::symlink(root.path().join("missing"), &link).expect("link");
+            assert!(assignment_inbox(&link, "ws_synthetic").is_err());
+        }
+    }
 }
 
 #[cfg(test)]

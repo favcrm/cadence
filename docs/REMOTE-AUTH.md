@@ -307,8 +307,10 @@ The gateway's real refusal shapes (AOS-243):
   was confirmed and identifies the local failure. Inspect
   `cadence --org <workspace-slug> agent assignments` in the original workspace
   and retain the assignment, claim, generation and operation identifiers before
-  deciding whether to retry. Unsupported work kinds are never started locally;
-  a confirmed receipt is recorded before that local refusal.
+  deciding whether to retry. If this machine has no initialized local state,
+  assignments still come from the board and the local inbox is marked
+  unavailable; no inbox history is invented. Unsupported work kinds are never
+  started locally; a confirmed receipt is recorded before that local refusal.
 - Hosted app release mutations retain the caller's operation UUID. On an
   unproved response, inspect `app catalog operation` or `reconcile` for that
   UUID in the same workspace; do not create a new operation blindly.

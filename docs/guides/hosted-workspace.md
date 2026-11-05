@@ -471,6 +471,10 @@ checkout (see below). Existing kickoff/member, claim and generation fences
 remain. A claim/queued receipt is not proof that execution or a result
 happened; inspect assignment/report state.
 
+`agent assignments` can read the board without a local daemon or initialized
+local state. When the local state is absent, its inbox is marked unavailable;
+the assignment response does not claim that inbox is empty.
+
 An existing terminal or coding session can work on the named issue instead.
 Check the owning repository's worktree and integration-branch rules first;
 if the supported placement cannot meet them, report the conflict before
