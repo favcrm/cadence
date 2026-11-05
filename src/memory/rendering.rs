@@ -158,14 +158,19 @@ fn applicability_line(m: &Memory) -> String {
 
 /// The normalized wiki path when it may be shown to a dispatch recipient.
 ///
-/// Three things must hold, in this order: `wiki::normalize` accepts the
-/// stored source (it refuses absolute paths, traversal, dotfiles, `.blob`
-/// pointers and control bytes); the path is `global/…` or the lesson's own
+/// Two things must hold, in this order: `wiki::normalize` accepts the stored
+/// source (it refuses absolute paths, traversal, dotfiles, `.blob` pointers
+/// and control bytes); and the path is `global/…` or the lesson's own
 /// `projects/<project>/…` namespace — agent view areas and another project's
-/// pages stay out even though the coarse table would allow reading them; and
-/// `wiki::allowed` grants `Op::Read` to `Caller::Public`, the weakest reader
-/// in that table, which proves every recipient may read the path. Nothing is
-/// read from the wiki here.
+/// pages stay out.
+///
+/// There used to be a third: `wiki::allowed` granting `Op::Read` to
+/// `Caller::Public` "as the weakest reader". CAD-2187 made the answer depend
+/// on who is asking rather than on the path, so that question no longer has a
+/// caller-independent answer: a project page is readable by the people its
+/// policy admits, and this function proves the path is inside the lesson's own
+/// project, which is the part it can prove. Nothing is read from the wiki
+/// here.
 fn readable_wiki_path(source: &str, project: &str) -> Option<String> {
     let path = crate::wiki::normalize(source).ok()?;
     let segments: Vec<&str> = path.split('/').collect();
@@ -174,16 +179,7 @@ fn readable_wiki_path(source: &str, project: &str) -> Option<String> {
         ["projects", key, _, ..] => *key == project,
         _ => false,
     };
-    if !in_scope {
-        return None;
-    }
-    crate::wiki::allowed(
-        &crate::wiki::Caller::Public,
-        crate::wiki::Op::Read,
-        &segments,
-    )
-    .ok()?;
-    Some(path)
+    in_scope.then_some(path)
 }
 
 /// The record's structured citations for the dispatch line — its policy refs

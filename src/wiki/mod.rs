@@ -86,6 +86,67 @@ const VIEW_CAP: u64 = 1_048_576;
 /// an unbounded `read` still returns the whole page.
 pub const NATIVE_TOOL_LINE_BOUND: usize = 50_000;
 
+/// CAD-2187: the project a wiki path names, when it names one.
+///
+/// `projects/<key>/…` and the bare `projects/<key>` — which is a page, and a
+/// directory, in its own right — are project-scoped. `global/` names no
+/// project and must never be filtered by one.
+fn project_of_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("projects/")?;
+    let (key, _) = rest.split_once('/').unwrap_or((rest, ""));
+    (!key.is_empty()).then_some(key)
+}
+
+/// This caller's spelling in a project policy — the one the board writes.
+pub(super) fn policy_spelling(caller: &Caller) -> String {
+    match caller {
+        Caller::Operator => "operator".to_string(),
+        Caller::Agent { alias, .. } => format!("agents/{alias}"),
+        Caller::User(handle) => format!("users/{handle}"),
+        // The policy knows `operator`, `users/`, `agents/` and `service/`.
+        // A public caller is none of those, but a project with no policy or a
+        // workspace-visible one admits everyone — `service/public` carries that
+        // meaning, where the unknown spelling `public` would deny every project.
+        Caller::Public => "service/public".to_string(),
+    }
+}
+
+/// CAD-2187: a project's pages answer only to callers its policy admits.
+///
+/// This lives in the store rather than in a route because every read
+/// arrives here — file, listing, history, transfer export, the board's
+/// envelope relay, the CLI — so a new surface cannot forget it, which is the
+/// way a per-route check fails. The refusal is worded exactly as a missing
+/// page, so it cannot be used to ask whether a project exists; an unreadable
+/// tracker yields an empty set and therefore refuses every project page,
+/// while `global` is untouched.
+fn admitted(pm: &Pm, caller: &Caller, path: &str) -> bool {
+    let Some(project) = project_of_path(path) else {
+        return true;
+    };
+    crate::project_policy::readable(pm, &policy_spelling(caller)).contains(project)
+}
+
+/// The refusal a page read gives, worded as the store's own missing-file one.
+fn no_such_page(path: &str) -> Error {
+    Error::rejected(format!("wiki read '{path}': no such file"))
+}
+
+/// The refusal a listing gives, worded as the store's own missing-directory one.
+fn no_such_directory(path: &str) -> Error {
+    Error::rejected(format!("wiki ls '{path}': no such directory"))
+}
+
+/// The export path's name for [`admitted`]: `transfer` is a child module, so
+/// it reaches the store's project gate through this instead of re-deriving it.
+pub(crate) fn admitted_for_export(pm: &Pm, caller: &Caller, path: &str) -> Result<()> {
+    if admitted(pm, caller, path) {
+        Ok(())
+    } else {
+        Err(no_such_page(path))
+    }
+}
+
 /// Who the daemon derived from the connection — never a request
 /// field. `wiki_as` on an operator connection produces the same
 /// variants for the board's relayed callers.
@@ -147,7 +208,27 @@ impl Op {
 /// policy is a change to the table.
 ///
 /// `segs` are normalized segments (empty = the root, for `ls`).
-pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
+pub fn allowed(pm: &Pm, caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
+    // CAD-2187: a project the caller's policy does not admit is not a place
+    // they can see or change. This check sits in `allowed` — the one function
+    // every operation already calls, read and write alike — because a check
+    // per route is a list that the next route forgets, and the reviews found
+    // five such doors before the gate moved here.
+    if segs.first() == Some(&"projects") {
+        if let Some(key) = segs.get(1) {
+            if !admitted(pm, caller, &format!("projects/{key}")) {
+                return Err(no_such_page(&format!("projects/{key}")));
+            }
+        }
+    }
+    allowed_by_table(caller, op, segs)
+}
+
+/// The coarse ACL alone — what every caller was checked against before the
+/// project policy existed. Kept separate because a caller that is not reading
+/// or writing as itself (the trash scan asking whether the operator *could*
+/// write an origin) has no `Pm`-bearing request to consult.
+pub(crate) fn allowed_by_table(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
     let verb = || format!("wiki {} '/{}' refused", op.as_str(), segs.join("/"));
     let no = |why: &str| -> Result<()> { Err(Error::rejected(format!("{}: {why}", verb()))) };
     // CAD-615: the operator's permission rules. Not a knowledge page,
@@ -661,12 +742,17 @@ fn blob_meta(pointer: &Path) -> Result<Value> {
 /// logical name.
 pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     let norm = normalize_dir(path)?;
+    // Normalized first, and the check reads the same spelling: a project
+    // recorded in NFC must not be refused because the caller typed NFD.
+    if !admitted(pm, caller, &norm) {
+        return Err(no_such_directory(&norm));
+    }
     let segs: Vec<&str> = if norm.is_empty() {
         Vec::new()
     } else {
         norm.split('/').collect()
     };
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     let vault = vault_dir(pm)?;
 
     // The root: the fixed top-level folders.
@@ -846,10 +932,15 @@ pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     let abs = resolve(&vault, &norm)?;
     match abs.symlink_metadata() {
         Ok(m) if m.is_dir() => {
-            let entries = read_dir_entries(&abs, &norm)?
-                .iter()
-                .map(Entry::json)
-                .collect::<Vec<_>>();
+            let mut entries = read_dir_entries(&abs, &norm)?;
+            // `projects/` names no single project, so the gate above admits it
+            // — but listing it would name every project, including the ones
+            // this caller cannot read. A child they cannot read is dropped, not
+            // marked: a listing must not enumerate what a page cannot show.
+            if norm == "projects" {
+                entries.retain(|entry| admitted(pm, caller, &entry.path));
+            }
+            let entries = entries.iter().map(Entry::json).collect::<Vec<_>>();
             Ok(json!({"path": norm, "entries": entries}))
         }
         Ok(m) if m.is_file() => Err(Error::rejected(format!(
@@ -994,6 +1085,9 @@ pub fn read_revision(
     at: &str,
     range: Option<BodyRange<'_>>,
 ) -> Result<Value> {
+    if !admitted(pm, caller, path) {
+        return Err(no_such_page(path));
+    }
     let pinned = revision::pin(pm, caller, path, at)?;
     let mut value = match (&pinned.body, range) {
         (revision::Body::Dir, Some(_)) => {
@@ -1103,6 +1197,9 @@ pub fn read_revision_for_evidence(
     at: &str,
     max_bytes: usize,
 ) -> Result<Option<Value>> {
+    if !admitted(pm, caller, path) {
+        return Ok(None);
+    }
     let Some(found) = revision::evidence_text(pm, caller, path, at, max_bytes)? else {
         return Ok(None);
     };
@@ -1451,6 +1548,9 @@ pub fn json_u64(params: &Value, key: &str) -> Result<Option<u64>> {
 }
 
 fn open_page(pm: &Pm, caller: &Caller, path: &str) -> Result<Opened> {
+    if !admitted(pm, caller, path) {
+        return Err(no_such_page(path));
+    }
     let norm = normalize(path)?;
     if norm.is_empty() {
         return Err(Error::rejected(
@@ -1458,7 +1558,7 @@ fn open_page(pm: &Pm, caller: &Caller, path: &str) -> Result<Opened> {
         ));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     let vault = vault_dir(pm)?;
 
     match classify(&segs) {
@@ -1690,7 +1790,7 @@ pub fn write(
         ));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Write, &segs)?;
+    allowed(pm, caller, Op::Write, &segs)?;
     if let View::Real = classify(&segs) {
     } else {
         unreachable!("allowed() refused the views before here")
@@ -1777,7 +1877,7 @@ pub fn mkdir(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
         return Err(Error::rejected("wiki mkdir '' refused: the root exists"));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Write, &segs)?;
+    allowed(pm, caller, Op::Write, &segs)?;
     if classify(&segs) != View::Real {
         unreachable!()
     }
@@ -1858,6 +1958,12 @@ fn valid_landing_key(key: &str) -> bool {
 /// the write ACL; the destination must not exist. A `from` under
 /// `.trash/` restores — operator only (trash is operator-managed).
 pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
+    // The source is read as it moves, and the destination may be a place the
+    // project gate does not cover (`global/`). Gating the source is what stops
+    // a move from laundering a private page out of its project.
+    if !admitted(pm, caller, from) {
+        return Err(no_such_page(from));
+    }
     let norm_to = normalize(to)?;
     if norm_to.is_empty() {
         return Err(Error::rejected("wiki mv refused: destination is the root"));
@@ -1925,14 +2031,14 @@ pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
                 return Err(Error::rejected("wiki mv refused: source is the root"));
             }
             let segs_from: Vec<&str> = norm_from.split('/').collect();
-            allowed(caller, Op::Remove, &segs_from)?;
+            allowed(pm, caller, Op::Remove, &segs_from)?;
             if classify(&segs_from) != View::Real {
                 unreachable!()
             }
             (resolve(&vault, &norm_from)?, norm_from, false)
         }
     };
-    allowed(caller, Op::Write, &segs_to)?;
+    allowed(pm, caller, Op::Write, &segs_to)?;
     if classify(&segs_to) != View::Real {
         unreachable!()
     }
@@ -2087,7 +2193,7 @@ pub fn rm(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
         return Err(Error::rejected("wiki rm '' refused: the root stays"));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Remove, &segs)?;
+    allowed(pm, caller, Op::Remove, &segs)?;
     if classify(&segs) != View::Real {
         unreachable!()
     }
@@ -2222,7 +2328,7 @@ pub fn put_blob(
         ));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Write, &segs)?;
+    allowed(pm, caller, Op::Write, &segs)?;
     if classify(&segs) != View::Real {
         unreachable!()
     }
@@ -2628,7 +2734,21 @@ mod test_pause {
 /// Search the derived index. The caller and path checks remain the wiki's
 /// existing allowlist; the index is only a candidate finder.
 pub fn search(pm: &Pm, state_dir: &Path, caller: &Caller, q: &str, base: &str) -> Result<Value> {
-    index::search(pm, state_dir, caller, q, base)
+    if !admitted(pm, caller, base) {
+        return Err(no_such_page(base));
+    }
+    let mut found = index::search(pm, state_dir, caller, q, base)?;
+    // A base inside the caller's tree is not enough: an index search can return
+    // a hit from anywhere, so every hit is asked the same question the page
+    // itself would be.
+    if let Some(hits) = found.get_mut("matches").and_then(|m| m.as_array_mut()) {
+        hits.retain(|hit| {
+            hit["path"]
+                .as_str()
+                .is_some_and(|path| admitted(pm, caller, path))
+        });
+    }
+    Ok(found)
 }
 
 /// `wiki history` — `git log` for a page, mapped to its tracker
@@ -2636,13 +2756,18 @@ pub fn search(pm: &Pm, state_dir: &Path, caller: &Caller, q: &str, base: &str) -
 /// views `agents/<a>/<file>`, memory views `<proj>/memory/<slug>.md`.
 pub fn history(pm: &Pm, caller: &Caller, path: &str, limit: usize) -> Result<Value> {
     let norm = normalize(path)?;
+    // A page that does not exist has an empty history, not an error, so a page
+    // the caller may not see answers exactly that.
+    if !admitted(pm, caller, path) {
+        return Ok(json!({"path": norm, "commits": []}));
+    }
     if norm.is_empty() {
         return Err(Error::rejected(
             "wiki history '' refused: the root has no file log",
         ));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     let vault = vault_dir(pm)?;
     let rels: Vec<PathBuf> = match classify(&segs) {
         View::Profile { alias } => {
@@ -2724,7 +2849,68 @@ pub fn history(pm: &Pm, caller: &Caller, path: &str, limit: usize) -> Result<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::issue::Pm;
     use serde_json::json;
+
+    /// CAD-2187, the acceptance check: a page under a project answers only to
+    /// a caller that project's policy admits, and says the same thing to
+    /// everyone else that it says about a page that does not exist.
+    #[test]
+    fn a_project_page_is_refused_unless_its_policy_admits_the_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pm_dir = dir.path().join("pm");
+        std::fs::create_dir_all(&pm_dir).unwrap();
+        std::fs::write(
+            pm_dir.join("pm.yaml"),
+            "schema: 1\nnotes_dir: /var/www/agent-notes\n",
+        )
+        .unwrap();
+        let project = pm_dir.join("secret");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("project.yaml"),
+            "key: secret\nprefix: SEC\npolicy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
+        )
+        .unwrap();
+        let pm = Pm::at(&pm_dir).unwrap();
+
+        let page = "projects/secret/notes.md";
+        // The grant and the owner read it.
+        assert!(admitted(&pm, &Caller::Operator, page));
+        assert!(admitted(&pm, &Caller::User("mia".to_string()), page));
+        // Everyone else is refused, in the words of a missing page — so the
+        // refusal cannot be read as "this project exists".
+        assert!(!admitted(&pm, &Caller::User("rob".to_string()), page));
+        assert!(no_such_page(page).to_string().contains("no such file"));
+        assert!(no_such_directory("projects/secret")
+            .to_string()
+            .contains("no such directory"));
+        // The shallowest spelling of the project is gated too — it is a page.
+        assert!(!admitted(
+            &pm,
+            &Caller::User("rob".to_string()),
+            "projects/secret"
+        ));
+        // `global` names no project, so no policy can empty it.
+        assert!(admitted(
+            &pm,
+            &Caller::User("rob".to_string()),
+            "global/x/y.md"
+        ));
+
+        // An empty tracker admits no project page, which is the fail-closed
+        // direction; `global` is still served.
+        let empty_dir = dir.path().join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        std::fs::write(
+            empty_dir.join("pm.yaml"),
+            "schema: 1\nnotes_dir: /var/www/agent-notes\n",
+        )
+        .unwrap();
+        let empty = Pm::at(&empty_dir).unwrap();
+        assert!(!admitted(&empty, &Caller::Operator, page));
+        assert!(admitted(&empty, &Caller::Operator, "global/x.md"));
+    }
 
     fn segs(path: &str) -> Vec<&str> {
         if path.is_empty() {
@@ -2862,7 +3048,7 @@ mod tests {
             (&public, Op::Read, "wiki/x", false),
         ];
         for (caller, op, path, want) in table {
-            let got = allowed(caller, *op, &segs(path));
+            let got = allowed_by_table(caller, *op, &segs(path));
             assert_eq!(
                 got.is_ok(),
                 *want,

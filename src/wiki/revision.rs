@@ -73,7 +73,7 @@ fn resolve_pin(pm: &Pm, caller: &Caller, path: &str, at: &str) -> Result<Pinned>
         return Err(unavailable("the wiki root has no historical file"));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     if !matches!(super::classify(&segs), super::View::Real) {
         return Err(unavailable(
             "profile and memory views have no content-addressed original",
@@ -179,7 +179,7 @@ pub(crate) fn evidence_text(
         return Err(unavailable("the wiki root has no historical file"));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     if !matches!(super::classify(&segs), super::View::Real) {
         return Err(unavailable(
             "profile and memory views have no content-addressed original",

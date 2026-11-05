@@ -40,8 +40,11 @@ struct Meta {
 }
 
 pub(crate) fn get(pm: &Pm, state_dir: &Path, caller: &Caller, path: &str) -> Result<Value> {
+    // A collection's metadata names its documents; the store's project gate
+    // decides before that metadata is assembled, not after.
+    super::admitted_for_export(pm, caller, path)?;
     let root = collection_root(path)?;
-    require_read(caller, &root)?;
+    require_read(pm, caller, &root)?;
     let (meta, rev) = load(pm, &root)?;
     state_value(pm, state_dir, caller, &root, &meta, rev)
 }
@@ -66,7 +69,7 @@ pub(crate) fn put(
             "wiki collection refused: server provenance is missing",
         ));
     }
-    require_read(caller, &root)?;
+    require_read(pm, caller, &root)?;
     let meta = parse_client(pm, caller, &root, metadata, provenance)?;
     let vault = vault_dir(pm)?;
     let abs = sidecar_path(&vault, &root)?;
@@ -127,7 +130,7 @@ pub(crate) fn put(
 
 pub(crate) fn root_and_project(pm: &Pm, caller: &Caller, path: &str) -> Result<Loaded> {
     let root = collection_root(path)?;
-    require_read(caller, &root)?;
+    require_read(pm, caller, &root)?;
     let (meta, _) = load(pm, &root)?;
     let sidecar_sha256 = meta_sha(pm, &root)?;
     Ok(Loaded {
@@ -178,9 +181,9 @@ pub(crate) fn under_root(root: &str, path: &str) -> bool {
     path == root || path.starts_with(&format!("{root}/"))
 }
 
-fn require_read(caller: &Caller, root: &str) -> Result<()> {
+fn require_read(pm: &Pm, caller: &Caller, root: &str) -> Result<()> {
     let segs: Vec<&str> = root.split('/').collect();
-    allowed(caller, Op::Read, &segs)
+    allowed(pm, caller, Op::Read, &segs)
 }
 
 fn parse_client(
@@ -274,7 +277,7 @@ fn parse_doc(pm: &Pm, caller: &Caller, root: &str, row: &Value, provenance: &str
         )));
     }
     let segs: Vec<&str> = path.split('/').collect();
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     let supersedes = match optional_label(obj.get("supersedes"), "supersedes")? {
         Some(other) => {
             let other = normalize(&other)?;
@@ -665,8 +668,9 @@ fn indexed(conn: Option<&rusqlite::Connection>, path: &str, rev: &str) -> bool {
     if rev.is_empty() {
         return false;
     }
+    let table = super::index::table_for(path);
     conn.query_row(
-        "SELECT rev FROM wiki_index_chunks WHERE path=?1 LIMIT 1",
+        &format!("SELECT rev FROM {table} WHERE path=?1 LIMIT 1"),
         [path],
         |row| row.get::<_, String>(0),
     )
