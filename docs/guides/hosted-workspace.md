@@ -655,8 +655,8 @@ can tell a fresh session from the author (the workflow-issued reviews of
 CAD-2081 are live as a cheap first pass beside fresh-session reviews on gate, security,
 schema and release PRs, and two of them satisfy other PRs; AGENTS.md "Review"), a hosted
 `ui/**` PR takes two workflow passes, the operator's approval and `--browser-qa <url>`,
-naming an unedited comment on the PR by a repository member, with the lines `Browser QA:
-pass` and `Head: <full sha>` standing alone at the margin (CAD-2173). That binds the claim to the head but cannot prove the QA ran, which is
+naming an unedited comment on the PR by a repository member that is exactly the two lines
+`Browser QA: pass` and `Head: <full sha>`, with the report in another comment (CAD-2173). That binds the claim to the head but cannot prove the QA ran, which is
 what the approval accepts. Until it ends, it can instead merge with the temporary
 `--exception --advisory ...` path (exact-head operator approval and two
 advisory links, standards and spec-security, plus browser-qa for a `ui/`

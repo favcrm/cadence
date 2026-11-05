@@ -1314,7 +1314,7 @@ mod cad2081_workflow_verdicts {
             "Browser QA: pass\nHead: 0000\n".into(),
         );
         assert_eq!(code, 1, "{stderr}");
-        assert!(stderr.contains("must have one line `Head:"), "{stderr}");
+        assert!(stderr.contains("must be exactly the two lines"), "{stderr}");
 
         let (code, _, stderr) = run(vec![f.std()], format!("Browser QA: pass\nHead: {head}\n"));
         assert_eq!(code, 1, "{stderr}");

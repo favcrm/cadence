@@ -68,8 +68,8 @@ gate, security, schema and release PRs, and two of them satisfy other PRs. A
 hosted board has no readiness record, so a hosted `routine` PR takes those two
 workflow reviews and the operator approval they carry (CAD-2135). A hosted `ui/**`
 PR takes those two workflow reviews, operator approval, and `--browser-qa <url>`
-naming a comment on this PR with the lines `Browser QA: pass` and `Head: <full sha>`
-(CAD-2173). This binds the claim to the head; it cannot prove the QA ran, and the
+naming a comment on this PR that is exactly the lines `Browser QA: pass` and
+`Head: <full sha>` (CAD-2173). This binds the claim to the head; it cannot prove the QA ran, and the
 operator's approval accepts that. The temporary exception below also still serves
 until it ends on 2026-12-31.
 
@@ -1231,57 +1231,16 @@ def browser_qa_comment_reasons(url, repo, pr, head):
         return [f"the --browser-qa comment {m.group(1)} was edited after posting: post a new one"]
     if comment.get("author_association") not in QA_AUTHOR_ASSOCIATIONS:
         return [f"the --browser-qa comment {m.group(1)} is not by a repository member"]
-    body = comment["body"].replace("\r\n", "\n")
-    if comment_hides_lines(body):
-        return [f"the --browser-qa comment {m.group(1)} holds text a person cannot see"]
-    results, heads = qa_comment_lines(body)
-    reasons = []
-    if results != ["Browser QA: pass"]:
-        reasons.append(f"the --browser-qa comment {m.group(1)} must have one line `Browser QA: pass`")
-    if heads != [f"Head: {head}"]:
-        reasons.append(f"the --browser-qa comment {m.group(1)} must have one line `Head: {head}`")
-    return reasons
+    # The whole body, not a search of it: what a person reads and what this reads cannot
+    # differ when nothing else is there to render. The report goes in its own comment.
+    if comment["body"].replace("\r\n", "\n").rstrip("\n") != f"Browser QA: pass\nHead: {head}":
+        return [f"the --browser-qa comment {m.group(1)} must be exactly the two lines "
+                f"`Browser QA: pass` and `Head: {head}`; put the report in another comment"]
+    return []
 
 
 # The repository is public, so anyone can comment. GitHub states this per comment.
 QA_AUTHOR_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
-# Non-ASCII letters read as `?` here, so a lookalike still counts as the label.
-QA_RESULT_LOOSE = re.compile(r"[b?][r?][o?][w?][s?][e?][r?]\W*[q?][a?]\W*:")
-QA_HEAD_LOOSE = re.compile(r"[h?][e?][a?][d?]\W*:")
-MARKDOWN_REFERENCE = re.compile(r" {0,3}\[[^\]]*\]:\s")
-
-
-def comment_hides_lines(body):
-    """`hides_text`, plus what makes one rendered line read as several: control
-    characters and Unicode line separators, and a Markdown reference, which renders
-    as nothing. Lines are split on newline alone, so none of these can make a line."""
-    return (hides_text(body)
-            or any(unicodedata.category(c) in ("Cc", "Zl", "Zp") and c not in "\n\t" for c in body)
-            or any(MARKDOWN_REFERENCE.match(line) for line in body.split("\n")))
-
-
-def qa_comment_lines(body):
-    """(result lines, head lines), counting every line that loosely reads as either
-    label, as `risk_line` does for a ticket: after Markdown markers, NFKC and casefold,
-    with lookalike letters, fenced code included. A line counts as written only if it
-    stands alone at the margin outside a code fence; any other reads as None, so a
-    disguised `fail` or a pass quoted in a fence cannot sit beside the real one."""
-    results, heads = [], []
-    fence = None
-    for raw in body.split("\n"):
-        line = raw.rstrip()
-        marker = re.match(r" {0,3}(`{3,}|~{3,})", line)
-        loose = re.sub(r"[*_`~]", "", line).lstrip(" \t>-+#").strip()
-        loose = re.sub(r"[^\x00-\x7f]", "?", unicodedata.normalize("NFKC", loose).casefold())
-        for pattern, found in ((QA_RESULT_LOOSE, results), (QA_HEAD_LOOSE, heads)):
-            if pattern.match(loose):
-                found.append(line if fence is None else None)
-        if marker:
-            if fence is None:
-                fence = marker.group(1)[0]
-            elif marker.group(1)[0] == fence:
-                fence = None
-    return results, heads
 
 
 ADVISORY_KINDS = ("standards", "spec-security", "browser-qa")

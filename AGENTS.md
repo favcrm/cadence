@@ -144,7 +144,7 @@ the code you just wrote.
   takes those two workflow rows and the operator approval they carry under the
   auto-paths rule below (CAD-2135).
   A hosted `ui/**` PR takes those two rows, operator approval and `--browser-qa
-  <url>`, naming an unedited comment on this PR by a repository member, with the lines `Browser QA: pass` and
+  <url>`, naming an unedited comment on this PR by a repository member that is exactly the lines `Browser QA: pass` and
   `Head: <full sha>` (CAD-2173). Until it ends, a `ui/**` PR can instead take
   the temporary exception (`--exception --advisory standards=<url> --advisory
   spec-security=<url>`, plus `browser-qa=<url>` for a `ui/` change), which ends
