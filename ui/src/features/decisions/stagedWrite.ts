@@ -87,8 +87,9 @@ export function valueText(v: unknown): string | null | undefined {
 
 function parseChange(v: unknown): StagedChange | null {
   if (!isRecord(v)) return null;
-  const field = str(v.field);
-  const label = str(v.label) ?? field;
+  // A name is data: any string, even a blank one, never a reason to drop the row.
+  const field = typeof v.field === "string" ? v.field : null;
+  const label = typeof v.label === "string" ? v.label : field;
   const kind = v.kind;
   if (field === null || label === null) return null;
   if (kind !== "changed" && kind !== "added" && kind !== "removed") return null;
@@ -324,3 +325,6 @@ export function sentFields(write: StagedWrite): Set<string> | null {
     return null;
   }
 }
+
+/** Isolate initiators and terminators inside shown text could close the isolate around it. */
+export const isolate = (text: string): string => text.replace(/[\u2066-\u2069]/g, "");

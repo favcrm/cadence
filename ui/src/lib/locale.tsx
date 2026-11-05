@@ -1964,4 +1964,5 @@ Object.assign(zhTW, {
   "Empty": "空白",
   "{n} default also set": "另設定 {n} 項預設值",
   "{n} defaults also set": "另設定 {n} 項預設值",
+  "(unnamed field)": "（未命名欄位）",
 });

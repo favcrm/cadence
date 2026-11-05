@@ -18,6 +18,7 @@ import {
   type NeedType,
   type UnfenceChoice,
 } from "./needs";
+import { isolate } from "../decisions/stagedWrite";
 import { sendToMaster } from "./send";
 import { useTranslate } from "../../lib/locale";
 import { marksFor, sendingTodo, settleTodo, useTodoLocal } from "./todoLocal";
@@ -347,9 +348,9 @@ export default function TodoCard({
             onKeyDown={onKey}
           >
             <div className="todo-title" title={title}>
-              {action.type === "staged" ? <bdi>{title}</bdi> : title}
+              {action.type === "staged" ? <bdi>{isolate(title)}</bdi> : title}
             </div>
-            <div className="todo-meta">{done ? doneText : action.type === "staged" ? <bdi>{metaLine(need)}</bdi> : metaLine(need)}</div>
+            <div className="todo-meta">{done ? doneText : action.type === "staged" ? <bdi>{isolate(metaLine(need))}</bdi> : metaLine(need)}</div>
           </div>
           {inside}
           {!done && quickRow}

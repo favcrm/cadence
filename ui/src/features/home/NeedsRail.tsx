@@ -4,7 +4,7 @@ import type { ResourceState } from "../../lib/cache";
 import type { Agent, Overview } from "../../lib/types";
 import { kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
-import { ageText, failureReason, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
+import { ageText, failureReason, isolate, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
 import { clearNotice, markFailedSeen, useDecisions } from "../decisions/useDecisions";
 import AgentUpdates from "./AgentUpdates";
 import type { AgentUpdate } from "./agentUpdateModel";
@@ -404,7 +404,7 @@ function DecidedLine({ write }: { write: StagedWrite }) {
   if (outcome === "failed") {
     return (
       <li data-fail>
-        <span><bdi>{write.title}</bdi></span>
+        <span><bdi>{isolate(write.title)}</bdi></span>
         <span className="text-ink-500">
           <span className="dx-bad">{t("Did not apply")}</span> · {when}
         </span>
@@ -433,7 +433,7 @@ function DecidedLine({ write }: { write: StagedWrite }) {
         : t("Applied");
   return (
     <li>
-      <span><bdi>{write.title}</bdi></span>
+      <span><bdi>{isolate(write.title)}</bdi></span>
       <span className="text-ink-500">
         {label} · {when}
       </span>

@@ -722,6 +722,45 @@ listStatus = 200;
   await y.done();
 }
 
+// ---- 17. a blank field name is data; a blind update's null is cleared; an embedded PDI cannot close an isolate ----
+{
+  const row = parseStagedRow(customer("b", { changes: [{ field: "", label: "", kind: "changed", before: "a", after: "b" }, { field: "  ", label: "  ", kind: "added", after: "c" }] }));
+  assert(row !== null && row.changes.length === 2, "blank names do not drop the row");
+  actions = [customer("a1", {
+    changes: [{ field: "", label: "", kind: "changed", before: "old", after: "new" }, { field: "phone", label: "Phone", kind: "added", after: null }],
+    changes_complete: false,
+  })];
+  const v = await render();
+  await settle(() => assert(v.cards().length === 1 && v.badge() === "1", "the row still shows, counts, and Nothing needs you is untrue"));
+  await click(labelled(v.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  const rows = Array.from(drawerEl()!.querySelectorAll(".dx-row")).map((r) => `${text(r.querySelector("dt"))}: ${text(r.querySelector("dd"))}`);
+  assert(rows.some((r) => r.startsWith("(unnamed field)") && r.includes("new")), `a blank name renders as data (${rows.join("|")})`);
+  assert(rows.some((r) => r.startsWith("Phone") && r.includes("(cleared)") && !r.includes("Empty")), `a blind update's null reads (cleared) (${rows.join("|")})`);
+  await v.done();
+
+  const PDI = "\u2069";
+  const bad = (w: string) => `${w}${PDI}x`;
+  actions = [customer("a1", {
+    title: bad("title"), reason: bad("reason"), origin: { via: "cli", kind: "person", label: bad("origin") },
+    consent: { channel: bad("consent") },
+    changes: [{ field: "stage", label: bad("label"), kind: "changed", before: bad("before"), after: bad("after") }],
+    effects: [bad("effect")],
+  })];
+  const w = await render();
+  await settle(() => assert(w.cards().length === 1, "one card"));
+  const inBdi = (root: Element) => Array.from(root.querySelectorAll("bdi")).map((b) => b.textContent ?? "").join("");
+  assert(!/[\u2066-\u2069]/.test(inBdi(w.cards()[0])), "the card strips isolate controls from API text");
+  await click(labelled(w.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "open"));
+  assert(!/[\u2066-\u2069]/.test(inBdi(drawerEl()!)), "so does the drawer");
+  assert(drawerEl()!.textContent!.includes("titlex") && drawerEl()!.textContent!.includes("afterx"), "the words are still shown");
+  const { noticeText } = require("../src/features/decisions/StagedWriteDetail") as typeof import("../src/features/decisions/StagedWriteDetail");
+  const sentence = noticeText({ outcome: "applied", title: bad("t") }, (e: string) => e);
+  assert(sentence.split(PDI).length === 2 && sentence.endsWith(`${PDI}`), "in a sentence only our own terminator remains");
+  await w.done();
+}
+
 console.log("staged decision checks passed");
 }
 void main();

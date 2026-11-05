@@ -3,7 +3,7 @@ import DrawerShell from "../app-shell/shared/DrawerShell";
 import { useWriteBlock } from "../auth/WriteGate";
 import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
-import { ageText, sentFields, type StagedChange, type StagedWrite } from "./stagedWrite";
+import { ageText, isolate, sentFields, type StagedChange, type StagedWrite } from "./stagedWrite";
 import { checkDecision, clearNotice, currentDecisions, decide, type DecisionNotice, type DecisionsState, type Verb } from "./useDecisions";
 import "./decisions.css";
 
@@ -17,7 +17,7 @@ function safeLink(href: string | null): string | null {
 }
 
 /** Text from the API is isolated: a bidi override in it cannot reach the words around it. */
-const B = ({ children }: { children: ReactNode }) => <bdi>{children}</bdi>;
+const B = ({ children }: { children: ReactNode }) => <bdi>{typeof children === "string" ? isolate(children) : children}</bdi>;
 
 /** Fill `{name}` in a translated template with a node. */
 function fill(template: string, values: Record<string, ReactNode>): ReactNode[] {
@@ -39,13 +39,13 @@ function Data({ v, t, empty = false }: { v: string | null | undefined; t: Say; e
   );
 }
 
-function ChangeRow({ change, update, t }: { change: StagedChange; update: boolean; t: Say }) {
+function ChangeRow({ change, update, create, t }: { change: StagedChange; update: boolean; create: boolean; t: Say }) {
   // A create has nothing to compare with: its fields are just the values.
   const compared = change.kind !== "added" || update;
   return (
     <div className="dx-row">
       <dt>
-        <B>{change.label}</B>
+        <B>{change.label.trim() === "" ? t("(unnamed field)") : change.label}</B>
       </dt>
       <dd>
         {compared && (
@@ -60,14 +60,14 @@ function ChangeRow({ change, update, t }: { change: StagedChange; update: boolea
             <span aria-hidden="true">→</span>{" "}
           </>
         )}
-        <span className="dx-now">{change.after === undefined ? "—" : <Data v={change.after} t={t} empty={change.kind === "added"} />}</span>
+        <span className="dx-now">{change.after === undefined ? "—" : <Data v={change.after} t={t} empty={create && change.kind === "added"} />}</span>
       </dd>
     </div>
   );
 }
 
 /** FSI…PDI: the title cannot bleed into the sentence around it. */
-const iso = (text: string) => `\u2068${text}\u2069`;
+const iso = (text: string) => `\u2068${isolate(text)}\u2069`;
 
 export function noticeText(n: DecisionNotice, t: Say): string {
   switch (n.outcome) {
@@ -123,7 +123,7 @@ function Body({ write, notice, state, t }: { write: StagedWrite; notice: Decisio
             <>
               <dl className="dx-chg">
                 {shown.map((c) => (
-                  <ChangeRow key={`${c.kind}:${c.field}`} change={c} update={update} t={t} />
+                  <ChangeRow key={`${c.kind}:${c.field}`} change={c} update={update} create={write.target === null} t={t} />
                 ))}
               </dl>
               {folded.length > 0 && (
@@ -134,7 +134,7 @@ function Body({ write, notice, state, t }: { write: StagedWrite; notice: Decisio
                   {defaults && (
                     <dl className="dx-chg dx-folded">
                       {folded.map((c) => (
-                        <ChangeRow key={`${c.kind}:${c.field}`} change={c} update={update} t={t} />
+                        <ChangeRow key={`${c.kind}:${c.field}`} change={c} update={update} create={write.target === null} t={t} />
                       ))}
                     </dl>
                   )}
