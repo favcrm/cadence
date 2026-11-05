@@ -135,7 +135,11 @@ pub(crate) fn adds_nothing_to(root: &Path, tip: &str, into: &str) -> bool {
     let Some(merged) = merged.lines().next().map(str::trim) else {
         return false;
     };
-    git(root, &["rev-parse", "--verify", &format!("{into}^{{tree}}")]).is_ok_and(|t| t == merged)
+    git(
+        root,
+        &["rev-parse", "--verify", &format!("{into}^{{tree}}")],
+    )
+    .is_ok_and(|t| t == merged)
 }
 
 /// Squash-merge test: if the branch's combined diff against its
