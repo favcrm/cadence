@@ -1561,8 +1561,8 @@ impl ProviderAdapter for PiAdapter {
         }
         let mut encoded = Vec::with_capacity(images.len());
         for image in images {
-            if image.bytes.len() > 4 * 1024 * 1024
-                || !matches!(image.media_type, "image/png" | "image/jpeg" | "image/webp")
+            if image.bytes.len() > crate::attachment_image::IMAGE_MAX_BYTES
+                || !crate::attachment_image::raster_mime(image.media_type)
             {
                 return Err(Error::pre_write(
                     "retained image is outside the native prompt bound, so it was not sent",

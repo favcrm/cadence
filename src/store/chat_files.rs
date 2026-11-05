@@ -370,11 +370,12 @@ fn sniffed_kind(bytes: &[u8]) -> &'static str {
     // A UTF-8 BOM is legal in an SVG/XML document and is not whitespace
     // to the wiki sniff; strip it for the shape check only.
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    match crate::wiki::sniff_mime(bytes) {
+    let sniffed = crate::wiki::sniff_mime(bytes);
+    if let Some((_, kind)) = RASTER_KIND.iter().find(|(mime, _)| *mime == sniffed) {
+        return kind;
+    }
+    match sniffed {
         "application/pdf" => "pdf",
-        "image/png" => "png",
-        "image/jpeg" => "jpeg",
-        "image/webp" => "webp",
         "image/svg+xml" => "svg",
         // `sniff_mime` folds UTF-8 text to text/plain and readable HTML to
         // text/html. Both are inert UTF-8 source here; a NUL in the head
@@ -412,13 +413,21 @@ const IMAGE_EXTS: [(&str, &str); 4] = [
     ("webp", "image/webp"),
 ];
 
+/// The sniffed kind each delivered raster MIME is recorded as. This is the one
+/// place the MIME↔kind relation lives; `sniffed_kind` and `check_kind` both
+/// read it, so an extension and the bytes it must match cannot drift apart.
+const RASTER_KIND: [(&str, &str); 3] = [
+    ("image/png", "png"),
+    ("image/jpeg", "jpeg"),
+    ("image/webp", "webp"),
+];
+
 fn raster_kind_name(mime: &str) -> &'static str {
-    match mime {
-        "image/png" => "png",
-        "image/jpeg" => "jpeg",
-        "image/webp" => "webp",
-        _ => "",
-    }
+    RASTER_KIND
+        .iter()
+        .find(|(candidate, _)| *candidate == mime)
+        .map(|(_, kind)| *kind)
+        .unwrap_or("")
 }
 
 /// Extensions that are never attachable even when their bytes happen to

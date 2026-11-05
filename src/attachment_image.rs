@@ -13,7 +13,8 @@
 //!   inert text. Visual delivery parses it with the linked `roxmltree`
 //!   parser (document types disabled) and refuses any document that carries
 //!   script, embedded markup, animation, an event handler or a reference
-//!   outside a same-document fragment; [`rasterize_svg`] then renders it
+//!   outside a same-document fragment (or an embedded PNG/JPEG/WebP data URI);
+//!   [`rasterize_svg`] then renders it
 //!   with rsvg-convert resolved from PATH, root-owned and non-writable,
 //!   under a Landlock ruleset built before fork, RLIMIT_CPU/AS/FSIZE/CORE/
 //!   NOFILE/NPROC and a process-group deadline.
