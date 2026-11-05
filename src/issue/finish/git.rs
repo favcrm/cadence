@@ -103,7 +103,12 @@ pub(crate) fn merge_rule(
     // also need `adds_nothing_to`: merging `tip` into `into` must change
     // nothing.
     if let Ok(marks) = git(root, &["cherry", into, tip]) {
-        if !marks.lines().any(|l| l.starts_with('+')) && adds_nothing_to(root, tip, into) {
+        // `git cherry` skips merge commits, which can hold unique resolution work.
+        let merges = git(root, &["rev-list", "--merges", &format!("{into}..{tip}")]);
+        if !marks.lines().any(|l| l.starts_with('+'))
+            && merges.is_ok_and(|m| m.is_empty())
+            && adds_nothing_to(root, tip, into)
+        {
             return Some("cherry");
         }
     }
@@ -118,13 +123,26 @@ pub(crate) fn merge_rule(
 
 /// Does merging `tip` into `into` leave `into`'s tree unchanged? A clean
 /// three-way merge (`git merge-tree --write-tree`, git 2.38+) whose result
-/// equals `into^{tree}` proves `into` already holds everything `tip` adds,
-/// including merge-commit resolutions, mode changes and repeated lines that
-/// `git cherry` and a reverse apply miss. Any failure refuses: a conflict, or
-/// a git without the command. A squash whose file later changed differently
-/// on `into` also fails here; refusing is the safe direction, and the merged
-/// PR (`pr` arm) can still prove it.
+/// equals `into^{tree}` means `into` already holds what `tip` adds, including
+/// mode changes and repeated lines that `git cherry` and a reverse apply miss.
+/// That holds only for git's own merge: a configured merge driver
+/// (`merge.<name>.driver`, e.g. `merge=ours`) can force a clean result that
+/// drops the branch's edits, so any configured driver refuses. Any failure
+/// refuses too: a conflict, or a git without the command. A squash whose file
+/// later changed differently on `into` also fails here; refusing is the safe
+/// direction, and the merged PR (`pr` arm) can still prove it.
 pub(crate) fn adds_nothing_to(root: &Path, tip: &str, into: &str) -> bool {
+    // Exit 0 = at least one driver is configured (repo, global or system).
+    if git_out(
+        root,
+        &["config", "--get-regexp", r"^merge\..*\.driver$"],
+        &[],
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(true)
+    {
+        return false;
+    }
     let Ok(out) = git_out(root, &["merge-tree", "--write-tree", into, tip], &[]) else {
         return false;
     };
@@ -156,10 +174,11 @@ pub(crate) fn patch_applied(root: &Path, tip: &str, into: &str) -> bool {
         Ok(o) if o.status.success() => o.stdout,
         _ => return false,
     };
-    // An empty diff means the branch contributes nothing — deleting
-    // it loses no work.
+    // An empty diff is not evidence: ancestry already covered a tip at the
+    // merge-base, so commits beyond it that cancel out (add work, then drop it)
+    // are unpushed history that deleting the branch would lose.
     if diff.is_empty() {
-        return true;
+        return false;
     }
     let Ok(tmp) = TempDir::new() else {
         return false;
@@ -192,6 +211,18 @@ pub(crate) fn patch_applied(root: &Path, tip: &str, into: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// `owner/repo` of a GitHub remote url (https or ssh), so `gh` queries the
+/// repository `origin` names rather than whatever the cwd resolves to.
+fn github_slug(url: &str) -> Option<String> {
+    let rest = url.split("github.com").nth(1)?;
+    let rest = rest.trim_start_matches([':', '/']).trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut parts = rest.split('/');
+    let (owner, repo) = (parts.next()?, parts.next()?);
+    (!owner.is_empty() && !repo.is_empty() && parts.next().is_none())
+        .then(|| format!("{owner}/{repo}"))
+}
+
 /// A merged GitHub PR counts as merged only when its recorded head
 /// commit covers `tip` — the name alone is not evidence: a branch
 /// name reused after its PR merged would otherwise report new
@@ -215,6 +246,9 @@ pub(crate) fn pr_merged(root: &Path, branch: &str, tip: &str, into: &str) -> boo
     // base is a bare branch name.
     let base_name = into.strip_prefix("origin/").unwrap_or(into);
     let mut cmd = Command::new("gh");
+    if let Some(slug) = github_slug(&url) {
+        cmd.args(["-R", &slug]);
+    }
     cmd.args([
         "pr",
         "list",

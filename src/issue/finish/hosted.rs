@@ -35,6 +35,19 @@ pub(crate) fn release_hosted_lane(
         msg_refs: std::collections::HashSet::new(),
         cargo_target: None,
     };
+    // Without `origin/HEAD`, native falls back to the main checkout's current
+    // branch, so "merged" could mean a feature branch. Hosted refuses that.
+    if git(
+        root,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    )
+    .is_err()
+    {
+        return Err(refuse(
+            "origin/HEAD is not set, so the default branch is unknown (run `git remote set-head \
+             origin -a`)",
+        ));
+    }
     let view = daemon_view(state_dir);
     let ev = evidence(&t, false);
     let (_, tip, survivability_block) = survivability(&ev, &t);
@@ -116,22 +129,29 @@ pub(crate) fn release_hosted_lane(
     }))
 }
 
-/// Ignored paths a hosted release may delete without asking: build output and
-/// the lane's own `.cadence/` state. Anything else ignored (`.env`, `docs/*`,
-/// `claudedocs/`) is the operator's.
-const ALLOWED_IGNORED: [&str; 3] = ["target/", "node_modules/", ".cadence/"];
+/// Top-level ignored build output a hosted release may delete without asking.
+/// Anything else ignored (`.env`, `docs/*`, `claudedocs/`, `docs/target/`) is
+/// the operator's. `.cadence/` is not listed: nothing the hosted lane writes
+/// there was found, and it could hold operator files. Git reports an ignored
+/// directory collapsed (`!! target/`), so a file an operator keeps inside
+/// `target/` or `node_modules/` is deleted with it; that is accepted.
+const ALLOWED_IGNORED: [&str; 2] = ["target/", "node_modules/"];
 
 /// A short sample of ignored paths outside [`ALLOWED_IGNORED`], or `None`.
 fn unexpected_ignored(path: &Path) -> Result<Option<String>> {
-    let status = git(path, &["status", "--porcelain", "--ignored"])?;
+    let status = git(
+        path,
+        &[
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=normal",
+        ],
+    )?;
     let rest: Vec<&str> = status
         .lines()
         .filter_map(|l| l.strip_prefix("!! "))
-        .filter(|p| {
-            !ALLOWED_IGNORED
-                .iter()
-                .any(|a| p.starts_with(a) || p.contains(&format!("/{a}")))
-        })
+        .filter(|p| !ALLOWED_IGNORED.iter().any(|a| p.starts_with(a)))
         .collect();
     if rest.is_empty() {
         return Ok(None);
@@ -147,6 +167,10 @@ fn unexpected_ignored(path: &Path) -> Result<Option<String>> {
 /// A native block reason ends by offering `--force`; hosted release has none.
 fn refuse(reason: &str) -> Error {
     let reason = reason
+        .replace(
+            "reconcile it before finishing this worktree",
+            "an operator must resolve the unknown message on this machine's daemon",
+        )
         .replace(", or pass --force", "")
         .replace(" or pass --force", "")
         .replace("; pass --force", "")
@@ -157,7 +181,10 @@ fn refuse(reason: &str) -> Error {
         );
     Error::rejected(format!(
         "Hosted issue finish did not release the lane: {reason}. Hosted release has no \
-         --force; resolve this (pushing the branch alone does not release it) and run \
-         `issue finish` again. Nothing was removed"
+         --force. Resolve this and run `issue finish` again if it can change (pushing the \
+         branch alone does not release it); if the lane will never qualify, check it by hand \
+         and use `git worktree remove <path>` (this deletes its ignored files) and \
+         `git branch -d <branch>` (`-D` for a squash-merged branch, only after verifying \
+         the merge). Nothing was removed"
     ))
 }
