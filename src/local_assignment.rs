@@ -3003,7 +3003,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 receipt["head"] = json!(git_line(Path::new(path), &["rev-parse", "HEAD"]));
                 receipt["guidance"] = json!({
                     "code": "report_from_this_session",
-                    "text": "This session holds the claim. Report with `cadence agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
+                    "text": "The board recorded this claim; a distinct runtime identity is not verified. Report with `cadence agent report <assignment> --state running|blocked|failed|result`; no local agent was connected.",
                 });
             }
             None => {
@@ -3012,7 +3012,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 receipt["worktree"] = Value::Null;
                 receipt["guidance"] = json!({
                     "code": "report_from_this_session",
-                    "text": "This session holds the claim. Report with `cadence agent report <assignment> --state running|blocked|failed|result --text '<summary>'`, and for a result add `--deliverable artifact:<ref>` or `--deliverable link:<https url>` for an output that exists. No checkout was opened and no commit is expected.",
+                    "text": "The board recorded this claim; a distinct runtime identity is not verified. Report with `cadence agent report <assignment> --state running|blocked|failed|result --text '<summary>'`, and for a result add `--deliverable artifact:<ref>` or `--deliverable link:<https url>` for an output that exists. No checkout was opened and no commit is expected.",
                 });
             }
         }
