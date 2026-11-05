@@ -20,7 +20,7 @@ publish to a live account to prove a release.
 - **Blast radius:** all tenants; stateless and immediate.
 - **Order:** review and merge the promotion, then dispatch `production-deploy.yml`
   pinned to the promotion merge's second parent (`source_sha`). Use the smallest
-  artifact that carries the fix; do not wait for an unrelated image cycle.
+  artifact that carries the fix.
 - **Rollback trigger / decision:** failed read-only smoke or a production
   regression; operator decides whether to roll back.
 - **Rollback:** redeploy the previous `source_sha`.
@@ -38,8 +38,7 @@ publish to a live account to prove a release.
   Automatic `workflow_run`/scheduled staging deliberately skips promotion.
   Only then hand over [the production update procedure](../../AGENTS.md#production-safety)
   to the operator. Verify `--check` reports the intended available SHA; stop on
-  a refusal or stale candidate. Batch host changes that need the same image
-  cycle with that cycle, not a separate restart.
+  a refusal or stale candidate.
 - **Rollback trigger / decision:** update refusal, failed read-only health
   probe, or regression; operator decides whether to restore the previous
   release.
@@ -97,7 +96,7 @@ superseded; a current failed, pending, missing, ambiguous, mis-bound or
 untrusted gate still refuses. Dry-run checks the same proof without posting
 evidence or enqueueing. The canonical ticket comment must name the selected
 CI URL and the exact head, base and base branch.
-For a script-only repair, no daemon restart or image cycle is needed when
+For a script-only repair, no daemon restart is needed when
 read-only native requirements already supply the matching target binding.
 
 ## App bundle

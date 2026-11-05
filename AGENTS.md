@@ -67,7 +67,7 @@ ticket per step. When two approaches both meet the ticket, pick the smaller
 one and say why in the PR. Before review, simplify your own diff: drop dead
 code, duplication and abstractions the change does not need, in the lines
 you changed only. If expansion is necessary to meet acceptance, explain why
-and explain why in the PR; otherwise defer it. Stop once acceptance and required
+and say so in the PR; otherwise defer it. Stop once acceptance and required
 verification are complete. Scope never waives a check, a review, an
 approval or a production-safety rule.
 
@@ -278,7 +278,9 @@ the code you just wrote.
   `>` header lines follow the title directly; a bare `Issue:` line does not
   link the note to the ticket. The title and the section must say the same
   thing. Link the note from the ticket. Hosted: one PR comment per review axis,
-  linked in the ticket comment (no verdict note).
+  linked in the ticket comment (no verdict note); under the temporary
+  `--exception` the gate wants `standards=` and `spec-security=` as two
+  distinct PR comment URLs even when one review is required.
 - Before enqueueing, post one ticket comment for that head: every required
   verdict note, the green CI run and, for a `human` PR, the approval id. A
   new head voids every verdict on the old head.

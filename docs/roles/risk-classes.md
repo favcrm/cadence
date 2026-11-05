@@ -1,8 +1,9 @@
 # Merge risk classes — operator decision 2026-09-19
 
-Routine PRs merge without a human; only substantial changes wait for the operator. `cadence delivery requirements` and `scripts/enqueue-reviewed` compute what a PR needs.
+The aim: routine PRs merge without a human, and only substantial changes wait for the operator. `cadence delivery requirements` and `scripts/enqueue-reviewed` compute what a PR needs.
 
 ## Class `human` — the operator approves (any ONE trigger is enough)
+When unsure whether a trigger applies, `human`.
 1. **Trust boundary:** turn tokens, generations, session binding or ownership proofs, adoption/recovery (`recover()`, `open_adopted`, `verify_ownership`, `resolve_session`), the approval broker, permission modes, bypass handling, auth or identity (`request_identity`, `write_caller`, `tailnet_proof`, tailnet).
 2. **Data and deletion:** schema migrations or any change to the store version; code that deletes or rewrites user data (worktree/branch removal, `issue finish`, `agent gc`, tracker write path, memory writes); anything that can lose commits.
 3. **Security:** fixes for a leak or vulnerability, secret handling, redaction logic.
@@ -32,7 +33,7 @@ A PR is auto-eligible under this allowlist only when every `scripts/**` path it 
 
 ### Mechanical path lists
 
-`delegable` names files, not directories, wherever code is involved: nothing that builds, runs in the browser (`ui/**` is trigger 1: the board runs with the operator's session) or acts on the host. Gate inputs and the tests that prove gates are trigger 7.
+`delegable` feeds only the daemon's `--delegated` approval check, not the merge evaluator. It names files, not directories, wherever code is involved: nothing that builds, runs in the browser (`ui/**` is trigger 1: the board runs with the operator's session) or acts on the host. Gate inputs and the tests that prove gates are trigger 7.
 
 - **delegable**: `src/issue/blocked.rs`, `src/issue/cli.rs`, `src/issue/context.rs`, `src/issue/groom.rs`, `src/issue/history.rs`, `src/issue/line_times.rs`, `src/issue/lint.rs`, `src/issue/retro.rs`, `src/issue/sprint.rs`, `src/issue/summary.rs`, `src/issue/sync.rs`, `src/issue/time.rs`, `src/issue/write.rs`, `src/cli/issue.rs`, `src/cli/milestone.rs`, `src/cli/project.rs`, `src/cli/status.rs`, `src/cli/overview.rs`, `src/cli/events.rs`, `src/cli/help.rs`, `docs/**`
 - **trigger1**: `src/peer.rs`, `src/daemon.rs`, `src/daemon/identity.rs`, `src/daemon/caller_rule.rs`, `src/daemon/slots_rpc.rs`, `src/adapter/pty/**`, `src/ui.rs`, `src/ui/**`, `ui/**`, `src/operator_auth.rs`, `src/tailnet_proof.rs`, `src/test_seam.rs`, `src/master_perm.rs`, `src/agent_uid/**`, `src/cli/agent_uid.rs`, `src/daemon/operator_rpc.rs`, `src/daemon/supervisor_grant.rs`, `src/daemon/installer_enrollment_wire.rs`, `src/platform/custody.rs`, `src/cli/platform.rs`, `src/bin/cadence-agent-exec/**`, `src/cli_actor.rs`, `src/board_identity.rs`, `src/device_login.rs`, `src/remote_auth.rs`, `src/remote_cli.rs`, `src/remote_enrollment.rs`, `src/remote_cli/**`, `src/remote_enrollment/**`, `src/remote_*_acceptance.rs`, `src/runner.rs`
@@ -45,7 +46,7 @@ A PR is auto-eligible under this allowlist only when every `scripts/**` path it 
 ## Class `auto`
 Everything else.
 
-### Who counts as a reviewer: the fresh-session review standard
+## Who counts as a reviewer: the fresh-session review standard
 Operator decision 2026-11-03 (CAD-1946). A review is valid when a fresh-context
 session that is not the author does it; a subagent qualifies. Fresh means it
 inherits no conversation or context from the work: a forked subagent or a
@@ -77,8 +78,8 @@ field still exists in code; it is not this standard. A workflow-issued reviewer
 identity (CAD-2081) is counted by the gate and its workflows are live; their role is
 in AGENTS.md "Review".
 
-### Review count by diff (CAD-957)
+## Review count by diff (CAD-957)
 A PR whose every change qualifies under the one-review allowlist
 (`docs/roles/one-review-paths.toml`, match rules in its header) needs
-one fresh-session review covering standards and spec. Everything else keeps two. This changes only the count:
+one fresh-session review covering standards and spec. Under `strict`, everything else keeps two. This changes only the count:
 a `human` trigger still needs the operator, and the file is itself trigger 7.

@@ -113,9 +113,9 @@ If you are sent a `[review]` kickoff, judge exactly the head it names and
 file your verdict as a report: `cadence report file --task <ID> --kind
 verdict --file <f>`, frontmatter `verdict: pass` or `verdict: revise` and
 `sha: <the head you reviewed>`, the findings as the body. Only the
-assigned reviewer can file it, and only for the head under review. This is a
-native job-report verdict; the merge gate counts only hosted verdicts, and
-agents file none.
+assigned reviewer can file it, and only for the head under review. This job report is not what the merge gate counts. The gate counts
+verdict notes on a native org and attested rows on a hosted one; on hosted,
+agents file none (AGENTS.md "Review").
 
 ## Peers and your group
 
@@ -457,11 +457,6 @@ cadence send <w> --task <task> --text "follow-up"   # attach, no state drive
 
 Routed `job_event` notifications are informational like `worker_result` —
 they complete on delivery and carry no turn for you.
-
-Delegated approvals (CAD-918): a designated agent approves a
-`delegated`-class PR from its own pane with `cadence audit approve --pr <n>
---head <full-sha> --delegated --source "<notes>"` (`--scope <id>` for a
-pre-approved ticket) — never for a PR it authored or reviewed.
 
 Fresh joins get a `bootstrap-<alias>` kickoff plus the briefing file;
 `join --no-bootstrap` skips both. An inbox is the right `reply_to`/
