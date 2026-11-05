@@ -1863,6 +1863,39 @@ fn a_lost_response_to_a_team_mutation_is_unknown_not_a_refusal() {
     assert!(!text.contains("retry later"), "{text}");
 }
 
+/// AOS-528: a link write answers the card it changed. A 200 naming another
+/// ticket, or naming none, cannot prove this link landed, so it is an unknown
+/// outcome rather than a success the caller would trust.
+#[test]
+fn aos528_link_receipts_must_name_the_ticket_they_changed() {
+    let args = |id: &str| json!({"id": id, "kind": "blocked_by", "target": "CAD-9"});
+    let receipt = |id: &str| json!({"issue": {"id": id}, "card": {"id": id}});
+    for verb in ["issue_link", "issue_unlink"] {
+        let sent = args("CAD-16");
+        let sent = sent.as_object().unwrap();
+        assert!(
+            issue_receipt_correlates(verb, &receipt("CAD-16"), sent),
+            "{verb}"
+        );
+        assert!(
+            !issue_receipt_correlates(verb, &receipt("CAD-99"), sent),
+            "{verb} accepted a foreign card"
+        );
+        assert!(
+            !issue_receipt_correlates(verb, &json!({}), sent),
+            "{verb} accepted an empty body"
+        );
+        assert!(
+            !issue_receipt_correlates(verb, &json!({"card": {"id": "CAD-16"}}), sent),
+            "{verb} accepted a receipt with no issue"
+        );
+        assert!(
+            !issue_receipt_correlates(verb, &json!({"issue": {"id": "CAD-16"}}), sent),
+            "{verb} accepted a receipt with no card"
+        );
+    }
+}
+
 /// A team 2xx whose receipt does not name the row this call changed proves
 /// nothing about the write: it is the same unknown outcome a lost answer is,
 /// with the directory read named and the call never replayed.
