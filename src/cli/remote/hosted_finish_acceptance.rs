@@ -354,7 +354,7 @@ fn refusal(result: Result<impl std::fmt::Debug>) -> String {
 /// uncommitted-changes one, not a downstream git failure.
 #[test]
 fn dirty_lane_is_refused_and_left_intact() {
-    let fx = Fx::new(Shape::Squash);
+    let fx = Fx::new(Shape::FastForward);
     fs::write(fx.lane.join("a"), "uncommitted edit\n").unwrap();
     age(&fx.lane);
     let (result, released) = cli_finish(&fx, Flags::default());
@@ -376,7 +376,7 @@ impl Drop for Reap {
 /// Case: A process whose cwd is inside the lane blocks release.
 #[test]
 fn process_inside_the_lane_is_refused() {
-    let fx = Fx::new(Shape::Squash);
+    let fx = Fx::new(Shape::FastForward);
     let child = Reap(
         Command::new("sleep")
             .arg("600")
@@ -394,7 +394,7 @@ fn process_inside_the_lane_is_refused() {
 /// lane.
 #[test]
 fn unfinished_assignment_is_refused() {
-    let fx = Fx::new(Shape::Squash);
+    let fx = Fx::new(Shape::FastForward);
     for state in ["running", "blocked"] {
         let mut rec = Rec::ended(&fx);
         rec.state = state;
@@ -415,29 +415,25 @@ fn unmerged_but_pushed_branch_is_refused() {
     fx.intact();
 }
 
-/// Case: A merged, clean, idle lane releases through `issue finish`: squash
-/// shape (no ancestry, patch applied) and fast-forward shape.
+/// Case: A merged, clean, idle lane releases through `issue finish`: the
+/// tip is on origin/main (fast-forward shape, non-GitHub origin).
 #[test]
 fn merged_clean_idle_lane_is_released_through_issue_finish() {
-    let fx = Fx::new(Shape::Squash);
+    let fx = Fx::new(Shape::FastForward);
     fx.intact();
     let (result, value) = cli_finish(&fx, Flags::default());
     assert_eq!(result.unwrap(), 0);
     let value = value.expect("routing must reach the release");
     assert_eq!(value["finished"], true, "{value}");
-    assert!(value["merged_by"].is_string(), "{value}");
+    assert_eq!(value["merged_by"], "ancestry", "{value}");
     fx.gone();
-
-    let ff = Fx::new(Shape::FastForward);
-    assert_eq!(ff.release().unwrap()["finished"], true);
-    ff.gone();
 }
 
 /// Case: Options that would widen or soften the release are refused before any
 /// removal, even on a lane that would otherwise release.
 #[test]
 fn widening_flags_are_refused_and_remove_nothing() {
-    let fx = Fx::new(Shape::Squash);
+    let fx = Fx::new(Shape::FastForward);
     for (name, flags) in [
         (
             "--force",
@@ -529,7 +525,7 @@ fn unbound_or_mismatched_lane_is_refused_with_the_manual_path() {
         }),
     ];
     for (name, edit) in edits {
-        let fx = Fx::new(Shape::Squash);
+        let fx = Fx::new(Shape::FastForward);
         let mut rec = Rec::ended(&fx);
         edit(&mut rec, &fx);
         fx.ledger(&rec);
@@ -546,7 +542,7 @@ fn unbound_or_mismatched_lane_is_refused_with_the_manual_path() {
 /// every binding field intact its merged lane releases.
 #[test]
 fn cancelled_fenced_row_with_intact_binding_releases() {
-    let fx = Fx::new(Shape::Squash);
+    let fx = Fx::new(Shape::FastForward);
     let mut rec = Rec::ended(&fx);
     rec.state = "cancelled";
     rec.fenced = true;
@@ -632,39 +628,149 @@ fn merge_commit_only_work_is_not_taken_for_merged() {
     );
 }
 
-/// Cadence's normal merges must still release.
+fn github(fx: &Fx) {
+    git(
+        &fx.repo,
+        &["remote", "set-url", "origin", "https://github.com/o/r.git"],
+    );
+}
+
+fn pr_row(tip: &str) -> Value {
+    serde_json::json!({
+        "number": 7, "headRefOid": tip, "baseRefName": "main",
+        "mergedAt": "2026-11-05T00:00:00Z"
+    })
+}
+
+/// `release` with a fake GitHub: `rows` is what `gh pr list` returns (`None`
+/// = could not ask), given only for the slug `only_slug` when set.
+fn release_prs(fx: &Fx, rows: Option<Value>, only_slug: Option<&str>) -> Result<Value> {
+    finish_guidance::release_with(
+        &fx.coord(),
+        ISSUE,
+        None,
+        &fx.state,
+        &|slug, _| match only_slug {
+            Some(only) if only != slug => Some(serde_json::json!([])),
+            _ => rows.clone(),
+        },
+    )
+}
+
+/// Squash shapes release only on an exact merged-PR match (`merged_by` pr):
+/// multi-commit, with main moved on, and single-commit.
 #[test]
-fn normal_squash_shapes_release() {
-    // Multi-commit squash, the normal case (the `patch` arm).
-    let multi = Fx::new(Shape::Squash);
-    let v = multi.release().unwrap();
-    assert_eq!(v["merged_by"], "patch", "{v}");
-    multi.gone();
+fn squash_with_exact_pr_match_releases() {
+    let builds: [fn(&Path, &Path); 3] = [
+        |repo, lane| lane_work(repo, lane, Shape::Squash),
+        |repo, lane| {
+            lane_work(repo, lane, Shape::Squash);
+            for n in ["unrelated1", "unrelated2"] {
+                commit_file(repo, n, "x\n");
+            }
+        },
+        |repo, lane| {
+            commit_file(lane, "only", "only\n");
+            git(repo, &["merge", "--squash", "cadence/test"]);
+            git(repo, &["commit", "-m", "squashed"]);
+        },
+    ];
+    for build in builds {
+        let fx = Fx::build(build);
+        github(&fx);
+        let rows = serde_json::json!([pr_row(&tip(&fx))]);
+        let v = release_prs(&fx, Some(rows), None).unwrap();
+        assert_eq!(v["merged_by"], "pr", "{v}");
+        fx.gone();
+    }
+}
 
-    // The same squash after main moved on with unrelated files.
-    let moved = Fx::build(|repo, lane| {
-        lane_work(repo, lane, Shape::Squash);
-        for n in ["unrelated1", "unrelated2"] {
-            fs::write(repo.join(n), "x\n").unwrap();
-            git(repo, &["add", n]);
-            git(repo, &["commit", "-m", n]);
-        }
-    });
-    moved
-        .release()
-        .expect("squash with unrelated main commits must release");
-    moved.gone();
+type Rows = Box<dyn Fn(&str) -> Option<Value>>;
 
-    // Single-commit squash.
-    let single = Fx::build(|repo, lane| {
-        fs::write(lane.join("only"), "only\n").unwrap();
-        git(lane, &["add", "only"]);
-        git(lane, &["commit", "-m", "only"]);
-        git(repo, &["merge", "--squash", "cadence/test"]);
-        git(repo, &["commit", "-m", "squashed"]);
-    });
-    single.release().expect("single-commit squash must release");
-    single.gone();
+fn row_with(edit: fn(&mut Value)) -> Rows {
+    Box::new(move |t| {
+        let mut row = pr_row(t);
+        edit(&mut row);
+        Some(serde_json::json!([row]))
+    })
+}
+
+/// Everything short of an exact merged PR on origin's GitHub repo refuses
+/// with the lane intact and the manual path named.
+#[test]
+fn squash_without_exact_pr_evidence_is_refused() {
+    const GH: &str = "https://github.com/o/r.git";
+    let exact: fn() -> Rows = || row_with(|_| {});
+    let cases: Vec<(&str, &str, Rows, Option<&str>)> = vec![
+        ("could not ask", GH, Box::new(|_| None), None),
+        (
+            "empty list",
+            GH,
+            Box::new(|_| Some(serde_json::json!([]))),
+            None,
+        ),
+        (
+            "head mismatch",
+            GH,
+            row_with(|r| r["headRefOid"] = "0".repeat(40).into()),
+            None,
+        ),
+        (
+            "mergedAt null",
+            GH,
+            row_with(|r| r["mergedAt"] = Value::Null),
+            None,
+        ),
+        (
+            "wrong base",
+            GH,
+            row_with(|r| r["baseRefName"] = "develop".into()),
+            None,
+        ),
+        ("other slug only", GH, exact(), Some("x/y")),
+        (
+            "host in path",
+            "https://git.corp.test/github.com/o/r",
+            exact(),
+            None,
+        ),
+        ("notgithub.com", "https://notgithub.com/o/r", exact(), None),
+        (
+            "github.com.evil.example",
+            "https://github.com.evil.example/o/r",
+            exact(),
+            None,
+        ),
+    ];
+    for (name, url, rows, only) in cases {
+        let fx = Fx::new(Shape::Squash);
+        git(&fx.repo, &["remote", "set-url", "origin", url]);
+        let before = tip(&fx);
+        let message = refusal(release_prs(&fx, rows(&before), only));
+        assert!(message.contains("git worktree remove"), "{name}: {message}");
+        assert_eq!(tip(&fx), before, "{name}: tip moved");
+        fx.intact();
+    }
+    // Pushed only, no PR.
+    let fx = Fx::new(Shape::PushedOnly);
+    github(&fx);
+    refusal(release_prs(&fx, Some(serde_json::json!([])), None));
+    fx.intact();
+}
+
+/// A local commit on top of a merged PR's head is not covered by that PR.
+#[test]
+fn local_commit_on_top_of_a_merged_pr_head_is_refused() {
+    let fx = Fx::new(Shape::Squash);
+    github(&fx);
+    let merged_head = tip(&fx);
+    commit_file(&fx.lane, "after-merge", "unpushed work\n");
+    age(&fx.lane);
+    let rows = serde_json::json!([pr_row(&merged_head)]);
+    refusal(release_prs(&fx, Some(rows), None));
+    fx.intact();
+    assert_ne!(tip(&fx), merged_head);
+    assert!(fx.lane.join("after-merge").is_file());
 }
 
 /// A squash whose file later changed on main cannot be proven merged without
@@ -682,14 +788,14 @@ fn squash_then_file_changed_on_main_is_refused() {
 /// Only build output may be deleted with the worktree.
 #[test]
 fn ignored_files_decide_release() {
-    let fx = Fx::new(Shape::Squash);
+    let fx = Fx::new(Shape::FastForward);
     fs::create_dir_all(fx.lane.join("target/debug")).unwrap();
     fs::write(fx.lane.join("target/debug/out"), "bin").unwrap();
     fx.release().expect("target/ only must release");
     fx.gone();
 
     for file in ["docs/x.md", ".env"] {
-        let fx = Fx::new(Shape::Squash);
+        let fx = Fx::new(Shape::FastForward);
         let path = fx.lane.join(file);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "operator data").unwrap();
@@ -805,7 +911,7 @@ fn merge_driver_hides_repeated_rows_on_the_patch_arm() {
 fn hidden_untracked_and_ignored_files_still_refuse() {
     let fx = Fx::build(|repo, lane| {
         git(repo, &["config", "status.showUntrackedFiles", "no"]);
-        lane_work(repo, lane, Shape::Squash);
+        lane_work(repo, lane, Shape::FastForward);
     });
     fs::write(fx.lane.join("scratch.txt"), "mine").unwrap();
     age(&fx.lane);
@@ -818,7 +924,7 @@ fn hidden_untracked_and_ignored_files_still_refuse() {
 
     let fx = Fx::build(|repo, lane| {
         git(repo, &["config", "status.showUntrackedFiles", "no"]);
-        lane_work(repo, lane, Shape::Squash);
+        lane_work(repo, lane, Shape::FastForward);
     });
     fs::write(fx.lane.join(".env"), "secret").unwrap();
     let message = assert_refused_keeping_tip(&fx);
@@ -830,7 +936,7 @@ fn hidden_untracked_and_ignored_files_still_refuse() {
 /// one is build output.
 #[test]
 fn nested_target_refuses_and_top_level_target_releases() {
-    let fx = Fx::new(Shape::Squash);
+    let fx = Fx::new(Shape::FastForward);
     let nested = fx.lane.join("docs/target/out");
     fs::create_dir_all(nested.parent().unwrap()).unwrap();
     fs::write(&nested, "keep").unwrap();
@@ -838,7 +944,7 @@ fn nested_target_refuses_and_top_level_target_releases() {
     assert!(message.contains("docs/"), "{message}");
     assert_eq!(fs::read_to_string(&nested).unwrap(), "keep");
 
-    let fx = Fx::new(Shape::Squash);
+    let fx = Fx::new(Shape::FastForward);
     fs::create_dir_all(fx.lane.join("target/debug")).unwrap();
     fs::write(fx.lane.join("target/debug/out"), "bin").unwrap();
     fx.release().expect("top-level target/ releases");
@@ -850,7 +956,7 @@ fn nested_target_refuses_and_top_level_target_releases() {
 #[test]
 fn missing_origin_head_with_checkout_on_a_feature_branch_is_refused() {
     let fx = Fx::build(|repo, lane| {
-        lane_work(repo, lane, Shape::Squash);
+        lane_work(repo, lane, Shape::FastForward);
         git(
             repo,
             &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
@@ -859,4 +965,33 @@ fn missing_origin_head_with_checkout_on_a_feature_branch_is_refused() {
     });
     let message = assert_refused_keeping_tip(&fx);
     assert!(message.contains("origin/HEAD"), "{message}");
+}
+
+/// `merge=union` (with repeated context) and `merge.default=union` make a
+/// merge look clean too; hosted release takes no content evidence, so the
+/// lane is refused for want of any.
+#[test]
+fn union_merge_settings_do_not_produce_evidence() {
+    for default_union in [false, true] {
+        let fx = Fx::build(|repo, lane| {
+            if default_union {
+                git(repo, &["config", "merge.default", "union"]);
+            } else {
+                fs::write(repo.join(".git/info/attributes"), "cfg merge=union\n").unwrap();
+            }
+            commit_file(repo, "cfg", &format!("head\n{}", "x\n".repeat(9)));
+            git(lane, &["merge", "--ff-only", "main"]);
+            fs::write(lane.join("cfg"), format!("head\n{}", "x\n".repeat(10))).unwrap();
+            git(lane, &["commit", "-am", "one more row"]);
+            fs::write(repo.join("cfg"), format!("HEAD\n{}", "x\n".repeat(9))).unwrap();
+            git(repo, &["commit", "-am", "main edits another line"]);
+        });
+        assert_refused_keeping_tip(&fx);
+        assert_eq!(
+            git(&fx.repo, &["show", "cadence/test:cfg"])
+                .matches('x')
+                .count(),
+            10
+        );
+    }
 }
