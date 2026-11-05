@@ -424,10 +424,10 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
             </ul>
           )}
           <div className="mt-3">
-            {(() => {
+            {removed ? null : (() => {
               const href = installationAppHref(installs, inst.install_id);
               return href === null ? (
-                <span className="text-micro text-ink-500">{t("No unique app page — the app key names more than one installation.")}</span>
+                <span className="text-micro text-ink-500">{t("The app page is unavailable for this installation.")}</span>
               ) : (
                 <Link className="btn btn-sm" href={href}>{t("Open its page")}</Link>
               );
