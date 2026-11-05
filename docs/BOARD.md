@@ -1237,12 +1237,14 @@ checkout is not guessed at. It refuses, naming what it found, while:
   an abandoned lane and reports `not_started: true` (CAD-275), or
 - the branch's work survives nowhere: not merged into the repo's
   default branch (`origin/HEAD`, else the checkout's current branch)
-  and not pushed to a remote-tracking ref. "Merged" recognizes
-  however the work landed — ancestry, `git cherry` patch-equivalence
-  (rebase/cherry-pick), the branch's combined diff reverse-applying
-  onto the default tree (a squash merge, checked in a temporary index
-  so no worktree is touched), or a merged GitHub PR naming the head
-  branch. The output's `merged_by` reports which rule matched.
+  and not pushed to a remote-tracking ref. "Merged" means the exact
+  tip survives somewhere durable: ancestry of the default ref, or a
+  merged GitHub PR on origin's own repository whose head is exactly
+  the tip (CAD-2181). Content inference (`git cherry`, a diff that
+  reverse-applies) is never evidence — it is forgeable by content
+  shape. A squash-merged lane with no PR, or on a non-GitHub origin,
+  is kept: push it, or `--force`. The output's `merged_by` reports
+  which rule matched.
 
 Then it runs `git worktree remove`, deletes the local branch (with
 `--remote` the remote one too), and lands one tracker commit
