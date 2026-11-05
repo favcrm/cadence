@@ -1628,6 +1628,7 @@ Object.assign(zhTW, {
   "Reasoning": "思考",
   "Finished": "已完成",
   "not available": "無法使用",
+  "not run": "未執行",
   "A queued message was withdrawn too. Send it again if you still need it.": "排隊中的訊息也已撤回。如仍需要，請再次傳送。",
   "Withdrawn when the turn was stopped. Retry to send it again.": "停止此回合時已撤回。請重試以再次傳送。",
   "Commands aren't available in this chat, so this wasn't sent. To send it as a message, start with something other than /.": "此對話無法使用指令，因此未傳送。如要以訊息傳送，請不要以 / 開頭。",

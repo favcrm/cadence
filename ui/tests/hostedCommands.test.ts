@@ -175,6 +175,7 @@ async function main() {
   assert(!requests.some((r) => r.startsWith("POST")), `words after a no-argument verb send nothing (got ${requests.join(", ")})`);
   assert(box()?.value === sentence, "and stay in the box");
   assert(host.querySelector('[data-cmd="new"]')?.textContent?.includes("takes nothing after its name"), "and the card says why");
+  assert(host.querySelector('[data-cmd="new"]')?.textContent?.includes("not run") && !host.querySelector('[data-cmd="new"]')?.textContent?.includes("not available"), "and does not call an available verb unavailable");
 
   // Stopping withdraws what was queued, and the board hands it back.
   await React.act(async () => { root.render(null); });
