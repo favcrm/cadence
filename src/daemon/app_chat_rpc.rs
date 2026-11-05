@@ -26,8 +26,9 @@
 //! declaration and the stored provenance). The projection is a browser
 //! hint, never a grant: every operational call re-proves the current
 //! exact-digest consent and declaration rather than trusting this read.
-//! PDF/image processing does not exist, so only text kinds are servable.
-//! The `descriptor` JSON itself is unchanged.
+//! The scoped service retains text, SVG source, PDF and PNG/JPEG/WebP;
+//! visual kinds are delivered as native image pixels, not text. The
+//! `descriptor` JSON itself is unchanged.
 
 use serde_json::{json, Value};
 

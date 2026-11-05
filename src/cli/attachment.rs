@@ -8,8 +8,9 @@ use super::*;
 
 #[derive(Subcommand)]
 pub(crate) enum AttachmentAction {
-    /// Read one retained attachment: bounded text for txt/md/csv.
-    /// From an agent pane it must be the master's own running turn.
+    /// Read one retained attachment: bounded text for text/SVG/PDF, or
+    /// a visual receipt for a raster image. From an agent pane it must be
+    /// the master's own running turn.
     Read {
         /// The daemon-minted `chf-…` id the attachments envelope names.
         id: String,

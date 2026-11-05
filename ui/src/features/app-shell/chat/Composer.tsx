@@ -11,7 +11,7 @@ import {
 import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
-import { ATTACH_ACCEPT, attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
+import { attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
 import type { UiNotice } from "../../../lib/uiNotice";
 import {
   addFiles,
@@ -676,7 +676,6 @@ export default function Composer({
       ref={fileInput}
       type="file"
       multiple
-      accept={ATTACH_ACCEPT}
       className="sr-only"
       aria-hidden="true"
       tabIndex={-1}
@@ -692,7 +691,7 @@ export default function Composer({
       className="app-chat-attach"
       aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : "unavailable"}`}
       title={attachEnabled
-        ? t("Attach files (pdf, txt, md, csv, json, yaml, xml — up to 10 MiB each)")
+        ? t("Attach files (up to 10 MiB each)")
         : typeof attach === "object" ? attach.reason : t("Attach is unavailable")}
       disabled={!!block || !attachEnabled}
       onClick={() => fileInput.current?.click()}

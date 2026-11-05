@@ -1,5 +1,4 @@
 import {
-  ATTACH_EXTS,
   ATTACH_MAX_BYTES,
   ATTACH_MAX_FILES,
   attachFits,
@@ -18,28 +17,11 @@ function equal(actual: unknown, expected: unknown, what: string): void {
   if (a !== e) throw new Error(`${what}: expected ${e}, got ${a}`);
 }
 
-// ---- the v1 allowlist and cap (client pre-check; the daemon re-checks) ---
+// ---- the size cap (the server checks the content) ----------------------
 
-equal(
-  ATTACH_EXTS,
-  ["pdf", "txt", "md", "markdown", "csv", "tsv", "json", "jsonl", "yaml", "yml", "xml"],
-  "the processable allowlist",
-);
-equal(attachRefusal("brief.pdf", 100), null, "a PDF passes the pre-flight check");
-equal(attachRefusal("data.json", 100), null, "JSON passes the pre-flight check");
-equal(attachRefusal("conf.yaml", 100), null, "YAML passes the pre-flight check");
-equal(attachRefusal("rows.tsv", 100), null, "TSV passes the pre-flight check");
-equal(attachRefusal("feed.xml", 100), null, "XML passes the pre-flight check");
-equal(attachRefusal("reference.png", 100)?.includes("Image processing is not available yet"), true, "an image is honestly unavailable");
-equal(ATTACH_MAX_BYTES, 10 * 1024 * 1024, "10 MiB cap");
-
-equal(attachRefusal("notes.txt", 100), null, "a small text file goes");
-equal(attachRefusal("brief.CSV", 100), null, "extensions are case-insensitive");
-equal(attachRefusal("a.exe", 100) !== null, true, "an off-list extension refuses");
-equal(attachRefusal("noext", 100) !== null, true, "no extension refuses");
-equal(attachRefusal("a.txt", 0) !== null, true, "an empty file refuses");
-equal(attachRefusal("a.txt", ATTACH_MAX_BYTES), null, "exactly at the cap goes");
-equal(attachRefusal("a.txt", ATTACH_MAX_BYTES + 1) !== null, true, "one byte over refuses");
+equal(attachRefusal(0) !== null, true, "an empty file refuses");
+equal(attachRefusal(ATTACH_MAX_BYTES), null, "exactly at the cap goes");
+equal(attachRefusal(ATTACH_MAX_BYTES + 1) !== null, true, "one byte over refuses");
 
 // ---- the count cap --------------------------------------------------------
 
@@ -89,11 +71,6 @@ equal(isPermanentUploadFailure(503), false, "a 5xx is retryable");
 equal(isPermanentUploadFailure(429), false, "a rate limit is retryable");
 equal(isPermanentUploadFailure(undefined), false, "an abort is retryable");
 equal(attachMeta("customers.csv", 180 * 1024), "180 KB · CSV", "size and kind like the mock's file rows");
-equal(
-  (unresolvedHint([{ ...item("a", "failed"), error: "Image processing is not available yet — .png cannot be attached" }]) ?? "").includes(".png cannot be attached"),
-  true,
-  "the hold line carries the specific reason, not a generic count",
-);
 equal(attachMeta("invoice.pdf", 142 * 1024), "142 KB · PDF", "a PDF row says PDF");
 equal(attachMeta("data.json", 2 * 1024), "2 KB · JSON", "a JSON row says JSON");
 

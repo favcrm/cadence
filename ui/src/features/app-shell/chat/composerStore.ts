@@ -665,7 +665,7 @@ export function addFiles(key: string, files: Iterable<File>, destination?: Attac
   const added: AttachItem[] = [];
   for (const file of files) {
     const itemKey = `a${++nextItemKey}`;
-    const problem = attachRefusal(file.name, file.size) ?? attachFits(have, 1);
+    const problem = attachRefusal(file.size) ?? attachFits(have, 1);
     have += 1;
     if (problem !== null) {
       added.push({
@@ -720,8 +720,8 @@ export function retryAttach(key: string, itemKey: string): void {
   const item = q.items.find((a) => a.key === itemKey);
   if (!item || item.status !== "failed" || item.permanent) return;
   // The same pre-flight checks as a fresh pick: a retry never admits a
-  // file addition would have refused (kind, size, count).
-  const problem = attachRefusal(item.name, item.size) ?? attachFits(q.items.length - 1, 1);
+  // file addition would have refused (size, count).
+  const problem = attachRefusal(item.size) ?? attachFits(q.items.length - 1, 1);
   if (problem !== null) {
     q.items = q.items.map((a) => (a.key === itemKey ? { ...a, error: problem, permanent: true } : a));
     publish(cell);

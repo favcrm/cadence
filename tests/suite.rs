@@ -8,6 +8,25 @@ fn an_identifier_is_validated_before_anything_uses_it() {
     assert!(cadence_agent::proto::identifier("not a valid id", "issue id").is_err());
 }
 
+// CAD-2162 security acceptance, authored independently of the implementation.
+#[test]
+fn svg_attachment_refuses_active_external_references() {
+    use cadence_agent::attachment_image::validate_svg_source;
+
+    let allowed = r##"<svg xmlns="http://www.w3.org/2000/svg"><title>A &amp; B</title><rect width="1" height="1"/></svg>"##;
+    assert!(validate_svg_source(allowed).is_ok());
+
+    let bypass = r##"<svg xmlns="http://www.w3.org/2000/svg">&lt;!--<image href="https://example.invalid/x.png" width="1" height="1"/><!-- --></svg>"##;
+    let encoded_href = r##"<svg xmlns="http://www.w3.org/2000/svg"><image href="&#x68;ttps://example.invalid/x.png"/></svg>"##;
+    let hidden_handler = r##"<svg xmlns="http://www.w3.org/2000/svg">&lt;!--<rect onload="alert(1)"/><!-- --></svg>"##;
+    for source in [bypass, encoded_href, hidden_handler] {
+        assert!(
+            validate_svg_source(source).is_err(),
+            "unsafe SVG passed: {source}"
+        );
+    }
+}
+
 // CAD-1981 acceptance, authored by the ticket author; implementers must not edit it.
 #[test]
 fn audit_verdicts_respect_the_invocations_organization() {

@@ -28,8 +28,9 @@
 //!   read against the turn's own `message_app` + `message_conversation`,
 //!   an operator read against the stored conversation and the current
 //!   approved declaration — the operator never bypasses scope merely by
-//!   being the operator. Only text kinds are retained; a read returns
-//!   bounded secret-scanned text.
+//!   being the operator. Text/SVG/PDF reads return bounded secret-scanned
+//!   text; a raster image reports that it is delivered as native image
+//!   pixels and has no text projection.
 
 use std::path::PathBuf;
 

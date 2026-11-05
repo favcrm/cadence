@@ -5,35 +5,10 @@
  * so Composer stays a thin wrapper and the rules are testable.
  */
 
-/** The kinds the composer offers and the daemon accepts: a PDF, whose text the
- *  daemon extracts under its own cap, and the UTF-8 structured text kinds. */
-export const ATTACH_EXTS = [
-  "pdf",
-  "txt",
-  "md",
-  "markdown",
-  "csv",
-  "tsv",
-  "json",
-  "jsonl",
-  "yaml",
-  "yml",
-  "xml",
-];
 type Translate = (english: string) => string;
 const identity: Translate = (english) => english;
-/** The file picker's accept list — both densities share it. Image kinds are
- *  absent: their representation is CAD-1233, so a selection of one is refused
- *  here and at the daemon rather than uploaded as unprocessed bytes. */
-export const ATTACH_ACCEPT = ATTACH_EXTS.map((e) => `.${e}`).join(",");
 export const ATTACH_MAX_BYTES = 10 * 1024 * 1024;
 export const ATTACH_MAX_FILES = 5;
-
-/** Image kinds this build cannot represent to a model yet. */
-export const ATTACH_UNAVAILABLE_EXTS = ["png", "jpg", "jpeg", "webp", "gif"];
-
-/** The allowlist as the operator reads it in a refusal. */
-const ATTACH_LIST = "pdf, txt, md, markdown, csv, tsv, json, jsonl, yaml and xml";
 
 export interface AttachDestination {
   /** Absent for Home; app uploads must carry their install and conversation. */
@@ -55,7 +30,7 @@ export interface AttachItem {
   id?: string;
   mime?: string;
   error?: string;
-  /** A refusal a retry cannot change (kind, size, count, daemon 4xx):
+  /** A refusal a retry cannot change (size, count, daemon 4xx):
    *  the row offers Remove only. Transient failures keep Retry. */
   permanent?: boolean;
   /** Which upload this row awaits — a remove/re-pick bumps it, so a
@@ -65,32 +40,15 @@ export interface AttachItem {
   destination?: AttachDestination;
 }
 
-/** The client's early refusal — the daemon re-checks bytes and the
- *  sniffed kind, so this is a pre-flight hint, never enforcement. */
-export function attachRefusal(name: string, size: number): string | null {
-  const ext = name.toLowerCase().split(".").pop() ?? "";
-  if (ATTACH_UNAVAILABLE_EXTS.includes(ext))
-    return `Image processing is not available yet — .${ext} cannot be attached`;
-  if (!ATTACH_EXTS.includes(ext))
-    return `${ext ? `.${ext}` : "that type"} is not attachable (${ATTACH_LIST})`;
+/** The client checks the size; the server decides whether the bytes are usable. */
+export function attachRefusal(size: number): string | null {
   if (size === 0) return "empty file — nothing to attach";
   if (size > ATTACH_MAX_BYTES) return `over 10 MiB — rejected`;
   return null;
 }
 
-/** The daemon words a refusal "chat_file_upload refused 'x.txt': …"; the
- *  operator reads only the reason, never the RPC name or the file again. */
+/** Translate local validation messages, including the dynamic attachment count. */
 export function displayAttachError(message: string, t: Translate = identity): string {
-  const image = /^Image processing is not available yet — (\.[^ ]+) cannot be attached$/.exec(message);
-  if (image)
-    return t("Image processing is not available yet — {ext} cannot be attached").replace("{ext}", () => image[1]);
-  // Rows retained before images were narrowed carry the older sentence.
-  const unavailable = /^PDF and image processing is not available yet — (\.[^ ]+) cannot be attached$/.exec(message);
-  if (unavailable)
-    return t("PDF and image processing is not available yet — {ext} cannot be attached").replace("{ext}", () => unavailable[1]);
-  const unsupported = /^(.+?) is not attachable \(([^)]+)\)$/.exec(message);
-  if (unsupported)
-    return `${unsupported[1]} ${t(`is not attachable (${unsupported[2]})`)}`;
   const count = /^at most (\d+) attachments per message$/.exec(message);
   if (count)
     return t("at most {count} attachments per message").replace("{count}", () => count[1]);
@@ -111,8 +69,7 @@ export function isPermanentUploadFailure(status: number | undefined): boolean {
   return status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
-/** The kind label for a row's meta line. Only the kinds the allowlist can
- *  actually produce are named; anything else falls back to its extension. */
+/** The kind label for a row's meta line; other kinds fall back to their extension. */
 const KIND_LABELS: Record<string, string> = {
   csv: "CSV",
   tsv: "TSV",

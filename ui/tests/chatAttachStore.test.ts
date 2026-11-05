@@ -6,19 +6,17 @@ function equal(actual: unknown, expected: unknown, what: string): void {
   if (a !== e) throw new Error(`${what}: expected ${e}, got ${a}`);
 }
 
-// A refused kind lands as a failed, permanent row with a visible reason;
-// Retry never re-sends it (no upload is attempted, the row is unchanged).
+// An empty file lands as a permanent refusal; retry never re-sends it.
 const key = "attach-store-test";
-addFiles(key, [new File(["\x89PNG\r\n\x1a\n"], "photo.png")]);
-const [image] = attachItems(key);
-equal(image.status, "failed", "an image is refused at selection");
-equal(image.permanent, true, "a pre-flight refusal is permanent");
-equal(String(image.error).includes("Image processing is not available yet"), true, "the reason is specific");
-retryAttach(key, image.key);
+addFiles(key, [new File([], "empty.txt")]);
+const [empty] = attachItems(key);
+equal(empty.status, "failed", "an empty file is refused at selection");
+equal(empty.permanent, true, "a pre-flight refusal is permanent");
+retryAttach(key, empty.key);
 equal(attachItems(key)[0].status, "failed", "Retry on a permanent refusal changes nothing");
 
 // The sixth file is refused at selection and stays refused on Retry.
-for (let i = 0; i < 4; i++) addFiles(key, [new File(["x"], `bad${i}.exe`)]);
+for (let i = 0; i < 4; i++) addFiles(key, [new File([], `empty${i}.txt`)]);
 equal(attachItems(key).length, 5, "five rows queued");
 addFiles(key, [new File(["x"], "sixth.txt")]);
 const sixth = attachItems(key)[5];
