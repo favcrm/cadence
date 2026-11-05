@@ -946,7 +946,7 @@ mod cad2081_workflow_verdicts {
                 "no_readiness": case.no_readiness, "qa_comments": case.qa_comments, "native": case.native,
                 "tip_fails": case.tip_fails, "tip_sha": case.tip_sha,
                 "approved_head": case.approved_head, "no_qa_evidence": case.no_qa_evidence,
-                "board_asks_qa": case.board_asks_qa,
+                "board_asks_qa": case.board_asks_qa, "qa_evidence_url": case.qa_evidence_url,
                 "identities": if case.no_identity_map { Value::Null } else {
                     case.identities.clone().unwrap_or_else(Self::identities) },
             });
@@ -1005,6 +1005,7 @@ mod cad2081_workflow_verdicts {
         approved_head: Option<String>,
         no_qa_evidence: bool,
         board_asks_qa: bool,
+        qa_evidence_url: Option<String>,
     }
 
     fn scenario(rows: Vec<Value>) -> Scenario {
@@ -1028,6 +1029,7 @@ mod cad2081_workflow_verdicts {
             approved_head: None,
             no_qa_evidence: false,
             board_asks_qa: false,
+            qa_evidence_url: None,
         }
     }
 
@@ -2556,11 +2558,8 @@ mod cad2081_workflow_verdicts {
         const NOT_ON_PR: &str = "the --browser-qa comment 55 is not on this PR";
         const UNREADABLE: &str = "cannot read the --browser-qa comment 55";
         const EDITED: &str = "the --browser-qa comment 55 was edited after posting";
-        const HIDDEN: &str = "the --browser-qa comment 55 holds text a person cannot see";
-        const RESULT: &str = "the --browser-qa comment 55 must have one line `Browser QA: pass`";
-        const HEAD: &str = "the --browser-qa comment 55 must have one line `Head: ";
+        const EXACT: &str = "the --browser-qa comment 55 must be exactly the two lines";
         const NOT_MEMBER: &str = "the --browser-qa comment 55 is not by a repository member";
-        const THE_COMMENT: &str = "--browser-qa comment 55";
         // A comment that does not hold leaves the PR where it was: it needs a Browser QA row.
         const NO_QA: &str = "a ui/ change needs a pass Browser QA verdict";
         const BOTH: &str = "--browser-qa also needs a pass from both review workflows at this head";
@@ -2624,30 +2623,6 @@ mod cad2081_workflow_verdicts {
         let exactly = |label: &str, case: Scenario, whys: &[&str]| {
             fail(refusal_mismatch(&f, label, &case, whys))
         };
-        // The reason's wording is the gate's to choose where the rule names no message;
-        // the refusal must still be about the comment, and nothing else.
-        let on_the_comment = |label: &str, case: Scenario| {
-            let (code, stdout, stderr) = f.gate(&case);
-            let lines: Vec<&str> = stderr
-                .lines()
-                .filter(|l| l.contains(": refused: "))
-                .collect();
-            println!("[{label}] exit {code}");
-            for line in &lines {
-                println!("    {line}");
-            }
-            let about = lines.iter().any(|l| l.contains(THE_COMMENT));
-            let other = lines
-                .iter()
-                .any(|l| !l.contains(THE_COMMENT) && !l.contains(NO_QA));
-            if code != 1 || stdout.contains("every rule holds") {
-                fail(Some(format!("{label}: NOT REFUSED (exit {code})")));
-            } else if !about || other {
-                fail(Some(format!(
-                    "{label}: refused otherwise\n  stderr: {stderr}"
-                )));
-            }
-        };
         let passes = |label: &str, case: Scenario| {
             let (code, stdout, stderr) = f.gate(&case);
             println!("[{label}] exit {code}");
@@ -2676,27 +2651,26 @@ mod cad2081_workflow_verdicts {
             saying(&format!("Browser QA: pass\r\nHead: {head}\r\n")),
         );
         passes(
-            "a report around the two lines",
+            "no trailing newline",
+            saying(&format!("Browser QA: pass\nHead: {head}")),
+        );
+        passes(
+            "many trailing newlines, which render as nothing",
             saying(&format!(
-                "Drove the agent panel in headless Chrome.\n\nBrowser QA: pass\nHead: {head}\n"
+                "Browser QA: pass\nHead: {head}{}",
+                "\n".repeat(50)
             )),
         );
-
         passes(
-            "a trailing space, which renders the same",
-            saying(&format!("Browser QA: pass \nHead: {head} \n")),
+            "many trailing CRLFs",
+            saying(&format!(
+                "Browser QA: pass\r\nHead: {head}{}",
+                "\r\n".repeat(50)
+            )),
         );
         passes(
-            "a closed fence before the lines",
-            saying(&format!("```text\nsome log\n```\n{good}")),
-        );
-        passes(
-            "a closed tilde fence before the lines",
-            saying(&format!("~~~\nsome log\n~~~\n{good}")),
-        );
-        passes(
-            "a closer longer than its opener",
-            saying(&format!("```\nsome log\n`````\n{good}")),
+            "CRLF in the middle, LF at the end",
+            saying(&format!("Browser QA: pass\r\nHead: {head}\n")),
         );
 
         // Without the flag nothing changes: two workflow passes and the approval refuse.
@@ -2881,7 +2855,7 @@ mod cad2081_workflow_verdicts {
             exactly(
                 label,
                 saying(&format!("{line}\nHead: {head}\n")),
-                &[RESULT, NO_QA],
+                &[EXACT, NO_QA],
             );
         }
 
@@ -2920,7 +2894,7 @@ mod cad2081_workflow_verdicts {
             exactly(
                 label,
                 saying(&format!("Browser QA: pass\n{lines}\n")),
-                &[HEAD, NO_QA],
+                &[EXACT, NO_QA],
             );
         }
 
@@ -2940,7 +2914,7 @@ mod cad2081_workflow_verdicts {
                 format!("> Browser QA: pass\n> Head: {head}\n\nI did not run this."),
             ),
         ] {
-            exactly(label, saying(&body), &[RESULT, HEAD, NO_QA]);
+            exactly(label, saying(&body), &[EXACT, NO_QA]);
         }
 
         // Text a person cannot see, around otherwise perfect lines.
@@ -2957,12 +2931,12 @@ mod cad2081_workflow_verdicts {
             ("a character reference", "&#8203;"),
             ("a named character reference", "&nbsp;"),
         ] {
-            exactly(label, saying(&format!("{good}{extra}\n")), &[HIDDEN, NO_QA]);
+            exactly(label, saying(&format!("{good}{extra}\n")), &[EXACT, NO_QA]);
         }
         exactly(
             "a zero-width character inside the result line",
             saying(&format!("Browser\u{200b} QA: pass\nHead: {head}\n")),
-            &[HIDDEN, NO_QA],
+            &[EXACT, NO_QA],
         );
 
         // Lines a person does not read as those lines. Each is a second label beside
@@ -3051,7 +3025,7 @@ mod cad2081_workflow_verdicts {
                 "Browser QA result: fail",
             ),
         ] {
-            exactly(label, saying(&result_then(extra)), &[RESULT, NO_QA]);
+            exactly(label, saying(&result_then(extra)), &[EXACT, NO_QA]);
         }
         for (label, extra) in [
             (
@@ -3066,7 +3040,7 @@ mod cad2081_workflow_verdicts {
             ("a table cell stale head", format!("| Head: {other} |")),
             ("an HTML bold stale head", format!("<b>Head: {other}</b>")),
         ] {
-            exactly(label, saying(&result_then(&extra)), &[HEAD, NO_QA]);
+            exactly(label, saying(&result_then(&extra)), &[EXACT, NO_QA]);
         }
 
         // The one line itself, not quite as written.
@@ -3088,7 +3062,7 @@ mod cad2081_workflow_verdicts {
             exactly(
                 label,
                 saying(&format!("{line}\nHead: {head}\n")),
-                &[RESULT, NO_QA],
+                &[EXACT, NO_QA],
             );
         }
         for (label, line) in [
@@ -3105,7 +3079,7 @@ mod cad2081_workflow_verdicts {
             exactly(
                 label,
                 saying(&format!("Browser QA: pass\n{line}\n")),
-                &[HEAD, NO_QA],
+                &[EXACT, NO_QA],
             );
         }
 
@@ -3166,12 +3140,12 @@ mod cad2081_workflow_verdicts {
                 format!("``` a`b\nlog\n```\n{good}```\n"),
             ),
         ] {
-            exactly(label, saying(&body), &[RESULT, HEAD, NO_QA]);
+            exactly(label, saying(&body), &[EXACT, NO_QA]);
         }
         exactly(
             "a fenced fail beside the pass",
             saying(&format!("```\nBrowser QA: fail\n```\n{good}")),
-            &[RESULT, NO_QA],
+            &[EXACT, NO_QA],
         );
 
         // Text a person cannot see, or lines that do not render as lines at all.
@@ -3214,10 +3188,8 @@ mod cad2081_workflow_verdicts {
                 format!("{good}\n   [//]: # (failed)\n"),
             ),
         ] {
-            exactly(label, saying(&body), &[HIDDEN, NO_QA]);
+            exactly(label, saying(&body), &[EXACT, NO_QA]);
         }
-        // The wording here is the gate's to choose: no message yet names these. The
-        // refusal must still be about the comment, and nothing else.
         for (label, body) in [
             (
                 "a reference with no space after the colon",
@@ -3269,7 +3241,161 @@ mod cad2081_workflow_verdicts {
                 format!("<details>\n\n{good}\n</details>\n"),
             ),
         ] {
-            on_the_comment(label, saying(&body));
+            exactly(label, saying(&body), &[EXACT, NO_QA]);
+        }
+
+        // The rule is the whole body: what the first pass allowed around the lines, and
+        // anything at the edges of the exact string, now refuses.
+        for (label, body) in [
+            (
+                "a report around the two lines",
+                format!("Drove the panel in Chrome.\n\n{good}"),
+            ),
+            (
+                "a report after the two lines",
+                format!("{good}\nDrove the panel in Chrome.\n"),
+            ),
+            (
+                "a closed fence before the lines",
+                format!("```text\nsome log\n```\n{good}"),
+            ),
+            (
+                "a closed tilde fence before the lines",
+                format!("~~~\nsome log\n~~~\n{good}"),
+            ),
+            (
+                "a closer longer than its opener",
+                format!("```\nsome log\n`````\n{good}"),
+            ),
+            (
+                "a trailing space on the pass line",
+                format!("Browser QA: pass \nHead: {head}\n"),
+            ),
+            (
+                "a trailing space on the head line",
+                format!("Browser QA: pass\nHead: {head} \n"),
+            ),
+            (
+                "two trailing spaces, a hard break",
+                format!("Browser QA: pass  \nHead: {head}\n"),
+            ),
+            (
+                "a trailing tab",
+                format!("Browser QA: pass\nHead: {head}\t"),
+            ),
+            (
+                "a trailing no-break space",
+                format!("Browser QA: pass\nHead: {head}\u{a0}"),
+            ),
+            ("spaces on a last line", format!("{good}  \n")),
+            ("a last line of one space", format!("{good} \n")),
+            ("a leading newline", format!("\n{good}")),
+            ("a leading CRLF", format!("\r\n{good}")),
+            ("a leading space", format!(" {good}")),
+            (
+                "a blank line between the lines",
+                format!("Browser QA: pass\n\nHead: {head}\n"),
+            ),
+            (
+                "a blank CRLF line between the lines",
+                format!("Browser QA: pass\r\n\r\nHead: {head}\r\n"),
+            ),
+            (
+                "the lines in the wrong order",
+                format!("Head: {head}\nBrowser QA: pass\n"),
+            ),
+            (
+                "the first line repeated last",
+                format!("{good}Browser QA: pass\n"),
+            ),
+            ("the whole comment twice", format!("{good}{good}")),
+            (
+                "the lines joined by a lone CR",
+                format!("Browser QA: pass\rHead: {head}"),
+            ),
+            (
+                "a lone CR at the end",
+                format!("Browser QA: pass\nHead: {head}\r"),
+            ),
+            (
+                "LF then CR at the end",
+                format!("Browser QA: pass\nHead: {head}\n\r"),
+            ),
+            (
+                "CR CR LF at the end",
+                format!("Browser QA: pass\nHead: {head}\r\r\n"),
+            ),
+            (
+                "CR CR LF between the lines",
+                format!("Browser QA: pass\r\r\nHead: {head}"),
+            ),
+            (
+                "newlines, then text far below",
+                format!("{good}{}failed\n", "\n".repeat(200)),
+            ),
+            (
+                "CRLFs, then text far below",
+                format!("{good}{}failed\r\n", "\r\n".repeat(200)),
+            ),
+            (
+                "a vertical tab at the end",
+                format!("Browser QA: pass\nHead: {head}\u{b}"),
+            ),
+            (
+                "a form feed at the end",
+                format!("Browser QA: pass\nHead: {head}\u{c}"),
+            ),
+            (
+                "a next-line control at the end",
+                format!("Browser QA: pass\nHead: {head}\u{85}"),
+            ),
+            (
+                "a line separator at the end",
+                format!("Browser QA: pass\nHead: {head}\u{2028}"),
+            ),
+            (
+                "a NUL at the end",
+                format!("Browser QA: pass\nHead: {head}\u{0}"),
+            ),
+            (
+                "a zero-width space at the end",
+                format!("Browser QA: pass\nHead: {head}\u{200b}"),
+            ),
+            (
+                "a variation selector at the end",
+                format!("Browser QA: pass\nHead: {head}\u{fe0f}"),
+            ),
+            ("a byte order mark at the start", format!("\u{feff}{good}")),
+            (
+                "a lookalike letter in the pass",
+                format!("Browser QA: p\u{430}ss\nHead: {head}"),
+            ),
+            (
+                "a head of the wrong length",
+                format!("Browser QA: pass\nHead: {head}0"),
+            ),
+        ] {
+            exactly(label, saying(&body), &[EXACT, NO_QA]);
+        }
+        // A lookalike the case-insensitive match lets through: the gate reads the real
+        // comment, but what it records, and what a person would follow, is this URL.
+        for (label, url) in [
+            (
+                "a dotless i in the host",
+                "https://g\u{131}thub.com/favcrm/cadence/pull/7#issuecomment-55",
+            ),
+            (
+                "a long s in the scheme",
+                "http\u{17f}://github.com/favcrm/cadence/pull/7#issuecomment-55",
+            ),
+            (
+                "a long s in the fragment",
+                "https://github.com/favcrm/cadence/pull/7#i\u{17f}\u{17f}uecomment-55",
+            ),
+        ] {
+            let mut case = routed(two(), comment(&good), url);
+            case.qa_evidence_url = Some(url.to_string());
+            exactly(label, case, &[NOT_THIS_PR, NO_QA]);
         }
 
         // Who wrote it: the repository is public, so anyone can comment.
@@ -3432,7 +3558,7 @@ mod cad2081_workflow_verdicts {
                 comment(&format!("Browser QA: fail\nHead: {head}\n")),
                 URL,
             ),
-            &[RESULT],
+            &[EXACT],
         );
 
         // The approval: this head, from the operator, and nothing in its place.

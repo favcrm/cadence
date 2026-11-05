@@ -89,6 +89,8 @@ def cadence():
         for comment_id in () if S.get("no_qa_evidence") else (S.get("qa_comments") or {}):
             body += (f"Browser QA comment: https://github.com/{S['repo']}/pull/{S['pr']}"
                      f"#issuecomment-{comment_id}\n")
+        if S.get("qa_evidence_url"):
+            body += f"Browser QA comment: {S['qa_evidence_url']}\n"
         out({"id": "CAD-1", "project": "cadence", "owner": None, "claim": None,
              "comments": [{"body": body}]})
     if ARGS[:2] == ["delivery", "requirements"]:
