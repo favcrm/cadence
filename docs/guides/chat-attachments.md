@@ -131,14 +131,15 @@ quota are described in [Quota admission contract](#quota-admission-contract).
    carries a daemon-minted `chf-<32-hex>` id and its digest is verified on read.
 5. `thread_send` accepts `attachments: [{id}]` (1–5 ids, `chf-` grammar) from
    the operator chat only. **Readiness is checked against the actual bytes,
-   not the row's existence**: the row must be a readable kind, the blob must
-   exist as a regular file, and its bounded content must still match the
-   declared size and digest, sniff as the declared kind, extract (a PDF
-   through the bounded converter; a text kind by decoding) and pass the
-   secret gate. A visual kind is additionally proved here and at upload: an
-   SVG screens and renders, a raster decodes inside the bounds, and the
-   selected model admits image input. An altered, unreadable, oversized or
-   mislabelled row refuses the send before the message is queued. Version-1
+   not the row's existence**: the blob must exist as a regular file, and its
+   bounded content must still match the declared size and digest and sniff as
+   the declared kind. A PDF must extract through the bounded converter, a text
+   kind must decode, and a raster must decode to pixels — it has no text to
+   extract. Text kinds also pass the secret gate. A visual kind is
+   additionally proved here and at upload: an SVG screens and renders, a
+   raster decodes inside the bounds, and the selected model admits image
+   input. An altered, unreadable, oversized or mislabelled row refuses the
+   send before the message is queued. Version-1
    paths derive from the validated stored owner/thread/attachment tuple;
    legacy paths derive from the validated stored digest, never request data.
 6. The resolved `{id,name,size,mime,sha256}` rows are stored on the entry's
@@ -218,7 +219,7 @@ quota are described in [Quota admission contract](#quota-admission-contract).
   caller-supplied ancestor alias that no longer resolves to the staging
   dir (the source is read through the server-owned staging directory, not
   the caller's path); a retained file whose on-disk bytes no longer match
-  its recorded size/digest, that no longer sniffs as an allowed text kind,
+  its recorded size/digest, that no longer sniffs as its recorded kind,
   or whose digest path is a symlink or FIFO (`thread_send` and
   `chat_file_read` both re-check with a bounded no-follow open).
 - A board upload-staging name that already exists (the board uses

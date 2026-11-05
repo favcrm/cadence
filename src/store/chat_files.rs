@@ -986,6 +986,13 @@ impl Store {
         let sha256 = sha256_hex(&bytes);
         let mime = check_kind(&name, sniff_head(&bytes))?.to_string();
         checked_attachment_body(&name, &mime, &bytes)?;
+        // The caller's own delivery proof runs on the exact bytes it is about
+        // to report, before dedup can return an older row and before any
+        // custody or quota is committed: a visual kind that cannot be
+        // screened, rendered or admitted by the selected model is refused
+        // here, so nothing is retained, charged, or reported ready — including
+        // a re-upload of a file whose model or renderer has since changed.
+        deliverable(&mime, &bytes)?;
         if let Some(existing) =
             self.chat_file_by_user_sha(&sha256, scope, context_id, user_id, thread_id)?
         {
@@ -993,11 +1000,6 @@ impl Store {
             self.chat_file_ready_checked_bytes(&existing, actual)?;
             return Ok(existing);
         }
-        // The caller's own delivery proof runs on the exact bytes about to be
-        // published, before any custody or quota is committed: a visual kind
-        // that cannot be screened, rendered or admitted by the selected model
-        // is refused here, so nothing is retained, charged or reported ready.
-        deliverable(&mime, &bytes)?;
         enforce_workspace_quota(
             self,
             &legacy_root,
