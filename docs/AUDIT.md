@@ -331,7 +331,8 @@ operator secret file. The residual carries over: a same-uid process
 that reads `<state>/operator/secret` and passes the proof can mint a
 link. A process cadence launched (a pane, a managed endpoint, a runner,
 anything the daemon started) must evade the proof — `setsid -f` with a
-scrubbed env and stdio. No test pins this. **A same-uid process cadence never launched needs little or no
+scrubbed env and stdio. No test pins this.
+**A same-uid process cadence never launched needs little or no
 evasion**: an agent CLI the operator started by hand, outside every
 registered pane, passes the proof as it is when it carries no known
 marker or runs on another store, and otherwise has to scrub its

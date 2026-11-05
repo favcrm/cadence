@@ -120,7 +120,7 @@ pub(crate) enum AuditAction {
         /// Hosted orgs only (CAD-2150): also print each note's review text as
         /// `body`, so a REVISE can be read. Never sent by the merge gate and
         /// never counted; the text is board-supplied, bounded, and printed
-        /// with control characters replaced. A board that predates it still
+        /// with control and invisible characters replaced. A board that predates it still
         /// answers the rows, with `bodies` saying the text is unavailable.
         #[arg(long)]
         body: bool,
