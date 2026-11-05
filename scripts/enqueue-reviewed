@@ -66,8 +66,12 @@ under one login. CAD-2081 adds workflow-issued rows (see AGENTS.md "Review"); th
 workflows (CAD-2088) are live, a cheap first pass beside fresh-session reviews on
 gate, security, schema and release PRs, and two of them satisfy other PRs. A
 hosted board has no readiness record, so a hosted `routine` PR takes those two
-workflow reviews and the operator approval they carry (CAD-2135). On hosted today
-`ui/**` PRs still need the temporary exception below, which runs to 2026-12-31.
+workflow reviews and the operator approval they carry (CAD-2135). A hosted `ui/**`
+PR takes those two workflow reviews, operator approval, and `--browser-qa <url>`
+naming a comment on this PR with the lines `Browser QA: pass` and `Head: <full sha>`
+(CAD-2173). This binds the claim to the head; it cannot prove the QA ran, and the
+operator's approval accepts that. The temporary exception below also still serves
+until it ends on 2026-12-31.
 
 CAD-1946 temporary exception: `--exception --advisory standards=<url> --advisory
 spec-security=<url>` (and `browser-qa=<url>` for a `ui/` change) waives only the
@@ -1149,7 +1153,8 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
         reasons.append(f"a ui/ change needs a pass Browser QA verdict for {issue} pinned to this head, from someone other than the author; "
                        "the review workflows file only Standards and Spec/security, so they cannot supply it; "
                        "on hosted, agents file no Browser QA verdict: post the findings as a PR comment and use it "
-                       "as the browser-qa advisory under --exception (AGENTS.md \"Review\")")
+                       "as the browser-qa advisory under --exception, or name it with --browser-qa "
+                       "(AGENTS.md \"Review\")")
     return reasons, counted
 
 
@@ -1201,6 +1206,41 @@ def hosted_routine_reasons(verdicts, counted, hosted, repo, pr, head):
             + (": " + "; ".join(commands) if commands else "")
             + (f"; filed but not counted: {', '.join(sorted(stuck))}. A filed review cannot be "
                "filed again at this head; a new row takes a new commit" if stuck else "")]
+
+
+def browser_qa_comment_reasons(url, repo, pr, head):
+    """Why a `--browser-qa` comment does not bind a pass to this head (CAD-2173).
+
+    It proves who said what about which head, not that the QA ran, so the route also
+    takes the operator's approval. One edit could turn a fail into a pass after the
+    fact, so an edited comment does not count: post a new one."""
+    m = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/pull/{pr}#issuecomment-([0-9]+)",
+                     url, re.IGNORECASE)
+    if not m:
+        return [f"--browser-qa must name a comment on this PR: {url!r}"]
+    rc, out, _ = run(["gh", "api", f"repos/{repo}/issues/comments/{m.group(1)}"])
+    try:
+        comment = json.loads(out) if rc == 0 else None
+    except ValueError:
+        comment = None
+    if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+        return [f"cannot read the --browser-qa comment {m.group(1)} (fail closed)"]
+    if (comment.get("issue_url") or "").lower() != f"https://api.github.com/repos/{repo}/issues/{pr}".lower():
+        return [f"the --browser-qa comment {m.group(1)} is not on this PR"]
+    if not comment.get("created_at") or comment.get("updated_at") != comment["created_at"]:
+        return [f"the --browser-qa comment {m.group(1)} was edited after posting: post a new one"]
+    body = comment["body"]
+    if hides_text(body):
+        return [f"the --browser-qa comment {m.group(1)} holds text a person cannot see"]
+    lines = [line.strip() for line in body.splitlines()]
+    results = [line for line in lines if line.lower().startswith("browser qa:")]
+    heads = [line for line in lines if line.lower().startswith("head:")]
+    reasons = []
+    if results != ["Browser QA: pass"]:
+        reasons.append(f"the --browser-qa comment {m.group(1)} must have one line `Browser QA: pass`")
+    if heads != [f"Head: {head}"]:
+        reasons.append(f"the --browser-qa comment {m.group(1)} must have one line `Head: {head}`")
+    return reasons
 
 
 ADVISORY_KINDS = ("standards", "spec-security", "browser-qa")
@@ -1771,6 +1811,17 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         active = authority is not None and authority["requirements"]["activation"] == "active"
         klass = authority["requirements"]["class"] if authority else None
         counted = []
+        qa_by_comment = False
+        if args.browser_qa:
+            if hosted is None:
+                reasons.append("--browser-qa is for a hosted org")
+            elif not need_qa:
+                reasons.append("--browser-qa is for a ui/ change, and this PR has none")
+            else:
+                rs = browser_qa_comment_reasons(args.browser_qa, repo, pr, head)
+                reasons += rs
+                qa_by_comment = not rs
+        row_qa = need_qa and not qa_by_comment
         if args.exception:
             rc, ends, err = run([sys.executable, GATE_SCRIPT, "exception-open"])
             if rc != 0:
@@ -1790,7 +1841,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         elif not active or klass == "strict":
             native_one = bool(authority and authority["requirements"]["reviews"] == 1)
             effective_one = one and native_one
-            rs, counted = check_reviews(verdicts, effective_one, need_qa, authors, issue, hosted)
+            rs, counted = check_reviews(verdicts, effective_one, row_qa, authors, issue, hosted)
             reasons += rs
         elif klass == "routine":
             if authority["readiness"] is None and origin == "hosted":
@@ -1812,7 +1863,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                         "a workflow review that is not a pass always refuses"
                         for v in verdicts if is_workflow_row(v) and v["outcome"] != "pass"]
         elif klass == "consequential":
-            rs, counted = check_reviews(verdicts, True, need_qa, authors, issue, hosted)
+            rs, counted = check_reviews(verdicts, True, row_qa, authors, issue, hosted)
             reasons += rs
             combined = [n for n in counted if n.get("kind") == "combined"]
             # Two counted workflow reviews, Standards plus Spec/security from distinct
@@ -1820,6 +1871,10 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             if (len({reviewer_key(n, hosted) for n in combined}) != 1
                     and not two_workflow_reviews(counted, hosted)):
                 reasons.append(f"active {klass} delivery requires exactly one independent combined review")
+        if qa_by_comment:
+            required_comment_evidence.append(f"Browser QA comment: {args.browser_qa}")
+            if not two_workflow_reviews(counted, hosted):
+                reasons.append("--browser-qa also needs a pass from both review workflows at this head")
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
 
     # Human class: paths, size, any head-pinned note whose Risk is not exactly `auto`,
@@ -1850,11 +1905,15 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     not_auto = [v for v in verdicts if v["risk"] != "auto"]
     if not_auto:
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
+    if args.browser_qa:
+        # The comment cannot prove the QA ran. The operator accepts that per head, so no
+        # auto-paths entry and no scope approval stands in here.
+        why.append("Browser QA by PR comment")
     if why:
         report.append("class: human (" + "; ".join(why) + ")")
         rs = check_approval(repo, pr, head, report, approval_evidence,
                             hosted_project, issue)
-        if rs and not args.exception:  # legacy CAD-1106 scope fallback only
+        if rs and not args.exception and not args.browser_qa:  # legacy CAD-1106 scope fallback only
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
                              risk_text, one_text, verdicts, counted, report, approval_evidence)
             if sr:
@@ -1888,6 +1947,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                         binding=authority["binding"] if authority else None,
                         requirements=authority["requirements"] if authority else None,
                         readiness=authority["readiness"] if authority else None)
+        if args.browser_qa:
+            evidence["browser_qa"] = args.browser_qa
         if args.exception:
             evidence["exception"] = {"ends": ends, "advisory": dict(args.advisory),
                                      "waives_readiness": waives_readiness}
@@ -1939,6 +2000,8 @@ def evidence_body(evidence):
                       f"Native CI run: {readiness['ci_run_id']} {readiness['ci_run_url']}"))
     if evidence.get("approval"):
         lines.append("Operator approval id: " + evidence["approval"])
+    if evidence.get("browser_qa"):
+        lines.append(f"Browser QA comment: {evidence['browser_qa']}")
     exception = evidence.get("exception")
     if exception:
         waived = "authenticated reviewer attestation"
@@ -2192,6 +2255,8 @@ def main(argv):
                     help="CAD-1946: waive only the missing reviewer attestation; needs --advisory")
     ap.add_argument("--advisory", action="append", default=[], metavar="KIND=URL",
                     help="a separate advisory review: standards, spec-security or browser-qa")
+    ap.add_argument("--browser-qa", metavar="URL",
+                    help="a ui/ change on a hosted org: the PR comment recording its Browser QA")
     ap.add_argument("--poll-secs", type=float, default=30)
     ap.add_argument("--poll-interval", type=float, default=2)
     args = ap.parse_args(argv)
@@ -2200,6 +2265,9 @@ def main(argv):
     args.advisory = {k: v for k, _, v in pairs}
     if len(args.advisory) != len(pairs) or (pairs and not args.exception):
         print(f"{ME}: --advisory takes one KIND=URL per kind, with --exception", file=sys.stderr)
+        return 2
+    if args.browser_qa and args.exception:
+        print(f"{ME}: --browser-qa and --exception are separate routes", file=sys.stderr)
         return 2
     if args.pr < 1 or not FULL_SHA.match(args.head):
         print(f"{ME}: --head must be the full 40-hex SHA and <pr> a positive number", file=sys.stderr)

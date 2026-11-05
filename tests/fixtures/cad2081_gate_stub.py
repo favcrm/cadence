@@ -58,6 +58,12 @@ def gh():
             "id": 9, "name": "ci", "head_sha": S["head"], "status": "completed",
             "conclusion": "success", "started_at": "2026-11-03T10:00:01Z",
             "app": {"id": 15368, "slug": "github-actions"}, "check_suite": {"id": 55}}]})
+    m = re.fullmatch(rf"repos/{re.escape(repo)}/issues/comments/([0-9]+)", path)
+    if m:
+        comment = (S.get("qa_comments") or {}).get(m.group(1))
+        if comment is None:
+            fail("Not Found (HTTP 404)")
+        out(comment)
     m = re.fullmatch(rf"repos/{re.escape(repo)}/contents/(.+)\?ref=([^&]+)", path)
     if m:
         # The ref matters: a file read at the head is not a file read at the base.
@@ -80,6 +86,9 @@ def cadence():
                      + "\nOutcome report: CAD-1/reports/x\nNative CI run: 101 " + RUN_URL + "\n")
         if S.get("class") == "consequential":
             body += "Delivery class: consequential\nPolicy digest: sha256:" + "0" * 64 + "\n"
+        for comment_id in S.get("qa_comments") or {}:
+            body += (f"Browser QA comment: https://github.com/{S['repo']}/pull/{S['pr']}"
+                     f"#issuecomment-{comment_id}\n")
         out({"id": "CAD-1", "project": "cadence", "owner": None, "claim": None,
              "comments": [{"body": body}]})
     if ARGS[:2] == ["delivery", "requirements"]:

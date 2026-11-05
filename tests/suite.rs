@@ -943,7 +943,7 @@ mod cad2081_workflow_verdicts {
                 "repo": REPO, "pr": 7, "title": "CAD-1: add the thing", "head": head,
                 "base": case.base_ref, "base_oid": self.base, "tip": self.tip, "author": "authorlogin",
                 "files_by_ref": by_ref, "verdicts": case.rows, "class": case.class, "approved": case.approved,
-                "no_readiness": case.no_readiness, "native": case.native,
+                "no_readiness": case.no_readiness, "qa_comments": case.qa_comments, "native": case.native,
                 "tip_fails": case.tip_fails, "tip_sha": case.tip_sha,
                 "identities": if case.no_identity_map { Value::Null } else {
                     case.identities.clone().unwrap_or_else(Self::identities) },
@@ -998,6 +998,7 @@ mod cad2081_workflow_verdicts {
         tip_sha: Option<String>,
         no_identity_map: bool,
         no_readiness: bool,
+        qa_comments: Option<Value>,
         native: bool,
     }
 
@@ -1017,6 +1018,7 @@ mod cad2081_workflow_verdicts {
             tip_sha: None,
             no_identity_map: false,
             no_readiness: false,
+            qa_comments: None,
             native: false,
         }
     }
@@ -1268,6 +1270,49 @@ mod cad2081_workflow_verdicts {
             }
             refused(&f, scenario(vec![row, f.spec()]), "records no base_sha");
         }
+    }
+
+    #[test]
+    fn a_ui_change_can_name_its_browser_qa_comment_with_the_workflow_reviews() {
+        // CAD-2173: the implementer's check of the route. It binds the claim to the head.
+        let f = Fixture::new();
+        let head = f.touch("ui/app.txt");
+        let url = "https://github.com/favcrm/cadence/pull/7#issuecomment-55";
+        let comment = |body: String| {
+            json!({"55": {
+                "issue_url": "https://api.github.com/repos/favcrm/cadence/issues/7",
+                "created_at": "2026-11-05T00:00:00Z",
+                "updated_at": "2026-11-05T00:00:00Z",
+                "body": body,
+            }})
+        };
+        let run = |rows: Vec<Value>, body: String| {
+            let mut case = scenario(rows);
+            case.head = Some(head.clone());
+            case.qa_comments = Some(comment(body));
+            case.extra_args = vec!["--browser-qa".into(), url.into()];
+            f.gate(&case)
+        };
+        let (code, stdout, stderr) = run(
+            vec![f.std(), f.spec()],
+            format!("Browser QA: pass\nHead: {head}\n"),
+        );
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("Browser QA by PR comment"), "{stdout}");
+
+        let (code, _, stderr) = run(
+            vec![f.std(), f.spec()],
+            "Browser QA: pass\nHead: 0000\n".into(),
+        );
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stderr.contains("must have one line `Head:"), "{stderr}");
+
+        let (code, _, stderr) = run(vec![f.std()], format!("Browser QA: pass\nHead: {head}\n"));
+        assert_eq!(code, 1, "{stderr}");
+        assert!(
+            stderr.contains("needs a pass from both review workflows"),
+            "{stderr}"
+        );
     }
 
     #[test]
