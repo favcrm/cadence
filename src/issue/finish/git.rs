@@ -263,3 +263,72 @@ pub(crate) fn github_slug(url: &str) -> Option<String> {
     };
     (parts.next().is_none() && ok(owner) && ok(repo)).then(|| format!("{owner}/{repo}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// CAD-2181: a lane whose only "merged" claim is patch equivalence
+    /// (`git cherry`) but which carries an unpushed merge commit with a
+    /// hand edit is NOT merged — that guess is what deleted the only
+    /// copy of the edit. The guess is still reported; it no longer
+    /// authorizes a delete.
+    #[test]
+    fn merge_commit_holding_unique_content_is_not_merge_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-b", "main"]).unwrap();
+        git(
+            &root,
+            &["config", "user.email", "synthetic@example.invalid"],
+        )
+        .unwrap();
+        git(&root, &["config", "user.name", "Synthetic"]).unwrap();
+        fs::write(root.join("a.txt"), "base\n").unwrap();
+        fs::write(root.join("b.txt"), "base\n").unwrap();
+        git(&root, &["add", "a.txt", "b.txt"]).unwrap();
+        git(&root, &["commit", "-m", "base"]).unwrap();
+
+        git(&root, &["switch", "-c", "cadence/lane"]).unwrap();
+        fs::write(root.join("a.txt"), "lane work\n").unwrap();
+        git(&root, &["commit", "-am", "lane work"]).unwrap();
+
+        // main moves on in another file, then the lane merges it and
+        // commits with a hand edit that lives only in the merge commit.
+        git(&root, &["switch", "main"]).unwrap();
+        fs::write(root.join("b.txt"), "main moved on\n").unwrap();
+        git(&root, &["commit", "-am", "main moved on"]).unwrap();
+        git(&root, &["switch", "cadence/lane"]).unwrap();
+        git(&root, &["merge", "--no-commit", "main"]).unwrap();
+        fs::write(root.join("b.txt"), "hand edit only on this lane\n").unwrap();
+        git(&root, &["add", "b.txt"]).unwrap();
+        git(&root, &["commit", "--no-edit"]).unwrap();
+        let tip = git(&root, &["rev-parse", "HEAD"]).unwrap();
+
+        // The lane's own commit then lands on main as its own
+        // patch-equivalent commit (the squash case), so `git cherry`
+        // reports only `- <lane commit>` — the merge commit and its hand
+        // edit are invisible to it.
+        git(&root, &["switch", "main"]).unwrap();
+        fs::write(root.join("a.txt"), "lane work\n").unwrap();
+        git(&root, &["commit", "-am", "squash lane work"]).unwrap();
+
+        // The old shape: content looks landed, so the lane used to be
+        // swept and `branch -D` removed the only ref to the edit.
+        assert_eq!(content_hint(&root, &tip, "main"), Some("cherry"));
+        // The new rule: content inference is not evidence.
+        assert_eq!(merge_rule(&root, "cadence/lane", &tip, "main"), None);
+        // The work survives, and exists only on the lane.
+        assert_eq!(
+            git(&root, &["rev-parse", "--verify", "refs/heads/cadence/lane"]).unwrap(),
+            tip
+        );
+        let on_lane = git(&root, &["show", &format!("{tip}:b.txt")]).unwrap();
+        assert!(on_lane.contains("hand edit only on this lane"), "{on_lane}");
+        let on_main = git(&root, &["show", "main:b.txt"]).unwrap();
+        assert_eq!(on_main, "main moved on");
+        assert_ne!(on_lane.trim_end(), on_main);
+    }
+}
