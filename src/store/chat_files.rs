@@ -426,10 +426,10 @@ fn raster_kind_name(mime: &str) -> &'static str {
 /// composer has no prefilter, so this is the daemon's honest minimum —
 /// the full-byte UTF-8/kind check remains the enforcement boundary for
 /// everything else.
-const REFUSED_EXTS: [&str; 31] = [
+const REFUSED_EXTS: [&str; 30] = [
     "exe", "dll", "so", "dylib", "bin", "com", "msi", "msp", "wasm", "class", "jar", "zip", "tar",
-    "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "iso", "dmg", "deb", "rpm", "apk", "aab", "gif",
-    "bmp", "ico", "tif", "tiff",
+    "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "iso", "dmg", "deb", "rpm", "apk", "aab", "bmp",
+    "ico", "tif", "tiff",
 ];
 
 /// Media/container extensions the daemon refuses by name even after the

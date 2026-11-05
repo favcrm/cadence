@@ -5113,7 +5113,7 @@ fn preflight_attachment_visual(
     let delivered: u64 = if file.mime == "image/svg+xml" {
         let (_, raster) = crate::attachment_image::rasterize_svg(bytes).map_err(|e| {
             Error::rejected(format!(
-                "attachment '{}' was refused before send: {e}",
+                "attachment '{}' cannot be delivered as an image: {e}",
                 file.id
             ))
         })?;

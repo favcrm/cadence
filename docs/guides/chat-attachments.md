@@ -35,9 +35,13 @@ quota are described in [Quota admission contract](#quota-admission-contract).
 ## What an operator can attach
 
 - Kinds, decided by the daemon from the bytes rather than the name:
-  - **UTF-8 text**, at any extension the composer offers. A NUL byte, invalid
-    UTF-8 or an empty body refuses, so an unknown binary is never retained as
-    text.
+  - **UTF-8 text**, at any extension the composer offers except the names the
+    daemon refuses outright: executables, archives and packages (`.exe`,
+    `.dll`, `.so`, `.wasm`, `.jar`, `.zip`, `.tar`, `.gz`, `.7z`, `.deb`,
+    `.rpm`, `.apk` and their siblings) and media containers (`.heic`, `.mp4`,
+    `.mov`, `.mkv`, `.mp3`, `.wav` and their siblings). A NUL byte, invalid
+    UTF-8 or an empty body refuses too, so an unknown binary is never retained
+    as text.
   - **`.pdf`**, retained as the original and read through the same bounded
     `pdftotext` seam the wiki ingest uses, under the attachment text cap. A
     corrupt, encrypted or text-free (image-only) PDF is refused at upload with
@@ -54,20 +58,28 @@ quota are described in [Quota admission contract](#quota-admission-contract).
     the model. The source is parsed with `roxmltree` (document types disabled)
     and refused whole if it carries script, embedded markup, animation, an
     event handler, a CSS escape, or any reference outside a same-document
-    fragment or an embedded PNG/JPEG/WebP data URI. The renderer is
+    fragment or an embedded PNG/JPEG/WebP data URI. The stylesheet is judged as
+    the renderer concatenates it, so a comment cannot split a forbidden token,
+    and an XML declaration may not name an encoding other than UTF-8 — a second
+    declared encoding would be a second parse of the same bytes. The renderer is
     `rsvg-convert` from `PATH`, which must be root-owned and not writable;
     it runs under a Landlock ruleset built before fork plus
     `RLIMIT_CPU/AS/FSIZE/CORE/NOFILE/NPROC` and a process-group deadline. Text
     outside the host font set renders as missing glyphs, which the model sees
     as-is.
-- Size: at most **10 MiB** per file; at most **5 files** per message.
+- Size: at most **10 MiB** per file; at most **5 files** per message. A visual
+  attachment is additionally bounded at delivery: at most 4 MiB per raster
+  after conversion, and at most 16 MiB of native image bytes across one turn
+  (a library image pin plus the attachments).
 - Attachments fail closed: unsafe symlinks or ownership/modes in the captured
   operational workspace path, or in legacy quota custody, make uploads refuse.
 - The composer pre-checks only the size and count caps and its file picker
-  offers every kind; the daemon's byte checks are the enforcement. An image is
-  additionally refused at upload when the resolved model publishes no image
-  policy or the running runtime build cannot present one, with a reason that
-  names which of the two is missing.
+  offers every kind; the daemon's byte checks are the enforcement. A visual
+  attachment is proved at upload, not only at send: an SVG must screen and
+  render, a raster must decode inside the bounds, and the selected model must
+  admit image input (native) or publish an image policy (hosted). A refusal
+  leaves the file unretained and the draft intact, and names which of those
+  failed.
 
 ## The path a file takes
 
@@ -123,8 +135,10 @@ quota are described in [Quota admission contract](#quota-admission-contract).
    exist as a regular file, and its bounded content must still match the
    declared size and digest, sniff as the declared kind, extract (a PDF
    through the bounded converter; a text kind by decoding) and pass the
-   secret gate. An altered, unreadable, oversized or mislabelled row refuses
-   the send before the message is queued. Version-1
+   secret gate. A visual kind is additionally proved here and at upload: an
+   SVG screens and renders, a raster decodes inside the bounds, and the
+   selected model admits image input. An altered, unreadable, oversized or
+   mislabelled row refuses the send before the message is queued. Version-1
    paths derive from the validated stored owner/thread/attachment tuple;
    legacy paths derive from the validated stored digest, never request data.
 6. The resolved `{id,name,size,mime,sha256}` rows are stored on the entry's
@@ -157,8 +171,9 @@ quota are described in [Quota admission contract](#quota-admission-contract).
    kind — the Home operator read reaches this projection without the readiness
    helper, so the proof lives here too — and returns
    `{extractable:true, text: <bounded>}` for a readable kind (≤64k chars,
-   `secret::guard` re-run). A mislabelled row is refused; no fabricated
-   extraction is ever returned.
+   `secret::guard` re-run). A raster has no text projection: it is delivered as
+   pixels to a vision-capable turn, never decoded into a fabricated caption. A
+   mislabelled row is refused; no fabricated extraction is ever returned.
 
 ## Scope and retry rules
 

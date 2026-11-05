@@ -58,11 +58,6 @@ equal(
   "A '.txt' file must sniff as its declared kind — the bytes did not",
   "the RPC name and file prefix never reach the operator",
 );
-equal(
-  userUploadError("chat_file_upload: '.exe' is not an attachable type — the interim allowlist is txt, md and csv"),
-  "'.exe' is not an attachable type",
-  "the allowlist tail is dropped; the reason stays",
-);
 equal(userUploadError("upload failed — connection lost"), "Upload failed — connection lost", "plain messages stay");
 equal(isPermanentUploadFailure(400), true, "a server refusal is permanent");
 equal(isPermanentUploadFailure(413), true, "an oversize refusal is permanent");

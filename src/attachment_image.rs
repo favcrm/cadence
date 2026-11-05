@@ -185,6 +185,19 @@ pub fn validate_svg_source(source: &str) -> Result<()> {
     if source.trim().is_empty() {
         return Err(Error::rejected("the SVG source is empty"));
     }
+    // The renderer reads the raw bytes and honours the document's own encoding
+    // declaration; this screen reads a string that is already UTF-8. A second
+    // declared encoding is therefore a second parse of the same bytes — one
+    // where `+ADw-script+AD4-` under UTF-7 is markup, not text — so it is
+    // refused rather than reconciled.
+    if let Some(declared) = declared_encoding(source) {
+        if !declared.eq_ignore_ascii_case("utf-8") {
+            return Err(Error::rejected(
+                "the SVG was refused: the XML declaration may not name an encoding other \
+                 than UTF-8",
+            ));
+        }
+    }
     let options = roxmltree::ParsingOptions {
         allow_dtd: false,
         nodes_limit: SVG_NODE_LIMIT,
@@ -245,17 +258,39 @@ pub fn validate_svg_source(source: &str) -> Result<()> {
                     check_svg_value(attribute.value())?;
                 }
                 // `<style>` content is CSS the renderer interprets; every
-                // other character data is inert text.
+                // other character data is inert text. The renderer
+                // concatenates every character-data node in the stylesheet, so
+                // judge that same joined text: a comment must not split a
+                // forbidden token into two harmless halves.
                 if name == "style" {
-                    for child in node.children().filter(|child| child.is_text()) {
-                        check_svg_value(child.text().unwrap_or_default())?;
+                    let mut stylesheet = String::new();
+                    for child in node.descendants().filter(|child| child.is_text()) {
+                        stylesheet.push_str(child.text().unwrap_or_default());
                     }
+                    check_svg_value(&stylesheet)?;
                 }
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// The encoding named by the document's own XML declaration, when it has one.
+fn declared_encoding(source: &str) -> Option<&str> {
+    let head = source.trim_start_matches('\u{feff}').trim_start();
+    let declaration = head.strip_prefix("<?xml")?;
+    let declaration = &declaration[..declaration.find("?>")?];
+    let lowered = declaration.to_ascii_lowercase();
+    let at = lowered.find("encoding")?;
+    let after = declaration[at + "encoding".len()..].trim_start();
+    let after = after.strip_prefix('=')?.trim_start();
+    let quote = after.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value = &after[1..];
+    Some(&value[..value.find(quote)?])
 }
 
 /// Elements refused outright: script, embedded markup, and anything that

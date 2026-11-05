@@ -448,6 +448,23 @@ impl Shared {
                 })?
             }
         };
+        // CAD-2162: a visual attachment is marked ready only when this build
+        // can actually deliver it. Prove the content here — an SVG screen and
+        // render, a raster decode inside the bounds — and the selected model's
+        // image support, so the composer never shows a ready chip that a send
+        // must then refuse. Delivery re-proves scope, digest and the model.
+        if store::chat_visual_kind(&file.mime) {
+            let bytes = self.store.chat_file_ready_checked_in_roots(
+                &pm_dir,
+                &self.upload_workspace_dir,
+                &file,
+                store::CHAT_FILE_MAX_BYTES,
+            )?;
+            let mut visual_bytes = 0u64;
+            super::preflight_attachment_visual(&file, &bytes, &mut visual_bytes)?;
+            let alias = self.resolve_alias(crate::master::ALIAS)?;
+            self.adapter_for(&alias)?.preflight_turn_images()?;
+        }
         Ok(file.to_json())
     }
 

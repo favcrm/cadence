@@ -870,9 +870,10 @@ impl Shared {
             ));
         }
         // Visual delivery is proved before a fresh send receives a receipt:
-        // bounded conversion (SVG is currently gated off), the selected live
-        // runtime/model's image support, and the combined turn-image bound.
-        // Delivery re-proves scope, digest and the model for queued changes.
+        // bounded conversion (an SVG is screened, then rendered), the selected
+        // live runtime/model's image support, and the combined turn-image
+        // bound. Delivery re-proves scope, digest and the model for queued
+        // changes.
         let pinned_bytes = match &media_refs {
             Some(pin) => self.pinned_image_size(pin)?,
             None => 0,

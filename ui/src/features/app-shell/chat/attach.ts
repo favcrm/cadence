@@ -58,7 +58,6 @@ export function displayAttachError(message: string, t: Translate = identity): st
 export function userUploadError(message: string): string {
   const reason = message
     .replace(/^chat_file_upload(?: refused)?(?: '[^']*')?:\s*/, "")
-    .replace(/ — the (?:interim )?allowlist is .+$/, "")
     .trim();
   return reason.charAt(0).toUpperCase() + reason.slice(1);
 }
