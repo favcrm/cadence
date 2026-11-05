@@ -3217,6 +3217,30 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             )?;
             printed((receipt, 0))
         }
+        Commands::Audit {
+            action:
+                Some(AuditAction::AcceptRevise {
+                    pr,
+                    head,
+                    issue,
+                    project,
+                    source,
+                    repo,
+                }),
+            ..
+        } => {
+            refuse_managed(target, "audit accept-revise")?;
+            let head = super::audit::full_head(head)?;
+            let repo = repo_or_origin(repo)?;
+            let project = Some(project.clone());
+            let receipt = hosted_gate::accept_revise(
+                target,
+                wake_timeout,
+                &binding(&project, &repo, issue.trim(), *pr, &head)?,
+                source,
+            )?;
+            printed((receipt, 0))
+        }
         Commands::Issue {
             action:
                 cadence_agent::issue::cli::IssueAction::Project {

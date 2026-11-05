@@ -637,6 +637,15 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
                  cli::audit::run"
             )
         }
+        // CAD-2197: a local org files no workflow review rows, so there is
+        // nothing to accept. The verb is hosted-only and says so rather than
+        // recording a row no gate reads.
+        AuditAction::AcceptRevise { .. } => {
+            return Err(Error::rejected(
+                "audit accept-revise is hosted-only: a local org files no workflow review rows, \
+                 so there is nothing to accept. Nothing was recorded",
+            ));
+        }
         AuditAction::Designate {
             alias,
             project,

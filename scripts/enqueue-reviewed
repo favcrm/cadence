@@ -946,11 +946,17 @@ def unbound_reason(n, hosted):
 
 
 def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
-                  exception=False):
+                  exception=False, accepted=None):
     """(reasons, counted notes).
 
     `exception` (CAD-1946) drops only the counts of missing verdicts. A filed
     non-pass, an unorderable row or a non-independent row still refuses.
+
+    `accepted` (CAD-2197) is the operator's head-pinned acceptance row. It
+    lifts exactly one refusal: a WORKFLOW row that is not a pass. A person's
+    revise, an unorderable row, a non-independent row and every other gate
+    still refuse, because the acceptance is the operator reading a model's
+    finding, never a verdict of their own.
 
     Every head-pinned note counts toward a refusal, whatever its kind or file
     name: a non-pass note refuses unless the SAME reviewer has a later-stamped
@@ -1003,6 +1009,8 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
             if (n["stamp"] and not is_workflow_row(n)
                     and any(p["stamp"] > n["stamp"] for p in passes)):
                 continue  # superseded by a later pass of this reviewer; a workflow row is final
+            if accepted is not None and is_workflow_row(n):
+                continue  # CAD-2197: the operator read this finding and accepted it at this head
             why = "" if n["stamp"] else "; the file name has no stamp, so it cannot be ordered"
             reasons.append(
                 f"verdict by {who or '(no reviewer)'} on this head is not a pass "
@@ -1136,6 +1144,20 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
                        if (n.get("github_login") or "").strip().lower() not in shared]
     by = lambda kind: {identity(n) for n in counted if n["kind"] == kind}
     std, spec, combined = by("standards"), by("spec-security"), by("combined")
+    if accepted is not None:
+        # CAD-2197: an accepted workflow revise answers ITS axis for the review
+        # count, and never for another. A sentinel keeps it out of the identity
+        # comparison below and out of `counted`, so nothing reports it as a pass
+        # and a forged same-reviewer pair cannot be manufactured by it.
+        for n in verdicts:
+            if not is_workflow_row(n) or n["outcome"] == "pass":
+                continue
+            if hosted is not None and workflow_reason(n, hosted):
+                continue
+            if n["kind"] == "standards":
+                std.add("accepted-standards")
+            elif n["kind"] == "spec-security":
+                spec.add("accepted-spec-security")
     two = bool(std) and bool(spec) and any(a != b for a in std for b in spec)
     if exception:
         return reasons, counted
@@ -1381,6 +1403,41 @@ def check_approval(repo, pr, head, report, evidence=None, project=None, issue=No
         return []
     why = state.get("reason") or state.get("state") or "unknown"
     return [f"human-class diff has no operator approval recorded for exactly head {head} ({why}); the operator records it with `cadence audit approve`"]
+
+def read_acceptance(repo, pr, head, project, issue):
+    """(row, why) for the operator's acceptance of a workflow revise (CAD-2197).
+
+    The row is the board's `accepts_revise` on the approval read: recorded by
+    the operator's hosted login, for this project, issue, PR and exactly this
+    head. Anything else is no acceptance — a failed read refuses nothing by
+    itself, it only withholds the lift, so a board that predates the field
+    keeps every existing refusal."""
+    argv = ["cadence", "audit", "approval", "--pr", str(pr), "--head", head,
+            "--repo", repo, "--project", project, "--issue", issue]
+    rc, out, err = run(argv)
+    try:
+        state = json.loads(out)
+    except ValueError:
+        return None, f"cannot read an acceptance via `cadence audit approval` (rc {rc}): {(err or out).strip()[:200]}"
+    row = state.get("accepts_revise")
+    if row is None:
+        return None, None
+    if not isinstance(row, dict):
+        return None, "`accepts_revise` is not a row"
+    if (row.get("head_sha") or "").lower() != head.lower():
+        return None, f"the acceptance names head {row.get('head_sha')}"
+    if row.get("action") != "accept-revise":
+        return None, f"the acceptance names action {row.get('action')!r}"
+    if row.get("recorded_via") != "hosted-owner-login":
+        # An acceptance is the hosted owner's own write; the native
+        # `operator-connection` recorder is a different surface this board
+        # does not have, so it is not evidence here.
+        return None, f"the acceptance was recorded via {row.get('recorded_via')!r}"
+    if not isinstance(row.get("approval_id"), str) or not row["approval_id"]:
+        return None, "the acceptance has no id"
+    if row.get("project") not in (None, project) or row.get("issue") not in (None, issue):
+        return None, "the acceptance names another project or issue"
+    return row, None
 
 
 # ---- ticket scope approval (CAD-1106) --------------------------------------
@@ -1747,6 +1804,17 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     if authority is not None and authority["origin"] == "hosted":
         hosted_project = authority["binding"]["project"]
 
+    # CAD-2197: the operator's acceptance of a workflow revise at exactly this
+    # head. Read before the review checks because it lifts one of their
+    # refusals. A failed read or a board that predates the field withholds the
+    # lift and changes nothing else, so every existing refusal stays.
+    accepted_revise, acceptance_why = None, None
+    if hosted_project is not None and issue:
+        accepted_revise, acceptance_why = read_acceptance(
+            repo, pr, head, hosted_project, issue)
+        if acceptance_why:
+            report.append(f"acceptance not used: {acceptance_why}")
+
     verdicts, counted = [], []
     origin = "local"
     main_tip, has_workflow = "", False
@@ -1822,6 +1890,11 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                 reasons += rs
                 qa_by_comment = not rs
         row_qa = need_qa and not qa_by_comment
+        # A workflow row the operator accepted is settled for the routes that ask
+        # whether both review axes answered; it is never counted as a pass.
+        settled = ([v for v in verdicts if is_workflow_row(v) and v["outcome"] != "pass"
+                    and (hosted is None or not workflow_reason(v, hosted))]
+                   if accepted_revise is not None else [])
         if args.exception:
             rc, ends, err = run([sys.executable, GATE_SCRIPT, "exception-open"])
             if rc != 0:
@@ -1832,7 +1905,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                 klass, active, origin, authority["readiness"] if authority else None, ci_url)
             reasons += routine_reasons
             rs, counted = check_reviews(verdicts, False, need_qa, authors, issue, hosted,
-                                        exception=True)
+                                        exception=True, accepted=accepted_revise)
             reasons += rs
             report.append(f"review EXCEPTION until {ends}: reviewer attestation waived")
             required_comment_evidence.append(f"Review exception until: {ends}")
@@ -1841,13 +1914,15 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         elif not active or klass == "strict":
             native_one = bool(authority and authority["requirements"]["reviews"] == 1)
             effective_one = one and native_one
-            rs, counted = check_reviews(verdicts, effective_one, row_qa, authors, issue, hosted)
+            rs, counted = check_reviews(verdicts, effective_one, row_qa, authors, issue, hosted,
+                                         accepted=accepted_revise)
             reasons += rs
         elif klass == "routine":
             if authority["readiness"] is None and origin == "hosted":
-                rs, counted = check_reviews(verdicts, False, need_qa, authors, issue, hosted)
+                rs, counted = check_reviews(verdicts, False, need_qa, authors, issue, hosted,
+                                          accepted=accepted_revise)
                 reasons += rs
-                reasons += hosted_routine_reasons(verdicts, counted, hosted, repo, pr, head)
+                reasons += hosted_routine_reasons(verdicts, counted + settled, hosted, repo, pr, head)
             elif authority["readiness"] is None:
                 reasons.append("active routine delivery has no fresh native readiness proof for this exact binding")
             else:
@@ -1855,26 +1930,33 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                 if ci_url is not None and ci_url != ready["ci_run_url"]:
                     reasons.append("native routine readiness CI run is not the actual successful ci.yml run at this head")
             if need_qa:
-                reasons += check_reviews(verdicts, True, True, authors, issue, hosted)[0]
+                reasons += check_reviews(verdicts, True, True, authors, issue, hosted,
+                                                     accepted=accepted_revise)[0]
             # A workflow row that is not a pass refuses whatever the class, so it
             # stays true when hosted readiness ships. Without readiness on hosted,
             # check_reviews above also reads owner rows.
-            reasons += [f"workflow verdict {v['name']} is not a pass (outcome '{v['outcome']}'): "
-                        "a workflow review that is not a pass always refuses"
-                        for v in verdicts if is_workflow_row(v) and v["outcome"] != "pass"]
+            if accepted_revise is None:
+                reasons += [f"workflow verdict {v['name']} is not a pass (outcome '{v['outcome']}'): "
+                            "a workflow review that is not a pass always refuses"
+                            for v in verdicts if is_workflow_row(v) and v["outcome"] != "pass"]
         elif klass == "consequential":
-            rs, counted = check_reviews(verdicts, True, row_qa, authors, issue, hosted)
+            rs, counted = check_reviews(verdicts, True, row_qa, authors, issue, hosted,
+                                     accepted=accepted_revise)
             reasons += rs
             combined = [n for n in counted if n.get("kind") == "combined"]
             # Two counted workflow reviews, Standards plus Spec/security from distinct
             # principals, are stricter than one combined review and satisfy it.
             if (len({reviewer_key(n, hosted) for n in combined}) != 1
-                    and not two_workflow_reviews(counted, hosted)):
+                    and not two_workflow_reviews(counted + settled, hosted)):
                 reasons.append(f"active {klass} delivery requires exactly one independent combined review")
         if qa_by_comment:
             required_comment_evidence.append(f"Browser QA comment: {args.browser_qa}")
             if not two_workflow_reviews(counted, hosted):
                 reasons.append("--browser-qa also needs a pass from both review workflows at this head")
+        if accepted_revise is not None:
+            report.append("accepted workflow revise: "
+                          + str(accepted_revise.get("approval_id"))
+                          + f" at {head[:12]} (source {accepted_revise.get('source')!r})")
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
 
     # Human class: paths, size, any head-pinned note whose Risk is not exactly `auto`,
@@ -1935,6 +2017,10 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             else:
                 rs = []
         reasons += rs
+    if accepted_revise is not None:
+        required_comment_evidence.append(
+            "Accepted workflow revise: " + str(accepted_revise.get("approval_id"))
+            + f" at {head[:12]}")
     if require_comment:
         if approval_evidence.get("approval"):
             required_comment_evidence.append("Operator approval id: " + approval_evidence["approval"])
@@ -1949,6 +2035,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                         readiness=authority["readiness"] if authority else None)
         if args.browser_qa:
             evidence["browser_qa"] = args.browser_qa
+        if accepted_revise is not None:
+            evidence["accepted_revise"] = accepted_revise
         if args.exception:
             evidence["exception"] = {"ends": ends, "advisory": dict(args.advisory),
                                      "waives_readiness": waives_readiness}
