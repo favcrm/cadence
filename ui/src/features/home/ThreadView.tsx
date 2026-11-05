@@ -264,7 +264,7 @@ export function ThreadItemView({
     case "hire":
       return <HireProposalCard entry={item.entry} reason={item.reason} />;
     case "ticket":
-      return <TicketProposalCard entry={item.entry} onOpenIssue={onOpenIssue} />;
+      return <TicketProposalCard entry={item.entry} onOpenIssue={onOpenIssue} readOnly={readOnly} />;
     case "answer": {
       // A failed turn carries its reason in payload.error and no text: say
       // why, instead of an empty bubble. No Retry here — the turn ran.

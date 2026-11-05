@@ -13,15 +13,18 @@ import { createAndAssign, parseTicketProposal } from "./ticketProposal";
 export default function TicketProposalCard({
   entry,
   onOpenIssue,
+  readOnly = false,
 }: {
   entry: ThreadEntry;
   onOpenIssue?: (id: string) => void;
+  /** A read-only board refuses both writes; do not offer the action. */
+  readOnly?: boolean;
 }) {
   const t = useTranslate();
   const proposal = parseTicketProposal(entry.payload);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [created, setCreated] = useState<string | null>(null);
+  const [created, setCreated] = useState<{ ticket: string; assigned: boolean } | null>(null);
 
   if (!proposal) {
     return (
@@ -35,10 +38,10 @@ export default function TicketProposalCard({
     setBusy(true);
     setError(null);
     createAndAssign(api, proposal)
-      .then(({ ticket }) => {
-        setCreated(ticket);
+      .then((outcome) => {
+        setCreated(outcome);
         void resources.issues.invalidate();
-        void resources.issue(ticket).invalidate();
+        void resources.issue(outcome.ticket).invalidate();
       })
       .catch((e: ApiError) => setError(e.message ?? String(e)))
       .finally(() => setBusy(false));
@@ -73,9 +76,14 @@ export default function TicketProposalCard({
         </dl>
         {created ? (
           <p className="text-label text-ok mt-3" role="status">
-            {t("Created {id} and assigned it.").replace("{id}", () => created)}{" "}
+            {created.assigned
+              ? t("Created {id} and assigned it.").replace("{id}", () => created.ticket)
+              : t("Created {id}; it already has an owner, so nothing was reassigned.").replace(
+                  "{id}",
+                  () => created.ticket,
+                )}{" "}
             {onOpenIssue && (
-              <Button variant="ghost" size="sm" onClick={() => onOpenIssue(created)}>
+              <Button variant="ghost" size="sm" onClick={() => onOpenIssue(created.ticket)}>
                 {t("Open ticket")}
               </Button>
             )}
@@ -86,13 +94,21 @@ export default function TicketProposalCard({
               variant="primary"
               size="sm"
               loading={busy}
-              disabled={busy}
+              disabled={busy || readOnly}
               onClick={run}
-              title={t("Creates the ticket and starts the agent once")}
+              title={
+                readOnly
+                  ? t("This board is read-only")
+                  : t("Creates the ticket and starts the agent once")
+              }
             >
               {t("Create and assign")}
             </Button>
-            <span className="text-micro text-ink-500">{t("Starts one run. A second click does nothing.")}</span>
+            <span className="text-micro text-ink-500">
+              {readOnly
+                ? t("Read-only: this card cannot start the work.")
+                : t("Starts one run. A second click does nothing.")}
+            </span>
           </div>
         )}
         {error && (

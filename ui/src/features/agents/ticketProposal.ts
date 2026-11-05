@@ -40,9 +40,15 @@ export function parseTicketProposal(
   if (!agentId || !agentName) return null;
   // An audience this card did not design for is not drawn as company-visible.
   if (payload.visibility !== "company") return null;
-  const tools = Array.isArray(payload.tools)
-    ? payload.tools.filter((tool): tool is string => typeof tool === "string")
-    : [];
+  // The tool list is part of what the person authorises: an incomplete one
+  // would make the card claim capabilities it cannot state, so no card at all.
+  const tools = payload.tools;
+  if (
+    !Array.isArray(tools) ||
+    tools.length === 0 ||
+    !tools.every((tool) => typeof tool === "string" && tool !== "")
+  )
+    return null;
   return {
     id,
     project,
@@ -61,26 +67,34 @@ export type TicketProposalClient = {
     title: string;
     body: string;
     idempotency_key: string;
-  }) => Promise<{ issue: { id: string }; card?: { rev?: string } }>;
+  }) => Promise<{
+    issue: { id: string; owner?: string | null };
+    card?: { rev?: string; owner?: string | null };
+  }>;
   patch: (id: string, patch: { owner: string }, ifRev?: string) => Promise<unknown>;
 };
 
-/** Create the ticket, then assign it to the agent. The same proposal id and
- *  the same `if_rev` make a retry of either half a repeat, not a second write. */
+/** Create the ticket, then assign it to the agent unless somebody already owns
+ *  it. The create is idempotent by card id, so a retry (or a reloaded thread)
+ *  answers the ticket made the first time — with its *current* revision. Patching
+ *  that revision blindly would overwrite a reassignment made in between, so an
+ *  owned ticket is reported, never reassigned. */
 export async function createAndAssign(
   client: TicketProposalClient,
   proposal: TicketProposal,
-): Promise<{ ticket: string }> {
+): Promise<{ ticket: string; assigned: boolean }> {
   const created = await client.create({
     project: proposal.project,
     title: proposal.title,
     body: proposal.brief,
     idempotency_key: proposal.id,
   });
+  const owner = created.card?.owner ?? created.issue.owner ?? null;
+  if (owner !== null) return { ticket: created.issue.id, assigned: false };
   await client.patch(
     created.issue.id,
     { owner: `agents/${proposal.agent.id}` },
     created.card?.rev,
   );
-  return { ticket: created.issue.id };
+  return { ticket: created.issue.id, assigned: true };
 }

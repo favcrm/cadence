@@ -44,7 +44,8 @@ const parsed = parseTicketProposal(proposal);
 check(parsed !== null && parsed.agent.id === "ap_1" && parsed.tools.length === 3, "a complete payload parses");
 check(parseTicketProposal({ ...proposal, agent: null }) === null, "no agent, no proposal");
 check(parseTicketProposal({ ...proposal, brief: "  " }) === null, "blank brief, no proposal");
-check(parseTicketProposal({ ...proposal, tools: ["web_read", 7] })?.tools.length === 1, "non-string tools are dropped");
+check(parseTicketProposal({ ...proposal, tools: ["web_read", 7] }) === null, "an incomplete tool list makes no proposal");
+check(parseTicketProposal({ ...proposal, tools: [] }) === null, "an empty tool list makes no proposal");
 check(parseTicketProposal({ ...proposal, visibility: "private" }) === null, "an audience the card cannot state makes no proposal");
 check(parseTicketProposal(null) === null, "no payload, no proposal");
 
@@ -63,9 +64,10 @@ const client = {
   },
 };
 async function main(): Promise<void> {
-  const result = await createAndAssign(client, parsed!);
+  const first = await createAndAssign(client, parsed!);
   const replay = await createAndAssign(client, parsed!);
-  check(result.ticket === "DEMO-1" && replay.ticket === "DEMO-1", "both calls resolve the same ticket");
+  check(first.ticket === "DEMO-1" && replay.ticket === "DEMO-1", "both calls resolve the same ticket");
+  check(first.assigned && replay.assigned, "the unowned ticket is assigned on each replay");
   check(creates.length === 2 && patches.length === 2, "each call creates once and patches once");
   check(
     creates.every((c) => c.idempotency_key === "c-0001" && c.project === "demo"),
@@ -75,6 +77,18 @@ async function main(): Promise<void> {
     patches.every((p) => p.id === "DEMO-1" && p.owner === "agents/ap_1" && p.ifRev === "r1"),
     "the patch names the agent at the created revision",
   );
+
+  // The card is replayed after somebody reassigned the ticket: the create
+  // answers the ticket with its current revision and an owner, and the card
+  // must report it instead of overwriting the newer assignment.
+  const owned = {
+    create: async () => ({ issue: { id: "DEMO-1", owner: "user_owner" }, card: { rev: "r9", owner: "user_owner" } }),
+    patch: async () => {
+      throw new Error("a replay must not patch an owned ticket");
+    },
+  };
+  const replayOwned = await createAndAssign(owned, parsed!);
+  check(replayOwned.ticket === "DEMO-1" && !replayOwned.assigned, "an owned ticket is reported, not reassigned");
 }
 
 void main();
