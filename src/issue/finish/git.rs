@@ -299,5 +299,22 @@ mod tests {
         let on_main = git(&root, &["show", "main:b.txt"]).unwrap();
         assert_eq!(on_main, "main moved on");
         assert_ne!(on_lane.trim_end(), on_main);
+        // The decision `issue finish` actually makes: no deletable tip,
+        // and the block that keeps the lane.
+        let ev = Evidence {
+            state: Branch::Open { tip: tip.clone() },
+            into: Some("main".to_string()),
+            into_sha: None,
+            remote_tip: None,
+            remote_cmp: true,
+            remote_note: None,
+        };
+        let (how, deletable, block) = survivability(&ev, &root, "cadence/lane");
+        assert_eq!(how, None);
+        assert_eq!(deletable, None);
+        assert_eq!(
+            block.as_ref().map(|b| b.tag.as_str()),
+            Some("unmerged-unpushed")
+        );
     }
 }
