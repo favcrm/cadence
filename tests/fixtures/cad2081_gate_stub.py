@@ -91,6 +91,10 @@ def cadence():
                      f"#issuecomment-{comment_id}\n")
         if S.get("qa_evidence_url"):
             body += f"Browser QA comment: {S['qa_evidence_url']}\n"
+        acceptance = S.get("accepts_revise")
+        if acceptance and acceptance.get("head", S["head"]) == S["head"]:
+            body += (f"Accepted workflow revise: {acceptance.get('approval_id', 'accept-1')}"
+                     f" at {S['head'][:12]}\n")
         out({"id": "CAD-1", "project": "cadence", "owner": None, "claim": None,
              "comments": [{"body": body}]})
     if ARGS[:2] == ["delivery", "requirements"]:
@@ -142,11 +146,24 @@ def cadence():
             fail("the workspace identity map is not readable by this caller")
         out({"identities": S["identities"]})
     if ARGS[:2] == ["audit", "approval"]:
+        asked = ARGS[ARGS.index("--head") + 1]
+        acceptance = None
+        acc = S.get("accepts_revise")
+        if acc and acc.get("head", asked) == asked:
+            acceptance = {"approval_id": acc.get("approval_id", "accept-1"),
+                          "project": "cadence", "issue": "CAD-1",
+                          "repo": S["repo"].lower(), "pr": S["pr"], "head_sha": asked,
+                          "action": "accept-revise",
+                          "source": acc.get("source", "operator read the finding"),
+                          "recorded_via": acc.get("recorded_via", "hosted-owner-login"),
+                          "policy_revision": 1, "policy_provenance": "p",
+                          "recorded_at": "2026-11-05T00:00:00Z"}
         # A set `approved_head` is the one head the operator approved.
-        if S.get("approved") and S.get("approved_head") in (None, ARGS[ARGS.index("--head") + 1]):
+        if S.get("approved") and S.get("approved_head") in (None, asked):
             out({"state": "in-force", "approval_id": "ap-1", "recorded_via": "operator-connection",
-                 "source": "operator", "action": "merge"})
-        print(json.dumps({"state": "missing", "reason": "no approval recorded"}))
+                 "source": "operator", "action": "merge", "accepts_revise": acceptance})
+        print(json.dumps({"state": "missing", "reason": "no approval recorded",
+                          "accepts_revise": acceptance}))
         sys.exit(1)
     fail(f"stub cadence: unexpected {ARGS}", 3)
 

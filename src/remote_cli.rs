@@ -209,6 +209,8 @@ pub const REMOTE_VERBS: &[&str] = &[
     "audit_verdicts_project",
     "audit_verdict_project",
     "audit_approve_project",
+    // CAD-2197: the operator's head-pinned acceptance of a workflow revise.
+    "audit_accept_revise_project",
     "audit_reviewers_project",
     "audit_reviewers_project_set",
     "audit_identities",
@@ -249,6 +251,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         // them for the live human owner only.
         "audit_approve"
         | "audit_approve_project"
+        | "audit_accept_revise_project"
         | "audit_reviewers_set"
         | "audit_reviewers_project_set"
         | "audit_identities_set"
