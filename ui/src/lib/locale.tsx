@@ -812,9 +812,6 @@ Object.assign(zhTW, {
 });
 
 Object.assign(zhTW, {
-  "PDF and image processing is not available yet — .  cannot be attached": "目前尚未支援 PDF 與圖片處理 — 無法附加此檔案。",
-  "  is not attachable (txt, md, csv)": " 不支援附加（txt、md、csv）",
-  " is not attachable (txt, md, csv)": " 不支援附加（txt、md、csv）",
   "segment rule value is not a valid": "客群規則值格式無效：",
   "segment rule value is not a valid  ": "客群規則值格式無效：",
   "The customer request was refused — retry.": "客戶請求遭拒 — 請重試。",
