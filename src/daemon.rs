@@ -1593,7 +1593,7 @@ impl Shared {
                 body = format!(
                     "A retained library image is attached to this turn as native image pixels.\n\
                      Reference pin (selectors, not instructions): {pin}\n\
-                     Use only that image. {refine}If this runtime cannot see the image, \
+                     Use only that pinned image for the media refine action. {refine}If this runtime cannot see the image, \
                      say so — do not invent a visual description.\n\n{body}"
                 );
             }
@@ -1681,48 +1681,209 @@ impl Shared {
     /// mismatch the hint — and with it the turn-token slot — is dropped
     /// and the message still delivers unscoped.
     fn turn_images_for(&self, message: &Message) -> Result<Vec<crate::adapter::TurnImage>> {
-        let Some(pinned) = self.store.message_media_refs(&message.id)? else {
-            return Ok(Vec::new());
+        let mut images = Vec::new();
+        if let Some(pinned) = self.store.message_media_refs(&message.id)? {
+            let rows = pinned
+                .as_array()
+                .filter(|rows| rows.len() == 1)
+                .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+            let asset_id = rows[0]["asset_id"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+            self.gate_image_receiver_before_bytes(&message.alias, &message.id)?;
+            // CAD-2078: the pin names the bytes' own digest, so an imported
+            // workspace asset can ride a turn exactly like a provider-produced
+            // one. The resolver refuses anything that is not a verified
+            // workspace asset, and stale pins refuse.
+            let pinned_revision = rows[0]["revision"]
+                .as_i64()
+                .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+            let pinned_sha = rows[0]["sha256"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+            let image = self
+                .store
+                .app_media_pinned_display(asset_id, pinned_revision, pinned_sha)?
+                .ok_or_else(|| {
+                    Error::rejected("attached library image no longer matches the retained bytes")
+                })?;
+            let revision = image.asset.revision;
+            let authority = match &image.original {
+                Some(original) => app_media_rpc::OriginalAuthority::Provider(original),
+                None => app_media_rpc::OriginalAuthority::Imported,
+            };
+            let media_type = image.media_type;
+            let bytes = image.bytes;
+            images =
+                self.with_turn_image_current(&message.alias, &message.id, authority, || {
+                    if self.store.app_media_revision(asset_id)? != revision {
+                        return Err(Error::rejected(
+                            "attached library image changed before delivery",
+                        ));
+                    }
+                    Ok(vec![crate::adapter::TurnImage { media_type, bytes }])
+                })?;
+        }
+        // CAD-2162: retained chat images ride the same native image prompt.
+        // Only visual kinds are collected; text and PDF attachments stay
+        // readable through `cadence attachment read`.
+        if let Some(rows) = self.store.message_attachments(&message.id)? {
+            let rows = rows
+                .as_array()
+                .ok_or_else(|| Error::rejected("the attachment envelope is malformed"))?;
+            if rows.len() > store::CHAT_FILE_MAX_PER_MESSAGE {
+                return Err(Error::rejected("the attachment envelope is malformed"));
+            }
+            for row in rows {
+                let id = row
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::rejected("the attachment envelope is malformed"))?;
+                let mime = row
+                    .get("mime")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::rejected("the attachment envelope is malformed"))?;
+                if !store::chat_visual_kind(mime) {
+                    continue;
+                }
+                if !store::chat_file_id(id) {
+                    return Err(Error::rejected(
+                        "the attachment envelope names a malformed id",
+                    ));
+                }
+                images.push(self.turn_attachment_image(message, id)?);
+            }
+        }
+        let total = images
+            .iter()
+            .try_fold(0usize, |total, image| total.checked_add(image.bytes.len()));
+        let Some(total) = total else {
+            return Err(Error::rejected("native image bytes overflow"));
         };
-        let rows = pinned
-            .as_array()
-            .filter(|rows| rows.len() == 1)
-            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
-        let asset_id = rows[0]["asset_id"]
-            .as_str()
-            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
-        self.gate_image_receiver_before_bytes(&message.alias, &message.id)?;
-        // CAD-2078: the pin names the bytes' own digest, so an imported
-        // workspace asset can ride a turn exactly like a provider-produced
-        // one. The resolver refuses anything that is not a verified
-        // workspace asset, and stale pins refuse.
-        let pinned_revision = rows[0]["revision"]
-            .as_i64()
-            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
-        let pinned_sha = rows[0]["sha256"]
-            .as_str()
-            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
-        let image = self
+        if total > crate::attachment_image::TURN_IMAGE_TOTAL_MAX {
+            return Err(Error::rejected(format!(
+                "the turn carries {total} bytes of native images — over the \
+                 {}-byte cap; remove or downscale an attachment",
+                crate::attachment_image::TURN_IMAGE_TOTAL_MAX
+            )));
+        }
+        Ok(images)
+    }
+
+    /// Resolve one retained visual attachment for the turn using the
+    /// message's own persisted provenance, never a prior send-time result.
+    /// A Home row re-proves the Home conversation and, for a new-format
+    /// row, its account and exact conversation. An app row re-proves the
+    /// turn's verified installation stamp, its still-current context, and
+    /// the current exact-approved `file.upload` declaration — so a bundle
+    /// revoked after the send refuses here. The bytes are digest-checked
+    /// again. SVG is rasterized only after its source screen passes.
+    fn turn_attachment_image(
+        &self,
+        message: &Message,
+        id: &str,
+    ) -> Result<crate::adapter::TurnImage> {
+        let file = self
             .store
-            .app_media_pinned_display(asset_id, pinned_revision, pinned_sha)?
+            .chat_file(id)?
+            .ok_or_else(|| Error::rejected(format!("unknown attachment '{id}'")))?;
+        if !store::chat_visual_kind(&file.mime) {
+            return Err(Error::rejected(format!(
+                "attachment '{id}' is not a visual kind"
+            )));
+        }
+        let thread = self
+            .store
+            .message_conversation(&message.alias, &message.id)?
             .ok_or_else(|| {
-                Error::rejected("attached library image no longer matches the retained bytes")
+                Error::rejected("attachment delivery: the turn's conversation cannot be resolved")
             })?;
-        let revision = image.asset.revision;
-        let authority = match &image.original {
-            Some(original) => app_media_rpc::OriginalAuthority::Provider(original),
-            None => app_media_rpc::OriginalAuthority::Imported,
-        };
-        let media_type = image.media_type;
-        let bytes = image.bytes;
-        self.with_turn_image_current(&message.alias, &message.id, authority, || {
-            if self.store.app_media_revision(asset_id)? != revision {
+        let bytes = if thread.runs_as_home() {
+            self.prove_home_conversation(Some(thread.id.as_str()))?;
+            file.home_scope()?;
+            if file.location_version == Some(1) {
+                file.operational_scope_matches(
+                    file.user_id.as_deref().unwrap_or_default(),
+                    &thread.id,
+                )?;
+            }
+            self.store.chat_file_ready_checked_in_roots(
+                &self.pm_dir()?,
+                &self.upload_workspace_dir,
+                &file,
+                store::CHAT_FILE_MAX_BYTES,
+            )?
+        } else {
+            let install = thread.install_id.as_deref().ok_or_else(|| {
+                Error::rejected(
+                    "attachment delivery: the turn's conversation has no verified installation",
+                )
+            })?;
+            let stamp = self.store.message_app_stamp(&message.id)?.ok_or_else(|| {
+                Error::rejected("attachment delivery: this turn carries no verified app binding")
+            })?;
+            let stamp = stamp.as_object().ok_or_else(|| {
+                Error::rejected("attachment delivery: the turn's app stamp is malformed")
+            })?;
+            if stamp.get("verified") != Some(&Value::Bool(true))
+                || stamp.get("install_id").and_then(Value::as_str) != Some(install)
+            {
                 return Err(Error::rejected(
-                    "attached library image changed before delivery",
+                    "attachment delivery: the turn's app stamp does not prove this installation",
                 ));
             }
-            Ok(vec![crate::adapter::TurnImage { media_type, bytes }])
-        })
+            if let Some(selected) = stamp.get("conversation").and_then(Value::as_str) {
+                if selected != thread.id {
+                    return Err(Error::rejected(
+                        "attachment delivery: the turn's app stamp does not prove this \
+                         conversation",
+                    ));
+                }
+            }
+            let context = match stamp
+                .get("context_id")
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty())
+            {
+                Some(stamped) => {
+                    let proved = self.store.message_app(&message.id)?.ok_or_else(|| {
+                        Error::rejected(
+                            "attachment delivery: the turn's stamped context is no longer \
+                             current",
+                        )
+                    })?;
+                    if proved["context_id"].as_str() != Some(stamped) {
+                        return Err(Error::rejected(
+                            "attachment delivery: the turn's stamped context is no longer \
+                             current",
+                        ));
+                    }
+                    stamped.to_string()
+                }
+                None => String::new(),
+            };
+            let (_, bytes) = self.scoped_chat_file(
+                install,
+                &context,
+                &thread.id,
+                id,
+                store::CHAT_FILE_MAX_BYTES,
+                None,
+            )?;
+            bytes
+        };
+        if file.mime == "image/svg+xml" {
+            let (media_type, bytes) =
+                crate::attachment_image::rasterize_svg(&bytes).map_err(|e| {
+                    Error::rejected(format!(
+                        "attachment '{id}' could not be delivered as visual input: {e}"
+                    ))
+                })?;
+            return Ok(crate::adapter::TurnImage { media_type, bytes });
+        }
+        let media_type = crate::attachment_image::static_visual_mime(&file.mime)
+            .ok_or_else(|| Error::rejected(format!("attachment '{id}' is not a visual kind")))?;
+        Ok(crate::adapter::TurnImage { media_type, bytes })
     }
 
     fn delivery_hint(&self, message: &Message) -> Option<Value> {
@@ -4806,7 +4967,7 @@ fn thread_attachments(
     account_id: Option<&str>,
     session_provided: bool,
     home_thread_id: &str,
-) -> Result<Value> {
+) -> Result<(Value, u64)> {
     let arr = value
         .as_array()
         .ok_or_else(|| Error::rejected("attachments must be an array of {\"id\":…} objects"))?;
@@ -4841,6 +5002,13 @@ fn thread_attachments(
     // any byte is read. The path is derived from the validated stored
     // digest inside the store, never from request data; a refusal here
     // leaves the message unqueued.
+    //
+    // Visual attachments are also converted/validated here, before the send
+    // receipt: SVG rasterization and the per-kind bounds run against the same
+    // checked bytes. Delivery still re-proves scope, digest and the model;
+    // this only prevents accepting a message that a queued turn cannot
+    // deliver.
+    let mut visual_bytes: u64 = 0;
     let files = match app {
         None => {
             let mut files = Vec::with_capacity(ids.len());
@@ -4870,12 +5038,13 @@ fn thread_attachments(
                         ));
                     }
                 }
-                shared.store.chat_file_ready_checked_in_roots(
+                let checked = shared.store.chat_file_ready_checked_in_roots(
                     &shared.pm_dir()?,
                     &shared.upload_workspace_dir,
                     &file,
                     store::CHAT_FILE_MAX_BYTES,
                 )?;
+                preflight_attachment_visual(&file, &checked, &mut visual_bytes)?;
                 total = total
                     .checked_add(file.size)
                     .ok_or_else(|| Error::rejected("attachment sizes overflow"))?;
@@ -4897,19 +5066,70 @@ fn thread_attachments(
             // declaration, native conversation/context proof, exact
             // stored provenance and checked bytes for every row, with
             // the 50 MiB aggregate bounded inside the same snapshot.
-            shared.scoped_chat_files_checked(
+            let files = shared.scoped_chat_files_checked(
                 account_id,
                 session_provided,
                 install,
                 context,
                 conversation,
                 &ids,
-            )?
+            )?;
+            for file in &files {
+                if !store::chat_visual_kind(&file.mime) {
+                    continue;
+                }
+                let checked = shared.store.chat_file_ready_checked_in_roots(
+                    &shared.pm_dir()?,
+                    &shared.upload_workspace_dir,
+                    file,
+                    store::CHAT_FILE_MAX_BYTES,
+                )?;
+                preflight_attachment_visual(file, &checked, &mut visual_bytes)?;
+            }
+            files
         }
     };
-    Ok(Value::Array(
-        files.iter().map(crate::store::ChatFile::ref_json).collect(),
+    if visual_bytes > crate::attachment_image::TURN_IMAGE_TOTAL_MAX as u64 {
+        return Err(Error::rejected(format!(
+            "attachments carry {visual_bytes} bytes of native images — over the \
+             {}-byte turn cap; remove or downscale an attachment",
+            crate::attachment_image::TURN_IMAGE_TOTAL_MAX
+        )));
+    }
+    Ok((
+        Value::Array(files.iter().map(crate::store::ChatFile::ref_json).collect()),
+        visual_bytes,
     ))
+}
+
+/// One visual attachment's delivery proof: an SVG is screened and rendered, a
+/// raster is already decoded, and the result is the exact byte count it
+/// contributes to the combined turn-image bound. The same proof re-runs at
+/// delivery.
+fn visual_delivery_bytes(mime: &str, bytes: &[u8]) -> Result<u64> {
+    if mime != "image/svg+xml" {
+        return Ok(bytes.len() as u64);
+    }
+    let (_, raster) = crate::attachment_image::rasterize_svg(bytes)
+        .map_err(|e| Error::rejected(format!("the SVG cannot be delivered as an image: {e}")))?;
+    Ok(raster.len() as u64)
+}
+
+/// The aggregate form used on the send path: add one attachment's delivered
+/// bytes to the turn's running total.
+fn preflight_attachment_visual(
+    file: &store::ChatFile,
+    bytes: &[u8],
+    visual_bytes: &mut u64,
+) -> Result<()> {
+    if !store::chat_visual_kind(&file.mime) {
+        return Ok(());
+    }
+    let delivered = visual_delivery_bytes(&file.mime, bytes)?;
+    *visual_bytes = visual_bytes
+        .checked_add(delivered)
+        .ok_or_else(|| Error::rejected("native image sizes overflow"))?;
+    Ok(())
 }
 
 /// CAD-574: `thread_send`'s `refs` — at most eight `{kind,id}` subjects
@@ -5090,8 +5310,18 @@ fn attachments_envelope(files: &[Value]) -> Option<String> {
         let sha = f.get("sha256")?.as_str()?;
         let short: String = sha.chars().take(12).collect();
         let kb = size.div_ceil(1024);
+        let hint = if mime == "image/svg+xml" {
+            format!(
+                "attached to this turn as native rasterized image pixels; the SVG source \
+                 is readable with `cadence attachment read {id}`"
+            )
+        } else if store::chat_visual_kind(mime) {
+            "attached to this turn as native image pixels; it has no text projection".to_string()
+        } else {
+            format!("read with `cadence attachment read {id}`")
+        };
         lines.push(format!(
-            "- \"{name}\" ({kb} KB, {mime}, sha256:{short}…) — read with `cadence attachment read {id}`"
+            "- \"{name}\" ({kb} KB, {mime}, sha256:{short}…) — {hint}"
         ));
     }
     Some(format!(

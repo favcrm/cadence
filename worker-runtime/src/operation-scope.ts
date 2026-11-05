@@ -169,6 +169,14 @@ export function parseEntryAppScope(
   return parseAppScope(data.app);
 }
 
+/** The board id stored in a placed input, or null for an older non-board entry. */
+export function parseEntryOperationId(kind: unknown, data: unknown): string | null {
+  if (kind !== BOARD_MESSAGE_KIND) return null;
+  if (typeof data !== "object" || data === null || Array.isArray(data) || !("messageId" in data))
+    throw new Error("The stored operation entry is malformed.");
+  return requireOperationId(data.messageId);
+}
+
 /**
  * Whether two operation scopes are the same binding: both Home, or the same
  * installation with the same context. Never compares only one part, so a

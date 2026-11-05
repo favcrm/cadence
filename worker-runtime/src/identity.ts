@@ -152,6 +152,22 @@ export function readSubmissionEntry(
   return entry;
 }
 
+/** The engine's request id for a placed input, never a value inferred from its text. */
+export function readSubmissionRequestId(sql: TaskSql, submissionId: string): string {
+  const unavailable = () =>
+    new Error(`Submission "${submissionId}" has no readable request identity.`);
+  const id = Number(submissionId);
+  if (!Number.isSafeInteger(id) || id <= 0) throw unavailable();
+  const submission = record(sql, "pi_submissions", id);
+  if (
+    submission === null ||
+    submission.type !== "input" ||
+    typeof submission.requestId !== "string"
+  )
+    throw unavailable();
+  return submission.requestId;
+}
+
 /**
  * Whether the engine holds any submission — queued, placed or settled — for one
  * operation id.

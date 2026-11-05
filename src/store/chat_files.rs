@@ -70,7 +70,10 @@ CREATE TABLE IF NOT EXISTS chat_upload_accounts(
 pub const CHAT_FILES_DIR: &str = "chat-files";
 
 /// One file is at most 10 MiB (the mock's ceiling; the multipart
-/// envelope rides above it at the board).
+/// envelope rides above it at the board). A raster image is additionally
+/// capped at [`crate::attachment_image::IMAGE_MAX_BYTES`] because that is
+/// the native image prompt bound; a larger image refuses rather than
+/// being retained as an attachment no turn can deliver.
 pub const CHAT_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// A text read returns at most this many bytes (the thread's own cap).
 pub const CHAT_FILE_TEXT_CAP: usize = 64_000;
@@ -226,11 +229,31 @@ impl ChatFile {
 
     /// The read projection of one row from the exact bytes whose size
     /// and digest were verified against it: bounded secret-scanned UTF-8
-    /// text (only text kinds are ever retained). The caller passes the
-    /// checked bytes; this helper never
+    /// text for text/SVG/PDF, or an explicit no-text-projection receipt
+    /// for a raster image. The caller passes the checked bytes; this
+    /// helper never
     /// opens a path, so a completed scope or capability proof is not
     /// undone by a second read.
     pub fn read_projection(&self, bytes: Vec<u8>) -> Result<Value> {
+        if visual_kind(&self.mime) && !text_kind(&self.mime) {
+            // A raster image has no text projection. The model observes
+            // it as native pixels through the turn image path; the read
+            // verb reports exactly that instead of inventing a
+            // description or returning encoded bytes.
+            prove_declared_kind(&self.name, &self.mime, &bytes)?;
+            checked_attachment_body(&self.name, &self.mime, &bytes)
+                .map_err(|e| Error::rejected(format!("attachment '{}': {e}", self.id)))?;
+            return Ok(json!({
+                "id": self.id,
+                "name": self.name,
+                "size": self.size,
+                "mime": self.mime,
+                "sha256": self.sha256,
+                "extractable": false,
+                "visual": true,
+                "delivery": "this image is delivered to an image-capable model as native image pixels; it has no text projection",
+            }));
+        }
         if !text_kind(&self.mime) {
             return Err(Error::rejected(format!(
                 "attachment '{}' is not a text attachment",
@@ -339,18 +362,26 @@ fn sniff_head(bytes: &[u8]) -> &[u8] {
     }
 }
 
-/// What the real bytes sniff as, restricted to the v1 allowlist plus
-/// the honest refusal classes (executables, archives, svg/html, zip).
-/// `sniff_mime` is the wiki's magic-byte table.
+/// What the real bytes sniff as: text (including readable HTML and script
+/// source), PDF, SVG, PNG/JPEG/WebP, or the refusal classes (executables,
+/// archives, zip). A NUL in the head marks binary content even when the
+/// bytes are valid UTF-8. `sniff_mime` is the wiki's magic-byte table.
 fn sniffed_kind(bytes: &[u8]) -> &'static str {
-    match crate::wiki::sniff_mime(bytes) {
+    // A UTF-8 BOM is legal in an SVG/XML document and is not whitespace
+    // to the wiki sniff; strip it for the shape check only.
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let sniffed = crate::wiki::sniff_mime(bytes);
+    if let Some((_, kind)) = RASTER_KIND.iter().find(|(mime, _)| *mime == sniffed) {
+        return kind;
+    }
+    match sniffed {
         "application/pdf" => "pdf",
-        "image/png" => "png",
-        "image/jpeg" => "jpeg",
-        "image/webp" => "webp",
-        // `sniff_mime` folds every UTF-8 file to text/plain except the
-        // html/svg shapes it names — those are refused below.
-        "text/plain" => "text",
+        "image/svg+xml" => "svg",
+        // `sniff_mime` folds UTF-8 text to text/plain and readable HTML to
+        // text/html. Both are inert UTF-8 source here; a NUL in the head
+        // still marks binary content.
+        "text/plain" | "text/html" if !bytes.contains(&0) => "text",
+        "text/plain" | "text/html" => "binary",
         other => other,
     }
 }
@@ -371,23 +402,94 @@ const TEXT_EXTS: [(&str, &str); 10] = [
     ("xml", "application/xml"),
 ];
 
+/// The raster kinds delivered as native image pixels, keyed by the
+/// extension a name may claim. The bytes must still sniff as the same
+/// kind; an image with no recognised extension is accepted from its
+/// bytes alone (the composer has no extension prefilter).
+const IMAGE_EXTS: [(&str, &str); 4] = [
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("webp", "image/webp"),
+];
+
+/// The sniffed kind each delivered raster MIME is recorded as. This is the one
+/// place the MIME↔kind relation lives; `sniffed_kind` and `check_kind` both
+/// read it, so an extension and the bytes it must match cannot drift apart.
+const RASTER_KIND: [(&str, &str); 3] = [
+    ("image/png", "png"),
+    ("image/jpeg", "jpeg"),
+    ("image/webp", "webp"),
+];
+
+fn raster_kind_name(mime: &str) -> &'static str {
+    RASTER_KIND
+        .iter()
+        .find(|(candidate, _)| *candidate == mime)
+        .map(|(_, kind)| *kind)
+        .unwrap_or("")
+}
+
+/// Extensions that are never attachable even when their bytes happen to
+/// be valid UTF-8: executables, archives and media containers. The
+/// composer has no prefilter, so this is the daemon's honest minimum —
+/// the full-byte UTF-8/kind check remains the enforcement boundary for
+/// everything else.
+const REFUSED_EXTS: [&str; 30] = [
+    "exe", "dll", "so", "dylib", "bin", "com", "msi", "msp", "wasm", "class", "jar", "zip", "tar",
+    "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "iso", "dmg", "deb", "rpm", "apk", "aab", "bmp",
+    "ico", "tif", "tiff",
+];
+
+/// Media/container extensions the daemon refuses by name even after the
+/// visual kinds above were considered (the image decoder cannot speak
+/// them, and retaining them would imply a delivery it cannot make).
+const REFUSED_MEDIA_EXTS: [&str; 13] = [
+    "heic", "heif", "avif", "mp4", "m4v", "mov", "avi", "mkv", "webm", "mp3", "wav", "flac", "ogg",
+];
+
 /// The claimed extension must match the real bytes; `mime` is the
-/// stored content type. Refuses anything off the allowlist
-/// (executables, html/svg, archives, corrupt/empty magic). Image kinds —
-/// by extension or by sniffed bytes — are refused with a specific
-/// reason: their representation is CAD-1233.
+/// stored content type. Refuses binary/off-list content (GIF, archives,
+/// executables, corrupt/empty magic). HTML and script source are inert UTF-8
+/// text, never rendered or executed. A name with no recognised
+/// extension is classified from its bytes alone, so the composer needs
+/// no extension prefilter: ordinary UTF-8 text, SVG source, PDF, PNG,
+/// JPEG and WebP are attachable, and everything else refuses.
 fn check_kind(name: &str, bytes: &[u8]) -> Result<&'static str> {
     let ext = claimed_ext(name);
     let ext = ext.as_str();
     let sniffed = sniffed_kind(bytes);
-    if matches!(ext, "png" | "jpg" | "jpeg" | "webp" | "gif")
-        || matches!(sniffed, "png" | "jpeg" | "webp" | "image/gif")
-    {
+    if ext == "gif" || sniffed == "image/gif" {
         return Err(Error::rejected(format!(
-            "chat_file_upload refused '{name}': image processing is not available \
-             yet — the allowlist is pdf, txt, md, markdown, csv, tsv, json, jsonl, \
-             yaml and xml",
+            "chat_file_upload refused '{name}': GIF is not a supported visual kind — \
+             use PNG, JPEG, WebP or SVG"
         )));
+    }
+    if REFUSED_EXTS.contains(&ext) || REFUSED_MEDIA_EXTS.contains(&ext) {
+        return Err(Error::rejected(format!(
+            "chat_file_upload refused '{name}': '.{ext}' is not an attachable kind — \
+             expected UTF-8 text, SVG, PDF, PNG, JPEG or WebP"
+        )));
+    }
+    if let Some((_, mime)) = IMAGE_EXTS.iter().find(|(candidate, _)| *candidate == ext) {
+        if sniffed != raster_kind_name(mime) {
+            return Err(Error::rejected(format!(
+                "chat_file_upload refused '{name}': a '.{ext}' file must sniff as \
+                 its declared kind — the bytes did not (extension and client MIME \
+                 are never the enforcement boundary)"
+            )));
+        }
+        return Ok(mime);
+    }
+    if ext == "svg" {
+        if sniffed != "svg" {
+            return Err(Error::rejected(format!(
+                "chat_file_upload refused '{name}': a '.svg' file must sniff as \
+                 its declared kind — the bytes did not (extension and client MIME \
+                 are never the enforcement boundary)"
+            )));
+        }
+        return Ok("image/svg+xml");
     }
     if ext == "pdf" {
         if sniffed != "pdf" {
@@ -399,20 +501,31 @@ fn check_kind(name: &str, bytes: &[u8]) -> Result<&'static str> {
         }
         return Ok("application/pdf");
     }
-    let Some((_, mime)) = TEXT_EXTS.iter().find(|(candidate, _)| *candidate == ext) else {
-        return Err(Error::rejected(format!(
-            "chat_file_upload: '.{ext}' is not an attachable type — the allowlist is \
-             pdf, txt, md, markdown, csv, tsv, json, jsonl, yaml and xml",
-        )));
-    };
-    if sniffed != "text" {
-        return Err(Error::rejected(format!(
-            "chat_file_upload refused '{name}': a '.{ext}' file must sniff as \
-             its declared kind — the bytes did not (extension and client MIME \
-             are never the enforcement boundary)"
-        )));
+    if let Some((_, mime)) = TEXT_EXTS.iter().find(|(candidate, _)| *candidate == ext) {
+        if sniffed != "text" {
+            return Err(Error::rejected(format!(
+                "chat_file_upload refused '{name}': a '.{ext}' file must sniff as \
+                 its declared kind — the bytes did not (extension and client MIME \
+                 are never the enforcement boundary)"
+            )));
+        }
+        return Ok(mime);
     }
-    Ok(mime)
+    // No recognised extension: the bytes decide. This is what lets the
+    // operator pick any file and have the daemon classify it.
+    match sniffed {
+        "text" => Ok("text/plain"),
+        "svg" => Ok("image/svg+xml"),
+        "png" => Ok("image/png"),
+        "jpeg" => Ok("image/jpeg"),
+        "webp" => Ok("image/webp"),
+        "pdf" => Ok("application/pdf"),
+        other => Err(Error::rejected(format!(
+            "chat_file_upload refused '{name}': the bytes sniff as '{other}', which \
+             is not an attachable kind — expected UTF-8 text, SVG, PDF, PNG, JPEG \
+             or WebP"
+        ))),
+    }
 }
 
 /// The extracted text of one retained attachment, from the exact bytes the
@@ -427,13 +540,43 @@ fn attachment_text(name: &str, mime: &str, bytes: &[u8]) -> Result<String> {
                 "attachment '{name}' is not a text source"
             )));
         }
-        return std::str::from_utf8(bytes)
-            .map(|text| text.to_string())
+        if bytes.contains(&0) {
+            return Err(Error::rejected(format!(
+                "chat_file_upload '{name}': the bytes contain NUL — that is binary \
+                 content, not text"
+            )));
+        }
+        let text = std::str::from_utf8(bytes)
             .map_err(|e| {
                 Error::rejected(format!("chat_file_upload '{name}': not UTF-8 text: {e}"))
-            });
+            })?
+            .to_string();
+        // SVG source is retained and read as inert text. Rendering it is a
+        // separate proof: `attachment_image::rasterize_svg` parses the source
+        // with the linked XML parser and refuses it before any renderer runs
+        // when it carries script, markup, animation or an external reference.
+        return Ok(text);
     }
     pdf_attachment_text(PDFTOTEXT, name, bytes)
+}
+
+/// The one content gate every retained kind passes at upload and at
+/// every readiness check: text/SVG extract and scan; raster images prove
+/// their signature and decode within the delivery bound. Only those
+/// kinds are reachable here — `check_kind` has already classified the
+/// bytes.
+fn checked_attachment_body(name: &str, mime: &str, bytes: &[u8]) -> Result<()> {
+    if text_kind(mime) {
+        checked_attachment_text(name, mime, bytes)?;
+        return Ok(());
+    }
+    if crate::attachment_image::raster_mime(mime) {
+        return crate::attachment_image::validate_raster(bytes, mime)
+            .map_err(|e| Error::rejected(format!("chat_file_upload refused '{name}': {e}")));
+    }
+    Err(Error::rejected(format!(
+        "chat_file_upload refused '{name}': '{mime}' is not a supported attachment kind"
+    )))
 }
 
 /// The converter a PDF attachment is read through (poppler-utils).
@@ -530,9 +673,10 @@ fn checked_attachment_text(name: &str, mime: &str, bytes: &[u8]) -> Result<Strin
 }
 
 /// `true` for the kinds `chat_file_read` returns text for: the structured text
-/// kinds and a PDF, whose text is extracted under the same cap.
+/// kinds, SVG source, and a PDF, whose text is extracted under the same cap.
 pub fn text_kind(mime: &str) -> bool {
     mime == "application/pdf"
+        || mime == "image/svg+xml"
         || matches!(
             mime,
             "text/plain"
@@ -544,6 +688,22 @@ pub fn text_kind(mime: &str) -> bool {
                 | "application/yaml"
                 | "application/xml"
         )
+}
+
+/// `true` for every kind that can be delivered to an image-capable
+/// model as native image pixels (SVG through the bounded rasterizer).
+pub fn visual_kind(mime: &str) -> bool {
+    crate::attachment_image::visual_mime(mime)
+}
+
+/// One `chat_file_put_for_user` call: the scope it lands in, the owner it binds
+/// to, and the caller's own delivery proof for the exact bytes about to be
+/// published. Grouped so the retention call keeps a readable signature.
+pub struct ChatFileUpload<'a, F> {
+    pub scope: &'a str,
+    pub context_id: &'a str,
+    pub owner: (&'a str, &'a str),
+    pub deliverable: F,
 }
 
 impl Store {
@@ -706,10 +866,11 @@ impl Store {
         let sha256 = sha256_hex(&bytes);
         let head = sniff_head(&bytes);
         let mime = check_kind(&name, head)?.to_string();
-        // Every kind carries its read gate before retention: the text is
-        // extracted (a PDF through the bounded converter) and scanned for
-        // credentials — the same check a read runs.
-        checked_attachment_text(&name, &mime, &bytes)?;
+        // Every kind carries its read gate before retention: text/SVG is
+        // extracted and scanned for credentials, a PDF through the
+        // bounded converter, and a raster image decodes within the
+        // delivery bound — the same check a read runs.
+        checked_attachment_body(&name, &mime, &bytes)?;
 
         let existing = {
             let conn = self.conn();
@@ -790,15 +951,22 @@ impl Store {
     /// tree. The legacy PM root is used only for the shared quota lock; the
     /// anonymous custody stage and final hard link are on the destination
     /// operational filesystem, and ownership is versioned in SQLite.
-    pub fn chat_file_put_for_user(
+    pub fn chat_file_put_for_user<F>(
         &self,
         roots: ChatFileOperationalRoots<'_>,
         tmp: &Path,
         name: &str,
-        scope: &str,
-        context_id: &str,
-        owner: (&str, &str),
-    ) -> Result<ChatFile> {
+        plan: ChatFileUpload<'_, F>,
+    ) -> Result<ChatFile>
+    where
+        F: Fn(&str, &[u8]) -> Result<()>,
+    {
+        let ChatFileUpload {
+            scope,
+            context_id,
+            owner,
+            deliverable,
+        } = plan;
         let (user_id, thread_id) = owner;
         if !valid_upload_account_id(user_id) || !valid_native_thread_id(thread_id) {
             return Err(Error::rejected(
@@ -826,7 +994,14 @@ impl Store {
         }
         let sha256 = sha256_hex(&bytes);
         let mime = check_kind(&name, sniff_head(&bytes))?.to_string();
-        checked_attachment_text(&name, &mime, &bytes)?;
+        checked_attachment_body(&name, &mime, &bytes)?;
+        // The caller's own delivery proof runs on the exact bytes it is about
+        // to report, before dedup can return an older row and before any
+        // custody or quota is committed: a visual kind that cannot be
+        // screened, rendered or admitted by the selected model is refused
+        // here, so nothing is retained, charged, or reported ready — including
+        // a re-upload of a file whose model or renderer has since changed.
+        deliverable(&mime, &bytes)?;
         if let Some(existing) =
             self.chat_file_by_user_sha(&sha256, scope, context_id, user_id, thread_id)?
         {
@@ -1012,13 +1187,13 @@ impl Store {
         }
     }
 
-    /// Checked readiness for one retained text row against the bytes on
-    /// disk: the row must be a text kind within `cap` (clamped to
+    /// Checked readiness for one retained row against the bytes on disk:
+    /// the row must be an attachable kind within `cap` (clamped to
     /// [`CHAT_FILE_MAX_BYTES`]; a larger row refuses, never truncates),
     /// the workspace blob must exist as a regular file and its bounded
-    /// content must still match the declared size and digest, sniff as an
-    /// allowed text kind, decode as UTF-8 and pass the secret gate.
-    /// Returns the exact checked bytes. This proves bytes only — scope,
+    /// content must still match the declared size and digest, sniff as
+    /// its declared kind, pass the text/secret gate (or decode as a
+    /// bounded raster image). Returns the exact checked bytes. This proves bytes only — scope,
     /// provenance and capability stay the caller's proof, and a caller
     /// holding an authorized operation must call this while that
     /// operation is still open.
@@ -1029,10 +1204,10 @@ impl Store {
         cap: u64,
     ) -> Result<Vec<u8>> {
         let cap = cap.min(CHAT_FILE_MAX_BYTES);
-        if !text_kind(&file.mime) {
+        if !text_kind(&file.mime) && !visual_kind(&file.mime) {
             return Err(Error::rejected(format!(
-                "attachment '{}' is not a ready text source — only a text kind or a \
-                 PDF can be referenced",
+                "attachment '{}' is not a ready attachment — it is neither text/PDF \
+                 nor a supported visual kind",
                 file.id
             )));
         }
@@ -1054,9 +1229,10 @@ impl Store {
         cap: u64,
     ) -> Result<Vec<u8>> {
         let cap = cap.min(CHAT_FILE_MAX_BYTES);
-        if !text_kind(&file.mime) {
+        if !text_kind(&file.mime) && !visual_kind(&file.mime) {
             return Err(Error::rejected(format!(
-                "attachment '{}' is not a ready text source — only a text kind or a PDF can be referenced",
+                "attachment '{}' is not a ready attachment — it is neither text/PDF \
+                 nor a supported visual kind",
                 file.id
             )));
         }
@@ -1091,9 +1267,10 @@ impl Store {
         // The same kind proof the upload and every read run.
         prove_declared_kind(&file.name, &file.mime, &bytes)
             .map_err(|e| Error::rejected(format!("attachment '{}' is not ready — {e}", file.id)))?;
-        // Readiness is the read gate: the text must still extract (a PDF
-        // through the bounded converter) and still pass the secret scan.
-        checked_attachment_text(&file.name, &file.mime, &bytes)
+        // Readiness is the read gate: text/SVG must still extract and
+        // pass the secret scan (a PDF through the bounded converter), and
+        // a raster image must still decode within the delivery bound.
+        checked_attachment_body(&file.name, &file.mime, &bytes)
             .map_err(|e| Error::rejected(format!("attachment '{}' is not ready — {e}", file.id)))?;
         Ok(bytes)
     }
@@ -2658,18 +2835,24 @@ mod tests {
     }
 
     #[test]
-    fn refuses_bad_magic_and_offlist() {
+    fn refuses_bad_magic_and_unknown_binary() {
         let (dir, s) = store();
         let refused =
             |bytes: &[u8], name: &str| put(&s, dir.path(), bytes, name).unwrap_err().to_string();
         // A .pdf whose bytes are not a PDF refuses: a name is not a kind.
         assert!(refused(b"hello", "fake.pdf").contains("sniff"));
-        // An image is refused with the image reason, not a generic one.
-        assert!(refused(b"PK\x03\x04rest", "a.png").contains("image processing"));
-        // svg is text-ish by shape but off the allowlist
+        // A .png whose bytes are a ZIP magic refuses on the sniff.
+        assert!(refused(b"PK\x03\x04rest", "a.png").contains("sniff"));
+        // SVG bytes mislabelled as text refuse on the sniff.
         assert!(refused(b"<svg></svg>", "x.txt").contains("sniff"));
-        // an unsupported extension refuses before sniffing
-        assert!(refused(b"MZ", "a.exe").contains("not an attachable type"));
+        // Unsigned binary bytes have no attachable kind.
+        assert!(refused(b"MZ", "a.exe").contains("not an attachable kind"));
+        // With no extension prefilter the bytes decide: plain UTF-8 is
+        // ordinary text even under an unrecognised name.
+        assert_eq!(
+            put(&s, dir.path(), b"plain notes", "NOTES").unwrap().mime,
+            "text/plain"
+        );
     }
 
     /// A minimal, well-formed one-page PDF whose only text is `text`. Built

@@ -552,9 +552,18 @@ pub trait ProviderAdapter: Send + Sync {
             Ok(())
         } else {
             Err(Error::pre_write(
-                "this runtime has no native image prompt, so the attached library image was not sent. Use an image-capable Pi session; the selected model was left unchanged.",
+                "this runtime has no native image prompt, so the attached image was not sent. Use an image-capable Pi session; the selected model was left unchanged.",
             ))
         }
+    }
+    /// Refuse a visual attachment before a send is accepted when this live
+    /// runtime cannot deliver it. The delivery path still re-checks, but a
+    /// queued message must not receive a successful receipt for an image the
+    /// selected runtime/model provably cannot take. Empty is a no-op.
+    fn preflight_turn_images(&self) -> Result<()> {
+        Err(Error::rejected(
+            "this runtime has no native image prompt, so the image attachment was refused before send. Use an image-capable Pi session; the selected model was left unchanged.",
+        ))
     }
     /// CAD-1009: [`Self::run_turn`] for a prompt that may carry a
     /// scoped-turn token `slot` (a unique marker the daemon left after

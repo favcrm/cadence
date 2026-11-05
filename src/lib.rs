@@ -32,6 +32,7 @@ pub mod agent_uid;
 pub mod app_assistant;
 pub mod app_preview_export;
 pub mod assistant_actor;
+pub mod attachment_image;
 pub mod audit;
 pub mod backup;
 pub mod board_identity;

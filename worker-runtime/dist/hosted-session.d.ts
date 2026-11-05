@@ -125,6 +125,8 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      * throws, so the caller refuses rather than running an app turn as Home.
      */
     private operationAppScope;
+    /** The message ids of the run's own placed board inputs, never prompt text. */
+    private operationIds;
     /** What the runtime has not settled yet, so the board can show queued/running/parked. */
     pendingOperations(): Promise<PendingOperation[]>;
     /**

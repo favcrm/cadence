@@ -6,8 +6,9 @@ import {
   LiveDoc,
   type Extension,
 } from "@earendil-works/pi-durable";
-import type { AppScope } from "./contract.ts";
+import type { AppScope, ToolContent } from "./contract.ts";
 import { withSystemContext } from "./identity-context.ts";
+import { MAX_IMAGE_BASE64_CHARS, MAX_IMAGE_PARTS } from "./image-limits.ts";
 import { guardModelStream } from "./model-guard.ts";
 import { sameAppScope } from "./operation-scope.ts";
 
@@ -136,6 +137,48 @@ export function runAppScope(
   return scope ?? null;
 }
 
+type AttachedImage = Extract<ToolContent, { type: "image" }>;
+type AttachedImages = (
+  roots: readonly number[],
+  app: AppScope | null,
+  signal?: AbortSignal,
+) => Promise<readonly AttachedImage[]>;
+
+/** Validate transient host-supplied images before they enter a model request. */
+function imageMessage(images: readonly AttachedImage[], maxImages: number): Message | null {
+  if (!Array.isArray(images) || images.length > maxImages || images.length > MAX_IMAGE_PARTS)
+    throw new Error("The active operation's images are invalid or exceed the image limit.");
+  if (images.length === 0) return null;
+  let encodedBytes = 0;
+  for (const image of images) {
+    if (
+      image === null ||
+      typeof image !== "object" ||
+      image.type !== "image" ||
+      (image.mimeType !== "image/png" &&
+        image.mimeType !== "image/jpeg" &&
+        image.mimeType !== "image/webp") ||
+      typeof image.data !== "string" ||
+      image.data.length === 0 ||
+      image.data.length > MAX_IMAGE_BASE64_CHARS ||
+      image.data.length % 4 !== 0 ||
+      !/^[A-Za-z0-9+/]+={0,2}$/.test(image.data)
+    )
+      throw new Error("The active operation's image is invalid.");
+    encodedBytes += image.data.length;
+    if (encodedBytes > MAX_IMAGE_BASE64_CHARS)
+      throw new Error("The active operation's images exceed the image limit.");
+  }
+  return {
+    role: "user",
+    content: [
+      { type: "text", text: "Images attached to the active user messages, in attachment order:" },
+      ...images.map(({ data, mimeType }) => ({ type: "image" as const, data, mimeType })),
+    ],
+    timestamp: Date.now(),
+  };
+}
+
 /**
  * Build the app-scope extension for one session object.
  *
@@ -148,6 +191,8 @@ export function runAppScope(
 export function operationContextExtension(
   load: (submissionRoot: string) => AppScope | null,
   authored: WeakSet<object>,
+  attachedImages?: AttachedImages,
+  maxImages = 1,
 ): Extension {
   return {
     name: "hosted-operation-context",
@@ -172,15 +217,28 @@ export function operationContextExtension(
                 "The active run's operation envelope is unavailable.",
               );
             const app = runAppScope(run.inputs, load);
+            if (context.abortSignal?.aborted)
+              throw new Error("The active operation was cancelled.");
+            const image = attachedImages
+              ? imageMessage(
+                  await attachedImages(run.inputs, app, context.abortSignal),
+                  maxImages,
+                )
+              : null;
+            if (context.abortSignal?.aborted)
+              throw new Error("The active operation was cancelled.");
+            const messages = image === null
+              ? request.messages
+              : [...request.messages, image];
             if (app === null) {
-              const attested = withAttestation(request.messages, authored);
+              const attested = withAttestation(messages, authored);
               return attested === undefined
                 ? undefined
                 : { messages: attested };
             }
             return {
               messages: withSystemContext(
-                request.messages,
+                messages,
                 appScopeText(app),
                 authored,
               ),

@@ -408,20 +408,20 @@ fn resolved_pi_model(state: &Value) -> Option<(String, &str)> {
 fn selected_model_admits_image(state: &Value) -> Result<()> {
     let Some((provider, id)) = pi_model_identity(state) else {
         return Err(Error::pre_write(
-            "Pi did not identify its selected model, so the attached library image was not sent. The model was left unchanged.",
+            "Pi did not identify its selected model, so the attached image was not sent. The model was left unchanged.",
         ));
     };
     let model = &state["model"];
     let Some(input) = model.get("input").and_then(Value::as_array) else {
         return Err(Error::pre_write(
-            "Pi did not report input modalities for the selected model, so the attached library image was not sent. The model was left unchanged.",
+            "Pi did not report input modalities for the selected model, so the attached image was not sent. The model was left unchanged.",
         ));
     };
     if input.iter().any(|item| item.as_str() == Some("image")) {
         return Ok(());
     }
     Err(Error::pre_write(format!(
-        "selected model {provider}/{id} admits no image input, so the attached library image was not sent. Choose a model whose reported input modalities include image; this model was left unchanged."
+        "selected model {provider}/{id} admits no image input, so the attached image was not sent. Choose a model whose reported input modalities include image; this model was left unchanged."
     )))
 }
 
@@ -1561,8 +1561,8 @@ impl ProviderAdapter for PiAdapter {
         }
         let mut encoded = Vec::with_capacity(images.len());
         for image in images {
-            if image.bytes.len() > 4 * 1024 * 1024
-                || !matches!(image.media_type, "image/png" | "image/jpeg" | "image/webp")
+            if image.bytes.len() > crate::attachment_image::IMAGE_MAX_BYTES
+                || !crate::attachment_image::raster_mime(image.media_type)
             {
                 return Err(Error::pre_write(
                     "retained image is outside the native prompt bound, so it was not sent",
@@ -1579,6 +1579,15 @@ impl ProviderAdapter for PiAdapter {
         }
         *self.shared.turn_images.lock().unwrap() = encoded;
         Ok(())
+    }
+
+    fn preflight_turn_images(&self) -> Result<()> {
+        let state = self.checked("get_state", json!({})).map_err(|e| {
+            Error::rejected(format!(
+                "the selected model's image input support cannot be verified before send: {e}"
+            ))
+        })?;
+        selected_model_admits_image(&state).map_err(|e| Error::rejected(e.to_string()))
     }
 
     /// One durable message → one `prompt` command → provider settlement.

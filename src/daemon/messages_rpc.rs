@@ -156,6 +156,35 @@ impl Shared {
         })
     }
 
+    /// The pinned library image's delivered bytes, proved before a send is
+    /// accepted. The delivery path re-proves the pin and the receiver; this
+    /// preflight only prevents a receipt for an image the turn could not take.
+    fn pinned_image_size(&self, pin: &Value) -> Result<u64> {
+        let rows = pin
+            .as_array()
+            .filter(|rows| rows.len() == 1)
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let asset_id = rows[0]["asset_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let revision = rows[0]["revision"]
+            .as_i64()
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let sha = rows[0]["sha256"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let image = self
+            .store
+            .app_media_pinned_display(asset_id, revision, sha)?
+            .ok_or_else(|| {
+                Error::rejected("pinned library image no longer matches the retained bytes")
+            })?;
+        crate::attachment_image::validate_raster(&image.bytes, image.media_type).map_err(|e| {
+            Error::rejected(format!("pinned library image was refused before send: {e}"))
+        })?;
+        Ok(image.bytes.len() as u64)
+    }
+
     /// `agent_send` without a connection to attribute (unit tests):
     /// a threaded agent records the message as unattributed, and a
     /// steering send is the operator's.
@@ -786,8 +815,8 @@ impl Shared {
                  needs rows; `cadence send` and `agent_send` carry none",
             ));
         }
-        let attachments = match params.get("attachments") {
-            None | Some(Value::Null) => None,
+        let (attachments, attachment_visual_bytes) = match params.get("attachments") {
+            None | Some(Value::Null) => (None, 0u64),
             Some(_) if sender != store::Sender::OperatorChat => {
                 return Err(Error::rejected(
                     "attachments is a thread_send field — only the operator's chat \
@@ -814,14 +843,15 @@ impl Shared {
                 } else {
                     None
                 };
-                Some(thread_attachments(
+                let (value, visual_bytes) = thread_attachments(
                     self,
                     v,
                     app.as_ref(),
                     account_id.as_deref(),
                     params.get("session").is_some(),
                     home_thread.as_deref().unwrap_or_default(),
-                )?)
+                )?;
+                (Some(value), visual_bytes)
             }
         };
         let media_refs = match params.get("media_refs") {
@@ -833,6 +863,39 @@ impl Shared {
             }
             Some(value) => Some(self.prove_media_refs(value)?),
         };
+        if nudge && (attachments.is_some() || media_refs.is_some()) {
+            return Err(Error::rejected(
+                "--nudge is steering, not a new turn — it cannot carry attachments or a \
+                 library image; send a normal queued message",
+            ));
+        }
+        // Visual delivery is proved before a fresh send receives a receipt:
+        // bounded conversion (an SVG is screened, then rendered), the selected
+        // live runtime/model's image support, and the combined turn-image
+        // bound. Delivery re-proves scope, digest and the model for queued
+        // changes.
+        let pinned_bytes = match &media_refs {
+            Some(pin) => self.pinned_image_size(pin)?,
+            None => 0,
+        };
+        let visual_total = attachment_visual_bytes
+            .checked_add(pinned_bytes)
+            .ok_or_else(|| Error::rejected("native image sizes overflow"))?;
+        if visual_total > crate::attachment_image::TURN_IMAGE_TOTAL_MAX as u64 {
+            return Err(Error::rejected(format!(
+                "the turn carries {visual_total} bytes of native images — over the \
+                 {}-byte cap; remove or downscale an attachment",
+                crate::attachment_image::TURN_IMAGE_TOTAL_MAX
+            )));
+        }
+        if visual_total > 0 && !self.store.message_exists(&message)? {
+            // No live adapter means the selected model's image support cannot
+            // be proved now. Refuse the fresh send rather than accept a queued
+            // turn that provably fails later; a retry of an already-enqueued
+            // message is not a new receipt.
+            let adapter = self.adapter_for(&alias)?;
+            adapter.preflight_turn_images()?;
+        }
         // CAD-1098: app conversations are the master's. Another agent has
         // no per-conversation session, so an app binding to it is refused.
         if home_conversation.is_some() && sender != store::Sender::OperatorChat {
