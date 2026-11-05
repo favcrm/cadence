@@ -690,6 +690,18 @@ fn verb_for(
             "issue_set"
         }
         Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Link { id, kind, target },
+        } => {
+            link_args(&mut args, id, kind, target, "link")?;
+            "issue_link"
+        }
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Unlink { id, kind, target },
+        } => {
+            link_args(&mut args, id, kind, target, "unlink")?;
+            "issue_unlink"
+        }
+        Commands::Issue {
             action:
                 cadence_agent::issue::cli::IssueAction::Project {
                     action:
@@ -1274,6 +1286,43 @@ fn platform_replay_key(tool: &str, query: Option<&Value>, body: Option<&Value>) 
 const TICKET_MESSAGE_BYTES: usize = 16_000;
 
 /// A role on a ticket: a free label, in the tenant's grammar.
+/// One link request, validated where the answer is already known: the four
+/// kinds are fixed, an id must satisfy the shared grammar, and a self-link is
+/// always refused. All three cost a round trip otherwise, and each says
+/// nothing was sent. Nothing is trimmed: a value the board would refuse must
+/// be refused here rather than quietly repaired into a different write.
+fn link_args(
+    args: &mut serde_json::Map<String, Value>,
+    id: &str,
+    kind: &str,
+    target: &str,
+    action: &str,
+) -> Result<()> {
+    if !matches!(kind, "blocked_by" | "relates" | "parent" | "duplicate_of") {
+        return Err(Error::rejected(format!(
+            "unknown link kind '{kind}' — use blocked_by, relates, parent or \
+             duplicate_of; nothing was sent"
+        )));
+    }
+    for (label, value) in [("issue", id), ("target", target)] {
+        if !cadence_core::issue::valid_id(value) {
+            return Err(Error::rejected(format!(
+                "invalid {label} id '{value}' — expected <PREFIX>-<n> like CAD-16; \
+                 nothing was sent"
+            )));
+        }
+    }
+    if id == target {
+        return Err(Error::rejected(format!(
+            "a ticket cannot {action} itself ({id}); nothing was sent"
+        )));
+    }
+    args.insert("id".into(), json!(id));
+    args.insert("kind".into(), json!(kind));
+    args.insert("target".into(), json!(target));
+    Ok(())
+}
+
 fn ticket_role<'a>(value: &'a str, flag: &str) -> Result<&'a str> {
     let mut chars = value.chars();
     let shaped = chars.next().is_some_and(|c| c.is_ascii_lowercase())
@@ -4768,6 +4817,64 @@ mod read_contract_tests {
             *text = Some("   ".into());
         });
         assert!(outcome(&empty_text).is_err());
+    }
+
+    #[test]
+    fn remote_link_maps_to_the_board_verb_and_refuses_locally() {
+        use cadence_agent::issue::cli::IssueAction;
+        let link = |kind: &str, target: &str| Commands::Issue {
+            action: IssueAction::Link {
+                id: "CAD-16".into(),
+                kind: kind.into(),
+                target: target.into(),
+            },
+        };
+
+        let (verb, args) = verb_for(&link("blocked_by", "CAD-9"), None).unwrap();
+        assert_eq!(verb, "issue_link");
+        assert_eq!(args.get("id").and_then(Value::as_str), Some("CAD-16"));
+        assert_eq!(args.get("kind").and_then(Value::as_str), Some("blocked_by"));
+        assert_eq!(args.get("target").and_then(Value::as_str), Some("CAD-9"));
+
+        // Both refusals are knowable here, so neither reaches the wire.
+        let unknown = verb_for(&link("cousin", "CAD-9"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unknown.contains("blocked_by, relates, parent or duplicate_of"),
+            "{unknown}"
+        );
+        assert!(unknown.contains("nothing was sent"), "{unknown}");
+
+        // A value the board would refuse is refused here, never trimmed into a
+        // different write: a trailing newline is not "repaired" to a valid kind.
+        let padded_kind = verb_for(&link("relates\n", "CAD-9"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(padded_kind.contains("unknown link kind"), "{padded_kind}");
+
+        let self_link = verb_for(&link("relates", "CAD-16"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(self_link.contains("cannot link itself"), "{self_link}");
+
+        // The shared grammar bounds both ids, so a malformed one costs no request.
+        for malformed in ["CAD-", "cad-16", "CAD-1234567890", "CAD-9\nX"] {
+            let err = verb_for(&link("relates", malformed), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid target id"), "{malformed}: {err}");
+            assert!(err.contains("nothing was sent"), "{malformed}: {err}");
+        }
+
+        let unlink = Commands::Issue {
+            action: IssueAction::Unlink {
+                id: "CAD-16".into(),
+                kind: "parent".into(),
+                target: "CAD-9".into(),
+            },
+        };
+        assert_eq!(verb_for(&unlink, None).unwrap().0, "issue_unlink");
     }
 
     #[test]

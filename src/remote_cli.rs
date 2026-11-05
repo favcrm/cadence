@@ -157,6 +157,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_message_send",
     "issue_messages_read",
     "issue_set",
+    // AOS-528: one link added or removed. The board applies the delta to the
+    // card it holds, so the client sends ids and a kind, never a whole card.
+    "issue_link",
+    "issue_unlink",
     "team_invite",
     "team_revoke_invite",
     "team_set_role",
@@ -641,6 +645,14 @@ fn issue_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, V
                         .and_then(|ids| ids.get(0))
                         .and_then(Value::as_str),
                 )
+        }
+        // A link write answers the card it changed, so the receipt must name
+        // the ticket the link was sent for — a 200 naming another card, or one
+        // naming none, cannot prove this link landed.
+        "issue_link" | "issue_unlink" => {
+            object("card")
+                && card_id == issue_id
+                && same(arguments.get("id").and_then(Value::as_str))
         }
         _ => false,
     }
@@ -5472,7 +5484,7 @@ fn call_verb_until_retry(
         let receipt_missing = effect.is_mutation()
             && (200..300).contains(&status)
             && body.as_ref().is_some_and(|reply| match verb {
-                "issue_new" | "issue_comment" | "issue_set" => {
+                "issue_new" | "issue_comment" | "issue_set" | "issue_link" | "issue_unlink" => {
                     !issue_receipt_correlates(verb, reply, &arguments)
                 }
                 "project_policy" => !policy_receipt_correlates(reply, &arguments),
