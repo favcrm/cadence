@@ -362,6 +362,15 @@ jobs:
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name == 'pull_request' }}
       - run: cargo build --profile ci --locked
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
+      # CAD-2153: the one deliberate exception to "CI does not run tests"
+      # (AGENTS.md). The fixture is a copy of what agenticos-v2 mints; this
+      # test is what fails a Cadence PR if verification stops accepting it
+      # (v2's own check covers the other side). One test, run in the `ci`
+      # profile so the cached dependency artifacts are reused. Do not widen
+      # it to a suite.
+      - name: Verify the platform-minted board assertion fixture
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
+        run: cargo test --profile ci --locked --lib board_identity::tests::the_platform_minted_fixture -- --test-threads 2
       - name: Package and clean-consumer check for the app toolchain
         if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
         run: scripts/app-toolchain-acceptance.sh "$GITHUB_WORKSPACE/target/ci/cadence"

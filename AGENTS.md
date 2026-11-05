@@ -298,7 +298,8 @@ the code you just wrote.
 
 ### Testing principles
 
-CI does not run tests. `ci.yml` proves the code compiles for the shipping
+CI does not run tests, except one: the CAD-2153 board-assertion fixture
+test in the `build` job. `ci.yml` proves the code compiles for the shipping
 features and both targets, lints it, and proves the release seam on the merge
 queue and main; the suite runs on a schedule and on demand (`tests.yml`), where
 a red test finds its owner instead of blocking an unrelated push. Per-module
