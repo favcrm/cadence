@@ -2524,7 +2524,12 @@ fn run_with_finish<F>(
     finish: F,
 ) -> Result<i32>
 where
-    F: FnOnce(&RemoteTarget, Option<&str>, Option<&std::path::Path>) -> Error,
+    F: FnOnce(
+        &RemoteTarget,
+        &str,
+        Option<&std::path::Path>,
+        Option<&std::path::Path>,
+    ) -> Result<serde_json::Value>,
 {
     if let Commands::Org { action } = command {
         return org::run(action);
@@ -2659,10 +2664,44 @@ where
         return local_agent::dispatch(&target, issue, to);
     }
     if let Commands::Issue {
-        action: cadence_agent::issue::cli::IssueAction::Finish { id, worktree, .. },
+        action:
+            cadence_agent::issue::cli::IssueAction::Finish {
+                id,
+                worktree,
+                force,
+                keep_branch,
+                remote,
+                merged,
+                dry_run,
+                ..
+            },
     } = &command
     {
-        return Err(finish(&target, id.as_deref(), worktree.as_deref()));
+        // CAD-2178: hosted finish releases one merged, clean, idle lane and
+        // nothing else. An option that would widen or soften that is refused
+        // rather than ignored — `--keep-branch` ignored would delete a branch
+        // the caller asked to keep.
+        for (set, flag) in [
+            (*force, "--force"),
+            (*keep_branch, "--keep-branch"),
+            (*remote, "--remote"),
+            (*merged, "--merged"),
+            (*dry_run, "--dry-run"),
+        ] {
+            if set {
+                return Err(Error::rejected(format!(
+                    "`issue finish {flag}` is not available on a hosted org; hosted finish \
+                     takes only <ID> [--worktree <path>] and releases a merged, clean, idle \
+                     lane. Nothing was removed"
+                )));
+            }
+        }
+        let Some(id) = id.as_deref() else {
+            return Err(Error::usage("hosted issue finish requires an issue id"));
+        };
+        let value = finish(&target, id, worktree.as_deref(), local_state.as_deref())?;
+        print_json(&value);
+        return Ok(0);
     }
     if let Commands::Issue {
         action:
@@ -3434,6 +3473,9 @@ pub(super) fn remote_failure(error: Error) -> Result<i32> {
 }
 
 #[cfg(test)]
+mod hosted_finish_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -3463,9 +3505,9 @@ mod tests {
             action: IssueAction::Finish {
                 id: Some("CAD-42".into()),
                 worktree: None,
-                force: true,
+                force: false,
                 keep_branch: false,
-                remote: true,
+                remote: false,
                 merged: false,
                 project: None,
                 dry_run: false,
@@ -3484,18 +3526,19 @@ mod tests {
             1,
             Some(tracker.clone()),
             Some("issue finish".into()),
-            |_, issue, worktree| {
-                cadence_agent::local_assignment::finish_guidance::refusal(
+            |_, issue, worktree, state| {
+                cadence_agent::local_assignment::finish_guidance::release(
                     &coordinator,
                     issue,
                     worktree,
+                    state.unwrap(),
                 )
             },
         )
         .unwrap_err();
         assert_eq!(error.kind(), "rejected");
-        assert!(error.to_string().contains("reconcile sweep"), "{error}");
         assert!(error.to_string().contains("cannot be confirmed"), "{error}");
+        assert!(!error.to_string().contains("reconcile"), "{error}");
         assert_eq!(calls.get(), 0, "no remote tracker call");
         assert!(!tracker.exists(), "no local tracker operation");
     }
