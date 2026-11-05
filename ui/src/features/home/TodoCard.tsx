@@ -362,7 +362,7 @@ export default function TodoCard({
         </div>
         <div className="todo-act">
           {showControl && controlButton}
-          {!done && (
+          {!done && action.type !== "staged" && (
             <button type="button" className="needmore" aria-label={t("more actions")} aria-expanded={menu} onClick={() => setMenu((m) => !m)}>
               ⋯
             </button>

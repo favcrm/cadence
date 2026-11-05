@@ -51,7 +51,7 @@ import Outbox from "./features/outbox/Outbox";
 import ThreadsPage from "./features/threads/ThreadsPage";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
-import DecisionsPanel from "./features/decisions/DecisionsPanel";
+import { useDecisions } from "./features/decisions/useDecisions";
 import MyWork from "./features/home/MyWork";
 import { useHomeCount } from "./features/home/todoLocal";
 import Context from "./features/projects/Context";
@@ -249,7 +249,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const agentsState = useResource(resources.agents);
   const overviewState = useResource(resources.overview);
   // The Home badge counts pending To do items only (CAD-1216).
-  const homeCount = useHomeCount(overviewState.data?.needs_me);
+  // CAD-2186: the owner's staged decisions count here too. Only a signed-in
+  // viewer of a hosted board who is not a member is asked; every other board
+  // is never queried.
+  const decisions = useDecisions(
+    meta?.signed_in === true && (meta.hosted === true || meta.session?.origin === "public") && meta.session?.user?.role !== "member",
+  );
+  const homeCount = useHomeCount(overviewState.data?.needs_me, decisions.pending.length);
   const issues = issuesState.data ?? [];
   const projects = projectsState.data ?? [];
   const agents = agentsState.data;
@@ -1088,7 +1094,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <HeaderSearch noWiki={!wikiAvailable(meta)} issues={issuesState} route={route} navHref={hrefFor} />
 
           <div className="ml-auto flex items-center gap-1 shrink-0">
-            {screen === "home" && meta?.signed_in === true && <DecisionsPanel />}
             {humanThreadsAvailable(meta) && <NotificationInbox authEpoch={authEpoch} />}
             <StatusChips
               variant="header"

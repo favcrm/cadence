@@ -1458,6 +1458,7 @@ function MasterHome({
           permissionsHref={permissionsHref}
           onAsk={onAsk}
           onOpenDecision={onOpenDecision}
+          decisions={hosted === true}
           onAskAgent={(agent, update) => setSeed((s) => ({
             text: `Check in with ${agent.alias}${agentOn(agent).length ? ` on ${agentOn(agent).join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,
             refs: [], n: s.n + 1,
