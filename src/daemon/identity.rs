@@ -456,7 +456,9 @@ impl Shared {
         let pm = self.pm()?;
         let (project, _dir) = crate::issue::write::issue_dir(&pm, issue)?;
         if crate::project_policy::refused(&pm, &project.key, actor.as_str()) {
-            return Err(Error::rejected(format!("{verb} refused: unknown issue")));
+            return Err(Error::rejected(format!(
+                "Unknown issue '{issue}' — `cadence issue ls` lists what exists"
+            )));
         }
         Ok(())
     }
@@ -471,25 +473,22 @@ impl Shared {
             .collect())
     }
 
-    /// The readable set and the issue→project map, or `None` when this daemon
-    /// has no tracker at all.
-    ///
-    /// A daemon without a tracker records no projects, so it has no private
-    /// one to withhold: `None` is "nothing to scope", not "scope everything
-    /// away". Every caller that reads a row still checks the ids it can
-    /// resolve, so a row naming an issue the tracker does not know is dropped
-    /// when there is a tracker and kept when there is not.
+    /// The readable set and issue→project map. A proven operator retains the
+    /// legacy unscoped view when no tracker exists; an agent cannot resolve
+    /// any issue in that case, and an unproven connection is refused.
+    /// An unreadable or malformed tracker is never treated as absent.
     pub(super) fn project_scope(&self, peer_pid: u32, verb: &str) -> Result<Option<ProjectScope>> {
-        match self.pm() {
-            // No tracker at all: there are no project records, so there is no
-            // private project, and nothing to scope. This is the only absence
-            // that is not a refusal — an unreadable or malformed tracker is an
-            // answer we cannot give, and refuses.
-            Err(Error::Rejected(message)) if message.starts_with("No PM dir at ") => {
-                return Ok(None)
-            }
-            Err(error) => return Err(error),
-            Ok(_) => {}
+        if let Err(error) = self.pm() {
+            let config = self.pm_dir()?.join("pm.yaml");
+            return match std::fs::symlink_metadata(config) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                    match self.agent_caller(peer_pid, verb)? {
+                        crate::peer::AgentCaller::Operator => Ok(None),
+                        crate::peer::AgentCaller::Agent(_) => Ok(Some(Default::default())),
+                    }
+                }
+                _ => Err(error),
+            };
         }
         Ok(Some((
             self.readable_projects(peer_pid, verb)?,

@@ -148,7 +148,7 @@ impl Shared {
         // policy does not admit answers as an unknown job.
         if let Some(issue) = job.issue_id.as_deref() {
             if self.admit_issue(peer_pid, "job show", issue).is_err() {
-                return Err(Error::rejected("job show refused: unknown job"));
+                return Err(Error::rejected(format!("No such job '{id}'")));
             }
         }
         let mut jj = job.to_json();
@@ -270,7 +270,7 @@ impl Shared {
         if let Ok(job) = self.store.job(&task.job_id) {
             if let Some(issue) = job.issue_id.as_deref() {
                 if self.admit_issue(peer_pid, "task show", issue).is_err() {
-                    return Err(Error::rejected("task show refused: unknown task"));
+                    return Err(Error::rejected(format!("No such task '{}'", task.id)));
                 }
             }
         }

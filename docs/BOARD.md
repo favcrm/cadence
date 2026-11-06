@@ -376,57 +376,20 @@ The OpenRouter worker/reviewer prohibition and existing master exception
 remain unchanged. A catalog entry or this documentation does not authorize
 an unlisted model or a production configuration change.
 
-## Project access policy — what `private` covers, and what it does not
+## Project access policy
 
-A project records its own access policy in its `PROJECT.md` (`policy:`): a
-`visibility` of `workspace-visible` (the default, and the behaviour every
-project had before policies existed) or `private`, plus the `members` it
-admits. The decision lives in the project file on purpose, so an older build
-refuses a project it cannot authorize instead of ignoring a policy that hides
-content.
+A project's access policy is stored in `<pm>/<project>/project.yaml`.
+Projects without a recorded policy retain their existing access, and new
+projects default to `workspace_visible`.
 
-**What the policy enforces — the board and the daemon.**
+`private` is a defined policy value, but this build refuses to record it:
+`private_available()` remains `false` while the isolation paths and their
+acceptance checks are incomplete. Do not rely on project policy as a
+completed isolation boundary.
 
-- Board rows, counts and titles: the overview, the projects and issues
-  listings, milestones, apps and their runs and outputs, a project's
-  workflows and rendered plans, memories and evidence, the "since you left"
-  summary, and the agent fleet's task bindings.
-- The wiki: reads, writes, listings, search, history, export and the
-  signed-envelope routes answer only for a project the caller's policy
-  admits — and the refusals are worded exactly as a missing page, directory,
-  history or issue, so a refusal cannot be used to ask whether something
-  exists.
-- The daemon's own reads: `lane_show`, `job_show`, `task_show`, `job_list`,
-  `monitor_show`/`monitor_list`, `agent_list`'s issue bindings and
-  `project_work_approvals`.
-- The hosted CLI (`/api/cli/*`): `issue ls/show/history/new/comment/set` go
-  through the same policy.
-
-A caller the policy does not admit is served nothing — not a row, not a
-count, not a title — and a route that cannot resolve the caller fails closed.
-An unreadable tracker refuses every project page rather than guessing.
-
-**What it does not enforce — the tracker on disk.**
-
-`private` is a board-and-daemon control. The tracker is plain files under
-`~/.local/state/cadence` (and whatever `pm.yaml` points at), and anything
-running as the owning unix user can read them: a local `cadence issue show`,
-`memory ls`, or the `issue_show` MCP tool reads by path, with no session to
-check. The CLI's `CADENCE_ALIAS` is a self-declared label used for audit
-trailers, not an attested identity, so it cannot be gated on.
-
-That is deliberate and worth stating where the control is described: on a
-single-operator host, `private` protects the **board** from other board
-members, not the disk from a local process. A hostile local process is out
-of scope; protecting against one needs encryption at rest with its own key
-management, which is a different project (CAD-2216).
-
-**Turning it on.** A build refuses to *record* `private` while
-`private_available()` in `src/issue/write/projects.rs` is `false`. It flips
-once each enforcement surface above has a test proving a non-granted caller
-is served nothing; the wiki, board rows and daemon reads are the last three,
-and the flip is a deliberate release decision rather than a switch an agent
-flips.
+The tracker is stored in ordinary files. A process with filesystem access
+to those files is not isolated merely by board or daemon permission checks.
+The local CLI and MCP trust boundary remains a decision tracked by CAD-2216.
 
 ## `cadence issue` — the only writer
 

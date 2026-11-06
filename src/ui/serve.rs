@@ -2673,7 +2673,18 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             // `/api/master/summary?since=` — "since you left" (CAD-328).
             if path == "/api/master/summary" {
-                send(request, home::master_summary(state_dir, &query));
+                let Some(admission) = read_admission.as_ref() else {
+                    send(request, err_response(503, "read admission is missing"));
+                    return;
+                };
+                let actor = match operator::read_actor(admission, &request, state_dir, opts) {
+                    Ok(actor) => actor,
+                    Err(resp) => {
+                        send(request, resp);
+                        return;
+                    }
+                };
+                send(request, home::master_summary(state_dir, &query, &actor));
                 return;
             }
             // `/api/master/state` — the header chips + turn state (CAD-551).

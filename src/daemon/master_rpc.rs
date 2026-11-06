@@ -1183,10 +1183,25 @@ impl Shared {
             self.master_or_operator(params, peer_pid, "posting into the master's thread")?;
         }
         let pm = self.pm()?;
+        let mut actor = self.policy_actor(peer_pid, "master_summary")?;
+        if let Some(claim) = params.get("read_as") {
+            if actor != "operator" {
+                return Err(Error::rejected(
+                    "master_summary refused: only the operator may relay a read identity",
+                ));
+            }
+            let claim = claim
+                .as_str()
+                .filter(|claim| crate::project_policy::caller_of(claim).is_some())
+                .ok_or_else(|| Error::rejected("master_summary refused: invalid read identity"))?;
+            actor = claim.to_string();
+        }
         let escalated = master::escalations(&self.state_dir);
-        let readable = self.readable_projects(peer_pid, "master_summary")?;
+        let readable = crate::project_policy::readable(&pm, &actor);
         let mut out = issue::summary::since(&pm, since, &escalated, Some(&readable))?;
-        out["routing_backlog"] = json!(self.router_backlog.load(Ordering::SeqCst));
+        if crate::project_policy::reads_every_project(&pm, &actor) {
+            out["routing_backlog"] = json!(self.router_backlog.load(Ordering::SeqCst));
+        }
         if post {
             self.store.ensure_thread(ALIAS)?;
             let seq = self.store.thread_append(

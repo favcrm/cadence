@@ -926,6 +926,7 @@ pub(super) fn agent_action(
 pub(super) fn master_summary(
     state_dir: &std::path::Path,
     query: &dyn Fn(&str) -> Option<String>,
+    policy_actor: &str,
 ) -> HttpResp {
     let Some(since) = query("since")
         .and_then(|v| v.trim().parse::<i64>().ok())
@@ -933,7 +934,11 @@ pub(super) fn master_summary(
     else {
         return err_response(400, "since must be epoch seconds");
     };
-    match client::rpc(state_dir, "master_summary", json!({ "since": since })) {
+    match client::rpc(
+        state_dir,
+        "master_summary",
+        json!({ "since": since, "read_as": policy_actor }),
+    ) {
         Ok(out) => json_response(out),
         Err(e) => rpc_err(&e, "master_summary"),
     }
