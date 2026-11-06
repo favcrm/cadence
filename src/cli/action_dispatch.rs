@@ -569,11 +569,18 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 let missing = missing_full_access(grant.capabilities());
                 if !missing.is_empty() {
                     eprintln!(
-                        "warning: the issuer withheld {} — re-run `cadence login --full-access` \
-                         after the workspace grants it",
+                        "warning: requested {} and the issuer withheld {} — re-run \
+                         `cadence login --full-access` after the workspace grants them",
+                        FULL_ACCESS_SCOPES.join(", "),
                         missing.join(", ")
                     );
                 }
+            } else {
+                eprintln!(
+                    "note: this login requested board access only; --full-access also requests \
+                     {} (required before approve, settings, web and cloud-agent verbs)",
+                    FULL_ACCESS_SCOPES.join(", ")
+                );
             }
             show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
             return Ok(0);
