@@ -702,9 +702,22 @@ pub(crate) fn agent_roots(
     if !state_dir.join("cadence.sqlite3").exists() {
         return Ok(crate::peer::AgentRoots::default());
     }
-    let listed = match budget {
-        Some(b) => b.read(state_dir, "agent_list", json!({})),
-        None => client::rpc(state_dir, "agent_list", json!({})),
+    // CAD-2207: the narrow operational projection, not the profile-bearing
+    // `agent_list` — a member assistant's row must still tie its process to
+    // an agent (never "no agent"), which is exactly what pid→alias mapping
+    // here needs; it carries no display name/avatar/profile.
+    let read = |verb: &str| match budget {
+        Some(b) => b.read(state_dir, verb, json!({})),
+        None => client::rpc(state_dir, verb, json!({})),
+    };
+    let listed = match read("agent_operational") {
+        Ok(value) => Ok(value),
+        // A pre-change daemon does not serve the narrow projection; its
+        // `agent_list` was the complete (unfiltered) view, so attribution
+        // keeps working across a mixed-version restart. Any other refusal
+        // fails closed — never an empty fleet.
+        Err(error) if error.to_string().contains("Unknown method") => read("agent_list"),
+        Err(error) => Err(error),
     };
     let list = listed.map_err(|e| format!("the daemon cannot list registered agents ({e})"))?;
     let agents = list["agents"]

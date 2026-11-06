@@ -25,7 +25,7 @@ export type Attempt =
   /** It was decided, or is gone, by someone else. */
   | { phase: "elsewhere" };
 
-export type Verb = "approve" | "deny";
+export type Verb = "approve" | "deny" | "acknowledge";
 
 export interface DecisionNotice {
   outcome: StagedOutcome | "elsewhere" | "still-waiting";
@@ -37,9 +37,9 @@ export interface DecisionNotice {
 export interface DecisionsState {
   phase: DecisionsPhase;
   rows: readonly StagedWrite[];
-  /** Waiting for the owner, oldest first. */
+  /** Awaiting a decision or an explicit review of an unknown outcome. */
   pending: readonly StagedWrite[];
-  /** Decided, newest first. */
+  /** Decided or acknowledged, newest first. */
   decided: readonly StagedWrite[];
   attempts: ReadonlyMap<string, Attempt>;
   notice: DecisionNotice | null;
@@ -62,8 +62,8 @@ const listeners = new Set<() => void>();
 const seenFailed = new Set<string>();
 
 function publish(next: Omit<DecisionsState, "pending" | "decided" | "failedUnseen"> & Partial<Pick<DecisionsState, "failedUnseen">>) {
-  const pending = next.rows.filter((r) => r.status === "pending").sort((a, b) => a.createdAt - b.createdAt);
-  const decided = next.rows.filter((r) => r.status !== "pending").sort((a, b) => (b.decidedAt ?? b.createdAt) - (a.decidedAt ?? a.createdAt));
+  const pending = next.rows.filter((r) => r.status === "pending" || r.status === "unresolved").sort((a, b) => a.createdAt - b.createdAt);
+  const decided = next.rows.filter((r) => r.status !== "pending" && r.status !== "unresolved").sort((a, b) => (b.decidedAt ?? b.createdAt) - (a.decidedAt ?? a.createdAt));
   const failedUnseen = decided.some((r) => outcomeOf(r) === "failed" && !seenFailed.has(r.id));
   state = { ...next, pending, decided, failedUnseen };
   for (const fn of listeners) fn();
@@ -191,21 +191,22 @@ function release() {
 
 export const currentDecisions = (): DecisionsState => state;
 
-export type DecideResult = "decided" | "elsewhere" | "access" | "unconfirmed";
+export type DecideResult = "decided" | "elsewhere" | "access" | "unconfirmed" | "unresolved";
 
 function failedOrDone(row: StagedWrite): DecisionNotice {
   const outcome = outcomeOf(row);
   return outcome === "failed" ? { outcome, title: row.title, reason: failureReason(row) } : { outcome, title: row.title };
 }
 
-/** Approve or deny one decision. Never retries; never submits twice. */
+/** Approve, deny or acknowledge uncertainty. Never retries; never submits twice. */
 export async function decide(id: string, verb: Verb): Promise<DecideResult> {
   const current = state.rows.find((r) => r.id === id);
-  // One decision at a time: a second click while one is in flight is dropped.
-  if (current === undefined || current.status !== "pending") return "elsewhere";
+  // An acknowledgement never approves or denies the original request.
+  if (current === undefined || current.status !== (verb === "acknowledge" ? "unresolved" : "pending")) return "elsewhere";
   for (const attempt of state.attempts.values()) if (attempt.phase === "busy") return "unconfirmed";
   setAttempt(id, { phase: "busy", verb });
   let status = 0;
+  let code: string | null = null;
   try {
     const response = await fetch(`/api/assist/actions/${encodeURIComponent(id)}/${verb}`, {
       method: "POST",
@@ -214,6 +215,10 @@ export async function decide(id: string, verb: Verb): Promise<DecideResult> {
       body: "{}",
     });
     status = response.status;
+    if (status === 409) {
+      const body = await response.json().catch(() => null) as { error?: { code?: unknown } } | null;
+      code = typeof body?.error?.code === "string" ? body.error.code : null;
+    }
   } catch {
     // The request may have reached the server: say so, do not resubmit.
     setAttempt(id, { phase: "unconfirmed", verb });
@@ -222,6 +227,15 @@ export async function decide(id: string, verb: Verb): Promise<DecideResult> {
   if (status === 403 || status === 401) {
     setAttempt(id, { phase: "access" });
     return "access";
+  }
+  if (status === 409 && code === "action_unresolved") {
+    const rows = await reloadDecisions();
+    if (rows?.some((row) => row.id === id && row.status === "unresolved")) {
+      setAttempt(id, null);
+      return "unresolved";
+    }
+    setAttempt(id, { phase: "unconfirmed", verb });
+    return "unconfirmed";
   }
   if (status === 409 || status === 404) {
     await reloadDecisions();
@@ -250,6 +264,10 @@ async function settle(id: string, verb: Verb): Promise<DecideResult> {
     setAttempt(id, { phase: "unconfirmed", verb });
     return "unconfirmed";
   }
+  if (row.status === "unresolved") {
+    setAttempt(id, null);
+    return "unresolved";
+  }
   const attempts = new Map(state.attempts);
   attempts.delete(id);
   patch({ attempts, notice: failedOrDone(row) });
@@ -273,6 +291,10 @@ export async function checkDecision(id: string): Promise<DecideResult> {
     attempts.delete(id);
     patch({ attempts, notice: { outcome: "still-waiting", title: row.title } });
     return "unconfirmed";
+  }
+  if (row.status === "unresolved") {
+    setAttempt(id, null);
+    return "unresolved";
   }
   const attempts = new Map(state.attempts);
   attempts.delete(id);

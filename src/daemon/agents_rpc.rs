@@ -363,6 +363,67 @@ impl Shared {
         }))
     }
 
+    /// `agent_operational` — the narrow, operator-only operational
+    /// projection of every registered agent (CAD-2207). It carries only the
+    /// process/lifecycle fields pid→agent attribution and fleet lifecycle
+    /// need: runtime `alias`, uid, pid/start, provider/kind, generation,
+    /// state, liveness flags, a bounded `{id,state}` list of in-flight rows
+    /// and the unknown-turn count. It never carries a display name, avatar,
+    /// profile, params or message body. A member's personal assistant appears
+    /// here by its runtime alias only, so a board or CLI can never mistake
+    /// its process for a human or miss its busy state.
+    pub(super) fn rpc_agent_operational(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("agent operational", params, peer_pid)?;
+        let mut agents: Vec<Value> = Vec::new();
+        for agent in self.store.agents()? {
+            let (dead, resumable) = self.agent_liveness(&agent);
+            let unknown = self.store.unknown_messages(&agent.alias)?.len();
+            let member_private = self.store.assistant_for_alias(&agent.alias)?.is_some();
+            let in_flight: Vec<Value> = self
+                .store
+                .messages(&agent.alias)?
+                .into_iter()
+                .filter(|m| matches!(m.state.as_str(), "running" | "submitted" | "unknown"))
+                .take(32)
+                .map(|m| json!({"id": m.id, "state": m.state}))
+                .collect();
+            agents.push(json!({
+                "alias": agent.alias,
+                "uid": agent.uid,
+                "provider": agent.provider,
+                "endpoint_kind": agent.endpoint_kind,
+                "state": agent.state,
+                "pid": agent.pid,
+                "pid_start": agent.pid_start,
+                "generation": agent.generation,
+                // CAD-2207: a provider resume handle is a runtime secret, not
+                // something an operator needs to know a session exists. A
+                // member-private assistant's handles are withheld; every agent
+                // exposes only the non-sensitive resume signal the CLI uses.
+                "thread_id": if member_private { Value::Null } else { json!(agent.thread_id) },
+                "session_id": if member_private { Value::Null } else { json!(agent.session_id) },
+                // Endpoint is redacted for private agents, so the resume
+                // decision cannot be "null endpoint" alone; this boolean also
+                // proves a native session exists.
+                "needs_native_resume": agent.endpoint.is_none()
+                    && (agent.thread_id.is_some() || agent.session_id.is_some()),
+                // An endpoint address is a runtime handle; a member-private
+                // assistant's address is withheld from this projection.
+                "endpoint": if member_private { Value::Null } else { json!(agent.endpoint) },
+                "dead": dead,
+                "resumable": resumable,
+                "busy": !in_flight.is_empty(),
+                "unknown": unknown,
+                "messages": in_flight,
+            }));
+        }
+        Ok(json!({"agents": agents}))
+    }
+
     /// CAD-1989: `POST /api/agent-profiles` - a catalogue hire saves a settings
     /// profile and launches nothing. Operator only, by the connection.
     pub(super) fn rpc_agent_profile_create(
@@ -460,6 +521,57 @@ impl Shared {
         } else {
             self.resolve_alias(raw)?
         };
+        // CAD-2207: a bound member assistant may read only events above the
+        // immutable cutoff frozen when its binding was created (or events
+        // minted after it). Legacy same-alias history — including a prior
+        // ordinary agent's — stays withheld. An unprovable binding/fence
+        // refuses rather than serving it; ordinary agents keep the old read.
+        let floor = if daemon {
+            0
+        } else {
+            match self.store.assistant_for_alias(&alias)? {
+                None => 0,
+                Some(binding) => {
+                    let Some(fence) = self
+                        .store
+                        .assistant_event_fence(&binding.org, &binding.sub)?
+                    else {
+                        return Err(Error::rejected(format!(
+                            "agent events refused: the member assistant binding for \
+                             '{alias}' has no event cutoff (CAD-2207)"
+                        )));
+                    };
+                    if fence.alias != binding.alias || fence.assistant_id != binding.assistant_id {
+                        return Err(Error::rejected(format!(
+                            "agent events refused: the member assistant binding for \
+                             '{alias}' does not match its recorded event cutoff (CAD-2207)"
+                        )));
+                    }
+                    let Some(agent) = self.store.agent_opt(&alias)? else {
+                        return Err(Error::rejected(format!(
+                            "agent events refused: the member assistant agent for \
+                             '{alias}' is not registered (CAD-2207)"
+                        )));
+                    };
+                    if let Some(uid) = &fence.agent_uid {
+                        if uid != &agent.uid {
+                            return Err(Error::rejected(format!(
+                                "agent events refused: the member assistant agent for \
+                                 '{alias}' no longer matches its recorded event cutoff \
+                                 (CAD-2207)"
+                            )));
+                        }
+                    } else {
+                        self.store.assistant_event_fence_bind_agent(
+                            &binding.org,
+                            &binding.sub,
+                            &agent.uid,
+                        )?;
+                    }
+                    fence.cutoff_seq
+                }
+            }
+        };
         // CAD-1853 review: the alias' event stream carries cloud request and
         // result detail, so it applies the same source/owner decision as the
         // dedicated cloud read before projecting anything — current READ
@@ -496,7 +608,7 @@ impl Shared {
         // the latest seq, oldest first within it, plus the forward
         // cursor and whether older history exists below the page.
         if params.get("tail").and_then(Value::as_bool).unwrap_or(false) {
-            let mut events = self.store.events_tail(&alias, 51)?;
+            let mut events = self.store.events_tail_after(&alias, floor, 51)?;
             let has_older = events.len() > 50;
             // The store returns oldest first; discard the extra oldest row.
             if has_older {
@@ -527,7 +639,7 @@ impl Shared {
         }
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
-            let events = self.store.events(&alias, after, 100)?;
+            let events = self.store.events_after(&alias, floor, after, 100)?;
             if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
                 // A waiting read can observe an event about a turn that
                 // settled after this admission was taken — or, on an ordinary
@@ -802,7 +914,10 @@ impl Shared {
     /// (CAD-251). The drain is a consume: like `agent_inbox_ack`, a
     /// proven **agent** caller may drain only its own inbox — a worker
     /// can never consume another agent's queue — while unattributed and
-    /// operator callers pass as they always have.
+    /// operator callers pass as they always have. A member assistant's
+    /// alias is the exception at dispatch: only that assistant itself may
+    /// list its mailbox (CAD-2207), so an operator is refused before this
+    /// handler runs.
     pub(super) fn rpc_inbox(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         reject_identity_fields(params, "agent_inbox")?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
@@ -1138,6 +1253,17 @@ impl Shared {
     pub(super) fn rpc_unfence(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection_on_agent("agent unfence", params, peer_pid)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-2207: an operator must not fabricate or route a member
+        // assistant's unknown outcomes — the bulk path bypasses the
+        // `message_reconcile` guard. No authorized owner recovery channel
+        // exists yet, so refuse before any mutation.
+        if self.store.assistant_for_alias(&alias)?.is_some() {
+            return Err(Error::rejected(
+                "agent unfence refused: a member assistant's unknown outcomes are private \
+                 to its owning member; no operator recovery channel is authorized \
+                 (CAD-2207)",
+            ));
+        }
         let status = required_str(params, "status")?;
         let note = optional_str(params, "note");
         let by = "operator";

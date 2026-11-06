@@ -3,6 +3,36 @@
 
 use super::*;
 
+/// CAD-2207: the lifecycle view of one agent. `agent_show` is the full
+/// projection for ordinary agents; a member's personal assistant refuses it,
+/// so its narrow operational record (the same lifecycle fields, no content)
+/// is used instead — resume/restart must never stop being able to see that
+/// the assistant is busy or fenced.
+fn lifecycle_row(state_dir: &Path, alias: &str) -> Result<Value> {
+    match client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
+        Ok(show) => Ok(show),
+        Err(refused) => match client::rpc(state_dir, "agent_operational", json!({})) {
+            Ok(answer) => {
+                let rows = answer["agents"].as_array().cloned().unwrap_or_default();
+                match rows
+                    .into_iter()
+                    .find(|row| row["alias"].as_str() == Some(alias))
+                {
+                    Some(row) => {
+                        let unknown = row["unknown"].clone();
+                        Ok(json!({"agent": row, "unknown": unknown}))
+                    }
+                    None => Err(refused),
+                }
+            }
+            // An older daemon does not serve the projection; the original
+            // refusal is the honest answer (its agent_show has no filter).
+            Err(error) if error.to_string().contains("Unknown method") => Err(refused),
+            Err(error) => Err(error),
+        },
+    }
+}
+
 /// `cadence agent resume`: provider-launch treatment for a reopen —
 /// bounded wait for the endpoint, then attach this terminal by default.
 /// `--detach` or a non-TTY/nested-tmux context prints the attach command
@@ -10,7 +40,7 @@ use super::*;
 /// the resume receipt immediately — there is no endpoint to wait for.
 pub(crate) fn resume_agent(state_dir: &Path, alias: &str, detach: bool) -> Result<i32> {
     let result = client::rpc(state_dir, "agent_resume", json!({"alias": alias}))?;
-    let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+    let show = lifecycle_row(state_dir, alias)?;
     let agent = &show["agent"];
     let (provider, kind) = (
         agent["provider"].as_str().unwrap_or_default(),
@@ -26,7 +56,7 @@ pub(crate) fn resume_agent(state_dir: &Path, alias: &str, detach: bool) -> Resul
     // Poll until the endpoint is live or the actor gives up.
     let deadline = Instant::now() + Duration::from_secs(30);
     let (agent, unknown) = loop {
-        let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+        let show = lifecycle_row(state_dir, alias)?;
         let agent = show["agent"].clone();
         let state = agent["state"].as_str().unwrap_or_default();
         if agent["endpoint"].is_string() || matches!(state, "stopped" | "offline" | "attention") {
@@ -100,7 +130,7 @@ pub(crate) fn fenced_next(alias: &str, error: &str, unknown: i64) -> Value {
 /// (the pane adopted a different native session) gets an explicit
 /// remove-and-rejoin hint.
 pub(crate) fn resume_one(state_dir: &Path, alias: &str) -> Value {
-    let (agent, unknown) = match client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
+    let (agent, unknown) = match lifecycle_row(state_dir, alias) {
         Ok(show) => (show["agent"].clone(), show["unknown"].as_i64().unwrap_or(0)),
         Err(e) => return json!({"alias": alias, "resumed": false, "error": e.to_string()}),
     };
@@ -165,7 +195,7 @@ pub(crate) fn resume_one(state_dir: &Path, alias: &str) -> Value {
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let agent = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
+        let agent = lifecycle_row(state_dir, alias)
             .map(|s| s["agent"].clone())
             .unwrap_or_default();
         let state = agent["state"].as_str().unwrap_or_default();
@@ -229,7 +259,7 @@ pub(crate) fn finish_resume(state_dir: &Path, alias: &str, mut out: Value) -> Va
 pub(crate) fn refresh_briefing(state_dir: &Path, alias: &str) -> Result<Option<PathBuf>> {
     let deadline = Instant::now() + Duration::from_secs(15);
     let agent = loop {
-        let agent = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
+        let agent = lifecycle_row(state_dir, alias)
             .map(|s| s["agent"].clone())
             .unwrap_or_default();
         let state = agent["state"].as_str().unwrap_or_default();
@@ -245,6 +275,11 @@ pub(crate) fn refresh_briefing(state_dir: &Path, alias: &str) -> Result<Option<P
         agent["provider"].as_str().unwrap_or_default(),
         agent["endpoint_kind"].as_str().unwrap_or_default(),
     ) {
+        return Ok(None);
+    }
+    // The narrow operational projection carries no `params`; a member's
+    // personal assistant is private and gets no briefing written from here.
+    if agent.get("params").is_none() {
         return Ok(None);
     }
     let file = client::briefing_path(state_dir, &agent["params"], alias);
@@ -302,14 +337,16 @@ pub(crate) fn resume_command(
     detach: bool,
 ) -> Result<i32> {
     if all {
-        let targets = client::rpc(state_dir, "agent_list", json!({}))?["agents"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        // CAD-2207: the operational projection, not the filtered list, so a
+        // member assistant is still resumed; it carries the lifecycle fields
+        // this filter needs and no profile content.
+        let targets = super::daemon::operational_agents(state_dir)?
             .iter()
             .filter(|a| {
-                a["endpoint"].is_null()
-                    && (a["thread_id"].is_string() || a["session_id"].is_string())
+                a["needs_native_resume"].as_bool().unwrap_or_else(|| {
+                    a["endpoint"].is_null()
+                        && (a["thread_id"].is_string() || a["session_id"].is_string())
+                })
             })
             .filter_map(|a| a["alias"].as_str().map(str::to_string))
             .collect::<Vec<_>>();

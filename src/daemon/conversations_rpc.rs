@@ -307,6 +307,15 @@ impl Shared {
         reject_unknown_fields(params, &["alias", "install_id"], "conversation list")?;
         self.operator_chat("conversation list", peer_pid)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-2207: a member assistant's app-thread metadata is the member's
+        // private surface; this operator-chat verb carries no member-envelope
+        // proof, so a private alias is refused before ensure/list writes.
+        if self.store.assistant_for_alias(&alias)?.is_some() {
+            return Err(Error::rejected(
+                "conversation list refused: a member assistant's conversation is \
+                 private to its member (CAD-2207)",
+            ));
+        }
         let install = required_str(params, "install_id")?;
         self.known_install(install)?;
         // General always exists once an installation is proven.
@@ -827,6 +836,15 @@ impl Shared {
         // CAD-1374: the verified owner human, or `None` for the local operator.
         let human = self.verified_owner_human(params)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-2207: a member assistant's app-thread metadata is the member's
+        // private surface; this operator-chat verb carries no member-envelope
+        // proof, so a private alias is refused before any create.
+        if self.store.assistant_for_alias(&alias)?.is_some() {
+            return Err(Error::rejected(
+                "conversation create refused: a member assistant's conversation is \
+                 private to its member (CAD-2207)",
+            ));
+        }
         // CAD-1772: the master's single Recruit conversation — find or
         // create, no installation. Operator-only like every create above.
         if let Some(kind) = optional_text(params, "kind")? {

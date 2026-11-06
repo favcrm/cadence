@@ -517,6 +517,26 @@ impl Shared {
             ));
         }
         let alias = required_str(params, "alias")?;
+        // CAD-2207: a personal assistant's mailbox carries its member's private
+        // conversation. The remote inspector is a workspace owner, and owner
+        // rights on the workspace are not proof of that member, so only the
+        // binding's own principal may inspect it here. Everyone else is refused
+        // rather than shown the member's mail; the member reads through the
+        // signed `member_assist_*` route instead.
+        if let Ok(canonical) = self.resolve_alias(alias) {
+            if let Some(binding) = self.store.assistant_for_alias(&canonical)? {
+                if binding.org != principal.config.company || binding.sub != principal.actor.sub {
+                    return Err(Error::invalid(
+                        "not_permitted",
+                        format!(
+                            "remote inbox inspection refused: '{canonical}' is a member's \
+                             private assistant; only its bound member's own signed route \
+                             reads it (CAD-2207)"
+                        ),
+                    ));
+                }
+            }
+        }
         let mut peek = json!({"alias": alias, "peek": true});
         if let Some(after) = optional_i64(params, "after") {
             peek["after"] = json!(after);

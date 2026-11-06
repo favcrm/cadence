@@ -45,6 +45,10 @@ export interface HumanRoomPage {
   room: string;
   members: HumanMember[];
   posts: HumanPost[];
+  /** Oldest seq this page examined; the next older request starts below it. */
+  cursor?: number | null;
+  /** Some older rows remain beyond this page (a withheld tail included). */
+  has_more?: boolean;
   /** Fresh permission hint for an explicit Ask. Missing or false offers no Ask. */
   can_ask?: boolean;
 }

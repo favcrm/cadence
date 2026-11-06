@@ -57,6 +57,47 @@
 //! admission is covered end-to-end in
 //! `src/ui/team_assistants_http_refusal.rs` (real daemon socket + real board
 //! + real platform authority server).
+//!
+//! CAD-2207 extension (independently authored checks:
+//! `operator_cannot_read_or_list_a_member_private_assistant`,
+//! `profile_or_alias_label_never_manufactures_member_owner_authority`,
+//! `cli_owner_cannot_inspect_a_member_private_assistant_mailbox`,
+//! `cad2207_dispatch_send_cannot_queue_for_a_member_assistant_or_route_its_reply`,
+//! `cad2207_private_assistant_room_posts_stay_hidden_after_agent_row_removal`,
+//! `cad2207_room_membership_and_human_agent_list_refuse_a_private_assistant`,
+//! `cad2207_private_effect_input_and_decisions_stay_private`,
+//! `cad2207_private_effect_decline_does_not_route_to_a_nonowner_upstream`,
+//! `cad2207_room_paging_and_unread_exclude_hidden_posts_without_stranding`,
+//! `cad2207_operator_chat_verbs_refuse_private_app_and_thread_surfaces`,
+//! `cad2207_unstamped_operator_turn_cannot_reprove_into_a_bound_assistant`,
+//! `cad2207_private_message_reconcile_and_cancel_refuse_without_mutation`,
+//! `cad2207_task_kickoff_provenance_requires_member_owned_job`,
+//! `cad2207_agent_unfence_refuses_private_unknown_recovery`,
+//! `cad2207_assist_notice_requires_delivery_receipt_and_live_share`,
+//! `cad2207_effect_notice_receipt_is_owner_bound_and_enforced`,
+//! `cad2207_effect_alias_reuse_cannot_inherit_the_old_owner`,
+//! `cad2207_retained_event_alias_reuse_cannot_read_the_old_owner_stream`,
+//! `cad2207_retained_mail_alias_reuse_cannot_read_the_old_owner_mail`,
+//! `cad2207_agent_operational_hides_private_native_session_ids`): the
+//! member's personal assistant — its alias, private bootstrap profile,
+//! conversation, events and mail — belongs to the VERIFIED (workspace,
+//! member). A proven operator connection, an unproven external harness and a
+//! DIFFERENT member's bound assistant must not read that alias, its thread,
+//! its events or its mail, the operator's generic lists must not carry its
+//! row, and a different workspace owner's remote-CLI envelope must not inspect
+//! its mailbox. The positive controls are the two verified routes the ticket
+//! names: the owner's SIGNED `member_envelope` (the board relay), the owner's
+//! own bound assistant connection, the bound principal's own `cli_envelope`,
+//! plus the operator's unrelated and explicitly non-member targets. No check
+//! asserts refusal wording: a refusal is paired with a positive control that
+//! proves the same verb/envelope works for the authorized caller or target.
+//! Job/task authorization is deliberately NOT re-tested here: it predates this
+//! slice and keeps its own policy, so these checks encode no blanket job/task
+//! restriction. `human_agents_list`'s CAD-2207 row filter IS exercised here:
+//! the fixture serves the live roster endpoint those checks need. The generic
+//! HTTP agent routes are still unexercised (the HTTP fixture drives
+//! `/api/assist/*` only) and are reported as unexercised rather than
+//! simulated.
 
 #![cfg(all(test, feature = "test-seam"))]
 
@@ -246,6 +287,10 @@ struct ServiceAuthority {
 struct Authority {
     members: BTreeMap<String, MemberAuthority>,
     services: Vec<ServiceAuthority>,
+    /// The current roster the fixture platform answers for the human-room
+    /// guard — `[{subject_id, name, role}]` (CAD-2207 acceptance). Empty by
+    /// default: the other fixtures never read the roster endpoint.
+    roster: Vec<Value>,
     /// Serve a malformed body instead of the contract shape.
     malformed_next: bool,
     /// Answer a non-200 status.
@@ -420,6 +465,22 @@ impl Fx {
                 request,
                 200,
                 json!({"keys":[{"kty":"OKP","crv":"Ed25519","kid":KID,"x":jwks_public}]}),
+            );
+            return;
+        }
+        // CAD-2207 acceptance: the human-room guard reads the live roster
+        // from this configured public host. The fixture answers the exact
+        // `Roster` DTO; membership/role come from `Authority.roster`.
+        if path == "/__platform/threads/roster" {
+            let roster = authority.lock().unwrap().roster.clone();
+            respond(
+                request,
+                200,
+                json!({
+                    "issuer": issuer,
+                    "organization_id": ORG,
+                    "members": roster,
+                }),
             );
             return;
         }
@@ -2516,6 +2577,920 @@ fn ordinary_job_list_hides_member_private_job_until_shared() {
         )
         .is_err(),
         "a subscribe after share withdrawal was accepted"
+    );
+}
+
+// ============================================================================
+// CAD-2207 independent negative acceptance — a member's personal assistant
+// (its alias, profile, conversation and event stream) belongs to the VERIFIED
+// (workspace, member), not to whoever holds a generic operator connection.
+// Authored by the acceptance maintainer from the ticket's privacy clause; the
+// guard implementer must not edit or weaken these checks.
+//
+// Everything below is the real daemon: `Shared::dispatch` under the real
+// `test-seam` caller identities, the real stored `assistants` binding, the
+// real bound thread and the real private bootstrap profile files. Nothing
+// mirrors a guard.
+//
+// Bad cases (against today's `Who::Operator => Ok(())` bypass): a proven
+// operator, an unproven external harness and a DIFFERENT member's bound
+// assistant each name the owner's private alias and are refused on every
+// generic read; the operator's `agent_list` no longer carries the private
+// row; no path returns the private profile value.
+//
+// Controls in the same fixture so a blanket refusal cannot pass: the
+// verified member's signed envelope still reads its own profile and
+// conversation, the owner's own assistant still reads its own row/thread/
+// mail, and the operator keeps every non-private operational read (another
+// agent's row and thread, its non-member job and task, the unrelated list
+// rows).
+// ============================================================================
+
+/// A distinctive value the fixture writes into the owner's private bootstrap
+/// files. It must appear in the OWNER's read and in no non-owner payload.
+const CAD2207_PRIVATE_NAME: &str = "Violet Quill (private)";
+const CAD2207_PRIVATE_TONE: &str = "wry and unhurried";
+const CAD2207_PRIVATE_BODY: &str =
+    "private mailbox body: only the member's assistant may read this";
+
+fn seed_cad2207_private_profile(fx: &Fx, sub: &str) {
+    let root = fx.shared.assistant_principal_cwd(ORG, sub);
+    super::bootstrap_files::write_profile(
+        &root,
+        &super::bootstrap_files::Profile {
+            name: Some(CAD2207_PRIVATE_NAME.into()),
+            tone: Some(CAD2207_PRIVATE_TONE.into()),
+            preferences: Some("terse answers only".into()),
+            user_name: Some("Mx Private".into()),
+            look: None,
+        },
+    )
+    .unwrap_or_else(|e| panic!("seed the private profile for {sub}: {e}"));
+}
+
+#[test]
+fn operator_cannot_read_or_list_a_member_private_assistant() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let ben = fx.member_runtime("sub-ben");
+    seed_cad2207_private_profile(&fx, "sub-alice");
+
+    // ---- positive controls: the verified member's own signed route still
+    // reads the private profile and the bound conversation ----
+    let own_state = fx.op(
+        "member_assist_state",
+        json!({"member_envelope": fx.member_envelope("sub-alice")}),
+    );
+    assert_eq!(
+        own_state["assistant"]["alias"].as_str(),
+        Some(alice.alias.as_str()),
+        "the owner's signed envelope did not resolve its own assistant"
+    );
+    assert_eq!(
+        own_state["assistant"]["identity"]["name"].as_str(),
+        Some(CAD2207_PRIVATE_NAME),
+        "the owner could not read its own private profile name: {own_state}"
+    );
+    assert_eq!(
+        own_state["assistant"]["identity"]["tone"].as_str(),
+        Some(CAD2207_PRIVATE_TONE),
+        "the owner could not read its own private profile tone"
+    );
+    assert_eq!(
+        own_state["conversation_id"].as_str(),
+        Some(alice.thread_id.as_str()),
+        "the owner's profile read did not name its bound conversation"
+    );
+    let own_history = fx.op(
+        "member_assist_history",
+        json!({"member_envelope": fx.member_envelope("sub-alice")}),
+    );
+    assert_eq!(
+        own_history["conversation"]["id"].as_str(),
+        Some(alice.thread_id.as_str()),
+        "the owner could not read its own private conversation"
+    );
+    // The owner's own assistant session still reads its own surface.
+    for (method, params) in [
+        ("agent_show", json!({"alias": alice.alias})),
+        ("agent_events", json!({"alias": alice.alias})),
+        ("thread_read", json!({"alias": alice.alias})),
+        ("message_list", json!({"to": alice.alias})),
+    ] {
+        assert!(
+            fx.as_assistant(&alice.alias, method, params).is_ok(),
+            "the owner's own assistant could not {method} its own surface"
+        );
+    }
+
+    // ---- positive controls: the operator keeps every NON-private
+    // operational read (the privacy guard must not become a blanket
+    // operator lockout, and job/task policy is untouched by this slice) ----
+    assert!(
+        fx.call(
+            Asserted::Operator,
+            "agent_show",
+            json!({"alias": "ordinary-worker"})
+        )
+        .is_ok(),
+        "operator lost a non-private agent_show"
+    );
+    assert!(
+        fx.call(
+            Asserted::Operator,
+            "thread_read",
+            json!({"alias": "ordinary-worker"})
+        )
+        .is_ok(),
+        "operator lost a non-private thread_read"
+    );
+    assert!(
+        fx.call(
+            Asserted::Operator,
+            "job_show",
+            json!({"job": alice.foreign_job})
+        )
+        .is_ok(),
+        "operator lost the independent non-member job read"
+    );
+    assert!(
+        fx.call(
+            Asserted::Operator,
+            "task_show",
+            json!({"task": alice.foreign_task})
+        )
+        .is_ok(),
+        "operator lost the independent non-member task read"
+    );
+    // Alias-level liveness discloses state and reason only — no profile, no
+    // conversation — so it stays an operator control path (CAD-2207). This is
+    // the scoped exception, not a blanket operator lockout. The registration
+    // state is `starting` until an actor claims it; pin it idle so the
+    // bounded read returns at once instead of waiting for a turn.
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE agents SET state='idle' WHERE alias=?",
+                rusqlite::params![alice.alias],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        fx.call(
+            Asserted::Operator,
+            "agent_wait",
+            json!({"alias": alice.alias, "until": "idle", "timeout": 1}),
+        )
+        .is_ok(),
+        "operator lost alias-level liveness for the private assistant"
+    );
+
+    // A stored message addressed to the private assistant: its body is the
+    // member's mail. The owning assistant still reads its own copy; the
+    // operator, an unverified caller and a foreign assistant get no body.
+    let private_msg = "cad2207-private-mail";
+    let (dup, _state) = fx
+        .shared
+        .store
+        .enqueue(
+            &alice.alias,
+            CAD2207_PRIVATE_BODY,
+            None,
+            private_msg,
+            "test",
+        )
+        .unwrap_or_else(|e| panic!("seed the private mailbox message: {e}"));
+    assert!(!dup, "the private mailbox message id collided");
+    let own_mail = fx
+        .as_assistant(
+            &alice.alias,
+            "message_read",
+            json!({"message": private_msg}),
+        )
+        .unwrap_or_else(|e| panic!("owning assistant could not read its own mail: {e}"));
+    assert!(
+        own_mail["text"]
+            .as_str()
+            .is_some_and(|text| text.contains(CAD2207_PRIVATE_BODY)),
+        "owning assistant's own mailbox body is missing: {own_mail}"
+    );
+    // The owning assistant read the SAME row body above; this refusal is
+    // therefore about the caller, not about the message being unreadable.
+    let operator_mail = fx.call(
+        Asserted::Operator,
+        "message_read",
+        json!({"message": private_msg}),
+    );
+    assert!(
+        operator_mail.is_err(),
+        "a proven operator read the private assistant's stored mail body: {operator_mail:?}"
+    );
+    for (who, label) in [
+        (Asserted::Unproven, "an unverified external caller"),
+        (
+            Asserted::Agent(ben.alias.clone()),
+            "another member's assistant",
+        ),
+    ] {
+        let read = fx.call(who, "message_read", json!({"message": private_msg}));
+        assert!(
+            read.is_err(),
+            "{label} read the private assistant's stored mail body: {read:?}"
+        );
+    }
+
+    let before = fx.tree();
+    // Every alias-targeted private read: the operator acting only as
+    // operator, an unproven external harness, and another member's bound
+    // assistant. `agent_show` is also probed with the profile-instructions
+    // flag so the profile projection is covered, not only the row.
+    let probes: [(&str, Value); 5] = [
+        ("agent_show", json!({"alias": alice.alias})),
+        (
+            "agent_show",
+            json!({"alias": alice.alias, "include_profile_instructions": true}),
+        ),
+        ("agent_events", json!({"alias": alice.alias})),
+        ("thread_read", json!({"alias": alice.alias})),
+        ("message_list", json!({"to": alice.alias})),
+    ];
+    for (method, params) in &probes {
+        // The same verb + alias succeeds for the owner's own assistant and
+        // the same verb on a non-private alias succeeds for the operator, so
+        // the refusal below is about THIS target, not a blanket error.
+        let operator = fx.call(Asserted::Operator, method, params.clone());
+        assert!(
+            operator.is_err(),
+            "a proven operator read member-private {method} {params}: {operator:?}"
+        );
+        let external = fx.call(Asserted::Unproven, method, params.clone());
+        assert!(
+            external.is_err(),
+            "an unverified external caller read member-private {method} {params}: {external:?}"
+        );
+        let foreign = fx.as_assistant(&ben.alias, method, params.clone());
+        assert!(
+            foreign.is_err(),
+            "another member's assistant read member-private {method} {params}: {foreign:?}"
+        );
+    }
+
+    // `agent_requests` discloses a private assistant's pending effect
+    // parameters, and `agent_send`/`agent_ask` would queue it a turn or steer
+    // it. The same operator verbs on an ordinary agent still work — the
+    // positive control that keeps this from being a blanket operator refusal.
+    // `agent_requests` is deliberately NOT here: the landed guard keeps the
+    // operator's actionable workflow and withholds only the pending params
+    // (a redaction, not a refusal), so an `is_err` expectation would be
+    // wrong. See the report for why it is left unexercised by this fixture.
+    for (method, private, ordinary) in [
+        (
+            "agent_send",
+            json!({"alias": alice.alias, "text": "private steer"}),
+            json!({"alias": "ordinary-worker", "text": "ordinary steer"}),
+        ),
+        (
+            "agent_ask",
+            json!({"alias": alice.alias, "text": "private ask", "wait": 0}),
+            json!({"alias": "ordinary-worker", "text": "ordinary ask", "wait": 0}),
+        ),
+    ] {
+        assert!(
+            fx.call(Asserted::Operator, method, ordinary.clone())
+                .is_ok(),
+            "operator lost {method} on a non-private target"
+        );
+        let operator = fx.call(Asserted::Operator, method, private.clone());
+        assert!(
+            operator.is_err(),
+            "a proven operator reached member-private {method} {private}: {operator:?}"
+        );
+        let external = fx.call(Asserted::Unproven, method, private.clone());
+        assert!(
+            external.is_err(),
+            "an unverified external caller reached member-private {method} {private}: {external:?}"
+        );
+        let foreign = fx.as_assistant(&ben.alias, method, private.clone());
+        assert!(
+            foreign.is_err(),
+            "another member's assistant reached member-private {method} {private}: {foreign:?}"
+        );
+    }
+
+    // Lists FILTER: the private row is absent while unrelated rows and the
+    // operator's own operational view remain.
+    for who in [Asserted::Operator, Asserted::Unproven] {
+        let listed = fx
+            .call(who.clone(), "agent_list", json!({}))
+            .unwrap_or_else(|e| panic!("{who:?} agent_list refused: {e}"));
+        let aliases: Vec<&str> = listed["agents"]
+            .as_array()
+            .expect("agent_list carries no agents array")
+            .iter()
+            .filter_map(|a| a["alias"].as_str())
+            .collect();
+        assert!(
+            !aliases.contains(&alice.alias.as_str()),
+            "{who:?} agent_list exposed member alice's private assistant row"
+        );
+        assert!(
+            !aliases.contains(&ben.alias.as_str()),
+            "{who:?} agent_list exposed member ben's private assistant row"
+        );
+        assert!(
+            aliases.contains(&"ordinary-worker"),
+            "{who:?} agent_list lost the unrelated non-private row"
+        );
+        let serialized = listed.to_string();
+        assert!(
+            !serialized.contains(CAD2207_PRIVATE_NAME)
+                && !serialized.contains(CAD2207_PRIVATE_TONE)
+                && !serialized.contains(alice.thread_id.as_str()),
+            "{who:?} agent_list leaked private profile/conversation data"
+        );
+    }
+    assert_eq!(
+        fx.tree(),
+        before,
+        "a refused private read or list changed the tracker"
+    );
+
+    // Still positive after the refusals: the owner's own route is intact.
+    let after_state = fx.op(
+        "member_assist_state",
+        json!({"member_envelope": fx.member_envelope("sub-alice")}),
+    );
+    assert_eq!(
+        after_state["assistant"]["identity"]["name"].as_str(),
+        Some(CAD2207_PRIVATE_NAME),
+        "the owner's private profile broke after refused foreign reads"
+    );
+}
+
+/// CAD-2207: a caller-named alias, profile label or claimed member is never
+/// proof of identity. Only the SIGNED member envelope selects the member, and
+/// an unverified external harness resolves no identity at all.
+#[test]
+fn profile_or_alias_label_never_manufactures_member_owner_authority() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let ben = fx.member_runtime("sub-ben");
+    seed_cad2207_private_profile(&fx, "sub-alice");
+
+    let alice_env = fx.member_envelope("sub-alice");
+    // Control: the OWNER's signed envelope is the one proof that reads the
+    // owner's private profile (and it is what the board relays).
+    let owner = fx.op(
+        "member_assist_state",
+        json!({"member_envelope": alice_env.clone()}),
+    );
+    assert_eq!(
+        owner["assistant"]["alias"].as_str(),
+        Some(alice.alias.as_str())
+    );
+    assert_eq!(
+        owner["assistant"]["identity"]["name"].as_str(),
+        Some(CAD2207_PRIVATE_NAME)
+    );
+
+    // A DIFFERENT member's signed envelope resolves that member's own
+    // assistant and never the first member's private value, even on the same
+    // board relay.
+    let other = fx.op(
+        "member_assist_state",
+        json!({"member_envelope": fx.member_envelope("sub-ben")}),
+    );
+    assert_eq!(
+        other["assistant"]["alias"].as_str(),
+        Some(ben.alias.as_str())
+    );
+    assert_ne!(
+        other["assistant"]["identity"]["name"].as_str(),
+        Some(CAD2207_PRIVATE_NAME),
+        "another member's route returned alice's private profile"
+    );
+    assert!(!other.to_string().contains(CAD2207_PRIVATE_NAME));
+
+    let before = fx.tree();
+    // A caller-selected identity field is refused on the member route: the
+    // label cannot redirect or widen the read.
+    for selector in [
+        json!({"sub": "sub-ben"}),
+        json!({"profile": "assist-agent-sub-ben"}),
+        json!({"alias": ben.alias}),
+        json!({"member_as": "sub-ben"}),
+        json!({"owner": "sub-ben"}),
+    ] {
+        let mut params = selector.clone();
+        params["member_envelope"] = json!(alice_env);
+        let r = fx.op_err("member_assist_state", params);
+        assert!(
+            r.is_err(),
+            "a caller-selected identity field was accepted beside the signed \
+             member envelope: {r:?}"
+        );
+    }
+    // No envelope, only claims: still refused — no profile resolves.
+    let claims_only = fx.op_err(
+        "member_assist_state",
+        json!({
+            "sub": "sub-alice",
+            "alias": alice.alias,
+            "profile": "assist-agent-sub-alice",
+            "member_as": "sub-alice",
+            "owner": "sub-alice",
+        }),
+    );
+    assert!(
+        claims_only.is_err(),
+        "claimed identity fields resolved a member profile without a signed \
+         envelope: {claims_only:?}"
+    );
+    // The same claimed selectors do not unlock the generic private read.
+    for extra in [
+        json!({"sub": "sub-alice"}),
+        json!({"profile": "assist-agent-sub-alice"}),
+        json!({"member_as": "sub-alice"}),
+        json!({"owner": "sub-alice"}),
+        json!({"member_envelope": alice_env}),
+    ] {
+        let mut params = json!({"alias": alice.alias});
+        for (key, value) in extra.as_object().expect("selector is not an object") {
+            params[key.as_str()] = value.clone();
+        }
+        let r = fx.call(Asserted::Operator, "agent_show", params.clone());
+        assert!(
+            r.is_err(),
+            "a claimed selector unlocked the private alias read: {params} -> {r:?}"
+        );
+    }
+    // An unverified external harness never invents an identity.
+    assert!(
+        fx.call(Asserted::Unproven, "agent_identity", json!({}))
+            .is_err(),
+        "an unverified caller was attributed an identity"
+    );
+    assert!(
+        fx.call(
+            Asserted::Unproven,
+            "agent_show",
+            json!({"alias": alice.alias, "as": "assist-agent-sub-alice"}),
+        )
+        .is_err(),
+        "an unverified caller read the private alias by claiming one"
+    );
+    assert_eq!(fx.tree(), before, "a refused selector changed the tracker");
+
+    // Still positive: the owner's envelope keeps working after the refusals.
+    let after_state = fx.op(
+        "member_assist_state",
+        json!({"member_envelope": fx.member_envelope("sub-alice")}),
+    );
+    assert_eq!(
+        after_state["assistant"]["identity"]["name"].as_str(),
+        Some(CAD2207_PRIVATE_NAME),
+        "the owner's profile read broke after refused selectors"
+    );
+}
+
+/// CAD-2207: the remote CLI's passive inbox inspector is a workspace OWNER,
+/// and owner rights are not proof of the member whose personal assistant owns
+/// the mailbox (`cli_rpc::rpc_cli_message_inbox`). The bound principal's own
+/// verified `cli_envelope` still peeks its own mailbox, and an ordinary
+/// (non-member) mailbox keeps the owner's inspection path; a DIFFERENT
+/// workspace owner is refused for the member's assistant mailbox only.
+///
+/// Minting matches the real contract: the `agenticos-wiki-actor/1` header,
+/// the closed claim set, and the fixture platform's JWKS (`kid`) — the daemon
+/// re-verifies the Ed25519 signature, iss/aud/org/time pins and the scope
+/// exactly as the container does.
+fn cad2207_cli_envelope(fx: &Fx, sub: &str, role: &str) -> String {
+    let now = crate::issue::time::now_epoch();
+    let header = json!({"alg":"EdDSA","typ":"agenticos-wiki-actor/1","kid":KID});
+    let claims = json!({
+        "iss": fx.issuer,
+        "aud": format!("http://{}", fx.host),
+        "sub": sub,
+        "actor": format!("users/{sub}"),
+        "principal_kind": "user",
+        "role_at_issue": role,
+        "organization_id": ORG,
+        "scope": ["cli.read", "cli.write"],
+        "credential_id": format!("cred-{sub}"),
+        "iat": now,
+        "exp": now + 120,
+        "jti": format!("cli-jti-{sub}-{now}"),
+    });
+    let signed = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+    );
+    format!(
+        "{signed}.{}",
+        URL_SAFE_NO_PAD.encode(fx.key.sign(signed.as_bytes()).as_ref())
+    )
+}
+
+#[test]
+fn cli_owner_cannot_inspect_a_member_private_assistant_mailbox() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    // A member's personal assistant registered as an `inbox` mailbox: the
+    // passive inspector's real precondition. Without the privacy guard the
+    // same owner envelope WOULD read it, so the refusal below can only come
+    // from the member boundary — never from an unrelated placement error.
+    let inbox_dir = fx.dir.path().join("inbox-cwd");
+    std::fs::create_dir_all(&inbox_dir).unwrap();
+    let register_inbox = |alias: &str| {
+        fx.shared
+            .store
+            .register_agent(&crate::store::NewAgent {
+                alias,
+                provider: "inbox",
+                endpoint_kind: "inbox",
+                role: "worker",
+                cwd: inbox_dir.to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap_or_else(|e| panic!("register inbox mailbox '{alias}': {e}"));
+    };
+    // The binding must exist BEFORE the alias is registered: `assistant_bind`
+    // refuses an alias already registered as an ordinary agent (never adopt).
+    fx.shared
+        .store
+        .assistant_bind(
+            ORG,
+            "sub-cli",
+            "assist_sub-cli",
+            "assist-agent-sub-cli",
+            Some("rev0"),
+        )
+        .unwrap_or_else(|e| panic!("bind the member to its assistant mailbox: {e}"));
+    register_inbox("assist-agent-sub-cli");
+    fx.shared
+        .store
+        .enqueue(
+            "assist-agent-sub-cli",
+            CAD2207_PRIVATE_BODY,
+            None,
+            "mail-private",
+            "test",
+        )
+        .unwrap_or_else(|e| panic!("seed the private mailbox: {e}"));
+    // An ordinary mailbox (no member binding): it keeps the workspace owner's
+    // existing inspection policy.
+    register_inbox("inbox-ordinary");
+    fx.shared
+        .store
+        .enqueue(
+            "inbox-ordinary",
+            "ordinary body",
+            None,
+            "mail-ordinary",
+            "test",
+        )
+        .unwrap();
+
+    let peek = |sub: &str, alias: &str| -> Result<Value> {
+        fx.op_err(
+            "cli_message_inbox",
+            json!({"cli_envelope": cad2207_cli_envelope(&fx, sub, "owner"), "alias": alias}),
+        )
+    };
+
+    // Positive control: the BOUND member's own verified envelope reads its
+    // own mailbox.
+    let own = peek("sub-cli", "assist-agent-sub-cli")
+        .unwrap_or_else(|e| panic!("the bound member's own cli inbox read was refused: {e}"));
+    assert!(
+        own["messages"].as_array().is_some_and(|rows| rows
+            .iter()
+            .any(|row| row["id"].as_str() == Some("mail-private"))),
+        "the bound member's own cli inbox read lost its queued entry: {own}"
+    );
+    // Positive control: a workspace owner still inspects an ORDINARY mailbox.
+    let ordinary = peek("sub-admin", "inbox-ordinary")
+        .unwrap_or_else(|e| panic!("an owner's ordinary inbox inspection was refused: {e}"));
+    assert!(
+        ordinary["messages"].as_array().is_some_and(|rows| rows
+            .iter()
+            .any(|row| row["id"].as_str() == Some("mail-ordinary"))),
+        "an owner's ordinary inbox inspection lost its entry: {ordinary}"
+    );
+
+    // Native `agent_inbox` follows the same rule for the member's assistant
+    // mailbox; the operator's ordinary peek still works.
+    assert!(
+        fx.call(
+            Asserted::Operator,
+            "agent_inbox",
+            json!({"alias": "assist-agent-sub-cli", "peek": true}),
+        )
+        .is_err(),
+        "a proven operator peeked a member's private assistant mailbox"
+    );
+    let ordinary_peek = fx
+        .call(
+            Asserted::Operator,
+            "agent_inbox",
+            json!({"alias": "inbox-ordinary", "peek": true}),
+        )
+        .expect("operator lost the ordinary inbox peek");
+    assert!(
+        ordinary_peek["messages"].as_array().is_some_and(|rows| rows
+            .iter()
+            .any(|row| row["id"].as_str() == Some("mail-ordinary"))),
+        "operator's ordinary inbox peek lost its entry: {ordinary_peek}"
+    );
+
+    // A DIFFERENT workspace owner is not the member: the SAME valid owner
+    // envelope is refused for the member's assistant mailbox only.
+    assert!(
+        peek("sub-admin", "assist-agent-sub-cli").is_err(),
+        "another workspace owner inspected a member's private assistant mailbox"
+    );
+    // Still positive: the bound member's read is intact after the refusal.
+    assert!(
+        peek("sub-cli", "assist-agent-sub-cli").is_ok(),
+        "the bound member's cli inbox read broke after the refused foreign inspection"
+    );
+}
+
+/// Mint a live verified public session for one principal — the CAD-1412
+/// human-room guard's first input. The fixture writes the row through the
+/// production opener with the fixture realm; the live roster the guard
+/// fetches is set by [`cad2207_room_roster`]. `role` "owner" maps the board
+/// user to the operator role (the ask authority); any other role is a plain
+/// member.
+fn cad2207_public_session(fx: &Fx, sub: &str, name: &str, role: &str) -> String {
+    let now = crate::issue::time::now_epoch();
+    let jti = format!("cad2207-{sub}-{now}");
+    fx.shared
+        .operator_auth()
+        .open_public_bound_with_intent(
+            crate::operator_auth::BoardUser {
+                sub: sub.to_string(),
+                email: format!("{sub}@example.com"),
+                name: name.to_string(),
+                role: if role == "owner" {
+                    "operator".to_string()
+                } else {
+                    "member".to_string()
+                },
+                handle: sub.to_string(),
+            },
+            (jti.as_str(), now + 60),
+            "cad2207-fixture",
+            crate::operator_auth::PublicRealm {
+                issuer: fx.issuer.clone(),
+                company: ORG.to_string(),
+                host: fx.host.clone(),
+            },
+            now,
+            |_| Ok(()),
+        )
+        .unwrap()
+        .expect("the fixture's verified public session was refused")
+        .token
+}
+
+/// The live roster the fixture platform answers for the human-room guard.
+fn cad2207_room_roster(fx: &Fx, members: &[(&str, &str, &str)]) {
+    fx.authority.lock().unwrap().roster = members
+        .iter()
+        .map(|(sub, name, role)| json!({"subject_id": sub, "name": name, "role": role}))
+        .collect();
+}
+
+/// CAD-2207: a shared room is not an authorization to expose a member's
+/// personal assistant. `human_room_ask` refuses ANY member-assistant target
+/// (its replies would be visible to every participant), while the same
+/// verified owner still asks an ordinary agent in an ordinary mixed room.
+///
+/// The room is seeded through the STORE (the RPC add/create guards are a
+/// different check), so this is the ask guard under test. The verified human
+/// session is a real public-session row plus the fixture platform's live
+/// roster — the daemon's own guard chain, not a mirrored decision.
+#[test]
+fn human_room_ask_refuses_a_member_private_assistant() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let assistant_uid = fx
+        .shared
+        .store
+        .agent(&alice.alias)
+        .expect("the assistant agent row is missing")
+        .uid;
+    let ordinary_uid = fx
+        .shared
+        .store
+        .agent("ordinary-worker")
+        .expect("the ordinary worker is missing")
+        .uid;
+
+    cad2207_room_roster(&fx, &[("sub-room-owner", "Room Owner", "owner")]);
+    let token = cad2207_public_session(&fx, "sub-room-owner", "Room Owner", "owner");
+
+    let actor = crate::store::human_threads::VerifiedHuman::with_name(
+        &fx.issuer,
+        ORG,
+        "sub-room-owner",
+        "Room Owner",
+    )
+    .unwrap();
+    let make_room = |title: &str, key: &str, agent: &str| {
+        fx.shared
+            .store
+            .human_group_create(
+                &actor,
+                "mixed_group",
+                title,
+                key,
+                &[crate::store::human_threads::RoomMember::Agent(
+                    agent.to_string(),
+                )],
+            )
+            .unwrap_or_else(|e| panic!("seed room '{title}': {e}"))
+    };
+    let private_room = make_room("private room", "cad2207-room-private", &alice.alias);
+    let ordinary_room = make_room("ordinary room", "cad2207-room-ordinary", "ordinary-worker");
+
+    let ask = |room: &str, uid: &str, client_id: &str| -> Result<Value> {
+        fx.op_err(
+            "human_room_ask",
+            json!({
+                "token": token,
+                "room": room,
+                "agent_uid": uid,
+                "client_id": client_id,
+                "body": "a room question",
+            }),
+        )
+    };
+
+    // Positive control: the same verified owner still asks an ordinary agent.
+    assert!(
+        ask(&ordinary_room, &ordinary_uid, "cad2207-ask-ordinary").is_ok(),
+        "a verified owner lost the ordinary mixed-room ask"
+    );
+
+    let before = fx.tree();
+    let queued_before = fx.shared.store.messages(&alice.alias).unwrap().len();
+    // Negative: the member's personal assistant is refused in a shared room.
+    assert!(
+        ask(&private_room, &assistant_uid, "cad2207-ask-private").is_err(),
+        "a verified owner addressed a member's private assistant in a shared room"
+    );
+    assert_eq!(
+        fx.shared.store.messages(&alice.alias).unwrap().len(),
+        queued_before,
+        "a refused room ask queued the private assistant"
+    );
+    assert_eq!(fx.tree(), before, "a refused room ask changed the tracker");
+}
+
+/// CAD-2207: a member assistant's pending request input is private. The
+/// operator keeps the actionable row (`request` + `method`) but never the
+/// params; approval/answers/steering are blocked before the handle is
+/// claimed; only a decline that is a real negative is preserved. The bound
+/// assistant's own connection still sees its input, and an ordinary agent's
+/// request keeps the normal accept path.
+#[test]
+fn private_request_input_is_withheld_and_blind_approval_is_refused() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    const PRIVATE_INPUT: &str = "private request input: member-only command text";
+    const SAFE_HANDLE: &str = "cad2207-private-request";
+    const FREETEXT_HANDLE: &str = "cad2207-private-freetext";
+    const ORDINARY_HANDLE: &str = "cad2207-ordinary-request";
+
+    let seed = |handle: &str, alias: &str, method: &str| {
+        fx.shared.pending.lock().unwrap().insert(
+            handle.to_string(),
+            super::PendingRequest {
+                alias: alias.to_string(),
+                id: Value::Null,
+                method: method.to_string(),
+                params: json!({
+                    "kind": "approval",
+                    "tool": "Bash",
+                    "input_summary": PRIVATE_INPUT,
+                    "input": {"command": PRIVATE_INPUT},
+                }),
+            },
+        );
+    };
+    seed(SAFE_HANDLE, &alice.alias, "cadence/approval");
+    seed(FREETEXT_HANDLE, &alice.alias, "item/tool/requestUserInput");
+    seed(ORDINARY_HANDLE, "ordinary-worker", "cadence/approval");
+
+    let pending_has = |handle: &str| fx.shared.pending.lock().unwrap().contains_key(handle);
+
+    // ---- the operator's listing keeps the row, not the private input ----
+    let listed = fx
+        .call(
+            Asserted::Operator,
+            "agent_requests",
+            json!({"alias": alice.alias}),
+        )
+        .expect("operator agent_requests refused");
+    assert!(
+        !listed.to_string().contains(PRIVATE_INPUT),
+        "the operator's request listing leaked the private input: {listed}"
+    );
+    let row = listed["requests"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|r| r["request"].as_str() == Some(SAFE_HANDLE))
+        })
+        .expect("the private request row disappeared from the operator listing");
+    assert_eq!(row["method"].as_str(), Some("cadence/approval"));
+    assert!(
+        row["params"].get("withheld").is_some() && row["params"].get("input").is_none(),
+        "the operator's row did not withhold the private params: {row}"
+    );
+    // Positive: the redaction is TARGET-keyed — the same operator listing for
+    // an ordinary agent still carries the real params. (The bound assistant's
+    // own connection cannot reach this verb: `agent_requests` is not in the
+    // member-assist verb whitelist, so that branch has no real surface here.)
+    let ordinary_listed = fx
+        .call(
+            Asserted::Operator,
+            "agent_requests",
+            json!({"alias": "ordinary-worker"}),
+        )
+        .expect("operator agent_requests for an ordinary agent refused");
+    assert!(
+        ordinary_listed.to_string().contains(PRIVATE_INPUT),
+        "the operator's ordinary-agent request listing lost its params: {ordinary_listed}"
+    );
+
+    let before = fx.tree();
+    // ---- blind approval / answers / free-text decline are refused, and
+    // refused BEFORE the handle is claimed ----
+    for params in [
+        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "accept"}),
+        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "accept", "answers": {"q": "a"}}),
+        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "decline", "answers": {"q": "a"}}),
+        json!({"alias": alice.alias, "request": FREETEXT_HANDLE, "decision": "decline"}),
+    ] {
+        let refused = fx.call(Asserted::Operator, "agent_respond", params.clone());
+        assert!(
+            refused.is_err(),
+            "an operator decision the reviewer cannot justify was accepted: {params} -> {refused:?}"
+        );
+    }
+    assert!(
+        pending_has(SAFE_HANDLE),
+        "a refused decision consumed the safe request"
+    );
+    assert!(
+        pending_has(FREETEXT_HANDLE),
+        "a refused free-text decline consumed the request"
+    );
+    assert_eq!(fx.tree(), before, "a refused decision changed the tracker");
+
+    // ---- the preserved half: a plain decline that is a real negative ----
+    let declined = fx.call(
+        Asserted::Operator,
+        "agent_respond",
+        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "decline"}),
+    );
+    assert!(
+        declined.is_ok(),
+        "the safe decline (executes nothing) was refused: {declined:?}"
+    );
+    assert!(
+        !pending_has(SAFE_HANDLE),
+        "the safe decline did not consume the request"
+    );
+
+    // ---- ordinary agents keep the normal accept path ----
+    let ordinary = fx.call(
+        Asserted::Operator,
+        "agent_respond",
+        json!({"alias": "ordinary-worker", "request": ORDINARY_HANDLE, "decision": "accept"}),
+    );
+    assert!(
+        ordinary.is_ok(),
+        "an ordinary agent's request lost the operator accept path: {ordinary:?}"
     );
 }
 
@@ -8359,6 +9334,3723 @@ fn cad1726_member_history_never_carries_an_artifact_card() {
         err.contains("'member_envelope' is not accepted"),
         "member envelope artifact_read: {err}"
     );
+}
+
+// ============================================================================
+// CAD-2207 independent negative acceptance (second author): dispatch routing,
+// durable room authorship after an agent-row removal, the room membership and
+// verified-human agent-list guards, and the private effect read/decision path.
+//
+// Every check drives the real daemon dispatch/store path under the real
+// `test-seam` caller identities. Each negative is paired with a positive
+// control that proves the same verb/envelope/path still works for an ordinary
+// agent or an authorized member, so a blanket error cannot pass. No check
+// asserts refusal wording: only side effects (queued rows, stored posts,
+// durable effect state) decide.
+// ============================================================================
+
+/// Run `git` in `dir`; a fixture failure is not a guard failure.
+fn cad2207_git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .env("GIT_AUTHOR_NAME", "cad2207")
+        .env("GIT_AUTHOR_EMAIL", "cad2207@example.invalid")
+        .env("GIT_COMMITTER_NAME", "cad2207")
+        .env("GIT_COMMITTER_EMAIL", "cad2207@example.invalid")
+        .args(args)
+        .output()
+        .expect("git unavailable");
+    assert!(
+        out.status.success(),
+        "fixture git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A real eligible dispatch fixture: a git repo with a registered live lane
+/// (`<repo>/.cadence/wt/<lane>`), a project declaring it, an issue whose open
+/// `worktree` ref names that lane, and a `doing` claim held by the ordinary
+/// worker. `dispatch_send` resolves every one of those itself; nothing here
+/// mirrors its guards.
+struct Cad2207Dispatch {
+    issue: String,
+    lane: PathBuf,
+}
+
+fn cad2207_dispatch_fixture(fx: &Fx) -> Cad2207Dispatch {
+    let repo = fx.dir.path().join("cad2207-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    cad2207_git(&repo, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::write(repo.join("README.md"), "cad2207 fixture\n").unwrap();
+    cad2207_git(&repo, &["add", "."]);
+    cad2207_git(&repo, &["commit", "--quiet", "-m", "fixture"]);
+    let repo = repo.canonicalize().unwrap();
+    let lane = crate::worktree::layout::worktrees_dir(&repo).join("cad2207-lane");
+    std::fs::create_dir_all(lane.parent().unwrap()).unwrap();
+    cad2207_git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "cadence/cad2207-lane",
+            lane.to_str().unwrap(),
+        ],
+    );
+    let pm = crate::issue::Pm::at(&fx.pm()).expect("fixture PM");
+    let project = "cad2207";
+    let prefix = "C7";
+    let issue = "C7-1";
+    crate::issue::write::project_add(
+        &pm,
+        project,
+        prefix,
+        &[repo.display().to_string()],
+        &[],
+        &[],
+        None,
+    )
+    .unwrap_or_else(|e| panic!("fixture project: {e}"));
+    crate::issue::write::new_issue(
+        &pm,
+        &repo,
+        Some(project),
+        "dispatch acceptance fixture",
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &[],
+        Some(issue),
+        Some("fixture body\n\n## Acceptance\n\n- [ ] fixture work\n"),
+        "cad2207-acceptance",
+    )
+    .unwrap_or_else(|e| panic!("fixture issue: {e}"));
+    let (_project, dir) = crate::issue::write::issue_dir(&pm, issue).unwrap();
+    let (mut front, body) = crate::issue::write::load_front(&dir).unwrap();
+    front.status = "doing".to_string();
+    front.owner = Some("ordinary-worker".to_string());
+    front.refs = vec![crate::issue::model::Ref {
+        kind: "worktree".to_string(),
+        url: None,
+        path: Some(lane.display().to_string()),
+        label: None,
+        closed: None,
+        worktree: None,
+        cargo_target: None,
+        agent: None,
+    }];
+    front.claim = Some(crate::issue::model::Claim {
+        by: "ordinary-worker".to_string(),
+        at: crate::issue::time::iso(crate::issue::time::now_epoch()),
+        session: None,
+        last_seen: None,
+        note: None,
+        stale: None,
+    });
+    crate::issue::write::save_front(&dir, &front, &body).unwrap();
+    Cad2207Dispatch {
+        issue: issue.to_string(),
+        lane,
+    }
+}
+
+/// A verified human principal derived exactly as `human_current_actor` does
+/// (same issuer, org and subject), for seeding a room through the store.
+fn cad2207_human_actor(
+    fx: &Fx,
+    sub: &str,
+    name: &str,
+) -> crate::store::human_threads::VerifiedHuman {
+    crate::store::human_threads::VerifiedHuman::with_name(&fx.issuer, ORG, sub, name)
+        .unwrap_or_else(|e| panic!("verified human {sub}: {e}"))
+}
+
+fn cad2207_room_topic(room: &str) -> String {
+    crate::store::topic_id(crate::store::human_threads::ROOM_TOPIC_TYPE, room)
+}
+
+fn cad2207_post_bodies(view: &Value) -> Vec<&str> {
+    view["posts"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|post| post["body"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Stage a real `platform_effects` row through the store's own staging write
+/// (`authorization_kind` defaults to `agent_grant`, which the read model
+/// selects). Returns its brokered request handle.
+fn cad2207_stage_effect(fx: &Fx, alias: &str, key: &str, text: &str) -> String {
+    let request = format!("req-{key}");
+    let row = crate::store::EffectRow {
+        effect_id: format!("eff-{key}"),
+        request: request.clone(),
+        agent: alias.to_string(),
+        platform: "cad2207-fixture".to_string(),
+        account: "cad2207-account".to_string(),
+        tool: "widgets.publish".to_string(),
+        label: None,
+        input: json!({"body": text}),
+        input_summary: text.to_string(),
+        preview: text.to_string(),
+        source_name: None,
+        source_hash: None,
+        scopes: vec!["widgets:write".to_string()],
+        task: None,
+        state: "waiting".to_string(),
+        close_reason: None,
+        decision: None,
+        outcome: None,
+        needs_you: false,
+        staged_at: 0.0,
+        updated_at: 0.0,
+    };
+    fx.shared
+        .store
+        .effect_stage(&row)
+        .unwrap_or_else(|e| panic!("stage effect {key}: {e}"));
+    request
+}
+
+/// CAD-2207: `dispatch_send` is a queue-then-report path. An operator that
+/// names a member's personal assistant must not queue the kickoff and must not
+/// route its reply into a mailbox the member does not own. The SAME real
+/// issue/project/lane/claim fixture accepts an ordinary agent, so the refusal
+/// below is about the private target — never an ineligible fixture (missing
+/// lane, unheld claim, unresolved project).
+#[test]
+fn cad2207_dispatch_send_cannot_queue_for_a_member_assistant_or_route_its_reply() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let reply_dir = fx.dir.path().join("dispatch-reply-cwd");
+    std::fs::create_dir_all(&reply_dir).unwrap();
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias: "ordinary-reply",
+            provider: "pi",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: reply_dir.to_str().unwrap(),
+            sandbox: "workspace-write",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    let dispatch = cad2207_dispatch_fixture(&fx);
+
+    // Positive control: the same issue, claim holder, lane and reply mailbox
+    // accept a real kickoff for an ordinary agent. This is the eligibility
+    // proof for every field the negative call reuses.
+    let ordinary_mid = "cad2207-dispatch-ordinary";
+    let ordinary = fx
+        .call(
+            Asserted::Operator,
+            "dispatch_send",
+            json!({
+                "alias": "ordinary-worker",
+                "issue": dispatch.issue,
+                "text": "ordinary kickoff",
+                "reply_to": "ordinary-reply",
+                "message": ordinary_mid,
+            }),
+        )
+        .unwrap_or_else(|e| panic!("the ordinary dispatch fixture is not eligible: {e}"));
+    assert_eq!(ordinary["duplicate"], json!(false), "{ordinary}");
+    let queued = fx
+        .shared
+        .store
+        .message(ordinary_mid)
+        .unwrap()
+        .expect("the ordinary kickoff was accepted without a stored message");
+    assert_eq!(queued.alias, "ordinary-worker");
+    assert_eq!(queued.reply_to.as_deref(), Some("ordinary-reply"));
+    assert_eq!(queued.issue.as_deref(), Some(dispatch.issue.as_str()));
+    assert_eq!(
+        queued.worktree.as_deref(),
+        Some(dispatch.lane.to_str().unwrap()),
+        "the accepted kickoff did not bind the issue's real lane"
+    );
+
+    // Negative: the identical call, only the target changes to the member's
+    // personal assistant. It must not queue the kickoff, must not store a
+    // reply route to the caller-named mailbox, and must not touch the
+    // assistant's queue.
+    let private_mid = "cad2207-dispatch-private";
+    let private_text = "private kickoff that must never queue";
+    let private_before = fx.shared.store.messages(&alice.alias).unwrap().len();
+    let worker_before = fx.shared.store.messages("ordinary-worker").unwrap().len();
+    let reply_before = fx.shared.store.messages("ordinary-reply").unwrap().len();
+    let refused = fx.call(
+        Asserted::Operator,
+        "dispatch_send",
+        json!({
+            "alias": alice.alias,
+            "issue": dispatch.issue,
+            "text": private_text,
+            "reply_to": "ordinary-reply",
+            "message": private_mid,
+        }),
+    );
+    assert!(
+        refused.is_err(),
+        "an operator queued a dispatch kickoff to a member's private assistant: {refused:?}"
+    );
+    assert!(
+        fx.shared.store.message(private_mid).unwrap().is_none(),
+        "the refused private dispatch still stored its message"
+    );
+    assert_eq!(
+        fx.shared.store.messages(&alice.alias).unwrap().len(),
+        private_before,
+        "the refused private dispatch queued the member's assistant"
+    );
+    assert_eq!(
+        fx.shared.store.messages("ordinary-worker").unwrap().len(),
+        worker_before,
+        "the refused private dispatch changed the target worker's queue"
+    );
+    assert_eq!(
+        fx.shared.store.messages("ordinary-reply").unwrap().len(),
+        reply_before,
+        "the refused private dispatch routed a copy into the caller-named mailbox"
+    );
+    assert!(
+        !fx.shared
+            .store
+            .messages("ordinary-reply")
+            .unwrap()
+            .iter()
+            .any(|m| m.body.contains(private_text) || m.id == private_mid),
+        "the private kickoff text reached the unowned reply mailbox"
+    );
+    assert!(
+        !fx.shared
+            .store
+            .messages(&alice.alias)
+            .unwrap()
+            .iter()
+            .any(|m| m.body.contains(private_text)),
+        "the private assistant received the kickoff text"
+    );
+}
+
+/// CAD-2207: room posts are durable authorship. Once an assistant's `agents`
+/// row is removed, its recorded sender alias still resolves to the
+/// `assistants` binding, so its existing posts stay hidden from another member
+/// and another agent while the owning member and every unrelated ordinary post
+/// remain visible. The fixture writes the posts through the real store post
+/// path before the removal (an old row, not a simulated one).
+#[test]
+fn cad2207_private_assistant_room_posts_stay_hidden_after_agent_row_removal() {
+    const PRIVATE: &str = "cad2207 private room reply: only the owning member sees this";
+    const ORDINARY_AGENT: &str = "cad2207 ordinary agent room reply";
+    const ORDINARY_HUMAN: &str = "cad2207 other member room reply";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let assistant_uid = fx.shared.store.agent(&alice.alias).unwrap().uid;
+    let ordinary_uid = fx.shared.store.agent("ordinary-worker").unwrap().uid;
+    cad2207_room_roster(
+        &fx,
+        &[
+            ("sub-alice", "Alice", "member"),
+            ("sub-ben", "Ben", "member"),
+        ],
+    );
+    let alice_actor = cad2207_human_actor(&fx, "sub-alice", "Alice");
+    let ben_actor = cad2207_human_actor(&fx, "sub-ben", "Ben");
+    fx.shared
+        .store
+        .human_directory_upsert(
+            ORG,
+            &[
+                (alice_actor.clone(), "Alice".to_string()),
+                (ben_actor.clone(), "Ben".to_string()),
+            ],
+        )
+        .unwrap();
+
+    // Seed an older mixed room containing the private assistant (the add
+    // guard now refuses new admissions; existing rows must still be filtered).
+    let room = fx
+        .shared
+        .store
+        .human_group_create(
+            &ben_actor,
+            "mixed_group",
+            "cad2207 room",
+            "cad2207-room-posts",
+            &[
+                crate::store::human_threads::RoomMember::Human(alice_actor.id.clone()),
+                crate::store::human_threads::RoomMember::Agent(alice.alias.clone()),
+                crate::store::human_threads::RoomMember::Agent("ordinary-worker".to_string()),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("seed the mixed room: {e}"));
+    let topic = cad2207_room_topic(&room);
+    fx.shared
+        .store
+        .human_agent_post(ORG, &assistant_uid, &topic, "cad2207-room-private", PRIVATE)
+        .unwrap();
+    fx.shared
+        .store
+        .human_agent_post(
+            ORG,
+            &ordinary_uid,
+            &topic,
+            "cad2207-room-agent",
+            ORDINARY_AGENT,
+        )
+        .unwrap();
+    fx.shared
+        .store
+        .human_room_post(&ben_actor, &room, "cad2207-room-human", ORDINARY_HUMAN)
+        .unwrap();
+
+    let owner_token = cad2207_public_session(&fx, "sub-alice", "Alice", "member");
+    let ben_token = cad2207_public_session(&fx, "sub-ben", "Ben", "member");
+
+    // Before the removal the binding is still resolvable through the row.
+    let ben_before = fx
+        .op_err("human_room_read", json!({"token": ben_token, "room": room}))
+        .unwrap_or_else(|e| panic!("another member lost the room read: {e}"));
+    let before_bodies = cad2207_post_bodies(&ben_before);
+    assert!(
+        before_bodies.iter().all(|body| !body.contains(PRIVATE)),
+        "another member read a private assistant post: {ben_before}"
+    );
+    assert!(
+        before_bodies
+            .iter()
+            .any(|body| body.contains(ORDINARY_AGENT))
+            && before_bodies
+                .iter()
+                .any(|body| body.contains(ORDINARY_HUMAN)),
+        "another member lost an unrelated room post: {ben_before}"
+    );
+
+    // The agent row disappears. The binding and the post row survive; a
+    // removed row must not turn the private sender ordinary.
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "DELETE FROM agents WHERE alias=?",
+                rusqlite::params![alice.alias],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        fx.shared.store.agent_opt(&alice.alias).unwrap().is_none(),
+        "the fixture's agent-row removal did not land"
+    );
+    assert!(
+        fx.shared
+            .store
+            .assistant_for_alias(&alice.alias)
+            .unwrap()
+            .is_some(),
+        "the fixture's durable assistant binding disappeared with the row"
+    );
+
+    let owner = fx
+        .op_err(
+            "human_room_read",
+            json!({"token": owner_token, "room": room}),
+        )
+        .unwrap_or_else(|e| panic!("the owning member lost the room read: {e}"));
+    let ben = fx
+        .op_err("human_room_read", json!({"token": ben_token, "room": room}))
+        .unwrap_or_else(|e| panic!("another member lost the room read: {e}"));
+    let other_agent = fx
+        .call(
+            Asserted::Agent("ordinary-worker".to_string()),
+            "topic_read",
+            json!({"topic": topic, "limit": 50}),
+        )
+        .unwrap_or_else(|e| panic!("another agent lost the room read: {e}"));
+
+    let owner_bodies = cad2207_post_bodies(&owner);
+    assert!(
+        owner_bodies.iter().any(|body| body.contains(PRIVATE)),
+        "the owning member lost its own assistant's post: {owner}"
+    );
+    assert!(
+        owner_bodies
+            .iter()
+            .any(|body| body.contains(ORDINARY_AGENT))
+            && owner_bodies
+                .iter()
+                .any(|body| body.contains(ORDINARY_HUMAN)),
+        "the owning member lost an unrelated room post: {owner}"
+    );
+    let ben_bodies = cad2207_post_bodies(&ben);
+    assert!(
+        ben_bodies.iter().all(|body| !body.contains(PRIVATE)),
+        "another member read a private assistant post after the row removal: {ben}"
+    );
+    assert!(
+        ben_bodies.iter().any(|body| body.contains(ORDINARY_AGENT))
+            && ben_bodies.iter().any(|body| body.contains(ORDINARY_HUMAN)),
+        "another member lost an unrelated room post after the row removal: {ben}"
+    );
+    let agent_bodies = cad2207_post_bodies(&other_agent);
+    assert!(
+        agent_bodies.iter().all(|body| !body.contains(PRIVATE)),
+        "another agent read a private assistant post after the row removal: {other_agent}"
+    );
+    assert!(
+        agent_bodies
+            .iter()
+            .any(|body| body.contains(ORDINARY_AGENT))
+            && agent_bodies
+                .iter()
+                .any(|body| body.contains(ORDINARY_HUMAN)),
+        "another agent lost an unrelated room post after the row removal: {other_agent}"
+    );
+}
+
+/// CAD-2207: the reachable room-membership guards and the verified-human agent
+/// list. A private assistant cannot be added to or created inside a shared
+/// room, nor appear in another member's agent list, while ordinary agents keep
+/// those paths. A transcript post by another authorized member is NOT an
+/// outage: it still lands, does not queue/steer the private assistant, and the
+/// assistant's own post stays hidden.
+#[test]
+fn cad2207_room_membership_and_human_agent_list_refuse_a_private_assistant() {
+    const PRIVATE: &str = "cad2207 private membership post";
+    const ORDINARY_POST: &str = "cad2207 ordinary member post";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let assistant_uid = fx.shared.store.agent(&alice.alias).unwrap().uid;
+    let ordinary_uid = fx.shared.store.agent("ordinary-worker").unwrap().uid;
+    let worker2_dir = fx.dir.path().join("worker2-cwd");
+    std::fs::create_dir_all(&worker2_dir).unwrap();
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias: "ordinary-worker-2",
+            provider: "pi",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: worker2_dir.to_str().unwrap(),
+            sandbox: "workspace-write",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    let worker2_uid = fx.shared.store.agent("ordinary-worker-2").unwrap().uid;
+
+    cad2207_room_roster(
+        &fx,
+        &[
+            ("sub-alice", "Alice", "member"),
+            ("sub-ben", "Ben", "member"),
+        ],
+    );
+    let alice_actor = cad2207_human_actor(&fx, "sub-alice", "Alice");
+    let ben_actor = cad2207_human_actor(&fx, "sub-ben", "Ben");
+    fx.shared
+        .store
+        .human_directory_upsert(
+            ORG,
+            &[
+                (alice_actor.clone(), "Alice".to_string()),
+                (ben_actor.clone(), "Ben".to_string()),
+            ],
+        )
+        .unwrap();
+    let alice_token = cad2207_public_session(&fx, "sub-alice", "Alice", "member");
+    let ben_token = cad2207_public_session(&fx, "sub-ben", "Ben", "member");
+
+    // Verified human agent list: the owner sees its own assistant and the
+    // ordinary fleet; another verified member sees the ordinary fleet only.
+    let ben_list = fx.op("human_agents_list", json!({"token": ben_token}));
+    let ben_aliases: Vec<&str> = ben_list["agents"]
+        .as_array()
+        .expect("human_agents_list carries no agents array")
+        .iter()
+        .filter_map(|row| row["alias"].as_str())
+        .collect();
+    assert!(
+        !ben_aliases.contains(&alice.alias.as_str()),
+        "another verified member saw a private assistant in human_agents_list: {ben_list}"
+    );
+    assert!(
+        ben_aliases.contains(&"ordinary-worker") && ben_aliases.contains(&"ordinary-worker-2"),
+        "another verified member lost an ordinary agent row: {ben_list}"
+    );
+    let owner_list = fx.op("human_agents_list", json!({"token": alice_token}));
+    let owner_aliases: Vec<&str> = owner_list["agents"]
+        .as_array()
+        .expect("human_agents_list carries no agents array")
+        .iter()
+        .filter_map(|row| row["alias"].as_str())
+        .collect();
+    assert!(
+        owner_aliases.contains(&alice.alias.as_str()),
+        "the owning member lost its own assistant from human_agents_list: {owner_list}"
+    );
+    assert!(
+        owner_aliases.contains(&"ordinary-worker"),
+        "the owning member lost an ordinary agent row: {owner_list}"
+    );
+
+    // Create: a private assistant is refused; an ordinary agent succeeds.
+    let create_private = fx.op_err(
+        "human_group_create",
+        json!({
+            "token": ben_token,
+            "kind": "mixed_group",
+            "title": "cad2207 private create",
+            "client_id": "cad2207-create-private",
+            "agents": [assistant_uid],
+        }),
+    );
+    assert!(
+        create_private.is_err(),
+        "a verified member created a shared room with a private assistant: {create_private:?}"
+    );
+    let created = fx
+        .op_err(
+            "human_group_create",
+            json!({
+                "token": ben_token,
+                "kind": "mixed_group",
+                "title": "cad2207 ordinary create",
+                "client_id": "cad2207-create-ordinary",
+                "agents": [ordinary_uid],
+            }),
+        )
+        .unwrap_or_else(|e| panic!("a verified member lost the ordinary room create: {e}"));
+    let ordinary_room = created["room"]
+        .as_str()
+        .expect("the ordinary room create returned no room")
+        .to_string();
+
+    // Add: a private assistant is refused; a second ordinary agent succeeds.
+    let add_private = fx.op_err(
+        "human_room_add",
+        json!({
+            "token": ben_token,
+            "room": ordinary_room,
+            "agent_uid": assistant_uid,
+        }),
+    );
+    assert!(
+        add_private.is_err(),
+        "a verified member added a private assistant to a shared room: {add_private:?}"
+    );
+    fx.op_err(
+        "human_room_add",
+        json!({
+            "token": ben_token,
+            "room": ordinary_room,
+            "agent_uid": worker2_uid,
+        }),
+    )
+    .unwrap_or_else(|e| panic!("a verified member lost the ordinary room add: {e}"));
+
+    // Post: an older shared room still holds the assistant's durable
+    // membership (seeded through the store). Another authorized member may
+    // still post a transcript row; that must not queue or steer the private
+    // assistant, and its post stays hidden from that member.
+    let shared_room = fx
+        .shared
+        .store
+        .human_group_create(
+            &ben_actor,
+            "mixed_group",
+            "cad2207 shared room",
+            "cad2207-room-mixed",
+            &[
+                crate::store::human_threads::RoomMember::Human(alice_actor.id.clone()),
+                crate::store::human_threads::RoomMember::Agent(alice.alias.clone()),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("seed the shared room: {e}"));
+    let topic = cad2207_room_topic(&shared_room);
+    fx.shared
+        .store
+        .human_agent_post(
+            ORG,
+            &assistant_uid,
+            &topic,
+            "cad2207-membership-private",
+            PRIVATE,
+        )
+        .unwrap();
+    let assistant_messages = fx.shared.store.messages(&alice.alias).unwrap().len();
+    let posted = fx
+        .op_err(
+            "human_room_post",
+            json!({
+                "token": ben_token,
+                "room": shared_room,
+                "client_id": "cad2207-ben-post",
+                "body": ORDINARY_POST,
+            }),
+        )
+        .unwrap_or_else(|e| panic!("another member lost the shared-room post: {e}"));
+    assert!(
+        posted["post"]["body"]
+            .as_str()
+            .is_some_and(|body| body.contains(ORDINARY_POST)),
+        "another member's shared-room post did not land: {posted}"
+    );
+    assert_eq!(
+        fx.shared.store.messages(&alice.alias).unwrap().len(),
+        assistant_messages,
+        "a transcript post queued or steered the private assistant"
+    );
+
+    let ben_view = fx
+        .op_err(
+            "human_room_read",
+            json!({"token": ben_token, "room": shared_room}),
+        )
+        .unwrap_or_else(|e| panic!("another member lost the shared-room read: {e}"));
+    let ben_bodies = cad2207_post_bodies(&ben_view);
+    assert!(
+        ben_bodies.iter().any(|body| body.contains(ORDINARY_POST)),
+        "another member lost its own shared-room post: {ben_view}"
+    );
+    assert!(
+        ben_bodies.iter().all(|body| !body.contains(PRIVATE)),
+        "another member read the private assistant's shared-room post: {ben_view}"
+    );
+    let owner_view = fx
+        .op_err(
+            "human_room_read",
+            json!({"token": alice_token, "room": shared_room}),
+        )
+        .unwrap_or_else(|e| panic!("the owning member lost the shared-room read: {e}"));
+    let owner_bodies = cad2207_post_bodies(&owner_view);
+    assert!(
+        owner_bodies.iter().any(|body| body.contains(PRIVATE)),
+        "the owning member lost its assistant's shared-room post: {owner_view}"
+    );
+    assert!(
+        owner_bodies.iter().any(|body| body.contains(ORDINARY_POST)),
+        "the owning member lost another member's post: {owner_view}"
+    );
+}
+
+/// CAD-2207: a staged effect's input is private to the member's assistant.
+/// `platform_effects` must not leak it; `agent_respond` must not accept,
+/// answer or steer it (only a bare negative decline is preserved); close must
+/// not echo the caller's reason or the input. Ordinary effects keep every one
+/// of those paths, including the visible record.
+#[test]
+fn cad2207_private_effect_input_and_decisions_stay_private() {
+    const PRIVATE: &str = "cad2207 private effect input: member-only command text";
+    const ORDINARY: &str = "cad2207 ordinary effect input";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+
+    let private_accept = cad2207_stage_effect(&fx, &alice.alias, "cad2207-private-accept", PRIVATE);
+    let private_decline =
+        cad2207_stage_effect(&fx, &alice.alias, "cad2207-private-decline", PRIVATE);
+    let private_close = cad2207_stage_effect(&fx, &alice.alias, "cad2207-private-close", PRIVATE);
+    let ordinary_accept =
+        cad2207_stage_effect(&fx, "ordinary-worker", "cad2207-ordinary-accept", ORDINARY);
+    let ordinary_decline =
+        cad2207_stage_effect(&fx, "ordinary-worker", "cad2207-ordinary-decline", ORDINARY);
+    let ordinary_close =
+        cad2207_stage_effect(&fx, "ordinary-worker", "cad2207-ordinary-close", ORDINARY);
+
+    // Read model: the private input never appears; the ordinary input does.
+    let all = fx.op("platform_effects", json!({}));
+    assert!(
+        !all.to_string().contains(PRIVATE),
+        "the operator's effect read model leaked a member-private input: {all}"
+    );
+    assert!(
+        all.to_string().contains(ORDINARY),
+        "the operator's effect read model lost an ordinary effect input: {all}"
+    );
+    let scoped = fx.op("platform_effects", json!({"agent": alice.alias}));
+    assert!(
+        !scoped.to_string().contains(PRIVATE),
+        "the operator's filtered effect read model leaked a member-private input: {scoped}"
+    );
+    for handle in [&private_accept, &private_decline, &private_close] {
+        if let Some(row) = all["effects"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|row| row["request"].as_str() == Some(handle))
+        }) {
+            assert!(
+                !row.to_string().contains(PRIVATE),
+                "the operator saw a member-private effect row with its input: {row}"
+            );
+        }
+    }
+
+    // Approval, answers and a caller-authored reason are all blocked before
+    // the row is claimed; the row stays waiting with no decision.
+    let accepted = fx.call(
+        Asserted::Operator,
+        "agent_respond",
+        json!({"alias": alice.alias, "request": private_accept, "decision": "accept"}),
+    );
+    assert!(
+        accepted.is_err(),
+        "an operator accepted a member-private effect: {accepted:?}"
+    );
+    for params in [
+        json!({"alias": alice.alias, "request": private_accept, "decision": "decline",
+               "answers": {"question": "private answer"}}),
+        json!({"alias": alice.alias, "request": private_accept, "decision": "decline",
+               "reason": "private steer"}),
+    ] {
+        let refused = fx.call(Asserted::Operator, "agent_respond", params.clone());
+        assert!(
+            refused.is_err(),
+            "an operator steered a member-private effect with {params}: {refused:?}"
+        );
+    }
+    let waiting = fx
+        .shared
+        .store
+        .effect_by_request(&private_accept)
+        .unwrap()
+        .expect("the private accept row disappeared");
+    assert_eq!(waiting.state, "waiting", "a refused press changed the row");
+    assert!(
+        waiting.decision.is_none(),
+        "a refused press recorded a decision"
+    );
+    assert_eq!(
+        fx.shared
+            .store
+            .effect_by_request(&private_decline)
+            .unwrap()
+            .expect("the private decline row disappeared")
+            .state,
+        "waiting"
+    );
+
+    // Preserved half: a bare decline executes nothing and is allowed, but its
+    // response still carries no private input.
+    let declined = fx
+        .call(
+            Asserted::Operator,
+            "agent_respond",
+            json!({"alias": alice.alias, "request": private_decline, "decision": "decline"}),
+        )
+        .unwrap_or_else(|e| panic!("the safe bare decline was refused: {e}"));
+    assert_eq!(declined["state"], json!("answered"), "{declined}");
+    assert_eq!(declined["effect"]["state"], json!("declined"), "{declined}");
+    assert!(
+        !declined.to_string().contains(PRIVATE),
+        "the safe decline echoed the member-private input: {declined}"
+    );
+    let declined_row = fx
+        .shared
+        .store
+        .effect_by_request(&private_decline)
+        .unwrap()
+        .expect("the bare decline did not decide its row");
+    assert_eq!(declined_row.state, "declined");
+    assert!(
+        declined_row.decision.is_some(),
+        "the bare decline recorded no decision"
+    );
+
+    // Close: server-owned reason only, and the record is input-free.
+    let caller_reason = "cad2207 caller-authored close reason";
+    let closed = fx
+        .call(
+            Asserted::Operator,
+            "platform_effect_close",
+            json!({"request": private_close, "reason": caller_reason}),
+        )
+        .unwrap_or_else(|e| panic!("the private effect could not be closed safely: {e}"));
+    assert_eq!(closed["record"]["state"], json!("closed"), "{closed}");
+    assert!(
+        closed["record"].get("close_reason").is_none(),
+        "the private close receipt serialized a close_reason: {closed}"
+    );
+    assert!(
+        closed["record"].get("outcome").is_none(),
+        "the private close receipt serialized an outcome: {closed}"
+    );
+    assert!(
+        !closed.to_string().contains(PRIVATE),
+        "the private close leaked the member-private input: {closed}"
+    );
+    assert!(
+        !closed.to_string().contains(caller_reason),
+        "the private close echoed the caller-authored reason: {closed}"
+    );
+    let closed_row = fx
+        .shared
+        .store
+        .effect_by_request(&private_close)
+        .unwrap()
+        .expect("the private close did not land");
+    assert_eq!(closed_row.state, "closed");
+    assert_ne!(
+        closed_row.close_reason.as_deref(),
+        Some(caller_reason),
+        "the private close persisted the caller-authored reason"
+    );
+
+    // The outcome receipt after a decision/close is the member's context too:
+    // no other agent's mailbox may carry the private input.
+    for agent in fx.shared.store.agents().unwrap() {
+        if agent.alias == alice.alias {
+            continue;
+        }
+        assert!(
+            !fx.shared
+                .store
+                .messages(&agent.alias)
+                .unwrap()
+                .iter()
+                .any(|m| m.body.contains(PRIVATE)),
+            "a private effect receipt reached another agent's mailbox: {}",
+            agent.alias
+        );
+    }
+
+    // Ordinary-effect positive controls: the same paths still work and still
+    // return the ordinary record's real input.
+    let ordinary_accepted = fx
+        .call(
+            Asserted::Operator,
+            "agent_respond",
+            json!({"alias": "ordinary-worker", "request": ordinary_accept, "decision": "accept"}),
+        )
+        .unwrap_or_else(|e| panic!("an ordinary effect lost the operator accept path: {e}"));
+    assert!(
+        ordinary_accepted.to_string().contains(ORDINARY),
+        "the ordinary accept lost its visible input: {ordinary_accepted}"
+    );
+    let ordinary_declined = fx
+        .call(
+            Asserted::Operator,
+            "agent_respond",
+            json!({"alias": "ordinary-worker", "request": ordinary_decline, "decision": "decline"}),
+        )
+        .unwrap_or_else(|e| panic!("an ordinary effect lost the operator decline path: {e}"));
+    assert!(
+        ordinary_declined.to_string().contains(ORDINARY),
+        "the ordinary decline lost its visible input: {ordinary_declined}"
+    );
+    let ordinary_closed = fx
+        .call(
+            Asserted::Operator,
+            "platform_effect_close",
+            json!({"request": ordinary_close}),
+        )
+        .unwrap_or_else(|e| panic!("an ordinary effect lost the operator close path: {e}"));
+    assert!(
+        ordinary_closed.to_string().contains(ORDINARY),
+        "the ordinary close lost its visible input: {ordinary_closed}"
+    );
+}
+
+/// CAD-2207: a bound assistant may carry a nonowner `upstream` label. An
+/// allowed bare decline of a private effect must not deliver the private
+/// input_summary/preview to that mailbox; an ordinary agent's upstream keeps
+/// the normal outcome routing.
+#[test]
+fn cad2207_private_effect_decline_does_not_route_to_a_nonowner_upstream() {
+    const PRIVATE: &str = "cad2207 private upstream secret";
+    const ORDINARY: &str = "cad2207 ordinary upstream outcome";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let reply_dir = fx.dir.path().join("effect-reply-cwd");
+    std::fs::create_dir_all(&reply_dir).unwrap();
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias: "ordinary-reply",
+            provider: "pi",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: reply_dir.to_str().unwrap(),
+            sandbox: "workspace-write",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    // A nonowner upstream label on both the private assistant and an ordinary
+    // agent — the routing decision must be target-keyed, not blanket.
+    for alias in [alice.alias.as_str(), "ordinary-worker"] {
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "UPDATE agents SET params=json_set(COALESCE(params,'{}'),'$.upstream',?) \
+                     WHERE alias=?",
+                    rusqlite::params!["ordinary-reply", alias],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let private_request =
+        cad2207_stage_effect(&fx, &alice.alias, "cad2207-private-upstream", PRIVATE);
+    let declined = fx
+        .call(
+            Asserted::Operator,
+            "agent_respond",
+            json!({"alias": alice.alias, "request": private_request, "decision": "decline"}),
+        )
+        .unwrap_or_else(|e| panic!("the safe private decline was refused: {e}"));
+    assert_eq!(declined["effect"]["state"], json!("declined"), "{declined}");
+    assert!(
+        !declined.to_string().contains(PRIVATE),
+        "the private decline receipt leaked the secret input: {declined}"
+    );
+    let upstream = fx.shared.store.messages("ordinary-reply").unwrap();
+    assert!(
+        upstream.iter().all(|m| !m.body.contains(PRIVATE)),
+        "a private effect decline routed its secret body/result to a nonowner upstream"
+    );
+
+    // Positive: the same upstream routing works for an ordinary effect.
+    let ordinary_request = cad2207_stage_effect(
+        &fx,
+        "ordinary-worker",
+        "cad2207-ordinary-upstream",
+        ORDINARY,
+    );
+    let before = fx.shared.store.messages("ordinary-reply").unwrap().len();
+    fx.call(
+        Asserted::Operator,
+        "agent_respond",
+        json!({"alias": "ordinary-worker", "request": ordinary_request, "decision": "decline"}),
+    )
+    .unwrap_or_else(|e| panic!("the ordinary decline was refused: {e}"));
+    let after = fx.shared.store.messages("ordinary-reply").unwrap();
+    assert!(
+        after.len() > before,
+        "the ordinary effect outcome did not reach its configured upstream"
+    );
+    assert!(
+        after.iter().any(|m| m.body.contains(ORDINARY)),
+        "the ordinary upstream outcome lost its visible input"
+    );
+}
+
+fn cad2207_room_unread(view: &Value, room: &str) -> (i64, bool) {
+    let group = view["groups"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|g| g["room"].as_str() == Some(room)))
+        .unwrap_or_else(|| panic!("room {room} missing from the inbox: {view}"));
+    (
+        group["unread"]
+            .as_i64()
+            .expect("notification group carries no unread count"),
+        group["mention"].as_bool().unwrap_or(false),
+    )
+}
+
+/// CAD-2207: filtering hidden assistant posts must not strand a client.
+/// Seed one ordinary post, then more than eight pages of newer hidden
+/// assistant posts. A non-owner's empty first page still returns `has_more`
+/// plus a usable cursor, and following that cursor reaches the ordinary post;
+/// the owner sees its own assistant's new posts in the same first page; the
+/// agent `topic_read` page keeps the same continuation; and the non-owner's
+/// room/inbox unread counts exclude hidden posts while the owner's include
+/// them.
+#[test]
+fn cad2207_room_paging_and_unread_exclude_hidden_posts_without_stranding() {
+    const ORDINARY: &str = "cad2207 paging ordinary post";
+    const PRIVATE: &str = "cad2207 paging hidden assistant post";
+    const PAGE: i64 = 2;
+    const HIDDEN: usize = (PAGE as usize) * 8 + 1;
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let assistant_uid = fx.shared.store.agent(&alice.alias).unwrap().uid;
+    let ordinary_uid = fx.shared.store.agent("ordinary-worker").unwrap().uid;
+    cad2207_room_roster(
+        &fx,
+        &[
+            ("sub-alice", "Alice", "member"),
+            ("sub-ben", "Ben", "member"),
+        ],
+    );
+    let alice_actor = cad2207_human_actor(&fx, "sub-alice", "Alice");
+    let ben_actor = cad2207_human_actor(&fx, "sub-ben", "Ben");
+    fx.shared
+        .store
+        .human_directory_upsert(
+            ORG,
+            &[
+                (alice_actor.clone(), "Alice".to_string()),
+                (ben_actor.clone(), "Ben".to_string()),
+            ],
+        )
+        .unwrap();
+    let room = fx
+        .shared
+        .store
+        .human_group_create(
+            &ben_actor,
+            "mixed_group",
+            "cad2207 paging",
+            "cad2207-room-paging",
+            &[
+                crate::store::human_threads::RoomMember::Human(alice_actor.id.clone()),
+                crate::store::human_threads::RoomMember::Agent(alice.alias.clone()),
+                crate::store::human_threads::RoomMember::Agent("ordinary-worker".to_string()),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("seed the paging room: {e}"));
+    let topic = cad2207_room_topic(&room);
+    // The ordinary post is OLDER than every hidden assistant post.
+    fx.shared
+        .store
+        .human_agent_post(
+            ORG,
+            &ordinary_uid,
+            &topic,
+            "cad2207-paging-ordinary",
+            ORDINARY,
+        )
+        .unwrap();
+    for index in 0..HIDDEN {
+        fx.shared
+            .store
+            .human_agent_post(
+                ORG,
+                &assistant_uid,
+                &topic,
+                &format!("cad2207-paging-hidden-{index}"),
+                &format!("{PRIVATE} #{index}"),
+            )
+            .unwrap();
+    }
+    let alice_token = cad2207_public_session(&fx, "sub-alice", "Alice", "member");
+    let ben_token = cad2207_public_session(&fx, "sub-ben", "Ben", "member");
+
+    // Non-owner first page: the newest PAGE posts are hidden, so the visible
+    // page is empty — yet it must still say there is more and where to go.
+    let first = fx
+        .op_err(
+            "human_room_read",
+            json!({"token": ben_token, "room": room, "limit": PAGE}),
+        )
+        .unwrap_or_else(|e| panic!("nonowner first page: {e}"));
+    assert!(
+        cad2207_post_bodies(&first).is_empty(),
+        "the nonowner's hidden-only first page was not empty: {first}"
+    );
+    assert_eq!(
+        first["has_more"],
+        json!(true),
+        "an empty filtered page lost has_more: {first}"
+    );
+    let mut before = first["cursor"]
+        .as_i64()
+        .expect("an empty filtered page returned no cursor");
+    assert!(
+        before > 0,
+        "the empty filtered page cursor was not usable: {first}"
+    );
+    let mut reached = false;
+    for _ in 0..(HIDDEN + 4) {
+        let page = fx
+            .op_err(
+                "human_room_read",
+                json!({"token": ben_token, "room": room, "limit": PAGE, "before": before}),
+            )
+            .unwrap_or_else(|e| panic!("nonowner continuation page: {e}"));
+        let bodies = cad2207_post_bodies(&page);
+        assert!(
+            bodies.iter().all(|body| !body.contains(PRIVATE)),
+            "a continuation page exposed a hidden assistant post: {page}"
+        );
+        if bodies.iter().any(|body| body.contains(ORDINARY)) {
+            reached = true;
+            break;
+        }
+        if page["has_more"] != json!(true) {
+            break;
+        }
+        let next = page["cursor"]
+            .as_i64()
+            .expect("a continuation page returned no cursor");
+        assert!(
+            next < before,
+            "the continuation cursor did not move older: {page}"
+        );
+        before = next;
+    }
+    assert!(
+        reached,
+        "the nonowner's continuation never reached the ordinary post"
+    );
+
+    // The owner sees its own assistant's new posts in the same first page.
+    let owner_first = fx
+        .op_err(
+            "human_room_read",
+            json!({"token": alice_token, "room": room, "limit": PAGE}),
+        )
+        .unwrap_or_else(|e| panic!("owner first page: {e}"));
+    let owner_bodies = cad2207_post_bodies(&owner_first);
+    assert!(
+        owner_bodies.iter().any(|body| body.contains(PRIVATE)),
+        "the owner lost its own assistant's new posts: {owner_first}"
+    );
+    assert_eq!(
+        owner_first["has_more"],
+        json!(true),
+        "the owner's first page lost has_more: {owner_first}"
+    );
+
+    // Agent `topic_read`: the same continuation contract for another agent.
+    let agent_first = fx
+        .call(
+            Asserted::Agent("ordinary-worker".to_string()),
+            "topic_read",
+            json!({"topic": topic, "limit": PAGE}),
+        )
+        .unwrap_or_else(|e| panic!("agent first page: {e}"));
+    assert!(
+        cad2207_post_bodies(&agent_first).is_empty(),
+        "the other agent's hidden-only first page was not empty: {agent_first}"
+    );
+    assert_eq!(
+        agent_first["more_before"],
+        json!(true),
+        "an empty filtered agent page lost more_before: {agent_first}"
+    );
+    let mut agent_before = agent_first["cursor"]
+        .as_i64()
+        .expect("an empty filtered agent page returned no cursor");
+    assert!(agent_before > 0);
+    let mut agent_reached = false;
+    for _ in 0..(HIDDEN + 4) {
+        let page = fx
+            .call(
+                Asserted::Agent("ordinary-worker".to_string()),
+                "topic_read",
+                json!({"topic": topic, "limit": PAGE, "before": agent_before}),
+            )
+            .unwrap_or_else(|e| panic!("agent continuation page: {e}"));
+        let bodies = cad2207_post_bodies(&page);
+        assert!(
+            bodies.iter().all(|body| !body.contains(PRIVATE)),
+            "an agent continuation page exposed a hidden assistant post: {page}"
+        );
+        if bodies.iter().any(|body| body.contains(ORDINARY)) {
+            agent_reached = true;
+            break;
+        }
+        if page["more_before"] != json!(true) {
+            break;
+        }
+        let next = page["cursor"]
+            .as_i64()
+            .expect("an agent continuation page returned no cursor");
+        assert!(
+            next < agent_before,
+            "the agent continuation cursor did not move older: {page}"
+        );
+        agent_before = next;
+    }
+    assert!(
+        agent_reached,
+        "the other agent's continuation never reached the ordinary post"
+    );
+
+    // Unread/notifications: the non-owner counts only the ordinary post; the
+    // owner also counts its own assistant's posts, which are hidden to others.
+    let ben_notifications = fx.op("human_notifications", json!({"token": ben_token}));
+    let (ben_unread, ben_mention) = cad2207_room_unread(&ben_notifications, &room);
+    assert_eq!(
+        ben_unread, 1,
+        "the nonowner's unread count included hidden assistant posts: {ben_notifications}"
+    );
+    assert!(
+        !ben_mention,
+        "the nonowner received a hidden mention: {ben_notifications}"
+    );
+    assert_eq!(
+        ben_notifications["unread_total"],
+        json!(1),
+        "the nonowner's unread total included hidden posts: {ben_notifications}"
+    );
+    let ben_rooms = fx.op("human_rooms_list", json!({"token": ben_token}));
+    let ben_room = ben_rooms["rooms"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row["id"].as_str() == Some(room.as_str()))
+        })
+        .expect("the nonowner's room list lost the room");
+    assert_eq!(
+        ben_room["unread"],
+        json!(1),
+        "the nonowner's room list counted hidden assistant posts: {ben_rooms}"
+    );
+    let owner_notifications = fx.op("human_notifications", json!({"token": alice_token}));
+    let (owner_unread, owner_mention) = cad2207_room_unread(&owner_notifications, &room);
+    assert_eq!(
+        owner_unread,
+        (HIDDEN as i64) + 1,
+        "the owner's unread count lost its own assistant posts: {owner_notifications}"
+    );
+    assert!(!owner_mention);
+    assert_eq!(
+        owner_notifications["unread_total"],
+        json!((HIDDEN as i64) + 1),
+        "the owner's unread total lost its own assistant posts: {owner_notifications}"
+    );
+    let owner_rooms = fx.op("human_rooms_list", json!({"token": alice_token}));
+    let owner_room = owner_rooms["rooms"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row["id"].as_str() == Some(room.as_str()))
+        })
+        .expect("the owner's room list lost the room");
+    assert_eq!(
+        owner_room["unread"],
+        json!((HIDDEN as i64) + 1),
+        "the owner's room list lost its own assistant posts: {owner_rooms}"
+    );
+}
+
+/// CAD-2207: `thread_send` and the operator-chat `conversation_*` verbs carry
+/// no member-envelope proof. A private assistant alias is refused before any
+/// message/thread/app-conversation write, while the same verbs keep working
+/// for an ordinary agent with a known installation.
+#[test]
+fn cad2207_operator_chat_verbs_refuse_private_app_and_thread_surfaces() {
+    const INSTALL: &str = "cad2207-install";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    // A known installation: `app_contexts` is the store's own proof.
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "INSERT INTO app_contexts
+                 (id,install_id,request_id,revision,state,config_json,config_digest,created,updated)
+                 VALUES('cad2207-context',?1,'cad2207-request',1,'active',?2,'digest',0,0)",
+                rusqlite::params![
+                    INSTALL,
+                    json!({"schema":1,"label":"cad2207 fixture","input_defaults":{}}).to_string()
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Private conversation listing/creation is refused before the store's
+    // ensure/create; the private alias keeps no app thread rows.
+    assert!(
+        fx.shared
+            .store
+            .conversation_list(&alice.alias, INSTALL)
+            .unwrap()
+            .is_empty(),
+        "the fixture already had an app conversation for the private alias"
+    );
+    let list_private = fx.op_err(
+        "conversation_list",
+        json!({"alias": alice.alias, "install_id": INSTALL}),
+    );
+    assert!(
+        list_private.is_err(),
+        "an operator listed a member assistant's app conversations: {list_private:?}"
+    );
+    assert!(
+        fx.shared
+            .store
+            .conversation_list(&alice.alias, INSTALL)
+            .unwrap()
+            .is_empty(),
+        "a refused private conversation list created a thread row"
+    );
+    let create_private = fx.op_err(
+        "conversation_create",
+        json!({"alias": alice.alias, "install_id": INSTALL}),
+    );
+    assert!(
+        create_private.is_err(),
+        "an operator created a member assistant's app conversation: {create_private:?}"
+    );
+    assert!(
+        fx.shared
+            .store
+            .conversation_list(&alice.alias, INSTALL)
+            .unwrap()
+            .is_empty(),
+        "a refused private conversation create wrote a thread row"
+    );
+
+    // Positive controls: the same operator verbs work for an ordinary agent.
+    let listed = fx
+        .op_err(
+            "conversation_list",
+            json!({"alias": "ordinary-worker", "install_id": INSTALL}),
+        )
+        .unwrap_or_else(|e| panic!("the ordinary conversation list was refused: {e}"));
+    assert!(
+        listed["general"].as_str().is_some(),
+        "the ordinary conversation list carried no General row: {listed}"
+    );
+    let created = fx
+        .op_err(
+            "conversation_create",
+            json!({"alias": "ordinary-worker", "install_id": INSTALL}),
+        )
+        .unwrap_or_else(|e| panic!("the ordinary conversation create was refused: {e}"));
+    assert_eq!(created["created"], json!(true), "{created}");
+    assert!(
+        created["conversation"]["id"].as_str().is_some(),
+        "the ordinary conversation create returned no id: {created}"
+    );
+
+    // `thread_send` is the operator-chat write half: its private target is
+    // refused before a message, thread entry or source stamp exists.
+    let before_entries = fx
+        .shared
+        .store
+        .thread_entries_of(&alice.thread_id, 0, 100)
+        .unwrap()
+        .len();
+    let send_private = fx.call(
+        Asserted::Operator,
+        "thread_send",
+        json!({"alias": alice.alias, "text": "private thread text",
+               "message": "cad2207-thread-private"}),
+    );
+    assert!(
+        send_private.is_err(),
+        "an operator sent into a member assistant's thread: {send_private:?}"
+    );
+    assert!(
+        fx.shared
+            .store
+            .message("cad2207-thread-private")
+            .unwrap()
+            .is_none(),
+        "a refused private thread send stored its message"
+    );
+    assert_eq!(
+        fx.shared
+            .store
+            .thread_entries_of(&alice.thread_id, 0, 100)
+            .unwrap()
+            .len(),
+        before_entries,
+        "a refused private thread send wrote a thread entry"
+    );
+    // Positive: the same send for an ordinary agent lands.
+    let sent = fx
+        .call(
+            Asserted::Operator,
+            "thread_send",
+            json!({"alias": "ordinary-worker", "text": "ordinary thread text",
+                   "message": "cad2207-thread-ordinary"}),
+        )
+        .unwrap_or_else(|e| panic!("the ordinary thread send was refused: {e}"));
+    assert!(
+        sent["thread"]["id"].as_str().is_some(),
+        "the ordinary thread send returned no thread: {sent}"
+    );
+    let ordinary_message = fx.shared.store.message("cad2207-thread-ordinary").unwrap();
+    assert!(
+        ordinary_message.is_some_and(|m| m.alias == "ordinary-worker"),
+        "the ordinary thread send did not land in the ordinary mailbox"
+    );
+}
+
+/// CAD-2207: a queued turn for a bound assistant that an operator (or another
+/// untrusted conversational source) enqueued must not re-prove at execution
+/// time just because the operator is trusted. The row stays queued and
+/// unchanged; the same seed on an ordinary alias is unaffected, and a real
+/// stamped `member_assist_send` turn still re-proves.
+#[test]
+fn cad2207_unstamped_operator_turn_cannot_reprove_into_a_bound_assistant() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let reply_dir = fx.dir.path().join("reprove-reply-cwd");
+    std::fs::create_dir_all(&reply_dir).unwrap();
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias: "ordinary-reply",
+            provider: "pi",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: reply_dir.to_str().unwrap(),
+            sandbox: "workspace-write",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+
+    // The bypass shape: a bound assistant's queued turn with source
+    // `operator` and no member authority stamp.
+    let (duplicate, state) = fx
+        .shared
+        .store
+        .enqueue(
+            &alice.alias,
+            "operator-queued private turn",
+            None,
+            "cad2207-operator-turn",
+            "operator",
+        )
+        .unwrap();
+    assert!(!duplicate);
+    let seeded = fx
+        .shared
+        .store
+        .message("cad2207-operator-turn")
+        .unwrap()
+        .expect("the seeded operator turn was not stored");
+    assert_eq!(seeded.state, state);
+    assert!(
+        fx.shared
+            .store
+            .message_member_authority(&seeded.id)
+            .unwrap()
+            .is_none(),
+        "the fixture's operator turn carried a member stamp"
+    );
+
+    let refused = fx.shared.member_message_reprove(&seeded);
+    assert!(
+        refused.is_err(),
+        "an unstamped operator turn re-proved for a member's assistant: {refused:?}"
+    );
+    let after = fx
+        .shared
+        .store
+        .message("cad2207-operator-turn")
+        .unwrap()
+        .expect("the refused turn was deleted");
+    assert_eq!(
+        after.state, seeded.state,
+        "a refused reprove changed the queued turn"
+    );
+    assert!(
+        after.result.is_none(),
+        "a refused reprove wrote a result onto the turn"
+    );
+    assert!(
+        fx.shared
+            .store
+            .messages(&alice.alias)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == "cad2207-operator-turn"),
+        "the refused turn left the assistant's queue"
+    );
+
+    // Historical `agent_send` (source `user`) and dispatch (source `dispatch`,
+    // with a reply routed into another mailbox) are the same bypass under a
+    // different label: an unstamped turn has no member authority, whatever it
+    // claims its source is.
+    for (id, source, reply_to) in [
+        ("cad2207-user-turn", "user", None),
+        ("cad2207-dispatch-turn", "dispatch", Some("ordinary-worker")),
+    ] {
+        fx.shared
+            .store
+            .enqueue(
+                &alice.alias,
+                "historical unstamped turn",
+                reply_to,
+                id,
+                source,
+            )
+            .unwrap();
+        let row = fx
+            .shared
+            .store
+            .message(id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("historical {source} turn was not stored"));
+        assert_eq!(row.reply_to.as_deref(), reply_to);
+        assert!(
+            fx.shared
+                .store
+                .message_member_authority(&row.id)
+                .unwrap()
+                .is_none(),
+            "the historical {source} turn carried a member stamp"
+        );
+        let refused = fx.shared.member_message_reprove(&row);
+        assert!(
+            refused.is_err(),
+            "a historical unstamped {source} turn re-proved for a member's assistant: \
+             {refused:?}"
+        );
+        let after = fx
+            .shared
+            .store
+            .message(id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("the refused {source} turn was deleted"));
+        assert_eq!(
+            after.state, row.state,
+            "a refused {source} reprove changed the queued turn"
+        );
+        assert!(
+            after.result.is_none(),
+            "a refused {source} reprove wrote a result"
+        );
+    }
+
+    // Positive: the same historical sources on a non-bound ordinary alias are
+    // ordinary work and re-prove.
+    for (id, source, reply_to) in [
+        ("cad2207-ordinary-turn", "operator", None),
+        ("cad2207-ordinary-user", "user", None),
+        (
+            "cad2207-ordinary-dispatch",
+            "dispatch",
+            Some("ordinary-reply"),
+        ),
+    ] {
+        fx.shared
+            .store
+            .enqueue(
+                "ordinary-worker",
+                "ordinary historical turn",
+                reply_to,
+                id,
+                source,
+            )
+            .unwrap();
+        let ordinary = fx
+            .shared
+            .store
+            .message(id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("ordinary {source} turn was not stored"));
+        fx.shared
+            .member_message_reprove(&ordinary)
+            .unwrap_or_else(|e| panic!("an ordinary agent's {source} turn was refused: {e}"));
+    }
+
+    // Positive: a real member send is stamped and still re-proves.
+    fx.op(
+        "member_assist_send",
+        json!({
+            "member_envelope": fx.member_envelope("sub-alice"),
+            "text": "real member turn",
+            "message": "cad2207-member-turn",
+        }),
+    );
+    let member_turn = fx
+        .shared
+        .store
+        .message("cad2207-member-turn")
+        .unwrap()
+        .expect("the member send did not queue its turn");
+    assert!(
+        fx.shared
+            .store
+            .message_member_authority(&member_turn.id)
+            .unwrap()
+            .is_some(),
+        "the real member send carried no member authority stamp"
+    );
+    fx.shared
+        .member_message_reprove(&member_turn)
+        .unwrap_or_else(|e| panic!("the stamped member turn did not re-prove: {e}"));
+}
+
+/// CAD-2207: operator reconcile/cancel must not touch a member assistant's
+/// private message. The landed contract refuses both before any write or
+/// route, so the row keeps its state/body/result/error and no unowned mailbox
+/// receives the outcome. Ordinary messages keep the normal reconcile/cancel
+/// path, and the owning member's own signed/assistant read still works.
+#[test]
+fn cad2207_private_message_reconcile_and_cancel_refuse_without_mutation() {
+    const PRIVATE_BODY: &str = "cad2207 private queued body";
+    const PRIVATE_ERROR: &str = "cad2207 private provider error";
+    const PRIVATE_RESULT: &str = "cad2207 private result";
+    const ORDINARY_BODY: &str = "cad2207 ordinary queued body";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+
+    let seed = |id: &str, state: &str, body: &str, reply_to: Option<&str>| {
+        fx.shared
+            .store
+            .enqueue(&alice.alias, body, reply_to, id, "user")
+            .unwrap();
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "UPDATE messages SET state=?, error=?, result=? WHERE id=?",
+                    rusqlite::params![
+                        state,
+                        PRIVATE_ERROR,
+                        json!({"private": PRIVATE_RESULT}).to_string(),
+                        id
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    };
+    let snapshot = |id: &str| {
+        let message = fx
+            .shared
+            .store
+            .message(id)
+            .unwrap()
+            .expect("message vanished");
+        (
+            message.state,
+            message.error,
+            message.result.map(|value| value.to_string()),
+        )
+    };
+
+    // Private reconcile: an operator status/note/sha is refused before the
+    // store write and before any reply_to routing.
+    seed(
+        "cad2207-private-reconcile",
+        "unknown",
+        PRIVATE_BODY,
+        Some("ordinary-worker"),
+    );
+    let reconcile_before = snapshot("cad2207-private-reconcile");
+    let reconcile = fx.op_err(
+        "message_reconcile",
+        json!({
+            "message": "cad2207-private-reconcile",
+            "status": "completed",
+            "note": "cad2207 operator note",
+            "sha": "0123456789abcdef0123456789abcdef01234567",
+        }),
+    );
+    assert!(
+        reconcile.is_err(),
+        "an operator reconciled a member assistant's private unknown turn: {reconcile:?}"
+    );
+    assert_eq!(
+        snapshot("cad2207-private-reconcile"),
+        reconcile_before,
+        "a refused private reconcile mutated the message"
+    );
+    // Private cancel: an operator reason is refused before the store write and
+    // before any reply_to notice.
+    seed(
+        "cad2207-private-cancel",
+        "queued",
+        PRIVATE_BODY,
+        Some("ordinary-worker"),
+    );
+    let cancel_before = snapshot("cad2207-private-cancel");
+    let cancel = fx.op_err(
+        "message_cancel",
+        json!({
+            "message": "cad2207-private-cancel",
+            "by": "operator",
+            "reason": "cad2207 operator cancel",
+        }),
+    );
+    assert!(
+        cancel.is_err(),
+        "an operator cancelled a member assistant's private queued turn: {cancel:?}"
+    );
+    assert_eq!(
+        snapshot("cad2207-private-cancel"),
+        cancel_before,
+        "a refused private cancel mutated the message"
+    );
+    assert!(
+        !fx.shared
+            .store
+            .messages("ordinary-worker")
+            .unwrap()
+            .iter()
+            .any(|m| m.body.contains(PRIVATE_BODY)
+                || m.body.contains(PRIVATE_ERROR)
+                || m.body.contains(PRIVATE_RESULT)),
+        "a refused private reconcile/cancel routed private content to an unowned mailbox"
+    );
+
+    // No caller may mutate the private rows through these verbs.
+    for who in [
+        Asserted::Agent("ordinary-worker".to_string()),
+        Asserted::Unproven,
+    ] {
+        let reconciled = fx.call(
+            who.clone(),
+            "message_reconcile",
+            json!({"message": "cad2207-private-reconcile", "status": "completed"}),
+        );
+        assert!(
+            reconciled.is_err(),
+            "{who:?} reconciled a member assistant's private turn: {reconciled:?}"
+        );
+        assert_eq!(
+            snapshot("cad2207-private-reconcile"),
+            reconcile_before,
+            "{who:?} mutated the private unknown turn"
+        );
+        let cancelled = fx.call(
+            who.clone(),
+            "message_cancel",
+            json!({"message": "cad2207-private-cancel", "by": "ordinary-worker"}),
+        );
+        assert!(
+            cancelled.is_err(),
+            "{who:?} cancelled a member assistant's private turn: {cancelled:?}"
+        );
+        assert_eq!(
+            snapshot("cad2207-private-cancel"),
+            cancel_before,
+            "{who:?} mutated the private queued turn"
+        );
+    }
+
+    // Ordinary messages keep the normal reconcile/cancel path and receipt.
+    fx.shared
+        .store
+        .enqueue(
+            "ordinary-worker",
+            ORDINARY_BODY,
+            None,
+            "cad2207-ordinary-reconcile",
+            "user",
+        )
+        .unwrap();
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE messages SET state='unknown' WHERE id='cad2207-ordinary-reconcile'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let ordinary_reconcile = fx
+        .op_err(
+            "message_reconcile",
+            json!({"message": "cad2207-ordinary-reconcile", "status": "completed",
+                   "note": "ordinary reconcile"}),
+        )
+        .unwrap_or_else(|e| panic!("the ordinary message reconcile was refused: {e}"));
+    assert!(
+        ordinary_reconcile.to_string().contains(ORDINARY_BODY),
+        "the ordinary reconcile receipt lost its message body: {ordinary_reconcile}"
+    );
+    assert_eq!(
+        fx.shared
+            .store
+            .message("cad2207-ordinary-reconcile")
+            .unwrap()
+            .unwrap()
+            .state,
+        "completed"
+    );
+
+    fx.shared
+        .store
+        .enqueue(
+            "ordinary-worker",
+            ORDINARY_BODY,
+            None,
+            "cad2207-ordinary-cancel",
+            "user",
+        )
+        .unwrap();
+    let ordinary_cancel = fx
+        .op_err(
+            "message_cancel",
+            json!({"message": "cad2207-ordinary-cancel", "by": "operator",
+                   "reason": "ordinary cancel"}),
+        )
+        .unwrap_or_else(|e| panic!("the ordinary message cancel was refused: {e}"));
+    assert!(
+        ordinary_cancel.to_string().contains(ORDINARY_BODY),
+        "the ordinary cancel receipt lost its message body: {ordinary_cancel}"
+    );
+    assert_eq!(
+        fx.shared
+            .store
+            .message("cad2207-ordinary-cancel")
+            .unwrap()
+            .unwrap()
+            .state,
+        "cancelled"
+    );
+
+    // The owning member's own paths remain: signed history still reads and its
+    // assistant still reads its own queued body.
+    fx.op_err(
+        "member_assist_history",
+        json!({"member_envelope": fx.member_envelope("sub-alice")}),
+    )
+    .unwrap_or_else(|e| panic!("the member lost its signed history after refusals: {e}"));
+    let own = fx
+        .as_assistant(
+            &alice.alias,
+            "message_read",
+            json!({"message": "cad2207-private-cancel"}),
+        )
+        .unwrap_or_else(|e| panic!("the assistant lost its own message read: {e}"));
+    assert!(
+        own["text"]
+            .as_str()
+            .is_some_and(|text| text.contains(PRIVATE_BODY)),
+        "the assistant's own read lost its queued body: {own}"
+    );
+}
+
+/// CAD-2207: a task kickoff is trusted only when its job is the member's own
+/// assist-bound request. `tasks.dispatch_message`, `assignee` and a matching
+/// reply_to are not owner permission: an attacker PM's job that merely names
+/// the victim assistant must fail the take path with no mailbox route.
+#[test]
+fn cad2207_task_kickoff_provenance_requires_member_owned_job() {
+    const SPEC_TEXT: &str = "cad2207 attacker task spec secret";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let attacker_dir = fx.dir.path().join("attacker-cwd");
+    std::fs::create_dir_all(&attacker_dir).unwrap();
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias: "attacker-pm",
+            provider: "pi",
+            endpoint_kind: "managed",
+            role: "pm",
+            cwd: attacker_dir.to_str().unwrap(),
+            sandbox: "workspace-write",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    let spec = fx.dir.path().join("attacker-spec.md");
+    std::fs::write(&spec, SPEC_TEXT).unwrap();
+    let spec_sha = super::sha256_file(&spec).unwrap();
+    let snapshot = |id: &str| {
+        let message = fx
+            .shared
+            .store
+            .message(id)
+            .unwrap()
+            .expect("message vanished");
+        (
+            message.state,
+            message.result.map(|value| value.to_string()),
+            message.error,
+            message.body,
+            message.reply_to,
+            message.task_id,
+        )
+    };
+    let set_task = |task: &str, assignee: &str, dispatch: &str| {
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "UPDATE tasks SET assignee=?, state='dispatched', dispatch_message=? WHERE id=?",
+                    rusqlite::params![assignee, dispatch, task],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    };
+
+    // Attacker PM's ordinary job: no assist_requests row. The task names the
+    // victim assistant exactly and the kickoff id is the exact
+    // dispatch_message, yet the take must refuse.
+    let (_, attacker_job) = fx
+        .shared
+        .store
+        .create_job(
+            "cad2207-attacker-job",
+            Some("attacker job"),
+            spec.to_str().unwrap(),
+            &spec_sha,
+            "attacker-pm",
+            None,
+            None,
+            None,
+            2,
+            None,
+            Some("attacker task"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let attacker_task = format!("{}-t1", attacker_job.id);
+    let attacker_kickoff = "cad2207-attacker-kickoff";
+    fx.shared
+        .store
+        .enqueue_task(
+            &alice.alias,
+            SPEC_TEXT,
+            Some("attacker-pm"),
+            attacker_kickoff,
+            "job_dispatch",
+            Some(&attacker_task),
+        )
+        .unwrap();
+    set_task(&attacker_task, &alice.alias, attacker_kickoff);
+    assert_eq!(
+        fx.shared
+            .store
+            .task(&attacker_task)
+            .unwrap()
+            .dispatch_message
+            .as_deref(),
+        Some(attacker_kickoff),
+        "the fixture did not record the exact task dispatch message"
+    );
+    let message = fx
+        .shared
+        .store
+        .message(attacker_kickoff)
+        .unwrap()
+        .expect("attacker kickoff missing");
+    let before = snapshot(attacker_kickoff);
+    let refused = fx.shared.member_message_reprove(&message);
+    assert!(
+        refused.is_err(),
+        "an attacker job's kickoff naming the victim assistant took the turn: {refused:?}"
+    );
+    assert_eq!(
+        snapshot(attacker_kickoff),
+        before,
+        "a refused attacker kickoff mutated its queued turn"
+    );
+    assert!(
+        !fx.shared
+            .store
+            .messages("attacker-pm")
+            .unwrap()
+            .iter()
+            .any(|m| m.body.contains(SPEC_TEXT)),
+        "an attacker task kickoff routed its spec to the attacker mailbox"
+    );
+
+    // Member-owned job, but the kickoff routes the reply to an arbitrary
+    // mailbox: still refused.
+    let request = fx.op(
+        "member_job_request",
+        json!({
+            "member_envelope": fx.member_envelope("sub-alice"),
+            "title": "cad2207 member job",
+            "request_key": "cad2207-member-job",
+            "body": "member spec",
+        }),
+    );
+    let member_job = request["job"].as_str().expect("member job id").to_string();
+    let member_task = format!("{member_job}-t1");
+    let bad_reply_kickoff = "cad2207-member-bad-reply";
+    fx.shared
+        .store
+        .enqueue_task(
+            &alice.alias,
+            "member kickoff body",
+            Some("attacker-pm"),
+            bad_reply_kickoff,
+            "job_dispatch",
+            Some(&member_task),
+        )
+        .unwrap();
+    set_task(&member_task, &alice.alias, bad_reply_kickoff);
+    let message = fx
+        .shared
+        .store
+        .message(bad_reply_kickoff)
+        .unwrap()
+        .expect("member bad-reply kickoff missing");
+    let before = snapshot(bad_reply_kickoff);
+    let refused = fx.shared.member_message_reprove(&message);
+    assert!(
+        refused.is_err(),
+        "a member-owned kickoff routed to an arbitrary mailbox took the turn: {refused:?}"
+    );
+    assert_eq!(
+        snapshot(bad_reply_kickoff),
+        before,
+        "a refused bad-reply kickoff mutated its queued turn"
+    );
+    assert!(
+        !fx.shared
+            .store
+            .messages("attacker-pm")
+            .unwrap()
+            .iter()
+            .any(|m| m.body.contains(SPEC_TEXT)),
+        "a bad-reply member kickoff routed private content to the attacker mailbox"
+    );
+
+    // Even a member-owned task kickoff is refused under the final typed
+    // contract: no durable member-approved assignment/sharing receipt exists
+    // yet, so every unstamped task kickoff to a bound assistant fails and the
+    // row is left untouched. This is the reported temporary blocker.
+    let good_kickoff = "cad2207-member-good";
+    fx.shared
+        .store
+        .enqueue_task(
+            &alice.alias,
+            "member good kickoff",
+            None,
+            good_kickoff,
+            "job_dispatch",
+            Some(&member_task),
+        )
+        .unwrap();
+    set_task(&member_task, &alice.alias, good_kickoff);
+    let message = fx
+        .shared
+        .store
+        .message(good_kickoff)
+        .unwrap()
+        .expect("member good kickoff missing");
+    let before = snapshot(good_kickoff);
+    let refused = fx.shared.member_message_reprove(&message);
+    assert!(
+        refused.is_err(),
+        "an unstamped member-owned task kickoff took the turn before a durable \
+         member-approved receipt exists: {refused:?}"
+    );
+    assert_eq!(
+        snapshot(good_kickoff),
+        before,
+        "a refused member-owned task kickoff mutated its queued turn"
+    );
+
+    // Ordinary job/task kickoff on a non-bound alias is unaffected.
+    let (_, ordinary_job) = fx
+        .shared
+        .store
+        .create_job(
+            "cad2207-ordinary-job",
+            Some("ordinary job"),
+            spec.to_str().unwrap(),
+            &spec_sha,
+            "ordinary-worker",
+            None,
+            None,
+            None,
+            2,
+            None,
+            Some("ordinary task"),
+            None,
+            None,
+            None,
+            Some("ordinary-worker"),
+            None,
+        )
+        .unwrap();
+    let ordinary_task = format!("{}-t1", ordinary_job.id);
+    let ordinary_kickoff = "cad2207-ordinary-kickoff";
+    fx.shared
+        .store
+        .enqueue_task(
+            "ordinary-worker",
+            "ordinary kickoff body",
+            None,
+            ordinary_kickoff,
+            "job_dispatch",
+            Some(&ordinary_task),
+        )
+        .unwrap();
+    set_task(&ordinary_task, "ordinary-worker", ordinary_kickoff);
+    let message = fx
+        .shared
+        .store
+        .message(ordinary_kickoff)
+        .unwrap()
+        .expect("ordinary kickoff missing");
+    assert!(fx
+        .shared
+        .store
+        .assistant_for_alias("ordinary-worker")
+        .unwrap()
+        .is_none());
+    fx.shared
+        .member_message_reprove(&message)
+        .unwrap_or_else(|e| panic!("an ordinary task kickoff was refused: {e}"));
+}
+
+/// CAD-2207: `agent_unfence` is a bulk reconcile that bypasses the private
+/// `message_reconcile` guard. It must refuse a member-bound alias before any
+/// status write or reply routing; ordinary aliases keep the operator recovery.
+#[test]
+fn cad2207_agent_unfence_refuses_private_unknown_recovery() {
+    const PRIVATE_BODY: &str = "cad2207 private unknown body";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let attacker_dir = fx.dir.path().join("unfence-attacker-cwd");
+    std::fs::create_dir_all(&attacker_dir).unwrap();
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias: "attacker-pm",
+            provider: "pi",
+            endpoint_kind: "managed",
+            role: "pm",
+            cwd: attacker_dir.to_str().unwrap(),
+            sandbox: "workspace-write",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    let snapshot = |id: &str| {
+        let message = fx
+            .shared
+            .store
+            .message(id)
+            .unwrap()
+            .expect("message vanished");
+        (
+            message.state,
+            message.result.map(|value| value.to_string()),
+            message.error,
+            message.body,
+            message.reply_to,
+        )
+    };
+
+    let private_id = "cad2207-unfence-private";
+    fx.shared
+        .store
+        .enqueue(
+            &alice.alias,
+            PRIVATE_BODY,
+            Some("attacker-pm"),
+            private_id,
+            "user",
+        )
+        .unwrap();
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE messages SET state='unknown', error=? WHERE id=?",
+                rusqlite::params!["cad2207 private unknown error", private_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let before = snapshot(private_id);
+    let refused = fx.op_err(
+        "agent_unfence",
+        json!({"alias": alice.alias, "status": "failed", "note": "operator note"}),
+    );
+    assert!(
+        refused.is_err(),
+        "agent_unfence reconciled a member assistant's unknown turn: {refused:?}"
+    );
+    assert_eq!(
+        snapshot(private_id),
+        before,
+        "a refused private agent_unfence mutated the unknown message"
+    );
+    assert!(
+        !fx.shared
+            .store
+            .messages("attacker-pm")
+            .unwrap()
+            .iter()
+            .any(|m| m.body.contains(PRIVATE_BODY)),
+        "a refused private agent_unfence routed private content to a nonowner"
+    );
+
+    // Ordinary aliases keep the operator recovery.
+    let ordinary_id = "cad2207-unfence-ordinary";
+    fx.shared
+        .store
+        .enqueue(
+            "ordinary-worker",
+            "ordinary unknown body",
+            None,
+            ordinary_id,
+            "user",
+        )
+        .unwrap();
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE messages SET state='unknown' WHERE id=?",
+                rusqlite::params![ordinary_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let recovered = fx.op(
+        "agent_unfence",
+        json!({"alias": "ordinary-worker", "status": "failed", "note": "ordinary"}),
+    );
+    assert!(
+        recovered["reconciled"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(ordinary_id))),
+        "the ordinary agent_unfence lost its reconciled id: {recovered}"
+    );
+    assert_eq!(
+        fx.shared.store.message(ordinary_id).unwrap().unwrap().state,
+        "failed"
+    );
+}
+
+/// CAD-2207: an `assist_job_event` notice needs the committed delivery
+/// receipt for its exact intent/body/recipient, and a subscriber needs the
+/// owner's LIVE share. A legacy NULL-sender row with the right task/member but
+/// no receipt, and a notice queued before the share was revoked, must both
+/// fail at turn admission without mutation or routing.
+#[test]
+fn cad2207_assist_notice_requires_delivery_receipt_and_live_share() {
+    const FORGED_BODY: &str = "cad2207 forged notice body";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let ben = fx.member_runtime("sub-ben");
+    let alice_envelope = fx.member_envelope("sub-alice");
+    let ben_envelope = fx.member_envelope("sub-ben");
+    let snapshot = |id: &str| {
+        let message = fx
+            .shared
+            .store
+            .message(id)
+            .unwrap()
+            .expect("message vanished");
+        (
+            message.state,
+            message.result.map(|value| value.to_string()),
+            message.error,
+            message.body,
+            message.sender,
+            message.sender_uid,
+            message.reply_to,
+        )
+    };
+
+    let request = fx.op(
+        "member_job_request",
+        json!({
+            "member_envelope": alice_envelope,
+            "title": "cad2207 notice job",
+            "request_key": "cad2207-notice-job",
+            "body": "cad2207 notice spec",
+        }),
+    );
+    let job = request["job"].as_str().expect("member job id").to_string();
+    let task = format!("{job}-t1");
+    fx.op(
+        "member_job_share",
+        json!({"member_envelope": alice_envelope, "job": job, "enabled": true}),
+    );
+    fx.op(
+        "member_job_subscribe",
+        json!({"member_envelope": ben_envelope, "job": job}),
+    );
+    assert!(
+        fx.shared
+            .store
+            .job_is_subscriber(&job, ORG, "sub-ben")
+            .unwrap(),
+        "the fixture did not create ben's subscriber row"
+    );
+
+    // Real pending intents for the current owner and subscriber, drained
+    // through the production intent path (which also writes the delivery
+    // receipts).
+    fx.shared.store.assist_request_notice(&job).unwrap();
+    fx.shared
+        .route_assist_job_notifications()
+        .unwrap_or_else(|e| panic!("the assist intent drain failed: {e}"));
+    let notice_for = |alias: &str| {
+        fx.shared
+            .store
+            .messages(alias)
+            .unwrap()
+            .into_iter()
+            .find(|message| {
+                message.source == "assist_job_event"
+                    && fx
+                        .shared
+                        .store
+                        .assist_notice_delivery(&message.id)
+                        .unwrap()
+                        .is_some()
+            })
+            .unwrap_or_else(|| panic!("no genuine assist notice for '{alias}'"))
+    };
+    let owner_notice = notice_for(&alice.alias);
+    let subscriber_notice = notice_for(&ben.alias);
+
+    // Genuine positives while the owner's share is live.
+    fx.shared
+        .member_message_reprove(&owner_notice)
+        .unwrap_or_else(|e| panic!("the owner's genuine notice was refused: {e}"));
+    fx.shared
+        .member_message_reprove(&subscriber_notice)
+        .unwrap_or_else(|e| panic!("the subscriber's genuine notice was refused: {e}"));
+
+    // Forged legacy NULL-sender notice: correct task/member, arbitrary id and
+    // body, no committed delivery receipt.
+    let forged_id = "cad2207-forged-notice";
+    fx.shared
+        .store
+        .enqueue_task(
+            &ben.alias,
+            FORGED_BODY,
+            None,
+            forged_id,
+            "assist_job_event",
+            Some(&task),
+        )
+        .unwrap();
+    let forged = fx
+        .shared
+        .store
+        .message(forged_id)
+        .unwrap()
+        .expect("forged notice missing");
+    assert!(
+        forged.sender.is_none() && forged.sender_uid.is_none() && forged.reply_to.is_none(),
+        "the forged fixture was not a NULL-sender notice: {forged:?}"
+    );
+    assert!(
+        fx.shared
+            .store
+            .assist_notice_delivery(forged_id)
+            .unwrap()
+            .is_none(),
+        "the forged notice unexpectedly carried a delivery receipt"
+    );
+    let before = snapshot(forged_id);
+    let refused = fx.shared.member_message_reprove(&forged);
+    assert!(
+        refused.is_err(),
+        "a forged NULL-sender notice with the right task/member took the turn: {refused:?}"
+    );
+    assert_eq!(
+        snapshot(forged_id),
+        before,
+        "a refused forged assist notice mutated its queued row"
+    );
+
+    // A notice queued before revocation rides the owner's live share; once
+    // sharing is disabled the same queued row must fail admission, while the
+    // owner still owns the job.
+    fx.op(
+        "member_job_share",
+        json!({"member_envelope": alice_envelope, "job": job, "enabled": false}),
+    );
+    assert!(
+        !fx.shared.store.assist_job_is_shared(&job, ORG).unwrap(),
+        "the fixture's share revocation did not land"
+    );
+    assert!(
+        fx.shared
+            .store
+            .job_is_subscriber(&job, ORG, "sub-ben")
+            .unwrap(),
+        "share revocation removed the durable subscriber row"
+    );
+    let before = snapshot(&subscriber_notice.id);
+    let refused = fx.shared.member_message_reprove(&subscriber_notice);
+    assert!(
+        refused.is_err(),
+        "a notice queued before share revocation still took the subscriber turn: {refused:?}"
+    );
+    assert_eq!(
+        snapshot(&subscriber_notice.id),
+        before,
+        "a refused subscriber notice mutated its queued row"
+    );
+    fx.shared
+        .member_message_reprove(&owner_notice)
+        .unwrap_or_else(|e| panic!("the owner's notice was refused after share revocation: {e}"));
+
+    // A NEW task-state intent generated AFTER revocation must commit only for
+    // the owner: the former subscriber keeps its durable row but gets no new
+    // notice or delivery receipt.
+    let notice_count = |alias: &str| {
+        fx.shared
+            .store
+            .messages(alias)
+            .unwrap()
+            .iter()
+            .filter(|message| message.source == "assist_job_event")
+            .count()
+    };
+    let latest_notice = |alias: &str| {
+        fx.shared
+            .store
+            .messages(alias)
+            .unwrap()
+            .into_iter()
+            .filter(|message| {
+                message.source == "assist_job_event"
+                    && fx
+                        .shared
+                        .store
+                        .assist_notice_delivery(&message.id)
+                        .unwrap()
+                        .is_some()
+            })
+            .last()
+            .unwrap_or_else(|| panic!("no delivered notice for '{alias}'"))
+    };
+    let ben_before = notice_count(&ben.alias);
+    let owner_before = notice_count(&alice.alias);
+    fx.shared
+        .store
+        .job_notice(&task, "blocked", "cad2207-after-revoke", "after revoke")
+        .unwrap();
+    fx.shared
+        .route_assist_job_notifications()
+        .unwrap_or_else(|e| panic!("the post-revocation intent drain failed: {e}"));
+    assert_eq!(
+        notice_count(&ben.alias),
+        ben_before,
+        "a new task-state intent after revocation reached the former subscriber"
+    );
+    assert_eq!(
+        notice_count(&alice.alias),
+        owner_before + 1,
+        "the owner lost a new task-state notice after revocation"
+    );
+    fx.shared
+        .member_message_reprove(&latest_notice(&alice.alias))
+        .unwrap_or_else(|e| panic!("the owner's new post-revocation notice was refused: {e}"));
+}
+
+/// CAD-2207: a private effect outcome notice is owner-bound. Only the bound
+/// assistant receives it; the committed receipt binds message, effect,
+/// assistant tuple and body; a real live notice reproves; and forged/
+/// unreceipted, changed-body or foreign-assistant notices are refused.
+#[test]
+fn cad2207_effect_notice_receipt_is_owner_bound_and_enforced() {
+    const PRIVATE: &str = "cad2207 effect notice private body";
+    const ORDINARY: &str = "cad2207 effect notice ordinary body";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let ben = fx.member_runtime("sub-ben");
+    let reply_dir = fx.dir.path().join("effect-notice-reply-cwd");
+    std::fs::create_dir_all(&reply_dir).unwrap();
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias: "ordinary-reply",
+            provider: "pi",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: reply_dir.to_str().unwrap(),
+            sandbox: "workspace-write",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    for alias in [alice.alias.as_str(), "ordinary-worker"] {
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "UPDATE agents SET params=json_set(COALESCE(params,'{}'),'$.upstream',?) \
+                     WHERE alias=?",
+                    rusqlite::params!["ordinary-reply", alias],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let effect_id_for = |request: &str| {
+        fx.shared
+            .store
+            .effect_by_request(request)
+            .unwrap()
+            .unwrap_or_else(|| panic!("effect row missing for {request}"))
+            .effect_id
+    };
+    let notice_id = |effect_id: &str| crate::proto::daemon_message_id("effect", effect_id);
+    let decline = |alias: &str, request: &str| {
+        fx.call(
+            Asserted::Operator,
+            "agent_respond",
+            json!({"alias": alias, "request": request, "decision": "decline"}),
+        )
+        .unwrap_or_else(|e| panic!("safe decline for {request} was refused: {e}"));
+    };
+    let snapshot = |message: &crate::store::Message| {
+        (
+            message.state.clone(),
+            message.result.clone(),
+            message.body.clone(),
+            message.alias.clone(),
+        )
+    };
+
+    let real_request = cad2207_stage_effect(&fx, &alice.alias, "cad2207-effect-notice", PRIVATE);
+    let changed_request = cad2207_stage_effect(&fx, &alice.alias, "cad2207-effect-body", PRIVATE);
+    let foreign_request =
+        cad2207_stage_effect(&fx, &alice.alias, "cad2207-effect-foreign", PRIVATE);
+    let real_effect = effect_id_for(&real_request);
+    let changed_effect = effect_id_for(&changed_request);
+    let foreign_effect = effect_id_for(&foreign_request);
+    let real_notice_id = notice_id(&real_effect);
+    let changed_notice_id = notice_id(&changed_effect);
+    let foreign_notice_id = notice_id(&foreign_effect);
+    for request in [&real_request, &changed_request, &foreign_request] {
+        decline(&alice.alias, request);
+    }
+
+    let real_notice = fx
+        .shared
+        .store
+        .message(&real_notice_id)
+        .unwrap()
+        .expect("the private effect notice was not queued");
+    assert_eq!(real_notice.source, "effect");
+    assert_eq!(real_notice.alias, alice.alias);
+    assert!(
+        real_notice.body.contains(PRIVATE),
+        "the owner's effect notice lost its private body: {real_notice:?}"
+    );
+    let binding = fx
+        .shared
+        .store
+        .assistant_for_alias(&alice.alias)
+        .unwrap()
+        .expect("the private assistant binding is missing");
+    let receipt = fx
+        .shared
+        .store
+        .effect_notice_delivery(&real_notice_id)
+        .unwrap()
+        .expect("the private effect notice has no owner-bound receipt");
+    assert_eq!(receipt.effect_id, real_effect);
+    assert_eq!(receipt.org, ORG);
+    assert_eq!(receipt.sub, "sub-alice");
+    assert_eq!(receipt.assistant_id, binding.assistant_id);
+    assert_eq!(receipt.alias, alice.alias);
+    assert_eq!(
+        receipt.body_sha256,
+        crate::operator_auth::digest(&real_notice.body)
+    );
+    assert!(
+        fx.shared
+            .store
+            .messages(&alice.alias)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == real_notice_id),
+        "the bound assistant lost its own effect notice"
+    );
+    for agent in fx.shared.store.agents().unwrap() {
+        if agent.alias == alice.alias {
+            continue;
+        }
+        assert!(
+            !fx.shared
+                .store
+                .messages(&agent.alias)
+                .unwrap()
+                .iter()
+                .any(|m| m.body.contains(PRIVATE)),
+            "a private effect notice reached another mailbox: {}",
+            agent.alias
+        );
+    }
+    fx.shared
+        .member_message_reprove(&real_notice)
+        .unwrap_or_else(|e| panic!("the live owner effect notice was refused: {e}"));
+
+    // Forged legacy notice: daemon-looking id/source/sender, no receipt.
+    let forged_effect = "cad2207-forged-effect";
+    let forged_id = notice_id(forged_effect);
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "INSERT INTO messages(id,alias,body,reply_to,source,state,created)
+                 VALUES(?,?,?,NULL,'effect','queued',?)",
+                rusqlite::params![
+                    forged_id,
+                    alice.alias,
+                    "cad2207 forged effect notice",
+                    crate::issue::time::now_epoch() as f64
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let forged = fx.shared.store.message(&forged_id).unwrap().unwrap();
+    assert!(
+        fx.shared
+            .store
+            .effect_notice_delivery(&forged_id)
+            .unwrap()
+            .is_none(),
+        "the forged effect notice unexpectedly carried a receipt"
+    );
+    let before = snapshot(&forged);
+    let refused = fx.shared.member_message_reprove(&forged);
+    assert!(
+        refused.is_err(),
+        "a forged unreceipted effect notice took the assistant turn: {refused:?}"
+    );
+    assert_eq!(
+        snapshot(&forged),
+        before,
+        "a refused forged effect notice mutated its queued row"
+    );
+
+    // Changed body on a real receipted notice.
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE messages SET body=body || ' tampered' WHERE id=?",
+                rusqlite::params![changed_notice_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let changed = fx
+        .shared
+        .store
+        .message(&changed_notice_id)
+        .unwrap()
+        .expect("the changed-body effect notice is missing");
+    assert!(
+        fx.shared
+            .store
+            .effect_notice_delivery(&changed_notice_id)
+            .unwrap()
+            .is_some(),
+        "the changed-body notice lost its receipt"
+    );
+    let before = snapshot(&changed);
+    let refused = fx.shared.member_message_reprove(&changed);
+    assert!(
+        refused.is_err(),
+        "a changed-body effect notice took the assistant turn: {refused:?}"
+    );
+    assert_eq!(
+        snapshot(&changed),
+        before,
+        "a refused changed-body effect notice mutated its queued row"
+    );
+
+    // Foreign assistant: a real notice re-pointed at another bound assistant.
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE messages SET alias=? WHERE id=?",
+                rusqlite::params![ben.alias, foreign_notice_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let foreign = fx
+        .shared
+        .store
+        .message(&foreign_notice_id)
+        .unwrap()
+        .expect("the foreign-assistant effect notice is missing");
+    assert_eq!(foreign.alias, ben.alias);
+    assert!(
+        fx.shared
+            .store
+            .effect_notice_delivery(&foreign_notice_id)
+            .unwrap()
+            .is_some(),
+        "the foreign-assistant notice lost its receipt"
+    );
+    let before = snapshot(&foreign);
+    let refused = fx.shared.member_message_reprove(&foreign);
+    assert!(
+        refused.is_err(),
+        "a foreign-assistant effect notice took the turn: {refused:?}"
+    );
+    assert_eq!(
+        snapshot(&foreign),
+        before,
+        "a refused foreign-assistant effect notice mutated its queued row"
+    );
+
+    // Ordinary effect routing remains positive through the same upstream.
+    let ordinary_request = cad2207_stage_effect(
+        &fx,
+        "ordinary-worker",
+        "cad2207-effect-notice-ordinary",
+        ORDINARY,
+    );
+    let before = fx.shared.store.messages("ordinary-reply").unwrap().len();
+    decline("ordinary-worker", &ordinary_request);
+    let after = fx.shared.store.messages("ordinary-reply").unwrap();
+    assert!(
+        after.len() > before,
+        "the ordinary effect notice did not reach its upstream"
+    );
+    assert!(
+        after.iter().any(|m| m.body.contains(ORDINARY)),
+        "the ordinary upstream notice lost its visible body"
+    );
+    assert!(
+        after.iter().all(|m| !m.body.contains(PRIVATE)),
+        "a private effect notice reached the ordinary upstream mailbox"
+    );
+
+    // Live member authority is required even with a matching receipt.
+    fx.remove_member("sub-alice");
+    let refused = fx.shared.member_message_reprove(&real_notice);
+    assert!(
+        refused.is_err(),
+        "a revoked member's effect notice still took the turn: {refused:?}"
+    );
+    let _ = ben;
+}
+
+/// CAD-2207: a retained effect row must never inherit a later member
+/// binding through alias reuse. The old ordinary effect has no stage-time
+/// owner, so after the agent is removed and the alias rebound its outcome is
+/// suppressed (no receipt, no mailbox); a genuinely new effect staged after
+/// the bind records its owner and reaches that owner exactly once.
+#[test]
+fn cad2207_effect_alias_reuse_cannot_inherit_the_old_owner() {
+    const OLD_SECRET: &str = "cad2207 old ordinary effect secret";
+    const NEW_SECRET: &str = "cad2207 new member effect secret";
+    let alias = "reused-effect";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let old_dir = fx.dir.path().join("reused-old-cwd");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias,
+            provider: "inbox",
+            endpoint_kind: "inbox",
+            role: "worker",
+            cwd: old_dir.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+
+    let old_request = cad2207_stage_effect(&fx, alias, "cad2207-old-effect", OLD_SECRET);
+    let old_effect = fx
+        .shared
+        .store
+        .effect_by_request(&old_request)
+        .unwrap()
+        .unwrap()
+        .effect_id;
+    assert!(
+        fx.shared
+            .store
+            .effect_member_owner(&old_effect)
+            .unwrap()
+            .is_none(),
+        "an effect staged under a non-member alias recorded an owner"
+    );
+    fx.shared
+        .store
+        .remove_agent(alias, true, &json!({"by": "operator"}))
+        .unwrap();
+    assert!(
+        fx.shared.store.agent_opt(alias).unwrap().is_none(),
+        "the fixture did not remove the old ordinary agent row"
+    );
+
+    fx.authority
+        .lock()
+        .unwrap()
+        .members
+        .insert("sub-carol".to_string(), MemberAuthority::live("sub-carol"));
+    fx.shared
+        .store
+        .assistant_bind(ORG, "sub-carol", "assist_sub-carol", alias, Some("rev0"))
+        .unwrap();
+    let carol_envelope = fx.member_envelope("sub-carol");
+    let carol_state = fx.op(
+        "member_assist_state",
+        json!({"member_envelope": carol_envelope}),
+    );
+    assert_eq!(carol_state["assistant"]["alias"].as_str(), Some(alias));
+    let carol_binding = fx
+        .shared
+        .store
+        .assistant_for_alias(alias)
+        .unwrap()
+        .expect("the rebound binding is missing");
+    let carol_uid = fx.shared.store.agent(alias).unwrap().uid;
+
+    // Old effect outcome: RPC may succeed, but no receipt/mailbox copy may
+    // reach the rebound member.
+    let old_notice_id = crate::proto::daemon_message_id("effect", &old_effect);
+    fx.call(
+        Asserted::Operator,
+        "agent_respond",
+        json!({"alias": alias, "request": old_request, "decision": "decline"}),
+    )
+    .unwrap_or_else(|e| panic!("the old effect's safe decline was refused: {e}"));
+    assert!(
+        fx.shared
+            .store
+            .effect_member_owner(&old_effect)
+            .unwrap()
+            .is_none(),
+        "the old effect acquired a stage-time owner retroactively"
+    );
+    assert!(
+        fx.shared
+            .store
+            .effect_notice_delivery(&old_notice_id)
+            .unwrap()
+            .is_none(),
+        "the old effect minted a delivery receipt for the new member"
+    );
+    assert!(
+        !fx.shared
+            .store
+            .messages(alias)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == old_notice_id || m.body.contains(OLD_SECRET)),
+        "the old ordinary effect leaked into the rebound member's mailbox"
+    );
+    for agent in fx.shared.store.agents().unwrap() {
+        assert!(
+            !fx.shared
+                .store
+                .messages(&agent.alias)
+                .unwrap()
+                .iter()
+                .any(|m| m.body.contains(OLD_SECRET)),
+            "the old ordinary effect leaked into mailbox '{}'",
+            agent.alias
+        );
+    }
+
+    // New effect after the bind: stage-time owner + one receipted notice.
+    let new_request = cad2207_stage_effect(&fx, alias, "cad2207-carol-effect", NEW_SECRET);
+    let new_effect = fx
+        .shared
+        .store
+        .effect_by_request(&new_request)
+        .unwrap()
+        .unwrap()
+        .effect_id;
+    let owner = fx
+        .shared
+        .store
+        .effect_member_owner(&new_effect)
+        .unwrap()
+        .expect("the new member effect has no stage-time owner");
+    assert_eq!(owner.effect_id, new_effect);
+    assert_eq!(owner.org, ORG);
+    assert_eq!(owner.sub, "sub-carol");
+    assert_eq!(owner.assistant_id, carol_binding.assistant_id);
+    assert_eq!(owner.alias, alias);
+    assert_eq!(owner.agent_uid, carol_uid);
+
+    fx.call(
+        Asserted::Operator,
+        "agent_respond",
+        json!({"alias": alias, "request": new_request, "decision": "decline"}),
+    )
+    .unwrap_or_else(|e| panic!("the new member effect's safe decline was refused: {e}"));
+    let new_notice_id = crate::proto::daemon_message_id("effect", &new_effect);
+    let notice = fx
+        .shared
+        .store
+        .message(&new_notice_id)
+        .unwrap()
+        .expect("the new member effect produced no notice");
+    assert_eq!(notice.alias, alias);
+    assert!(notice.body.contains(NEW_SECRET));
+    assert!(!notice.body.contains(OLD_SECRET));
+    let receipt = fx
+        .shared
+        .store
+        .effect_notice_delivery(&new_notice_id)
+        .unwrap()
+        .expect("the new member effect notice has no receipt");
+    assert_eq!(receipt.effect_id, new_effect);
+    assert_eq!(receipt.org, ORG);
+    assert_eq!(receipt.sub, "sub-carol");
+    assert_eq!(receipt.assistant_id, carol_binding.assistant_id);
+    assert_eq!(receipt.alias, alias);
+    assert_eq!(
+        receipt.body_sha256,
+        crate::operator_auth::digest(&notice.body)
+    );
+    assert_eq!(
+        fx.shared
+            .store
+            .messages(alias)
+            .unwrap()
+            .iter()
+            .filter(|m| m.id == new_notice_id)
+            .count(),
+        1
+    );
+    fx.shared
+        .member_message_reprove(&notice)
+        .unwrap_or_else(|e| panic!("the new member effect notice did not reprove: {e}"));
+    let history = fx.op(
+        "member_assist_history",
+        json!({"member_envelope": fx.member_envelope("sub-carol")}),
+    );
+    assert!(
+        !history.to_string().contains(OLD_SECRET),
+        "the old ordinary effect reached the new member's history: {history}"
+    );
+}
+
+/// CAD-2207: a retained `task_failed` event from an ordinary agent must not
+/// become readable after its alias is rebound to a member assistant. The own
+/// assistant's forward and tail event pages must omit the old reason and show
+/// the event created after the binding; an ordinary alias keeps its history.
+#[test]
+fn cad2207_retained_event_alias_reuse_cannot_read_the_old_owner_stream() {
+    const OLD_REASON: &str = "cad2207 old ordinary task failure reason";
+    const NEW_REASON: &str = "cad2207 new member task event reason";
+    const ORDINARY_REASON: &str = "cad2207 ordinary event reason";
+    let alias = "reused-event";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let old_dir = fx.dir.path().join("reused-event-old-cwd");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias,
+            provider: "inbox",
+            endpoint_kind: "inbox",
+            role: "worker",
+            cwd: old_dir.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    fx.shared
+        .store
+        .event_public_scoped(
+            alias,
+            "task_failed",
+            json!({"reason": OLD_REASON}),
+            Some("job-old"),
+            Some("task-old"),
+        )
+        .unwrap();
+    fx.shared
+        .store
+        .remove_agent(alias, true, &json!({"by": "operator"}))
+        .unwrap();
+    fx.authority
+        .lock()
+        .unwrap()
+        .members
+        .insert("sub-carol".to_string(), MemberAuthority::live("sub-carol"));
+    fx.shared
+        .store
+        .assistant_bind(ORG, "sub-carol", "assist_sub-carol", alias, Some("rev0"))
+        .unwrap();
+    let carol = fx.op(
+        "member_assist_state",
+        json!({"member_envelope": fx.member_envelope("sub-carol")}),
+    );
+    assert_eq!(carol["assistant"]["alias"].as_str(), Some(alias));
+    fx.shared
+        .store
+        .event_public_scoped(
+            alias,
+            "task_failed",
+            json!({"reason": NEW_REASON}),
+            Some("job-new"),
+            Some("task-new"),
+        )
+        .unwrap();
+
+    let forward = fx
+        .call(
+            Asserted::Agent(alias.to_string()),
+            "agent_events",
+            json!({"alias": alias, "after": 0}),
+        )
+        .unwrap_or_else(|e| panic!("the rebound assistant's event page failed: {e}"));
+    assert!(
+        !forward.to_string().contains(OLD_REASON),
+        "the old ordinary task reason appeared in the forward event page: {forward}"
+    );
+    assert!(
+        forward.to_string().contains(NEW_REASON),
+        "the new event after binding is missing from the forward page: {forward}"
+    );
+    let tail = fx
+        .call(
+            Asserted::Agent(alias.to_string()),
+            "agent_events",
+            json!({"alias": alias, "tail": true}),
+        )
+        .unwrap_or_else(|e| panic!("the rebound assistant's tail event page failed: {e}"));
+    assert!(
+        !tail.to_string().contains(OLD_REASON),
+        "the old ordinary task reason appeared in the tail event page: {tail}"
+    );
+    assert!(
+        tail.to_string().contains(NEW_REASON),
+        "the new event after binding is missing from the tail page: {tail}"
+    );
+
+    // Ordinary alias behavior is unchanged.
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias: "ordinary-event",
+            provider: "inbox",
+            endpoint_kind: "inbox",
+            role: "worker",
+            cwd: old_dir.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    fx.shared
+        .store
+        .event_public_scoped(
+            "ordinary-event",
+            "task_failed",
+            json!({"reason": ORDINARY_REASON}),
+            Some("job-ordinary"),
+            Some("task-ordinary"),
+        )
+        .unwrap();
+    let ordinary = fx
+        .call(
+            Asserted::Agent("ordinary-event".to_string()),
+            "agent_events",
+            json!({"alias": "ordinary-event", "after": 0}),
+        )
+        .unwrap_or_else(|e| panic!("the ordinary agent's event page failed: {e}"));
+    assert!(
+        ordinary.to_string().contains(ORDINARY_REASON),
+        "ordinary event history was hidden: {ordinary}"
+    );
+}
+
+/// CAD-2207: retained terminal mail under a reused alias must not become
+/// visible to a newly bound assistant through a known old recipient UID or a
+/// NULL-UID legacy row with an equal/later forged timestamp. Own agent_show,
+/// message_list and message_read must all exclude it; new current-UID mail
+/// stays readable and ordinary aliases keep the legacy behavior.
+#[test]
+fn cad2207_retained_mail_alias_reuse_cannot_read_the_old_owner_mail() {
+    const NEW_BODY: &str = "cad2207 new member current mail";
+    const ORDINARY_BODY: &str = "cad2207 ordinary legacy mail";
+    let alias = "reused-mail";
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let old_dir = fx.dir.path().join("reused-mail-old-cwd");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias,
+            provider: "inbox",
+            endpoint_kind: "inbox",
+            role: "worker",
+            cwd: old_dir.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    let old_uid = fx.shared.store.agent(alias).unwrap().uid;
+    let old_ids = [
+        "cad2207-old-known-equal",
+        "cad2207-old-known-later",
+        "cad2207-old-null-equal",
+        "cad2207-old-null-later",
+    ];
+    for (index, id) in old_ids.iter().enumerate() {
+        let recipient = if index < 2 {
+            Some(old_uid.as_str())
+        } else {
+            None
+        };
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "INSERT INTO messages(id,alias,body,reply_to,source,state,created,recipient_uid) \
+                     VALUES(?,?,?,NULL,'user','completed',0.0,?)",
+                    rusqlite::params![id, alias, format!("old mail {id}"), recipient],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    fx.shared
+        .store
+        .remove_agent(alias, true, &json!({"by": "operator"}))
+        .unwrap();
+
+    // Active pre-cutoff rows inserted after removal but before the bind; the
+    // binding cutoff includes them and active_messages must still hide them.
+    let old_active_ids = ["cad2207-old-active-known", "cad2207-old-active-null"];
+    for (index, id) in old_active_ids.iter().enumerate() {
+        let recipient = if index == 0 {
+            Some(old_uid.as_str())
+        } else {
+            None
+        };
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "INSERT INTO messages(id,alias,body,reply_to,source,state,created,recipient_uid) \
+                     VALUES(?,?,?,NULL,'user','queued',0.0,?)",
+                    rusqlite::params![id, alias, format!("old active mail {id}"), recipient],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fx.authority
+        .lock()
+        .unwrap()
+        .members
+        .insert("sub-carol".to_string(), MemberAuthority::live("sub-carol"));
+    fx.shared
+        .store
+        .assistant_bind(ORG, "sub-carol", "assist_sub-carol", alias, Some("rev0"))
+        .unwrap();
+    fx.op(
+        "member_assist_state",
+        json!({"member_envelope": fx.member_envelope("sub-carol")}),
+    );
+    // First proved read stamps the event fence's agent uid; later mail reads
+    // must not depend on an unstamped fence.
+    fx.call(
+        Asserted::Agent(alias.to_string()),
+        "agent_events",
+        json!({"alias": alias, "after": 0}),
+    )
+    .unwrap_or_else(|e| panic!("the rebound assistant's event fence read failed: {e}"));
+    let new_agent = fx.shared.store.agent(alias).unwrap();
+    for (index, id) in old_ids.iter().enumerate() {
+        let created = if index % 2 == 0 {
+            new_agent.created
+        } else {
+            new_agent.created + 1.0
+        };
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "UPDATE messages SET created=? WHERE id=?",
+                    rusqlite::params![created, id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fx.shared
+        .store
+        .enqueue(alias, NEW_BODY, None, "cad2207-new-current-mail", "user")
+        .unwrap();
+    // Post-cutoff but addressed to the OLD known UID: the sequence fallback
+    // is for NULL-UID legacy rows only, so this must stay hidden.
+    let stale_uid_id = "cad2207-post-cutoff-old-uid";
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "INSERT INTO messages(id,alias,body,reply_to,source,state,created,recipient_uid) \
+                 VALUES(?,?,?,NULL,'user','queued',?,?)",
+                rusqlite::params![
+                    stale_uid_id,
+                    alias,
+                    "cad2207 post-cutoff old uid mail",
+                    crate::issue::time::now_epoch() as f64,
+                    old_uid
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // A NULL-UID row after the cutoff is the legacy/daemon path and must stay
+    // visible, including as a cursor.
+    let null_after_id = "cad2207-post-cutoff-null-uid";
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "INSERT INTO messages(id,alias,body,reply_to,source,state,created,recipient_uid) \
+                 VALUES(?,?,?,NULL,'user','queued',?,NULL)",
+                rusqlite::params![
+                    null_after_id,
+                    alias,
+                    "cad2207 post-cutoff null uid mail",
+                    crate::issue::time::now_epoch() as f64
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let stale_row = fx.shared.store.message(stale_uid_id).unwrap().unwrap();
+    let fence = fx
+        .shared
+        .store
+        .assistant_event_fence(ORG, "sub-carol")
+        .unwrap()
+        .expect("the rebound binding has no event fence");
+    assert!(
+        stale_row.seq > fence.message_cutoff_seq,
+        "the post-cutoff fixture did not land above the mail cutoff"
+    );
+    assert!(
+        !fx.shared
+            .store
+            .agent_reads_message(&stale_row, alias)
+            .unwrap(),
+        "store.agent_reads_message admitted a post-cutoff old-UID row"
+    );
+    assert!(
+        !fx.shared
+            .store
+            .messages(alias)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == stale_uid_id),
+        "store.messages exposed the post-cutoff old-UID row"
+    );
+    let hidden_ids: Vec<&str> = old_ids
+        .iter()
+        .chain(old_active_ids.iter())
+        .chain(std::iter::once(&stale_uid_id))
+        .copied()
+        .collect();
+    let listed = fx
+        .call(
+            Asserted::Agent(alias.to_string()),
+            "message_list",
+            json!({"to": alias}),
+        )
+        .unwrap_or_else(|e| panic!("the rebound assistant's message list failed: {e}"));
+    let ids: Vec<&str> = listed["messages"]
+        .as_array()
+        .expect("message_list carries no messages")
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    assert!(
+        !hidden_ids.iter().any(|old| ids.contains(old)),
+        "retained old mail appeared in the rebound assistant's message_list: {listed}"
+    );
+    assert!(
+        !ids.contains(&stale_uid_id),
+        "post-cutoff mail addressed to the old UID appeared in message_list: {listed}"
+    );
+    assert!(
+        ids.contains(&"cad2207-new-current-mail"),
+        "the current-UID mail was missing from message_list: {listed}"
+    );
+    assert!(
+        ids.contains(&null_after_id),
+        "the post-cutoff NULL-UID mail was hidden from message_list: {listed}"
+    );
+    assert_eq!(
+        listed.get("omitted").and_then(Value::as_u64).unwrap_or(0),
+        0,
+        "message_list counted hidden old mail: {listed}"
+    );
+    for id in &hidden_ids {
+        let read = fx.call(
+            Asserted::Agent(alias.to_string()),
+            "message_read",
+            json!({"message": *id}),
+        );
+        assert!(
+            read.is_err(),
+            "the rebound assistant read retained old mail '{id}': {read:?}"
+        );
+    }
+    let current = fx
+        .call(
+            Asserted::Agent(alias.to_string()),
+            "message_read",
+            json!({"message": "cad2207-new-current-mail"}),
+        )
+        .unwrap_or_else(|e| panic!("the current-UID mail was refused: {e}"));
+    assert!(current["text"]
+        .as_str()
+        .is_some_and(|t| t.contains(NEW_BODY)));
+    let shown = fx
+        .call(
+            Asserted::Agent(alias.to_string()),
+            "agent_show",
+            json!({"alias": alias}),
+        )
+        .unwrap_or_else(|e| panic!("the rebound assistant's agent_show failed: {e}"));
+    for id in &hidden_ids {
+        assert!(
+            !shown.to_string().contains(*id),
+            "agent_show exposed retained old message '{id}': {shown}"
+        );
+    }
+
+    // Bounded agent_show paths use separate windows and must apply the same
+    // fence: limit, since, and active_only.
+    let bounded = fx
+        .call(
+            Asserted::Agent(alias.to_string()),
+            "agent_show",
+            json!({"alias": alias, "limit": 50}),
+        )
+        .unwrap_or_else(|e| panic!("the bounded agent_show limit path failed: {e}"));
+    assert!(
+        bounded.to_string().contains("cad2207-new-current-mail"),
+        "the bounded limit path lost current-UID mail: {bounded}"
+    );
+    for id in &hidden_ids {
+        assert!(
+            !bounded.to_string().contains(*id),
+            "agent_show limit exposed retained old message '{id}': {bounded}"
+        );
+    }
+    assert_eq!(
+        bounded.get("omitted").and_then(Value::as_u64).unwrap_or(0),
+        0,
+        "agent_show limit counted hidden old mail: {bounded}"
+    );
+    let bounded_since = fx
+        .call(
+            Asserted::Agent(alias.to_string()),
+            "agent_show",
+            json!({"alias": alias, "since": 0}),
+        )
+        .unwrap_or_else(|e| panic!("the bounded agent_show since path failed: {e}"));
+    assert!(
+        bounded_since
+            .to_string()
+            .contains("cad2207-new-current-mail"),
+        "the bounded since path lost current-UID mail: {bounded_since}"
+    );
+    for id in &hidden_ids {
+        assert!(
+            !bounded_since.to_string().contains(*id),
+            "agent_show since exposed retained old message '{id}': {bounded_since}"
+        );
+    }
+    assert_eq!(
+        bounded_since
+            .get("omitted")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        0,
+        "agent_show since counted hidden old mail: {bounded_since}"
+    );
+    let active = fx
+        .call(
+            Asserted::Agent(alias.to_string()),
+            "agent_show",
+            json!({"alias": alias, "active_only": true}),
+        )
+        .unwrap_or_else(|e| panic!("the active_only agent_show path failed: {e}"));
+    assert!(
+        active.to_string().contains("cad2207-new-current-mail"),
+        "the active_only path lost current-UID mail: {active}"
+    );
+    assert!(
+        active.to_string().contains(null_after_id),
+        "the active_only path lost post-cutoff NULL-UID mail: {active}"
+    );
+    for id in &hidden_ids {
+        assert!(
+            !active.to_string().contains(*id),
+            "agent_show active_only exposed retained old message '{id}': {active}"
+        );
+    }
+
+    // A hidden old id used as `since` must be rejected exactly like an absent
+    // id on both bounded paths, so it cannot act as an existence oracle.
+    let since_call = |method: &str, since: &str| {
+        let params = if method == "agent_show" {
+            json!({"alias": alias, "since": since})
+        } else {
+            json!({"to": alias, "since": since})
+        };
+        fx.call(Asserted::Agent(alias.to_string()), method, params)
+    };
+    let absent_since = "cad2207-absent-since-id";
+    for method in ["agent_show", "message_list"] {
+        let hidden_since = since_call(method, hidden_ids[0]);
+        let absent = since_call(method, absent_since);
+        assert!(
+            hidden_since.is_err(),
+            "{method} accepted a hidden old id as since: {hidden_since:?}"
+        );
+        assert!(
+            absent.is_err(),
+            "{method} accepted an absent id as since: {absent:?}"
+        );
+        assert_eq!(
+            hidden_since.unwrap_err().code(),
+            absent.unwrap_err().code(),
+            "{method} treated a hidden old id differently from an absent id"
+        );
+        assert!(
+            since_call(method, "cad2207-new-current-mail").is_ok(),
+            "{method} rejected the current-UID id as since"
+        );
+        assert!(
+            since_call(method, null_after_id).is_ok(),
+            "{method} rejected the post-cutoff NULL-UID id as since"
+        );
+    }
+
+    // Ordinary aliases keep the NULL-UID legacy behavior.
+    fx.shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias: "ordinary-mail",
+            provider: "inbox",
+            endpoint_kind: "inbox",
+            role: "worker",
+            cwd: old_dir.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    let ordinary_agent = fx.shared.store.agent("ordinary-mail").unwrap();
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "INSERT INTO messages(id,alias,body,reply_to,source,state,created,recipient_uid) \
+                 VALUES('cad2207-ordinary-legacy-main','ordinary-mail',?1,NULL,'user', \
+                        'completed',?2,NULL)",
+                // A terminal legacy row is listed only when its `created` is at
+                // or after the current registration; `now_epoch()` truncates to
+                // whole seconds and can land just before the fractional
+                // `agent.created`, which would make this fixture look hidden.
+                rusqlite::params![ORDINARY_BODY, ordinary_agent.created + 1.0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let ordinary_list = fx
+        .call(
+            Asserted::Agent("ordinary-mail".to_string()),
+            "message_list",
+            json!({"to": "ordinary-mail"}),
+        )
+        .unwrap_or_else(|e| panic!("the ordinary message list failed: {e}"));
+    assert!(ordinary_list
+        .to_string()
+        .contains("cad2207-ordinary-legacy-main"));
+    let ordinary_read = fx
+        .call(
+            Asserted::Agent("ordinary-mail".to_string()),
+            "message_read",
+            json!({"message": "cad2207-ordinary-legacy-main"}),
+        )
+        .unwrap_or_else(|e| panic!("the ordinary legacy mail was refused: {e}"));
+    assert!(ordinary_read["text"]
+        .as_str()
+        .is_some_and(|t| t.contains(ORDINARY_BODY)));
+}
+
+/// CAD-2207: the narrow `agent_operational` projection may keep a member
+/// assistant's busy/liveness attribution but must not expose its raw native
+/// thread/session handles. A boolean `needs_native_resume` preserves enough for
+/// resume; ordinary agents keep their raw handles.
+#[test]
+fn cad2207_agent_operational_hides_private_native_session_ids() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let ben = fx.member_runtime("sub-ben");
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE agents SET thread_id=?, session_id=?, endpoint=NULL WHERE alias=?",
+                rusqlite::params![
+                    "private-thread-secret",
+                    "private-session-secret",
+                    alice.alias
+                ],
+            )?;
+            tx.execute(
+                "UPDATE agents SET thread_id=?, session_id=?, endpoint=? WHERE alias=?",
+                rusqlite::params![
+                    "private-live-thread",
+                    "private-live-session",
+                    "private-endpoint-live",
+                    ben.alias
+                ],
+            )?;
+            tx.execute(
+                "UPDATE agents SET thread_id=?, session_id=?, endpoint=NULL WHERE alias=?",
+                rusqlite::params![
+                    "ordinary-thread-secret",
+                    "ordinary-session-secret",
+                    "ordinary-worker"
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let operational = fx.op("agent_operational", json!({}));
+    let agents = operational["agents"]
+        .as_array()
+        .expect("agent_operational carries no agents array");
+    fn operational_row<'a>(agents: &'a [Value], alias: &str) -> &'a Value {
+        agents
+            .iter()
+            .find(|row| row["alias"].as_str() == Some(alias))
+            .unwrap_or_else(|| panic!("agent_operational lost '{alias}'"))
+    }
+    let private_with_session = operational_row(agents, &alice.alias);
+    assert!(
+        private_with_session["thread_id"].is_null(),
+        "agent_operational exposed a private native thread id: {private_with_session}"
+    );
+    assert!(
+        private_with_session["session_id"].is_null(),
+        "agent_operational exposed a private native session id: {private_with_session}"
+    );
+    assert!(
+        private_with_session["endpoint"].is_null(),
+        "agent_operational exposed a private endpoint handle: {private_with_session}"
+    );
+    assert_eq!(
+        private_with_session["needs_native_resume"],
+        json!(true),
+        "the private agent lost its resume boolean"
+    );
+    let private_live_endpoint = operational_row(agents, &ben.alias);
+    assert!(private_live_endpoint["thread_id"].is_null());
+    assert!(private_live_endpoint["session_id"].is_null());
+    assert!(private_live_endpoint["endpoint"].is_null());
+    assert_eq!(
+        private_live_endpoint["needs_native_resume"],
+        json!(false),
+        "a live private endpoint should project needs_native_resume=false"
+    );
+    let ordinary = operational_row(agents, "ordinary-worker");
+    assert_eq!(
+        ordinary["thread_id"],
+        json!("ordinary-thread-secret"),
+        "ordinary thread id was hidden: {ordinary}"
+    );
+    assert_eq!(
+        ordinary["session_id"],
+        json!("ordinary-session-secret"),
+        "ordinary session id was hidden: {ordinary}"
+    );
+    assert_eq!(
+        ordinary["needs_native_resume"],
+        json!(true),
+        "ordinary projection lost needs_native_resume"
+    );
+    let raw = operational.to_string();
+    for secret in [
+        "private-thread-secret",
+        "private-session-secret",
+        "private-live-thread",
+        "private-live-session",
+        "private-endpoint-live",
+    ] {
+        assert!(
+            !raw.contains(secret),
+            "agent_operational serialized a private native handle '{secret}': {operational}"
+        );
+    }
 }
 
 // CAD-1767 G2: the member-assist-history half (check author, failing first).

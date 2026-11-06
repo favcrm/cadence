@@ -127,14 +127,15 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
             // --resume: once the daemon answers, sweep every agent
             // with a stored thread and no live endpoint.
             if resume {
-                let targets = client::rpc(&state_dir, "agent_list", json!({}))?["agents"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
+                // CAD-2207: the operational projection, not the filtered
+                // list, so a member assistant is not omitted here either.
+                let targets = operational_agents(&state_dir)?
                     .iter()
                     .filter(|a| {
-                        a["endpoint"].is_null()
-                            && (a["thread_id"].is_string() || a["session_id"].is_string())
+                        a["needs_native_resume"].as_bool().unwrap_or_else(|| {
+                            a["endpoint"].is_null()
+                                && (a["thread_id"].is_string() || a["session_id"].is_string())
+                        })
                     })
                     .filter_map(|a| a["alias"].as_str().map(str::to_string))
                     .collect::<Vec<_>>();
@@ -225,6 +226,21 @@ pub(crate) fn daemon_stop(state_dir: &Path) -> Result<i32> {
 /// `submitted` row under either is stale and can never finish, so waiting
 /// on it is a deadlock (F19). `starting`/`stopping` still hold an actor
 /// mid-transition — their rows stay live blockers.
+/// CAD-2207: the complete narrow operational projection, with a mixed-version
+/// fallback. An older daemon does not serve `agent_operational`; its
+/// `agent_list` is the complete pre-change projection, so restart/resume keeps
+/// its existing behavior. Any other refusal is returned — never an empty fleet.
+pub(crate) fn operational_agents(state_dir: &Path) -> Result<Vec<Value>> {
+    match client::rpc(state_dir, "agent_operational", json!({})) {
+        Ok(answer) => Ok(answer["agents"].as_array().cloned().unwrap_or_default()),
+        Err(error) if error.to_string().contains("Unknown method") => {
+            let answer = client::rpc(state_dir, "agent_list", json!({}))?;
+            Ok(answer["agents"].as_array().cloned().unwrap_or_default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn stale_holder(agent: &Value) -> bool {
     match agent["state"].as_str().unwrap_or_default() {
         "stopped" | "offline" | "attention" => true,
@@ -265,39 +281,43 @@ pub(crate) fn busy_agents(
         }
         // In-flight turn on any actor endpoint — the pane probe can
         // read idle between paste and render, so the message row is
-        // the authoritative in-flight signal.
-        if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
-            let inflight: Vec<&Value> = show["messages"]
-                .as_array()
-                .map(|ms| {
-                    ms.iter()
-                        .filter(|m| {
-                            matches!(
-                                m["state"].as_str().unwrap_or_default(),
-                                "running" | "submitted"
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if inflight.is_empty() {
-                continue;
-            }
-            if stale_holder(a) {
-                for m in inflight {
-                    stale.push(format!(
-                        "{alias}: {} ({})",
-                        m["id"].as_str().unwrap_or("?"),
-                        m["state"].as_str().unwrap_or("?")
-                    ));
-                    stale_pairs.push((
-                        alias.to_string(),
+        // the authoritative in-flight signal. The operational projection
+        // carries the bounded `{id,state}` rows for every agent, including a
+        // member assistant the profile-bearing list withholds, so a restart
+        // can never mistake it for idle. A mixed-version fallback (an older
+        // daemon's list row has no `messages`) keeps the pre-change
+        // per-agent read.
+        let mut inflight: Vec<(String, String)> = Vec::new();
+        let mut collect = |messages: &[Value]| {
+            for m in messages {
+                if matches!(
+                    m["state"].as_str().unwrap_or_default(),
+                    "running" | "submitted"
+                ) {
+                    inflight.push((
                         m["id"].as_str().unwrap_or("?").to_string(),
+                        m["state"].as_str().unwrap_or("?").to_string(),
                     ));
                 }
-            } else {
-                busy.push(format!("{alias}(running message)"));
             }
+        };
+        if let Some(messages) = a["messages"].as_array() {
+            collect(messages);
+        } else if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
+            if let Some(messages) = show["messages"].as_array() {
+                collect(messages);
+            }
+        }
+        if inflight.is_empty() {
+            continue;
+        }
+        if stale_holder(a) {
+            for (id, state) in inflight {
+                stale.push(format!("{alias}: {id} ({state})"));
+                stale_pairs.push((alias.to_string(), id));
+            }
+        } else {
+            busy.push(format!("{alias}(running message)"));
         }
     }
     (busy, stale, stale_pairs)
@@ -374,23 +394,36 @@ pub(crate) fn daemon_restart(
     // A failed replacement can leave no daemon serving the socket.
     // Preserve semantic refusals, but let transport failure reach the
     // shutdown/lock checks below so rollback can start the old release.
-    let (before, reachable) = match client::rpc_answer(state_dir, "agent_list", json!({})) {
-        Ok(Ok(answer)) => (
-            answer["agents"].as_array().cloned().unwrap_or_default(),
-            true,
-        ),
-        Ok(Err(refused)) => return Err(refused),
-        Err(_) => {
-            // A lost response does not prove the daemon is down. Never
-            // skip --when-idle on a live lock holder whose fleet
-            // snapshot was unavailable.
-            if !daemon_lock_free(state_dir) {
-                return Err(Error::rejected(
-                    "daemon owns the state-dir lock but does not answer the \
-                     socket — inspect daemon.log before restarting",
-                ));
+    // CAD-2207: the complete operational projection; an older daemon that
+    // does not serve it falls back to its pre-change complete `agent_list`.
+    let mut snapshot_verb = "agent_operational";
+    let (before, reachable) = loop {
+        match client::rpc_answer(state_dir, snapshot_verb, json!({})) {
+            Ok(Ok(answer)) => {
+                break (
+                    answer["agents"].as_array().cloned().unwrap_or_default(),
+                    true,
+                )
             }
-            (Vec::new(), false)
+            Ok(Err(refused))
+                if snapshot_verb == "agent_operational"
+                    && refused.to_string().contains("Unknown method") =>
+            {
+                snapshot_verb = "agent_list";
+            }
+            Ok(Err(refused)) => return Err(refused),
+            Err(_) => {
+                // A lost response does not prove the daemon is down. Never
+                // skip --when-idle on a live lock holder whose fleet
+                // snapshot was unavailable.
+                if !daemon_lock_free(state_dir) {
+                    return Err(Error::rejected(
+                        "daemon owns the state-dir lock but does not answer the \
+                         socket — inspect daemon.log before restarting",
+                    ));
+                }
+                break (Vec::new(), false);
+            }
         }
     };
     // Stale `(alias, message_id)` pairs observed while waiting — a row
@@ -402,10 +435,7 @@ pub(crate) fn daemon_restart(
         let mut next_report = Instant::now();
         let mut stale_noted = false;
         loop {
-            let agents = client::rpc(state_dir, "agent_list", json!({}))?["agents"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            let agents = operational_agents(state_dir)?;
             let (busy, stale, pairs) = busy_agents(state_dir, &agents);
             if !stale.is_empty() {
                 if !ignore_stale {
@@ -737,26 +767,35 @@ pub(crate) fn daemon_restart(
         // still fails the restart verdict.
         for (sal, mid) in stale_turns.iter().filter(|(sal, _)| sal == &alias) {
             // A carried stale turn the show cannot verify leaves the
-            // verdict unproven — fail closed (CAD-694).
-            match client::rpc(state_dir, "agent_show", json!({"alias": sal})) {
-                Ok(show) => {
-                    let swept = show["messages"]
-                        .as_array()
-                        .map(|ms| {
-                            ms.iter().any(|m| {
-                                m["id"].as_str() == Some(mid.as_str())
-                                    && m["state"].as_str() == Some("unknown")
-                            })
-                        })
-                        .unwrap_or(false);
-                    if swept {
+            // verdict unproven — fail closed (CAD-694). A private assistant
+            // refuses `agent_show`; its operational projection still carries
+            // `{id,state}`, so the same check stays possible (CAD-2207).
+            let messages = match client::rpc(state_dir, "agent_show", json!({"alias": sal})) {
+                Ok(show) => Some(show["messages"].as_array().cloned().unwrap_or_default()),
+                Err(_) => client::rpc(state_dir, "agent_operational", json!({}))
+                    .ok()
+                    .and_then(|answer| {
+                        answer["agents"]
+                            .as_array()?
+                            .iter()
+                            .find(|row| row["alias"].as_str() == Some(sal.as_str()))
+                            .and_then(|row| row["messages"].as_array().cloned())
+                    }),
+            };
+            match messages {
+                Some(messages) => {
+                    if messages.iter().any(|m| {
+                        m["id"].as_str() == Some(mid.as_str())
+                            && m["state"].as_str() == Some("unknown")
+                    }) {
                         bad = true;
                         turn = "fenced".to_string();
                     }
                 }
-                Err(e) => {
+                None => {
                     eprint_line(&format!(
-                        "restart: could not verify carried stale turn {sal}/{mid}: {e}"
+                        "restart: could not verify carried stale turn {sal}/{mid}: \
+                         the daemon serves neither agent_show nor agent_operational"
                     ));
                     bad = true;
                 }

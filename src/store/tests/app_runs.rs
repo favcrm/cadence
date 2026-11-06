@@ -2001,7 +2001,11 @@ fn cad2042_interrupted_backfill_resumes_and_converges() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 62, "the resumed upgrade finishes");
+    assert_eq!(
+        version,
+        crate::rollout::SCHEMA_VERSION,
+        "the resumed upgrade finishes"
+    );
     let rows: Vec<(String, i64, Option<String>, Option<String>)> = conn
         .prepare("SELECT id,source_post_read,install_id,context_id FROM app_capability_results ORDER BY rowid")
         .unwrap()
@@ -2181,13 +2185,16 @@ fn concurrent_v61_round(round: usize) {
         })
         .collect();
     for handle in handles {
-        handle.join().unwrap().expect("every opener reaches v62");
+        handle
+            .join()
+            .unwrap()
+            .expect("every opener reaches the current schema");
     }
     let conn = rusqlite::Connection::open(&path).unwrap();
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 62);
+    assert_eq!(version, crate::rollout::SCHEMA_VERSION);
     let progress: i64 = conn
         .query_row("SELECT COUNT(*) FROM app_schema_progress", [], |r| r.get(0))
         .unwrap();

@@ -105,6 +105,44 @@ pub(super) struct MemberReprove<'a> {
     pub op_credential_id: Option<&'a str>,
 }
 
+/// The class of a member-private target a native read names (CAD-2207).
+///
+/// The class decides whether operator/administrator rights are sufficient:
+/// they are never owner proof for a personal assistant, but they remain valid
+/// for a shared job/task record and for alias-level liveness that carries no
+/// content.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemberReadTarget {
+    /// The member's personal assistant itself — its agent row (name, avatar,
+    /// profile), conversation, events, mail/inbox, pending request inputs or
+    /// an `agent_ask` round-trip. Only the bound assistant's own connection
+    /// may read it on the generic path; the verified owner uses the signed
+    /// member route.
+    PrivateAssistant,
+    /// Alias-level liveness only (`agent_wait`): state and reason, no content.
+    OperationalStatus,
+    /// A job/task record bound to a member's assistant: the existing explicit
+    /// shared-work policy (operator, canonical PM, assigned task author, live
+    /// subscriber) is unchanged.
+    SharedWork,
+}
+
+/// Who authored a shared-room post, resolved from DURABLE identity (CAD-2207).
+///
+/// The `assistants` binding is not foreign-keyed to `agents`, so it outlives
+/// an agent-row removal; a post keeps its recorded `sender` alias. A sender
+/// that resolves to neither an agent row nor a binding is `Unproven` — hidden
+/// from every reader that is not proven to be its member, never assumed
+/// ordinary.
+pub(super) enum RoomPostAuthor {
+    /// A resolved non-assistant sender (human, operator, ordinary agent).
+    Ordinary,
+    /// A member's personal assistant, by its durable binding row.
+    Private(crate::store::AssistantBinding),
+    /// Sender provenance could not be proved either way.
+    Unproven,
+}
+
 /// Daemon-side JWKS cache for the assist family — independent of the HTTP
 /// route's, so the daemon's re-verify does not depend on the route's cache.
 static MEMBER_JWKS: Mutex<crate::board_identity::JwksCache> =
@@ -136,10 +174,12 @@ impl Shared {
         if method.starts_with("member_") {
             return Ok(());
         }
-        // CAD-1380 target-side privacy: a member-owned read is refused for an
-        // ordinary or unproven caller BEFORE the handler runs, keyed on the
-        // canonical target from the real store (never a raw prefix or request
-        // claim). Operator and bound-owner access stay on their own rules.
+        // CAD-1380/CAD-2207 target-side privacy: a member-owned read is
+        // refused for an ordinary, unproven or operator caller BEFORE the
+        // handler runs, keyed on the canonical target from the real store
+        // (never a raw prefix or request claim). Only the bound owner's own
+        // agent connection passes here; the verified owner reads through the
+        // signed `member_*` route.
         self.member_target_read_guard(method, params, peer_pid)?;
         let alias = match self.caller_identity(peer_pid) {
             Ok(Caller::Agent(v)) => v.agent.alias.clone(),
@@ -381,20 +421,57 @@ impl Shared {
         Ok(())
     }
 
-    /// CAD-1380 target-side guard for the reachable member-owned READS. A
-    /// member-private target (an assistant alias, its thread/events, or a job
-    /// or task bound to a member) is refused for every caller except the
-    /// operator and the bound owner. Jobs and tasks additionally admit their
-    /// canonical PM and assigned task author through existing explicit
-    /// assignment. Ordinary nonmember targets are untouched.
+    /// CAD-1380/CAD-2207 target-side guard for the reachable member-owned
+    /// READS. A member-private target (an assistant alias, its
+    /// thread/events/mail/inbox/pending requests/sends/ask round-trips, or a
+    /// job or task bound to a member) is refused for every caller except the
+    /// bound owner. Jobs and tasks additionally admit their canonical PM and
+    /// assigned task author through existing explicit assignment, and keep
+    /// their existing operator access — shared work is not personal context.
+    /// Ordinary nonmember targets are untouched.
+    ///
+    /// CAD-2207: a personal assistant's name/avatar/profile, conversation,
+    /// events, mail/inbox, pending request inputs and ask replies belong to its
+    /// verified member alone. Operator or administrator rights on this machine
+    /// are NOT proof of that member, so an operator connection is refused on
+    /// those targets exactly like any other nonowner. The owner's read is the
+    /// signed `member_*` envelope route (`member_assist_state`/
+    /// `member_assist_history`), which this guard never serves. Alias-level
+    /// liveness (`agent_wait`) stays available to the operator because it
+    /// discloses no content.
     fn member_target_read_guard(&self, method: &str, params: &Value, peer_pid: u32) -> Result<()> {
-        let (alias_arg, job_arg, task_arg) = match method {
-            "thread_read" | "agent_show" | "agent_events" | "agent_wait" => {
-                (params.get("alias").and_then(Value::as_str), None, None)
-            }
-            "message_list" => (params.get("to").and_then(Value::as_str), None, None),
-            "job_show" | "job_events" => (None, params.get("job").and_then(Value::as_str), None),
-            "task_show" => (None, None, params.get("task").and_then(Value::as_str)),
+        let (alias_arg, job_arg, task_arg, target) = match method {
+            "thread_read" | "thread_send" | "agent_show" | "agent_events" | "agent_inbox"
+            | "agent_send" | "agent_ask" | "dispatch_send" => (
+                params.get("alias").and_then(Value::as_str),
+                None,
+                None,
+                MemberReadTarget::PrivateAssistant,
+            ),
+            "message_list" => (
+                params.get("to").and_then(Value::as_str),
+                None,
+                None,
+                MemberReadTarget::PrivateAssistant,
+            ),
+            "agent_wait" => (
+                params.get("alias").and_then(Value::as_str),
+                None,
+                None,
+                MemberReadTarget::OperationalStatus,
+            ),
+            "job_show" | "job_events" => (
+                None,
+                params.get("job").and_then(Value::as_str),
+                None,
+                MemberReadTarget::SharedWork,
+            ),
+            "task_show" => (
+                None,
+                None,
+                params.get("task").and_then(Value::as_str),
+                MemberReadTarget::SharedWork,
+            ),
             _ => return Ok(()),
         };
         // Resolve the CANONICAL target before any ownership decision, so an
@@ -406,9 +483,10 @@ impl Shared {
             let Some(binding) = self.store.assistant_for_alias(&canonical)? else {
                 return Ok(());
             };
-            return self.member_owner_or_operator(
+            return self.member_target_read_decision(
                 method,
                 peer_pid,
+                target,
                 Some(&binding),
                 &binding.org,
                 None,
@@ -434,30 +512,38 @@ impl Shared {
         // The job has a member-owned ledger row, so it is member-private. A
         // missing owner binding can never drop it to ordinary rules.
         let binding = self.store.assistant_binding(&owner.org, &owner.sub)?;
-        self.member_owner_or_operator(
+        self.member_target_read_decision(
             method,
             peer_pid,
+            MemberReadTarget::SharedWork,
             binding.as_ref(),
             &owner.org,
             Some((&job, task.as_deref())),
         )
     }
 
-    /// The shared decision for a member-owned target: the operator and the
-    /// bound assistant that owns it pass; an explicitly assigned job PM or
-    /// task author passes for a job (never for member-private chat); anyone
-    /// else (ordinary worker, unproven) is refused.
+    /// The shared decision for a member-owned target. The bound assistant that
+    /// owns it always passes. For a job/task record the existing explicit
+    /// shared-work policy also admits the operator, the canonical job PM, the
+    /// assigned task author and a live subscriber. A personal-assistant target
+    /// (row, thread, events, mail, inbox) admits only the owning assistant on
+    /// this path: an operator connection is not owner proof (CAD-2207), and an
+    /// assigned job role never opens private chat. Anyone else — ordinary
+    /// worker, unproven — is refused.
+    ///
     /// `binding` is the owner's live binding, or `None` when the ledger row
     /// names an owner with no binding (never dropped to ordinary rules).
     /// `job` is `Some((job_id, requested_task))` for a job or task read.
-    fn member_owner_or_operator(
+    fn member_target_read_decision(
         &self,
         method: &str,
         peer_pid: u32,
+        target: MemberReadTarget,
         binding: Option<&crate::store::AssistantBinding>,
         org: &str,
         job: Option<(&str, Option<&str>)>,
     ) -> Result<()> {
+        let alias = binding.map(|b| b.alias.as_str()).unwrap_or("");
         let refuse = |who: &str| {
             Err(Error::rejected(format!(
                 "{method} refused: '{who}' cannot read a member-private target \
@@ -465,7 +551,17 @@ impl Shared {
             )))
         };
         match self.connection_caller(peer_pid)? {
-            caller_rule::Who::Operator => Ok(()),
+            caller_rule::Who::Operator => {
+                if target == MemberReadTarget::PrivateAssistant {
+                    return Err(Error::rejected(format!(
+                        "{method} refused: personal assistant '{alias}' is member-private; \
+                         an operator connection does not prove the member's ownership of \
+                         its profile, conversation or mail — the owner reads through the \
+                         signed member route (CAD-2207)"
+                    )));
+                }
+                Ok(())
+            }
             caller_rule::Who::Agent(caller) => {
                 if binding.is_some_and(|b| caller == b.alias) {
                     return Ok(());
@@ -491,6 +587,33 @@ impl Shared {
         }
     }
 
+    /// Resolve a shared-room post's author from DURABLE identity: the live
+    /// agent row first, then the post's recorded sender alias (the `assistants`
+    /// binding keys on that alias and is not FK'd to `agents`, so it survives
+    /// an agent-row removal). A sender that resolves to neither is `Unproven`,
+    /// never implicitly ordinary — the room filters then hide it.
+    pub(super) fn room_post_author(
+        &self,
+        sender_uid: Option<&str>,
+        stored_sender: &str,
+    ) -> Result<RoomPostAuthor> {
+        if let Some(uid) = sender_uid {
+            if let Some(alias) = self.store.alias_of_uid(uid)? {
+                return Ok(match self.store.assistant_for_alias(&alias)? {
+                    Some(binding) => RoomPostAuthor::Private(binding),
+                    None => RoomPostAuthor::Ordinary,
+                });
+            }
+        }
+        if !stored_sender.is_empty() {
+            return Ok(match self.store.assistant_for_alias(stored_sender)? {
+                Some(binding) => RoomPostAuthor::Private(binding),
+                None => RoomPostAuthor::Ordinary,
+            });
+        }
+        Ok(RoomPostAuthor::Unproven)
+    }
+
     /// Is the caller an ACTIVE bound assistant in `org` whose principal is a
     /// live subscriber of `job`, while the owner still shares the job?
     fn caller_is_active_subscriber(&self, caller: &str, job: &str, org: &str) -> Result<bool> {
@@ -503,18 +626,19 @@ impl Shared {
             && self.store.assist_job_is_shared(job, org)?)
     }
 
-    /// CAD-1380 list filter for `agent_list`. Returns `true` when the row must
-    /// be withheld from this caller because it is a member-private assistant
-    /// row the caller is not the owner of. The operator sees every row, a bound
-    /// assistant sees its own row, and nonmember rows are never withheld.
+    /// CAD-1380/CAD-2207 list filter for `agent_list`. Returns `true` when the
+    /// row must be withheld from this caller because it is a member-private
+    /// assistant row the caller is not the owner of. The bound assistant sees
+    /// its own row; every other caller — the operator included, because
+    /// operator rights are not the member's proof (CAD-2207) — does not.
+    /// Nonmember rows are never withheld.
     pub(super) fn member_agent_row_withheld(&self, alias: &str, peer_pid: u32) -> Result<bool> {
         let Some(binding) = self.store.assistant_for_alias(alias)? else {
             return Ok(false);
         };
         Ok(match self.connection_caller(peer_pid)? {
-            caller_rule::Who::Operator => false,
             caller_rule::Who::Agent(caller) => caller != binding.alias,
-            caller_rule::Who::Unproven(_) => true,
+            caller_rule::Who::Operator | caller_rule::Who::Unproven(_) => true,
         })
     }
 
@@ -967,8 +1091,10 @@ impl Shared {
     /// - Stamped member send: the stamp must match the binding tuple, then the
     ///   ORIGINAL recorded credential is re-proven for `assist_send`.
     /// - Bound, unstamped, `member-` source: fail closed (no member provenance).
-    /// - Bound, unstamped, other source: the current binding is re-proven for
-    ///   `assist_state` under the enrolled service. No latest CID is borrowed.
+    /// - Bound, unstamped, any other source: refused — a `sys-` id, daemon
+    ///   label, job membership and reply_to prove no member-approved
+    ///   assignment or sharing receipt (CAD-2207). Only separately revalidated,
+    ///   receipted job and effect notices may enter without a member stamp.
     pub(super) fn member_message_reprove(&self, message: &store::Message) -> Result<()> {
         let stamp = self.store.message_member_authority(&message.id)?;
         let binding = self.store.assistant_for_alias(&message.alias)?;
@@ -977,8 +1103,53 @@ impl Shared {
         // credential is never reused. The private-cwd invariant runs first, on
         // the bound runtime that would receive the notice.
         if message.source == "assist_job_event" {
-            if let Some(b) = binding.as_ref() {
-                self.assistant_runtime_cwd_guard(b)?;
+            let Some(binding) = binding.as_ref().filter(|b| b.is_active()) else {
+                return Err(Error::rejected(format!(
+                    "assist notice '{}' refused: no active assistant binding",
+                    message.id
+                )));
+            };
+            self.assistant_runtime_cwd_guard(binding)?;
+            // CAD-2207: only a message carrying the committed delivery
+            // receipt for THIS exact intent/recipient/body may run. A legacy
+            // or forged row (including a NULL-sender row with a matching
+            // task) has none and is refused.
+            let Some(delivery) = self.store.assist_notice_delivery(&message.id)? else {
+                return Err(Error::rejected(format!(
+                    "assist notice '{}' refused: no durable delivered-intent receipt \
+                     (CAD-2207)",
+                    message.id
+                )));
+            };
+            let body_matches = delivery.body_sha256 == crate::operator_auth::digest(&message.body);
+            let tuple_matches = delivery.alias == message.alias
+                && Some(delivery.task.as_str()) == message.task_id.as_deref()
+                && delivery.org == binding.org
+                && delivery.sub == binding.sub
+                && delivery.assistant_id == binding.assistant_id;
+            if !body_matches || !tuple_matches {
+                return Err(Error::rejected(format!(
+                    "assist notice '{}' refused: its delivery receipt does not match this \
+                     message (CAD-2207)",
+                    message.id
+                )));
+            }
+            // The owning member is always allowed; a subscriber rides the
+            // owner's LIVE share, so revoking it stops a notice queued before
+            // revocation.
+            let owns = self
+                .store
+                .assist_request_owns(&binding.org, &binding.sub, &delivery.job)?;
+            if !owns
+                && !self
+                    .store
+                    .assist_job_is_shared(&delivery.job, &binding.org)?
+            {
+                return Err(Error::rejected(format!(
+                    "assist notice '{}' refused: the job is no longer shared by its \
+                     owner (CAD-2207)",
+                    message.id
+                )));
             }
             return self.assist_notice_reprove(message);
         }
@@ -999,6 +1170,76 @@ impl Shared {
             )));
         }
         self.assistant_runtime_cwd_guard(&binding)?;
+        // CAD-2207: the only unstamped delivery a bound assistant may run for
+        // an effect is its own outcome notice, and only with the receipt the
+        // daemon wrote in the SAME transaction as the enqueue. The receipt
+        // binds this message, effect, assistant tuple and body; the member
+        // must still be live under the read authority. A legacy, forged or
+        // stale notice has no matching receipt and is refused.
+        if message.source == "effect" && stamp.is_none() {
+            let Some(delivery) = self.store.effect_notice_delivery(&message.id)? else {
+                return Err(Error::rejected(format!(
+                    "effect notice '{}' refused: no owner-bound delivery receipt (CAD-2207)",
+                    message.id
+                )));
+            };
+            let body_matches = delivery.body_sha256 == crate::operator_auth::digest(&message.body);
+            let tuple_matches = delivery.alias == message.alias
+                && delivery.org == binding.org
+                && delivery.sub == binding.sub
+                && delivery.assistant_id == binding.assistant_id;
+            if !body_matches || !tuple_matches {
+                return Err(Error::rejected(format!(
+                    "effect notice '{}' refused: its delivery receipt does not match this \
+                     message (CAD-2207)",
+                    message.id
+                )));
+            }
+            // CAD-2207: the receipt must also match the effect's stage-time
+            // owner tuple and agent row uid. An alias reused by a different
+            // agent row (or a legacy effect with no owner row) is unproved.
+            let Some(owner) = self.store.effect_member_owner(&delivery.effect_id)? else {
+                return Err(Error::rejected(format!(
+                    "effect notice '{}' refused: the effect has no durable member owner \
+                     (CAD-2207)",
+                    message.id
+                )));
+            };
+            let agent_uid = self.store.agent_opt(&message.alias)?.map(|agent| agent.uid);
+            let owner_matches = owner.alias == message.alias
+                && owner.org == delivery.org
+                && owner.sub == delivery.sub
+                && owner.assistant_id == delivery.assistant_id
+                && agent_uid.as_deref() == Some(owner.agent_uid.as_str());
+            if !owner_matches {
+                return Err(Error::rejected(format!(
+                    "effect notice '{}' refused: its original member owner does not match \
+                     (CAD-2207)",
+                    message.id
+                )));
+            }
+            let member = MemberCaller {
+                org: binding.org.clone(),
+                sub: binding.sub.clone(),
+                assistant_id: binding.assistant_id.clone(),
+                alias: binding.alias.clone(),
+                conversation_id: binding.conversation_id.clone(),
+                state: binding.state.clone(),
+                credential_id: String::new(),
+            };
+            self.member_authority_live(
+                "",
+                &member,
+                MemberReprove {
+                    operation: "assist_state",
+                    scope: "assist.read",
+                    job_id: None,
+                    op_credential_id: None,
+                },
+                "effect notice",
+            )?;
+            return Ok(());
+        }
         let member_lineage = message.source.starts_with("member-");
         match stamp {
             Some(auth) => {
@@ -1038,26 +1279,19 @@ impl Shared {
                 message.id
             ))),
             None => {
-                let member = MemberCaller {
-                    org: binding.org.clone(),
-                    sub: binding.sub.clone(),
-                    assistant_id: binding.assistant_id.clone(),
-                    alias: binding.alias.clone(),
-                    conversation_id: binding.conversation_id.clone(),
-                    state: binding.state.clone(),
-                    credential_id: String::new(),
-                };
-                self.member_authority_live(
-                    "",
-                    &member,
-                    MemberReprove {
-                        operation: "assist_state",
-                        scope: "assist.read",
-                        job_id: None,
-                        op_credential_id: None,
-                    },
-                    "member message",
-                )
+                // CAD-2207: with no member authority stamp there is no durable
+                // member-approved assignment or sharing receipt for this bound
+                // assistant. A `sys-` id only proves envelope minting, the
+                // "daemon" label can collide with an agent alias, and job
+                // membership/reply_to prove no owner consent — so all are
+                // refused. The only unstamped exception is the separately
+                // revalidated `assist_job_event` branch above.
+                return Err(Error::rejected(format!(
+                    "member message '{}' refused: a bound assistant's unstamped turn has \
+                     no durable member-approved assignment or sharing receipt — it cannot \
+                     run as the member (CAD-2207)",
+                    message.id
+                )));
             }
         }
     }

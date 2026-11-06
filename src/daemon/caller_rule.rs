@@ -109,6 +109,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     // CAD-1752: the static role catalogue - a read.
     ("agent_roles", Rule::Read),
+    // CAD-2207: the narrow operational agent projection (attribution and
+    // lifecycle fields only, no profile/context) — proven operator only.
+    ("agent_operational", Rule::Handler("rpc_agent_operational: operator_connection (CAD-2207 operational projection)")),
     // CAD-1989: a hire saves a profile; the operator only.
     (
         "agent_profile_create",

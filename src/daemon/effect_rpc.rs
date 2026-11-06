@@ -695,6 +695,40 @@ impl Shared {
         }))
     }
 
+    /// CAD-2207: whether this agent alias is a member's personal assistant —
+    /// the authoritative `assistants` binding, never a request field.
+    fn member_private_effect(&self, agent: &str) -> Result<bool> {
+        Ok(self.store.assistant_for_alias(agent)?.is_some())
+    }
+
+    /// Whether this caller may see a member-private effect's input. The bound
+    /// assistant's own connection passes; every other caller sees only the
+    /// routing shell (and the list omits the row entirely).
+    fn effect_input_visible(&self, agent: &str, peer_pid: u32) -> Result<bool> {
+        if !self.member_private_effect(agent)? {
+            return Ok(true);
+        }
+        let caller = self.connection_caller(peer_pid)?;
+        Ok(matches!(&caller, super::caller_rule::Who::Agent(alias) if alias.as_str() == agent))
+    }
+
+    /// The effect receipt for `peer_pid`. A member assistant's effect is
+    /// private end to end: a nonowner gets only the opaque handle it already
+    /// named, the fixed state vocabulary and a withheld marker — never the
+    /// input, summary, preview, label, decision, outcome, close reason or
+    /// owner alias. Ordinary effect records are byte-for-byte unchanged.
+    fn effect_record_for(&self, row: &EffectRow, peer_pid: u32) -> Result<Value> {
+        if !self.effect_input_visible(&row.agent, peer_pid)? {
+            return Ok(json!({
+                "request": row.request,
+                "kind": "effect",
+                "state": row.state,
+                "withheld": "member-private effect (CAD-2207)",
+            }));
+        }
+        Ok(row.to_record())
+    }
+
     /// `platform_effects {agent?, limit?}` — the pending-effect and
     /// draft read model. An agent caller sees its own rows; the
     /// operator sees all, or one agent's. The read first runs the
@@ -722,24 +756,31 @@ impl Shared {
         self.scan_effect_sources(filter.as_deref());
         let limit = super::optional_u64(params, "limit").unwrap_or(50) as usize;
         let rows = self.store.platform_effects(filter.as_deref())?;
-        let effects: Vec<Value> = rows.iter().map(EffectRow::to_record).collect();
+        // CAD-2207: a member assistant's effect input is the member's private
+        // context — the row is omitted entirely for every caller but that
+        // assistant's own connection (fail closed, not merely redacted).
+        let mut effects: Vec<Value> = Vec::new();
         // Needs-you rows ride their own array — the record itself is
         // the §5.4 schema shape only (needs_you is row bookkeeping).
-        let needs_you: Vec<Value> = rows
-            .iter()
-            .filter(|r| r.needs_you)
-            .map(|r| {
-                json!({"effect_id": r.effect_id, "request": r.request,
-                       "agent": r.agent, "tool": r.tool, "state": r.state,
-                       "platform": r.platform, "account": r.account})
-            })
-            .collect();
-        let drafts: Vec<Value> = self
-            .store
-            .platform_drafts(filter.as_deref(), limit)?
-            .iter()
-            .map(store::DraftRow::to_json)
-            .collect();
+        let mut needs_you: Vec<Value> = Vec::new();
+        for row in &rows {
+            if !self.effect_input_visible(&row.agent, peer_pid)? {
+                continue;
+            }
+            effects.push(row.to_record());
+            if row.needs_you {
+                needs_you.push(json!({"effect_id": row.effect_id, "request": row.request,
+                       "agent": row.agent, "tool": row.tool, "state": row.state,
+                       "platform": row.platform, "account": row.account}));
+            }
+        }
+        let mut drafts: Vec<Value> = Vec::new();
+        for draft in self.store.platform_drafts(filter.as_deref(), limit)? {
+            if !self.effect_input_visible(&draft.agent, peer_pid)? {
+                continue;
+            }
+            drafts.push(draft.to_json());
+        }
         Ok(json!({"effects": effects, "needs_you": needs_you, "drafts": drafts}))
     }
 
@@ -778,6 +819,14 @@ impl Shared {
                 )))
             }
         }
+        // CAD-2207: a member-private effect's close reason is surfaced to the
+        // assistant; a caller who cannot inspect the effect supplies none — the
+        // server-owned default below is used instead.
+        let reason = if self.member_private_effect(&row.agent)? {
+            None
+        } else {
+            reason
+        };
         // A flagged terminal row (verified:false outcome) is not
         // closeable — but the operator's close on it acknowledges the
         // Needs-you: the item clears, the record stands.
@@ -792,7 +841,8 @@ impl Shared {
                 .store
                 .effect_ack(&row.effect_id)?
                 .unwrap_or_else(|| row.clone());
-            return Ok(json!({"state": "acknowledged", "record": row.to_record()}));
+            let record = self.effect_record_for(&row, peer_pid)?;
+            return Ok(json!({"state": "acknowledged", "record": record}));
         }
         // Classification, screen and durable write share C; release before notifications.
         let custody_guard = self.custody_operation()?;
@@ -814,7 +864,8 @@ impl Shared {
         drop(custody_guard);
         self.emit_request_closed(&row.agent, &row.request, &reason);
         self.wake();
-        Ok(json!({"state": "closed", "record": row.to_record()}))
+        let record = self.effect_record_for(&row, peer_pid)?;
+        Ok(json!({"state": "closed", "record": record}))
     }
 
     /// The press — `agent respond` on a staged effect's handle. The
@@ -912,7 +963,8 @@ impl Shared {
             self.deliver_effect_outcome(&row, "declined");
             self.emit_request_closed(&row.agent, &row.request, "declined");
             self.wake();
-            return Ok(json!({"state": "answered", "effect": row.to_record()}));
+            let record = self.effect_record_for(&row, peer_pid)?;
+            return Ok(json!({"state": "answered", "effect": record}));
         }
         // The decision is durable; the test gate models the daemon
         // dying inside step 5's window — the row stays `decided` for
@@ -922,10 +974,14 @@ impl Shared {
             .as_ref()
             .is_some_and(|gate| !gate(&row))
         {
-            return Ok(json!({"state": "answered", "effect": row.to_record()}));
+            let record = self.effect_record_for(&row, peer_pid)?;
+            return Ok(json!({"state": "answered", "effect": record}));
         }
         match self.execute_effect(&row) {
-            Ok(row) => Ok(json!({"state": "answered", "effect": row.to_record()})),
+            Ok(row) => {
+                let record = self.effect_record_for(&row, peer_pid)?;
+                Ok(json!({"state": "answered", "effect": record}))
+            }
             Err(err) => Err(err),
         }
     }
@@ -1119,9 +1175,45 @@ impl Shared {
     /// daemon message, deduped by the `effect_id` whether or not a
     /// caller is still waiting.
     fn deliver_effect_outcome(&self, row: &EffectRow, state: &str) {
-        let to = self
-            .upstream_of(&row.agent)
-            .unwrap_or_else(|| row.agent.clone());
+        // CAD-2207: the effect's durable stage-time owner decides ownership,
+        // never the current alias. An ordinary agent row can outlive its
+        // effect and a later member binding can take the alias, so an effect
+        // with no owner row that now sits on a member assistant alias has no
+        // provable principal: it is not delivered to that member.
+        let owner = match self.store.effect_member_owner(&row.effect_id) {
+            Ok(owner) => owner,
+            Err(_) => return,
+        };
+        let binding = match self.store.assistant_for_alias(&row.agent) {
+            Ok(binding) => binding,
+            Err(_) => return,
+        };
+        let agent_uid = match self.store.agent_opt(&row.agent) {
+            Ok(agent) => agent.map(|agent| agent.uid),
+            Err(_) => return,
+        };
+        let private = match (&owner, &binding) {
+            (Some(owner), Some(binding)) => {
+                let same_agent = agent_uid.as_deref() == Some(owner.agent_uid.as_str());
+                let same_binding = binding.is_active()
+                    && binding.org == owner.org
+                    && binding.sub == owner.sub
+                    && binding.assistant_id == owner.assistant_id;
+                if !same_agent || !same_binding || owner.alias != row.agent {
+                    return;
+                }
+                true
+            }
+            (Some(_), None) => return,
+            (None, Some(_)) => return,
+            (None, None) => false,
+        };
+        let to = if private {
+            row.agent.clone()
+        } else {
+            self.upstream_of(&row.agent)
+                .unwrap_or_else(|| row.agent.clone())
+        };
         let verified = row
             .outcome
             .as_ref()
@@ -1161,14 +1253,47 @@ impl Shared {
         // A `task` the call named that no longer exists must not drop
         // the outcome — retry untagged (the dedupe id is the same; the
         // first send wins either way).
-        let delivered = self
-            .store
-            .enqueue_daemon_task(&to, &body, &id, "effect", row.task.as_deref())
-            .or_else(|_| {
-                self.store
-                    .enqueue_daemon_task(&to, &body, &id, "effect", None)
-            })
-            .is_ok();
+        let delivered = if private {
+            // The owner-bound notice carries the committed receipt in the
+            // same transaction as the enqueue, keyed by the stage-time owner
+            // tuple — which the checks above proved is still this alias.
+            match owner.as_ref() {
+                Some(owner) => self
+                    .store
+                    .enqueue_daemon_effect_notice(
+                        &to,
+                        &body,
+                        &id,
+                        &row.effect_id,
+                        &owner.org,
+                        &owner.sub,
+                        &owner.assistant_id,
+                        row.task.as_deref(),
+                    )
+                    .or_else(|_| {
+                        self.store.enqueue_daemon_effect_notice(
+                            &to,
+                            &body,
+                            &id,
+                            &row.effect_id,
+                            &owner.org,
+                            &owner.sub,
+                            &owner.assistant_id,
+                            None,
+                        )
+                    })
+                    .is_ok(),
+                None => false,
+            }
+        } else {
+            self.store
+                .enqueue_daemon_task(&to, &body, &id, "effect", row.task.as_deref())
+                .or_else(|_| {
+                    self.store
+                        .enqueue_daemon_task(&to, &body, &id, "effect", None)
+                })
+                .is_ok()
+        };
         if delivered {
             self.notify_agent(&to);
         }

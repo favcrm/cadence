@@ -3208,6 +3208,7 @@ impl Shared {
             }
             "agent_register" => self.rpc_register(params, peer_pid),
             "agent_roles" => self.rpc_agent_roles(),
+            "agent_operational" => self.rpc_agent_operational(params, peer_pid),
             "agent_profile_create" => self.rpc_agent_profile_create(params, peer_pid),
             "agent_profile_context" => self.rpc_agent_profile_context(params, peer_pid),
             "agent_instructions_set" => self.rpc_instructions_set(params, peer_pid),
@@ -3250,9 +3251,11 @@ impl Shared {
                     if !states.is_empty() && !states.contains(&agent.state) {
                         continue;
                     }
-                    // CAD-1380: a member-private assistant row is withheld from
-                    // every caller but its owner and the operator, before it is
-                    // serialized or counted into `live`.
+                    // CAD-1380/CAD-2207: a member-private assistant row is
+                    // withheld from every caller but that assistant itself —
+                    // the operator included, because operator rights are not
+                    // the member's proof — before it is serialized or counted
+                    // into `live`.
                     if self.member_agent_row_withheld(&agent.alias, peer_pid)? {
                         continue;
                     }
@@ -3723,6 +3726,20 @@ impl Shared {
                          (caller rule, CAD-506)"
                     )));
                 }
+                // CAD-2207: a member assistant's request input is the member's
+                // private context. The operator keeps the actionable workflow
+                // (handle + method, so `agent respond` can accept or decline)
+                // but its params are withheld; only the bound assistant itself
+                // reads its own input.
+                let member_private = self.store.assistant_for_alias(&alias)?.is_some();
+                let caller = self.connection_caller(peer_pid)?;
+                let owner_view =
+                    matches!(&caller, caller_rule::Who::Agent(viewer) if viewer == &alias);
+                let redact = member_private && !owner_view;
+                let withheld = json!({
+                    "withheld": "member-private request input; the owning member \
+                                 decides this request (CAD-2207)"
+                });
                 let mut requests: Vec<Value> = self
                     .pending
                     .lock()
@@ -3730,7 +3747,8 @@ impl Shared {
                     .iter()
                     .filter(|(_, req)| req.alias == alias)
                     .map(|(handle, req)| {
-                        json!({"request": handle, "method": req.method, "params": req.params})
+                        json!({"request": handle, "method": req.method,
+                               "params": if redact { withheld.clone() } else { req.params.clone() }})
                     })
                     .collect();
                 // A staged send is a brokered `kind:"effect"` request
@@ -3741,7 +3759,7 @@ impl Shared {
                     if row.state == "waiting" {
                         requests.push(json!({"request": row.request,
                             "method": "cadence/effect",
-                            "params": row.to_record()}));
+                            "params": if redact { withheld.clone() } else { row.to_record() }}));
                     }
                 }
                 Ok(json!({"requests": requests}))

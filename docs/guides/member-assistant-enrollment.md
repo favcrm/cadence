@@ -175,6 +175,24 @@ or an operator's local Home as a substitute:
    fabricated PASS rows. Do not substitute a fixture, replay or another company's
    existing workspace/Master reply.
 
+The CAD-2207 privacy candidate does not treat a local operator connection as
+the member's authority to read or steer a personal assistant. Use the signed
+member relay for that member's own assistant; ordinary agent catalog and
+message routes are not a substitute. Private approval decisions do not yet
+have a signed-member review path, so they must not be approved blindly. Until a
+member-authorized assignment and sharing receipt exists, task kickoffs and
+other unproved turns for a bound assistant are refused. Job and effect notices
+need an exact owner-bound delivery receipt; unproved notices are refused.
+When an alias is bound to a member assistant, earlier event history and
+unproved legacy effect routing remain withheld rather than being assigned to
+the new assistant by alias alone.
+
+Share revocation is rechecked when a notice is committed and admitted, but it
+is not atomic with provider submission. A notice already admitted can still
+reach the provider after a concurrent revocation. Do not claim a complete
+revocation guarantee from this candidate; same-UID credential custody remains
+the separate CAD-2148 blocker.
+
 CAD-1817 remains pending genuine candidate acceptance until these observations
 exist. Source review, CI, a credential-free preflight and a Worker conversation
 are separate evidence, not substitutes.

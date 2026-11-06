@@ -328,3 +328,9 @@ fn member_chat_refuses_another_members_signed_authority_before_effect() {
         "refused send changed member/Master files"
     );
 }
+
+// CAD-2207: independently authored native HTTP acceptance. It reuses this
+// module's real daemon/board/platform rig and private helpers; it adds no
+// production wiring. See the module's own docs for what it pins.
+#[path = "cad2207_native_http_acceptance.rs"]
+mod cad2207_native_http_acceptance;

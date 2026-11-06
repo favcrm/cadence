@@ -1009,8 +1009,10 @@ impl Shared {
     /// `message read` — the pull half of CAD-565's push/pull delivery:
     /// the stored body in bounded windows of Unicode scalars, never
     /// bytes. An agent caller reads only its own mail (the caller
-    /// rule); the operator and unattributed readers pass, exactly as
-    /// on the inbox drain (CAD-480).
+    /// rule); for ordinary mail the operator and unattributed readers
+    /// pass, exactly as on the inbox drain (CAD-480). A member
+    /// assistant's message is the exception: only that assistant itself
+    /// may read it (CAD-2207).
     pub(super) fn rpc_message_read(
         self: &Arc<Self>,
         params: &Value,
@@ -1057,17 +1059,20 @@ impl Shared {
                 )));
             }
         }
-        // CAD-1380 target-side privacy: a member assistant's stored message is
-        // readable only by the operator or that assistant itself. An unproven
-        // caller is refused, never served the body.
+        // CAD-1380/CAD-2207 target-side privacy: a member assistant's stored
+        // message is readable only by that assistant itself. Operator or
+        // administrator rights are not proof of the member, and an unproven
+        // caller is refused — never served the body. The verified owner reads
+        // its own conversation through the signed `member_assist_history`
+        // route, never this generic body reader.
         if self.store.assistant_for_alias(&message.alias)?.is_some() {
             match self.connection_caller(peer_pid)? {
-                caller_rule::Who::Operator => {}
                 caller_rule::Who::Agent(caller) if caller == message.alias => {}
                 _ => {
                     return Err(Error::rejected(
-                        "message_read refused: a member assistant's message is private \
-                         to its assistant (CAD-1380 target-side privacy)",
+                        "message_read refused: a member assistant's message is private to \
+                         its owning member; an operator connection is not owner proof \
+                         (CAD-2207 target-side privacy)",
                     ))
                 }
             }
@@ -1101,7 +1106,9 @@ impl Shared {
     /// `message list` — ids and state for one recipient. No body, result,
     /// error, or turn token. An agent lists only its own alias. An
     /// unproven caller is refused. App-owned rows are included only for
-    /// an operator, and still without their body.
+    /// an operator, and still without their body. A member assistant's
+    /// alias is refused for the operator at dispatch (CAD-2207): operator
+    /// rights are not that member's proof.
     pub(super) fn rpc_message_list(
         self: &Arc<Self>,
         params: &Value,
@@ -2097,7 +2104,29 @@ impl Shared {
     /// caller this accepts.
     pub(super) fn rpc_reconcile(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("message reconcile", params, peer_pid)?;
+        let message_id = required_str(params, "message")?;
+        // CAD-2207: a member assistant's turn outcome is the member's. An
+        // operator cannot fabricate it (status/note/sha) or route it to a
+        // recorded reply_to; there is no verified owner channel on this verb.
+        // A stuck private turn is ended with interrupt/agent stop instead.
+        if self.message_is_member_private(message_id)? {
+            return Err(Error::rejected(
+                "message reconcile refused: a member assistant's turn outcome is private \
+                 to its owning member; use interrupt or agent stop for a stuck turn \
+                 (CAD-2207)",
+            ));
+        }
         self.reconcile_message(params)
+    }
+
+    /// CAD-2207: whether the message's alias is a member's personal assistant —
+    /// the daemon's own agent row and assistants binding, never a request
+    /// field.
+    fn message_is_member_private(&self, id: &str) -> Result<bool> {
+        Ok(match self.store.message(id)? {
+            Some(message) => self.store.assistant_for_alias(&message.alias)?.is_some(),
+            None => false,
+        })
     }
 
     /// The reconcile itself, once [`Self::rpc_reconcile`]'s gate passed.
@@ -2126,6 +2155,15 @@ impl Shared {
     /// the terminal state promptly.
     pub(super) fn rpc_cancel(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let message_id = required_str(params, "message")?;
+        // CAD-2207: cancelling a member assistant's queued turn would route
+        // its result to the recorded reply_to; there is no verified owner
+        // channel on this verb, so fail closed (interrupt/agent stop instead).
+        if self.message_is_member_private(message_id)? {
+            return Err(Error::rejected(
+                "message cancel refused: a member assistant's turn is private to its \
+                 owning member; use interrupt or agent stop for a stuck turn (CAD-2207)",
+            ));
+        }
         let by = required_str(params, "by")?;
         let reason = optional_str(params, "reason");
         let message = self.store.cancel(message_id, by, reason)?;

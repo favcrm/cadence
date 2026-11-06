@@ -180,14 +180,26 @@ function mergePage(cur: HumanRoomPage | null, next: HumanRoomPage): HumanRoomPag
   if (!cur) return next;
   const bySeq = new Map<number, HumanPost>();
   for (const p of [...cur.posts, ...next.posts]) bySeq.set(p.seq, p);
-  return { ...next, posts: [...bySeq.values()].sort((a, b) => a.seq - b.seq) };
+  return {
+    ...next,
+    cursor: cur.cursor ?? cur.posts[0]?.seq ?? next.cursor,
+    has_more: cur.has_more ?? next.has_more,
+    posts: [...bySeq.values()].sort((a, b) => a.seq - b.seq),
+  };
 }
 
 /** An older page joins the loaded window; the current members and newest posts stay. */
 function mergeOlder(cur: HumanRoomPage, older: HumanRoomPage): HumanRoomPage {
   const bySeq = new Map<number, HumanPost>();
   for (const p of [...older.posts, ...cur.posts]) bySeq.set(p.seq, p);
-  return { ...cur, posts: [...bySeq.values()].sort((a, b) => a.seq - b.seq) };
+  return {
+    ...cur,
+    // The older page owns the next continuation point: keeping the newest
+    // page's cursor would re-request the same older page forever (CAD-2207).
+    cursor: older.cursor ?? older.posts[0]?.seq ?? cur.cursor,
+    has_more: older.has_more ?? older.posts.length === PAGE,
+    posts: [...bySeq.values()].sort((a, b) => a.seq - b.seq),
+  };
 }
 
 /** An open human room: posts, earlier paging, composer and read marks. */
@@ -214,13 +226,13 @@ export function HumanRoomTimeline({
   const [page, setPage] = useState<HumanRoomPage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [denied, setDenied] = useState(false);
-  const [hasOlder, setHasOlder] = useState(true);
   const [olderBusy, setOlderBusy] = useState(false);
   const [shown, setShown] = useState(0);
   const [askTarget, setAskTarget] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const agentsState = useHumanAgents(true);
   // Ask is offered only when the fresh room hint allows it and the target is a current agent.
+  const hasOlder = page !== null && (page.has_more ?? page.posts.length === PAGE);
   const catalog = agentsState.agents ?? [];
   const askable = page?.can_ask === true ? catalog.filter((a) => page.members.some((m) => m.kind === "agent" && m.id === a.uid)) : [];
   const ask = askable.find((a) => a.uid === askTarget) ?? null;
@@ -255,7 +267,6 @@ export function HumanRoomTimeline({
     setShown(0);
     setError(null);
     setDenied(false);
-    setHasOlder(true);
     void load();
     const timer = window.setInterval(() => void load(), HUMAN_POLL_MS);
     return () => window.clearInterval(timer);
@@ -266,12 +277,16 @@ export function HumanRoomTimeline({
   }, [refresh, load]);
 
   const loadEarlier = () => {
-    if (!page || page.posts.length === 0 || olderBusy) return;
+    if (!page || olderBusy || !hasOlder) return;
+    // A page can contain only withheld rows; the server's continuation
+    // cursor then points below them, so an empty visible page does not mean
+    // the history is exhausted (CAD-2207).
+    const before = page.cursor ?? page.posts[0]?.seq;
+    if (before === undefined || before === null) return;
     setOlderBusy(true);
-    readHumanRoom(id, { before: page.posts[0].seq, limit: PAGE })
+    readHumanRoom(id, { before, limit: PAGE })
       .then((older) => {
         setPage((cur) => (cur ? mergeOlder(cur, older) : cur));
-        setHasOlder(older.posts.length === PAGE);
       })
       .catch((e: unknown) => setError(messageOf(e)))
       .finally(() => setOlderBusy(false));
@@ -328,7 +343,7 @@ export function HumanRoomTimeline({
       ) : null}
       <div className="threads-messages" aria-live="polite" ref={messagesRef}>
         <CredentialRequestList conversationId={id} />
-        {page && hasOlder && page.posts.length > 0 && (
+        {page && hasOlder && (page.cursor != null || page.posts.length > 0) && (
           <Button variant="ghost" size="sm" disabled={olderBusy} onClick={loadEarlier}>
             Earlier
           </Button>
@@ -343,7 +358,7 @@ export function HumanRoomTimeline({
             </article>
           );
         })}
-        {page && page.posts.length === 0 && <p className="threads-note">No posts yet.</p>}
+        {page && page.posts.length === 0 && <p className="threads-note">No posts to show.</p>}
       </div>
       <ThreadComposerFrame
         showModes={!isDm}

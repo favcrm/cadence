@@ -510,7 +510,7 @@ export function stagedNeed(write: StagedWrite, t: (english: string) => string, n
     label: "write",
     title: write.title,
     shortTitle: write.title,
-    why: sourceLine(write, t) || null,
+    why: [write.status === "unresolved" ? t("Outcome unknown") : null, sourceLine(write, t)].filter(Boolean).join(" · ") || null,
     owner: "operator",
     age: Math.max(0, Math.floor((nowMs - write.createdAt) / 1000)),
     project: null,

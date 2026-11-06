@@ -74,6 +74,7 @@ let listCalls = 0;
 const posts: { path: string; body: any }[] = [];
 let decideStatus: Record<string, number> = {};
 let decideThrows: Record<string, boolean> = {};
+let unresolvedOnApprove: string | null = null;
 let onDecide: ((id: string, verb: string) => void) | null = null;
 let hold: Promise<void> | null = null;
 let listHold: Promise<void> | null = null;
@@ -87,10 +88,14 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     await listHold;
     return listStatus === 200 ? json({ actions }) : json({ error: { code: "x" } }, listStatus);
   }
-  const m = /^\/api\/assist\/actions\/([^/]+)\/(approve|deny)$/.exec(url.pathname);
+  const m = /^\/api\/assist\/actions\/([^/]+)\/(approve|deny|acknowledge)$/.exec(url.pathname);
   if (m && init?.method === "POST") {
     posts.push({ path: url.pathname, body: JSON.parse(String(init.body ?? "{}")) });
     await hold;
+    if (m[1] === unresolvedOnApprove && m[2] === "approve") {
+      onDecide?.(m[1], m[2]);
+      return json({ error: { code: "action_unresolved" } }, 409);
+    }
     if (lostReply[m[1]]) { onDecide?.(m[1], m[2]); throw new TypeError("network"); }
     if (decideThrows[m[1]]) throw new TypeError("network");
     const status = decideStatus[m[1]] ?? 200;
@@ -759,6 +764,35 @@ listStatus = 200;
   const sentence = noticeText({ outcome: "applied", title: bad("t") }, (e: string) => e);
   assert(sentence.split(PDI).length === 2 && sentence.endsWith(`${PDI}`), "in a sentence only our own terminator remains");
   await w.done();
+}
+
+// ---- 18. unknown create outcomes stay visible until explicitly acknowledged ----
+{
+  const row = issueRow("unknown");
+  actions = [row];
+  unresolvedOnApprove = "unknown";
+  onDecide = (id, verb) => {
+    actions = actions.map((value) => {
+      const action = value as typeof row;
+      if (action.id !== id) return action;
+      return { ...action, status: verb === "approve" ? "unresolved" : "acknowledged", result: { ok: false, code: "idempotency_unproved" }, decidedAt: verb === "acknowledge" ? Date.now() : null };
+    });
+  };
+  const v = await render();
+  await settle(() => assert(v.cards().length === 1, "the pending issue is visible"));
+  await click(labelled(v.cards()[0], "Review"));
+  await settle(() => assert(drawerEl(), "the issue opens"));
+  await click(labelled(drawerEl()!, "Approve"));
+  await settle(() => assert(text(drawerEl()).includes("Check existing tickets before creating again"), "an unknown result must give reconciliation guidance"));
+  assert(v.cards().length === 1 && v.badge() === "1", "the unresolved outcome remains in To do");
+  assert(!labelled(drawerEl()!, "Approve") && !labelled(drawerEl()!, "Deny"), "an unknown outcome cannot be approved or denied again");
+  await click(labelled(drawerEl()!, "Mark reviewed"));
+  await settle(() => assert(v.cards().length === 0, "acknowledgement clears To do"));
+  assert(posts.some((post) => post.path.endsWith("/unknown/acknowledge")), "review explicitly acknowledges uncertainty");
+  assert(posts.filter((post) => post.path.endsWith("/unknown/approve")).length === 1, "acknowledgement never re-approves the action");
+  await v.done();
+  unresolvedOnApprove = null;
+  onDecide = null;
 }
 
 console.log("staged decision checks passed");

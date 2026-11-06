@@ -424,7 +424,9 @@ function DecidedLine({ write }: { write: StagedWrite }) {
     );
   }
   const label =
-    outcome === "unconfirmed"
+    outcome === "acknowledged"
+      ? t("Outcome unknown · reviewed")
+      : outcome === "unconfirmed"
       ? t("Result not confirmed")
       : outcome === "denied"
       ? t("Denied")

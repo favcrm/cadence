@@ -137,23 +137,93 @@ impl Shared {
         }
         let before = optional_i64(params, "before");
         let org = crate::board_identity::read_config(&self.state_dir)?.company;
-        let (posts, more_before) = self
-            .store
-            .human_agent_read(&org, &uid, &topic.id, before, limit)?;
-        let out: Vec<Value> = posts
-            .iter()
-            .map(|post| {
-                let mut row = post.to_json();
-                row["body"] = json!(store::conversations::body(&post.body));
-                row["request"] = Value::Null;
-                row["deliveries"] = json!([]);
-                row
-            })
-            .collect();
+        // CAD-2207: a member's personal assistant is not readable by another
+        // agent merely because both sit in the same shared room. It is withheld
+        // from every agent connection but itself; the store's membership and
+        // join-cutoff checks still decide the ordinary rows. Author identity is
+        // resolved from durable state (the binding survives a removed agents
+        // row), and withheld rows must not shorten the page: older pages are
+        // scanned until `limit` visible posts (or the history/cap) are reached.
+        let reader = match caller {
+            crate::peer::AgentCaller::Agent(alias) => alias.as_str(),
+            // `human_room_agent` above already refused the operator.
+            crate::peer::AgentCaller::Operator => "",
+        };
+        let mut post_visibility: std::collections::BTreeMap<(String, String), bool> =
+            Default::default();
+        let mut visible: Vec<store::TopicPost> = Vec::new();
+        let mut scan_cursor = before;
+        let mut more_before = false;
+        let mut scanned: i64 = 0;
+        // The oldest seq this scan examined; the next page starts strictly
+        // below it, so a withheld-only tail never strands the client.
+        let mut oldest_examined: Option<i64> = None;
+        while (visible.len() as i64) < limit {
+            let (page, page_more) =
+                self.store
+                    .human_agent_read(&org, &uid, &topic.id, scan_cursor, limit)?;
+            if page.is_empty() {
+                more_before = false;
+                break;
+            }
+            let page_len = page.len() as i64;
+            scanned += page_len;
+            oldest_examined = page.first().map(|post| post.seq);
+            let mut processed = 0i64;
+            let mut last_processed: Option<i64> = None;
+            for post in page.into_iter().rev() {
+                if (visible.len() as i64) >= limit {
+                    break;
+                }
+                processed += 1;
+                last_processed = Some(post.seq);
+                let key = (
+                    post.sender_uid.clone().unwrap_or_default(),
+                    post.sender.clone(),
+                );
+                let shown = if let Some(shown) = post_visibility.get(&key) {
+                    *shown
+                } else {
+                    let shown =
+                        match self.room_post_author(post.sender_uid.as_deref(), &post.sender)? {
+                            super::members_rpc::RoomPostAuthor::Ordinary => true,
+                            super::members_rpc::RoomPostAuthor::Private(binding) => {
+                                binding.alias == reader
+                            }
+                            super::members_rpc::RoomPostAuthor::Unproven => false,
+                        };
+                    post_visibility.insert(key, shown);
+                    shown
+                };
+                if shown {
+                    visible.push(post);
+                }
+            }
+            if processed < page_len {
+                // Stopped at `limit` inside the page: older rows remain.
+                more_before = true;
+                oldest_examined = last_processed;
+                break;
+            }
+            more_before = page_more;
+            if !page_more || scanned >= limit.saturating_mul(8) {
+                break;
+            }
+            scan_cursor = oldest_examined;
+        }
+        visible.reverse();
+        let mut out: Vec<Value> = Vec::with_capacity(visible.len());
+        for post in &visible {
+            let mut row = post.to_json();
+            row["body"] = json!(store::conversations::body(&post.body));
+            row["request"] = Value::Null;
+            row["deliveries"] = json!([]);
+            out.push(row);
+        }
         Ok(json!({
             "topic": topic.to_json(),
             "posts": out,
-            "cursor": posts.last().map(|p| p.seq).unwrap_or(0),
+            "cursor": oldest_examined.unwrap_or(0),
             "more_before": more_before,
         }))
     }

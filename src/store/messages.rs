@@ -492,6 +492,20 @@ fn row_index(row: &rusqlite::Row) -> rusqlite::Result<MessageIndex> {
 /// bytes, on a char boundary, so a multibyte spec cannot blow that limit.
 pub const ENQUEUE_BYTES: usize = 48_000;
 
+/// CAD-2207: the durable binding between a daemon effect-outcome message and
+/// the member assistant it was minted for. Written in the same transaction as
+/// the enqueue; a notice without one is refused at admission.
+#[derive(Debug, Clone)]
+pub struct EffectNoticeDelivery {
+    pub message_id: String,
+    pub effect_id: String,
+    pub org: String,
+    pub sub: String,
+    pub assistant_id: String,
+    pub alias: String,
+    pub body_sha256: String,
+}
+
 impl Store {
     /// Enqueue a durable message. Client-supplied `id` makes retries of the
     /// exact same envelope idempotent; reusing an id with different content
@@ -962,6 +976,91 @@ impl Store {
             )?;
             Ok(out)
         })
+    }
+
+    /// CAD-2207: enqueue an effect-outcome notice for a member's bound
+    /// personal assistant and persist its delivery receipt in the SAME
+    /// write transaction. The receipt binds the exact message id, effect id,
+    /// member assistant tuple, target alias and body digest; `INSERT OR
+    /// IGNORE` keeps the first receipt so delivery stays at-most-once.
+    pub fn enqueue_daemon_effect_notice(
+        &self,
+        alias: &str,
+        body: &str,
+        id: &str,
+        effect_id: &str,
+        org: &str,
+        sub: &str,
+        assistant_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<(bool, String)> {
+        let daemon_id = format!("{}{}-", crate::proto::DAEMON_MESSAGE_PREFIX, "effect");
+        if !crate::proto::DAEMON_SOURCES.contains(&"effect") || !id.starts_with(&daemon_id) {
+            return Err(Error::internal(format!(
+                "an effect notice needs a daemon effect id, not {id}"
+            )));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let out = self.enqueue_tx_as(
+                &tx,
+                alias,
+                body,
+                None,
+                id,
+                "effect",
+                task_id,
+                None,
+                None,
+                &Sender::Unattributed,
+                Priority::Normal,
+                true,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO effect_notice_deliveries(
+                   message_id,effect_id,org,sub,assistant_id,alias,body_sha256,created)
+                 VALUES(?,?,?,?,?,?,?,?)",
+                params![
+                    id,
+                    effect_id,
+                    org,
+                    sub,
+                    assistant_id,
+                    alias,
+                    crate::operator_auth::digest(body),
+                    now()
+                ],
+            )?;
+            Ok(out)
+        })
+    }
+
+    /// The committed effect→message receipt, or `None` for a legacy or
+    /// unproved notice.
+    pub fn effect_notice_delivery(&self, message_id: &str) -> Result<Option<EffectNoticeDelivery>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT message_id,effect_id,org,sub,assistant_id,alias,body_sha256 \
+                 FROM effect_notice_deliveries WHERE message_id=?",
+                [message_id],
+                |r| {
+                    Ok(EffectNoticeDelivery {
+                        message_id: r.get(0)?,
+                        effect_id: r.get(1)?,
+                        org: r.get(2)?,
+                        sub: r.get(3)?,
+                        assistant_id: r.get(4)?,
+                        alias: r.get(5)?,
+                        body_sha256: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// The ids a steering send superseded, oldest first.
@@ -2662,6 +2761,52 @@ impl Store {
         )?)
     }
 
+    /// CAD-2207: the read fence for a bound personal assistant. `Ok(None)`
+    /// is an ordinary alias (unchanged behavior). Only a proved binding, its
+    /// immutable cutoffs and the current runtime uid prove the recipient;
+    /// anything else refuses rather than falling back to wall time.
+    fn message_fence_in(
+        &self,
+        conn: &impl super::StoreConn,
+        alias: &str,
+    ) -> Result<Option<(String, i64)>> {
+        let Some(binding) = self.assistant_for_alias_in(conn, alias)? else {
+            return Ok(None);
+        };
+        let Some(fence) = self.assistant_event_fence_in(conn, &binding.org, &binding.sub)? else {
+            return Err(Error::rejected(format!(
+                "message read refused: the member assistant binding for '{alias}' \
+                 has no visibility cutoff (CAD-2207)"
+            )));
+        };
+        if fence.alias != binding.alias || fence.assistant_id != binding.assistant_id {
+            return Err(Error::rejected(format!(
+                "message read refused: the member assistant binding for '{alias}' does \
+                 not match its visibility cutoff (CAD-2207)"
+            )));
+        }
+        let Some(agent) = self.agent_opt_in(conn, alias)? else {
+            return Err(Error::rejected(format!(
+                "message read refused: the member assistant agent for '{alias}' is not \
+                 registered (CAD-2207)"
+            )));
+        };
+        if let Some(uid) = &fence.agent_uid {
+            if uid != &agent.uid {
+                return Err(Error::rejected(format!(
+                    "message read refused: the member assistant agent for '{alias}' no \
+                     longer matches its visibility cutoff (CAD-2207)"
+                )));
+            }
+        }
+        Ok(Some((agent.uid, fence.message_cutoff_seq)))
+    }
+
+    fn message_fence(&self, alias: &str) -> Result<Option<(String, i64)>> {
+        let conn = self.conn();
+        self.message_fence_in(&conn, alias)
+    }
+
     /// The alias's messages as `agent show` lists them — this
     /// registration's only (CAD-304 S4). `agent remove` keeps the rows
     /// job history still resolves under the old alias (CAD-284); a later
@@ -2675,6 +2820,19 @@ impl Store {
     pub fn messages(&self, alias: &str) -> Result<Vec<Message>> {
         let conn = self.conn();
         let agent = self.agent_in(&conn, alias)?;
+        if let Some((uid, floor)) = self.message_fence_in(&conn, alias)? {
+            // A bound assistant sees rows that name its current uid, plus
+            // legacy NULL-uid rows minted after its binding. A row naming any
+            // other uid is never admitted, even past the cutoff; wall-clock
+            // registration time proves nothing.
+            let mut stmt = conn.prepare(
+                "SELECT * FROM messages WHERE alias=?1 \
+                 AND (recipient_uid=?2 OR (recipient_uid IS NULL AND seq>?3)) \
+                 ORDER BY seq",
+            )?;
+            let rows = stmt.query_map(params![alias, uid, floor], row_message)?;
+            return Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
         let mut stmt = conn.prepare(&format!(
             "SELECT * FROM messages WHERE alias=?1
              AND (created >= ?2 OR (state NOT IN
@@ -2699,15 +2857,30 @@ impl Store {
     ) -> Result<(Vec<Message>, usize)> {
         let conn = self.conn();
         let agent = self.agent_in(&conn, alias)?;
+        let fence = self.message_fence_in(&conn, alias)?;
         let (mut after_seq, mut after_ts) = (0i64, f64::MIN);
         if let Some(since) = since {
-            let by_id = conn
-                .query_row(
-                    "SELECT seq FROM messages WHERE alias=?1 AND id=?2",
-                    params![alias, since],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?;
+            // CAD-2207: a `since` id is a cursor, so a bound assistant must
+            // not learn whether a hidden row exists. Resolve it under the same
+            // visibility fence; an invisible id behaves exactly like an
+            // absent one (fall through to the timestamp parse / error).
+            let by_id = match &fence {
+                Some((uid, floor)) => conn
+                    .query_row(
+                        "SELECT seq FROM messages WHERE alias=?1 AND id=?2 \
+                         AND (recipient_uid=?3 OR (recipient_uid IS NULL AND seq>?4))",
+                        params![alias, since, uid, floor],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?,
+                None => conn
+                    .query_row(
+                        "SELECT seq FROM messages WHERE alias=?1 AND id=?2",
+                        params![alias, since],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?,
+            };
             match (by_id, since.parse::<f64>()) {
                 (Some(seq), _) => after_seq = seq,
                 (None, Ok(ts)) if ts.is_finite() => after_ts = ts,
@@ -2721,6 +2894,37 @@ impl Store {
         let live = format!(
             "state NOT IN ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}"
         );
+        let cap = limit.map_or(-1, |n| n.min(i64::MAX as usize) as i64);
+        if let Some((uid, floor)) = &fence {
+            // CAD-2207: the window projection applies the same recipient
+            // UID / legacy-NULL+sequence fence as the full list, before the
+            // live/recent split, the count and the omitted calculation.
+            let visible = "(recipient_uid=?2 OR (recipient_uid IS NULL AND seq>?3))";
+            let mut rows = {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT * FROM messages WHERE alias=?1 AND {visible} AND {live}"
+                ))?;
+                let rows = stmt.query_map(params![alias, uid, floor], row_message)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut stmt = conn.prepare(&format!(
+                "SELECT * FROM messages WHERE alias=?1 AND {visible} AND NOT ({live})
+                 AND created >= ?4 AND seq > ?5 ORDER BY seq DESC LIMIT ?6"
+            ))?;
+            let recent = stmt.query_map(
+                params![alias, uid, floor, after_ts, after_seq, cap],
+                row_message,
+            )?;
+            rows.extend(recent.collect::<rusqlite::Result<Vec<_>>>()?);
+            rows.sort_by_key(|m| m.seq);
+            let total: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM messages WHERE alias=?1 AND {visible}"),
+                params![alias, uid, floor],
+                |r| r.get(0),
+            )?;
+            let omitted = (total as usize).saturating_sub(rows.len());
+            return Ok((rows, omitted));
+        }
         let mut rows = {
             let mut stmt =
                 conn.prepare(&format!("SELECT * FROM messages WHERE alias=?1 AND {live}"))?;
@@ -2732,7 +2936,6 @@ impl Store {
              AND created >= ?2 AND created >= ?3 AND seq > ?4
              ORDER BY seq DESC LIMIT ?5"
         ))?;
-        let cap = limit.map_or(-1, |n| n.min(i64::MAX as usize) as i64);
         let recent = stmt.query_map(
             params![alias, agent.created, after_ts, after_seq, cap],
             row_message,
@@ -2771,15 +2974,30 @@ impl Store {
         } = *query;
         let conn = self.conn();
         let agent = self.agent_in(&conn, alias)?;
+        let fence = self.message_fence_in(&conn, alias)?;
         let (mut after_seq, mut after_ts) = (0i64, f64::MIN);
         if let Some(since) = since {
-            let by_id = conn
-                .query_row(
-                    "SELECT seq FROM messages WHERE alias=?1 AND id=?2",
-                    params![alias, since],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?;
+            // CAD-2207: a `since` id is a cursor, so a bound assistant must
+            // not learn whether a hidden row exists. Resolve it under the same
+            // visibility fence; an invisible id behaves exactly like an
+            // absent one (fall through to the timestamp parse / error).
+            let by_id = match &fence {
+                Some((uid, floor)) => conn
+                    .query_row(
+                        "SELECT seq FROM messages WHERE alias=?1 AND id=?2 \
+                         AND (recipient_uid=?3 OR (recipient_uid IS NULL AND seq>?4))",
+                        params![alias, since, uid, floor],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?,
+                None => conn
+                    .query_row(
+                        "SELECT seq FROM messages WHERE alias=?1 AND id=?2",
+                        params![alias, since],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?,
+            };
             match (by_id, since.parse::<f64>()) {
                 (Some(seq), _) => after_seq = seq,
                 (None, Ok(ts)) if ts.is_finite() => after_ts = ts,
@@ -2818,50 +3036,115 @@ impl Store {
             "state NOT IN ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}"
         );
         let cols = INDEX_COLS;
-        let mut live_binds = vec![Bind::Text(alias.to_string())];
-        live_binds.extend(filter_binds.iter().cloned());
-        let live_rows = index_query(
-            &conn,
-            &format!("SELECT {cols} FROM messages WHERE alias=? AND ({live}){filter} ORDER BY seq"),
-            &live_binds,
-        )?;
-        let mut terminal_binds = vec![
-            Bind::Text(alias.to_string()),
-            Bind::Real(agent.created),
-            Bind::Real(after_ts),
-            Bind::Int(after_seq),
-        ];
-        terminal_binds.extend(filter_binds.iter().cloned());
-        terminal_binds.push(Bind::Int(limit as i64));
-        let mut rows = live_rows;
-        rows.extend(index_query(
-            &conn,
-            &format!(
-                "SELECT {cols} FROM messages WHERE alias=? AND NOT ({live})
-                 AND created >= ? AND created >= ? AND seq > ?{filter}
-                 ORDER BY seq DESC LIMIT ?"
-            ),
-            &terminal_binds,
-        )?);
+        // CAD-2207: for a bound personal assistant the visibility predicate
+        // is the proven recipient uid or a post-binding sequence, never the
+        // registration timestamp; legacy NULL-uid rows stay withheld even
+        // when their created time is at/after the current agent row.
+        let (mut rows, total): (Vec<_>, i64) = match &fence {
+            Some((uid, floor)) => {
+                let mut live_binds = vec![
+                    Bind::Text(alias.to_string()),
+                    Bind::Text(uid.clone()),
+                    Bind::Int(*floor),
+                ];
+                live_binds.extend(filter_binds.iter().cloned());
+                let live_rows = index_query(
+                    &conn,
+                    &format!(
+                        "SELECT {cols} FROM messages WHERE alias=? AND ({live}) \
+                         AND (recipient_uid=? OR (recipient_uid IS NULL AND seq>?)){filter} \
+                         ORDER BY seq"
+                    ),
+                    &live_binds,
+                )?;
+                let mut terminal_binds = vec![
+                    Bind::Text(alias.to_string()),
+                    Bind::Text(uid.clone()),
+                    Bind::Int(*floor),
+                    Bind::Real(after_ts),
+                    Bind::Int(after_seq),
+                ];
+                terminal_binds.extend(filter_binds.iter().cloned());
+                terminal_binds.push(Bind::Int(limit as i64));
+                let recent = index_query(
+                    &conn,
+                    &format!(
+                        "SELECT {cols} FROM messages WHERE alias=? AND NOT ({live}) \
+                         AND (recipient_uid=? OR (recipient_uid IS NULL AND seq>?)) \
+                         AND created >= ? AND seq > ?{filter} ORDER BY seq DESC LIMIT ?"
+                    ),
+                    &terminal_binds,
+                )?;
+                let mut count_binds = vec![
+                    Bind::Text(alias.to_string()),
+                    Bind::Text(uid.clone()),
+                    Bind::Int(*floor),
+                    Bind::Real(after_ts),
+                    Bind::Int(after_seq),
+                ];
+                count_binds.extend(filter_binds.clone());
+                let total = count_query(
+                    &conn,
+                    &format!(
+                        "SELECT COUNT(*) FROM messages WHERE alias=? \
+                         AND (recipient_uid=? OR (recipient_uid IS NULL AND seq>?)) \
+                         AND (({live}) OR (NOT ({live}) AND created >= ? AND seq > ?)){filter}"
+                    ),
+                    &count_binds,
+                )?;
+                let mut rows = live_rows;
+                rows.extend(recent);
+                (rows, total)
+            }
+            None => {
+                let mut live_binds = vec![Bind::Text(alias.to_string())];
+                live_binds.extend(filter_binds.iter().cloned());
+                let live_rows = index_query(
+                    &conn,
+                    &format!(
+                        "SELECT {cols} FROM messages WHERE alias=? AND ({live}){filter} \
+                         ORDER BY seq"
+                    ),
+                    &live_binds,
+                )?;
+                let mut terminal_binds = vec![
+                    Bind::Text(alias.to_string()),
+                    Bind::Real(agent.created),
+                    Bind::Real(after_ts),
+                    Bind::Int(after_seq),
+                ];
+                terminal_binds.extend(filter_binds.iter().cloned());
+                terminal_binds.push(Bind::Int(limit as i64));
+                let recent = index_query(
+                    &conn,
+                    &format!(
+                        "SELECT {cols} FROM messages WHERE alias=? AND NOT ({live})
+                         AND created >= ? AND created >= ? AND seq > ?{filter}
+                         ORDER BY seq DESC LIMIT ?"
+                    ),
+                    &terminal_binds,
+                )?;
+                let mut count_binds = vec![
+                    Bind::Text(alias.to_string()),
+                    Bind::Real(agent.created),
+                    Bind::Real(after_ts),
+                    Bind::Int(after_seq),
+                ];
+                count_binds.extend(filter_binds.clone());
+                let total = count_query(
+                    &conn,
+                    &format!(
+                        "SELECT COUNT(*) FROM messages WHERE alias=? AND (({live})
+                         OR (NOT ({live}) AND created >= ? AND created >= ? AND seq > ?)){filter}"
+                    ),
+                    &count_binds,
+                )?;
+                let mut rows = live_rows;
+                rows.extend(recent);
+                (rows, total)
+            }
+        };
         rows.sort_by_key(|row| row.seq);
-        // Count the same set the two queries can return: every matching
-        // live row, plus terminal rows after the cursor. Older terminal
-        // mail is not "omitted" from a cursor page.
-        let mut count_binds = vec![
-            Bind::Text(alias.to_string()),
-            Bind::Real(agent.created),
-            Bind::Real(after_ts),
-            Bind::Int(after_seq),
-        ];
-        count_binds.extend(filter_binds);
-        let total: i64 = count_query(
-            &conn,
-            &format!(
-                "SELECT COUNT(*) FROM messages WHERE alias=? AND (({live})
-                 OR (NOT ({live}) AND created >= ? AND created >= ? AND seq > ?)){filter}"
-            ),
-            &count_binds,
-        )?;
         let omitted = (total as usize).saturating_sub(rows.len());
         Ok(MessageIndexPage { rows, omitted })
     }
@@ -2872,6 +3155,19 @@ impl Store {
     pub(crate) fn active_messages(&self, alias: &str) -> Result<Vec<Message>> {
         let conn = self.conn();
         self.agent_in(&conn, alias)?;
+        if let Some((uid, floor)) = self.message_fence_in(&conn, alias)? {
+            // CAD-2207: the active-only projection carries bodies too, so it
+            // applies the bound-assistant visibility fence before the state
+            // filter.
+            let mut stmt = conn.prepare(
+                "SELECT * FROM messages WHERE alias=?1
+                 AND (recipient_uid=?2 OR (recipient_uid IS NULL AND seq>?3))
+                 AND state IN ('queued','submitting','running','unknown')
+                 AND source != 'topic_notice' ORDER BY seq",
+            )?;
+            let rows = stmt.query_map(params![alias, uid, floor], row_message)?;
+            return Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
         let mut stmt = conn.prepare(
             "SELECT * FROM messages WHERE alias=?1
              AND state IN ('queued','submitting','running','unknown')
@@ -2980,6 +3276,14 @@ impl Store {
         if msg.alias != agent.alias {
             return Ok(false);
         }
+        if let Some((uid, floor)) = self.message_fence(alias)? {
+            // A bound assistant reads mail naming its current uid, plus
+            // legacy NULL-uid rows minted after its binding. A different
+            // non-NULL uid is never admitted past the cutoff, and a NULL-uid
+            // row is never admitted on wall-clock registration.
+            return Ok(msg.recipient_uid.as_deref() == Some(uid.as_str())
+                || (msg.recipient_uid.is_none() && msg.seq > floor));
+        }
         Ok(match &msg.recipient_uid {
             Some(uid) => *uid == agent.uid,
             None => msg.created >= agent.created,
@@ -3019,10 +3323,18 @@ impl Store {
             pattern.push(c);
         }
         pattern.push('%');
-        // The same predicate as `agent_reads_message`: a known recipient
-        // UID must be the alias's current UID; a NULL (legacy) UID counts
-        // only from the current registration on. An unknown alias matches
-        // nothing (NULL comparisons are false).
+        // The same predicate as `agent_reads_message`. A bound personal
+        // assistant uses its immutable sequence fence (a NULL legacy uid past
+        // the cutoff only); an ordinary alias keeps the registration window.
+        if let Some((uid, floor)) = self.message_fence_in(&conn, alias)? {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM messages WHERE id LIKE ?1 ESCAPE '\\' AND alias = ?2 AND \
+                 (recipient_uid = ?3 OR (recipient_uid IS NULL AND seq > ?4)) \
+                 ORDER BY id LIMIT 11",
+            )?;
+            let rows = stmt.query_map((pattern, alias, uid, floor), |r| r.get(0))?;
+            return Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?);
+        }
         let mut stmt = conn.prepare(
             "SELECT id FROM messages WHERE id LIKE ?1 ESCAPE '\\' AND alias = ?2 AND \
              (recipient_uid = (SELECT uid FROM agents WHERE alias = ?2) OR \
