@@ -99,8 +99,21 @@ impl Shared {
         let detail = params.get("tasks_detail").and_then(Value::as_bool) == Some(true);
         let open_only = params.get("open_tasks_only").and_then(Value::as_bool) == Some(true);
         let mut summary = self.store.job_task_summary(detail.then_some(open_only))?;
+        // A job row carries its ticket's title and id, so a project the
+        // caller's policy does not admit contributes no row. An issue that
+        // resolves to no project is withheld too: an unmapped id is not
+        // evidence that the ticket is readable.
+        let scope = self.project_scope(peer_pid, "job list")?;
         let mut out = Vec::new();
         for job in jobs {
+            if let (Some(issue), Some((readable, project_of_issue))) =
+                (job.issue_id.as_deref(), scope.as_ref())
+            {
+                match project_of_issue.get(issue) {
+                    Some(project) if readable.contains(project) => {}
+                    _ => continue,
+                }
+            }
             // CAD-1380: a member-private job is withheld from every caller
             // except the operator, its owner, an authorized actor, or a
             // subscriber, before it is serialized.
@@ -128,9 +141,16 @@ impl Shared {
     /// read side flags a task whose kickoff ended without completing,
     /// a dead assignee, a missing SHA, or a spec that drifted since
     /// `job new` hashed it.
-    pub(super) fn rpc_job_show(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_job_show(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let id = required_str(params, "job")?;
         let job = self.store.job(id)?;
+        // A job carries its ticket's title and spec: a project the caller's
+        // policy does not admit answers as an unknown job.
+        if let Some(issue) = job.issue_id.as_deref() {
+            if self.admit_issue(peer_pid, "job show", issue).is_err() {
+                return Err(Error::rejected("job show refused: unknown job"));
+            }
+        }
         let mut jj = job.to_json();
         if let Some(sha) = &job.spec_sha256 {
             match sha256_file(std::path::Path::new(&job.spec_path)) {
@@ -243,8 +263,17 @@ impl Shared {
         Ok(j)
     }
 
-    pub(super) fn rpc_task_show(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_task_show(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let task = self.store.task(required_str(params, "task")?)?;
+        // A task carries its spec, acceptance and worktree; the ticket's project
+        // decides who may read it.
+        if let Ok(job) = self.store.job(&task.job_id) {
+            if let Some(issue) = job.issue_id.as_deref() {
+                if self.admit_issue(peer_pid, "task show", issue).is_err() {
+                    return Err(Error::rejected("task show refused: unknown task"));
+                }
+            }
+        }
         let mut out = self.task_json(&task)?;
         out["messages"] = json!(self
             .store
