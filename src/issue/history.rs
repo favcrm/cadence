@@ -6,7 +6,8 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -541,24 +542,17 @@ pub fn blame(pm_dir: &Path, issue: &board::Issue) -> Result<Value> {
 
 /// RAII temp dir for `git archive` exports — always removed, errors
 /// included. `ls --at` promises the temp export is gone afterwards.
-struct TempExport(PathBuf);
+/// Created owner-only: the exported tree is a tracker's private content,
+/// and the ambient umask must never add group or other access to it.
+struct TempExport(tempfile::TempDir);
 
 impl TempExport {
     fn create() -> Result<Self> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path =
-            std::env::temp_dir().join(format!("cadence-issue-at-{}-{nanos}", std::process::id()));
-        std::fs::create_dir(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempExport {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let dir = tempfile::Builder::new()
+            .prefix("cadence-issue-at-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        Ok(Self(dir))
     }
 }
 
@@ -590,7 +584,7 @@ pub fn ls_at(
     let tar = crate::reaper::spawn(
         Command::new("tar")
             .args(["-x", "-C"])
-            .arg(&export.0)
+            .arg(export.0.path())
             .stdin(archive.stdout.take().expect("piped stdout"))
             .stdout(Stdio::null())
             .stderr(Stdio::piped()),
@@ -604,10 +598,10 @@ pub fn ls_at(
             String::from_utf8_lossy(&tar_out.stderr).trim()
         )));
     }
-    let issues = board::load_all(&export.0, project_key)?;
+    let issues = board::load_all(export.0.path(), project_key)?;
     // A notes dir that never exists — `derive`/`chain` return empty,
     // so status falls through to the file field exactly.
-    let views = board::views(&export.0.join(".no-notes"), issues);
+    let views = board::views(&export.0.path().join(".no-notes"), issues);
     Ok((at, views))
 }
 
@@ -1340,6 +1334,93 @@ mod tests {
         assert!(!subject_mentions("X-1x thing", "X-1"));
         assert!(!subject_mentions("fix-X-1 thing", "X-1"));
         assert!(!subject_mentions("unrelated", "X-1"));
+    }
+
+    /// CAD-2184: `ls_at`'s `git archive` export root is owner-only even
+    /// when the caller runs with a permissive umask, and it is gone when
+    /// the listing returns. The child process is isolated: only its own
+    /// umask changes, never the suite's.
+    #[test]
+    fn historical_export_is_private_and_cleaned_up_under_umask_0002() {
+        const CHILD: &str = "CADENCE_TEST_HISTORY_UMASK_CHILD";
+        const TEST: &str =
+            "issue::history::tests::historical_export_is_private_and_cleaned_up_under_umask_0002";
+        if std::env::var_os(CHILD).is_some() {
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            let root = tempfile::tempdir().unwrap();
+            let scratch = root.path().join("scratch");
+            std::fs::create_dir(&scratch).unwrap();
+            // A plain creation proves the permissive umask is in effect.
+            assert_eq!(mode(&scratch), 0o775);
+
+            let pm = root.path().join("pm");
+            std::fs::create_dir_all(pm.join("demo/D-1")).unwrap();
+            std::fs::write(pm.join("demo/project.yaml"), "key: demo\nprefix: D\n").unwrap();
+            std::fs::write(
+                pm.join("demo/D-1/issue.md"),
+                "---\nid: D-1\ntitle: t\nstatus: doing\npriority: P2\n\
+                 created: '2026-01-01T00:00:00Z'\n---\nbody\n",
+            )
+            .unwrap();
+            let git = |args: &[&str]| {
+                let out = Command::new("git")
+                    .arg("-C")
+                    .arg(&pm)
+                    .args(["-c", "user.name=test", "-c", "user.email=test@test"])
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+            };
+            git(&["init", "-q"]);
+            git(&["add", "-A"]);
+            git(&["commit", "-qm", "D-1: created"]);
+
+            // Everything `ls_at` stages lands in this child-only TMPDIR.
+            std::env::set_var("TMPDIR", &scratch);
+
+            let export = TempExport::create().unwrap();
+            assert_eq!(mode(export.0.path()), 0o700);
+            let exported = export.0.path().to_path_buf();
+            drop(export);
+            assert!(!exported.exists(), "the export scratch outlived its owner");
+            assert!(std::fs::read_dir(&scratch).unwrap().next().is_none());
+
+            let (at, views) = ls_at(&pm, "HEAD", None).unwrap();
+            assert_eq!(at["sha"].as_str().unwrap().len(), 40);
+            assert_eq!(views.len(), 1);
+            assert_eq!(views[0].issue.front.id, "D-1");
+            assert_eq!(views[0].status, "doing");
+            assert!(
+                std::fs::read_dir(&scratch).unwrap().next().is_none(),
+                "`ls_at` left its export scratch behind"
+            );
+            return;
+        }
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg("umask 0002 && exec \"$0\" --exact \"$1\" --test-threads=1")
+            .arg(std::env::current_exe().unwrap())
+            .arg(TEST)
+            // The inherited environment may name another repository
+            // (`GIT_DIR`/`GIT_WORK_TREE`) or a user config that would
+            // redirect both the fixture and the real `ls_at` git calls.
+            // This child gets an explicit allowlist only.
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("TMPDIR", std::env::temp_dir())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// A real tracker repo for `owner_assignments`: issues under

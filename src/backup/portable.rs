@@ -2659,9 +2659,11 @@ fn git_plain(dir: &Path, args: &[&str]) -> Result<String> {
 /// key only because every source git command comes through here. A later
 /// `-c core.hooksPath` in `args` would replace the override.
 fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let scratch = std::env::temp_dir().join(format!("cad1163-git-{}", nonce()));
-    fs::create_dir_all(&scratch)?;
-    let index = scratch.join("index");
+    let scratch = tempfile::Builder::new()
+        .prefix("cad1163-git-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()?;
+    let index = scratch.path().join("index");
     let real_index = dir.join(".git").join("index");
     if real_index.is_file() {
         fs::copy(&real_index, &index)?;
@@ -2687,11 +2689,9 @@ fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("HOME", &scratch);
+        .env("HOME", scratch.path());
     let out = crate::reaper::output(&mut cmd)
-        .map_err(|e| Error::rejected(format!("git unavailable: {e}")));
-    let _ = fs::remove_dir_all(&scratch);
-    let out = out?;
+        .map_err(|e| Error::rejected(format!("git unavailable: {e}")))?;
     if !out.status.success() {
         return Err(Error::rejected(format!("git {} failed", args.join(" "))));
     }

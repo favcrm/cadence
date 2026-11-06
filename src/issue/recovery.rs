@@ -1673,6 +1673,11 @@ fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
 /// of its own, with a gitfile so the hook's own
 /// `git rev-parse --show-toplevel` resolves to that copy. The real
 /// worktree is never handed to the hook and is never touched.
+///
+/// The copy's directory is created owner-only and fresh, and it lives
+/// exactly as long as this call: the hook runs while it exists, and it
+/// is removed when the hook returns — on a refusal as much as on
+/// success.
 fn run_pre_commit_hook(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<()> {
     let Some(hook) = effective_hook(pm) else {
         return Ok(());
@@ -1692,18 +1697,19 @@ fn run_pre_commit_hook(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<()> 
             return Ok(());
         }
     }
+    // Held for the whole call: the hook's working directory must outlive
+    // the child, and the drop removes the copy however this returns.
     let materialized = materialize_index(pm, git_dir, tmp_index)?;
     let mut cmd = Command::new(&hook);
-    cmd.current_dir(&materialized)
+    cmd.current_dir(materialized.path())
         .env("GIT_DIR", git_dir)
         .env("GIT_INDEX_FILE", tmp_index)
-        .env("GIT_WORK_TREE", &materialized)
+        .env("GIT_WORK_TREE", materialized.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let out = crate::reaper::output(&mut cmd)
         .map_err(|e| Error::internal(format!("the pre-commit hook could not be run: {e}")))?;
-    let _ = std::fs::remove_dir_all(&materialized);
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(Error::rejected(format!(
@@ -1724,19 +1730,32 @@ fn run_pre_commit_hook(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<()> 
 /// points the copy at the real repository, so the hook's own
 /// `git rev-parse --show-toplevel` resolves to the copy and its lint
 /// reads the staged `issue.md` bytes.
-fn materialize_index(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "cadence-recovery-materialized-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
+///
+/// The copy is made in a fresh, owner-only directory: `0700` is
+/// requested in the same step that creates it, so a permissive umask
+/// can no longer widen it (a stricter one only narrows the owner bits)
+/// and no default-mode directory ever exists. Nothing is created at a
+/// predictable path and nothing pre-existing is removed. The returned
+/// handle removes the copy on every exit path — success, refusal, and a
+/// failure to start the hook.
+fn materialize_index(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::Builder::new()
+        .prefix("cadence-recovery-materialized-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .map_err(|e| {
+            Error::internal(format!(
+                "a private scratch directory could not be created for the pre-commit hook \
+                 ({e}); nothing was committed."
+            ))
+        })?;
     let out = crate::reaper::output(
         Command::new("git")
             .arg("-C")
             .arg(&pm.dir)
             .arg(format!("--git-dir={}", git_dir.display()))
-            .arg(format!("--work-tree={}", dir.display()))
+            .arg(format!("--work-tree={}", dir.path().display()))
             .env("GIT_INDEX_FILE", tmp_index)
             .arg("checkout-index")
             .arg("-a"),
@@ -1748,14 +1767,16 @@ fn materialize_index(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<PathBu
         ))
     })?;
     if !out.status.success() {
-        let _ = std::fs::remove_dir_all(&dir);
         return Err(Error::internal(format!(
             "the staged content could not be materialized for the pre-commit hook: {}. \
              Nothing was committed.",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    std::fs::write(dir.join(".git"), format!("gitdir: {}\n", git_dir.display()))?;
+    std::fs::write(
+        dir.path().join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )?;
     Ok(dir)
 }
 

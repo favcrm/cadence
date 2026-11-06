@@ -791,11 +791,9 @@ mod tests {
             assert_eq!(fs::metadata(&control).unwrap().mode() & 0o777, 0o775);
 
             let git = |args: &[&str]| {
-                let output = Command::new("git")
+                let output = git_env(source.path())
                     .current_dir(source.path())
                     .args(args)
-                    .env("GIT_CONFIG_NOSYSTEM", "1")
-                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
                     .output()
                     .unwrap();
                 assert!(
@@ -835,6 +833,54 @@ mod tests {
             .env(CHILD, "1")
             .output()
             .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn tracker_fixture_does_not_touch_inherited_git_repository() {
+        let other = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = git_env(other.path())
+                .current_dir(other.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "-q"]);
+        fs::write(other.path().join("original.md"), "synthetic original").unwrap();
+        git(&["add", "original.md"]);
+        git(&["commit", "-qm", "original"]);
+        let before = git(&["rev-parse", "HEAD"]);
+        fs::write(other.path().join("private.md"), "untracked other content").unwrap();
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg("umask 0002 && exec \"$0\" --exact \"$1\" --test-threads=1")
+            .arg(std::env::current_exe().unwrap())
+            .arg("backup::portable::capture::tests::tracker_capture_is_private_under_umask_0002")
+            .env("CADENCE_TEST_TRACKER_CAPTURE_UMASK_CHILD", "1")
+            .env("GIT_DIR", other.path().join(".git"))
+            .env("GIT_WORK_TREE", other.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(git(&["rev-parse", "HEAD"]), before, "other HEAD changed");
+        assert_eq!(
+            git(&["status", "--porcelain", "--", "private.md"]).trim(),
+            "?? private.md",
+            "other index changed"
+        );
         assert!(
             output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
             "stdout: {}\nstderr: {}",
