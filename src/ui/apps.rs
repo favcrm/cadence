@@ -1502,6 +1502,55 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn upload_staging_is_private_under_umask_0002() {
+        const CHILD: &str = "CADENCE_TEST_APP_STAGING_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let control = tempfile::tempdir().unwrap();
+            let plain = control.path().join("plain");
+            std::fs::create_dir(&plain).unwrap();
+            assert_eq!(
+                std::fs::metadata(&plain).unwrap().permissions().mode() & 0o777,
+                0o775
+            );
+
+            let files = vec![("app.md".to_string(), "synthetic app content".to_string())];
+            let (staging, source) =
+                stage_files(&files).unwrap_or_else(|_| panic!("app staging failed"));
+            assert_eq!(
+                std::fs::read_to_string(staging.path().join("app.md")).unwrap(),
+                "synthetic app content"
+            );
+            assert_eq!(
+                std::fs::metadata(staging.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+            assert_eq!(staging.path(), std::path::Path::new(&source));
+            drop(staging);
+            assert!(!std::path::Path::new(&source).exists());
+            return;
+        }
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("umask 0002 && exec \"$0\" --exact \"$1\" --test-threads=1")
+            .arg(std::env::current_exe().unwrap())
+            .arg("ui::apps::tests::upload_staging_is_private_under_umask_0002")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     const LOCATOR: &str = r#"{"id":"social-content","version":"1.2.3","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
 
     /// CAD-1942: a catalogue install names the release; it does not carry it.
