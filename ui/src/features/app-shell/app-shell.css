@@ -1391,6 +1391,11 @@
   align-items: flex-start;
   gap: 0.5rem;
 }
+.app-assistant-card-head > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.app-assistant-card li { overflow-wrap: anywhere; }
 .app-assistant-section-head h2,
 .app-assistant-settings h3 { margin: 0; }
 .app-assistant-section-head button { flex: 0 0 auto; }

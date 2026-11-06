@@ -81,6 +81,14 @@ AgenticOS supplies the authenticated model proxy and domain capabilities.
 Provider credentials, model routing, financial authorization, current tenant
 membership and human approval decisions remain with that platform.
 
+An owner can review a write staged in an installed app's assistant conversation
+beside that conversation. **Review** shows the stored changes and declared
+effects; **Not now** leaves it pending. Approval may still fail to apply, so
+the conversation's Updates shows the recorded outcome, not just the decision.
+If a reply is lost, **Check again** re-reads the outcome rather than submitting
+another decision. Reads and decisions retain the selected conversation; the
+Home queue remains separate. Members cannot decide these requests.
+
 Every tool execution rechecks the supplied refusal and live authorization,
 including recovered executions and runtime-owned skill tools. Cancellation is
 checked before and after the authority check. Tool handlers receive only the

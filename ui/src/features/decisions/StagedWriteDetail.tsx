@@ -4,7 +4,7 @@ import { useWriteBlock } from "../auth/WriteGate";
 import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
 import { ageText, isolate, sentFields, type StagedChange, type StagedWrite } from "./stagedWrite";
-import { checkDecision, clearNotice, currentDecisions, decide, type DecisionNotice, type DecisionsState, type Verb } from "./useDecisions";
+import type { DecisionNotice, DecisionsState, DecisionsStore, Verb } from "./useDecisions";
 import "./decisions.css";
 
 type Say = (english: string) => string;
@@ -206,6 +206,7 @@ const TABBABLE = 'button:not([disabled]), a[href], pre[tabindex="0"], [tabindex]
  */
 export default function StagedWriteDetail({
   decisions,
+  store,
   queue,
   at,
   readOnly,
@@ -213,6 +214,7 @@ export default function StagedWriteDetail({
   onClose,
 }: {
   decisions: DecisionsState;
+  store: DecisionsStore;
   /** The ids that were waiting when the detail opened ("n of m" does not recount). */
   queue: readonly string[];
   at: number;
@@ -230,9 +232,11 @@ export default function StagedWriteDetail({
   const lost = decisions.phase === "unavailable" || attempt?.phase === "access";
   // Our own decision leaves "pending" a moment before the queue advances.
   const mine = useRef<string | null>(null);
+  // This drawer may reopen while its own request from a previous mount settles.
+  const resumed = useRef<string | null>(attempt?.phase === "busy" ? id : null);
   const uncertain = attempt?.phase === "unconfirmed";
   // Unsure of our own decision wins over "decided elsewhere": Check again reports the real outcome.
-  const elsewhere = !lost && !uncertain && !pending && mine.current !== id;
+  const elsewhere = !lost && !uncertain && !pending && mine.current !== id && resumed.current !== id;
   const idRef = useRef(id);
   idRef.current = id;
   const atRef = useRef(at);
@@ -282,7 +286,7 @@ export default function StagedWriteDetail({
 
   /** The next item that is still waiting, else close. Nothing is decided by moving on. */
   const advance = () => {
-    const s = currentDecisions();
+    const s = store.currentDecisions();
     for (let j = atRef.current + 1; j < queue.length; j++) {
       if (s.pending.some((p) => p.id === queue[j])) {
         onAt(j);
@@ -310,15 +314,15 @@ export default function StagedWriteDetail({
     // The click is for the row that was on screen when the handler was made.
     if (forId !== idRef.current) return;
     if (block !== null || !pending || busy !== undefined || lost || uncertain) return;
-    void run(() => decide(forId, verb));
+    void run(() => store.decide(forId, verb));
   };
   const check = () => {
     if (busy !== undefined) return;
-    void run(() => checkDecision(idRef.current));
+    void run(() => store.checkDecision(idRef.current));
   };
   const skip = () => {
     if (busy !== undefined) return;
-    clearNotice();
+    store.clearNotice();
     advance();
   };
 
@@ -378,7 +382,7 @@ export default function StagedWriteDetail({
     </p>
   ) : null;
 
-  const via = write.origin === null ? t("in Home") : t("via {via}").replace("{via}", write.origin.via.toLowerCase() === "cli" ? "CLI" : write.origin.via);
+  const via = write.origin === null ? t(store.conversation === null ? "in Home" : "in this conversation") : t("via {via}").replace("{via}", write.origin.via.toLowerCase() === "cli" ? "CLI" : write.origin.via);
   const link = safeLink(write.recordLink);
   const where = [write.app, write.target?.label].filter((p): p is string => !!p).join(" · ");
   const off = block !== null || busy !== undefined || lost || uncertain || !pending;
