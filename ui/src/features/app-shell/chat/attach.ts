@@ -40,10 +40,17 @@ export interface AttachItem {
   destination?: AttachDestination;
 }
 
+/** Video containers ride the same queue with a larger cap (CAD-2219). */
+const VIDEO_EXTS: Record<string, true> = { mp4: true, webm: true };
+export const ATTACH_VIDEO_MAX_BYTES = 20 * 1024 * 1024;
+
 /** The client checks the size; the server decides whether the bytes are usable. */
-export function attachRefusal(size: number): string | null {
+export function attachRefusal(size: number, name = ""): string | null {
   if (size === 0) return "empty file — nothing to attach";
-  if (size > ATTACH_MAX_BYTES) return `over 10 MiB — rejected`;
+  const ext = name.toLowerCase().split(".").pop() ?? "";
+  const video = VIDEO_EXTS[ext] === true;
+  if (size > (video ? ATTACH_VIDEO_MAX_BYTES : ATTACH_MAX_BYTES))
+    return video ? "over 20 MiB — rejected" : "over 10 MiB — rejected";
   return null;
 }
 
