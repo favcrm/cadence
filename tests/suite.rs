@@ -2535,6 +2535,8 @@ mod cad2081_workflow_verdicts {
             &[
                 "is not a pass (outcome 'revise'",
                 NOT_A_PASS,
+                // CAD-2197 emits this beside the non-pass line, so an exact-set
+                // assertion must expect it or the suite is red.
                 "no acceptance is recorded for that head",
             ],
         );
@@ -3652,6 +3654,8 @@ mod cad2081_workflow_verdicts {
             routed(vec![revise(f.std()), f.spec()], comment(&good), URL),
             &[
                 NOT_A_PASS,
+                // CAD-2197 emits this beside the non-pass line, so an exact-set
+                // assertion must expect it or the suite is red.
                 "no acceptance is recorded for that head",
                 NO_STD,
                 BOTH,
@@ -3662,6 +3666,8 @@ mod cad2081_workflow_verdicts {
             routed(vec![f.std(), revise(f.spec())], comment(&good), URL),
             &[
                 NOT_A_PASS,
+                // CAD-2197 emits this beside the non-pass line, so an exact-set
+                // assertion must expect it or the suite is red.
                 "no acceptance is recorded for that head",
                 NO_SPEC,
                 BOTH,
@@ -3685,7 +3691,11 @@ mod cad2081_workflow_verdicts {
         exactly(
             "a workflow revise, then a later pass",
             routed(vec![revise(f.std()), later, f.spec()], comment(&good), URL),
-            &[NOT_A_PASS, "no acceptance is recorded for that head"],
+            &[
+                NOT_A_PASS,
+                // CAD-2197 emits this beside the non-pass line.
+                "no acceptance is recorded for that head",
+            ],
         );
         let mut at_earlier = f.spec();
         at_earlier["at_head"] = json!(f.head);
