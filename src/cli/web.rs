@@ -147,7 +147,14 @@ fn trusted_state_dir(path: &Path) -> Result<std::fs::File> {
         None
     };
     let absolute = relative.as_deref().unwrap_or(path);
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // Traversal needs search permission, not permission to list each directory.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let access = libc::O_PATH;
+    #[cfg(target_vendor = "apple")]
+    let access = libc::O_SEARCH;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    let access = libc::O_RDONLY;
+    let flags = access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let mut dir = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(flags)
@@ -437,5 +444,71 @@ mod tests {
         std::fs::write(&planted, "untouched").unwrap();
         assert!(write_private(&planted, b"replacement").is_err());
         assert_eq!(std::fs::read_to_string(planted).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn web_staging_allows_trusted_search_only_ancestor() {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            const CHILD: &str = "CADENCE_TEST_WEB_SEARCH_ONLY_CHILD";
+            if std::env::var_os(CHILD).is_none() {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "cli::web::tests::web_staging_allows_trusted_search_only_ancestor",
+                        "--test-threads=1",
+                    ])
+                    .env_clear()
+                    .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                    .env("TMPDIR", std::env::temp_dir())
+                    .env(CHILD, "1");
+                // SAFETY: the child only drops its ambient capabilities before exec.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::prctl(
+                            libc::PR_CAP_AMBIENT,
+                            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                            0,
+                            0,
+                            0,
+                        ) == -1
+                        {
+                            let error = std::io::Error::last_os_error();
+                            if error.raw_os_error() != Some(libc::EINVAL) {
+                                return Err(error);
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "stdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+        }
+        let (root, _, site) = fixture();
+        let ancestor = root.path().join("search-only");
+        let state = ancestor.join("state");
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let readable = std::fs::File::open(&ancestor).is_ok();
+        let result = stage(&state, &site, "synthetic", false);
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!readable, "fixture still permits directory reads");
+        }
+        let token = result.unwrap();
+        remove_staging(&state, &token);
     }
 }
