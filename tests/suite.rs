@@ -2515,6 +2515,9 @@ mod cad2081_workflow_verdicts {
             &[
                 "is not a pass (outcome 'revise'",
                 NOT_A_PASS,
+                // CAD-2197 emits this beside the non-pass line, so an exact-set
+                // assertion must expect it or the suite is red.
+                "no acceptance is recorded for that head",
                 NEEDS_BOTH,
                 NO_STD,
             ],
@@ -2529,7 +2532,11 @@ mod cad2081_workflow_verdicts {
         check(
             "a workflow revise, then a later pass",
             routine(vec![revised(), later, f.spec()]),
-            &["is not a pass (outcome 'revise'", NOT_A_PASS],
+            &[
+                "is not a pass (outcome 'revise'",
+                NOT_A_PASS,
+                "no acceptance is recorded for that head",
+            ],
         );
 
         // Rows from a principal main's tip does not list, or a superseded workflow.
@@ -3643,12 +3650,22 @@ mod cad2081_workflow_verdicts {
         exactly(
             "a workflow standards revise",
             routed(vec![revise(f.std()), f.spec()], comment(&good), URL),
-            &[NOT_A_PASS, NO_STD, BOTH],
+            &[
+                NOT_A_PASS,
+                "no acceptance is recorded for that head",
+                NO_STD,
+                BOTH,
+            ],
         );
         exactly(
             "a workflow spec revise",
             routed(vec![f.std(), revise(f.spec())], comment(&good), URL),
-            &[NOT_A_PASS, NO_SPEC, BOTH],
+            &[
+                NOT_A_PASS,
+                "no acceptance is recorded for that head",
+                NO_SPEC,
+                BOTH,
+            ],
         );
         exactly(
             "an owner revise beside both passes",
@@ -3668,7 +3685,7 @@ mod cad2081_workflow_verdicts {
         exactly(
             "a workflow revise, then a later pass",
             routed(vec![revise(f.std()), later, f.spec()], comment(&good), URL),
-            &[NOT_A_PASS],
+            &[NOT_A_PASS, "no acceptance is recorded for that head"],
         );
         let mut at_earlier = f.spec();
         at_earlier["at_head"] = json!(f.head);
