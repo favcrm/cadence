@@ -30,10 +30,6 @@ function failedTurnReason(errorMessage: string | undefined): string {
   if (raw.includes("billing_unavailable")) return "billing_unavailable";
   if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
     return "The selected model cannot read images.";
-  // Only the runtime's own exact terminal message is named: provider text that
-  // merely mentions the code stays generic and private.
-  if (raw.trim() === CONTEXT_BUDGET_EXCEEDED_TEXT)
-    return CONTEXT_BUDGET_EXCEEDED_TEXT;
   if (TIMEOUT.test(raw)) return "The model request timed out.";
   if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
     return "The model service could not be reached.";
@@ -87,6 +83,8 @@ function createdAt(timestamp: unknown): { created: string } | Record<string, nev
     : {};
 }
 
+type BudgetProof = (entry: EntryRecord, message: string | undefined) => boolean;
+
 /**
  * The entries every thread read reports: the engine's mapping, then the host's
  * projection when it has one, so a paged read and both stream paths agree.
@@ -95,8 +93,9 @@ export function projectedThreadEntries(
   records: readonly EntryRecord[],
   includeThinking: boolean,
   project?: ThreadProjection,
+  budgetProof?: BudgetProof,
 ): ThreadEntry[] {
-  const entries = threadEntries(records, includeThinking);
+  const entries = threadEntries(records, includeThinking, budgetProof);
   return project ? [...project(entries)] : entries;
 }
 
@@ -150,6 +149,7 @@ export async function readAllRecords<C>(scan: EntryScan<C>): Promise<EntryRecord
 export function threadEntries(
   records: readonly EntryRecord[],
   includeThinking: boolean,
+  budgetProof?: BudgetProof,
 ): ThreadEntry[] {
   const entries: ThreadEntry[] = [];
   const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
@@ -292,7 +292,9 @@ export function threadEntries(
           ...createdAt(message.timestamp),
           payload: {
             status: "failed",
-            error: failedTurnReason(message.errorMessage),
+            error: budgetProof?.(record, message.errorMessage)
+              ? CONTEXT_BUDGET_EXCEEDED_TEXT
+              : failedTurnReason(message.errorMessage),
           },
         });
       }

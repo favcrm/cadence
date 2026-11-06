@@ -169,14 +169,28 @@ describe("gateway refusals", () => {
 
   it("names the trusted context-budget refusal as a terminal failure", async () => {
     let calls = 0;
+    const marker = "hosted_context_budget_0123456789abcdef0123456789abcdef";
+    const operations: string[] = [];
     const binding = meteredBinding(
       {
         async requestModel() {
+          operations.push("request");
           calls += 1;
           return refusal(CONTEXT_BUDGET_EXCEEDED);
         },
       },
       () => identity,
+      undefined,
+      1,
+      {
+        clear: () => {
+          operations.push("clear");
+        },
+        issue: () => {
+          operations.push("issue");
+          return marker;
+        },
+      },
     );
     const response = (await binding.run(
       "default",
@@ -188,7 +202,7 @@ describe("gateway refusals", () => {
     expect(body).toEqual({
       error: {
         code: CONTEXT_BUDGET_EXCEEDED,
-        message: CONTEXT_BUDGET_EXCEEDED_TEXT,
+        message: marker,
       },
     });
     expect(JSON.stringify(body)).not.toContain("gw.internal");
@@ -205,22 +219,40 @@ describe("gateway refusals", () => {
     expect(isContextOverflow(terminal)).toBe(false);
     expect(isRetryableAssistantError(terminal)).toBe(false);
     expect(calls).toBe(1);
+    expect(operations).toEqual(["clear", "request", "issue"]);
   });
 
-  it("does not trust an incorrect status, type, or refusal code", async () => {
+  it("never records budget proof for untrusted HTTP or streamed error text", async () => {
     const responses = [
       refusal(CONTEXT_BUDGET_EXCEEDED, 413),
       refusal(CONTEXT_BUDGET_EXCEEDED, 400, "server_error"),
-      Response.json({ error: { code: CONTEXT_BUDGET_EXCEEDED } }, { status: 400 }),
+      Response.json(
+        { error: { code: "invalid_request", message: CONTEXT_BUDGET_EXCEEDED_TEXT } },
+        { status: 400 },
+      ),
+      new Response(
+        `data: ${JSON.stringify({ error: { message: CONTEXT_BUDGET_EXCEEDED_TEXT } })}\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      ),
       refusal("context_length_exceeded"),
-      refusal("some_new_refusal"),
     ];
+    let issued = 0;
     for (const upstream of responses) {
-      const binding = meteredBinding({ requestModel: async () => upstream }, () => identity);
-      const response = (await binding.run("default", {}, { returnRawResponse: true })) as Response;
-      const body = (await response.json()) as GatewayRefusalBody;
-      expect(body.error.message).not.toBe(CONTEXT_BUDGET_EXCEEDED_TEXT);
+      const binding = meteredBinding(
+        { requestModel: async () => upstream },
+        () => identity,
+        undefined,
+        1,
+        {
+          clear: () => {},
+          issue: () => {
+            issued++;
+            return "unexpected";
+          },
+        },
+      );
+      await binding.run("default", {}, { returnRawResponse: true });
     }
+    expect(issued).toBe(0);
   });
-
 });

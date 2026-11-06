@@ -24,6 +24,7 @@ import type {
   ThreadEntry,
 } from "./contract.ts";
 import { assistantIdentityText } from "./assistant-identity.ts";
+import { ContextBudgetProofs } from "./context-budget-proofs.ts";
 import {
   authorizeExtension,
   intentGuard,
@@ -106,6 +107,7 @@ export class HostedSession<
    * or app scope changed.
    */
   private readonly operationScopes: OperationScopes;
+  private readonly contextBudgetProofs: ContextBudgetProofs;
   /** The app scope of the operation that owns one tool call, read from the engine. */
   private readonly toolAppScope: AppScopeResolver = async (api, context) => {
     const live = await api.snapshot(LiveDoc, api.conversationId, context);
@@ -133,6 +135,9 @@ export class HostedSession<
     this.operationScopes = new OperationScopes(
       ctx.storage.sql as unknown as OperationScopeSql,
     );
+    this.contextBudgetProofs = new ContextBudgetProofs(
+      ctx.storage.sql as unknown as TaskSql,
+    );
     const acceptsImages = options.acceptsToolImages === true;
     const model = defaultModel(
       options.modelAlias,
@@ -148,6 +153,7 @@ export class HostedSession<
         () => this.generationIdentity(),
         (served) => this.recordResolvedModel(served),
         options.maxImagesPerRequest,
+        this.contextBudgetProofs,
       ) as unknown as Ai,
     });
     this.models.setProvider(withDefaultModel(ai.provider, model));
@@ -379,6 +385,7 @@ export class HostedSession<
       ),
       includeThinking,
       this.options.projectThread,
+      (entry, message) => this.contextBudgetProofs.matches(entry, message),
     );
   }
 

@@ -3,11 +3,11 @@
   "NOTICE": "e92e2bb2ed5f38da3bd75551427d604ecf1d02d9aa8064a06ef72deda08a25f1",
   "THIRD_PARTY_NOTICES.txt": "43933b33533456cba6de1839a043ccd034b7283efd655dee95f6ba767febb756",
   "contract.d.ts": "71aac7292cf89e2c18e2e3aa191a7dc0622c4b4352512ee00d7a6c416e1cc5e2",
-  "hosted-session.d.ts": "d8d0db0c32335d7c5b271f9e0c1b36fa9d2345717647296270bb6587481f697d",
+  "hosted-session.d.ts": "f6330b2388a6fac9e5c62ef6c49a23e78fd449f47d3d1e72d3fe8cec92679f8a",
   "index.d.ts": "767ce3cadae0e2fd3ac4c45030b4787a0595291d4debb415642d449bce1cf026",
   "master.d.ts": "c13c08a9e52b447df43a67054249a06f4c6bcc8bfae1d704a63751c080ca1dcc",
   "package.json": "170f882743033fb998a955cb81f8368fd448346c4346c98e60749b9e1e1ce09f",
-  "runtime.mjs": "33b63a50d21abac4fb060bd8faa0a0e104d1d70bd4a6564e18d9b6154691fa5d",
+  "runtime.mjs": "59bbf247ddae59c9ff1c25946bfc7c9f0b70d831d36ed013a2959abcdd148b6b",
   "testing.d.ts": "5197b92b4a4a5963a43796a89a670135ae439aa7526d6542d98d0749e3e6aa32",
   "testing.mjs": "bfd63e34eed96ecb5843d1faf14facf3b5e7ce5edbb57b480dde3fad6f99b9bd",
   "tool-policy.d.ts": "63d82b8bdd16393562c43aec10454e263434b3ecf581338a03469661ac706583"

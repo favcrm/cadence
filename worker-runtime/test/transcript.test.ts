@@ -455,10 +455,13 @@ describe("board transcript identity", () => {
       );
     });
 
-    it("names the trusted context-budget refusal with the exact actionable message", () => {
+    it("names a context-budget refusal only with matching durable provenance", () => {
+      const marker = "hosted_context_budget_0123456789abcdef";
+      const record = { ...failed("2", marker), byTaskId: 42 as EntryRecord["byTaskId"] };
       const entries = entriesWithoutTime(
-        [input("1", "hi"), failed("2", CONTEXT_BUDGET_EXCEEDED_TEXT)],
+        [input("1", "hi"), record],
         false,
+        (candidate, text) => candidate.byTaskId === 42 && text === marker,
       );
       expect(entries[1]).toEqual({
         seq: 2,
@@ -467,6 +470,8 @@ describe("board transcript identity", () => {
         text: "",
         payload: { status: "failed", error: CONTEXT_BUDGET_EXCEEDED_TEXT },
       });
+      expect(reason(CONTEXT_BUDGET_EXCEEDED_TEXT)).toBe("The model request failed.");
+      expect(reason(marker)).toBe("The model request failed.");
     });
 
     it("keeps look-alike provider text generic and private", () => {

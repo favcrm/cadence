@@ -1,6 +1,7 @@
 import type { Api, Model, Provider } from "@earendil-works/pi-ai";
 import { CLOUDFLARE_AI_API, CLOUDFLARE_PROVIDER_ID } from "agents/models/pi-ai";
 import type { GenerationIdentity } from "./contract.ts";
+import type { ContextBudgetProofs } from "./context-budget-proofs.ts";
 import {
   IMAGE_INPUT_UNAVAILABLE,
   MAX_IMAGE_BASE64_CHARS,
@@ -243,14 +244,9 @@ const IMAGE_REFUSED_NOTICE =
   "[An image was omitted because the selected model cannot read images.]";
 
 /**
- * The AgenticOS gateway's structured refusal when a request exceeds a trusted
- * hosted size budget. It is terminal: the text below matches neither pi-ai's
- * retry patterns nor its context-overflow classifier, so the engine fails the
- * turn instead of compacting, retrying or making another paid call. The marker
- * is gate-agnostic: the gateway may emit it for the serialized context or for
- * the fully translated request (including images), and the runtime handles
- * both the same way. A fresh conversation, or a split task, is the safe next
- * step.
+ * The gateway's structured size refusal and its public, actionable projection.
+ * The engine receives a task-bound opaque marker, not this public sentence;
+ * the marker matches neither retry nor context-overflow classifiers.
  */
 export const CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded";
 export const CONTEXT_BUDGET_EXCEEDED_TEXT =
@@ -306,20 +302,23 @@ async function publicRefusal(response: Response): Promise<string | null> {
 }
 
 /**
- * Carry an allowlisted refusal code into the engine's private error text, so
- * the failed turn names it. A named refusal's own text replaces the gateway's:
- * for the context budget that text is the terminal, actionable message. No
- * response outside the allowlist changes, and nothing here retries or reissues
- * the request.
+ * Carry trusted refusals into the engine without forwarding gateway prose.
+ * Budget refusals need a task-bound proof; absent evidence remains generic.
  */
-function withRefusalCode(response: Response, code: string | null): Response {
+function withRefusalCode(
+  response: Response,
+  code: string | null,
+  budgetMarker?: string,
+): Response {
   if (code === null) return response;
   return Response.json(
     {
       error: {
         code,
         message:
-          code === CONTEXT_BUDGET_EXCEEDED ? CONTEXT_BUDGET_EXCEEDED_TEXT : code,
+          code === CONTEXT_BUDGET_EXCEEDED
+            ? (budgetMarker ?? "The model request failed.")
+            : code,
       },
     },
     { status: response.status },
@@ -368,6 +367,7 @@ export function meteredBinding(
   identity: () => GenerationIdentity | null,
   onModelResolved?: (model: string) => void,
   maxImagesPerRequest = 1,
+  budgetProofs?: Pick<ContextBudgetProofs, "clear" | "issue">,
 ): MeteredBinding {
   if (
     !Number.isSafeInteger(maxImagesPerRequest) ||
@@ -391,23 +391,27 @@ export function meteredBinding(
         );
       }
       const bounded = boundImageHistory(input, maxImagesPerRequest);
-      let response = await transport.requestModel(
-        bounded,
-        current,
-        options?.signal,
-      );
+      const request = (value: Record<string, unknown>) => {
+        // Recovery can repeat this task after a crash before the error entry
+        // was committed. Never let evidence from the earlier attempt survive.
+        budgetProofs?.clear(current);
+        return transport.requestModel(value, current, options?.signal);
+      };
+      let response = await request(bounded);
       let refusal = await publicRefusal(response);
       // A stored screenshot would otherwise be refused on every later turn,
       // leaving a conversation that can only be reset. History is untouched.
       if (refusal === IMAGE_INPUT_UNAVAILABLE && imagesOnlyInHistory(bounded)) {
-        response = await transport.requestModel(
+        response = await request(
           boundImageHistory(bounded, 0, IMAGE_REFUSED_NOTICE),
-          current,
-          options?.signal,
         );
         refusal = await publicRefusal(response);
       }
-      response = withRefusalCode(response, refusal);
+      const marker =
+        refusal === CONTEXT_BUDGET_EXCEEDED
+          ? budgetProofs?.issue(current)
+          : undefined;
+      response = withRefusalCode(response, refusal, marker);
       const metered = onModelResolved ? captureResolvedModel(response, onModelResolved) : response;
       if (options?.returnRawResponse !== false) return metered;
       return metered.json();
