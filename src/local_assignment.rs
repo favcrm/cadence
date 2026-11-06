@@ -145,6 +145,10 @@ struct Attempt {
     /// which an older client interprets as a fence it cannot run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff: Option<Handoff>,
+    /// Repository root of this lane reservation, recorded with it. A partial
+    /// reservation without it cannot be located safely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_repo: Option<String>,
 }
 
 /// Binding as it was when a fresh cancellation reserved its safety marker.
@@ -225,6 +229,9 @@ struct Handoff {
     external: bool,
 }
 
+/// Delivery bookkeeping merged across duplicate rows of one claim.
+type Delivery = (Option<String>, Option<String>, Option<String>, Option<u64>);
+
 /// A distinct create request that the board coalesced into another assignment.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -267,10 +274,6 @@ fn equivalent_custody(a: &Attempt, b: &Attempt) -> bool {
         && a.lane_claim == b.lane_claim
         && a.lane_generation == b.lane_generation
         && a.retired_lane_guard == b.retired_lane_guard
-        && a.kickoff_message == b.kickoff_message
-        && a.kickoff_reserved == b.kickoff_reserved
-        && a.origin_claim_id == b.origin_claim_id
-        && a.origin_generation == b.origin_generation
         && a.session_profile == b.session_profile
 }
 
@@ -402,6 +405,10 @@ fn normalize_assignment_rows(ledger: &mut Ledger, assignment: &str) -> Result<()
     // same claim could have delivered without recording it. Keep a proof only
     // when every row carries the same one.
     let mut handoff: Option<Option<Handoff>> = None;
+    // Delivery bookkeeping belongs to whichever row reserved the kickoff, so a
+    // duplicate legitimately has none. Merge it forward, refusing only when
+    // two rows claim different deliveries.
+    let mut delivery: Option<Delivery> = None;
     for attempt in ledger
         .attempts
         .values()
@@ -412,13 +419,55 @@ fn normalize_assignment_rows(ledger: &mut Ledger, assignment: &str) -> Result<()
             Some(known) if known == &attempt.handoff => {}
             Some(_) => handoff = Some(None),
         }
+        let row = (
+            attempt.kickoff_message.clone(),
+            attempt.kickoff_reserved.clone(),
+            attempt.origin_claim_id.clone(),
+            attempt.origin_generation,
+        );
+        match delivery.as_mut() {
+            None => delivery = Some(row),
+            Some(known) => {
+                for (slot, value) in [
+                    (&mut known.0, row.0),
+                    (&mut known.1, row.1),
+                    (&mut known.2, row.2),
+                ] {
+                    if slot.is_none() {
+                        *slot = value;
+                    } else if value.is_some() && *slot != value {
+                        return Err(Error::rejected(format!(
+                            "assignment {assignment} has conflicting delivery records; inspect \
+                             them before retrying. No new request was sent"
+                        )));
+                    }
+                }
+                if known.3.is_none() {
+                    known.3 = row.3;
+                } else if row.3.is_some() && known.3 != row.3 {
+                    return Err(Error::rejected(format!(
+                        "assignment {assignment} has conflicting delivery records; inspect \
+                         them before retrying. No new request was sent"
+                    )));
+                }
+            }
+        }
     }
-    let merged = handoff.flatten();
+    let delivery = delivery.unwrap_or_default();
+    let delivered = delivery.0.is_some()
+        || delivery.1.is_some()
+        || delivery.2.is_some()
+        || delivery.3.is_some();
+    let handoff = if delivered { None } else { handoff.flatten() };
     ledger.attempts.retain(|key, attempt| {
         key == &keep || attempt.assignment_id.as_deref() != Some(assignment)
     });
     if let Some(attempt) = ledger.attempts.get_mut(&keep) {
-        attempt.handoff = merged;
+        attempt.handoff = handoff;
+        attempt.kickoff_message = delivery.0;
+        attempt.kickoff_reserved = delivery.1;
+        attempt.origin_claim_id = delivery.2;
+        attempt.origin_generation = delivery.3;
     }
     Ok(())
 }
@@ -993,6 +1042,15 @@ fn retire_current_claim(attempt: &mut Attempt) {
     attempt.session_profile = None;
     attempt.target = None;
     attempt.state = "discovered".to_string();
+    // Once a kickoff existed, clearing its pins must not make the claim look
+    // undelivered; the proof stays unknown for the rest of this row's life.
+    if attempt.kickoff_message.is_some()
+        || attempt.kickoff_reserved.is_some()
+        || attempt.origin_claim_id.is_some()
+        || attempt.origin_generation.is_some()
+    {
+        attempt.handoff = None;
+    }
     attempt.kickoff_message = None;
     attempt.kickoff_reserved = None;
     attempt.origin_claim_id = None;
@@ -1350,6 +1408,7 @@ impl<H: CoordHttp> Coordinator<H> {
                         origin_generation: None,
                         session_profile: None,
                         handoff: None,
+                        lane_repo: None,
                     })
                     .operation_id
                     .clone()
@@ -1606,6 +1665,7 @@ impl<H: CoordHttp> Coordinator<H> {
         if let Some(profile) = profile {
             body["profile_id"] = json!(profile);
         }
+        let fresh_claim = assignment.claim_id.is_none();
         let path = format!("{}/{}/claim", self.base(), assignment.assignment_id);
         let value = match self.exchange("POST", &path, Some(&body)) {
             Ok(value) => value,
@@ -1686,24 +1746,30 @@ impl<H: CoordHttp> Coordinator<H> {
                     origin_generation: None,
                     session_profile: None,
                     handoff: None,
+                    lane_repo: None,
                 };
                 stamp(&mut attempt, &claimed);
                 ledger
                     .attempts
                     .insert(format!("discovered:{}", claimed.assignment_id), attempt);
             }
-            let claim = claimed.claim_id.as_deref().ok_or_else(|| {
-                Error::rejected("the claim has no id; provenance was not recorded")
-            })?;
-            for attempt in ledger.attempts.values_mut() {
-                if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
-                    && attempt.claim_id.as_deref() == Some(claim)
-                {
-                    attempt.handoff = Some(Handoff {
-                        claim_id: claim.to_string(),
-                        generation: claimed.generation,
-                        external: profile.is_some(),
-                    });
+            // Only a claim this client just acquired can be proven never to
+            // have been handed off. A replay of a claim already on the board —
+            // legacy, another ledger or a restart — leaves the marker absent.
+            if fresh_claim {
+                let claim = claimed.claim_id.as_deref().ok_or_else(|| {
+                    Error::rejected("the claim has no id; provenance was not recorded")
+                })?;
+                for attempt in ledger.attempts.values_mut() {
+                    if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
+                        && attempt.claim_id.as_deref() == Some(claim)
+                    {
+                        attempt.handoff = Some(Handoff {
+                            claim_id: claim.to_string(),
+                            generation: claimed.generation,
+                            external: profile.is_some(),
+                        });
+                    }
                 }
             }
             Ok(())
@@ -1757,6 +1823,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 origin_generation: None,
                 session_profile: None,
                 handoff: None,
+                lane_repo: None,
             };
             stamp(&mut attempt, assignment);
             ledger
@@ -2058,7 +2125,7 @@ impl<H: CoordHttp> Coordinator<H> {
 
     /// Lane already stored for this claim, or a new one that does not
     /// sit on an unsettled earlier actor's branch.
-    fn lane_for(&self, claimed: &Assignment, name: Option<&str>) -> Result<String> {
+    fn lane_for(&self, claimed: &Assignment, name: Option<&str>, root: &Path) -> Result<String> {
         let claim_id = claimed
             .claim_id
             .clone()
@@ -2126,6 +2193,7 @@ impl<H: CoordHttp> Coordinator<H> {
                     attempt.lane = Some(lane.clone());
                     attempt.lane_claim = Some(claim_id.clone());
                     attempt.lane_generation = Some(claimed.generation);
+                    attempt.lane_repo = Some(root.to_string_lossy().into_owned());
                     attempt.worktree = None;
                 }
             }
@@ -2216,7 +2284,7 @@ impl<H: CoordHttp> Coordinator<H> {
         // A cancellation must not retire this claim between lane reservation
         // and the checkout/actor handoff being recorded.
         let _assignment_lock = self.assignment_lock(&current.assignment_id)?;
-        let lane = match self.lane_for(&current, name) {
+        let lane = match self.lane_for(&current, name, root) {
             Ok(lane) => lane,
             Err(error) => {
                 return Err(self.activation_failure(&current, error));
@@ -2638,7 +2706,7 @@ impl<H: CoordHttp> Coordinator<H> {
             }
             Ok(())
         })?;
-        let lane = self.lane_for(&claimed, name)?;
+        let lane = self.lane_for(&claimed, name, &root)?;
         #[cfg(test)]
         if let Some(wait) = self.before_lane_open.clone() {
             wait();

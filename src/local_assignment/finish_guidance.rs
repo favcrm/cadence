@@ -278,13 +278,14 @@ pub fn reconcile_absent_guard<H: CoordHttp>(
             None => {
                 // A reservation interrupted before its path was recorded still
                 // names exactly one expected checkout; prove that one absent.
-                let Some(repo) = ledger.repo.as_deref() else {
+                // Only the root recorded *with* the reservation is safe here.
+                let Some(repo) = attempt.lane_repo.clone() else {
                     return Err(Error::rejected(
-                        "the ledger records no repository, so the partial lane cannot be \
+                        "the reservation records no repository, so the partial lane cannot be \
                          identified; inspect it by hand",
                     ));
                 };
-                let root = worktree::main_root(Path::new(repo))?;
+                let root = worktree::main_root(Path::new(&repo))?;
                 (root.clone(), layout::worktree_dir(&root, &lane))
             }
         };
@@ -941,6 +942,7 @@ mod tests {
     fn newer_claim_cannot_overwrite_pending_cancellation_lane() {
         struct ObserveNewClaim {
             auth: PathBuf,
+            repo: PathBuf,
             claim: Value,
         }
 
@@ -961,7 +963,7 @@ mod tests {
                 current["claim_id"] = json!("hlc_test");
                 let current = parse_assignment(&current)?;
                 assert!(
-                    observer.lane_for(&current, None).is_err(),
+                    observer.lane_for(&current, None, &self.repo).is_err(),
                     "a current claim must not activate while its cancellation is pending"
                 );
                 let ledger = Ledger::load(&self.auth, "ws_test")?;
@@ -998,6 +1000,7 @@ mod tests {
         let mut coord = Coordinator::new(
             ObserveNewClaim {
                 auth: fx.auth.clone(),
+                repo: fx.repo.clone(),
                 claim: claim.clone(),
             },
             "ws_test".into(),
@@ -1012,14 +1015,14 @@ mod tests {
             .reserve_kickoff(&claimed)
             .expect("the observed newer claim must remain active");
         let error = coord
-            .lane_for(&claimed, None)
+            .lane_for(&claimed, None, &fx.repo)
             .expect_err("a newer claim must not overwrite the retained lane")
             .to_string();
         assert!(error.contains("not released"), "{error}");
         fx.assert_intact(&tip);
         let hidden = fx.lane.with_file_name("temporarily-absent-test");
         fs::rename(&fx.lane, &hidden).unwrap();
-        let absent_result = coord.lane_for(&claimed, None);
+        let absent_result = coord.lane_for(&claimed, None, &fx.repo);
         fs::rename(&hidden, &fx.lane).unwrap();
         assert!(
             absent_result.is_err(),
@@ -1770,7 +1773,7 @@ mod tests {
         }))
         .unwrap();
         assert!(
-            coord.lane_for(&claimed, None).is_err(),
+            coord.lane_for(&claimed, None, &fx.repo).is_err(),
             "activation must not reserve a lane while cancellation is unresolved"
         );
         assert_eq!(fs::read(&ledger_path).unwrap(), before);
@@ -2796,12 +2799,12 @@ mod tests {
         for proved in [true, false] {
             let fx = CancelReleaseFixture::new(true);
             let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
-            ledger.repo = Some(fx.repo.to_str().unwrap().into());
             let attempt = ledger
                 .attempts
                 .get_mut(&attempt_key("CAD-1", "start", None))
                 .unwrap();
             attempt.worktree = None;
+            attempt.lane_repo = Some(fx.repo.to_str().unwrap().into());
             if !proved {
                 attempt.handoff = None;
             }
@@ -2834,6 +2837,107 @@ mod tests {
                 assert_eq!(fs::read(&ledger_path).unwrap(), before);
             }
         }
+    }
+
+    #[test]
+    fn replaying_an_existing_claim_does_not_mint_release_provenance() {
+        struct ReplayedClaim;
+
+        impl CoordHttp for ReplayedClaim {
+            fn send(&mut self, method: &str, path: &str, _: Option<&Value>) -> Result<Reply> {
+                assert_eq!(method, "POST");
+                assert!(path.ends_with("/hla_test/claim"), "{path}");
+                Ok(Reply {
+                    status: 200,
+                    body: json!({
+                        "version": VERSION,
+                        "assignment_id": "hla_test",
+                        "organization_id": "ws_test",
+                        "issue_id": "CAD-1",
+                        "action": "start",
+                        "execution": "local",
+                        "state": "running",
+                        "generation": 1,
+                        "claim_id": "hlc_test",
+                        "target": "usr_test",
+                        "created_by_subject_id": "usr_test",
+                        "client_agent_id": "la_test",
+                        "guidance": null,
+                        "reported_head_sha": null,
+                        "text": null
+                    }),
+                })
+            }
+        }
+
+        let fx = CancelReleaseFixture::new(true);
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        ledger
+            .attempts
+            .get_mut(&attempt_key("CAD-1", "start", None))
+            .unwrap()
+            .handoff = None;
+        ledger.save(&fx.auth, "ws_test").unwrap();
+        let row = parse_assignment(&json!({
+            "version": VERSION, "assignment_id": "hla_test", "organization_id": "ws_test",
+            "issue_id": "CAD-1", "action": "start", "execution": "local", "state": "running",
+            "generation": 1, "claim_id": "hlc_test", "target": "usr_test",
+            "created_by_subject_id": "usr_test", "client_agent_id": "la_test",
+            "guidance": null, "reported_head_sha": null, "text": null
+        }))
+        .unwrap();
+        let mut coord = Coordinator::new(ReplayedClaim, "ws_test".into(), fx.auth.clone()).unwrap();
+        coord.claim_with_profile(&row, "la_test", None).unwrap();
+        let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        assert!(
+            ledger.attempts[&attempt_key("CAD-1", "start", None)]
+                .handoff
+                .is_none(),
+            "a replayed legacy claim must stay unproven"
+        );
+
+        let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+        let coord = fx.cancel();
+        let error = release_cancelled(&coord, "hla_test", &fx.state)
+            .expect_err("replayed legacy provenance must not authorize deletion")
+            .to_string();
+        assert!(error.contains("cannot prove"), "{error}");
+        fx.assert_intact(&tip);
+    }
+
+    #[test]
+    fn legacy_duplicate_delivery_records_still_cancel_but_never_release() {
+        let fx = CancelReleaseFixture::new(true);
+        let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let mut duplicate = ledger.attempts[&attempt_key("CAD-1", "start", None)].clone();
+        duplicate.operation_id = "op_legacy_duplicate".into();
+        duplicate.kickoff_reserved = Some("msg_legacy".into());
+        duplicate.origin_claim_id = Some("hlc_test".into());
+        duplicate.origin_generation = Some(1);
+        ledger
+            .attempts
+            .insert("discovered:hla_test".into(), duplicate);
+        ledger.save(&fx.auth, "ws_test").unwrap();
+
+        let coord = fx.cancel();
+        let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let rows: Vec<_> = ledger
+            .attempts
+            .values()
+            .filter(|attempt| attempt.assignment_id.as_deref() == Some("hla_test"))
+            .collect();
+        assert_eq!(rows.len(), 1, "one claim keeps one custody row");
+        assert!(
+            rows[0].handoff.is_none(),
+            "duplicate delivery bookkeeping is not proof of non-delivery"
+        );
+        assert!(rows[0].retired_lane_guard);
+        let error = release_cancelled(&coord, "hla_test", &fx.state)
+            .expect_err("ambiguous delivery history must not release")
+            .to_string();
+        assert!(error.contains("cannot prove"), "{error}");
+        fx.assert_intact(&tip);
     }
 
     #[test]
