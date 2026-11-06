@@ -967,9 +967,10 @@ pub fn review_kickoff(
              pinned to the sha, and if the head moves the daemon sends a new review. File \
              the verdict: `cadence report file --task {issue} --kind verdict --file <f>` \
              with frontmatter `verdict: pass` or `verdict: revise` and `sha: {sha}`, the \
-             findings in the body. Include the actual policy class in `risk:`: `auto`, \
-             `human (<triggers>)` or `delegated (<triggers>)`, according to the change and \
-             repository rules, not the diff-size Risk above. An unattended PASS needs an \
+             findings in the body. Include the actual policy class in `risk:`: `auto` or \
+             `human (<triggers>)`, according to the change and repository rules, not the \
+             diff-size Risk above. `delegated` is not a verdict class: it names the \
+             daemon's `--delegated` approval check only (AGENTS.md). An unattended PASS needs an \
              explicit, genuinely eligible `risk: auto`; protected or sensitive work must \
              retain its actual classification and operator hold. Only you can file it, \
              and only for this head.",

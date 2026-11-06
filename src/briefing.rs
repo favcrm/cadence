@@ -539,7 +539,8 @@ pub fn briefing_body(
          ## Scope and stop\n\n\
          - Work the outcome in your task's acceptance, inside its stated scope.\n\
          \x20 Do not expand it (refactors, adjacent fixes, extra stages or agents)\n\
-         \x20 unless acceptance needs it; ask first.\n\
+         \x20 unless acceptance needs it; when it does, say why in the PR, and\n\
+         \x20 otherwise leave it as a follow-up (AGENTS.md Scope).\n\
          - Stop when acceptance is met and its required verification is done.\n\
          - Report blockers and scope changes as soon as they block you.\n\
          - Workspace procedures and your task's kickoff define what is required.\n\

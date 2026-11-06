@@ -33,7 +33,7 @@ A PR is auto-eligible under this allowlist only when every `scripts/**` path it 
 
 ### Mechanical path lists
 
-`delegable` feeds only the daemon's `--delegated` approval check, not the merge evaluator. It names files, not directories, wherever code is involved: nothing that builds, runs in the browser (`ui/**` is trigger 1: the board runs with the operator's session) or acts on the host. Gate inputs and the tests that prove gates are trigger 7.
+`delegable` feeds only the daemon's `--delegated` approval check (`docs/AUDIT.md`), not the merge evaluator. It names files, not directories, wherever code is involved: nothing that builds, runs in the browser (`ui/**` is trigger 1: the board runs with the operator's session) or acts on the host. Gate inputs and the tests that prove gates are trigger 7.
 
 - **delegable**: `src/issue/blocked.rs`, `src/issue/cli.rs`, `src/issue/context.rs`, `src/issue/groom.rs`, `src/issue/history.rs`, `src/issue/line_times.rs`, `src/issue/lint.rs`, `src/issue/retro.rs`, `src/issue/sprint.rs`, `src/issue/summary.rs`, `src/issue/sync.rs`, `src/issue/time.rs`, `src/issue/write.rs`, `src/cli/issue.rs`, `src/cli/milestone.rs`, `src/cli/project.rs`, `src/cli/status.rs`, `src/cli/overview.rs`, `src/cli/events.rs`, `src/cli/help.rs`, `docs/**`
 - **trigger1**: `src/peer.rs`, `src/daemon.rs`, `src/daemon/identity.rs`, `src/daemon/caller_rule.rs`, `src/daemon/slots_rpc.rs`, `src/adapter/pty/**`, `src/ui.rs`, `src/ui/**`, `ui/**`, `src/operator_auth.rs`, `src/tailnet_proof.rs`, `src/test_seam.rs`, `src/master_perm.rs`, `src/agent_uid/**`, `src/cli/agent_uid.rs`, `src/daemon/operator_rpc.rs`, `src/daemon/supervisor_grant.rs`, `src/daemon/installer_enrollment_wire.rs`, `src/platform/custody.rs`, `src/cli/platform.rs`, `src/bin/cadence-agent-exec/**`, `src/cli_actor.rs`, `src/board_identity.rs`, `src/device_login.rs`, `src/remote_auth.rs`, `src/remote_cli.rs`, `src/remote_enrollment.rs`, `src/remote_cli/**`, `src/remote_enrollment/**`, `src/remote_*_acceptance.rs`, `src/runner.rs`
@@ -82,7 +82,7 @@ identity (CAD-2081) is counted by the gate and its workflows are live; their rol
 in AGENTS.md "Review".
 
 ## Review count by diff (CAD-957)
-A PR whose every change qualifies under the one-review allowlist
+Under the default lean policy, a PR whose every change qualifies under the one-review allowlist
 (`docs/roles/one-review-paths.toml`, match rules in its header) needs
 one fresh-session review covering standards and spec. Under `strict`, everything else keeps two. This changes only the count:
 a `human` trigger still needs the operator, and the file is itself trigger 7.
