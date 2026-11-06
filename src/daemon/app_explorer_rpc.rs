@@ -15,6 +15,7 @@
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use super::*;
@@ -1224,7 +1225,9 @@ fn resolve_git_commit(url: &str, git_ref: &str) -> Result<String> {
     }
     // ls-remote resolves refs/tags/*, refs/heads/* and HEAD. A 40-hex
     // commit answers itself under HEAD only when it is the tip.
-    let tmp = tempfile::tempdir()?;
+    let tmp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let out = crate::issue::app_source::ls_remote(tmp.path(), url, git_ref)?;
     Ok(out)
 }

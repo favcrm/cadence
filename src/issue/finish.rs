@@ -32,6 +32,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+#[cfg(test)]
 use tempfile::TempDir;
 
 use crate::adapter::pty;

@@ -37,6 +37,7 @@
 //! refuses what the board must not do.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::os::unix::fs::PermissionsExt;
 
 use serde::de::{MapAccess, Visitor};
 use serde::Deserialize;
@@ -371,7 +372,10 @@ fn upload_path_ok(path: &str) -> bool {
 /// (`Source::Path`) only — a one-shot, not a reusable update URL. Shared
 /// by `workspace_upload` (install) and the CAD-1006 upgrade transport.
 fn stage_files(files: &[(String, String)]) -> Result<(tempfile::TempDir, String), HttpResp> {
-    let staging = match tempfile::tempdir() {
+    let staging = match tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+    {
         Ok(t) => t,
         Err(e) => return Err(err_response(500, &format!("staging dir failed: {e}"))),
     };

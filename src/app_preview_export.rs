@@ -7,6 +7,7 @@ use crate::daemon::{render_frame_html, SCREEN_KIT_CSS, SCREEN_KIT_VERSION};
 use crate::{Error, Result};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
@@ -286,6 +287,7 @@ fn capture_bounded<R: Read + Send + 'static>(
 fn run_producer(input: &[u8]) -> Result<Vec<u8>> {
     let temp = tempfile::Builder::new()
         .prefix("cad-fixture-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .map_err(|e| Error::internal(format!("create fixture runtime directory: {e}")))?;
     let script = temp.path().join("producer.mjs");

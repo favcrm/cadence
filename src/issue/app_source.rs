@@ -73,6 +73,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path};
 use std::process::{Command, Output};
@@ -271,7 +272,9 @@ fn check_dir(dir: &str) -> Result<()> {
 /// directory descriptor-relative. Every refusal is a plain `Err`; no
 /// record, journal or authority is touched.
 pub fn resolve(source: &SelectedGitSource) -> Result<ResolvedGitBundle> {
-    let tmp = tempfile::tempdir()?;
+    let tmp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let clone_dir = tmp.path().join("clone");
 
     // Full clone — no depth, no tags, no checkout yet.

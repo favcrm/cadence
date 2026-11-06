@@ -616,7 +616,9 @@ fn fetch_verified_with(
     runner: &str,
     source: cadence_agent::releases::HttpGh,
 ) -> Result<Verified> {
-    let scratch = tempfile::tempdir()?;
+    let scratch = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let asset = format!("cadence-{tag}-{target}.tar.gz");
     let sha_name = format!("{asset}.sha256");
     let tarball = scratch.path().join(&asset);

@@ -25,6 +25,7 @@
 //! source stays the original attachment.
 
 use std::io::Cursor;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -411,6 +412,7 @@ pub fn rasterize_svg(source: &[u8]) -> Result<(&'static str, Vec<u8>)> {
     let program = resolve_converter()?;
     let dir = tempfile::Builder::new()
         .prefix("cadence-svg-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .map_err(|e| Error::rejected(format!("staging the SVG render failed: {e}")))?;
     let input = dir.path().join("source.svg");

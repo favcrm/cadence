@@ -1,5 +1,7 @@
 //! Git and merge-evidence probes for `issue finish`.
 
+use std::os::unix::fs::PermissionsExt;
+
 use super::hosted::github_slug;
 use super::*;
 
@@ -162,7 +164,10 @@ pub(crate) fn patch_applied(root: &Path, tip: &str, into: &str) -> bool {
     if diff.is_empty() {
         return true;
     }
-    let Ok(tmp) = TempDir::new() else {
+    let Ok(tmp) = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+    else {
         return false;
     };
     let index = tmp.path().join("index");

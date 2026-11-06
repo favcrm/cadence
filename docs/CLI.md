@@ -781,6 +781,8 @@ coordination projection and credential scrub/scan, and builds the package.
 Independent package validation, comparison with the captured tracker inventory,
 and a final source-tracker recheck must pass before no-replace publication.
 Owned temporary capture and staging directories are cleaned on refusal.
+Capture scratch directories request owner-only `0700` at creation, before
+any tracker content is written; a more restrictive umask can narrow it.
 A source-change refusal is not an automatic retry.
 
 The coordination projection removes related private rows in one transaction

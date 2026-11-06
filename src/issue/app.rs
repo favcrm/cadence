@@ -39,6 +39,7 @@
 //! any byte is looked at.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -3013,7 +3014,9 @@ pub(crate) fn resolve_source(source: &str) -> Result<(PathBuf, Source, Option<te
             "app source {source} is a file — it names a folder or a git url"
         )));
     }
-    let tmp = tempfile::tempdir()?;
+    let tmp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let clone_dir = tmp.path().join("clone");
     let sha = clone_git(source, &clone_dir)?;
     Ok((
@@ -3192,7 +3195,9 @@ fn diff_report(name: &str, old_dir: &Path, new_files: &[(String, String)]) -> Re
         .filter(|(k, v)| old.get(*k).is_some_and(|o| o != *v))
         .map(|(k, _)| k)
         .collect();
-    let tmp = tempfile::tempdir()?;
+    let tmp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let (old_root, new_root) = (tmp.path().join("old"), tmp.path().join("new"));
     for (rel, text) in &old {
         let to = old_root.join(rel);
