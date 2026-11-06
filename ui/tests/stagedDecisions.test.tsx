@@ -40,8 +40,9 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const NeedsRail = (require("../src/features/home/NeedsRail") as typeof import("../src/features/home/NeedsRail")).default;
+const ConversationDecisions = (require("../src/features/app-shell/chat/ConversationDecisions") as typeof import("../src/features/app-shell/chat/ConversationDecisions")).default;
 const { resetTodoLocal, useHomeCount } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
-const { resetDecisions, useDecisions } = require("../src/features/decisions/useDecisions") as typeof import("../src/features/decisions/useDecisions");
+const { homeDecisions, useDecisions } = require("../src/features/decisions/useDecisions") as typeof import("../src/features/decisions/useDecisions");
 const { parseStagedRow } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
 
 // ---- a fake board: the staged list and the decide routes ----
@@ -69,12 +70,14 @@ const issueRow = (id: string) => ({
   input: { title: "Add the gift pack to the checklist", project: "OPS", priority: "high", body: "Every stockist asks." },
 });
 let actions: unknown[] = [];
+const scopedActions = new Map<string, Array<{ id: string; status: string; [key: string]: unknown }>>();
 let listStatus = 200;
 let listCalls = 0;
 const posts: { path: string; body: any }[] = [];
 let decideStatus: Record<string, number> = {};
 let decideThrows: Record<string, boolean> = {};
 let onDecide: ((id: string, verb: string) => void) | null = null;
+let onScopedDecide: ((conversation: string, id: string, verb: string) => void) | null = null;
 let hold: Promise<void> | null = null;
 let listHold: Promise<void> | null = null;
 /** The server records the decision, then the reply is lost. */
@@ -85,16 +88,22 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (url.pathname === "/api/assist/actions") {
     listCalls++;
     await listHold;
-    return listStatus === 200 ? json({ actions }) : json({ error: { code: "x" } }, listStatus);
+    const conversation = url.searchParams.get("conversation");
+    return listStatus === 200 ? json({ actions: conversation === null ? actions : scopedActions.get(conversation) ?? [] }) : json({ error: { code: "x" } }, listStatus);
   }
   const m = /^\/api\/assist\/actions\/([^/]+)\/(approve|deny)$/.exec(url.pathname);
   if (m && init?.method === "POST") {
-    posts.push({ path: url.pathname, body: JSON.parse(String(init.body ?? "{}")) });
+    posts.push({ path: url.pathname + url.search, body: JSON.parse(String(init.body ?? "{}")) });
     await hold;
-    if (lostReply[m[1]]) { onDecide?.(m[1], m[2]); throw new TypeError("network"); }
+    const record = () => {
+      const conversation = url.searchParams.get("conversation");
+      if (conversation === null) onDecide?.(m[1], m[2]);
+      else onScopedDecide?.(conversation, m[1], m[2]);
+    };
+    if (lostReply[m[1]]) { record(); throw new TypeError("network"); }
     if (decideThrows[m[1]]) throw new TypeError("network");
     const status = decideStatus[m[1]] ?? 200;
-    if (status === 200) onDecide?.(m[1], m[2]);
+    if (status === 200) record();
     return json(status === 200 ? { ok: true } : { error: { code: "refused" } }, status);
   }
   return json({});
@@ -159,7 +168,7 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
   await flush();
   const cards = () => Array.from(host.querySelectorAll('[data-need="staged_write"]')) as HTMLElement[];
   const badge = () => host.querySelector("[data-badge]")!.textContent;
-  const done = async () => { await React.act(async () => { root.unmount(); }); host.remove(); resetDecisions(); };
+  const done = async () => { await React.act(async () => { root.unmount(); }); host.remove(); homeDecisions.resetDecisions(); };
   return { host, cards, badge, done };
 }
 
@@ -467,7 +476,7 @@ listStatus = 200;
   actions = [];
   const w = await render();
   await flush(); await flush();
-  assert(!/Nothing needs you/.test(text(w.host)) && /Reading what needs you/.test(text(w.host)), "an unread list is not Nothing needs you");
+  assert(!/Nothing needs you/.test(text(w.host)) && w.host.querySelector('[role="alert"]'), "an unread list is reported as unavailable, not empty");
   listStatus = 200;
   await w.done();
 }
@@ -759,6 +768,186 @@ listStatus = 200;
   const sentence = noticeText({ outcome: "applied", title: bad("t") }, (e: string) => e);
   assert(sentence.split(PDI).length === 2 && sentence.endsWith(`${PDI}`), "in a sentence only our own terminator remains");
   await w.done();
+}
+
+// A staged action stays with its conversation, including across a late read
+// and when another conversation happens to use the same action id.
+{
+  actions = [customer("home", { title: "Home request" })];
+  scopedActions.set("conversation-a", [customer("same", { title: "Draft A" })]);
+  scopedActions.set("conversation-b", [customer("same", { title: "Draft B" })]);
+  onScopedDecide = (conversation, id, verb) => {
+    scopedActions.set(conversation, (scopedActions.get(conversation) ?? []).map((row) =>
+      row.id === id ? { ...row, status: verb === "approve" ? "approved" : "denied", decidedAt: Date.now(), result: verb === "approve" ? { ok: true } : null } : row,
+    ));
+  };
+  posts.length = 0;
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const pending = (_conversation: string, _waiting: boolean) => {};
+  const show = (conversation: string) => React.createElement(React.Fragment, null,
+    React.createElement(Badge, { needs: [], owner: true }),
+    React.createElement(ConversationDecisions, { key: conversation, conversation, revision: 0, onPendingChange: pending, onReview: () => {} }),
+  );
+  await React.act(async () => { root.render(show("conversation-a")); });
+  await settle(() => assert(text(host).includes("Draft A") && text(host.querySelector("[data-badge]")) === "1", "the conversation and Home show their own pending actions"));
+  await click(labelled(host.querySelector("[data-chat-staged]")!, "Review"));
+  await settle(() => assert(drawerEl() && text(drawerEl()).includes("Draft A"), "review opens the selected action"));
+
+  let releaseRead!: () => void;
+  listHold = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const reads = listCalls;
+  await React.act(async () => { win.dispatchEvent(new win.Event("focus")); });
+  await settle(() => assert(listCalls > reads, "a refresh is in flight"));
+  await React.act(async () => { root.render(show("conversation-b")); });
+  assert(!drawerEl(), "switching conversation closes the old review");
+  releaseRead(); listHold = null;
+  await settle(() => assert(text(host).includes("Draft B"), "the new conversation loads"));
+  assert(!text(host).includes("Draft A") && text(host.querySelector("[data-badge]")) === "1", "the late read cannot replace the new conversation or Home");
+
+  await click(labelled(host.querySelector("[data-chat-staged]")!, "Review"));
+  await settle(() => assert(drawerEl() && text(drawerEl()).includes("Draft B"), "the new review shows the correct subject"));
+  const clock = Date.now;
+  Date.now = () => clock() + 1_000;
+  try { await click(labelled(drawerEl()!, "Approve"), { quick: true }); }
+  finally { Date.now = clock; }
+  await settle(() => assert(!drawerEl() && text(host).includes("Applied"), "the recorded outcome is shown in the conversation"));
+  assert(posts.length === 1 && posts.map((post) => post.path).join("") === "/api/assist/actions/same/approve?conversation=conversation-b", "the decision carries the selected conversation");
+  assert(scopedActions.get("conversation-a")?.[0]?.status === "pending", "the other conversation remains pending");
+  assert(typeof actions[0] === "object" && actions[0] !== null && "status" in actions[0] && actions[0].status === "pending", "the Home action remains pending");
+  await React.act(async () => { root.unmount(); });
+  host.remove();
+  homeDecisions.resetDecisions();
+  scopedActions.clear();
+  onScopedDecide = null;
+}
+
+// An unresolved request survives switching away and back to its conversation.
+{
+  scopedActions.set("waiting-a", [customer("flight", { title: "Pending flight" })]);
+  scopedActions.set("waiting-b", [customer("other", { title: "Other conversation" })]);
+  onScopedDecide = (conversation, id) => {
+    scopedActions.set(conversation, (scopedActions.get(conversation) ?? []).map((row) =>
+      row.id === id ? { ...row, status: "approved", decidedAt: Date.now(), result: { ok: true } } : row,
+    ));
+  };
+  posts.length = 0;
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const show = (conversation: string) => React.createElement(ConversationDecisions, {
+    key: conversation, conversation, revision: 0, onPendingChange: () => {}, onReview: () => {},
+  });
+  const select = async (conversation: string) => {
+    await React.act(async () => { root.render(show(conversation)); });
+    await settle(() => assert(text(host).includes(conversation === "waiting-a" ? "Pending flight" : "Other conversation"), "selected conversation loaded"));
+  };
+  await select("waiting-a");
+  await click(labelled(host.querySelector("[data-chat-staged]")!, "Review"));
+  await settle(() => assert(drawerEl(), "flight opens"));
+  let finish!: () => void;
+  hold = new Promise<void>((resolve) => { finish = resolve; });
+  const clock = Date.now;
+  Date.now = () => clock() + 1_000;
+  try { await click(labelled(drawerEl()!, "Approve"), { quick: true }); }
+  finally { Date.now = clock; }
+  assert(posts.length === 1, "one approval is in flight");
+  await select("waiting-b");
+  await select("waiting-a");
+  await click(labelled(host.querySelector("[data-chat-staged]")!, "Review"));
+  await settle(() => assert(drawerEl(), "review reopens while the request is in flight"));
+  assert(labelled(drawerEl()!, "Deny")?.getAttribute("aria-disabled") === "true", "the in-flight approval prevents a conflicting denial after switching back");
+  Date.now = () => clock() + 1_000;
+  try { await click(labelled(drawerEl()!, "Deny"), { quick: true }); }
+  finally { Date.now = clock; }
+  assert(posts.length === 1, "a conflicting click does not submit");
+  finish(); hold = null;
+  await settle(() => assert(scopedActions.get("waiting-a")?.[0]?.status === "approved", "the original approval settled"));
+  await settle(() => assert(text(drawerEl()).includes("Applied"), "the reopened review shows the result"));
+  assert(!text(drawerEl()).includes("decided elsewhere"), "our own completed decision is not attributed elsewhere");
+  assert(posts.length === 1, "switching conversations did not submit another decision");
+  await React.act(async () => { root.unmount(); });
+  host.remove();
+  scopedActions.clear();
+  onScopedDecide = null;
+}
+
+// A lost reply while away remains uncertain until the owner checks, not resubmits.
+{
+  scopedActions.set("uncertain-a", [customer("uncertain", { title: "Uncertain flight" })]);
+  scopedActions.set("uncertain-b", [customer("other", { title: "Other conversation" })]);
+  decideThrows.uncertain = true;
+  posts.length = 0;
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const show = (conversation: string) => React.createElement(ConversationDecisions, {
+    key: conversation, conversation, revision: 0, onPendingChange: () => {}, onReview: () => {},
+  });
+  await React.act(async () => { root.render(show("uncertain-a")); });
+  await settle(() => assert(text(host).includes("Uncertain flight"), "uncertain action loaded"));
+  await click(labelled(host.querySelector("[data-chat-staged]")!, "Review"));
+  let finish!: () => void;
+  hold = new Promise<void>((resolve) => { finish = resolve; });
+  const clock = Date.now;
+  Date.now = () => clock() + 1_000;
+  try { await click(labelled(drawerEl()!, "Approve"), { quick: true }); }
+  finally { Date.now = clock; }
+  await React.act(async () => { root.render(show("uncertain-b")); });
+  finish(); hold = null;
+  await flush();
+  await React.act(async () => { root.render(show("uncertain-a")); });
+  await settle(() => assert(text(host).includes("Uncertain flight"), "uncertain action reloaded"));
+  await click(labelled(host.querySelector("[data-chat-staged]")!, "Review"));
+  await settle(() => assert(labelled(drawerEl()!, "Check again"), "the lost reply still requires checking"));
+  assert(!labelled(drawerEl()!, "Approve") && posts.length === 1, "the owner cannot resubmit an uncertain decision");
+  decideThrows = {};
+  await click(labelled(drawerEl()!, "Check again"));
+  await settle(() => assert(labelled(drawerEl()!, "Approve"), "a check showing it still pending permits a new decision"));
+  assert(posts.length === 1, "checking never resubmits");
+  await React.act(async () => { root.unmount(); });
+  host.remove();
+  scopedActions.clear();
+}
+
+// A private-session change clears retained attempts even while their view is absent.
+{
+  const { resetPrivateSession, allowPrivateReads } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
+  scopedActions.set("session-a", [customer("private", { title: "Previous session request" })]);
+  scopedActions.set("session-b", [customer("other", { title: "Other conversation" })]);
+  decideThrows.private = true;
+  posts.length = 0;
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const show = (conversation: string) => React.createElement(ConversationDecisions, {
+    key: conversation, conversation, revision: 0, onPendingChange: () => {}, onReview: () => {},
+  });
+  await React.act(async () => { root.render(show("session-a")); });
+  await settle(() => assert(text(host).includes("Previous session request"), "previous session action loaded"));
+  await click(labelled(host.querySelector("[data-chat-staged]")!, "Review"));
+  let finish!: () => void;
+  hold = new Promise<void>((resolve) => { finish = resolve; });
+  const clock = Date.now;
+  Date.now = () => clock() + 1_000;
+  try { await click(labelled(drawerEl()!, "Approve"), { quick: true }); }
+  finally { Date.now = clock; }
+  await React.act(async () => { root.render(show("session-b")); });
+  await React.act(async () => { resetPrivateSession(); allowPrivateReads(); });
+  scopedActions.set("session-a", [customer("private", { title: "New session request" })]);
+  finish(); hold = null;
+  await flush();
+  await React.act(async () => { root.render(show("session-a")); });
+  await settle(() => assert(text(host).includes("New session request"), "new session receives its own action"));
+  assert(!text(host).includes("Previous session request"), "no private row from the previous session is retained");
+  await click(labelled(host.querySelector("[data-chat-staged]")!, "Review"));
+  assert(labelled(drawerEl()!, "Approve")?.getAttribute("aria-disabled") !== "true", "the previous session's attempt does not block the new one");
+  assert(!labelled(drawerEl()!, "Check again"), "the previous session's uncertainty is not shown");
+  decideThrows = {};
+  await React.act(async () => { root.unmount(); });
+  host.remove();
+  scopedActions.clear();
 }
 
 console.log("staged decision checks passed");

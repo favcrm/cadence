@@ -5,7 +5,7 @@ import type { Agent, Overview } from "../../lib/types";
 import { kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
 import { ageText, failureReason, isolate, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
-import { clearNotice, markFailedSeen, useDecisions } from "../decisions/useDecisions";
+import { homeDecisions, useDecisions } from "../decisions/useDecisions";
 import AgentUpdates from "./AgentUpdates";
 import type { AgentUpdate } from "./agentUpdateModel";
 import { useTranslate } from "../../lib/locale";
@@ -108,11 +108,11 @@ export default function NeedsRail({
   const [showDecided, setShowDecided] = useState(false);
   const showTab = (next: "todo" | "updates") => {
     setTab(next);
-    if (next === "updates") clearNotice();
+    if (next === "updates") homeDecisions.clearNotice();
   };
   // Updates on screen is Updates viewed: a failed write stops asking for attention.
   useEffect(() => {
-    if (tab === "updates" && !collapsed) markFailedSeen();
+    if (tab === "updates" && !collapsed) homeDecisions.markFailedSeen();
   }, [tab, collapsed, staged.decided]);
   const stagedOpener = useRef<Element | null>(null);
   /** The detail closed: the opener if it is still there, else the rail. */
@@ -162,7 +162,7 @@ export default function NeedsRail({
       // Not an issue-backed item: the staged detail is the rail's own, on the same shell.
       const queue = cards.flatMap((n) => (n.action.type === "staged" ? [n.action.id] : []));
       stagedOpener.current = document.activeElement;
-      clearNotice();
+      homeDecisions.clearNotice();
       reviewOpening.current = true;
       setDrawer(false);
       setReview({ queue, at: Math.max(queue.indexOf(stagedCard.action.type === "staged" ? stagedCard.action.id : ""), 0) });
@@ -191,11 +191,14 @@ export default function NeedsRail({
       {!overview.data && overview.status !== "failed" && (
         <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
       )}
-      {/* Not read yet is not "nothing": a failed first read of the decisions says nothing. */}
+      {/* An unread or failed decision list is not an empty list. */}
       {overview.data && cards.length === 0 && decisionsOn && (staged.phase === "idle" || staged.phase === "loading") && (
         <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
       )}
-      {overview.data && cards.length === 0 && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading")) && (
+      {overview.data && cards.length === 0 && decisionsOn && staged.phase === "error" && (
+        <p className="px-3 py-2.5 text-label text-fail" role="alert">{t("The list couldn't be loaded. It will try again.")}</p>
+      )}
+      {overview.data && cards.length === 0 && !(decisionsOn && (staged.phase === "idle" || staged.phase === "loading" || staged.phase === "error")) && (
         <p className="px-3 py-3 text-label text-ink-400">{t("Nothing needs you. The team is working.")}</p>
       )}
       <ul className="todo-list">
@@ -367,6 +370,7 @@ export default function NeedsRail({
       {review !== null && (
         <StagedWriteDetail
           decisions={staged}
+          store={homeDecisions}
           queue={review.queue}
           at={review.at}
           readOnly={readOnly}

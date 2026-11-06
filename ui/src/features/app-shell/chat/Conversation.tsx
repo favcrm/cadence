@@ -99,6 +99,7 @@ import type { AppChat } from "./contract";
 import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
 import AssistantOperations from "./AssistantOperations";
+import ConversationDecisions from "./ConversationDecisions";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
@@ -677,11 +678,20 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const onSnapshot = useCallback(() => setStreamRevision((revision) => revision + 1), []);
   const operationScope = `${installId}\u0000${mode.contextId}`;
   const [operationState, setOperationState] = useState<{ scope: string; revision: number | null; pending: boolean } | null>(null);
+  const [stagedState, setStagedState] = useState<{ conversation: string; pending: boolean } | null>(null);
   const onOperationState = useCallback((pending: boolean, revision: number | null) => {
     setOperationState({ scope: operationScope, revision, pending });
-    onPendingDecision?.(pending);
-  }, [operationScope, onPendingDecision]);
+  }, [operationScope]);
+  const onStagedState = useCallback((conversation: string, pending: boolean) => {
+    setStagedState({ conversation, pending });
+  }, []);
   const operationsCurrent = operationState?.scope === operationScope && operationState.revision === streamRevision;
+  const operationPending = operationState?.scope === operationScope && operationState.pending;
+  const stagedPending = hosted && viewer.operator === true && !viewer.readOnly && convId !== null &&
+    stagedState?.conversation === convId && stagedState.pending;
+  useEffect(() => {
+    onPendingDecision?.(operationPending || stagedPending);
+  }, [onPendingDecision, operationPending, stagedPending]);
   const streamDown = streamLink !== "live" || !operationsCurrent;
   const [historyOpen, setHistoryOpen] = useState(false);
   // Client-side last-seen per conversation (CAD-1700). Opening a conversation
@@ -2022,6 +2032,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                   className="app-chat-history-row"
                   data-unread={unread || undefined}
                   onClick={() => {
+                    onCollapsed(false);
                     selectConversation(installId, c.id);
                     closeHistory();
                   }}
@@ -2257,6 +2268,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         })()}
       </ol>
       <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
+      {hosted && convId !== null && viewer.operator === true && !viewer.readOnly && (
+        <ConversationDecisions key={`${installId}\u0000${convId}`} conversation={convId} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
+      )}
       {unseen > 0 && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
           ↓ {jumpLabel(unseen, t)}
