@@ -2275,6 +2275,25 @@ fn full_access_requests_every_opt_in_scope_in_one_login() {
         action_dispatch::login_scopes(true, false, false, false, false),
         (true, false, false, false)
     );
+    assert_eq!(
+        action_dispatch::missing_full_access(&["cli.read".into(), "audit.approve".into()]),
+        vec![
+            "web.read",
+            "web.prepare",
+            "settings.read",
+            "settings.write",
+            "bridge.enroll",
+            "cloud_agent.read",
+            "cloud_agent.write",
+        ]
+    );
+    assert!(action_dispatch::missing_full_access(
+        &action_dispatch::FULL_ACCESS_SCOPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    )
+    .is_empty());
     assert_eq!(action_dispatch::login_granted_line(&[]), "none recorded");
     assert_eq!(
         action_dispatch::login_granted_line(&["cli.read".to_string(), "audit.approve".to_string()]),

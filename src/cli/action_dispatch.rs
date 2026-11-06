@@ -54,6 +54,29 @@ pub(super) fn login_scopes(
 
 /// The granted set, printed after login so a narrowed consent is visible
 /// immediately rather than surfacing later as an opaque 401.
+/// The scopes `--full-access` asks for, so login can name any the issuer
+/// withheld instead of leaving the gap to surface at the next verb
+/// (CAD-2213).
+pub(super) const FULL_ACCESS_SCOPES: &[&str] = &[
+    "web.read",
+    "web.prepare",
+    "settings.read",
+    "settings.write",
+    "bridge.enroll",
+    "cloud_agent.read",
+    "cloud_agent.write",
+    "audit.approve",
+];
+
+/// Requested-but-not-granted scopes, in the order above.
+pub(super) fn missing_full_access(capabilities: &[String]) -> Vec<&'static str> {
+    FULL_ACCESS_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| !capabilities.iter().any(|have| have == scope))
+        .collect()
+}
+
 pub(super) fn login_granted_line(capabilities: &[String]) -> String {
     if capabilities.is_empty() {
         "none recorded".to_string()
@@ -542,6 +565,16 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 grant.endpoint,
                 login_granted_line(grant.capabilities())
             ));
+            if *full_access {
+                let missing = missing_full_access(grant.capabilities());
+                if !missing.is_empty() {
+                    eprintln!(
+                        "warning: the issuer withheld {} — re-run `cadence login --full-access` \
+                         after the workspace grants it",
+                        missing.join(", ")
+                    );
+                }
+            }
             show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
             return Ok(0);
         }
