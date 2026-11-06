@@ -2,6 +2,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "bun:test";
 import { BOARD_MESSAGE_KIND } from "../src/contract.ts";
+import { CONTEXT_BUDGET_EXCEEDED_TEXT } from "../src/model.ts";
 import { projectedThreadEntries, threadEntries } from "../src/transcript.ts";
 
 const input = (
@@ -452,6 +453,41 @@ describe("board transcript identity", () => {
       expect(reason("read 14031 bytes then failed")).toBe(
         "The model request failed.",
       );
+    });
+
+    it("names the trusted context-budget refusal with the exact actionable message", () => {
+      const entries = entriesWithoutTime(
+        [input("1", "hi"), failed("2", CONTEXT_BUDGET_EXCEEDED_TEXT)],
+        false,
+      );
+      expect(entries[1]).toEqual({
+        seq: 2,
+        role: "agent",
+        kind: "turn_result",
+        text: "",
+        payload: { status: "failed", error: CONTEXT_BUDGET_EXCEEDED_TEXT },
+      });
+    });
+
+    it("keeps look-alike provider text generic and private", () => {
+      const projected = failures([
+        failed(
+          "2",
+          "upstream context_budget_exceeded at https://gw.internal for 273589 bytes",
+        ),
+        input("3", "again"),
+      ]);
+      expect(projected[0]?.payload?.error).toBe("The model request failed.");
+      expect(JSON.stringify(projected)).not.toContain("gw.internal");
+      expect(JSON.stringify(projected)).not.toContain("273589");
+    });
+
+    it("still hides an overflow error while a recovery is in progress", () => {
+      expect(
+        failures([
+          failed("2", "prompt is too long: 300000 tokens > 200000 maximum"),
+        ]),
+      ).toEqual([]);
     });
 
     it("does not surface an aborted turn", () => {

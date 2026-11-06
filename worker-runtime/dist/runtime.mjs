@@ -56388,16 +56388,32 @@ function boundImageHistory(input, maxImages, notice = "[An image was omitted fro
   };
 }
 var IMAGE_REFUSED_NOTICE = "[An image was omitted because the selected model cannot read images.]";
+var CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded";
+var CONTEXT_BUDGET_EXCEEDED_TEXT = "The context limit was reached. Start a fresh conversation or split the task and retry.";
 var PUBLIC_MODEL_REFUSALS = new Set([
-  IMAGE_INPUT_UNAVAILABLE
+  IMAGE_INPUT_UNAVAILABLE,
+  CONTEXT_BUDGET_EXCEEDED
 ]);
+function gatewayError(body) {
+  if (typeof body !== "object" || body === null || !("error" in body))
+    return null;
+  const failure = body.error;
+  if (typeof failure !== "object" || failure === null || Array.isArray(failure))
+    return null;
+  return {
+    code: "code" in failure ? failure.code : undefined,
+    type: "type" in failure ? failure.type : undefined
+  };
+}
 async function publicRefusal(response) {
   if (response.ok || !response.headers.get("content-type")?.includes("json"))
     return null;
   try {
-    const body = await response.clone().json();
-    const code = typeof body === "object" && body !== null && "error" in body ? body.error?.code : undefined;
-    return typeof code === "string" && PUBLIC_MODEL_REFUSALS.has(code) ? code : null;
+    const failure = gatewayError(await response.clone().json());
+    const code = failure?.code;
+    if (typeof code !== "string" || !PUBLIC_MODEL_REFUSALS.has(code))
+      return null;
+    return code === CONTEXT_BUDGET_EXCEEDED && (response.status !== 400 || failure?.type !== "invalid_request_error") ? null : code;
   } catch {
     return null;
   }
@@ -56405,7 +56421,12 @@ async function publicRefusal(response) {
 function withRefusalCode(response, code) {
   if (code === null)
     return response;
-  return Response.json({ error: { code, message: code } }, { status: response.status });
+  return Response.json({
+    error: {
+      code,
+      message: code === CONTEXT_BUDGET_EXCEEDED ? CONTEXT_BUDGET_EXCEEDED_TEXT : code
+    }
+  }, { status: response.status });
 }
 function hasImage(content) {
   return Array.isArray(content) && content.some((part) => typeof part === "object" && part !== null && ("type" in part) && part.type === "image_url");
@@ -57161,6 +57182,8 @@ function failedTurnReason(errorMessage) {
     return "billing_unavailable";
   if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
     return "The selected model cannot read images.";
+  if (raw.trim() === CONTEXT_BUDGET_EXCEEDED_TEXT)
+    return CONTEXT_BUDGET_EXCEEDED_TEXT;
   if (TIMEOUT.test(raw))
     return "The model request timed out.";
   if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))

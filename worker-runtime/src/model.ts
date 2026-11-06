@@ -243,26 +243,63 @@ const IMAGE_REFUSED_NOTICE =
   "[An image was omitted because the selected model cannot read images.]";
 
 /**
+ * The AgenticOS gateway's structured refusal when a request exceeds a trusted
+ * hosted size budget. It is terminal: the text below matches neither pi-ai's
+ * retry patterns nor its context-overflow classifier, so the engine fails the
+ * turn instead of compacting, retrying or making another paid call. The marker
+ * is gate-agnostic: the gateway may emit it for the serialized context or for
+ * the fully translated request (including images), and the runtime handles
+ * both the same way. A fresh conversation, or a split task, is the safe next
+ * step.
+ */
+export const CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded";
+export const CONTEXT_BUDGET_EXCEEDED_TEXT =
+  "The context limit was reached. Start a fresh conversation or split the task and retry.";
+
+/**
  * Gateway refusal codes the runtime may name. Anything else stays private: the
- * engine reports a generic failure rather than provider or gateway text.
+ * engine reports a generic failure rather than provider or gateway text. The
+ * context budget is the only one that must also arrive as the gateway's own
+ * structured 400 (`error.type` `invalid_request_error`); the rest name a
+ * provider-side refusal however it arrives.
  */
 const PUBLIC_MODEL_REFUSALS: ReadonlySet<string> = new Set([
   IMAGE_INPUT_UNAVAILABLE,
+  CONTEXT_BUDGET_EXCEEDED,
 ]);
+
+/** One JSON gateway error's own `error` object, when it has one. */
+function gatewayError(
+  body: unknown,
+): { code?: unknown; type?: unknown } | null {
+  if (typeof body !== "object" || body === null || !("error" in body))
+    return null;
+  const failure: unknown = body.error;
+  if (typeof failure !== "object" || failure === null || Array.isArray(failure))
+    return null;
+  return {
+    code: "code" in failure ? failure.code : undefined,
+    type: "type" in failure ? failure.type : undefined,
+  };
+}
 
 /** The refusal code of a JSON gateway error, when it is an allowlisted one. */
 async function publicRefusal(response: Response): Promise<string | null> {
   if (response.ok || !response.headers.get("content-type")?.includes("json"))
     return null;
   try {
-    const body: unknown = await response.clone().json();
-    const code =
-      typeof body === "object" && body !== null && "error" in body
-        ? (body.error as { code?: unknown } | null)?.code
-        : undefined;
-    return typeof code === "string" && PUBLIC_MODEL_REFUSALS.has(code)
-      ? code
-      : null;
+    const failure = gatewayError(await response.clone().json());
+    const code = failure?.code;
+    if (typeof code !== "string" || !PUBLIC_MODEL_REFUSALS.has(code))
+      return null;
+    // The context budget is the gateway's own policy refusal, not a provider's:
+    // its exact status and error type keep a look-alike code from a provider
+    // private. Any other status (such as the 512 KiB read limit) is a different
+    // refusal, so it is left untouched and stays generic.
+    return code === CONTEXT_BUDGET_EXCEEDED &&
+      (response.status !== 400 || failure?.type !== "invalid_request_error")
+      ? null
+      : code;
   } catch {
     return null;
   }
@@ -270,13 +307,21 @@ async function publicRefusal(response: Response): Promise<string | null> {
 
 /**
  * Carry an allowlisted refusal code into the engine's private error text, so
- * the failed turn names it. The gateway's own message is dropped, and any other
- * response passes through unchanged.
+ * the failed turn names it. A named refusal's own text replaces the gateway's:
+ * for the context budget that text is the terminal, actionable message. No
+ * response outside the allowlist changes, and nothing here retries or reissues
+ * the request.
  */
 function withRefusalCode(response: Response, code: string | null): Response {
   if (code === null) return response;
   return Response.json(
-    { error: { code, message: code } },
+    {
+      error: {
+        code,
+        message:
+          code === CONTEXT_BUDGET_EXCEEDED ? CONTEXT_BUDGET_EXCEEDED_TEXT : code,
+      },
+    },
     { status: response.status },
   );
 }

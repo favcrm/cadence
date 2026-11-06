@@ -7,6 +7,7 @@ import {
   type ThreadProjection,
 } from "./contract.ts";
 import { IMAGE_INPUT_UNAVAILABLE } from "./image-limits.ts";
+import { CONTEXT_BUDGET_EXCEEDED_TEXT } from "./model.ts";
 import { appPayload, parseEntryAppScope } from "./operation-scope.ts";
 
 /** The private engine's default retry.maxRetries: attempts 1..3 retry. */
@@ -29,6 +30,10 @@ function failedTurnReason(errorMessage: string | undefined): string {
   if (raw.includes("billing_unavailable")) return "billing_unavailable";
   if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
     return "The selected model cannot read images.";
+  // Only the runtime's own exact terminal message is named: provider text that
+  // merely mentions the code stays generic and private.
+  if (raw.trim() === CONTEXT_BUDGET_EXCEEDED_TEXT)
+    return CONTEXT_BUDGET_EXCEEDED_TEXT;
   if (TIMEOUT.test(raw)) return "The model request timed out.";
   if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
     return "The model service could not be reached.";
