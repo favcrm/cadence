@@ -122,6 +122,18 @@ ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 # kind each may fill. Read at main's LIVE tip, not the PR's base (which can lag).
 WORKFLOW_PRINCIPALS_FILE = "docs/roles/review-workflow-principals.toml"
 WORKFLOW_KINDS = ("standards", "spec-security")
+# CAD-2192: the axis a review of each kind actually judges. A pass clears one
+# reviewer's earlier non-pass only when it covers every axis the non-pass named,
+# so a Browser QA failure survives a later Standards pass (and a Standards pass no
+# longer clears a Spec/security revise). `combined` exists to cover both code
+# axes at once. A pass of an unmapped kind (e.g. `other`) covers no axis, so a
+# non-pass of one is cleared only by a later pass of that same kind.
+KIND_AXES = {
+    "standards": frozenset({"standards"}),
+    "spec-security": frozenset({"spec-security"}),
+    "combined": frozenset({"standards", "spec-security"}),
+    "browser-qa": frozenset({"browser-qa"}),
+}
 # The review standard is a fresh-session review (AGENTS.md "Review", CAD-1946), which
 # this gate cannot yet enforce. Refusals for a missing or shared reviewer point at
 # the temporary exception and the standard.
@@ -960,7 +972,8 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
 
     Every head-pinned note counts toward a refusal, whatever its kind or file
     name: a non-pass note refuses unless the SAME reviewer has a later-stamped
-    pass of a recognised kind, and an unstamped non-pass note always refuses.
+    pass that covers its own axes (CAD-2192: `combined` covers both code axes,
+    Browser QA only itself), and an unstamped non-pass note always refuses.
     Notes are ordered by the file-name stamp, never mtime.
 
     `hosted` is `{"repo": owner/name}` when the document came from the org.
@@ -1002,13 +1015,24 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
         by_reviewer.setdefault(identity(v), []).append(v)
     for who, notes in sorted(by_reviewer.items()):
         stamped = [n for n in notes if n["stamp"]]
-        passes = [n for n in stamped if n["outcome"] == "pass" and n["kind"] != "other"]
+        passes = [n for n in stamped if n["outcome"] == "pass"]
         for n in notes:
             if n["outcome"] == "pass":
                 continue
-            if (n["stamp"] and not is_workflow_row(n)
-                    and any(p["stamp"] > n["stamp"] for p in passes)):
-                continue  # superseded by a later pass of this reviewer; a workflow row is final
+            # CAD-2192: a later pass supersedes only what it re-reviewed. A
+            # Browser QA failure is cleared by Browser QA, not by the same
+            # reviewer's Standards pass, and `combined` still covers both code
+            # axes. A row of an unmapped kind names no axis, so only a pass of
+            # that same kind can show it was re-reviewed: unknown never
+            # inherits another kind's clearance, and it is not stuck forever.
+            axes = KIND_AXES.get(n["kind"])
+            covered = any(
+                p["stamp"] > n["stamp"]
+                and (p["kind"] == n["kind"] if axes is None
+                     else axes <= KIND_AXES.get(p["kind"], frozenset()))
+                for p in passes)
+            if n["stamp"] and not is_workflow_row(n) and covered:
+                continue  # superseded by a later pass of this reviewer that covers the same axes; a workflow row is final
             if accepted is not None and is_workflow_row(n) and n["stamp"]:
                 continue  # CAD-2197: the operator read this finding and accepted it at this head
             why = "" if n["stamp"] else "; the file name has no stamp, so it cannot be ordered"
@@ -1174,9 +1198,10 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
     if need_qa and not by("browser-qa"):
         reasons.append(f"a ui/ change needs a pass Browser QA verdict for {issue} pinned to this head, from someone other than the author; "
                        "the review workflows file only Standards and Spec/security, so they cannot supply it; "
-                       "on hosted, agents file no Browser QA verdict: post the findings as a PR comment and use it "
-                       "as the browser-qa advisory under --exception, or name it with --browser-qa "
-                       "(AGENTS.md \"Review\")")
+                       "on hosted, a non-author repository member posts a new comment whose whole body is the two "
+                       "lines `Browser QA: pass` and `Head: <this head>`, and the gate names that comment with "
+                       "--browser-qa <comment url> (the report goes in a different comment); the --exception "
+                       "browser-qa advisory link is the temporary route instead (AGENTS.md \"Review\")")
     return reasons, counted
 
 

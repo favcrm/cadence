@@ -689,8 +689,11 @@ During implementation and handoff:
   verdicts count by attested principal (the author's is refused) and local notes by
   their self-declared `From:` alias. On hosted, agents file no verdict: post
   findings as a PR comment (AGENTS.md "Review"); a local note's alias proves nothing. In the Cadence
-  repository itself, merges use the temporary `--exception --advisory ...`
-  path (exact-head operator approval and two advisory links, plus browser-qa for a `ui/` change) until
+  repository itself, the enqueue counts GitHub-attested workflow rows for Standards and
+  Spec/security (CAD-2088); a `ui/` change also needs a non-author member's comment whose
+  whole body is `Browser QA: pass` and `Head: <head>`, named with `--browser-qa <url>`.
+  The temporary `--exception --advisory ...` path (exact-head operator approval and two
+  advisory links) remains for a head that cannot produce the workflow rows and ends at
   `EXCEPTION_ENDS` (2026-12-31); it checks only that the links are separate https URLs.
   A second attested human is not required.
 - Make review converge. First inspect the complete change against acceptance;
