@@ -590,11 +590,12 @@ stops an actor, an older command already in flight, or a client using a
 different ledger.
 
 Automatic release of a guarded lane also requires **provenance**: the claim must
-have been taken by this client's local-agent protocol and the ledger must record
-no kickoff reserved or delivered for that claim generation. Current clients write
-that claim-scoped record when they take the claim. Legacy rows, external
-`--profile` sessions and any claim with a recorded kickoff are unknown history:
-the client refuses to delete the lane, keeps the guard, and names the manual
+have been acquired new by this client's local-agent protocol and the ledger must
+record no kickoff reserved or delivered for that claim generation. The record is
+written when the claim is acquired; replaying a claim that was already on the
+board — legacy, another ledger or a restart — leaves the history unknown. Legacy
+rows, external `--profile` sessions and any claim with a recorded kickoff are
+therefore refused: the client keeps the guard and lane and names the manual
 removal commands. Provenance covers this ledger's own protocol only — an external
 writer, another machine's ledger or an older client that already acted remains
 unknown, so establish that no actor is still using the lane before any manual
@@ -609,8 +610,8 @@ new work is started.
 
 A cancellation that interrupts lane reservation before the worktree path was
 recorded can be reconciled only with that provenance and only when the expected
-checkout path — derived from the recorded repository and lane name — is absent
-and no longer registered with Git:
+checkout — derived from the repository root recorded with the reservation and
+the lane name — is absent and no longer registered with Git:
 
 ```sh
 cadence --org <name> agent reconcile-release <assignment-id>

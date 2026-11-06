@@ -56,6 +56,23 @@ mod bridge_tests {
             AgentAction::Disconnect.bridge(),
             Some(local_agent::LocalAgentAction::Disconnect)
         ));
+        // The hosted bridge keeps the release opt-in and its default; deleting
+        // this assertion lost that mapping check once already.
+        for release_lane in [false, true] {
+            assert!(matches!(
+                AgentAction::Reassign {
+                    assignment: "a1".into(),
+                    to: None,
+                    cancel: true,
+                    release_lane,
+                }
+                .bridge(),
+                Some(local_agent::LocalAgentAction::Reassign {
+                    release_lane: expected,
+                    ..
+                }) if expected == release_lane
+            ));
+        }
         assert!(AgentAction::List {
             all: false,
             state: vec![],
