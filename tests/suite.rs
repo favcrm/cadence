@@ -948,6 +948,7 @@ mod cad2081_workflow_verdicts {
                 "approved_head": case.approved_head, "no_qa_evidence": case.no_qa_evidence,
                 "board_asks_qa": case.board_asks_qa, "qa_evidence_url": case.qa_evidence_url,
                 "accepts_revise": case.accepts_revise,
+                "accept_comment_without_findings": case.accept_comment_without_findings,
                 "identities": if case.no_identity_map { Value::Null } else {
                     case.identities.clone().unwrap_or_else(Self::identities) },
             });
@@ -1008,6 +1009,7 @@ mod cad2081_workflow_verdicts {
         board_asks_qa: bool,
         qa_evidence_url: Option<String>,
         accepts_revise: Option<Value>,
+        accept_comment_without_findings: bool,
     }
 
     fn scenario(rows: Vec<Value>) -> Scenario {
@@ -1033,6 +1035,7 @@ mod cad2081_workflow_verdicts {
             board_asks_qa: false,
             qa_evidence_url: None,
             accepts_revise: None,
+            accept_comment_without_findings: false,
         }
     }
 
@@ -1331,6 +1334,24 @@ mod cad2081_workflow_verdicts {
                 head.as_str(),
             ],
         );
+    }
+
+    #[test]
+    fn an_acceptance_comment_that_omits_the_finding_names_refuses() {
+        let f = Fixture::new();
+        let head = f.touch("docs/x.md");
+        let mut revise = f.spec();
+        revise["outcome"] = json!("revise");
+        revise["title_outcome"] = json!("revise");
+        revise["section_outcome"] = json!("revise");
+        revise["name"] = json!("20261103-000150-spec.md");
+        revise["stamp"] = json!("20261103-000150");
+        let mut case = scenario(vec![f.std(), revise]);
+        case.class = "consequential";
+        case.head = Some(head.clone());
+        case.accepts_revise = Some(json!({"head": head}));
+        case.accept_comment_without_findings = true;
+        refused(&f, case, "required delivery evidence");
     }
 
     #[test]
