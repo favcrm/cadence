@@ -1,0 +1,28 @@
+# Verbs whose hosted-org refusal needs more than the generic message (CAD-2180).
+# Kept beside its only reader rather than under docs/roles: that tree is
+# operator-owned and git-ignored, and this is client message data, not a merge rule.
+#
+# The generic message is the default and stays true: a verb that reaches the
+# hosted refusal is not implemented for hosted orgs in this build, and
+# `cadence commands --all` lists what is. A row here exists only when the
+# caller needs a fact the default cannot give: that the verb is planned (so
+# upgrade and retry), or that it is local-only (so stop), and which supported
+# verb to use instead.
+#
+# `path` is the exact `cadence <path>` the caller typed; the test refuses a
+# row whose path is not a real command. `class` is `planned` or `local-only`.
+# A `planned` row names the ticket that will add it. `alternative`, when
+# present, must be a real command path that is not itself a row here — a
+# refusal may never send the caller to another refusal.
+
+[[verb]]
+path = "issue edit"
+class = "planned"
+ticket = "CAD-2202"
+alternative = "issue comment"
+
+[[verb]]
+path = "issue acceptance"
+class = "planned"
+ticket = "CAD-2202"
+alternative = "issue comment"

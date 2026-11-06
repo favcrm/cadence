@@ -2388,11 +2388,11 @@ fn team_for(
     }
 }
 
-/// The rows in `docs/roles/hosted-verbs.toml` (CAD-2180): the verbs whose
+/// The rows in `hosted-verbs.toml` (CAD-2180): the verbs whose
 /// hosted refusal needs a fact the generic message cannot give. Every other
 /// refusal keeps the default — not implemented for a remote org in this
 /// build — and names `cadence commands --all`, which is a real answer.
-const HOSTED_VERBS_TOML: &str = include_str!("../../docs/roles/hosted-verbs.toml");
+const HOSTED_VERBS_TOML: &str = include_str!("hosted-verbs.toml");
 
 #[derive(serde::Deserialize)]
 struct HostedVerbs {
@@ -2413,8 +2413,7 @@ struct HostedVerb {
 fn hosted_verbs() -> &'static HostedVerbs {
     static TABLE: std::sync::OnceLock<HostedVerbs> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
-        toml::from_str(HOSTED_VERBS_TOML)
-            .expect("docs/roles/hosted-verbs.toml is a valid verb table")
+        toml::from_str(HOSTED_VERBS_TOML).expect("src/cli/hosted-verbs.toml is a valid verb table")
     })
 }
 
@@ -5065,7 +5064,7 @@ mod read_contract_tests {
         let rows = hosted_verbs();
         assert!(
             !rows.verb.is_empty(),
-            "docs/roles/hosted-verbs.toml has no rows"
+            "src/cli/hosted-verbs.toml has no rows"
         );
         let gaps: std::collections::HashSet<&str> =
             rows.verb.iter().map(|row| row.path.as_str()).collect();
