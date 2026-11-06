@@ -11840,7 +11840,7 @@ fn cad2207_assist_notice_requires_delivery_receipt_and_live_share() {
             .messages(alias)
             .unwrap()
             .into_iter()
-            .filter(|message| {
+            .rfind(|message| {
                 message.source == "assist_job_event"
                     && fx
                         .shared
@@ -11849,7 +11849,6 @@ fn cad2207_assist_notice_requires_delivery_receipt_and_live_share() {
                         .unwrap()
                         .is_some()
             })
-            .next_back()
             .unwrap_or_else(|| panic!("no delivered notice for '{alias}'"))
     };
     let ben_before = notice_count(&ben.alias);
