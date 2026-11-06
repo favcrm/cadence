@@ -1368,13 +1368,6 @@ fn ticket_seq(value: u64, flag: &str) -> Result<u64> {
     }
 }
 
-/// CAD-1568: `send`/`message send` → `message_send` arguments. Exactly
-/// `{alias, text, message}` crosses the wire — three strings, the same
-/// recipient + body + stable-id the local `agent_send` call would take,
-/// minus every surface that cannot ride the remote envelope faithfully.
-/// Sender identity lives only in the verified envelope; no flag in this
-/// build may name a sender, a role, or a different recipient class.
-#[allow(clippy::too_many_arguments)]
 /// Explain a refusal that a narrowed consent caused (CAD-2213): the credential
 /// is valid, it simply never asked for `scope`. Only the uncertain 401 is
 /// enriched — an authorization, availability or mutation-uncertain refusal
@@ -1397,6 +1390,13 @@ fn scope_hint(error: Error, capabilities: &[String], scope: &str, hint: &str) ->
          then repeat the command"
     ))
 }
+/// CAD-1568: `send`/`message send` → `message_send` arguments. Exactly
+/// `{alias, text, message}` crosses the wire — three strings, the same
+/// recipient + body + stable-id the local `agent_send` call would take,
+/// minus every surface that cannot ride the remote envelope faithfully.
+/// Sender identity lives only in the verified envelope; no flag in this
+/// build may name a sender, a role, or a different recipient class.
+#[allow(clippy::too_many_arguments)]
 fn remote_send_args(
     recipient: &str,
     text: &Option<String>,

@@ -2243,7 +2243,7 @@ fn full_access_requests_every_opt_in_scope_in_one_login() {
     assert!(help.contains("--full-access"), "{help}");
 
     // A fresh command: rendering help mutates the one above.
-    let mut fresh = Cli::command();
+    let fresh = Cli::command();
     let matches = fresh
         .try_get_matches_from(["cadence", "login", "--full-access"])
         .unwrap();
