@@ -480,8 +480,16 @@ impl Shared {
     /// resolve, so a row naming an issue the tracker does not know is dropped
     /// when there is a tracker and kept when there is not.
     pub(super) fn project_scope(&self, peer_pid: u32, verb: &str) -> Result<Option<ProjectScope>> {
-        if self.pm().is_err() {
-            return Ok(None);
+        match self.pm() {
+            // No tracker at all: there are no project records, so there is no
+            // private project, and nothing to scope. This is the only absence
+            // that is not a refusal — an unreadable or malformed tracker is an
+            // answer we cannot give, and refuses.
+            Err(Error::Rejected(message)) if message.starts_with("No PM dir at ") => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {}
         }
         Ok(Some((
             self.readable_projects(peer_pid, verb)?,
