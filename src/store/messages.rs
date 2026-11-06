@@ -983,15 +983,11 @@ impl Store {
     /// write transaction. The receipt binds the exact message id, effect id,
     /// member assistant tuple, target alias and body digest; `INSERT OR
     /// IGNORE` keeps the first receipt so delivery stays at-most-once.
-    pub fn enqueue_daemon_effect_notice(
+    pub(crate) fn enqueue_daemon_effect_notice(
         &self,
-        alias: &str,
+        owner: &super::effects::EffectMemberOwner,
         body: &str,
         id: &str,
-        effect_id: &str,
-        org: &str,
-        sub: &str,
-        assistant_id: &str,
         task_id: Option<&str>,
     ) -> Result<(bool, String)> {
         let daemon_id = format!("{}{}-", crate::proto::DAEMON_MESSAGE_PREFIX, "effect");
@@ -1004,7 +1000,7 @@ impl Store {
             let tx = &mut *conn;
             let out = self.enqueue_tx_as(
                 &tx,
-                alias,
+                &owner.alias,
                 body,
                 None,
                 id,
@@ -1026,11 +1022,11 @@ impl Store {
                  VALUES(?,?,?,?,?,?,?,?)",
                 params![
                     id,
-                    effect_id,
-                    org,
-                    sub,
-                    assistant_id,
-                    alias,
+                    owner.effect_id,
+                    owner.org,
+                    owner.sub,
+                    owner.assistant_id,
+                    owner.alias,
                     crate::operator_auth::digest(body),
                     now()
                 ],

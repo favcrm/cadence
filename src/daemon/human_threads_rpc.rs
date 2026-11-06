@@ -460,9 +460,8 @@ impl Shared {
                     let visible =
                         match self.room_post_author(post.sender_uid.as_deref(), &post.sender)? {
                             super::members_rpc::RoomPostAuthor::Ordinary => true,
-                            super::members_rpc::RoomPostAuthor::Private(binding) => {
-                                binding.org == current.scope.organization_id
-                                    && binding.sub == current.subject
+                            super::members_rpc::RoomPostAuthor::Private { org, sub, .. } => {
+                                org == current.scope.organization_id && sub == current.subject
                             }
                             super::members_rpc::RoomPostAuthor::Unproven => false,
                         };

@@ -138,7 +138,11 @@ pub(super) enum RoomPostAuthor {
     /// A resolved non-assistant sender (human, operator, ordinary agent).
     Ordinary,
     /// A member's personal assistant, by its durable binding row.
-    Private(crate::store::AssistantBinding),
+    Private {
+        org: String,
+        sub: String,
+        alias: String,
+    },
     /// Sender provenance could not be proved either way.
     Unproven,
 }
@@ -600,14 +604,22 @@ impl Shared {
         if let Some(uid) = sender_uid {
             if let Some(alias) = self.store.alias_of_uid(uid)? {
                 return Ok(match self.store.assistant_for_alias(&alias)? {
-                    Some(binding) => RoomPostAuthor::Private(binding),
+                    Some(binding) => RoomPostAuthor::Private {
+                        org: binding.org,
+                        sub: binding.sub,
+                        alias: binding.alias,
+                    },
                     None => RoomPostAuthor::Ordinary,
                 });
             }
         }
         if !stored_sender.is_empty() {
             return Ok(match self.store.assistant_for_alias(stored_sender)? {
-                Some(binding) => RoomPostAuthor::Private(binding),
+                Some(binding) => RoomPostAuthor::Private {
+                    org: binding.org,
+                    sub: binding.sub,
+                    alias: binding.alias,
+                },
                 None => RoomPostAuthor::Ordinary,
             });
         }
@@ -1284,14 +1296,14 @@ impl Shared {
                 // assistant. A `sys-` id only proves envelope minting, the
                 // "daemon" label can collide with an agent alias, and job
                 // membership/reply_to prove no owner consent — so all are
-                // refused. The only unstamped exception is the separately
-                // revalidated `assist_job_event` branch above.
-                return Err(Error::rejected(format!(
+                // refused. The only unstamped exceptions are the separately
+                // revalidated job and effect notices above.
+                Err(Error::rejected(format!(
                     "member message '{}' refused: a bound assistant's unstamped turn has \
                      no durable member-approved assignment or sharing receipt — it cannot \
                      run as the member (CAD-2207)",
                     message.id
-                )));
+                )))
             }
         }
     }

@@ -1260,27 +1260,10 @@ impl Shared {
             match owner.as_ref() {
                 Some(owner) => self
                     .store
-                    .enqueue_daemon_effect_notice(
-                        &to,
-                        &body,
-                        &id,
-                        &row.effect_id,
-                        &owner.org,
-                        &owner.sub,
-                        &owner.assistant_id,
-                        row.task.as_deref(),
-                    )
+                    .enqueue_daemon_effect_notice(owner, &body, &id, row.task.as_deref())
                     .or_else(|_| {
-                        self.store.enqueue_daemon_effect_notice(
-                            &to,
-                            &body,
-                            &id,
-                            &row.effect_id,
-                            &owner.org,
-                            &owner.sub,
-                            &owner.assistant_id,
-                            None,
-                        )
+                        self.store
+                            .enqueue_daemon_effect_notice(owner, &body, &id, None)
                     })
                     .is_ok(),
                 None => false,

@@ -187,8 +187,8 @@ impl Shared {
                     let shown =
                         match self.room_post_author(post.sender_uid.as_deref(), &post.sender)? {
                             super::members_rpc::RoomPostAuthor::Ordinary => true,
-                            super::members_rpc::RoomPostAuthor::Private(binding) => {
-                                binding.alias == reader
+                            super::members_rpc::RoomPostAuthor::Private { alias, .. } => {
+                                alias == reader
                             }
                             super::members_rpc::RoomPostAuthor::Unproven => false,
                         };
