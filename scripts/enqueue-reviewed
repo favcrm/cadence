@@ -2057,10 +2057,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         if args.browser_qa:
             evidence["browser_qa"] = args.browser_qa
         if accepted_revise is not None:
-            evidence["accepted_revise"] = accepted_revise
-        if accepted_revise is not None:
             evidence["accepted_revise"] = dict(accepted_revise,
-                                                findings=accepted_findings)
+                                               findings=accepted_findings)
         if args.exception:
             evidence["exception"] = {"ends": ends, "advisory": dict(args.advisory),
                                      "waives_readiness": waives_readiness}
