@@ -2388,11 +2388,63 @@ fn team_for(
     }
 }
 
+/// The rows in `docs/roles/hosted-verbs.toml` (CAD-2180): the verbs whose
+/// hosted refusal needs a fact the generic message cannot give. Every other
+/// refusal keeps the default — not implemented for a remote org in this
+/// build — and names `cadence commands --all`, which is a real answer.
+const HOSTED_VERBS_TOML: &str = include_str!("../../docs/roles/hosted-verbs.toml");
+
+#[derive(serde::Deserialize)]
+struct HostedVerbs {
+    #[serde(default)]
+    verb: Vec<HostedVerb>,
+}
+
+#[derive(serde::Deserialize)]
+struct HostedVerb {
+    path: String,
+    class: String,
+    #[serde(default)]
+    ticket: Option<String>,
+    #[serde(default)]
+    alternative: Option<String>,
+}
+
+fn hosted_verbs() -> &'static HostedVerbs {
+    static TABLE: std::sync::OnceLock<HostedVerbs> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        toml::from_str(HOSTED_VERBS_TOML)
+            .expect("docs/roles/hosted-verbs.toml is a valid verb table")
+    })
+}
+
+fn hosted_gap(path: &str) -> Option<&'static HostedVerb> {
+    hosted_verbs().verb.iter().find(|row| row.path == path)
+}
+
 fn unavailable(command_path: Option<&str>) -> Error {
+    let path = command_path.unwrap_or("<command>");
+    let listed = "`cadence commands --all` lists every verb this client offers.";
+    if let Some(gap) = hosted_gap(path) {
+        let alternative = gap
+            .alternative
+            .as_deref()
+            .map(|alt| format!(" Use `cadence {alt}` today."))
+            .unwrap_or_default();
+        let case = match gap.class.as_str() {
+            "planned" => format!(
+                "it is planned ({})",
+                gap.ticket.as_deref().unwrap_or("no ticket")
+            ),
+            _ => "it is local-only and will not be sent to a remote org".to_string(),
+        };
+        return Error::rejected(format!(
+            "`cadence {path}` is not available on a remote org in this build: {case}; \
+             nothing was sent.{alternative} {listed}"
+        ));
+    }
     Error::rejected(format!(
-        "`cadence {}` is not available on a remote org in this build; nothing was sent. \
-         Check the hosted CLI documentation for available alternatives.",
-        command_path.unwrap_or("<command>")
+        "`cadence {path}` is not available on a remote org in this build; nothing was sent. {listed}"
     ))
 }
 
@@ -4990,6 +5042,81 @@ mod read_contract_tests {
         })
         .unwrap_err();
         assert!(err.contains("not available on a remote org"), "{err}");
+    }
+
+    fn collect_paths(cmd: &clap::Command, prefix: &mut Vec<String>, out: &mut Vec<String>) {
+        for sub in cmd.get_subcommands() {
+            if sub.get_name() == "help" {
+                continue;
+            }
+            prefix.push(sub.get_name().to_string());
+            out.push(prefix.join(" "));
+            collect_paths(sub, prefix, out);
+            prefix.pop();
+        }
+    }
+
+    #[test]
+    fn hosted_verb_rows_name_real_commands_and_supported_alternatives() {
+        let root = super::super::help::root_command(false);
+        let mut paths = Vec::new();
+        collect_paths(&root, &mut Vec::new(), &mut paths);
+        let real: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+        let rows = hosted_verbs();
+        assert!(
+            !rows.verb.is_empty(),
+            "docs/roles/hosted-verbs.toml has no rows"
+        );
+        let gaps: std::collections::HashSet<&str> =
+            rows.verb.iter().map(|row| row.path.as_str()).collect();
+        for row in &rows.verb {
+            assert!(
+                real.contains(row.path.as_str()),
+                "{} is not a command",
+                row.path
+            );
+            assert!(
+                matches!(row.class.as_str(), "planned" | "local-only"),
+                "{}: unknown class {}",
+                row.path,
+                row.class
+            );
+            if row.class == "planned" {
+                let ticket = row.ticket.as_deref().unwrap_or("");
+                let numbered = ticket
+                    .strip_prefix("CAD-")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+                assert!(numbered, "{}: planned without a ticket", row.path);
+            }
+            if let Some(alt) = &row.alternative {
+                assert!(
+                    real.contains(alt.as_str()),
+                    "{}: alternative {alt} is not a command",
+                    row.path
+                );
+                assert!(
+                    !gaps.contains(alt.as_str()),
+                    "{}: alternative {alt} is itself a gap",
+                    row.path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_planned_verb_refusal_names_its_ticket_and_a_supported_alternative() {
+        let message = unavailable(Some("issue edit")).to_string();
+        assert!(message.contains("`cadence issue edit`"), "{message}");
+        assert!(message.contains("planned (CAD-2202)"), "{message}");
+        assert!(message.contains("`cadence issue comment`"), "{message}");
+        assert!(message.contains("nothing was sent"), "{message}");
+        let generic = unavailable(Some("ui")).to_string();
+        assert!(
+            generic.contains("not available on a remote org"),
+            "{generic}"
+        );
+        assert!(generic.contains("cadence commands --all"), "{generic}");
+        assert!(generic.contains("nothing was sent"), "{generic}");
     }
 
     #[test]
