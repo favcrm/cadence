@@ -56,15 +56,6 @@ mod bridge_tests {
             AgentAction::Disconnect.bridge(),
             Some(local_agent::LocalAgentAction::Disconnect)
         ));
-        assert!(matches!(
-            AgentAction::Reassign {
-                assignment: "a1".into(),
-                to: None,
-                cancel: true,
-            }
-            .bridge(),
-            Some(local_agent::LocalAgentAction::Reassign { .. })
-        ));
         assert!(AgentAction::List {
             all: false,
             state: vec![],
@@ -772,7 +763,14 @@ pub(crate) enum AgentAction {
         to: Option<String>,
         #[arg(long)]
         cancel: bool,
+        /// After cancellation, try to release its merged, clean, idle lane.
+        /// Cancellation does not stop the actor, even if release is refused.
+        #[arg(long, requires = "cancel", conflicts_with = "to")]
+        release_lane: bool,
     },
+    /// Clear a local release guard for an already absent, unregistered lane.
+    /// Does not delete a branch or verify merge evidence.
+    ReconcileRelease { assignment: String },
     /// Report a claim this machine already holds.
     Report {
         assignment: String,
@@ -845,10 +843,15 @@ impl AgentAction {
                 assignment,
                 to,
                 cancel,
+                release_lane,
             } => L::Reassign {
                 assignment: assignment.clone(),
                 to: to.clone(),
                 cancel: *cancel,
+                release_lane: *release_lane,
+            },
+            Self::ReconcileRelease { assignment } => L::ReconcileRelease {
+                assignment: assignment.clone(),
             },
             Self::Report {
                 assignment,
@@ -1357,10 +1360,11 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
         | AgentAction::Assignments
         | AgentAction::Disconnect
         | AgentAction::Reassign { .. }
+        | AgentAction::ReconcileRelease { .. }
         | AgentAction::Report { .. }
         | AgentAction::Tool { .. } => {
             return Err(Error::usage(
-                "agent connect/watch/assignments/disconnect/reassign/directory/notify/inbox/report/tool require a selected hosted org. Nothing was sent or claimed.",
+                "agent connect/watch/assignments/disconnect/reassign/reconcile-release/directory/notify/inbox/report/tool require a selected hosted org. Nothing was sent or claimed.",
             ))
         }
     };

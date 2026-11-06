@@ -92,7 +92,12 @@ pub(crate) enum LocalAgentAction {
         to: Option<String>,
         #[arg(long)]
         cancel: bool,
+        /// After cancellation, try to release its merged, clean, idle lane.
+        #[arg(long, requires = "cancel", conflicts_with = "to")]
+        release_lane: bool,
     },
+    /// Clear a local guard for an already absent, unregistered lane.
+    ReconcileRelease { assignment: String },
     /// Save one optional legacy tool/publisher credential; does not activate tooling.
     Tool {
         /// Legacy `provider.draft` or `publish.send`; normal account images need neither.
@@ -279,7 +284,45 @@ pub(super) fn run(
             assignment,
             to,
             cancel,
-        } => coord.reassign(assignment, to.as_deref(), *cancel)?,
+            release_lane,
+        } => {
+            if *release_lane && (!*cancel || to.is_some()) {
+                return Err(Error::usage(
+                    "--release-lane requires --cancel and cannot be used with --to",
+                ));
+            }
+            let state = if *release_lane {
+                Some(
+                    local_state
+                        .clone()
+                        .map(Ok)
+                        .unwrap_or_else(cadence_agent::client::state_dir)?,
+                )
+            } else {
+                None
+            };
+            let cancelled = coord.reassign(assignment, to.as_deref(), *cancel)?;
+            if let Some(state) = state {
+                let released = cadence_agent::local_assignment::finish_guidance::release_cancelled(
+                    &coord, assignment, &state,
+                )
+                .map_err(|error| Error::unknown(format!(
+                    "Assignment {assignment} was cancelled; cancellation does not stop the actor. \
+                     Guarded lane release did not report success: {error}. Inspect the lane before \
+                     retrying; if it still exists and the refusal is resolved, run \
+                     `cadence --org {} issue finish <issue-id>` for this assignment's recorded issue. Do not repeat cancellation.",
+                    target.org
+                )))?;
+                json!({ "assignment": cancelled, "release": released })
+            } else {
+                cancelled
+            }
+        }
+        LocalAgentAction::ReconcileRelease { assignment } => {
+            cadence_agent::local_assignment::finish_guidance::reconcile_absent_guard(
+                &coord, assignment,
+            )?
+        }
         LocalAgentAction::Tool { lane } => coord.authorize_tool(lane)?,
     };
     finish(&value)
