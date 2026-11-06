@@ -3240,6 +3240,10 @@ impl Shared {
                 let deliveries = self.store.open_delivery_summary()?;
                 let listed_agents = self.store.agents()?;
                 let aliases: Vec<String> = listed_agents.iter().map(|a| a.alias.clone()).collect();
+                // CAD-2215: an agent row carries the issues its tasks serve.
+                // A project the caller's policy does not admit contributes no
+                // issue id, and one that resolves to no project is withheld.
+                let scope = self.project_scope(peer_pid, "agent list")?;
                 // CAD-96/CAD-1239: one grouped read for the operational
                 // aliases only; archived rows are never enriched.
                 let markers = self
@@ -3266,7 +3270,15 @@ impl Shared {
                     // The alias's current non-terminal task assignments —
                     // derived from tasks.assignee, never stored.
                     j["tasks"] = json!(open_tasks.remove(&agent.alias).unwrap_or_default());
-                    j["lane_issues"] = json!(lane_issues.remove(&agent.alias).unwrap_or_default());
+                    let mut issues = lane_issues.remove(&agent.alias).unwrap_or_default();
+                    if let Some((readable, project_of_issue)) = scope.as_ref() {
+                        issues.retain(|issue: &String| {
+                            project_of_issue
+                                .get(issue)
+                                .is_some_and(|project| readable.contains(project))
+                        });
+                    }
+                    j["lane_issues"] = json!(issues);
                     j["capabilities"] =
                         registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
                     j["native_turn_steering_enabled"] = json!(
@@ -3790,12 +3802,12 @@ impl Shared {
             "member_job_share" => self.rpc_member_job_share(params, peer_pid),
             "member_job_reconcile" => self.rpc_member_job_reconcile(params, peer_pid),
             "job_list" => self.rpc_job_list(params, peer_pid),
-            "job_show" => self.rpc_job_show(params),
+            "job_show" => self.rpc_job_show(params, peer_pid),
             "job_events" => self.rpc_job_events(params),
             "job_cancel" => self.rpc_job_cancel(params),
             "job_close" => self.rpc_job_close(params),
             "task_new" => self.rpc_task_new(params),
-            "task_show" => self.rpc_task_show(params),
+            "task_show" => self.rpc_task_show(params, peer_pid),
             "task_dispatch" => self.rpc_task_dispatch(params),
             "cloud_probe" => self.rpc_cloud_probe(params),
             "task_verdict" => self.rpc_task_verdict(params, peer_pid),
@@ -3810,8 +3822,8 @@ impl Shared {
             "memory_classify" => self.rpc_memory_classify(params, peer_pid),
             "memory_feedback" => self.rpc_memory_feedback(params, peer_pid),
             "monitor_register" => self.rpc_monitor_register(params, peer_pid),
-            "monitor_list" => self.rpc_monitor_list(),
-            "monitor_show" => self.rpc_monitor_show(params),
+            "monitor_list" => self.rpc_monitor_list(peer_pid),
+            "monitor_show" => self.rpc_monitor_show(params, peer_pid),
             "monitor_heartbeat" => self.rpc_monitor_heartbeat(params, peer_pid),
             "monitor_alerts" => self.rpc_monitor_alerts(params),
             "monitor_alert_ack" => self.rpc_monitor_alert_ack(params),
@@ -4073,7 +4085,7 @@ impl Shared {
             // dispatch. Options is the form catalog for the same gate.
             "issue_kickoff" => self.rpc_issue_kickoff(params, peer_pid),
             "issue_kickoff_options" => self.rpc_issue_kickoff_options(params, peer_pid),
-            "lane_show" => self.rpc_lane_show(params),
+            "lane_show" => self.rpc_lane_show(params, peer_pid),
             "lane_ask" => self.rpc_lane_ask(params, peer_pid),
             "lane_instruct" => self.rpc_lane_instruct(params, peer_pid),
             "lane_interrupt" => self.rpc_lane_interrupt(params, peer_pid),
@@ -4094,9 +4106,14 @@ impl Shared {
             "staging_delegate" => self.rpc_staging_delegate(params, peer_pid),
             "staging_revoke" => self.rpc_staging_revoke(params, peer_pid),
             "staging_delegations" => self.rpc_staging_delegations(),
-            "project_work_approvals" => Ok(json!({
-                "approvals": self.store.work_approvals()?,
-            })),
+            "project_work_approvals" => {
+                // CAD-2215: the map is keyed by project, so an unadmitted
+                // project contributes no entry and no approval payload.
+                let readable = self.readable_projects(peer_pid, "project_work_approvals")?;
+                let mut approvals = self.store.work_approvals()?;
+                approvals.retain(|key, _| readable.contains(key));
+                Ok(json!({ "approvals": approvals }))
+            }
             "workflow_approve" => self.rpc_workflow_approve(params, peer_pid),
             "app_local_install_approve" => self.rpc_app_local(method, params, peer_pid),
             "app_local_install_revoke" => self.rpc_app_local(method, params, peer_pid),
