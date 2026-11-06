@@ -714,12 +714,15 @@ pub(crate) fn approval_answer(body: &Value, binding: &GateBinding) -> Result<(Va
         let id = text(body, "approval_id", verb)?;
         let source = text(body, "source", verb)?;
         let via = text(body, "recorded_via", verb)?;
-        return Ok((
-            json!({"state": "in-force", "approval_id": id, "source": source,
-                   "action": "merge", "recorded_via": via, "verified": false,
-                   "note": crate::audit::APPROVAL_UNVERIFIED}),
-            0,
-        ));
+        let mut doc = json!({"state": "in-force", "approval_id": id, "source": source,
+                             "action": "merge", "recorded_via": via, "verified": false,
+                             "note": crate::audit::APPROVAL_UNVERIFIED});
+        // CAD-2209: the board's head-pinned revise acceptance rides the same
+        // answer; dropping it here is what kept the gate's lift unreachable.
+        if let Some(accepts) = body.get("accepts_revise").filter(|v| v.is_object()) {
+            doc["accepts_revise"] = accepts.clone();
+        }
+        return Ok((doc, 0));
     }
     if body.get("approval_id").is_some() {
         return Err(refuse(format!(
@@ -727,7 +730,11 @@ pub(crate) fn approval_answer(body: &Value, binding: &GateBinding) -> Result<(Va
         )));
     }
     let reason = text(body, "reason", verb)?;
-    Ok((json!({"state": state, "reason": reason}), 1))
+    let mut doc = json!({"state": state, "reason": reason});
+    if let Some(accepts) = body.get("accepts_revise").filter(|v| v.is_object()) {
+        doc["accepts_revise"] = accepts.clone();
+    }
+    Ok((doc, 1))
 }
 
 /// `cadence audit scope` for a hosted org: `(document, exit code)` in the
@@ -1692,6 +1699,39 @@ mod tests {
         assert_eq!(doc["action"], "merge");
         assert_eq!(doc["recorded_via"], "operator-connection");
         assert_eq!(doc["verified"], false);
+    }
+
+    #[test]
+    fn approval_passes_the_acceptance_row_through_in_both_states() {
+        // CAD-2209: the gate reads `accepts_revise` off this answer; dropping
+        // it is what kept the CAD-2197 lift unreachable on a real board.
+        let acceptance = json!({"approval_id": "accept-1", "project": "cadence",
+                                "issue": "CAD-1", "repo": "favcrm/cadence", "pr": 7,
+                                "head_sha": HEAD, "action": "accept-revise",
+                                "source": "operator read it", "recorded_via": "hosted-owner-login"});
+        let mut with_acceptance = in_force();
+        with_acceptance["accepts_revise"] = acceptance.clone();
+        let (doc, code) = approval_answer(&with_acceptance, &binding()).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(doc["accepts_revise"], acceptance);
+        // The missing state carries the same row — an acceptance can exist
+        // with no merge approval.
+        let missing = json!({"state": "missing", "project": "cadence", "issue": "CAD-1",
+                             "reason": "no merge approval", "accepts_revise": acceptance});
+        let (doc, code) = approval_answer(&missing, &binding()).unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(doc["accepts_revise"], acceptance);
+        // Absent or non-object stays absent: a board that predates the field
+        // and a null both answer exactly as before.
+        for accepts in [Value::Null, json!("not-a-row")] {
+            let mut body = in_force();
+            body["accepts_revise"] = accepts;
+            let (doc, _) = approval_answer(&body, &binding()).unwrap();
+            assert!(doc.get("accepts_revise").is_none());
+        }
+        let bare = in_force();
+        let (doc, _) = approval_answer(&bare, &binding()).unwrap();
+        assert!(doc.get("accepts_revise").is_none());
     }
 
     #[test]
