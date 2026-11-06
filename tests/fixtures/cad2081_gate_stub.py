@@ -93,8 +93,14 @@ def cadence():
             body += f"Browser QA comment: {S['qa_evidence_url']}\n"
         acceptance = S.get("accepts_revise")
         if acceptance and acceptance.get("head", S["head"]) == S["head"]:
+            finding_names = sorted(v["name"] for v in S["verdicts"]
+                                   if v.get("identity_source") == "workflow-oidc"
+                                   and v.get("outcome") != "pass")
             body += (f"Accepted workflow revise: {acceptance.get('approval_id', 'accept-1')}"
-                     f" at {S['head'][:12]}\n")
+                     f" at {S['head'][:12]}")
+            if finding_names and not S.get("accept_comment_without_findings"):
+                body += f"; findings {', '.join(finding_names)}"
+            body += "\n"
         out({"id": "CAD-1", "project": "cadence", "owner": None, "claim": None,
              "comments": [{"body": body}]})
     if ARGS[:2] == ["delivery", "requirements"]:

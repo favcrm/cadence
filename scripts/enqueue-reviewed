@@ -1816,6 +1816,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             report.append(f"acceptance not used: {acceptance_why}")
 
     verdicts, counted = [], []
+    accepted_findings = []
     origin = "local"
     main_tip, has_workflow = "", False
     if issue:
@@ -1953,10 +1954,15 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             required_comment_evidence.append(f"Browser QA comment: {args.browser_qa}")
             if not two_workflow_reviews(counted, hosted):
                 reasons.append("--browser-qa also needs a pass from both review workflows at this head")
+        accepted_findings = sorted(
+            {v["name"] for v in verdicts
+             if is_workflow_row(v) and v["outcome"] != "pass"})
         if accepted_revise is not None:
             report.append("accepted workflow revise: "
                           + str(accepted_revise.get("approval_id"))
-                          + f" at {head[:12]} (source {accepted_revise.get('source')!r})")
+                          + f" at {head[:12]} (source {accepted_revise.get('source')!r})"
+                          + (f"; findings {', '.join(accepted_findings)}"
+                             if accepted_findings else ""))
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
 
     # CAD-2197: a workflow revise that was not accepted is final, and the operator
@@ -2030,9 +2036,12 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                 rs = []
         reasons += rs
     if accepted_revise is not None:
+        # CAD-2201: the comment names the finding that was accepted, not only the
+        # id, so a reader of the evidence can tell what the operator read.
         required_comment_evidence.append(
             "Accepted workflow revise: " + str(accepted_revise.get("approval_id"))
-            + f" at {head[:12]}")
+            + f" at {head[:12]}"
+            + (f"; findings {', '.join(accepted_findings)}" if accepted_findings else ""))
     if require_comment:
         if approval_evidence.get("approval"):
             required_comment_evidence.append("Operator approval id: " + approval_evidence["approval"])
@@ -2048,7 +2057,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         if args.browser_qa:
             evidence["browser_qa"] = args.browser_qa
         if accepted_revise is not None:
-            evidence["accepted_revise"] = accepted_revise
+            evidence["accepted_revise"] = dict(accepted_revise,
+                                               findings=accepted_findings)
         if args.exception:
             evidence["exception"] = {"ends": ends, "advisory": dict(args.advisory),
                                      "waives_readiness": waives_readiness}

@@ -3241,6 +3241,29 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
             )?;
             printed((receipt, 0))
         }
+        Commands::Audit {
+            action:
+                Some(AuditAction::Findings {
+                    pr,
+                    head,
+                    issue,
+                    project,
+                    kind,
+                    repo,
+                }),
+            ..
+        } => {
+            let head = super::audit::full_head(head)?;
+            let repo = repo_or_origin(repo)?;
+            let project = Some(project.clone());
+            let doc = hosted_gate::findings(
+                target,
+                wake_timeout,
+                &binding(&project, &repo, issue.trim(), *pr, &head)?,
+                kind.as_deref(),
+            )?;
+            printed((doc, 0))
+        }
         Commands::Issue {
             action:
                 cadence_agent::issue::cli::IssueAction::Project {

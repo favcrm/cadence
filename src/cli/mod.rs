@@ -646,6 +646,14 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
                  so there is nothing to accept. Nothing was recorded",
             ));
         }
+        // CAD-2201: findings are a workflow row's text, and a local org files
+        // no workflow rows. The verb is hosted-only and says so.
+        AuditAction::Findings { .. } => {
+            return Err(Error::rejected(
+                "audit findings is hosted-only: a local org files no workflow review rows. \
+                 Nothing was read",
+            ));
+        }
         AuditAction::Designate {
             alias,
             project,
