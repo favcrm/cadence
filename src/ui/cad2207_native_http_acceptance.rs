@@ -12,11 +12,12 @@
 //! REAL signed SSO exchange that mints the human's `__Host-aos-board-session`
 //! cookie, and a REAL separate OS process (a spawned shell) that opens its
 //! own TCP connection and sends the member POST. Attribution is the
-//! production `/proc` one: the process is recorded exactly as a live pane
-//! endpoint is (alias, pid, the pid's `/proc` start time, endpoint kind
-//! `pty`, a generation). No `X-Cadence-Test-As` assertion header and no
-//! caller-chosen environment alias is used as identity evidence anywhere in
-//! this check.
+//! production `/proc` one: the member runtime's own managed `pi` endpoint row
+//! is given the process exactly as the daemon records a launched endpoint —
+//! `Store::set_identity` inside the guarded writer lane (alias, pid, the
+//! pid's `/proc` start time, a generation) — never a raw store write. No
+//! `X-Cadence-Test-As` assertion header and no caller-chosen environment
+//! alias is used as identity evidence anywhere in this check.
 //!
 //! The bypass this pins: the daemon's `agent_list` now withholds a member's
 //! private assistant row from every caller but that assistant itself. A
@@ -44,6 +45,7 @@
 #![cfg(all(test, feature = "test-seam"))]
 
 use super::super::{start, Rig};
+use crate::adapter::Identity;
 use crate::daemon::team_assistants_refusal::AssistantFlagOn;
 use crate::daemon::ServeOptions;
 use crate::store::NewAgent;
@@ -51,16 +53,15 @@ use crate::test_seam::{scoped, Asserted};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 
 /// The alias the member's stored binding names (the fixture's
 /// `start(&["alice"])` binds exactly this), asserted by the positive control
 /// before any attribution decision below.
 const PRIVATE_ALIAS: &str = "assist-agent-alice";
-/// The endpoint generation a live pane row records. `agent_roots` treats a
-/// `pty` row without one as no root at all, so a fixture that omitted it
-/// would attribute nothing.
-const PANE_GENERATION: &str = "cad2207-fixture-generation";
+/// The endpoint generation recorded with the process, exactly as an adapter
+/// `open` records one (`agent_operational` carries it so a restart's snapshot
+/// is partitionable). The board's attribution uses the pid, not a generation.
+const ENDPOINT_GENERATION: &str = "cad2207-fixture-generation";
 /// A nonmember alias that must stay observable in the same fixture, so an
 /// empty list or an over-broad filter cannot pass as the private-row filter.
 const ORDINARY_ALIAS: &str = "cad2207-ordinary-worker";
@@ -76,7 +77,8 @@ cat <&3
 /// A real, separate process that will make the request as the member's
 /// private assistant. It inherits no Cadence identity: `env_clear` removes
 /// `CADENCE_ALIAS`, `CADENCE_TEST_AS` and the seam arming variable, so its
-/// only claim to a caller is the pane row the daemon records below.
+/// only claim to a caller is the managed endpoint row the daemon records
+/// below.
 fn spawn_private_assistant(rig: &Rig, token: &str) -> Child {
     Command::new("/bin/bash")
         .arg("-s")
@@ -203,8 +205,14 @@ fn private_member_assistant_process_cannot_ride_a_humans_board_session() {
     rig.assert_authority_wire(&token, "state");
 
     // ---- The private member-assistant PROCESS -----------------------------
-    // A separate OS process that has not connected yet; its pid and start
-    // time are recorded exactly as the daemon records a live pane endpoint.
+    // A separate OS process that has not connected yet. The member's runtime
+    // row — registered by the positive control as provider `pi`, endpoint kind
+    // `managed`, exactly the runtime a bound member assistant gets — is given
+    // that process through the store's own guarded `set_identity`, the same
+    // API an adapter `open` uses: it records the pid, the pid's `/proc` start
+    // time and a generation inside the arming writer lane. The store's sealed
+    // authorizer refuses raw DML from an unarmed connection, so no fixture SQL
+    // is attempted here.
     let private = spawn_private_assistant(&rig, &token);
     let pid = private.id();
     let pid_start = crate::peer::proc_starttime(pid)
@@ -216,29 +224,29 @@ fn private_member_assistant_process_cannot_ride_a_humans_board_session() {
         .set("CADENCE_PM_DIR", rig.pm.to_str().unwrap());
     let shared = crate::daemon::Shared::new(&state, &options)
         .expect("the fixture cannot open a second daemon view");
-    {
-        let conn = shared.store.try_conn().expect("the fixture store is busy");
-        // Another connection writes the row the daemon records on open; it
-        // may briefly contend with the live daemon's writer.
-        let _ = conn.busy_timeout(Duration::from_secs(10));
-        let changed = conn
-            .execute(
-                "UPDATE agents SET endpoint_kind='pty', generation=?, pid=?, \
-                 pid_start=?, endpoint=? WHERE alias=?",
-                rusqlite::params![
-                    PANE_GENERATION,
-                    pid as i64,
-                    pid_start as i64,
-                    format!("pty:{pid}"),
-                    PRIVATE_ALIAS,
-                ],
-            )
-            .expect("the fixture cannot record the private process as its assistant's pane");
-        assert_eq!(
-            changed, 1,
-            "the positive control did not register the assistant runtime row this fixture binds"
+    let runtime = shared
+        .store
+        .agent_opt(PRIVATE_ALIAS)
+        .expect("the fixture store is busy")
+        .expect(
+            "the positive control did not register the assistant runtime row this fixture binds",
         );
-    }
+    shared
+        .store
+        .set_identity(
+            PRIVATE_ALIAS,
+            &Identity {
+                thread_id: runtime.thread_id.clone().unwrap_or_default(),
+                session_id: runtime.session_id.clone().unwrap_or_default(),
+                model: runtime.model.clone(),
+                effort: runtime.effort.clone(),
+                pid,
+                endpoint: None,
+                generation: Some(ENDPOINT_GENERATION.to_string()),
+                attach: None,
+            },
+        )
+        .expect("the fixture cannot record the private process as the member runtime's managed endpoint");
     shared
         .store
         .register_agent(&NewAgent {
@@ -301,8 +309,8 @@ fn private_member_assistant_process_cannot_ride_a_humans_board_session() {
         "the operational projection names another pid: {row}"
     );
     assert_eq!(row["pid_start"].as_u64(), Some(pid_start), "{row}");
-    assert_eq!(row["endpoint_kind"], "pty", "{row}");
-    assert_eq!(row["generation"], PANE_GENERATION, "{row}");
+    assert_eq!(row["endpoint_kind"], "managed", "{row}");
+    assert_eq!(row["generation"], ENDPOINT_GENERATION, "{row}");
 
     // ---- THE BAD CASE -----------------------------------------------------
     // The real private assistant process now sends the same member POST with
