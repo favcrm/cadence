@@ -1533,7 +1533,9 @@ fn store_enqueue_rechecks_a_bound_target_for_a_generic_topic_post() {
             None,
             None,
             None,
-            Some(bound_post.as_str()),
+            Some(crate::store::TopicRequestPost::Existing(
+                bound_post.as_str(),
+            )),
         )
         .expect_err("a stale bound target was queued into a generic topic request");
     assert_eq!(
@@ -1591,7 +1593,9 @@ fn store_enqueue_rechecks_a_bound_target_for_a_generic_topic_post() {
             None,
             None,
             None,
-            Some(ordinary_post.as_str()),
+            Some(crate::store::TopicRequestPost::Existing(
+                ordinary_post.as_str(),
+            )),
         )
         .expect("an ordinary target's request-enqueue was refused");
     assert!(

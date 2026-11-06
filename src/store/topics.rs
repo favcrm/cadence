@@ -52,7 +52,7 @@ fn visible_topic_recipient(alias: &str, uid: &str) -> String {
     )
 }
 
-fn refuse_private_topic_uid(conn: &impl StoreConn, uid: &str) -> Result<()> {
+pub(super) fn refuse_private_topic_uid(conn: &impl StoreConn, uid: &str) -> Result<()> {
     let restricted = conn.query_opt(
         "SELECT 1 FROM agents g JOIN assistants a ON a.alias=g.alias WHERE g.uid=?1
          UNION SELECT 1 FROM assistant_event_fences f WHERE f.agent_uid=?1
@@ -161,6 +161,23 @@ pub struct TopicDelivery {
     pub alias: String,
     pub message: Option<String>,
     pub state: String,
+}
+
+/// CAD-2207: how one queued request binds to a topic transcript post.
+///
+/// `Existing` is a post its caller already committed in its own transaction
+/// (a human room's member-authorized Ask). `New` is a generic operator Ask
+/// whose post must be inserted in the same write transaction as the queue row
+/// and the request binding, so a refusal leaves no post, delivery intent,
+/// binding or queued message behind.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TopicRequestPost<'a> {
+    Existing(&'a str),
+    New {
+        topic: &'a str,
+        client_id: &'a str,
+        body: &'a str,
+    },
 }
 
 /// A receipt and its identity proof from one store snapshot.
@@ -654,45 +671,61 @@ impl Store {
         sender: &str,
         body: &str,
     ) -> Result<(String, bool)> {
+        self.write_tx(|conn| {
+            self.topic_post_insert_in(conn, topic, client_id, sender_uid, sender, body)
+        })
+    }
+
+    /// `topic_post_insert` inside a caller's write transaction (CAD-2207: a
+    /// generic Ask's queue commit owns the transaction, so the post, its
+    /// intents, the queued request and the request binding either all commit
+    /// or all roll back).
+    pub(super) fn topic_post_insert_in(
+        &self,
+        conn: &impl StoreConn,
+        topic: &str,
+        client_id: &str,
+        sender_uid: Option<&str>,
+        sender: &str,
+        body: &str,
+    ) -> Result<(String, bool)> {
         check_post_body(body)?;
         let id = post_id(topic, client_id);
-        self.write_tx(|conn| {
-            let existing: Option<(String, String)> = conn.query_opt(
-                "SELECT body, sender FROM topic_posts WHERE id=?",
-                [id.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            if let Some((stored, stored_sender)) = existing {
-                if stored != body || stored_sender != sender {
-                    return Err(Error::rejected(
-                        "Post id was already used with different content",
-                    ));
-                }
-                return Ok((id, false));
+        let existing: Option<(String, String)> = conn.query_opt(
+            "SELECT body, sender FROM topic_posts WHERE id=?",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if let Some((stored, stored_sender)) = existing {
+            if stored != body || stored_sender != sender {
+                return Err(Error::rejected(
+                    "Post id was already used with different content",
+                ));
             }
+            return Ok((id, false));
+        }
+        conn.execute(
+            "INSERT INTO topic_posts(id,topic_id,sender_uid,sender,body,created)
+             VALUES(?,?,?,?,?,?)",
+            params![id, topic, sender_uid, sender, body, now()],
+        )?;
+        // Intents for eligible subscribers are committed with the post.
+        // Bound assistants need a separate member-authorized path.
+        let members = ordinary_topic_subscribers(conn, topic)?;
+        for (uid, alias) in members {
             conn.execute(
-                "INSERT INTO topic_posts(id,topic_id,sender_uid,sender,body,created)
-                 VALUES(?,?,?,?,?,?)",
-                params![id, topic, sender_uid, sender, body, now()],
+                "INSERT OR IGNORE INTO topic_deliveries(post_id,uid,alias,message_id,state)
+                 VALUES(?,?,?,NULL,'pending')",
+                params![id, uid, alias],
             )?;
-            // Intents for eligible subscribers are committed with the post.
-            // Bound assistants need a separate member-authorized path.
-            let members = ordinary_topic_subscribers(conn, topic)?;
-            for (uid, alias) in members {
-                conn.execute(
-                    "INSERT OR IGNORE INTO topic_deliveries(post_id,uid,alias,message_id,state)
-                     VALUES(?,?,?,NULL,'pending')",
-                    params![id, uid, alias],
-                )?;
-            }
-            Store::event(
-                conn,
-                Store::DAEMON_STREAM,
-                TOPIC_CHANGED_EVENT,
-                json!({"topic": topic, "change": "posted", "post": id}),
-            )?;
-            Ok((id, true))
-        })
+        }
+        Store::event(
+            conn,
+            Store::DAEMON_STREAM,
+            TOPIC_CHANGED_EVENT,
+            json!({"topic": topic, "change": "posted", "post": id}),
+        )?;
+        Ok((id, true))
     }
 
     /// A page of a topic's transcript: `tail` by default; `before`/`after`

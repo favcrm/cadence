@@ -13874,6 +13874,7 @@ fn cad2207_public_waiting_shape_is_identical_for_private_and_ordinary_work() {
 // CAD-2207: independent acceptance for LOCAL share-revocation ordering against
 // an in-flight notice turn (see the module header for its narrow scope, the
 // deterministic barrier, the expected red and the run command).
+mod cad2207_queue_head_race_acceptance;
 mod cad2207_share_revocation_ordering;
 // CAD-2207: independent acceptance for the operator's cross-agent work
 // conversation view (`work_conversation_list` / `work_conversation_read`),
@@ -13892,6 +13893,7 @@ mod cad2207_lifecycle_guard;
 // its own publish, and non-owner reads/aggregate counts must refuse or
 // withhold while already-shared history and ordinary peers stay usable (see
 // the module header for its narrow scope and the fixture seam report).
+mod cad2207_topic_ask_race_acceptance;
 mod cad2207_topic_privacy;
 // CAD-2207: independent acceptance for the operator SETTINGS and MODEL-DEFAULTS
 // projections on a mixed fleet — observed-model suggestions, live-use counts,

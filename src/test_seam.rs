@@ -755,3 +755,91 @@ pub(crate) fn seed_pi_fixture_policy(store: &crate::store::Store, model: &str) -
     store.save_settings(settings.revision, settings.doc, "test-seam-fixture")?;
     Ok(())
 }
+
+#[cfg(all(test, feature = "test-seam"))]
+mod ask_park {
+    use std::cell::RefCell;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct State {
+        entered: bool,
+        released: bool,
+    }
+
+    pub(crate) struct AskCommitPark {
+        state: Mutex<State>,
+        wake: Condvar,
+    }
+
+    impl AskCommitPark {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(State::default()),
+                wake: Condvar::new(),
+            })
+        }
+
+        pub(crate) fn arm(self: &Arc<Self>) {
+            PARK.with(|slot| *slot.borrow_mut() = Some(Arc::clone(self)));
+        }
+
+        pub(crate) fn wait_entered(&self, bound: Duration) -> bool {
+            let deadline = Instant::now() + bound;
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            while !state.entered {
+                let now = Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let (next, _) = self
+                    .wake
+                    .wait_timeout(state, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner());
+                state = next;
+            }
+            true
+        }
+
+        pub(crate) fn release(&self) {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.released = true;
+            self.wake.notify_all();
+        }
+
+        fn enter(&self) {
+            let deadline = Instant::now() + Duration::from_secs(300);
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.entered = true;
+            self.wake.notify_all();
+            while !state.released {
+                let now = Instant::now();
+                if now >= deadline {
+                    return;
+                }
+                let (next, _) = self
+                    .wake
+                    .wait_timeout(state, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner());
+                state = next;
+            }
+        }
+    }
+
+    thread_local! {
+        static PARK: RefCell<Option<Arc<AskCommitPark>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn park_ask_before_queue_commit(is_ask: bool) {
+        if !is_ask {
+            return;
+        }
+        if let Some(park) = PARK.with(|slot| slot.borrow_mut().take()) {
+            park.enter();
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) use ask_park::{park_ask_before_queue_commit, AskCommitPark};

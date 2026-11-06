@@ -1992,7 +1992,14 @@ impl Shared {
         &self,
         alias: &str,
     ) -> Result<(Take, Option<super::members_rpc::AssistNoticeAdmission<'_>>)> {
-        let head = self.store.queued_head(alias)?;
+        // CAD-2207: admit and claim the SAME eligible head. This preview uses
+        // the claim's own selector (rank, running-turn turnless gate, no
+        // `submitting` rows), so a checked row is always claimable by this
+        // invocation and a `submitting`/held-over row can never be admitted
+        // in its place. The claim below is gated on the id read here; a head
+        // that replaced it (or appeared after this empty read) stays queued.
+        let head = self.store.queued_head_for_take(alias)?;
+        let head_id = head.as_ref().map(|message| message.id.clone());
         let mut notice_admission = None;
         let mut admitted_id = None;
         // CAD-1380 R1: a queued member turn re-proves its ORIGINAL credential
@@ -2062,21 +2069,39 @@ impl Shared {
                     if run["approval"]["human"] != checked["approval"]["human"] {
                         return Err(Error::gate_coded("approval_changed", "the run approval changed since its owner was checked; the queued step is refused"));
                     }
-                    self.store.take_queued_app_proven(
+                    self.store.take_queued_app_proven_progress(
                         alias,
                         Some((&message.id, row["digest"].as_str().unwrap())),
                     )
                 })
             })();
             match admission {
-                Ok(take) => Ok((take, None)),
+                Ok((take, changed_head)) => {
+                    if changed_head {
+                        // The app message this invocation proved stopped
+                        // leading before the claim; an eligible head remains.
+                        // Wake the actor so its next iteration performs a
+                        // fresh admission instead of waiting the idle poll.
+                        self.notify_agent(alias);
+                    }
+                    Ok((take, None))
+                }
                 Err(_) => {
                     self.store.reject_app_submission(&message.id)?;
                     Ok((Take::Empty, None))
                 }
             }
         } else {
-            let take = self.store.take_queued(alias)?;
+            let (take, changed_head) =
+                self.store.take_queued_admitted(alias, head_id.as_deref())?;
+            if changed_head {
+                // The head this invocation admitted was replaced while its
+                // authority was checked. Wake this agent so its existing wait
+                // re-enters with a FRESH preview and admission instead of
+                // sitting out the idle poll. Nothing is claimed here, so the
+                // replacement still needs its own admission.
+                self.notify_agent(alias);
+            }
             if !matches!(&take, Take::Message(message) if admitted_id.as_deref() == Some(message.id.as_str()))
             {
                 notice_admission = None;

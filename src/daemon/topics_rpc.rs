@@ -438,9 +438,12 @@ impl Shared {
     /// 3. a retry is compared with the stored post: same envelope returns
     ///    the bound request with `duplicate: true`, a different one is a
     ///    conflict — both before any send;
-    /// 4. the transcript post is written, then the one request is queued
-    ///    through `send_as` (the `thread_send` path: same envelope,
-    ///    idempotence and `operator` source), then the post is bound to it.
+    /// 4. the one request is queued through `send_as` (the `thread_send`
+    ///    path: same envelope, idempotence and `operator` source) with the
+    ///    typed post in its binding, so the transcript post, its delivery
+    ///    intents, the queued request and the request binding commit in the
+    ///    queue transaction together (CAD-2207) — a refused send leaves none
+    ///    of them.
     pub(super) fn rpc_topic_request(
         self: &Arc<Self>,
         params: &Value,
@@ -488,13 +491,13 @@ impl Shared {
         if body.len() > store::ENQUEUE_BYTES {
             return Err(Error::rejected("Prompt must contain 1-48000 characters"));
         }
-        // The post is written once. A retry that finds an unbound post (a
-        // crash between the post and the send) falls through to the send:
-        // the stable request id and envelope make that send idempotent, so
-        // it returns the same request, never a second one.
-        let (post, _fresh) = self
-            .store
-            .topic_post_insert(&topic.id, client_id, None, "operator", text)?;
+        // The post is inserted by the queue transaction together with the
+        // request and its binding (CAD-2207), so a send refused after this
+        // point leaves no committed post, delivery intent or binding. A retry
+        // that finds an unbound post (a crash between the post and the send)
+        // falls through to the send: the stable request id and envelope make
+        // that send idempotent, so it returns the same request, never a
+        // second one.
         // The one request, through the thread_send path (operator source,
         // caller-derived, id-idempotent).
         let send =
@@ -509,7 +512,11 @@ impl Shared {
             },
             None,
             Some(&target_uid),
-            Some(super::messages_rpc::SendBinding::TopicPost(&post)),
+            Some(super::messages_rpc::SendBinding::TopicAsk {
+                topic: &topic.id,
+                client_id,
+                body: text,
+            }),
         )?;
         let request = receipt
             .get("message")

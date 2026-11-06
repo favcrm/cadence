@@ -86,6 +86,7 @@ pub(crate) use events::event_store_stats;
 pub mod conversations;
 pub mod human_threads;
 mod topics;
+pub(crate) use topics::TopicRequestPost;
 pub use topics::{
     delivery_id as topic_delivery_id, post_id as topic_post_id, request_id as topic_request_id,
     topic_id, Topic, TopicDelivery, TopicPost, POST_MAX_BYTES as TOPIC_POST_MAX_BYTES,

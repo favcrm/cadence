@@ -15,7 +15,17 @@ pub(super) enum SendBinding<'a> {
         worktree: &'a str,
         authorized_until: f64,
     },
+    /// A post its caller already committed (a human room's Ask); only the
+    /// request binding and the in-transaction target rechecks remain.
     TopicPost(&'a str),
+    /// CAD-2207: a generic operator Ask. The post, its delivery intents, the
+    /// queued request and the request binding are committed in the queue
+    /// transaction, so a refusal leaves none of them behind.
+    TopicAsk {
+        topic: &'a str,
+        client_id: &'a str,
+        body: &'a str,
+    },
 }
 
 /// CAD-565: the largest window one `message read` returns — Unicode
@@ -504,7 +514,21 @@ impl Shared {
                 worktree,
                 authorized_until,
             }) => (Some((issue, worktree, authorized_until)), None),
-            Some(SendBinding::TopicPost(post)) => (None, Some(post)),
+            Some(SendBinding::TopicPost(post)) => {
+                (None, Some(store::TopicRequestPost::Existing(post)))
+            }
+            Some(SendBinding::TopicAsk {
+                topic,
+                client_id,
+                body,
+            }) => (
+                None,
+                Some(store::TopicRequestPost::New {
+                    topic,
+                    client_id,
+                    body,
+                }),
+            ),
             None => (None, None),
         };
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
@@ -965,6 +989,8 @@ impl Shared {
         if crate::master::is_master(&alias) && !self.store.message_exists(&message)? {
             self.master_send_preflight(&alias)?;
         }
+        #[cfg(all(test, feature = "test-seam"))]
+        crate::test_seam::park_ask_before_queue_commit(request_post.is_some());
         let (duplicate, state) = self.store.enqueue_steered_for_with_conversation(
             &alias,
             expected_uid,

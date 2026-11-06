@@ -191,21 +191,24 @@ For a subscriber notice whose local admission is held, an owner attempting to
 withdraw the job share receives a refusal while that attempt is in progress;
 the share remains enabled and the owner can retry. Withdrawal also blocks
 subsequent subscriber evidence and event reads, while separately assigned work
-keeps its own authority. This is not a complete revocation guarantee: a queue
-head can change before its own admission, background readers can still load
-queued or retained content, and remote membership revocation is not serialized
-with local submission. Already-sent provider requests cannot be recalled.
+keeps its own authority. An actor claims only the eligible queue head it
+admitted; a changed head waits for its own admission. This is not a complete
+revocation guarantee: the preview still reads the selected body before that
+admission, background readers can load queued or retained content, and remote
+membership revocation is not serialized with local submission. Already-sent
+provider requests cannot be recalled.
 
 For a stable binding, generic non-human topic membership refuses a bound
 assistant, generic topic reads and work-list aggregates omit its posts, and
-ordinary publications do not deliver notices to it. This is still not a
-complete privacy boundary: work-conversation and settings projections can race
-a binding change; topic reads can outlive the snapshot that authorized them;
-and shared topic cursors use global sequence numbers that can reveal
-intervening activity. The topic Ask post and queue writes are not yet one
-transaction. Other legacy paths also need an authorization audit. Do not rely
-on this candidate for owner-only confidentiality until those paths are fixed
-and verified.
+ordinary publications do not deliver notices to it. A new generic topic Ask
+commits its post, delivery intents and queued request together, after rechecking
+the recipient and subscription. The existing human-room post path is separate.
+This is still not a complete privacy boundary: work-conversation and settings
+projections can race a binding change; topic reads can outlive the snapshot that
+authorized them; and shared topic cursors use global sequence numbers that can
+reveal intervening activity. Other legacy paths also need an authorization
+audit. Do not rely on this candidate for owner-only confidentiality until those
+paths are fixed and verified.
 
 In this candidate, native daemons mark privacy-sensitive RPC responses, and
 updated clients refuse unmarked legacy projections. Update status reports an

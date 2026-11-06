@@ -314,6 +314,47 @@ impl Priority {
 /// the same head.
 const QUEUE_ORDER_SQL: &str = "ORDER BY priority DESC, seq";
 
+/// The one eligible-head selector: `holding` narrows a queue held by a
+/// running turn to turnless sources. `take_queued` reads the full row
+/// through it, and the CAD-2207 admitted-head gate reads only `id`, so the
+/// gate and the claim can never see different heads in different orders.
+fn queued_selector(holding: bool, columns: &str) -> String {
+    let scope = if holding {
+        format!("AND source IN {TURNLESS_SOURCES_SQL} ")
+    } else {
+        String::new()
+    };
+    format!(
+        "SELECT {columns} FROM messages WHERE alias=? AND state='queued' \
+         {scope}{QUEUE_ORDER_SQL} LIMIT 1"
+    )
+}
+
+/// The running turn that holds `alias`'s queue, if any. The take preview and
+/// the claim read it through this one query, so both apply the same
+/// turnless-source gate to the eligible head.
+fn queued_hold_in(conn: &impl StoreConn, alias: &str) -> Result<Option<String>> {
+    Ok(conn.query_opt(
+        &format!(
+            "SELECT turn_id FROM messages WHERE alias=? AND state='running'
+                        AND source NOT IN {TURNLESS_SOURCES_SQL} ORDER BY seq LIMIT 1"
+        ),
+        [alias],
+        |r| r.get(0),
+    )?)
+}
+
+/// CAD-2207: the queue head a caller already admitted before its own
+/// authority checks. `Admitted(None)` is an empty snapshot: a take that saw
+/// an empty queue must not claim a row that appeared afterwards.
+#[derive(Debug, Clone, Copy)]
+enum QueueAdmission<'a> {
+    /// No pre-read head: the legacy take claims the current head.
+    Unchecked,
+    /// The caller proved exactly this head (or observed none).
+    Admitted(Option<&'a str>),
+}
+
 /// CAD-158: how a send steers the recipient's queue — its rank, and the
 /// still-queued messages it atomically replaces. `by`/`by_kind` is the
 /// daemon-derived caller, stamped on every superseded row.
@@ -792,6 +833,14 @@ impl Store {
 
     /// `authorized_until` is daemon-derived and checked after acquiring
     /// the queue writer. Ordinary sends pass `None`.
+    ///
+    /// `request_post` is the server-derived topic binding (CAD-2207):
+    /// `Existing` is an already-committed post (the human-room and legacy
+    /// callers) whose request is bound after the enqueue, while `New` stages
+    /// the generic-topic Ask's transcript post, its delivery intents and its
+    /// request binding in THIS transaction, after the target's current
+    /// membership and privacy are proven. A refusal therefore leaves no post
+    /// behind.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_steered_for_with_conversation(
         &self,
@@ -814,7 +863,7 @@ impl Store {
         media_refs: Option<&Value>,
         authorized_until: Option<f64>,
         selection: Option<IssueSelection>,
-        request_post: Option<&str>,
+        request_post: Option<super::TopicRequestPost<'_>>,
     ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
@@ -825,19 +874,36 @@ impl Store {
                     ));
                 }
             }
-            if let Some(post) = request_post {
-                let generic_topic = tx
-                    .query_opt(
-                        "SELECT 1 FROM topic_posts p JOIN topics t ON t.id=p.topic_id
-                          WHERE p.id=? AND t.type<>? LIMIT 1",
-                        params![post, super::human_threads::ROOM_TOPIC_TYPE],
-                        |_| Ok(()),
-                    )?
-                    .is_some();
-                if generic_topic && self.assistant_for_alias_in(&tx, alias)?.is_some() {
-                    return Err(Error::rejected(super::RESTRICTED_LIFECYCLE));
+            // CAD-2207: a topic request's post and target checks share this
+            // queue transaction. `Existing` is an already-committed human
+            // room post (its old recheck is preserved); `New` is staged below
+            // once the current target is proven, so a refusal leaves neither
+            // post, intent nor queue row.
+            let (existing_post, new_ask) = match request_post {
+                Some(super::TopicRequestPost::Existing(post)) => {
+                    let generic_topic = tx
+                        .query_opt(
+                            "SELECT 1 FROM topic_posts p JOIN topics t ON t.id=p.topic_id
+                              WHERE p.id=? AND t.type<>? LIMIT 1",
+                            params![post, super::human_threads::ROOM_TOPIC_TYPE],
+                            |_| Ok(()),
+                        )?
+                        .is_some();
+                    if generic_topic && self.assistant_for_alias_in(&tx, alias)?.is_some() {
+                        return Err(Error::rejected(super::RESTRICTED_LIFECYCLE));
+                    }
+                    (Some(post), None)
                 }
-            }
+                Some(super::TopicRequestPost::New {
+                    topic,
+                    client_id,
+                    body,
+                }) => {
+                    self.topic_ask_target_in(&tx, alias, topic)?;
+                    (None, Some((topic, client_id, body)))
+                }
+                None => (None, None),
+            };
             let mut named: Vec<&str> = Vec::new();
             for m in steer.supersedes {
                 if !named.contains(&m.as_str()) {
@@ -874,6 +940,18 @@ impl Store {
                     "the bound grant expired before the queue write — nothing was queued",
                 ));
             }
+            // Stage the generic Ask's transcript row (and its delivery
+            // intents) in the same transaction, after the target proof above.
+            // Any later refusal — expired grant, envelope conflict, enqueue
+            // error — rolls the post back with the rest, so nothing is left
+            // to delete after the fact.
+            let staged_post = match new_ask {
+                Some((topic, client_id, body)) => Some(
+                    self.topic_post_insert_in(&tx, topic, client_id, None, "operator", body)?
+                        .0,
+                ),
+                None => None,
+            };
             let out = self.enqueue_tx_with_conversation(
                 &tx,
                 alias,
@@ -895,7 +973,7 @@ impl Store {
                 media_refs,
                 selection,
             )?;
-            if let Some(post) = request_post {
+            if let Some(post) = staged_post.as_deref().or(existing_post) {
                 super::topics::bind_request_in(&tx, post, id)?;
             }
             for old in &superseded {
@@ -916,6 +994,40 @@ impl Store {
             }
             Ok(out)
         })
+    }
+
+    /// CAD-2207: prove, inside the queue writer, that `alias` may still
+    /// receive a generic-topic one-target Ask. The alias must name a live
+    /// ordinary runtime (no member binding and no assistant/effect uid
+    /// fence), and the topic must still be a non-room topic it is currently
+    /// subscribed to. A late hand-over, removal or unsubscribe therefore
+    /// refuses before the post is staged, in the same transaction as the
+    /// enqueue.
+    fn topic_ask_target_in(
+        &self,
+        tx: &impl super::StoreConn,
+        alias: &str,
+        topic: &str,
+    ) -> Result<()> {
+        let target = self.agent_in(tx, alias)?;
+        if self.assistant_for_alias_in(tx, alias)?.is_some() {
+            return Err(Error::rejected(super::RESTRICTED_LIFECYCLE));
+        }
+        super::topics::refuse_private_topic_uid(tx, &target.uid)?;
+        let subscribed = tx
+            .query_opt(
+                "SELECT 1 FROM topics t JOIN topic_subscriptions s ON s.topic_id=t.id
+                  WHERE t.id=? AND t.type<>? AND s.uid=? LIMIT 1",
+                params![topic, super::human_threads::ROOM_TOPIC_TYPE, target.uid],
+                |_| Ok(()),
+            )?
+            .is_some();
+        if !subscribed {
+            return Err(Error::rejected(
+                "topic_request refused: target is not a member of this group",
+            ));
+        }
+        Ok(())
     }
 
     /// CAD-445: a message the daemon itself originates — a master wake,
@@ -2157,18 +2269,60 @@ impl Store {
     /// `submitting`. The actor is the only caller; one actor per alias
     /// keeps turns serialized.
     pub fn take_queued(&self, alias: &str) -> Result<Take> {
-        self.take_queued_app_proven(alias, None)
+        Ok(self
+            .take_queued_in(alias, None, QueueAdmission::Unchecked)?
+            .0)
     }
+    /// CAD-2207: claim only the queue head the caller already admitted.
+    /// `head` is the id whose authority the caller just proved (`None` when
+    /// it observed an empty queue). A changed head — or a row that appeared
+    /// after that empty read — is left queued for a later take that admits it
+    /// on its own terms. The second value is `changed_head`: an eligible head
+    /// other than `head` exists after this transaction, so a caller that
+    /// re-invokes a fresh admission (rather than waiting) has real work.
+    pub(crate) fn take_queued_admitted(
+        &self,
+        alias: &str,
+        head: Option<&str>,
+    ) -> Result<(Take, bool)> {
+        self.take_queued_in(alias, None, QueueAdmission::Admitted(head))
+    }
+    #[cfg(test)]
     pub(crate) fn take_queued_app_proven(
         &self,
         alias: &str,
         proof: Option<(&str, &str)>,
     ) -> Result<Take> {
+        Ok(self.take_queued_app_proven_progress(alias, proof)?.0)
+    }
+    /// Claim with the app proof and report `changed_head` when a different
+    /// eligible message needs a fresh admission.
+    pub(crate) fn take_queued_app_proven_progress(
+        &self,
+        alias: &str,
+        proof: Option<(&str, &str)>,
+    ) -> Result<(Take, bool)> {
+        // The proof names the exact app message whose filesystem/run binding
+        // the caller admitted. Gate the claim on that identity as well, so a
+        // head that changed to a non-app row — or that a skipped topic notice
+        // exposed — is never claimed under the checked app message's proof.
+        let admission = match proof {
+            Some((expected, _)) => QueueAdmission::Admitted(Some(expected)),
+            None => QueueAdmission::Unchecked,
+        };
+        self.take_queued_in(alias, proof, admission)
+    }
+    fn take_queued_in(
+        &self,
+        alias: &str,
+        proof: Option<(&str, &str)>,
+        admission: QueueAdmission<'_>,
+    ) -> Result<(Take, bool)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
             if !agent.enabled {
-                return Ok(Take::Stop);
+                return Ok((Take::Stop, false));
             }
             // CAD-250: the actor serializes report-owing turns. While one is
             // `running` (delivered, its report still owed), only routed
@@ -2179,27 +2333,48 @@ impl Store {
             // CAD-565: the running turn's token rides along — a nudge binds
             // to it at claim (below) and is rechecked against it, in this
             // same transaction, on every later claim.
-            let running_turn: Option<String> = tx.query_opt(
-                &format!(
-                    "SELECT turn_id FROM messages WHERE alias=? AND state='running'
-                                 AND source NOT IN {TURNLESS_SOURCES_SQL} ORDER BY seq LIMIT 1"
-                ),
-                [alias],
-                |r| r.get(0),
-            )?;
+            let running_turn = queued_hold_in(&tx, alias)?;
             let holding = running_turn.is_some();
-            let next_sql = if holding {
-                format!(
-                    "SELECT * FROM messages WHERE alias=? AND state='queued'
-                             AND source IN {TURNLESS_SOURCES_SQL} {QUEUE_ORDER_SQL} LIMIT 1"
-                )
-            } else {
-                format!(
-                    "SELECT * FROM messages WHERE alias=? AND state='queued'
-                             {QUEUE_ORDER_SQL} LIMIT 1"
-                )
+            let next_sql = queued_selector(holding, "*");
+            // CAD-2207: the caller admitted the head it read before its
+            // authority checks, so only that row may lead this claim. Identity
+            // is read by id only, so a head that replaced the admitted one is
+            // never decoded or claimed. After the admitted row has been
+            // consumed, daemon topic notices keep their legacy batch
+            // consumption (they own no turn); a real message this take never
+            // admitted ends it.
+            let admitted = match admission {
+                QueueAdmission::Unchecked => None,
+                QueueAdmission::Admitted(expected) => Some(expected),
             };
+            let mut admitted_head_processed = false;
             loop {
+                if let Some(expected) = admitted {
+                    let current: Option<String> = tx
+                        .query_row(&queued_selector(holding, "id"), [alias], |r| r.get(0))
+                        .optional()?;
+                    let Some(current) = current else {
+                        return Ok((Take::Empty, false));
+                    };
+                    if Some(current.as_str()) != expected {
+                        let notice = admitted_head_processed
+                            && expected.is_some()
+                            && tx
+                                .query_opt(
+                                    "SELECT 1 FROM messages WHERE id=? AND source=? LIMIT 1",
+                                    params![current, crate::proto::TOPIC_NOTICE_SOURCE],
+                                    |_| Ok(()),
+                                )?
+                                .is_some();
+                        if !notice {
+                            // A different eligible head leads. Defer it to a
+                            // fresh invocation (never claim it here) and tell
+                            // the caller there is real work, so it can retry
+                            // without waiting an idle poll.
+                            return Ok((Take::Empty, true));
+                        }
+                    }
+                }
                 let next = tx.query_row(&next_sql, [alias], row_message).ok();
                 // CAD-810: a topic notice never reaches the actor. It is made
                 // available here, in this transaction, after its provenance and
@@ -2207,6 +2382,7 @@ impl Store {
                 // slot, `busy` and `submitting` are never touched.
                 if let Some(notice) = next.as_ref().filter(|m| m.is_topic_notice()) {
                     self.consume_topic_notice_in(&tx, &agent, notice)?;
+                    admitted_head_processed = true;
                     continue;
                 }
                 let Some(message) = next else {
@@ -2214,7 +2390,7 @@ impl Store {
                     // been failed as unresolved before the queue became empty.
                     // Commit that durable evidence even though no message is
                     // returned to the actor.
-                    return Ok(Take::Empty);
+                    return Ok((Take::Empty, false));
                 };
                 if message.source == "app_run_dispatch" {
                     let (expected, bundle) = proof.ok_or_else(|| {
@@ -2243,6 +2419,9 @@ impl Store {
                             expected.as_ref(),
                             reason,
                         )?;
+                        // The admitted row is disposed of; the gate above
+                        // decides whether a different real head defers.
+                        admitted_head_processed = true;
                         continue;
                     }
                 }
@@ -2279,6 +2458,9 @@ impl Store {
                                                "reason": "skipped_inactive"}),
                             )?;
                         }
+                        // The admitted row is disposed of; the gate above
+                        // decides whether a different real head defers.
+                        admitted_head_processed = true;
                         continue;
                     }
                     if bound.is_none() {
@@ -2297,7 +2479,7 @@ impl Store {
                     params![now(), alias],
                 )?;
                 Self::event(&tx, alias, "submitting", json!({"message": message.id}))?;
-                return Ok(Take::Message(Box::new(message)));
+                return Ok((Take::Message(Box::new(message)), false));
             }
         })
     }
@@ -3621,10 +3803,34 @@ impl Store {
         })
     }
 
+    /// CAD-2207: the exact full row `take_queued_admitted` would claim right
+    /// now — same ordered selector, same running-turn/turnless gate, and no
+    /// `submitting` rows — so a caller can prove that row's authority and then
+    /// claim only it. `None` means the agent is disabled or its eligible queue
+    /// is empty; the following take then answers `Stop`/`Empty` without any
+    /// admission work.
+    pub(crate) fn queued_head_for_take(&self, alias: &str) -> Result<Option<Message>> {
+        self.read_tx(|conn| {
+            let agent = self.agent_in(&*conn, alias)?;
+            if !agent.enabled {
+                return Ok(None);
+            }
+            let holding = queued_hold_in(&*conn, alias)?.is_some();
+            let sql = queued_selector(holding, "*");
+            match conn.query_row(&sql, [alias], row_message) {
+                Ok(message) => Ok(Some(message)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
     /// The next still-waiting message for the agent — `queued` or
     /// mid-gate `submitting` — in `take_queued`'s order. The stall watch
     /// tracks it so a pane menu blocking delivery is visible before any
-    /// turn starts.
+    /// turn starts. This is the stall-watch view, not a claim preview: it
+    /// leads `submitting` rows and ignores the running-turn turnless gate, so
+    /// an admission decision uses [`Self::queued_head_for_take`] instead.
     pub fn queued_head(&self, alias: &str) -> Result<Option<Message>> {
         let conn = self.conn();
         // A mid-gate `submitting` row is the one being delivered, so it
