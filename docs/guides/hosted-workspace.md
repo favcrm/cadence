@@ -602,6 +602,17 @@ Artifact review summaries are unavailable when review details are malformed
 or a claimed pass has no valid recorded pass; other readable review rows remain
 visible. These summaries do not determine a project's review requirements.
 
+An open conversation rechecks its held proposal cards on focus, when the
+page becomes visible, and every 30 seconds while visible. A read times out
+after 10 seconds. If a previously shown hosted-run outcome cannot be
+re-established, including when the recheck fails, the card shows it as
+unavailable rather than offering to create the ticket again. When the server
+withholds cloud history, the conversation removes cached cloud rows and
+independently rechecks ordinary proposal rows. An absent initial outcome does
+not distinguish a pending proposal from a result hidden by scope; it is not
+proof that no assignment exists. This recheck does not cover a separate
+central local assignment on the same ticket.
+
 A `--state result` report ends the assignment but moves nothing else. Once
 the work meets the project's acceptance and completion rules, use the
 selected workspace's supported ticket update, for example:

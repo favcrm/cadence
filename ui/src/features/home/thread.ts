@@ -28,6 +28,8 @@ export interface ThreadEntry {
   /** The queued message this entry belongs to. */
   message?: string | null;
   created?: string | null;
+  /** A previously observed hosted outcome could not be re-established. */
+  proposalOutcomeUnavailable?: boolean;
 }
 
 export interface PendingMessage {
@@ -241,7 +243,16 @@ export function reduceFrame(state: ThreadState | null, event: SseEvent): ThreadS
     return base;
   }
   const entry = asEntry(parsed);
-  return entry ? mergeEntries(base, [entry]) : base;
+  if (!entry) return base;
+  if (entry.kind === "ticket_proposal") {
+    const previous = base.entries.find((item) => item.seq === entry.seq && item.kind === entry.kind &&
+      item.payload?.id === entry.payload?.id);
+    // The stream replays the stored card, not the separately joined outcome.
+    if (previous && (previous.proposalOutcomeUnavailable ||
+        (previous.payload?.ticket && previous.payload?.run)) &&
+        !(entry.payload?.ticket && entry.payload?.run)) return base;
+  }
+  return mergeEntries(base, [entry]);
 }
 
 /** A page from `GET /api/threads/<alias>` folded into the state. */

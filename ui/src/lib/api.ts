@@ -776,6 +776,7 @@ export const api = {
   thread: (
     alias: string,
     at: { after?: number; before?: number; tail?: boolean; limit?: number; conversation?: string } = {},
+    signal?: AbortSignal,
   ) => {
     const q = new URLSearchParams({ limit: String(at.limit ?? 200) });
     // CAD-1098: a selector only — the daemon validates it (404 creates nothing).
@@ -783,7 +784,7 @@ export const api = {
     if (at.tail) q.set("tail", "1");
     else if (at.before !== undefined) q.set("before", String(at.before));
     else q.set("after", String(at.after ?? 0));
-    return get<ThreadPage>(`/api/threads/${encodeURIComponent(alias)}?${q.toString()}`);
+    return get<ThreadPage>(`/api/threads/${encodeURIComponent(alias)}?${q.toString()}`, signal);
   },
   /** `POST /api/threads/master/conversations {kind:"recruit"}` (CAD-1772):
    *  find-or-create the master's single Recruit conversation. */

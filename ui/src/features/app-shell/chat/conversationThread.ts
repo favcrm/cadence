@@ -1,10 +1,12 @@
 import { useEffect } from "react";
 import type { Resource } from "../../../lib/cache";
+import { api } from "../../../lib/api";
 import { streamInto, type SseErrorState } from "../../../lib/sse";
 import { resources } from "../../../lib/resources";
 import type { MasterState } from "../../../lib/types";
-import { privateSessionGeneration } from "../../../lib/privateSession";
-import { EMPTY_THREAD, applyEarlier, fetchEarlier, reduceFrame, resumeSeq, threadItems, type PageReader, type ThreadPageLike, type ThreadState } from "../../home/thread";
+import { privateReadsAllowed, privateSessionGeneration } from "../../../lib/privateSession";
+import { EMPTY_THREAD, PAGE, applyEarlier, asEntry, fetchEarlier, mergePage, pageCloudWithheld, reduceFrame, resumeSeq, threadItems, type PageReader, type ThreadEntry, type ThreadPageLike, type ThreadState } from "../../home/thread";
+import { parseTicketProposal, type TicketProposal } from "../../agents/ticketProposal";
 
 /**
  * The one conversation thread engine Home and every app pane share
@@ -29,6 +31,91 @@ export type StreamLink = "live" | "connecting" | SseErrorState;
 /** How long a first attempt may stay silent before it counts as an outage: a
  *  stream that hangs must not read as healthy forever. */
 const FIRST_CONNECT_GRACE_MS = 5000;
+const OUTCOME_READ_TIMEOUT_MS = 10_000;
+
+/** A joined outcome is a separate observation from the immutable thread row. */
+function joinedOutcome(entry: ThreadEntry): { ticket: string; run: NonNullable<TicketProposal["run"]> } | null {
+  const proposal = parseTicketProposal(entry.payload);
+  return proposal?.ticket && proposal.run ? { ticket: proposal.ticket, run: proposal.run } : null;
+}
+
+function outcomeUnavailable(entry: ThreadEntry): ThreadEntry {
+  if (entry.proposalOutcomeUnavailable) return entry;
+  const payload = { ...entry.payload };
+  delete payload.ticket;
+  delete payload.run;
+  return { ...entry, payload, proposalOutcomeUnavailable: true };
+}
+
+function mergeOutcome(previous: ThreadEntry, observed: ThreadEntry): ThreadEntry {
+  const next = joinedOutcome(observed);
+  const current = joinedOutcome(previous);
+  if (!next) return current || previous.proposalOutcomeUnavailable ? outcomeUnavailable(previous) : previous;
+  if (!previous.proposalOutcomeUnavailable && current?.ticket === next.ticket &&
+      current.run.state === next.run.state && current.run.reason === next.run.reason && current.run.agent === next.run.agent) return previous;
+  return {
+    ...previous,
+    payload: { ...previous.payload, ticket: next.ticket, run: next.run },
+    proposalOutcomeUnavailable: false,
+  };
+}
+
+function sameOutcome(left: ThreadEntry, right: ThreadEntry): boolean {
+  if (!!left.proposalOutcomeUnavailable !== !!right.proposalOutcomeUnavailable) return false;
+  const a = joinedOutcome(left);
+  const b = joinedOutcome(right);
+  return a === null ? b === null : b !== null && a.ticket === b.ticket &&
+    a.run.state === b.run.state && a.run.reason === b.run.reason && a.run.agent === b.run.agent;
+}
+
+type ProposalRefresh = {
+  changes: Map<number, { before: ThreadEntry; after: ThreadEntry }>;
+  withheld: string | null;
+};
+
+/** Re-read held proposal rows without changing the transcript cursor or drafts. */
+async function refreshProposalOutcomes(state: ThreadState, reader: Pick<PageReader, "before">, conversation?: string): Promise<ProposalRefresh> {
+  const pending = new Map<number, ThreadEntry>();
+  const changes: ProposalRefresh["changes"] = new Map();
+  let withheld: string | null = null;
+  for (const entry of state.entries) {
+    if (entry.kind !== "ticket_proposal" || typeof entry.payload?.id !== "string") continue;
+    if (Number.isSafeInteger(entry.seq) && entry.seq < Number.MAX_SAFE_INTEGER) pending.set(entry.seq, entry);
+    else if (joinedOutcome(entry)) changes.set(entry.seq, { before: entry, after: outcomeUnavailable(entry) });
+  }
+  const descending = [...pending.keys()].sort((a, b) => b - a);
+  for (const seq of descending) {
+    const target = pending.get(seq);
+    if (!target) continue;
+    try {
+      const page = await reader.before(seq + 1, PAGE);
+      const thread = page.thread && typeof page.thread === "object" ? page.thread as Record<string, unknown> : null;
+      if (!Array.isArray(page.entries) ||
+          ((conversation ?? state.conversation) && typeof thread?.id === "string" && thread.id !== (conversation ?? state.conversation))) throw new Error("Proposal read unavailable");
+      withheld = pageCloudWithheld(page) ?? withheld;
+      for (const raw of page.entries) {
+        const observed = asEntry(raw);
+        const previous = observed && pending.get(observed.seq);
+        if (!observed || !previous || observed.kind !== "ticket_proposal" ||
+            observed.payload?.id !== previous.payload?.id) continue;
+        const next = mergeOutcome(previous, observed);
+        if (next !== previous) changes.set(previous.seq, { before: previous, after: next });
+        pending.delete(previous.seq);
+      }
+      // A legacy or filtered page may not contain the requested row.
+      if (pending.has(seq)) {
+        if (joinedOutcome(target) || target.proposalOutcomeUnavailable) changes.set(seq, { before: target, after: outcomeUnavailable(target) });
+        pending.delete(seq);
+      }
+    } catch {
+      for (const [pendingSeq, entry] of pending) {
+        if (joinedOutcome(entry) || entry.proposalOutcomeUnavailable) changes.set(pendingSeq, { before: entry, after: outcomeUnavailable(entry) });
+      }
+      break;
+    }
+  }
+  return { changes, withheld };
+}
 
 export function useThreadStream(
   store: Resource<ThreadState>,
@@ -107,6 +194,77 @@ export function useThreadStream(
     // Both callbacks are stable at the call sites; the stream must not
     // reopen when a parent re-renders.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [store, url, enabled]);
+  useEffect(() => {
+    if (!enabled || url === null) return;
+    const source = new URL(url, window.location.href);
+    const parts = source.pathname.split("/");
+    if (source.origin !== window.location.origin || parts.length !== 5 ||
+        parts[1] !== "api" || parts[2] !== "threads" || parts[4] !== "stream") return;
+    if (source.searchParams.getAll("conversation").length > 1 ||
+        [...source.searchParams.keys()].some((key) => key !== "conversation")) return;
+    let alias: string;
+    try { alias = decodeURIComponent(parts[3]); } catch { return; }
+    if (alias === "") return;
+    const conversation = source.searchParams.get("conversation") ?? undefined;
+    let request: AbortController | null = null;
+    const reader = { before: async (before: number, limit: number) => {
+      const controller = new AbortController();
+      request = controller;
+      const timeout = setTimeout(() => controller.abort(), OUTCOME_READ_TIMEOUT_MS);
+      try {
+        return await api.thread(alias, { before, limit, conversation }, controller.signal);
+      } finally {
+        clearTimeout(timeout);
+        if (request === controller) request = null;
+      }
+    } };
+    let active = true;
+    let inFlight = false;
+    let rerun = false;
+    const refresh = () => {
+      if (!active || document.visibilityState !== "visible" || !privateReadsAllowed()) return;
+      if (inFlight) { rerun = true; return; }
+      const state = store.get().data;
+      if (!state?.entries.some((entry) => entry.kind === "ticket_proposal")) return;
+      const generation = privateSessionGeneration();
+      inFlight = true;
+      void (async () => {
+        try {
+          const result = await refreshProposalOutcomes(state, reader, conversation);
+          if (!active || !privateReadsAllowed() || generation !== privateSessionGeneration()) return;
+          const current = store.get().data;
+          if (!current || current.conversation !== state.conversation) return;
+          if (current.cloudRevision !== state.cloudRevision) { rerun = true; return; }
+          const thread = current.conversation ? { id: current.conversation } : null;
+          const base = result.withheld === null ? current :
+            mergePage(current, { thread, entries: [], cloud_withheld: result.withheld });
+          let changed = base !== current;
+          const entries = base.entries.map((entry) => {
+            const change = result.changes.get(entry.seq);
+            if (!change || entry.kind !== "ticket_proposal" || entry.payload?.id !== change.before.payload?.id) return entry;
+            if (!sameOutcome(entry, change.before)) { rerun = true; return entry; }
+            const next = change.after.proposalOutcomeUnavailable ? outcomeUnavailable(entry) : mergeOutcome(entry, change.after);
+            if (next !== entry) changed = true;
+            return next;
+          });
+          if (changed) store.mutate(() => ({ ...base, entries }));
+        } finally {
+          inFlight = false;
+          if (rerun) { rerun = false; refresh(); }
+        }
+      })();
+    };
+    const timer = setInterval(refresh, 30_000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      active = false;
+      request?.abort();
+      clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
   }, [store, url, enabled]);
 }
 

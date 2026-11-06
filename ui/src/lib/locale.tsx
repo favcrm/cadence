@@ -1314,6 +1314,7 @@ Object.assign(zhTW, {
   "Lane state unavailable": "無法取得通道狀態",
   "Hosted run": "託管執行",
   "Hosted run status is unavailable or not recorded.": "無法取得託管執行狀態，或尚未記錄。",
+  "It will be checked again while this conversation is visible.": "當此對話可見時，系統會再次檢查。",
   "Assignment recorded; start not confirmed": "已記錄指派；尚未確認開始",
   "Started; completion not yet observed": "已開始；尚未觀察到完成",
   "Agent name unavailable": "無法取得代理程式名稱",

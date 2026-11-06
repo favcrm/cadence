@@ -106,7 +106,12 @@ export default function TicketProposalCard({
           <dt className="text-ink-400">{t("Visible to")}</dt>
           <dd className="text-ink-200">{t("Everyone in the company")}</dd>
         </dl>
-        {proposal.ticket ? (
+        {entry.proposalOutcomeUnavailable ? (
+          <p className="mt-3 text-label text-warn" role="status">
+            {t("Hosted run status is unavailable or not recorded.")}{" "}
+            {t("It will be checked again while this conversation is visible.")}
+          </p>
+        ) : proposal.ticket ? (
           <div className="mt-3" role="status">
             <p className="text-label text-ink-200">
               {t("Created {id}.").replace("{id}", () => proposal.ticket!)}{" "}
