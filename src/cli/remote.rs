@@ -1385,9 +1385,11 @@ fn scope_hint(error: Error, capabilities: &[String], scope: &str, hint: &str) ->
     } else {
         capabilities.join(", ")
     };
+    // Replace, never append: a scope gap is a known cause, so leaving the
+    // "uncertain 401" text in front would still read as an auth outage.
     Error::rejected(format!(
-        "{error} — this login does not carry `{scope}` (it has: {carried}); run `{hint}` once, \
-         then repeat the command"
+        "the remote refused this action because this login does not carry `{scope}` \
+         (it has: {carried}); run `{hint}` once, then repeat the command. Nothing was sent"
     ))
 }
 /// CAD-1568: `send`/`message send` → `message_send` arguments. Exactly
@@ -5176,6 +5178,8 @@ mod read_contract_tests {
         );
         assert!(hinted.contains("cadence login --audit-approve"), "{hinted}");
         assert!(hinted.contains("cli.read, cli.write"), "{hinted}");
+        // A known cause replaces the uncertain-401 text; it never leads with it.
+        assert!(!hinted.contains("uncertain"), "{hinted}");
 
         // A credential that carries the scope keeps the original message.
         let owned = vec!["audit.approve".to_string()];
