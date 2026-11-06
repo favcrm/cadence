@@ -917,9 +917,27 @@ pub(super) fn read(
     opts: &ServeOpts,
     query: &dyn Fn(&str) -> Option<String>,
     route: ReadRoute<'_>,
+    actor: &str,
 ) -> HttpResp {
+    // An app's guide, runs and outputs are the project's content. A project
+    // the caller does not admit answers as an unknown project, and the
+    // all-projects listing names only the ones they may read.
+    let named = match &route {
+        ReadRoute::List => query("project"),
+        ReadRoute::Detail(key, _) | ReadRoute::Runs(key, _) | ReadRoute::Outputs(key, _) => {
+            Some((*key).to_string())
+        }
+    };
+    if let Some(key) = &named {
+        if super::project_policy::refused(pm, key, actor) {
+            return err_response(404, "unknown project");
+        }
+    }
     match route {
-        ReadRoute::List => list(pm, state_dir, query),
+        ReadRoute::List => {
+            let readable = super::project_policy::readable(pm, actor);
+            list(pm, state_dir, query, named.is_none().then_some(&readable))
+        }
         ReadRoute::Detail(project, name) => detail(pm, state_dir, project, name),
         ReadRoute::Runs(project, name) => runs(pm, state_dir, project, name),
         ReadRoute::Outputs(project, name) => outputs(request, pm, state_dir, opts, project, name),
@@ -927,7 +945,12 @@ pub(super) fn read(
 }
 
 /// `GET /api/apps[?project=<key>]` — the `app ls` payload.
-fn list(pm: &Pm, state_dir: &std::path::Path, query: &dyn Fn(&str) -> Option<String>) -> HttpResp {
+fn list(
+    pm: &Pm,
+    state_dir: &std::path::Path,
+    query: &dyn Fn(&str) -> Option<String>,
+    readable: Option<&std::collections::BTreeSet<String>>,
+) -> HttpResp {
     let project = query("project");
     if let Some(p) = &project {
         if !model::valid_key(p) {
@@ -935,7 +958,21 @@ fn list(pm: &Pm, state_dir: &std::path::Path, query: &dyn Fn(&str) -> Option<Str
         }
     }
     match app::ls(pm, project.as_deref(), state_dir) {
-        Ok(listed) => json_response(listed),
+        Ok(mut listed) => {
+            if let Some(readable) = readable {
+                if let Some(rows) = listed.get_mut("apps").and_then(|v| v.as_array_mut()) {
+                    rows.retain(|row| {
+                        row.get("project")
+                            .and_then(|p| p.as_str())
+                            .is_some_and(|key| readable.contains(key))
+                    });
+                    // The count is the number of rows the caller can see, not
+                    // the number that exist.
+                    listed["count"] = json!(rows.len());
+                }
+            }
+            json_response(listed)
+        }
         Err(e) if e.to_string().starts_with("No project") => err_response(404, &e.to_string()),
         Err(e) => err_response(503, &e.to_string()),
     }

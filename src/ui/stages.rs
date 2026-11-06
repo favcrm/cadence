@@ -88,6 +88,7 @@ pub(super) fn milestones(
     state_dir: &std::path::Path,
     pm_dir: &std::path::Path,
     project: Option<&str>,
+    readable: &std::collections::BTreeSet<String>,
 ) -> HttpResp {
     if project.is_some_and(|p| !model::valid_key(p)) {
         return err_response(400, "bad project key");
@@ -101,6 +102,6 @@ pub(super) fn milestones(
     let by_id: std::collections::HashMap<String, &board::View> = read.by_id();
     let ctx = read.ctx(&by_id);
     json_response(json!({
-        "milestones": crate::issue::work::milestones_json(&ctx, &read.views, project),
+        "milestones": crate::issue::work::milestones_json(&ctx, &read.views, project, Some(readable)),
     }))
 }

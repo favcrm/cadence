@@ -114,7 +114,7 @@ pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> R
                 }
             }
             crate::filter::check_set("health", health, work::HEALTH_STATES)?;
-            let mut rows: Vec<Value> = work::milestones_json(&ctx, &views, None)
+            let mut rows: Vec<Value> = work::milestones_json(&ctx, &views, None, None)
                 .into_iter()
                 .filter(|r| crate::filter::any_of(&wanted, r["project"].as_str()))
                 .filter(|r| crate::filter::any_of(milestone, r["id"].as_str()))
