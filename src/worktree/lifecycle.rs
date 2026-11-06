@@ -1351,14 +1351,18 @@ fn validate_refs_only_finish_target(root: &Path, path: &Path, branch: Option<&st
     Ok(())
 }
 
+struct ReleaseOptions<'a> {
+    allow_legacy_absence: bool,
+    allow_already_released: bool,
+    bind_issue: Option<&'a str>,
+}
+
 fn begin_release_transaction(
     repo: &Path,
     path: &Path,
     reason: &str,
     refused: String,
-    allow_legacy_absence: bool,
-    allow_already_released: bool,
-    bind_issue: Option<&str>,
+    options: ReleaseOptions<'_>,
     expected: impl FnOnce(Option<&Checkout>) -> Result<bool>,
 ) -> Result<ReleaseGuard> {
     if reason.trim().is_empty() {
@@ -1381,7 +1385,7 @@ fn begin_release_transaction(
         )));
     }
     let Some(index) = matches.first().copied() else {
-        if !allow_legacy_absence {
+        if !options.allow_legacy_absence {
             return Err(Error::rejected(format!(
                 "{} has no managed ownership record; refusing deletion",
                 path.display()
@@ -1406,7 +1410,7 @@ fn begin_release_transaction(
             record.path
         )));
     }
-    if record.state == "released" && allow_already_released {
+    if record.state == "released" && options.allow_already_released {
         if !expected(Some(record))? {
             return Err(Error::rejected(format!(
                 "{refused} (lifecycle state released)"
@@ -1430,7 +1434,7 @@ fn begin_release_transaction(
     }
     let record = &mut ledger.records[index];
     if record.issue.is_none() {
-        record.issue = bind_issue.map(str::to_owned);
+        record.issue = options.bind_issue.map(str::to_owned);
     }
     record.state = "releasing".into();
     record.release_reason = Some(reason.to_string());
@@ -1462,9 +1466,11 @@ pub fn begin_release(
             "checkout ownership for {} changed before release of issue {issue}; refusing deletion",
             path.display()
         ),
-        true,
-        false,
-        None,
+        ReleaseOptions {
+            allow_legacy_absence: true,
+            allow_already_released: false,
+            bind_issue: None,
+        },
         |record| {
             Ok(record.is_none_or(|record| {
                 record.purpose == "development"
@@ -1493,9 +1499,11 @@ pub(crate) fn begin_hosted_release(
             "checkout ownership for {} changed before hosted release of issue {issue}; refusing deletion",
             path.display()
         ),
-        true,
-        false,
-        Some(issue),
+        ReleaseOptions {
+            allow_legacy_absence: true,
+            allow_already_released: false,
+            bind_issue: Some(issue),
+        },
         |record| {
             let allowed = record.is_none_or(|record| {
                 record.purpose == "development"
@@ -1527,9 +1535,11 @@ pub fn begin_refs_only_finish(
             "refs-only finish ownership for {} changed before closing issue {issue}; refusing closure",
             path.display()
         ),
-        true,
-        true,
-        None,
+        ReleaseOptions {
+            allow_legacy_absence: true,
+            allow_already_released: true,
+            bind_issue: None,
+        },
         |record| {
             validate_refs_only_finish_target(&root, path, branch)?;
             Ok(record.is_none_or(|record| {
@@ -1559,9 +1569,11 @@ pub fn begin_review_release(
             "review checkout ownership for {} changed before release; refusing deletion",
             path.display()
         ),
-        false,
-        false,
-        None,
+        ReleaseOptions {
+            allow_legacy_absence: false,
+            allow_already_released: false,
+            bind_issue: None,
+        },
         |record| {
             Ok(record.is_some_and(|record| {
                 record.purpose == "review"
