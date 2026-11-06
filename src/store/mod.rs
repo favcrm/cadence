@@ -102,6 +102,7 @@ pub use messages::{
     report_timeout_secs, IssueSelection, Message, MessageIndex, MessageIndexQuery, Priority, Steer,
     DEFAULT_REPORT_TIMEOUT_SECS, ENQUEUE_BYTES, NUDGE_SOURCE,
 };
+pub(crate) use messages::{MessageMeta, QueuedHead};
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
 mod business_templates;
@@ -120,7 +121,7 @@ pub use chat_files::{
 };
 mod assistants;
 pub use assistants::{
-    AssistDispatchExpect, AssistRecipient, AssistRequest, AssistantBinding,
+    AssistDispatchExpect, AssistNoticeDelivery, AssistRecipient, AssistRequest, AssistantBinding,
     AssistantBootstrapUpdate,
 };
 pub mod app_audiences;

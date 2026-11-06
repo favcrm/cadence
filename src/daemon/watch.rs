@@ -198,6 +198,16 @@ impl Default for StallWatch {
     }
 }
 
+/// CAD-2207: the tracked head's identity, event scope and age — everything
+/// the stall watch reads from a running message or from `queued_head_meta`.
+/// Borrowed from the owning row; never a message body.
+#[derive(Clone, Copy)]
+struct Tracked<'a> {
+    id: &'a str,
+    task_id: Option<&'a str>,
+    created: f64,
+}
+
 #[derive(Debug, PartialEq)]
 enum StallTransition {
     Resume(Instant, u64),
@@ -655,12 +665,28 @@ impl Shared {
             Ok(m) => m,
             Err(_) => return,
         };
-        let tracked: Option<Message> = match running {
-            Some(ref m) => Some(m.clone()),
-            None => match self.store.queued_head(alias) {
+        // CAD-2207: only the tracked head's identity, task scope and age are
+        // used — read the non-body projection instead of decoding a protected
+        // notice body on every watchdog tick.
+        let queued = if running.is_some() {
+            None
+        } else {
+            match self.store.queued_head_meta(alias) {
                 Ok(m) => m,
                 Err(_) => return,
-            },
+            }
+        };
+        let tracked: Option<Tracked<'_>> = match running.as_ref() {
+            Some(m) => Some(Tracked {
+                id: m.id.as_str(),
+                task_id: m.task_id.as_deref(),
+                created: m.created,
+            }),
+            None => queued.as_ref().map(|m| Tracked {
+                id: m.id.as_str(),
+                task_id: m.task_id.as_deref(),
+                created: m.created,
+            }),
         };
         let Ok(agent) = self.store.agent(alias) else {
             return;
@@ -682,14 +708,14 @@ impl Shared {
             .unwrap_or(0);
         let ad = ctl.adapter.lock().unwrap().clone();
         let mut w = ctl.stall.lock().unwrap();
-        if w.message.as_deref() != tracked.as_ref().map(|m| m.id.as_str()) {
+        if w.message.as_deref() != tracked.as_ref().map(|t| t.id) {
             // The tracked subject changed (or drained) — the watch
             // resets, but the fired-menu history is pane state, not
             // message state: keeping it stops a menu that survives a
             // message transition from re-firing its event.
             let menu_evented = std::mem::take(&mut w.menu_evented);
             *w = StallWatch {
-                message: tracked.as_ref().map(|m| m.id.clone()),
+                message: tracked.as_ref().map(|t| t.id.to_string()),
                 menu_evented,
                 ..StallWatch::default()
             };
@@ -790,12 +816,13 @@ impl Shared {
                 // refire while it sits. A busy pane or an open menu
                 // never trips it — those waits are real.
                 if running.is_none() && !w.delivery_stalled_sent && probe.idle {
-                    if let Some(m) = tracked.as_ref() {
+                    if let Some(t) = tracked.as_ref() {
                         let bound = self.delivery_watch_budget(&agent);
-                        let queued_secs = self.stall_epoch() - m.created;
+                        let queued_secs = self.stall_epoch() - t.created;
                         if bound > 0 && queued_secs >= bound as f64 {
                             w.delivery_stalled_sent = true;
-                            delivery_fire = Some((m.id.clone(), queued_secs as u64, probe.clone()));
+                            delivery_fire =
+                                Some((t.id.to_string(), queued_secs as u64, probe.clone()));
                         }
                     }
                 }
@@ -863,7 +890,7 @@ impl Shared {
         let after = w.stall_transition(running.is_some(), budget, self.stall_now());
         drop(w);
         if let Some(line) = menu_rise {
-            self.approval_menu_fired(&agent, tracked.as_ref(), &line, running.is_none());
+            self.approval_menu_fired(&agent, tracked, &line, running.is_none());
         }
         if let Some((age, last_activity, probe)) = end_fire {
             if let Some(m) = running.as_ref() {
@@ -876,7 +903,7 @@ impl Shared {
             }
         }
         if let Some((msg_id, queued_secs, probe)) = delivery_fire {
-            self.delivery_stalled_fired(&agent, tracked.as_ref(), &msg_id, queued_secs, &probe);
+            self.delivery_stalled_fired(&agent, tracked, &msg_id, queued_secs, &probe);
         }
         match after {
             StallTransition::Resume(at, episode) => self.stall_resumed(
@@ -950,7 +977,12 @@ impl Shared {
         &self,
         message: &'m Message,
     ) -> (Option<String>, Option<&'m str>) {
-        let task_id = message.task_id.as_deref();
+        self.metadata_scope(message.task_id.as_deref())
+    }
+
+    /// CAD-2207: the same `(job_id, task_id)` scope for a tracked head that
+    /// was read as metadata only; the `job events` view keys on these.
+    fn metadata_scope<'m>(&self, task_id: Option<&'m str>) -> (Option<String>, Option<&'m str>) {
         let job_id = task_id.and_then(|t| self.store.task(t).ok().map(|t| t.job_id));
         (job_id, task_id)
     }
@@ -1028,17 +1060,17 @@ impl Shared {
     fn approval_menu_fired(
         &self,
         agent: &Agent,
-        tracked: Option<&Message>,
+        tracked: Option<Tracked<'_>>,
         line: &str,
         queued: bool,
     ) {
         let mut payload = json!({"line": line});
         let (mut job_id, mut task_id) = (None, None);
-        if let Some(m) = tracked {
-            payload["message"] = json!(m.id);
-            let (j, t) = self.message_scope(m);
+        if let Some(t) = tracked {
+            payload["message"] = json!(t.id);
+            let (j, task) = self.metadata_scope(t.task_id);
             job_id = j;
-            task_id = t;
+            task_id = task;
             if queued {
                 payload["queued"] = json!(true);
             }
@@ -1098,13 +1130,13 @@ impl Shared {
     fn delivery_stalled_fired(
         &self,
         agent: &Agent,
-        tracked: Option<&Message>,
+        tracked: Option<Tracked<'_>>,
         msg_id: &str,
         queued_secs: u64,
         probe: &Probe,
     ) {
         let (job_id, task_id) = tracked
-            .map(|m| self.message_scope(m))
+            .map(|t| self.metadata_scope(t.task_id))
             .unwrap_or((None, None));
         let _ = self.store.event_public_scoped(
             &agent.alias,

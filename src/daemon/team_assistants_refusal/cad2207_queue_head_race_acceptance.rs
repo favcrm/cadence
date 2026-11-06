@@ -61,7 +61,7 @@
 //! Without it the RPC's pull times out and the test fails loudly at the
 //! `reached_platform` precondition — never a false pass.
 //!
-//! Expected red today (CAD-2207, admitted-head-A / claimed-head-B), both of:
+//! Before the admitted-head claim fix (CAD-2207), both cases failed:
 //!   * `cad2207_changed_queue_head_is_never_claimed_under_the_old_admissions_revalidation`
 //!     — `take_queued` returns the replacement head B, stores it `submitting` and
 //!     hands it back even though B's share was withdrawn before the take
@@ -362,7 +362,7 @@ fn cad2207_refusal_reason(message: &crate::store::Message) -> Option<&str> {
 /// withdrawn through the real RPC. On release the take's atomic `take_queued`
 /// sees B as the head.
 ///
-/// RED today: the take returns B, persists it `submitting` and hands it to the
+/// Before the fix, the take returned B, persisted it `submitting` and handed it to the
 /// caller — a message this take never admitted and whose authorization was
 /// already gone. Expected green: nothing is claimed, B stays `queued`, and a
 /// later take that actually admits B refuses it for its own withdrawn share.
@@ -1060,7 +1060,7 @@ fn cad2207_await_not_queued(
     }
 }
 
-/// CAD-2207 (liveness, expected RED against the current admitted-head claim): an
+/// CAD-2207 liveness: an
 /// actor that internally consumed the admitted head (a real CAD-810 topic
 /// notice) must promptly claim the ELIGIBLE message already queued behind it,
 /// not wait out its empty-queue poll first.
@@ -1074,8 +1074,8 @@ fn cad2207_await_not_queued(
 /// strictly shorter than `Shared::idle_poll` (5s), so the poll cannot be the
 /// thing that delivers it.
 ///
-/// RED today: after consuming the notice the take answers `Take::Empty`, the
-/// actor waits the whole poll, and the backlog is still `queued` at the bound.
+/// Before the wakeup fix the take answered `Take::Empty` after consuming the
+/// notice, and the actor waited the whole poll while the backlog stayed queued.
 #[test]
 fn cad2207_actor_claims_backlog_promptly_after_internal_topic_notice_progress() {
     let fx = Fx::new();

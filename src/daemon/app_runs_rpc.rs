@@ -1992,52 +1992,98 @@ impl Shared {
         &self,
         alias: &str,
     ) -> Result<(Take, Option<super::members_rpc::AssistNoticeAdmission<'_>>)> {
-        // CAD-2207: admit and claim the SAME eligible head. This preview uses
-        // the claim's own selector (rank, running-turn turnless gate, no
-        // `submitting` rows), so a checked row is always claimable by this
-        // invocation and a `submitting`/held-over row can never be admitted
-        // in its place. The claim below is gated on the id read here; a head
-        // that replaced it (or appeared after this empty read) stays queued.
+        // CAD-2207: admit and claim the SAME eligible head. This preview is
+        // IDENTITY + ROUTING METADATA ONLY — it never materializes a body — so
+        // a protected notice whose authority is gone is refused before its
+        // body is read. It uses the claim's own selector (rank, running-turn
+        // turnless gate, no `submitting` rows), so a checked row is always
+        // claimable by this invocation and a `submitting`/held-over row can
+        // never be admitted in its place. The claim below is gated on the id
+        // read here; a head that replaced it (or appeared after this empty
+        // read) stays queued.
         let head = self.store.queued_head_for_take(alias)?;
-        let head_id = head.as_ref().map(|message| message.id.clone());
+        let head_id = head.as_ref().map(|head| head.id.clone());
         let mut notice_admission = None;
         let mut admitted_id = None;
         // CAD-1380 R1: a queued member turn re-proves its ORIGINAL credential
         // before the generic take. A refused row is failed and retained, never
         // dropped, with a bounded event naming the refusal.
-        if let Some(message) = head.as_ref().filter(|m| m.source != "app_run_dispatch") {
-            let checked = self.admit_assist_notice(message).and_then(|admission| {
-                self.member_message_reprove(message)?;
-                Ok(admission)
-            });
+        if let Some(head) = head
+            .as_ref()
+            .filter(|head| head.source != "app_run_dispatch")
+        {
+            // CAD-2207: a shared-job notice proves identity, receipt, binding,
+            // current subscription and the CURRENT local share — and reserves
+            // the job — before the protected body is retrieved. Its current
+            // remote membership/grant proof runs from that receipt/binding
+            // metadata at the same point; only the body digest and the local
+            // share/subscription re-check remain after the body is read.
+            let mut materialized = None;
+            let checked = match self.pre_admit_assist_notice(head) {
+                Ok(admission) => {
+                    materialized = self.store.message(&head.id)?;
+                    match materialized.as_ref() {
+                        // The remote membership/grant proof already ran in
+                        // pre-admission, before this body was read; only the
+                        // still-body-dependent checks remain here.
+                        Some(message) if head.source == "assist_job_event" => self
+                            .assist_notice_local_reprove(message)
+                            .map(|()| admission),
+                        Some(message) => self.member_message_reprove(message).map(|()| admission),
+                        None => Err(Error::rejected(format!(
+                            "queued head '{}' disappeared before its admission",
+                            head.id
+                        ))),
+                    }
+                }
+                Err(error) => Err(error),
+            };
             match checked {
                 Ok(admission) => {
                     if admission.is_some() {
-                        admitted_id = Some(message.id.clone());
+                        admitted_id = Some(head.id.clone());
                     }
                     notice_admission = admission;
                 }
                 Err(error) => {
                     let reason = error.to_string();
                     let refused = json!({"status": "failed", "text": "", "error": reason});
-                    self.store
-                        .finish(message, "failed", &refused, Some(&reason))?;
-                    self.store.event_public(
-                        alias,
-                        "member_turn_refused",
-                        json!({"message": message.id, "reason": reason}),
-                    )?;
+                    if head.source == "assist_job_event" {
+                        // CAD-2207: settle this still-queued notice through
+                        // its live metadata (the store compare-and-set keeps a
+                        // concurrent claim/cancellation). No refusal path here
+                        // materializes the body; a post-body re-prove refusal
+                        // already failed before the body reached a provider.
+                        if self
+                            .store
+                            .refuse_queued_message(&head.id, &refused, &reason)?
+                        {
+                            self.store.event_public(
+                                alias,
+                                "member_turn_refused",
+                                json!({"message": head.id, "reason": reason}),
+                            )?;
+                        }
+                    } else if let Some(message) = materialized.as_ref() {
+                        self.store
+                            .finish(message, "failed", &refused, Some(&reason))?;
+                        self.store.event_public(
+                            alias,
+                            "member_turn_refused",
+                            json!({"message": head.id, "reason": reason}),
+                        )?;
+                    }
                     return Ok((Take::Empty, None));
                 }
             }
         }
-        if let Some(message) = head.filter(|m| m.source == "app_run_dispatch") {
+        if let Some(head) = head.filter(|head| head.source == "app_run_dispatch") {
             // CAD-1374: a queued app step is a new execution, so its sealed
             // approver is re-proven first, with no store or auth lock held. A
             // refusal or outage only defers the take: nothing is rejected or
             // cancelled, and no external success is reported.
-            let Some((run_id, _)) = self.store.app_message_installation(&message.id)? else {
-                self.store.reject_app_submission(&message.id)?;
+            let Some((run_id, _)) = self.store.app_message_installation(&head.id)? else {
+                self.store.reject_app_submission(&head.id)?;
                 return Ok((Take::Empty, None));
             };
             let checked = self.store.app_run_show(&run_id)?;
@@ -2052,7 +2098,7 @@ impl Shared {
             let admission = (|| {
                 let (run_id, install) = self
                     .store
-                    .app_message_installation(&message.id)?
+                    .app_message_installation(&head.id)?
                     .ok_or_else(|| Error::rejected("app message association is absent"))?;
                 self.probe_app_run_prices(&checked)?;
                 let pm = self.pm_at(&self.pm_dir()?)?;
@@ -2071,7 +2117,7 @@ impl Shared {
                     }
                     self.store.take_queued_app_proven_progress(
                         alias,
-                        Some((&message.id, row["digest"].as_str().unwrap())),
+                        Some((&head.id, row["digest"].as_str().unwrap())),
                     )
                 })
             })();
@@ -2087,7 +2133,7 @@ impl Shared {
                     Ok((take, None))
                 }
                 Err(_) => {
-                    self.store.reject_app_submission(&message.id)?;
+                    self.store.reject_app_submission(&head.id)?;
                     Ok((Take::Empty, None))
                 }
             }

@@ -141,7 +141,7 @@ impl Shared {
         done: Option<&Vec<next_action::DoneRef>>,
     ) -> Result<()> {
         let running = self.store.running_message(&agent.alias)?;
-        let queued = self.store.queued_head(&agent.alias)?;
+        let queued = self.store.queued_head_meta(&agent.alias)?;
         if running.is_none() && queued.is_none() {
             // CAD-484: no turn in flight — a lane that reported done
             // still gets its one next action.
@@ -150,14 +150,17 @@ impl Shared {
             }
             return Ok(());
         }
-        let head = running.as_ref().or(queued.as_ref());
+        let head_id = running
+            .as_ref()
+            .map(|m| m.id.as_str())
+            .or(queued.as_ref().map(|m| m.id.as_str()));
         let (outcome, reason) = self.checkup_decide(agent, running.as_ref());
         let _ = self.store.event_public(
             &agent.alias,
             CHECKUP_EVENT,
             json!({
                 "outcome": outcome.as_str(),
-                "message": head.map(|m| m.id.as_str()),
+                "message": head_id,
                 "running": running.is_some(),
                 "reason": reason,
             }),

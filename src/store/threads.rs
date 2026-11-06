@@ -29,6 +29,8 @@
 //! turn token is never copied into a payload; one quoted in prose is
 //! still caught by the export's generic turn-token redaction.
 
+use std::sync::LazyLock;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
@@ -337,6 +339,211 @@ struct Binding<'a> {
     conversation: Option<&'a str>,
 }
 
+/// CAD-2207: the retained-read visibility of one thread entry, as a SQL
+/// predicate over the alias `entry`.
+///
+/// A message minted by [`Store::commit_assist_intent`] carries a durable
+/// `assist_notice_deliveries` receipt. Every entry linked to that message is
+/// read only by the job's owner, or by the receipt's own subscriber while the
+/// owner's CURRENT local share is live. The receipt must still match the
+/// thread's ACTIVE personal-assistant binding (alias, org, sub and assistant
+/// id); a replaced, revoked or missing binding withholds the entry instead of
+/// making it public. The subscriber ledger row must name the same assistant id
+/// too, so a stale subscription under a replaced assistant never authorizes
+/// the new one.
+///
+/// An entry links by its `message_id` (the notice, the provider's reply and
+/// the turn result all carry the notice's id) OR, for a daemon note whose
+/// `message_id` is NULL, by a `payload.message` that is a well-formed TEXT id
+/// (pack-delivered, pack-not-delivered and provider-session-reset notes name
+/// the turn they are about). Either way the linked turn's authorization is
+/// the same, so an already-retained note is withheld with its notice and
+/// restored by a re-share without rewriting history.
+///
+/// Fail-closed provenance, applied only on a thread bound to a personal
+/// assistant (ordinary threads keep their previous behavior):
+/// * a non-null `payload` that is not JSON;
+/// * a valid `payload.message` that is present but not a TEXT id (nor JSON
+///   null);
+/// * a `message_id` that disagrees with a TEXT `payload.message`;
+/// * an entry that claims the notice origin (`payload.source` or its linked
+///   message's `source`) without a receipt;
+/// * a receipt-linked entry whose populated payload or linked message source
+///   clearly contradicts the notice origin.
+///
+/// Later `assistant_text` / `turn_result` entries carry no `source` and stay
+/// visible when their receipt is authorized.
+///
+/// Ordinary agents, non-member threads and the member's own content carry
+/// neither a receipt nor the origin marker and are returned unchanged.
+///
+/// Every retained read ([`Store::thread_entries`], [`Store::thread_entries_before`],
+/// [`Store::continuity_entries`] and their `_of` forms) applies this predicate
+/// in SQL, so a hidden row is excluded before its body is decoded and is never
+/// counted as a visible page row or pack entry. The `e`-alias predicate and
+/// each complete statement are built once (see the `LazyLock` constants below)
+/// rather than formatted per read. The reply watermark queries wrap their text
+/// test in `CASE` so a hidden entry's text is never evaluated.
+fn notice_visible_sql(entry: &str) -> String {
+    // The payload source, or NULL when the payload is absent, malformed or
+    // carries no `source`. `json_extract` is guarded so malformed JSON never
+    // raises inside a read.
+    let payload_source = format!(
+        "CASE WHEN {entry}.payload IS NOT NULL AND json_valid({entry}.payload)
+              THEN json_extract({entry}.payload,'$.source') END"
+    );
+    // The `payload.message` JSON type, or NULL when the payload is absent,
+    // malformed or has no such key. A CASE (never a bare AND) keeps json_type
+    // off malformed JSON: SQLite may reorder WHERE conjuncts, but it evaluates
+    // a CASE's WHEN before its THEN.
+    let payload_type = format!(
+        "CASE WHEN {entry}.payload IS NOT NULL AND json_valid({entry}.payload)
+              THEN json_type({entry}.payload,'$.message') END"
+    );
+    // A daemon note's own reference to the turn it is about, only when that
+    // key is a well-formed TEXT message id; absent/null/other types are NULL.
+    let payload_message = format!(
+        "CASE WHEN {payload_type}='text'
+              THEN json_extract({entry}.payload,'$.message') END"
+    );
+    // A turn entry links by its message column; a daemon note (pack delivered,
+    // pack not delivered, provider session reset) links by payload.message.
+    let link = format!("COALESCE({entry}.message_id, {payload_message})");
+    // The linked message's live source, or NULL when that row is gone.
+    let message_source = format!("(SELECT m.source FROM messages m WHERE m.id={link})");
+    format!(
+        "(
+            NOT (
+                EXISTS(SELECT 1 FROM assistants bound
+                       WHERE bound.conversation_id={entry}.thread_id)
+                AND (
+                    ({entry}.payload IS NOT NULL AND NOT json_valid({entry}.payload))
+                    OR ({payload_type} IS NOT NULL
+                        AND {payload_type} NOT IN ('text','null'))
+                    OR ({entry}.message_id IS NOT NULL
+                        AND {payload_message} IS NOT NULL
+                        AND {entry}.message_id <> {payload_message})
+                )
+            )
+            AND (
+                (
+                    NOT EXISTS(SELECT 1 FROM assist_notice_deliveries d
+                               WHERE d.message_id={link})
+                    AND COALESCE({payload_source}, '') <> 'assist_job_event'
+                    AND COALESCE({message_source}, '') <> 'assist_job_event'
+                )
+                OR (
+                    EXISTS(
+                        SELECT 1 FROM assist_notice_deliveries d
+                        JOIN threads te ON te.id={entry}.thread_id
+                        JOIN assistants a ON a.conversation_id=te.id
+                             AND a.org=d.org AND a.sub=d.sub
+                             AND a.assistant_id=d.assistant_id
+                             AND a.alias=te.alias AND a.state='active'
+                        WHERE d.message_id={link}
+                          AND d.alias=te.alias
+                          AND (
+                            EXISTS(SELECT 1 FROM assist_requests r
+                                   WHERE r.job=d.job AND r.org=d.org AND r.sub=d.sub)
+                            OR (
+                              EXISTS(SELECT 1 FROM assist_job_shares sh
+                                     WHERE sh.job=d.job AND sh.org=d.org)
+                              AND EXISTS(SELECT 1 FROM job_subscribers js
+                                         WHERE js.job=d.job AND js.org=d.org
+                                           AND js.sub=d.sub
+                                           AND js.assistant_id=d.assistant_id)
+                            )
+                          )
+                    )
+                    AND NOT (
+                        {payload_source} IS NOT NULL
+                        AND {payload_source} <> 'assist_job_event'
+                    )
+                    AND NOT (
+                        {message_source} IS NOT NULL
+                        AND {message_source} <> 'assist_job_event'
+                    )
+                )
+            )
+        )"
+    )
+}
+
+/// The `e`-alias visibility predicate, built once for the retained reads.
+static NOTICE_VISIBLE_E: LazyLock<String> = LazyLock::new(|| notice_visible_sql("e"));
+
+/// The cached predicate text.
+fn notice_visible_e() -> &'static str {
+    NOTICE_VISIBLE_E.as_str()
+}
+
+/// Complete cached statements: the long predicate is formatted into each once,
+/// never per history/continuity read.
+static ENTRIES_AFTER: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT e.* FROM thread_entries e WHERE e.thread_id=? AND e.seq>?
+         AND {} ORDER BY e.seq LIMIT ?",
+        notice_visible_e()
+    )
+});
+static ENTRIES_BEFORE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT e.* FROM thread_entries e WHERE e.thread_id=? AND e.seq<?
+         AND {} ORDER BY e.seq DESC LIMIT ?",
+        notice_visible_e()
+    )
+});
+static CONTINUITY_FILTER: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "e.thread_id=?1 AND (e.message_id IS NULL OR (e.message_id != ?2 AND
+         EXISTS(SELECT 1 FROM messages m WHERE m.id=e.message_id
+                AND m.state IN {dstates})))
+         AND {vis}",
+        dstates = DELIVERED_STATES,
+        vis = notice_visible_e()
+    )
+});
+static CONTINUITY_COUNT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT COUNT(*) FROM thread_entries e WHERE {}",
+        CONTINUITY_FILTER.as_str()
+    )
+});
+static CONTINUITY_ROWS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT e.* FROM thread_entries e WHERE {} ORDER BY e.seq DESC LIMIT ?3",
+        CONTINUITY_FILTER.as_str()
+    )
+});
+/// The reply watermark tests `text` only inside `CASE`, so a hidden row's text
+/// is never inspected; visible rows keep the exact previous semantics.
+static THREAD_REPLY_SEQ: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT COALESCE((
+            SELECT e.seq FROM thread_entries e
+            WHERE e.thread_id=?1 AND e.role=?2 AND e.kind IN (?,?)
+              AND CASE WHEN {vis} THEN length(trim(e.text, ?)) > 0 ELSE 0 END
+            ORDER BY e.seq DESC LIMIT 1
+         ), 0)",
+        vis = notice_visible_e()
+    )
+});
+/// [`THREAD_REPLY_SEQ`] for one app conversation, with the same guarded text
+/// test inside [`Store::conversation_summaries`].
+static CONVERSATION_SUMMARIES: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT t.*, COALESCE((
+            SELECT e.seq FROM thread_entries e
+            WHERE e.thread_id=t.id AND e.role=? AND e.kind IN (?,?)
+              AND CASE WHEN {vis} THEN length(trim(e.text, ?)) > 0 ELSE 0 END
+            ORDER BY e.seq DESC LIMIT 1
+         ), 0) AS reply_seq
+         FROM threads t WHERE t.alias=? AND t.install_id=?
+         ORDER BY t.is_general DESC, t.created, t.id LIMIT ?",
+        vis = notice_visible_e()
+    )
+});
+
 impl Store {
     /// The alias's thread, created on first use. The agent must exist.
     pub fn ensure_thread(&self, alias: &str) -> Result<Thread> {
@@ -537,17 +744,13 @@ impl Store {
     /// Conversation-list wire rows with the newest visible assistant reply.
     /// Creation, operator/system entries and tool progress are not replies.
     /// The watermark is computed from existing entries; no read state is stored.
+    /// CAD-2207: a withdrawn assist-notice turn is withheld here exactly as in
+    /// the page reads, and the text test is guarded so its text is never
+    /// evaluated.
     pub fn conversation_summaries(&self, alias: &str, install: &str) -> Result<Vec<Value>> {
         let conn = self.conn();
         Ok(conn.query_vec(
-            "SELECT t.*, COALESCE((
-                SELECT e.seq FROM thread_entries e
-                WHERE e.thread_id=t.id AND e.role=? AND e.kind IN (?,?)
-                  AND length(trim(e.text, ?)) > 0
-                ORDER BY e.seq DESC LIMIT 1
-             ), 0) AS reply_seq
-             FROM threads t WHERE t.alias=? AND t.install_id=?
-             ORDER BY t.is_general DESC, t.created, t.id LIMIT ?",
+            CONVERSATION_SUMMARIES.as_str(),
             params![
                 ROLE_AGENT,
                 KIND_ASSISTANT_TEXT,
@@ -569,16 +772,13 @@ impl Store {
     /// or 0 when it has none. The same predicate as
     /// [`Self::conversation_summaries`] — an agent `assistant_text` or
     /// `turn_result` whose text is not ECMAScript whitespace — computed
-    /// from the complete entries, never a read page or read state.
+    /// from the complete entries, never a read page or read state. CAD-2207:
+    /// a withheld assist-notice turn never wins the watermark, and its text
+    /// is not evaluated.
     pub fn thread_reply_seq(&self, thread_id: &str) -> Result<i64> {
         let conn = self.conn();
         Ok(conn.query_row(
-            "SELECT COALESCE((
-                SELECT e.seq FROM thread_entries e
-                WHERE e.thread_id=?1 AND e.role=?2 AND e.kind IN (?,?)
-                  AND length(trim(e.text, ?)) > 0
-                ORDER BY e.seq DESC LIMIT 1
-             ), 0)",
+            THREAD_REPLY_SEQ.as_str(),
             params![
                 thread_id,
                 ROLE_AGENT,
@@ -1246,7 +1446,7 @@ impl Store {
     pub(super) fn thread_note_finished(
         &self,
         tx: &impl super::StoreConn,
-        message: &super::Message,
+        message: &super::MessageMeta<'_>,
         status: &str,
         result: &Value,
         error: Option<&str>,
@@ -1256,7 +1456,7 @@ impl Store {
             .thread_held
             .lock()
             .unwrap()
-            .remove(&message.id)
+            .remove(message.id)
             .unwrap_or_default();
         for item in held {
             let body = item.text.trim();
@@ -1265,13 +1465,13 @@ impl Store {
             }
             Self::thread_append_in(
                 tx,
-                &message.alias,
+                message.alias,
                 NewEntry {
                     role: ROLE_AGENT,
                     kind: KIND_ASSISTANT_TEXT,
                     text: &item.text,
                     payload: Some(item.payload),
-                    message_id: Some(&message.id),
+                    message_id: Some(message.id),
                 },
             )?;
         }
@@ -1284,13 +1484,13 @@ impl Store {
         }
         Self::thread_append_in(
             tx,
-            &message.alias,
+            message.alias,
             NewEntry {
                 role: ROLE_AGENT,
                 kind: KIND_TURN_RESULT,
                 text,
                 payload: Some(payload),
-                message_id: Some(&message.id),
+                message_id: Some(message.id),
             },
         )?;
         Ok(())
@@ -1394,7 +1594,9 @@ impl Store {
     }
 
     /// Entries after `after`, oldest first, at most `limit` (bounded by
-    /// [`PAGE_MAX`]). An alias with no thread reads empty.
+    /// [`PAGE_MAX`]). An alias with no thread reads empty. CAD-2207: an
+    /// assist-notice turn whose local share is withdrawn is filtered before
+    /// its body is read (see [`notice_visible_sql`]).
     pub fn thread_entries(&self, alias: &str, after: i64, limit: i64) -> Result<Vec<ThreadEntry>> {
         let conn = self.conn();
         let Some(thread) = Self::thread_in(&conn, alias)? else {
@@ -1423,8 +1625,7 @@ impl Store {
     ) -> Result<Vec<ThreadEntry>> {
         let limit = limit.clamp(1, PAGE_MAX);
         let rows = conn.query_vec(
-            "SELECT * FROM thread_entries WHERE thread_id=? AND seq>?
-             ORDER BY seq LIMIT ?",
+            ENTRIES_AFTER.as_str(),
             params![thread_id, after, limit],
             row_entry,
         )?;
@@ -1467,8 +1668,7 @@ impl Store {
     ) -> Result<(Vec<ThreadEntry>, bool)> {
         let limit = limit.clamp(1, PAGE_MAX);
         let mut rows = conn.query_vec(
-            "SELECT * FROM thread_entries WHERE thread_id=? AND seq<?
-             ORDER BY seq DESC LIMIT ?",
+            ENTRIES_BEFORE.as_str(),
             params![thread_id, before.unwrap_or(i64::MAX), limit + 1],
             row_entry,
         )?;
@@ -1519,21 +1719,14 @@ impl Store {
         current: &str,
         limit: i64,
     ) -> Result<(Vec<ThreadEntry>, i64)> {
-        let filter = format!(
-            "e.thread_id=?1 AND (e.message_id IS NULL OR (e.message_id != ?2 AND
-             EXISTS(SELECT 1 FROM messages m WHERE m.id=e.message_id
-                    AND m.state IN {DELIVERED_STATES})))"
-        );
         let total: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM thread_entries e WHERE {filter}"),
+            CONTINUITY_COUNT.as_str(),
             params![thread_id, current],
             |r| r.get(0),
         )?;
         let limit = limit.clamp(1, PAGE_MAX);
         let mut rows = conn.query_vec(
-            &format!(
-                "SELECT e.* FROM thread_entries e WHERE {filter} ORDER BY e.seq DESC LIMIT ?3"
-            ),
+            CONTINUITY_ROWS.as_str(),
             params![thread_id, current, limit],
             row_entry,
         )?;

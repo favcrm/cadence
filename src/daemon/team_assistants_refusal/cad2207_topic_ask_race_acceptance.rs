@@ -75,7 +75,7 @@
 //! never requires one, and it never asserts anything about the post's
 //! intermediate existence.
 //!
-//! Expected red today (post/queue split): the refused Ask leaves its committed
+//! Before the post/queue atomicity fix, the refused Ask left its committed
 //! post row (and the target's pending intent) behind, so
 //! `ask_race_handover_before_queue_commit_leaves_no_operator_visible_body`
 //! fails on the surviving post and the operator `topic_read` body. It passes

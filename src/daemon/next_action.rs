@@ -584,7 +584,7 @@ impl Shared {
         // its ticket waits for a free lane, not for this one.
         if target.state != "idle"
             || self.store.running_message(&agent.alias)?.is_some()
-            || self.store.queued_head(&agent.alias)?.is_some()
+            || self.store.queued_head_meta(&agent.alias)?.is_some()
         {
             return Ok((
                 Outcome::Leave,

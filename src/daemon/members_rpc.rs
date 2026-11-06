@@ -111,6 +111,60 @@ impl Shared {
         }
     }
 
+    /// CAD-2207: body-free pre-admission of the eligible queue head. Only an
+    /// `assist_job_event` notice carries a protected body, so only it is
+    /// pre-admitted here: its ACTIVE binding, durable delivery receipt,
+    /// receipt tuple, CURRENT subscription and CURRENT local share are proved
+    /// — and the shared-job admission reserved — before the take retrieves
+    /// the row's body. The CURRENT remote membership/grant proof is pulled
+    /// from the same receipt/binding metadata at this point too, so a member
+    /// whose authority is gone (or whose subscription was removed) never
+    /// causes the body to be read. Every other source is left to
+    /// [`Self::member_message_reprove`] unchanged.
+    ///
+    /// The body digest and the whole-message re-proof still run after the body
+    /// is materialized ([`Self::assist_notice_local_reprove`]); the actor
+    /// repeats the full proof before any provider call.
+    pub(super) fn pre_admit_assist_notice(
+        &self,
+        head: &store::QueuedHead,
+    ) -> Result<Option<AssistNoticeAdmission<'_>>> {
+        if head.source != "assist_job_event" {
+            return Ok(None);
+        }
+        let (_binding, delivery) =
+            self.assist_notice_receipt(&head.id, &head.alias, head.task_id.as_deref())?;
+        if self
+            .store
+            .assist_request_owns(&delivery.org, &delivery.sub, &delivery.job)?
+        {
+            // The owner never rides a share; the current remote grant proof is
+            // still pulled from receipt/binding metadata before the body.
+            self.assist_notice_authority(&head.id, &head.alias, head.task_id.as_deref())?;
+            return Ok(None);
+        }
+        // Reserve before checking the current entitlement: the owner's local
+        // share withdrawal either completed already or is refused while this
+        // admission is held. The subscriber check does not serialize other
+        // membership or credential changes.
+        let admission = self.reserve_shared_job(delivery.org.clone(), delivery.job.clone());
+        let subscribed =
+            self.store
+                .job_is_subscriber(&delivery.job, &delivery.org, &delivery.sub)?;
+        let shared = self
+            .store
+            .assist_job_is_shared(&delivery.job, &delivery.org)?;
+        if !subscribed || !shared {
+            return Err(Error::rejected(format!(
+                "assist notice '{}' refused: the job is no longer currently shared with \
+                 this subscriber (CAD-2207)",
+                head.id
+            )));
+        }
+        self.assist_notice_authority(&head.id, &head.alias, head.task_id.as_deref())?;
+        Ok(Some(admission))
+    }
+
     fn admit_member_job_read(
         &self,
         org: &str,
@@ -1236,59 +1290,12 @@ impl Shared {
     pub(super) fn member_message_reprove(&self, message: &store::Message) -> Result<()> {
         let stamp = self.store.message_member_authority(&message.id)?;
         let binding = self.store.assistant_for_alias(&message.alias)?;
-        // CAD-1380 R4: a queued assist-job notice re-proves the subscriber's
-        // live jobs scope for the job its task names. Its original member
-        // credential is never reused. The private-cwd invariant runs first, on
-        // the bound runtime that would receive the notice.
+        // CAD-1380 R4/CAD-2207: a queued assist-job notice re-proves the
+        // subscriber's live jobs scope for the job its task names. Its
+        // original member credential is never reused. The check is split so
+        // the body-free part can run before the body is read; this entry
+        // point runs the whole proof.
         if message.source == "assist_job_event" {
-            let Some(binding) = binding.as_ref().filter(|b| b.is_active()) else {
-                return Err(Error::rejected(format!(
-                    "assist notice '{}' refused: no active assistant binding",
-                    message.id
-                )));
-            };
-            self.assistant_runtime_cwd_guard(binding)?;
-            // CAD-2207: only a message carrying the committed delivery
-            // receipt for THIS exact intent/recipient/body may run. A legacy
-            // or forged row (including a NULL-sender row with a matching
-            // task) has none and is refused.
-            let Some(delivery) = self.store.assist_notice_delivery(&message.id)? else {
-                return Err(Error::rejected(format!(
-                    "assist notice '{}' refused: no durable delivered-intent receipt \
-                     (CAD-2207)",
-                    message.id
-                )));
-            };
-            let body_matches = delivery.body_sha256 == crate::operator_auth::digest(&message.body);
-            let tuple_matches = delivery.alias == message.alias
-                && Some(delivery.task.as_str()) == message.task_id.as_deref()
-                && delivery.org == binding.org
-                && delivery.sub == binding.sub
-                && delivery.assistant_id == binding.assistant_id;
-            if !body_matches || !tuple_matches {
-                return Err(Error::rejected(format!(
-                    "assist notice '{}' refused: its delivery receipt does not match this \
-                     message (CAD-2207)",
-                    message.id
-                )));
-            }
-            // The owning member is always allowed; a subscriber rides the
-            // owner's LIVE share, so revoking it stops a notice queued before
-            // revocation.
-            let owns = self
-                .store
-                .assist_request_owns(&binding.org, &binding.sub, &delivery.job)?;
-            if !owns
-                && !self
-                    .store
-                    .assist_job_is_shared(&delivery.job, &binding.org)?
-            {
-                return Err(Error::rejected(format!(
-                    "assist notice '{}' refused: the job is no longer shared by its \
-                     owner (CAD-2207)",
-                    message.id
-                )));
-            }
             return self.assist_notice_reprove(message);
         }
         let Some(binding) = binding else {
@@ -1685,20 +1692,91 @@ impl Shared {
             .ok_or_else(|| Error::rejected("assist notice: assistant alias is not registered"))
     }
 
-    fn assist_notice_reprove(&self, message: &store::Message) -> Result<()> {
+    /// CAD-2207: the body-free binding/receipt proof for one assist notice.
+    /// The tuple is checked against the live row's metadata and the durable
+    /// receipt; the body digest is checked separately, after the body is
+    /// materialized. Refusal here happens before any protected body is read.
+    fn assist_notice_receipt(
+        &self,
+        id: &str,
+        alias: &str,
+        task_id: Option<&str>,
+    ) -> Result<(store::AssistantBinding, store::AssistNoticeDelivery)> {
+        let refused = |why: &str| Error::rejected(format!("assist notice '{id}' refused: {why}"));
+        let binding = self
+            .store
+            .assistant_for_alias(alias)?
+            .filter(|binding| binding.is_active())
+            .ok_or_else(|| refused("no active assistant binding"))?;
+        self.assistant_runtime_cwd_guard(&binding)?;
+        let delivery = self.store.assist_notice_delivery(id)?.ok_or_else(|| {
+            Error::rejected(format!(
+                "assist notice '{id}' refused: no durable delivered-intent receipt (CAD-2207)"
+            ))
+        })?;
+        let tuple_matches = delivery.alias == alias
+            && Some(delivery.task.as_str()) == task_id
+            && delivery.org == binding.org
+            && delivery.sub == binding.sub
+            && delivery.assistant_id == binding.assistant_id;
+        if !tuple_matches {
+            return Err(refused("its delivery receipt does not match this message"));
+        }
+        Ok((binding, delivery))
+    }
+
+    /// CAD-2207: the body-dependent half of an assist notice's re-proof: the
+    /// receipt's body digest and the CURRENT local owner-share gate. The
+    /// remote membership/grant proof is [`Self::assist_notice_authority`],
+    /// which the take runs from the same receipt/binding metadata before the
+    /// body is read.
+    pub(super) fn assist_notice_local_reprove(&self, message: &store::Message) -> Result<()> {
         let refused =
             |why: &str| Error::rejected(format!("assist notice '{}' refused: {why}", message.id));
-        let task_id = message
-            .task_id
-            .as_deref()
-            .ok_or_else(|| refused("no task"))?;
+        let (_binding, delivery) =
+            self.assist_notice_receipt(&message.id, &message.alias, message.task_id.as_deref())?;
+        if delivery.body_sha256 != crate::operator_auth::digest(&message.body) {
+            return Err(refused("its delivery receipt does not match this message"));
+        }
+        // The owning member is always allowed; a subscriber rides the owner's
+        // LIVE share and must still hold its own subscription, so either
+        // withdrawal stops a notice queued before it.
+        let owns = self
+            .store
+            .assist_request_owns(&delivery.org, &delivery.sub, &delivery.job)?;
+        if !owns
+            && (!self
+                .store
+                .assist_job_is_shared(&delivery.job, &delivery.org)?
+                || !self
+                    .store
+                    .job_is_subscriber(&delivery.job, &delivery.org, &delivery.sub)?)
+        {
+            return Err(refused("the job is no longer shared with this subscriber"));
+        }
+        Ok(())
+    }
+
+    /// CAD-2207: the current remote membership/grant proof for one assist
+    /// notice, derived only from the durable receipt's job/task and the live
+    /// binding — never from the protected body. The take runs this before it
+    /// materializes the body; the actor's admission gate re-runs it before
+    /// any provider call.
+    pub(super) fn assist_notice_authority(
+        &self,
+        id: &str,
+        alias: &str,
+        task_id: Option<&str>,
+    ) -> Result<()> {
+        let refused = |why: &str| Error::rejected(format!("assist notice '{id}' refused: {why}"));
+        let task_id = task_id.ok_or_else(|| refused("no task"))?;
         let job = self
             .store
             .task_job_id(task_id)?
             .ok_or_else(|| refused("task unknown"))?;
         let binding = self
             .store
-            .assistant_for_alias(&message.alias)?
+            .assistant_for_alias(alias)?
             .filter(|b| b.is_active())
             .ok_or_else(|| refused("binding inactive"))?;
         let owner_ok = self
@@ -1734,6 +1812,11 @@ impl Shared {
             },
             "member message",
         )
+    }
+
+    fn assist_notice_reprove(&self, message: &store::Message) -> Result<()> {
+        self.assist_notice_local_reprove(message)?;
+        self.assist_notice_authority(&message.id, &message.alias, message.task_id.as_deref())
     }
 
     /// `member_caller` — admission for every `member_*` verb: proven

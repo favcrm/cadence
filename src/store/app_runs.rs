@@ -1,4 +1,5 @@
 //! Project-free, broker-local text runs. This is not provider tool confinement.
+use super::MessageMeta;
 use super::StoreConn;
 use super::*;
 use crate::issue::{parse, plan, workflow};
@@ -2402,12 +2403,12 @@ impl Store {
     pub(super) fn app_run_finished_in(
         &self,
         tx: &impl super::StoreConn,
-        message: &Message,
+        meta: MessageMeta<'_>,
         status: &str,
         result: &Value,
         proof: &AppCompletionProof,
     ) -> Result<bool> {
-        let Some(task_id) = message.task_id.as_deref() else {
+        let Some(task_id) = meta.task_id else {
             return Ok(false);
         };
         let Some((run_id,step_id,spec,generation,state,message_id))=tx.query_row("SELECT run_id,step_id,spec,identity_digest,state,message_id FROM app_run_steps WHERE task_id=?",[task_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?))).optional()? else{return Ok(false)};
@@ -2426,24 +2427,31 @@ impl Store {
         // its own step failed (`app_run_call_failed`); the message that owns
         // it may still close.
         if state == "failed"
-            && message_id.as_deref() == Some(&message.id)
-            && message.source == "app_run_dispatch"
+            && message_id.as_deref() == Some(meta.id)
+            && meta.source == "app_run_dispatch"
         {
             return Ok(true);
         }
         // Reconciliation is transport history only, never material authority.
         if state != "dispatched"
-            || message_id.as_deref() != Some(&message.id)
-            || message.source != "app_run_dispatch"
+            || message_id.as_deref() != Some(meta.id)
+            || meta.source != "app_run_dispatch"
         {
             return Err(Error::rejected("stale app completion association"));
         }
-        let current = self
-            .message_in(tx, &message.id)?
+        // CAD-2207: the live row's turn binding is authoritative, and it is
+        // read as metadata only — the app kickoff's body is never decoded just
+        // to decide whether the material result is current.
+        let current_turn = tx
+            .query_opt(
+                "SELECT turn_id FROM messages WHERE id=?",
+                [meta.id],
+                |row| row.get::<_, Option<String>>(0),
+            )?
             .ok_or_else(|| Error::rejected("app kickoff disappeared"))?;
         let step: LocalStep =
             serde_json::from_str(&spec).map_err(|e| Error::internal(e.to_string()))?;
-        let worker = self.agent_in(tx, &message.alias)?;
+        let worker = self.agent_in(tx, meta.alias)?;
         let task = self.task_in(tx, task_id)?;
         if status != "completed" {
             // CAD-1142: the step's reason names what actually ended the
@@ -2454,11 +2462,7 @@ impl Store {
             // verbatim and may hold credentials; it stays on the
             // operator-only message row while the step records only the
             // class (see `app_reason_class` above).
-            let detail = message
-                .error
-                .as_deref()
-                .filter(|e| !e.trim().is_empty())
-                .is_some()
+            let detail = meta.error.is_some_and(|e| !e.trim().is_empty())
                 || result
                     .get("error")
                     .and_then(Value::as_str)
@@ -2479,17 +2483,16 @@ impl Store {
                 )
                 .map(|_| true);
         };
-        let token = current
-            .turn_id
+        let token = current_turn
             .as_deref()
             .ok_or_else(|| Error::rejected("app material result needs its active turn"))?;
         if turn_id != token
             || result.get("turn_id").and_then(Value::as_str) != Some(token)
             || material_digest(&Self::app_binding_identity(&worker)) != generation
-            || message.alias != step.assignee
+            || meta.alias != step.assignee.as_str()
             || task.assignee.as_deref() != Some(&step.assignee)
             || task.revision != 1
-            || task.dispatch_message.as_deref() != Some(&message.id)
+            || task.dispatch_message.as_deref() != Some(meta.id)
             || !local_token_current(
                 &worker.provider,
                 &worker.endpoint_kind,
@@ -2582,9 +2585,9 @@ impl Store {
                                 id,
                                 run_id,
                                 step_id,
-                                message.id,
+                                meta.id,
                                 token,
-                                message.alias,
+                                meta.alias,
                                 digest,
                                 artifact.media_type,
                                 artifact.text.as_bytes(),
@@ -2595,7 +2598,7 @@ impl Store {
                             tx,
                             Self::DAEMON_STREAM,
                             "app_run_artifact_recorded",
-                            json!({"run_id":run_id,"step_id":step_id,"artifact_id":id,"sha256":digest,"producer":message.alias}),
+                            json!({"run_id":run_id,"step_id":step_id,"artifact_id":id,"sha256":digest,"producer":meta.alias}),
                         )?;
                         valid = true;
                     }
@@ -2645,12 +2648,12 @@ impl Store {
                         // Revise stays a recorded decision without that read.
                         let fetched = decision != "approve" || tx.query_row(
                             "SELECT 1 FROM app_run_artifact_fetches WHERE artifact_id=?1 AND message_id=?2 AND turn_hash=?3",
-                            params![id, message.id, artifact_digest(token.as_bytes())],
+                            params![id, meta.id, artifact_digest(token.as_bytes())],
                             |_| Ok(()),
                         ).optional()?.is_some();
-                        if digest==artifact_sha256 && producer!=message.alias && asset_valid && fetched {
-                            tx.execute("INSERT INTO app_run_reviews(run_id,step_id,artifact_id,artifact_digest,reviewer,message_id,decision,rationale,asset_receipt_id,asset_digest) VALUES(?,?,?,?,?,?,?,?,?,?)",params![run_id,step_id,id,digest,message.alias,message.id,decision,rationale,asset_receipt_id,asset_sha256])?;
-                            Self::event(tx,Self::DAEMON_STREAM,"app_run_step_reviewed",json!({"run_id":run_id,"step_id":step_id,"artifact_digest":digest,"reviewer":message.alias,"decision":decision}))?;
+                        if digest==artifact_sha256 && producer!=meta.alias && asset_valid && fetched {
+                            tx.execute("INSERT INTO app_run_reviews(run_id,step_id,artifact_id,artifact_digest,reviewer,message_id,decision,rationale,asset_receipt_id,asset_digest) VALUES(?,?,?,?,?,?,?,?,?,?)",params![run_id,step_id,id,digest,meta.alias,meta.id,decision,rationale,asset_receipt_id,asset_sha256])?;
+                            Self::event(tx,Self::DAEMON_STREAM,"app_run_step_reviewed",json!({"run_id":run_id,"step_id":step_id,"artifact_digest":digest,"reviewer":meta.alias,"decision":decision}))?;
                             valid=decision=="approve";
                         }
                     }
@@ -2669,7 +2672,7 @@ impl Store {
                 .map(|_| true);
         };
         let result_digest = material_digest(
-            &json!({"material":normalized_result,"producer":message.alias,"message":message.id}),
+            &json!({"material":normalized_result,"producer":meta.alias,"message":meta.id}),
         );
         tx.execute("UPDATE app_run_steps SET state='succeeded',result_digest=? WHERE run_id=? AND step_id=?",params![result_digest,run_id,step_id])?;
         tx.execute(
@@ -2699,7 +2702,7 @@ impl Store {
             } else {
                 "app_run_step_result_recorded"
             },
-            json!({"run_id":run_id,"step_id":step_id,"result_digest":result_digest,"producer":message.alias,"eligible_successors":pending>0}),
+            json!({"run_id":run_id,"step_id":step_id,"result_digest":result_digest,"producer":meta.alias,"eligible_successors":pending>0}),
         )?;
         Ok(true)
     }
@@ -3039,21 +3042,35 @@ pub(super) enum AppCompletionProof {
     OperatorReconcile,
 }
 impl Store {
+    /// CAD-2207: the LIVE row is authoritative, not the caller's in-memory
+    /// `Message` — a stale or forged `source`/`alias` cannot invent or launder
+    /// an app proof. Only the row's routing metadata is read; its body is
+    /// never decoded to decide app completion.
     pub(super) fn app_completion_proof(
         &self,
         conn: &impl super::StoreConn,
-        message: &Message,
+        message: MessageMeta<'_>,
         result: &Value,
     ) -> Result<AppCompletionProof> {
-        let current = self.message_in(conn, &message.id)?;
-        if let Some(current) = current.filter(|m| {
-            m.source == "app_run_dispatch" && m.state == "running" && m.alias == message.alias
-        }) {
-            if let Some(turn) = current
-                .turn_id
-                .filter(|turn| result.get("turn_id").and_then(Value::as_str) == Some(turn.as_str()))
-            {
-                return Ok(AppCompletionProof::ActiveEndpoint { turn_id: turn });
+        let live = conn.query_opt(
+            "SELECT source, state, alias, turn_id FROM messages WHERE id=?",
+            [message.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )?;
+        if let Some((source, state, alias, turn_id)) = live {
+            if source == "app_run_dispatch" && state == "running" && alias == message.alias {
+                if let Some(turn) = turn_id.filter(|turn| {
+                    result.get("turn_id").and_then(Value::as_str) == Some(turn.as_str())
+                }) {
+                    return Ok(AppCompletionProof::ActiveEndpoint { turn_id: turn });
+                }
             }
         }
         Ok(AppCompletionProof::Unproven)

@@ -189,14 +189,26 @@ the new assistant by alias alone.
 
 For a subscriber notice whose local admission is held, an owner attempting to
 withdraw the job share receives a refusal while that attempt is in progress;
-the share remains enabled and the owner can retry. Withdrawal also blocks
-subsequent subscriber evidence and event reads, while separately assigned work
-keeps its own authority. An actor claims only the eligible queue head it
-admitted; a changed head waits for its own admission. This is not a complete
-revocation guarantee: the preview still reads the selected body before that
-admission, background readers can load queued or retained content, and remote
-membership revocation is not serialized with local submission. Already-sent
-provider requests cannot be recalled.
+the share remains enabled and the owner can retry. The worker checks the
+notice's binding, durable receipt, current local share and subscription, and
+remote member authority before reading its queued body. It claims only the
+eligible queue head it admitted; a changed head waits for its own admission.
+The stall watcher and periodic checkup use queue metadata rather than the body.
+
+After a local withdrawal, newly requested member history, the bound
+assistant's own thread read and a newly assembled continuity pack omit the
+receipt-linked notice turn and its recognized continuity status notes. The
+thread reply watermark excludes the hidden turn. The owner's own notice and
+the subscriber's unrelated conversation remain available. Re-sharing restores
+the durable subscriber's access, but a client that already advanced a history
+cursor past the hidden entries must rescan to see them.
+
+This is not a complete revocation guarantee. Historical reads do not re-prove
+each job's remote grant; local withdrawal can race a response or a different
+turn's provider submission. Other background or legacy readers, ambiguous
+provenance, later derived outputs and persistent provider sessions remain
+outside this check. Previously received responses, copied material and
+already-sent provider requests cannot be recalled.
 
 For a stable binding, generic non-human topic membership refuses a bound
 assistant, generic topic reads and work-list aggregates omit its posts, and

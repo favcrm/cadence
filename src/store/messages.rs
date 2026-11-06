@@ -241,6 +241,86 @@ impl Message {
         }
         j
     }
+
+    /// CAD-2207: the non-body facts a terminal settlement needs, borrowed
+    /// from this row — no field is copied.
+    pub(crate) fn meta(&self) -> MessageMeta<'_> {
+        MessageMeta {
+            id: &self.id,
+            alias: &self.alias,
+            source: &self.source,
+            task_id: self.task_id.as_deref(),
+            reply_to: self.reply_to.as_deref(),
+            error: self.error.as_deref(),
+        }
+    }
+}
+
+/// CAD-2207: a borrowed view of the non-body metadata one settlement needs —
+/// exactly what the terminal write, Thread note, reply-to routing and app
+/// completion proof read. A decoded row and a pre-body refusal's owned SQL
+/// projection both hand out this view, so the settlement path never copies a
+/// field or materializes a body.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MessageMeta<'a> {
+    pub id: &'a str,
+    pub alias: &'a str,
+    pub source: &'a str,
+    pub task_id: Option<&'a str>,
+    pub reply_to: Option<&'a str>,
+    pub error: Option<&'a str>,
+}
+
+/// CAD-2207: the owned row projection a pre-body refusal reads from SQL. It
+/// lives only for that refusal transaction; every consumer borrows it through
+/// [`Self::meta`]. This is the only place settlement metadata is allocated.
+#[derive(Debug)]
+pub(crate) struct MessageMetaRow {
+    pub id: String,
+    pub alias: String,
+    pub source: String,
+    pub task_id: Option<String>,
+    pub reply_to: Option<String>,
+    pub error: Option<String>,
+}
+
+impl MessageMetaRow {
+    pub(crate) fn meta(&self) -> MessageMeta<'_> {
+        MessageMeta {
+            id: &self.id,
+            alias: &self.alias,
+            source: &self.source,
+            task_id: self.task_id.as_deref(),
+            reply_to: self.reply_to.as_deref(),
+            error: self.error.as_deref(),
+        }
+    }
+}
+
+/// CAD-2207: the settlement facts, provided either by a decoded [`Message`] or
+/// by the owned SQL projection a pre-body refusal carries. The terminal write,
+/// thread note, routing and app proof therefore run identically in both cases,
+/// borrowing the same fields.
+pub(crate) trait SettlementMessage {
+    fn meta(&self) -> MessageMeta<'_>;
+}
+
+impl SettlementMessage for Message {
+    fn meta(&self) -> MessageMeta<'_> {
+        Message::meta(self)
+    }
+}
+
+impl<'a> SettlementMessage for MessageMeta<'a> {
+    fn meta(&self) -> MessageMeta<'_> {
+        *self
+    }
+}
+
+impl SettlementMessage for MessageMetaRow {
+    fn meta(&self) -> MessageMeta<'_> {
+        MessageMetaRow::meta(self)
+    }
 }
 
 /// CAD-250: how long a delivered pty turn may wait on its report before
@@ -314,6 +394,23 @@ impl Priority {
 /// the same head.
 const QUEUE_ORDER_SQL: &str = "ORDER BY priority DESC, seq";
 
+/// CAD-2207: one compile-time SQL body for [`Store::queued_head`] and its
+/// non-body projection, so the 2-second stall watch never builds a query at
+/// runtime and the two selectors can never disagree on precedence. A
+/// mid-gate `submitting` row leads, then rank, then arrival.
+macro_rules! queued_head_sql {
+    ($columns:literal) => {
+        concat!(
+            "SELECT ",
+            $columns,
+            " FROM messages WHERE alias=? AND state IN ('queued','submitting') \
+             ORDER BY state='submitting' DESC, priority DESC, seq LIMIT 1"
+        )
+    };
+}
+const QUEUED_HEAD_SQL: &str = queued_head_sql!("*");
+const QUEUED_HEAD_META_SQL: &str = queued_head_sql!("id, task_id, created");
+
 /// The one eligible-head selector: `holding` narrows a queue held by a
 /// running turn to turnless sources. `take_queued` reads the full row
 /// through it, and the CAD-2207 admitted-head gate reads only `id`, so the
@@ -355,7 +452,29 @@ enum QueueAdmission<'a> {
     Admitted(Option<&'a str>),
 }
 
-/// CAD-158: how a send steers the recipient's queue — its rank, and the
+/// CAD-2207: the eligible queue head's identity and routing metadata. The
+/// only columns a take needs to prove that head's authority before any
+/// protected body is read — deliberately no `body`, `result` or `error`.
+#[derive(Debug, Clone)]
+pub(crate) struct QueuedHead {
+    pub id: String,
+    pub alias: String,
+    pub source: String,
+    pub task_id: Option<String>,
+}
+
+/// CAD-2207: [`Store::queued_head`]'s non-body projection for the stall
+/// watch, the periodic checkup and presence probes. `id` keys the watch and
+/// the event, `task_id` preserves job/task event scope, and `created` drives
+/// the delivery watchdog. No body, result or source is read.
+#[derive(Debug, Clone)]
+pub(crate) struct QueuedHeadMeta {
+    pub id: String,
+    pub task_id: Option<String>,
+    pub created: f64,
+}
+
+/// CAD-2207: how a send steers the recipient's queue — its rank, and the
 /// still-queued messages it atomically replaces. `by`/`by_kind` is the
 /// daemon-derived caller, stamped on every superseded row.
 #[derive(Debug, Clone, Copy)]
@@ -3803,22 +3922,33 @@ impl Store {
         })
     }
 
-    /// CAD-2207: the exact full row `take_queued_admitted` would claim right
-    /// now — same ordered selector, same running-turn/turnless gate, and no
-    /// `submitting` rows — so a caller can prove that row's authority and then
-    /// claim only it. `None` means the agent is disabled or its eligible queue
-    /// is empty; the following take then answers `Stop`/`Empty` without any
-    /// admission work.
-    pub(crate) fn queued_head_for_take(&self, alias: &str) -> Result<Option<Message>> {
+    /// CAD-2207: the exact head `take_queued_admitted` would claim right now —
+    /// same ordered selector, same running-turn/turnless gate, and no
+    /// `submitting` rows — projected to the identity and routing metadata a
+    /// take needs to prove that head's authority, and NOT to its body. A
+    /// protected notice whose authority is gone is therefore refused before
+    /// its body is ever materialized; the caller claims exactly this id and
+    /// reads the body only after the authority checks pass.
+    /// `None` means the agent is disabled or its eligible queue is empty;
+    /// the following take then answers `Stop`/`Empty` without any admission
+    /// work.
+    pub(crate) fn queued_head_for_take(&self, alias: &str) -> Result<Option<QueuedHead>> {
         self.read_tx(|conn| {
             let agent = self.agent_in(&*conn, alias)?;
             if !agent.enabled {
                 return Ok(None);
             }
             let holding = queued_hold_in(&*conn, alias)?.is_some();
-            let sql = queued_selector(holding, "*");
-            match conn.query_row(&sql, [alias], row_message) {
-                Ok(message) => Ok(Some(message)),
+            let sql = queued_selector(holding, "id, alias, source, task_id");
+            match conn.query_row(&sql, [alias], |row| {
+                Ok(QueuedHead {
+                    id: row.get("id")?,
+                    alias: row.get("alias")?,
+                    source: row.get("source")?,
+                    task_id: row.get("task_id")?,
+                })
+            }) {
+                Ok(head) => Ok(Some(head)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(error) => Err(error.into()),
             }
@@ -3832,19 +3962,37 @@ impl Store {
     /// leads `submitting` rows and ignores the running-turn turnless gate, so
     /// an admission decision uses [`Self::queued_head_for_take`] instead.
     pub fn queued_head(&self, alias: &str) -> Result<Option<Message>> {
+        self.queued_head_in(QUEUED_HEAD_SQL, alias, row_message)
+    }
+
+    /// CAD-2207: the same still-waiting head as [`Self::queued_head`], in the
+    /// same `submitting`/rank/arrival order, projected to the non-body fields
+    /// the watchdog, checkup and presence checks read. The scan stays on the
+    /// same disarmed read surface and static SQL, so a refused protected
+    /// notice's body is never decoded.
+    pub(crate) fn queued_head_meta(&self, alias: &str) -> Result<Option<QueuedHeadMeta>> {
+        self.queued_head_in(QUEUED_HEAD_META_SQL, alias, |row| {
+            Ok(QueuedHeadMeta {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                created: row.get(2)?,
+            })
+        })
+    }
+
+    /// One still-waiting head read; `sql` is a compile-time constant so the
+    /// watcher never constructs a query string.
+    fn queued_head_in<T>(
+        &self,
+        sql: &'static str,
+        alias: &str,
+        row: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Option<T>> {
         let conn = self.conn();
-        // A mid-gate `submitting` row is the one being delivered, so it
-        // leads whatever its rank.
-        match conn.query_row(
-            "SELECT * FROM messages WHERE alias=? AND state IN
-             ('queued','submitting')
-             ORDER BY state='submitting' DESC, priority DESC, seq LIMIT 1",
-            [alias],
-            row_message,
-        ) {
-            Ok(m) => Ok(Some(m)),
+        match conn.query_row(sql, [alias], row) {
+            Ok(value) => Ok(Some(value)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 

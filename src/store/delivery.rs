@@ -6,7 +6,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::kickoff::{check_commit_sha, cloud_hold_exit, last_sha_line};
-use super::messages::{Message, FENCING_UNKNOWN_SQL};
+use super::messages::{
+    Message, MessageMeta, MessageMetaRow, SettlementMessage, FENCING_UNKNOWN_SQL,
+};
 use super::plans::{Job, Task};
 use super::StoreConn;
 use super::{now, Store};
@@ -248,6 +250,43 @@ impl Store {
             let tx = &mut *conn;
             self.finish_in(&tx, message, status, result, error)?;
             Ok(())
+        })
+    }
+
+    /// CAD-2207: settle ONE still-queued delivery as failed from a metadata
+    /// projection of its live row. A take that must refuse a protected notice
+    /// before its body is materialized uses this instead of [`Self::finish`]:
+    /// the body is never read, but everything else a normal `finish` writes —
+    /// the terminal row, the endpoint state, `turn_finished`, the Thread turn
+    /// result, the `reply_to` route and the live-row app proof — is preserved.
+    /// The terminal write is compare-and-set on `queued`, so a concurrent
+    /// claim or cancellation wins and is never overwritten. Returns `true`
+    /// only when this call settled the row; the caller records its refusal
+    /// event then.
+    pub(crate) fn refuse_queued_message(
+        &self,
+        id: &str,
+        result: &Value,
+        error: &str,
+    ) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let Some(row) = Self::message_meta_row_in(&*tx, id)? else {
+                return Ok(false);
+            };
+            let meta = row.meta();
+            // The live row decides the app proof, never a caller shape.
+            let app_proof = self.app_completion_proof(tx, meta, result)?;
+            let settled = tx.execute(
+                "UPDATE messages SET state='failed',result=?,error=?,completed=? \
+                 WHERE id=? AND state='queued'",
+                params![result.to_string(), error, now(), id],
+            )?;
+            if settled != 1 {
+                return Ok(false);
+            }
+            self.finish_recorded_in(tx, meta, "failed", result, Some(error), &app_proof)?;
+            Ok(true)
         })
     }
 
@@ -546,10 +585,47 @@ impl Store {
         })
     }
 
+    /// CAD-2207: the live row's non-body metadata, read without its body. A
+    /// pre-body refusal decides its terminal settle from exactly these fields;
+    /// the owned row lives only for that transaction and is borrowed through
+    /// [`MessageMetaRow::meta`].
+    fn message_meta_row_in(tx: &impl super::StoreConn, id: &str) -> Result<Option<MessageMetaRow>> {
+        Ok(tx.query_opt(
+            "SELECT id, alias, source, task_id, reply_to, error FROM messages WHERE id=?",
+            [id],
+            |row| {
+                Ok(MessageMetaRow {
+                    id: row.get(0)?,
+                    alias: row.get(1)?,
+                    source: row.get(2)?,
+                    task_id: row.get(3)?,
+                    reply_to: row.get(4)?,
+                    error: row.get(5)?,
+                })
+            },
+        )?)
+    }
+
     pub(super) fn finish_in(
         &self,
         tx: &impl super::StoreConn,
-        message: &Message,
+        message: &impl SettlementMessage,
+        status: &str,
+        result: &Value,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        self.finish_meta_in(tx, message.meta(), status, result, error)
+    }
+
+    /// CAD-2207: the terminal settlement from a metadata projection. Used by
+    /// [`Self::finish_in`] for every decoded row and directly by a pre-body
+    /// refusal. The write here is unconditional because the caller has already
+    /// established which row it owns; a refusal applies its own compare-and-set
+    /// before calling [`Self::finish_recorded_in`].
+    fn finish_meta_in(
+        &self,
+        tx: &impl super::StoreConn,
+        meta: MessageMeta<'_>,
         status: &str,
         result: &Value,
         error: Option<&str>,
@@ -561,27 +637,44 @@ impl Store {
         }
         // Capture the active endpoint proof before the terminal UPDATE.
         // RPC explicit app reports additionally prove their native caller.
-        let app_proof = self.app_completion_proof(tx, message, result)?;
+        let app_proof = self.app_completion_proof(tx, meta, result)?;
         tx.execute(
             "UPDATE messages SET state=?,result=?,error=?,completed=? WHERE id=?",
-            params![status, result.to_string(), error, now(), message.id],
+            params![status, result.to_string(), error, now(), meta.id],
         )?;
+        self.finish_recorded_in(tx, meta, status, result, error, &app_proof)
+    }
+
+    /// The rest of a settlement, after the message row is terminal: endpoint
+    /// state, the unscoped `turn_finished`, the Thread turn result, the
+    /// `reply_to` route and the task/app edge. It reads only the metadata
+    /// projection, so a refusal that never materialized the body still writes
+    /// the same durable record a normal finish would.
+    fn finish_recorded_in(
+        &self,
+        tx: &impl super::StoreConn,
+        meta: MessageMeta<'_>,
+        status: &str,
+        result: &Value,
+        error: Option<&str>,
+        app_proof: &super::app_runs::AppCompletionProof,
+    ) -> Result<bool> {
         tx.execute(
             "UPDATE agents SET state='idle',updated=? WHERE alias=?",
-            params![now(), message.alias],
+            params![now(), meta.alias],
         )?;
         Self::event(
             tx,
-            &message.alias,
+            meta.alias,
             "turn_finished",
-            if message.source == "app_run_dispatch" {
-                json!({"message":message.id,"app_owned":true,"result_digest":super::app_runs::material_digest(result)})
+            if meta.source == "app_run_dispatch" {
+                json!({"message":meta.id,"app_owned":true,"result_digest":super::app_runs::material_digest(result)})
             } else {
-                json!({"message": message.id, "result": result})
+                json!({"message": meta.id, "result": result})
             },
         )?;
-        if message.source != "app_run_dispatch" {
-            self.thread_note_finished(tx, message, status, result, error)?;
+        if meta.source != "app_run_dispatch" {
+            self.thread_note_finished(tx, &meta, status, result, error)?;
         }
         // Preserve the uncertain provider outcome on the work axis.  The
         // compatibility `turn_finished` row above stays unscoped, while
@@ -589,7 +682,7 @@ impl Store {
         // a real task whose job binding can be proved in this transaction.
         // Unknown is evidence for inspection, never a task success edge.
         if status == "unknown" {
-            if let Some(task_id) = message.task_id.as_deref() {
+            if let Some(task_id) = meta.task_id {
                 let job_id: Option<String> = tx
                     .query_row("SELECT job_id FROM tasks WHERE id=?", [task_id], |row| {
                         row.get(0)
@@ -598,13 +691,13 @@ impl Store {
                 if let Some(job_id) = job_id {
                     Self::event_scoped(
                         tx,
-                        &message.alias,
+                        meta.alias,
                         "turn_unknown",
                         json!({
-                            "message": message.id,
-                            "reason": if message.source == "app_run_dispatch" { "app turn outcome is uncertain; inspect authorized run surfaces".to_string() } else { unknown_event_reason(error, result) },
+                            "message": meta.id,
+                            "reason": if meta.source == "app_run_dispatch" { "app turn outcome is uncertain; inspect authorized run surfaces".to_string() } else { unknown_event_reason(error, result) },
                             "owner": "operator",
-                            "next_action": unknown_event_action(&message.id),
+                            "next_action": unknown_event_action(meta.id),
                         }),
                         Some(&job_id),
                         Some(task_id),
@@ -622,17 +715,16 @@ impl Store {
             // A held cloud poll keeps the live session. The PM still
             // hears about it, but the notice must not say the worker
             // is fenced.
-            self.route_notice(tx, message, "unknown", result)?
+            self.route_notice(tx, &meta, "unknown", result)?
         } else {
-            self.route_result(tx, message, result)?
+            self.route_result(tx, &meta, result)?
         };
         // Task edge: normal completion of a task-attached kickoff moves
         // the task to review and binds head_sha to the reported commit.
         // Any other terminal leaves the task flagged where it stands.
-        if !self.app_run_finished_in(tx, message, status, result, &app_proof)?
-            && status == "completed"
+        if !self.app_run_finished_in(tx, meta, status, result, app_proof)? && status == "completed"
         {
-            self.task_on_completed(tx, message, result)?;
+            self.task_on_completed(tx, meta, result)?;
         }
         Ok(routed)
     }
@@ -643,9 +735,10 @@ impl Store {
     pub(super) fn route_result(
         &self,
         tx: &impl super::StoreConn,
-        message: &Message,
+        message: &impl SettlementMessage,
         result: &Value,
     ) -> Result<bool> {
+        let meta = message.meta();
         // Reading a mailbox completes its row with a local receipt. That
         // receipt is durable history, not worker output: routing it through
         // reply_to would synthesize a worker_result and wake a reviewer for
@@ -658,12 +751,12 @@ impl Store {
         ) {
             return Ok(false);
         }
-        let Some(target) = &message.reply_to else {
+        let Some(target) = meta.reply_to else {
             return Ok(false);
         };
         let delivery = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
-            format!("cadence-result:{}", message.id).as_bytes(),
+            format!("cadence-result:{}", meta.id).as_bytes(),
         )
         .simple()
         .to_string();
@@ -673,15 +766,15 @@ impl Store {
             return Ok(false);
         }
         let (expected, current, reason) =
-            self.recipient_binding(tx, &message.alias, &message.id, &message.source, target)?;
+            self.recipient_binding(tx, meta.alias, meta.id, meta.source, target)?;
         if let Some(reason) = reason {
             self.handoff_unresolved(
                 tx,
-                message.task_id.as_deref(),
+                meta.task_id,
                 target,
                 &delivery,
                 "worker_result",
-                &message.id,
+                meta.id,
                 reason,
                 expected.as_ref(),
                 current.as_ref(),
@@ -694,12 +787,12 @@ impl Store {
             ));
         };
         let mut routed = result.clone();
-        let pointer = self.bound_routed_result(tx, target, &mut routed, &message.alias)?;
+        let pointer = self.bound_routed_result(tx, target, &mut routed, meta.alias)?;
         let payload = json!({
-            "worker": message.alias, "message": message.id, "result": routed,
+            "worker": meta.alias, "message": meta.id, "result": routed,
             // Self-describing for the PM: which task this reports on and
             // the commit the worker claims (NULL when unreported).
-            "task": message.task_id,
+            "task": meta.task_id,
             "sha": result.get("sha"),
         });
         // Single line: the routed body may be delivered to a pty
@@ -718,20 +811,20 @@ impl Store {
                 delivery,
                 target,
                 prompt,
-                message.task_id,
+                meta.task_id,
                 now(),
-                self.agent_uid_of_in(tx, &message.alias)?,
+                self.agent_uid_of_in(tx, meta.alias)?,
                 recipient.uid,
-                message.alias,
+                meta.alias,
                 recipient.alias,
-                message.id
+                meta.id
             ],
         )?;
         Self::event(
             tx,
-            &message.alias,
+            meta.alias,
             "result_routed",
-            json!({"message": message.id, "recipient": target, "delivery": delivery}),
+            json!({"message": meta.id, "recipient": target, "delivery": delivery}),
         )?;
         Self::event(
             tx,
@@ -740,7 +833,7 @@ impl Store {
             json!({
                 "message": delivery,
                 "source": "worker_result",
-                "sender": message.alias,
+                "sender": meta.alias,
                 "recipient_identity": Self::agent_identity(recipient),
             }),
         )?;
@@ -757,16 +850,17 @@ impl Store {
     pub(super) fn route_notice(
         &self,
         tx: &impl super::StoreConn,
-        message: &Message,
+        message: &impl SettlementMessage,
         kind: &str,
         result: &Value,
     ) -> Result<bool> {
-        let Some(target) = &message.reply_to else {
+        let meta = message.meta();
+        let Some(target) = meta.reply_to else {
             return Ok(false);
         };
         let delivery = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
-            format!("cadence-notice:{kind}:{}", message.id).as_bytes(),
+            format!("cadence-notice:{kind}:{}", meta.id).as_bytes(),
         )
         .simple()
         .to_string();
@@ -776,15 +870,15 @@ impl Store {
             return Ok(false);
         }
         let (expected, current, reason) =
-            self.recipient_binding(tx, &message.alias, &message.id, &message.source, target)?;
+            self.recipient_binding(tx, meta.alias, meta.id, meta.source, target)?;
         if let Some(reason) = reason {
             self.handoff_unresolved(
                 tx,
-                message.task_id.as_deref(),
+                meta.task_id,
                 target,
                 &delivery,
                 "worker_notice",
-                &message.id,
+                meta.id,
                 reason,
                 expected.as_ref(),
                 current.as_ref(),
@@ -797,25 +891,25 @@ impl Store {
             ));
         };
         let mut routed = result.clone();
-        let pointer = self.bound_routed_result(tx, target, &mut routed, &message.alias)?;
+        let pointer = self.bound_routed_result(tx, target, &mut routed, meta.alias)?;
         let payload = json!({
-            "message": message.id, "notice": kind,
-            "result": routed, "worker": message.alias,
+            "message": meta.id, "notice": kind,
+            "result": routed, "worker": meta.alias,
         });
         let held = kind == "unknown" && result.get("held").and_then(Value::as_bool) == Some(true);
         let prompt = if held || kind == "cloud_recover_escalated" {
             let session: Option<String> = tx
                 .query_row(
                     "SELECT endpoint FROM agents WHERE alias=?",
-                    [&message.alias],
+                    [meta.alias],
                     |row| row.get(0),
                 )
                 .optional()?
                 .flatten();
             let session = session
                 .filter(|url| !url.is_empty())
-                .unwrap_or_else(|| format!("shown by `cadence agent show {}`", message.alias));
-            let exit = cloud_hold_exit(&message.id, &message.alias, &session);
+                .unwrap_or_else(|| format!("shown by `cadence agent show {}`", meta.alias));
+            let exit = cloud_hold_exit(meta.id, meta.alias, &session);
             if held {
                 format!(
                     "A Devin cloud worker's turn is held: the poll outcome was not learned and \
@@ -879,20 +973,20 @@ impl Store {
                 delivery,
                 target,
                 prompt,
-                message.task_id,
+                meta.task_id,
                 now(),
-                self.agent_uid_of_in(tx, &message.alias)?,
+                self.agent_uid_of_in(tx, meta.alias)?,
                 self.agent_uid_of_in(tx, target)?,
-                message.alias,
+                meta.alias,
                 recipient.alias,
-                message.id
+                meta.id
             ],
         )?;
         Self::event(
             tx,
-            &message.alias,
+            meta.alias,
             "notice_routed",
-            json!({"message": message.id, "recipient": target,
+            json!({"message": meta.id, "recipient": target,
                    "delivery": delivery, "notice": kind}),
         )?;
         Self::event(
@@ -902,7 +996,7 @@ impl Store {
             json!({
                 "message": delivery,
                 "source": "worker_notice",
-                "sender": message.alias,
+                "sender": meta.alias,
                 "recipient_identity": Self::agent_identity(recipient),
             }),
         )?;
@@ -1126,13 +1220,13 @@ impl Store {
             // field on the result, else a `SHA:` line in the note, else NULL.
             if !self.app_run_finished_in(
                 &tx,
-                &message,
+                message.meta(),
                 status,
                 &result,
                 &super::app_runs::AppCompletionProof::OperatorReconcile,
             )? && status == "completed"
             {
-                self.task_on_completed(&tx, &message, &result)?;
+                self.task_on_completed(&tx, message.meta(), &result)?;
             }
             // The fence lifts when the last unknown reconciles — attention
             // drops to stopped and disabled, the same condition as an
@@ -1500,16 +1594,16 @@ impl Store {
     fn task_on_completed(
         &self,
         tx: &impl super::StoreConn,
-        message: &Message,
+        meta: MessageMeta<'_>,
         result: &Value,
     ) -> Result<()> {
         // Only a dispatch kickoff carries the work axis: `--task`
         // follow-ups and `job_event` notifications attach `task_id`
         // for indexing but completing them must not move the task.
-        if message.source != "job_dispatch" {
+        if meta.source != "job_dispatch" {
             return Ok(());
         }
-        let Some(task_id) = message.task_id.as_deref() else {
+        let Some(task_id) = meta.task_id else {
             return Ok(());
         };
         let Ok(task) = self.task_in(tx, task_id) else {
@@ -1537,10 +1631,10 @@ impl Store {
         )?;
         Self::event_scoped(
             tx,
-            &message.alias,
+            meta.alias,
             "task_reported",
             json!({"task": task_id, "job": task.job_id,
-                   "revision": task.revision, "message": message.id,
+                   "revision": task.revision, "message": meta.id,
                    "sha": sha}),
             Some(&task.job_id),
             Some(task_id),

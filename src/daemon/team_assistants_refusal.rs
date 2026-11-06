@@ -13874,6 +13874,9 @@ fn cad2207_public_waiting_shape_is_identical_for_private_and_ordinary_work() {
 // CAD-2207: independent acceptance for LOCAL share-revocation ordering against
 // an in-flight notice turn (see the module header for its narrow scope, the
 // deterministic barrier, the expected red and the run command).
+mod cad2207_continuity_revocation_acceptance;
+mod cad2207_history_revocation_acceptance;
+mod cad2207_pre_admission_acceptance;
 mod cad2207_queue_head_race_acceptance;
 mod cad2207_share_revocation_ordering;
 // CAD-2207: independent acceptance for the operator's cross-agent work
