@@ -1221,6 +1221,119 @@ mod cad2081_workflow_verdicts {
     }
 
     #[test]
+    fn a_later_pass_supersedes_only_the_axes_it_reviewed() {
+        let f = Fixture::new();
+        let mut qa = f.owner(
+            "20261103-000100-qa.md",
+            "20261103-000100",
+            "usr_bob",
+            "bob",
+            "browser-qa",
+        );
+        qa["outcome"] = json!("revise");
+        qa["section_outcome"] = json!("revise");
+        let mut later_std = f.owner(
+            "20261103-000300-std.md",
+            "20261103-000300",
+            "usr_bob",
+            "bob",
+            "standards",
+        );
+        later_std["outcome"] = json!("pass");
+        // CAD-2192: a Browser QA finding is judged on its own axis, so the same
+        // reviewer's later Standards pass does not clear it.
+        refused(
+            &f,
+            scenario(vec![f.std(), f.spec(), qa.clone(), later_std.clone()]),
+            "is not a pass (outcome 'revise'",
+        );
+        // A later pass of the same kind still clears it.
+        let mut later_qa = f.owner(
+            "20261103-000400-qa.md",
+            "20261103-000400",
+            "usr_bob",
+            "bob",
+            "browser-qa",
+        );
+        later_qa["outcome"] = json!("pass");
+        let (_, _, stderr) = f.gate(&scenario(vec![f.std(), f.spec(), qa, later_qa]));
+        assert!(
+            !stderr.contains("is not a pass"),
+            "a later Browser QA pass must clear the earlier finding: {stderr}"
+        );
+        // `combined` covers both code axes, so it clears a Standards finding.
+        let mut std_revise = f.owner(
+            "20261103-000500-std.md",
+            "20261103-000500",
+            "usr_bob",
+            "bob",
+            "standards",
+        );
+        std_revise["outcome"] = json!("revise");
+        std_revise["section_outcome"] = json!("revise");
+        let mut combined = f.owner(
+            "20261103-000600-comb.md",
+            "20261103-000600",
+            "usr_bob",
+            "bob",
+            "combined",
+        );
+        combined["outcome"] = json!("pass");
+        let (_, _, stderr) = f.gate(&scenario(vec![f.std(), f.spec(), std_revise, combined]));
+        assert!(
+            !stderr.contains("is not a pass"),
+            "a later combined pass covers the code axes: {stderr}"
+        );
+        // A row of an unmapped kind names no axis: another kind cannot clear it,
+        // while a pass of that same kind can — neither fail-open nor stuck.
+        let mut other_revise = f.owner(
+            "20261103-000700-other.md",
+            "20261103-000700",
+            "usr_bob",
+            "bob",
+            "other",
+        );
+        other_revise["outcome"] = json!("revise");
+        other_revise["section_outcome"] = json!("revise");
+        let mut later_std_again = f.owner(
+            "20261103-000800-late.md",
+            "20261103-000800",
+            "usr_bob",
+            "bob",
+            "standards",
+        );
+        later_std_again["outcome"] = json!("pass");
+        refused(
+            &f,
+            scenario(vec![
+                f.std(),
+                f.spec(),
+                other_revise.clone(),
+                later_std_again,
+            ]),
+            "is not a pass (outcome 'revise'",
+        );
+        let mut later_same_kind = f.owner(
+            "20261103-000900-late-other.md",
+            "20261103-000900",
+            "usr_bob",
+            "bob",
+            "other",
+        );
+        later_same_kind["outcome"] = json!("pass");
+        let (_, _, stderr) = f.gate(&scenario(vec![
+            f.std(),
+            f.spec(),
+            other_revise,
+            later_same_kind,
+        ]));
+        assert!(
+            !stderr.contains("is not a pass"),
+            "a later pass of the same unmapped kind clears it: {stderr}"
+        );
+    }
+
+    #[test]
     fn an_operator_acceptance_lifts_only_a_workflow_revise_at_that_head() {
         let f = Fixture::new();
         let mut revise = f.spec();
@@ -1497,7 +1610,17 @@ mod cad2081_workflow_verdicts {
         let f = Fixture::new();
         let mut case = scenario(vec![f.std(), f.spec()]);
         case.head = Some(f.touch("ui/app.txt"));
-        refused(&f, case, "a ui/ change needs a pass Browser QA verdict");
+        let (code, _, stderr) = f.gate(&case);
+        assert_eq!(code, 1, "{stderr}");
+        assert!(
+            stderr.contains("a ui/ change needs a pass Browser QA verdict"),
+            "{stderr}"
+        );
+        // CAD-2192: the refusal names the route that works — an exact two-line
+        // comment named with --browser-qa — not "post the findings as a comment".
+        for said in ["Browser QA: pass", "Head: <this head>", "--browser-qa"] {
+            assert!(stderr.contains(said), "{said}: {stderr}");
+        }
     }
 
     #[test]

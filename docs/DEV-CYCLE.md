@@ -31,9 +31,13 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    and UI paths (`docs/roles/one-review-paths.toml` lists what gets one). A
    fresh-session review is a non-author session with no inherited context,
    including a subagent (AGENTS.md "Review standard"). The merge gate does not
-   enforce that yet; merges use the temporary `--exception` (exact-head operator approval and two
-   advisory links, standards and spec-security, plus browser-qa for a `ui/`
-   change) until `EXCEPTION_ENDS`
+   enforce that yet, so it counts GitHub-attested workflow rows instead
+   (Standards and Spec/security, CAD-2088). A `ui/` change also needs a
+   non-author repository member's comment whose whole body is the two lines
+   `Browser QA: pass` and `Head: <head>`, named with `--browser-qa <url>`
+   (CAD-2173); the report goes in another comment. The temporary `--exception`
+   (exact-head operator approval plus two advisory links) remains for a head
+   that cannot produce the workflow rows, and ends at `EXCEPTION_ENDS`
    (2026-12-31).
 5. The version-one delivery tiers apply to clean default-equivalent policies
    by default after the reviewed implementation is installed; the introducing
@@ -400,12 +404,16 @@ enqueued from main's copy.
 
 Temporary path (CAD-1946; remove this note when it ends): while the hosted
 reviewer attestation cannot be produced, add `--exception --advisory
-standards=<url> --advisory spec-security=<url>` (plus `--advisory
-browser-qa=<url>` for a `ui/` change) to the enqueue. It waives only the
+standards=<url> --advisory spec-security=<url>` (`--advisory browser-qa=<url>`
+additionally covers a `ui/` change) to the enqueue. It waives only the
 missing reviewer attestation and, on a hosted routine PR, the readiness proof
 hosted cannot yet produce; the evidence names both. The advisory reviews are PR comments posted by
 separately assigned sessions, and the operator approves each exact head. The
 path ends at `EXCEPTION_ENDS` in `scripts/delivery-gate` (2026-12-31).
+
+The advisory links are the exception's own evidence. They are not the
+`--browser-qa` route in step 4, which names a pinned two-line pass comment and
+needs no exception.
 
 The helper enforces exact-head checks, verdicts, evidence and approval. Queue
 position is not merge evidence: watch the merge-group run and verify the
