@@ -17,10 +17,9 @@ const RUN_LABEL: Record<string, string> = {
   parked: "paused",
 };
 
-/** Master's start card (AOS-517): the whole ticket it proposes, the agent that
- *  would run it, the tools that agent gets, and who can read the result. One
- *  click creates the ticket and assigns it; nothing exists before the click and
- *  a second click starts nothing. */
+/** Master's start card (AOS-517): the whole ticket and destination, the agent
+ *  that would run it, the tools that agent gets, and who can read the result.
+ *  One click creates and assigns; a second click starts nothing. */
 export default function TicketProposalCard({
   entry,
   onOpenIssue,
@@ -40,7 +39,7 @@ export default function TicketProposalCard({
   if (!proposal) {
     return (
       <p className="text-micro text-ink-500" data-kind="ticket-proposal">
-        · {entry.text}
+        · {entry.text || t("This ticket proposal is unavailable. Ask the assistant to try again.")}
       </p>
     );
   }
@@ -75,6 +74,8 @@ export default function TicketProposalCard({
           className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-micro mt-2.5"
           aria-label={t("What this assigns")}
         >
+          <dt className="text-ink-400">{t("Project")}</dt>
+          <dd className="text-ink-200 break-words">{proposal.project}</dd>
           <dt className="text-ink-400">{t("Agent")}</dt>
           <dd className="text-ink-200 break-words">
             {proposal.agent.name} · {t("runs as you")}

@@ -6,6 +6,8 @@
  *  is the idempotency key, so a retry cannot mint a second one) and then assign
  *  it to the agent profile. Nothing here runs until the person clicks. */
 
+import { PROJECT_KEY } from "../../lib/projectKey";
+
 export type TicketProposal = {
   /** The card's own id; also the create's idempotency key. */
   id: string;
@@ -35,7 +37,8 @@ export function parseTicketProposal(
   const title = text(payload.title);
   const brief = text(payload.brief);
   const agent = payload.agent;
-  if (!id || !project || !title || !brief) return null;
+  if (!id || !project || !PROJECT_KEY.test(project) || project === "agents" || !title || !brief)
+    return null;
   if (agent === null || typeof agent !== "object" || Array.isArray(agent)) return null;
   const record = agent as { id?: unknown; name?: unknown };
   const agentId = text(record.id);

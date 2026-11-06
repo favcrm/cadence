@@ -44,6 +44,10 @@ const parsed = parseTicketProposal(proposal);
 check(parsed !== null && parsed.agent.id === "ap_1" && parsed.tools.length === 3, "a complete payload parses");
 check(parseTicketProposal({ ...proposal, agent: null }) === null, "no agent, no proposal");
 check(parseTicketProposal({ ...proposal, brief: "  " }) === null, "blank brief, no proposal");
+for (const project of [null, "  ", "ACME", "-invalid", "a".repeat(33), "agents"]) {
+  check(parseTicketProposal({ ...proposal, project }) === null, "invalid project cannot be approved");
+}
+check(parseTicketProposal({ ...proposal, project: `a${"b".repeat(31)}` }) !== null, "a valid 32-character project remains usable");
 check(parseTicketProposal({ ...proposal, tools: ["web_read", 7] }) === null, "an incomplete tool list makes no proposal");
 check(parseTicketProposal({ ...proposal, tools: [] })?.tools.length === 0, "an empty tool list is a real answer");
 check(parseTicketProposal({ ...proposal, visibility: "private" }) === null, "an audience the card cannot state makes no proposal");
