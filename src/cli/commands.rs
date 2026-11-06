@@ -106,6 +106,13 @@ pub(crate) enum Commands {
         /// `issue project delivery` can run. Never part of a default login.
         #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
         audit_approve: bool,
+        /// CAD-2213: request every opt-in scope this consent can carry —
+        /// `--web`, `--settings`, `--cloud-agent` and `--audit-approve` — in
+        /// one login, and print the granted set. A default login stays
+        /// narrow; this is the one flag an operator needs before spending,
+        /// approving or changing settings.
+        #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
+        full_access: bool,
     },
     /// Create a hosted workspace in the browser and approve this CLI. Opens
     /// the AgenticOS registration page, waits for email OTP, workspace

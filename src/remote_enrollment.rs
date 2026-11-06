@@ -2673,6 +2673,14 @@ fn login_grant(
     })
 }
 impl LoginGrant {
+    /// The capabilities the issuer actually granted this consent, as the
+    /// credential recorded them. Printed after login so a narrowed grant is
+    /// visible immediately instead of surfacing later as an opaque 401
+    /// (CAD-2213).
+    pub fn capabilities(&self) -> &[String] {
+        &self.capabilities
+    }
+
     /// Write the `hct_` to `cli-<slug>.json` at 0600 (temp file, then
     /// rename), separate from `orgs.json`. Never printed.
     pub fn save_credential(&self, dir: &Path) -> Result<()> {

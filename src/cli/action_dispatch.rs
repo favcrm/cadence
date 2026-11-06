@@ -36,6 +36,32 @@ pub(super) fn issued_session_persistence_error(workspace: &str, dir: &Path, erro
     ))
 }
 
+/// CAD-2213: the opt-in scopes `--full-access` turns on in one consent.
+pub(super) fn login_scopes(
+    web: bool,
+    settings: bool,
+    cloud_agent: bool,
+    audit_approve: bool,
+    full_access: bool,
+) -> (bool, bool, bool, bool) {
+    (
+        web || full_access,
+        settings || full_access,
+        cloud_agent || full_access,
+        audit_approve || full_access,
+    )
+}
+
+/// The granted set, printed after login so a narrowed consent is visible
+/// immediately rather than surfacing later as an opaque 401.
+pub(super) fn login_granted_line(capabilities: &[String]) -> String {
+    if capabilities.is_empty() {
+        "none recorded".to_string()
+    } else {
+        capabilities.join(", ")
+    }
+}
+
 fn show_workspace_handover(slug: &str, stored: &Value, explicit_auth_dir: bool) {
     let selected = stored.get("selected").and_then(Value::as_bool);
     match selected {
@@ -443,6 +469,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             settings,
             cloud_agent,
             audit_approve,
+            full_access,
         } => {
             if *use_ && !*token_stdin {
                 org::refuse_managed_default_change()?;
@@ -461,16 +488,21 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             let issuer = issuer
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            let grant = if *web || *settings || *cloud_agent || *audit_approve {
+            // CAD-2213: `--full-access` is the union of the opt-in scopes, so
+            // one consent can approve, change settings and spend a cloud
+            // agent instead of four logins discovered one failure at a time.
+            let (web, settings, cloud_agent, audit_approve) =
+                login_scopes(*web, *settings, *cloud_agent, *audit_approve, *full_access);
+            let grant = if web || settings || cloud_agent || audit_approve {
                 cadence_agent::remote_enrollment::login_portal_scoped(
                     issuer,
                     hint.as_deref().or(slug.as_deref()),
                     &dir,
                     |url, code| show_login_code(url, code, *no_open),
-                    *web,
-                    *settings,
-                    *cloud_agent,
-                    *audit_approve,
+                    web,
+                    settings,
+                    cloud_agent,
+                    audit_approve,
                 )?
             } else if let Some(org) = org.as_deref() {
                 let slug = slug.as_deref().ok_or_else(|| {
@@ -505,8 +537,10 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 issued_session_persistence_error(&grant.organization_id, &dir, error)
             })?;
             cadence_agent::output::print_format_line(format_args!(
-                "Signed in to {} ({})",
-                grant.slug, grant.endpoint
+                "Signed in to {} ({}); granted: {}",
+                grant.slug,
+                grant.endpoint,
+                login_granted_line(grant.capabilities())
             ));
             show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
             return Ok(0);
