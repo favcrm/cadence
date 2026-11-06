@@ -17,7 +17,7 @@ use crate::issue::{project, Pm};
 /// refused rather than guessed at. The reserved `agents/` and `service/`
 /// kinds map to their own variants so a restricted project refuses them
 /// explicitly.
-pub(super) fn caller_of(actor: &str) -> Option<project::ProjectCaller<'_>> {
+pub(crate) fn caller_of(actor: &str) -> Option<project::ProjectCaller<'_>> {
     use project::ProjectCaller;
     if actor == "operator" {
         return Some(ProjectCaller::Operator);
@@ -100,7 +100,7 @@ impl<'a> Access<'a> {
 /// Fail closed: an unknown spelling or an unreadable tracker yields an
 /// empty set, so a listing contributes no row, count or placeholder for a
 /// project the caller may not see.
-pub(super) fn readable(pm: &Pm, actor: &str) -> BTreeSet<String> {
+pub(crate) fn readable(pm: &Pm, actor: &str) -> BTreeSet<String> {
     Access::of(pm, actor).readable()
 }
 
@@ -108,7 +108,7 @@ pub(super) fn readable(pm: &Pm, actor: &str) -> BTreeSet<String> {
 ///
 /// An absent project returns false, so the caller's verb keeps its own
 /// unknown-project answer. An unreadable tracker refuses.
-pub(super) fn refused(pm: &Pm, key: &str, actor: &str) -> bool {
+pub(crate) fn refused(pm: &Pm, key: &str, actor: &str) -> bool {
     Access::of(pm, actor).refused(key)
 }
 
@@ -120,7 +120,7 @@ pub(super) fn refused(pm: &Pm, key: &str, actor: &str) -> bool {
 /// project would leak rows and counts from the restricted ones, so that
 /// caller is refused live updates instead (AOS-274 / SEC-006). Fail
 /// closed: an unreadable tracker or unknown spelling is not complete.
-pub(super) fn reads_every_project(pm: &Pm, actor: &str) -> bool {
+pub(crate) fn reads_every_project(pm: &Pm, actor: &str) -> bool {
     Access::of(pm, actor).reads_every_project()
 }
 
@@ -132,7 +132,7 @@ pub(super) fn reads_every_project(pm: &Pm, actor: &str) -> bool {
 /// section added later fails closed instead of leaking. A row with no
 /// project identity is not project-scoped and stays — except in
 /// `projects`, where an unnamed row is dropped.
-pub(super) fn retain_overview(payload: &mut serde_json::Value, readable: &BTreeSet<String>) {
+pub(crate) fn retain_overview(payload: &mut serde_json::Value, readable: &BTreeSet<String>) {
     let Some(root) = payload.as_object_mut() else {
         return;
     };

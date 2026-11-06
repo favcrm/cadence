@@ -72,7 +72,7 @@ mod my_work;
 mod notify_service;
 mod operator;
 mod platform_account;
-mod project_policy;
+pub(crate) use crate::project_policy;
 pub(crate) mod public_directory;
 mod read_model;
 mod serve;

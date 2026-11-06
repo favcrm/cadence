@@ -223,7 +223,7 @@ pub fn admit_manifest(
         ));
     }
     let root_segs: Vec<&str> = root.split('/').collect();
-    allowed(caller, Op::Write, &root_segs)?;
+    allowed(pm, caller, Op::Write, &root_segs)?;
     let vault = vault_dir(pm)?;
     refuse_special(&vault, &root, true)?;
     match read(pm, caller, &root) {
@@ -289,7 +289,7 @@ pub fn admit_manifest(
         }
         seen_path.push((full.clone(), kind == "dir"));
         let segs: Vec<&str> = full.split('/').collect();
-        allowed(caller, Op::Write, &segs)?;
+        allowed(pm, caller, Op::Write, &segs)?;
         refuse_special(&vault, &full, kind == "dir")?;
         if !rev_ok(&entry.if_rev) {
             return Err(reject(format!(
@@ -412,7 +412,7 @@ fn ensure_root(
     root: &str,
 ) -> Result<RootStatus> {
     let segs: Vec<&str> = root.split('/').collect();
-    allowed(caller, Op::Write, &segs)?;
+    allowed(pm, caller, Op::Write, &segs)?;
     if committed_dir(pm, root)? {
         store.wiki_transfer_note_root_attempt(job_id, ROOT_PROVED)?;
         return Ok(RootStatus::Ready { created: false });
@@ -508,6 +508,7 @@ fn require_job(store: &Store, request: &JobRequest<'_>) -> Result<JobHead> {
 }
 
 fn recheck_job_paths(
+    pm: &Pm,
     caller: &Caller,
     root: &str,
     entries: &[EntryRow],
@@ -515,6 +516,7 @@ fn recheck_job_paths(
 ) -> Result<()> {
     let root_segments: Vec<&str> = root.split('/').collect();
     allowed(
+        pm,
         caller,
         if writing { Op::Write } else { Op::Read },
         &root_segments,
@@ -522,6 +524,7 @@ fn recheck_job_paths(
     for entry in entries {
         let segments: Vec<&str> = entry.path.split('/').collect();
         allowed(
+            pm,
             caller,
             if writing { Op::Write } else { Op::Read },
             &segments,
@@ -659,6 +662,7 @@ fn receipt(job: &JobHead, entries: usize) -> Value {
 /// `{op:chunk}`.
 pub fn chunk(
     store: &Store,
+    pm: &Pm,
     state_dir: &Path,
     request: &JobRequest<'_>,
     entry_id: &str,
@@ -677,7 +681,7 @@ pub fn chunk(
     let entry = store
         .wiki_transfer_entry(job_id, entry_id)?
         .ok_or_else(not_found)?;
-    recheck_job_paths(caller, root, std::slice::from_ref(&entry), true)?;
+    recheck_job_paths(pm, caller, root, std::slice::from_ref(&entry), true)?;
     if entry.kind == "dir" {
         return Err(reject(
             "wiki transfer chunk refused: directories have no bytes",
@@ -778,7 +782,7 @@ pub fn apply(
     let entry = store
         .wiki_transfer_entry(job_id, entry_id)?
         .ok_or_else(not_found)?;
-    recheck_job_paths(caller, root, std::slice::from_ref(&entry), true)?;
+    recheck_job_paths(pm, caller, root, std::slice::from_ref(&entry), true)?;
     if job.state != "open"
         || matches!(
             entry.outcome.as_str(),
@@ -1620,7 +1624,7 @@ pub fn finish(
     let root = request.root;
     let job = require_job(store, request)?;
     let entries = store.wiki_transfer_entries(job_id)?;
-    recheck_job_paths(caller, root, &entries, true)?;
+    recheck_job_paths(pm, caller, root, &entries, true)?;
     if entries.iter().any(|entry| entry.outcome == "unresolved") {
         return Err(reject(
             "wiki transfer finish refused: publication is not committed",
@@ -1703,7 +1707,7 @@ pub fn status(
     let root = request.root;
     let job = require_job(store, request)?;
     let entries = store.wiki_transfer_entries(job_id)?;
-    recheck_job_paths(caller, root, &entries, false)?;
+    recheck_job_paths(pm, caller, root, &entries, false)?;
     let start = usize::try_from(offset).unwrap_or(usize::MAX);
     let page = bounded_metadata_page(
         entries
@@ -1881,8 +1885,9 @@ fn indexed_page_rev(state_dir: &Path, path: &str) -> Option<String> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .ok()?;
+    let table = super::index::table_for(path);
     conn.query_row(
-        "SELECT rev FROM wiki_index_chunks WHERE path=?1 LIMIT 1",
+        &format!("SELECT rev FROM {table} WHERE path=?1 LIMIT 1"),
         [path],
         |row| row.get(0),
     )
@@ -1899,6 +1904,7 @@ pub fn export(
     rev: Option<&str>,
     at: Option<&str>,
 ) -> Result<Value> {
+    super::admitted_for_export(pm, caller, path)?;
     let want = bytes.unwrap_or(MAX_CHUNK_BYTES as u64);
     if want == 0 || want > MAX_CHUNK_BYTES as u64 {
         return Err(reject(format!(
@@ -2269,7 +2275,16 @@ mod tests {
             root: "global/box",
         };
         if !bytes.is_empty() || manifest.entries[0].kind != "dir" {
-            chunk(store, state, &request, entry_id, 0, &STANDARD.encode(bytes)).unwrap();
+            chunk(
+                store,
+                pm,
+                state,
+                &request,
+                entry_id,
+                0,
+                &STANDARD.encode(bytes),
+            )
+            .unwrap();
         }
         apply(store, pm, state, &request, entry_id).unwrap()
     }
@@ -2290,7 +2305,16 @@ mod tests {
             job_id: &job_id,
             root: "global/box",
         };
-        chunk(&store, &state, &request, "note", 0, &STANDARD.encode(bytes)).unwrap();
+        chunk(
+            &store,
+            &pm,
+            &state,
+            &request,
+            "note",
+            0,
+            &STANDARD.encode(bytes),
+        )
+        .unwrap();
         let dest = vault_dir(&pm).unwrap().join("global/box/note.txt");
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
         fs::write(&dest, bytes).unwrap();
@@ -2344,7 +2368,16 @@ mod tests {
             job_id: &job_id,
             root: "global/box",
         };
-        chunk(&store, &state, &request, "note", 0, &STANDARD.encode(bytes)).unwrap();
+        chunk(
+            &store,
+            &pm,
+            &state,
+            &request,
+            "note",
+            0,
+            &STANDARD.encode(bytes),
+        )
+        .unwrap();
         let dest = vault_dir(&pm).unwrap().join("global/box/note.txt");
         fs::write(&dest, bytes).unwrap();
         let head = head_commit(&pm);
@@ -2418,7 +2451,16 @@ mod tests {
             job_id: &job_id,
             root: "global/box",
         };
-        chunk(&store, &state, &request, "file", 0, &STANDARD.encode(bytes)).unwrap();
+        chunk(
+            &store,
+            &pm,
+            &state,
+            &request,
+            "file",
+            0,
+            &STANDARD.encode(bytes),
+        )
+        .unwrap();
         let vault = vault_dir(&pm).unwrap();
         let blob = blobs_dir(&vault).join(&hash);
         fs::create_dir_all(blob.parent().unwrap()).unwrap();
@@ -2512,7 +2554,16 @@ mod tests {
             job_id: &job_id,
             root: "global/box",
         };
-        chunk(store, state, &request, entry_id, 0, &STANDARD.encode(bytes)).unwrap();
+        chunk(
+            store,
+            pm,
+            state,
+            &request,
+            entry_id,
+            0,
+            &STANDARD.encode(bytes),
+        )
+        .unwrap();
         apply(store, pm, state, &request, entry_id).unwrap()
     }
 
@@ -2736,7 +2787,16 @@ mod tests {
             job_id: &job_id,
             root: "global/box",
         };
-        chunk(&store, &state, &request, "note", 0, &STANDARD.encode(bytes)).unwrap();
+        chunk(
+            &store,
+            &pm,
+            &state,
+            &request,
+            "note",
+            0,
+            &STANDARD.encode(bytes),
+        )
+        .unwrap();
         let dest = vault_dir(&pm).unwrap().join("global/box/note.txt");
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
         fs::write(&dest, bytes).unwrap();
@@ -2790,7 +2850,16 @@ mod tests {
             job_id: &job_id,
             root: "global/box",
         };
-        chunk(&store, &state, &request, "note", 0, &STANDARD.encode(bytes)).unwrap();
+        chunk(
+            &store,
+            &pm,
+            &state,
+            &request,
+            "note",
+            0,
+            &STANDARD.encode(bytes),
+        )
+        .unwrap();
         let entry = store.wiki_transfer_entry(&job_id, "note").unwrap().unwrap();
         super::note_attempt(&store, &job_id, &entry).unwrap();
         let head = head_commit(&pm);
@@ -3055,7 +3124,16 @@ mod tests {
                 job_id: &job_id,
                 root: "global/box",
             };
-            chunk(&store, &state, &request, "file", 0, &STANDARD.encode(bytes)).unwrap();
+            chunk(
+                &store,
+                &pm,
+                &state,
+                &request,
+                "file",
+                0,
+                &STANDARD.encode(bytes),
+            )
+            .unwrap();
             let before = committed_bytes(&pm, &sidecar);
             let head = head_commit(&pm);
             let body = apply(&store, &pm, &state, &request, "file").unwrap();

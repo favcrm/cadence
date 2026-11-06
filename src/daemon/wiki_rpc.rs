@@ -201,7 +201,7 @@ impl Shared {
         for (path, op) in paths {
             let norm = wiki::normalize(path)?;
             let segs: Vec<&str> = norm.split('/').collect();
-            wiki::allowed(caller, *op, &segs)?;
+            wiki::allowed(&pm, caller, *op, &segs)?;
             if !resource.is_empty() {
                 resource.push_str(" -> ");
             }
@@ -819,6 +819,7 @@ impl Shared {
             .ok_or_else(|| Error::rejected("wiki transfer chunk refused: offset is required"))?;
         wiki::transfer::chunk(
             &self.store,
+            &crate::issue::Pm::at(&self.pm_dir()?)?,
             &self.state_dir,
             &wiki::transfer::JobRequest {
                 caller,

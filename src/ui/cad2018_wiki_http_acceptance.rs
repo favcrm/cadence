@@ -15,6 +15,7 @@ const KID: &str = "cad2018-synthetic-key";
 
 struct Rig {
     _dir: tempfile::TempDir,
+    pm: std::path::PathBuf,
     board_port: u16,
     public_host: String,
     issuer: String,
@@ -151,6 +152,7 @@ fn start() -> Rig {
     assert!(board_port > 0, "synthetic board could not bind");
     Rig {
         _dir: dir,
+        pm,
         board_port,
         public_host,
         issuer,
@@ -357,4 +359,109 @@ fn signed_public_owner_restores_through_http_and_member_is_refused() {
     assert_eq!(read.status().as_u16(), 200);
     let read: Value = read.body_mut().read_json().unwrap();
     assert_eq!(read["text"], "synthetic retained text");
+}
+
+/// CAD-2187, through the real board: a page under a private project is refused
+/// to a member who is not granted it, answered as a missing page, while the
+/// granted member and `global/` are served. Every layer is real — signed
+/// session, board route, daemon RPC, project policy, wiki store.
+#[test]
+fn a_private_project_page_is_refused_through_http_and_its_grant_reads_it() {
+    let rig = start();
+    let owner = session(&rig, "owner", "owner");
+    let mia = session(&rig, "mia", "member");
+    let rob = session(&rig, "rob", "member");
+
+    // The project exists without a policy first: a workspace-visible project is
+    // what a board member may write to, which is how one becomes private later.
+    let project = rig.pm.join("secret");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("project.yaml"), "key: secret\nprefix: SEC\n").unwrap();
+    for (path, text) in [
+        ("projects/secret/notes.md", "the secret theodolite"),
+        ("global/shared.md", "the shared theodolite"),
+    ] {
+        let created = put(
+            &rig,
+            "/api/wiki/file",
+            &owner,
+            &json!({"path": path, "text": text}),
+        );
+        if created.status().as_u16() != 200 {
+            let mut created = created;
+            let body = created.body_mut().read_to_string().unwrap();
+            panic!("{path} was not created: {} {body}", created.status());
+        }
+    }
+
+    // Now it is private, and `mia` is the only grant.
+    std::fs::write(
+        project.join("project.yaml"),
+        "key: secret\nprefix: SEC\npolicy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
+    )
+    .unwrap();
+
+    let read =
+        |cookie: &str, path: &str| get(&rig, &format!("/api/wiki/file?path={path}"), Some(cookie));
+    let denied = read(&rob, "projects/secret/notes.md");
+    assert_eq!(
+        denied.status().as_u16(),
+        400,
+        "a stranger read the private page"
+    );
+    let mut denied = denied;
+    let body = denied.body_mut().read_to_string().unwrap();
+    assert!(
+        body.contains("no such file"),
+        "the refusal was not a missing page: {body}"
+    );
+
+    assert_eq!(
+        read(&mia, "projects/secret/notes.md").status().as_u16(),
+        200,
+        "the grant could not read her project's page"
+    );
+    assert_eq!(
+        read(&rob, "global/shared.md").status().as_u16(),
+        200,
+        "a policy emptied global/"
+    );
+
+    // A listing answers the missing-directory wording, not a second oracle.
+    let listed = get(&rig, "/api/wiki/ls?path=projects/secret", Some(&rob));
+    assert_eq!(
+        listed.status().as_u16(),
+        400,
+        "a stranger listed the private project"
+    );
+    let mut listed = listed;
+    let body = listed.body_mut().read_to_string().unwrap();
+    assert!(body.contains("no such directory"), "{body}");
+
+    // Search does not return the private page to a stranger, and does to its grant.
+    let search = |cookie: &str| {
+        let mut response = get(&rig, "/api/wiki/search?q=theodolite", Some(cookie));
+        let body: Value = response.body_mut().read_json().unwrap();
+        body["matches"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|m| m["path"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+    };
+    let theirs = search(&mia);
+    assert!(
+        theirs.iter().any(|p| p.contains("projects/secret")),
+        "{theirs:?}"
+    );
+    let strangers = search(&rob);
+    assert!(
+        !strangers.iter().any(|p| p.contains("projects/secret")),
+        "{strangers:?}"
+    );
+    assert!(
+        strangers.iter().any(|p| p.contains("global/shared")),
+        "{strangers:?}"
+    );
 }

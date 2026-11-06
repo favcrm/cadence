@@ -20,8 +20,62 @@ use crate::issue::Pm;
 
 // v2 rebuilds indexes created before committed Git objects became the
 // source of the indexed text (v1 read the mutable worktree).
-const SCHEMA: &str = "wiki-fts-v2";
+const SCHEMA: &str = "wiki-fts-v3";
+
+/// The FTS table for paths that name no project (`global/`, `users/`, `agents/`).
+const INDEX_GLOBAL: &str = "wiki_index_global";
 const CHUNK_BYTES: usize = 4096;
+
+/// One FTS table per project, plus one for everything that names no project.
+///
+/// CAD-2187: `bm25` scores with statistics that belong to the table it reads,
+/// so a shared table makes a private page part of the corpus that ranks
+/// everyone else's. Partitioning by project gives each caller exactly the
+/// corpus they may read; the cost is that a score no longer means the same
+/// thing across projects, which is the honest reading of "search inside a
+/// project" anyway.
+pub(super) fn table_for(path: &str) -> String {
+    match super::project_of_path(path) {
+        Some(key) => format!("wiki_index_p_{}", hex_of(key)),
+        None => INDEX_GLOBAL.to_string(),
+    }
+}
+
+/// A table name suffix. Hex, not the key itself: a project key is user data,
+/// and a table name is interpolated into SQL.
+fn hex_of(text: &str) -> String {
+    text.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Every chunk table currently in the database.
+fn chunk_tables(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            // The virtual tables only: an FTS5 table's shadow tables share its
+            // prefix, and dropping the virtual table already drops them — a
+            // second drop would fail the rebuild.
+            "SELECT name FROM sqlite_master WHERE type='table'
+             AND sql LIKE 'CREATE VIRTUAL TABLE%'
+             AND (name = ?1 OR name LIKE 'wiki_index_p_%')",
+        )
+        .map_err(db_error)?;
+    let names = stmt
+        .query_map([INDEX_GLOBAL], |row| row.get::<_, String>(0))
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?;
+    Ok(names)
+}
+
+fn create_chunks(conn: &Connection, table: &str) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE {table} USING fts5(
+             path UNINDEXED, title, heading, body, line UNINDEXED,
+             rev UNINDEXED, source UNINDEXED, tokenize='unicode61 remove_diacritics 2'
+         );"
+    ))
+    .map_err(db_error)
+}
 
 fn db_error(error: rusqlite::Error) -> Error {
     Error::internal(format!("wiki index: {error}"))
@@ -42,22 +96,34 @@ fn open(state_dir: &Path) -> Result<Connection> {
         "CREATE TABLE IF NOT EXISTS wiki_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )
     .map_err(db_error)?;
-    let chunks_exist: bool = conn
+    // The v2 index kept every page in one table, which is what made a private
+    // page part of the corpus that ranks everyone else's. It is derived data:
+    // drop it and let the next refresh rebuild into the partitioned tables.
+    let legacy: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='wiki_index_chunks')",
             [],
             |row| row.get(0),
         )
         .map_err(db_error)?;
-    if !chunks_exist {
+    if legacy {
         conn.execute_batch(
-            "DELETE FROM wiki_index_meta WHERE key IN ('revision','schema');
-             CREATE VIRTUAL TABLE wiki_index_chunks USING fts5(
-             path UNINDEXED, title, heading, body, line UNINDEXED,
-             rev UNINDEXED, source UNINDEXED, tokenize='unicode61 remove_diacritics 2'
-         );",
+            "DROP TABLE wiki_index_chunks;
+             DELETE FROM wiki_index_meta WHERE key IN ('revision','schema');",
         )
         .map_err(db_error)?;
+    }
+    let global_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [INDEX_GLOBAL],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !global_exists {
+        conn.execute_batch("DELETE FROM wiki_index_meta WHERE key IN ('revision','schema');")
+            .map_err(db_error)?;
+        create_chunks(&conn, INDEX_GLOBAL)?;
     }
     let check: String = conn
         .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
@@ -89,8 +155,8 @@ fn open_status(state_dir: &Path) -> Result<Option<Connection>> {
     }
     let chunks_exist: bool = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='wiki_index_chunks')",
-            [],
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [INDEX_GLOBAL],
             |row| row.get(0),
         )
         .map_err(db_error)?;
@@ -389,18 +455,29 @@ struct Scan {
     skipped: usize,
 }
 
+/// One row of a chunk table, before it is written.
+struct Chunk {
+    path: String,
+    title: String,
+    heading: String,
+    body: String,
+    line: i64,
+    rev: String,
+    source: String,
+}
+
 fn rebuild(conn: &mut Connection, pm: &Pm, vault: &Path, source: &Source) -> Result<Scan> {
     let started = Instant::now();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error)?;
-    tx.execute("DELETE FROM wiki_index_chunks", [])
-        .map_err(db_error)?;
+    // Rows are grouped per project so each table holds exactly one project's
+    // corpus. The tables are rebuilt, not patched: a project that lost its last
+    // page must not leave its statistics behind.
+    let mut rows: std::collections::BTreeMap<String, Vec<Chunk>> =
+        std::collections::BTreeMap::new();
     let mut scan = Scan::default();
     {
-        let mut insert = tx
-            .prepare("INSERT INTO wiki_index_chunks(path,title,heading,body,line,rev,source) VALUES (?1,?2,?3,?4,?5,?6,?7)")
-            .map_err(db_error)?;
         let entries = match source {
             Source::Tree(tree) => tracked_entries(pm, tree)?,
             Source::Untracked => pages(vault)?
@@ -460,23 +537,50 @@ fn rebuild(conn: &mut Connection, pm: &Pm, vault: &Path, source: &Source) -> Res
                 .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(&path));
             let page_source = path.strip_suffix(".extracted.md").unwrap_or(&path);
             for (line, heading, body) in chunks(&text) {
-                insert
-                    .execute(params![
-                        path,
-                        title,
-                        heading,
-                        body,
-                        line as i64,
-                        rev,
-                        page_source
-                    ])
-                    .map_err(db_error)?;
+                rows.entry(table_for(&path)).or_default().push(Chunk {
+                    path: path.clone(),
+                    title: title.to_string(),
+                    heading,
+                    body,
+                    line: line as i64,
+                    rev: rev.clone(),
+                    source: page_source.to_string(),
+                });
                 scan.chunks += 1;
             }
         }
     }
-    // Rows + revision commit atomically: a reader on another connection
-    // sees either the old complete snapshot or this one — never half.
+    // Replace the tables inside the same transaction, so a reader on another
+    // connection sees either the old complete snapshot or this one — never
+    // half, and never a table that belongs to nobody.
+    for table in chunk_tables(&tx)? {
+        tx.execute_batch(&format!("DROP TABLE {table};"))
+            .map_err(db_error)?;
+    }
+    for (table, rows) in &rows {
+        create_chunks(&tx, table)?;
+        let mut insert = tx
+            .prepare(&format!(
+                "INSERT INTO {table}(path,title,heading,body,line,rev,source) VALUES (?1,?2,?3,?4,?5,?6,?7)"
+            ))
+            .map_err(db_error)?;
+        for chunk in rows {
+            insert
+                .execute(params![
+                    chunk.path,
+                    chunk.title,
+                    chunk.heading,
+                    chunk.body,
+                    chunk.line,
+                    chunk.rev,
+                    chunk.source
+                ])
+                .map_err(db_error)?;
+        }
+    }
+    if !rows.contains_key(INDEX_GLOBAL) {
+        create_chunks(&tx, INDEX_GLOBAL)?;
+    }
     meta_put(&tx, "revision", source.value())?;
     meta_put(&tx, "schema", SCHEMA)?;
     meta_put(&tx, "last_refresh_at", &format!("{:.3}", epoch_now()))?;
@@ -895,7 +999,7 @@ fn search_with_hook(
     } else {
         norm.split('/').collect::<Vec<_>>()
     };
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     let expression = query_terms(q)?;
     let vault = vault_dir(pm)?;
     // A write may commit between the first freshness check and the
@@ -911,7 +1015,7 @@ fn search_with_hook(
         // Read metadata first to establish the SQLite snapshot before
         // any concurrent index commit can land.
         let indexed = stored_meta(&tx);
-        let matches = search_from_connection(&tx, caller, &norm, &expression)?;
+        let matches = search_from_connection(&tx, pm, caller, &norm, &expression)?;
         after_hits();
         let after = source_revision(pm, &vault)?;
         let current = matches!(after, Source::Untracked)
@@ -931,54 +1035,171 @@ fn search_with_hook(
 
 fn search_from_connection(
     conn: &Connection,
+    pm: &Pm,
     caller: &Caller,
     norm: &str,
     expression: &str,
 ) -> Result<Vec<Value>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT path,line,rev,heading,source,
-                    snippet(wiki_index_chunks,3,'','','…',32),
-                    bm25(wiki_index_chunks,0.0,6.0,3.0,1.0)
-             FROM wiki_index_chunks WHERE wiki_index_chunks MATCH ?1
-             ORDER BY 7, path, line",
-        )
-        .map_err(db_error)?;
-    let rows = stmt
-        .query_map([expression], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, f64>(6)?,
-            ))
-        })
-        .map_err(db_error)?;
+    // CAD-2187: authorization runs before ranking. Each project has its own
+    // table, so a query scores only the corpus it may read — the alternative
+    // (one table plus a `WHERE`) removes private rows from the result but not
+    // from the statistics `bm25` scores with, which is an observable channel.
+    let readable: Vec<String> =
+        crate::project_policy::readable(pm, &super::policy_spelling(caller))
+            .into_iter()
+            .collect();
+    let existing = chunk_tables(conn)?;
+    let mut tables: Vec<String> = vec![INDEX_GLOBAL.to_string()];
+    for key in &readable {
+        let table = table_for(&format!("projects/{key}"));
+        if existing.contains(&table) {
+            tables.push(table);
+        }
+    }
     let mut matches = Vec::new();
-    for row in rows {
-        let (path, line, rev, heading, source, snippet, score) = row.map_err(db_error)?;
+    for table in tables {
+        let sql = format!(
+            "SELECT path,line,rev,heading,source,
+                    snippet({table},3,'','','…',32),
+                    bm25({table},0.0,6.0,3.0,1.0)
+             FROM {table} WHERE {table} MATCH ?1
+             ORDER BY 7, path, line"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(db_error)?;
+        let rows = stmt
+            .query_map([expression], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, f64>(6)?,
+                ))
+            })
+            .map_err(db_error)?;
+        let mut found = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        matches.append(&mut found);
+    }
+    // Scores come from different corpora, so they order within a project and
+    // not across one: the tie-break is the path, which is stable and readable.
+    matches.sort_by(|a, b| {
+        a.6.partial_cmp(&b.6)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    let mut out = Vec::new();
+    for (path, line, rev, heading, source, snippet, score) in matches {
         if !norm.is_empty() && path != norm && !path.starts_with(&format!("{norm}/")) {
             continue;
         }
+        // The table already bounds the corpus by project; the coarse table
+        // still decides `users/` and `agents/` — and re-checking costs nothing.
         let rel = path.split('/').collect::<Vec<_>>();
-        if allowed(caller, Op::Read, &rel).is_err() {
+        if !super::allowed_by_table(caller, Op::Read, &rel).is_ok() {
             continue;
         }
-        matches.push(json!({"path":path,"line":line,"text":snippet.trim(),
-                            "heading":heading,"rev":rev,"source":source,"score":-score}));
-        if matches.len() >= SEARCH_CAP {
+        out.push(json!({"path":path,"line":line,"text":snippet.trim(),
+                        "heading":heading,"rev":rev,"source":source,"score":-score}));
+        if out.len() >= SEARCH_CAP {
             break;
         }
     }
-    Ok(matches)
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CAD-2187: a private project's pages are not in a caller's results, and
+    /// the filter is a literal project prefix rather than a pattern — a key
+    /// containing `_` must not admit `axb` when the caller may read `a_b`.
+    #[test]
+    fn search_returns_only_the_projects_the_caller_may_read() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = Pm::init(&root.path().join("pm")).unwrap();
+        for (key, policy) in [
+            (
+                "secret",
+                "policy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
+            ),
+            (
+                "a_b",
+                "policy:\n  version: 3\n  visibility: private\n  members:\n  - users/rob\n",
+            ),
+            (
+                "axb",
+                "policy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
+            ),
+        ] {
+            let dir = pm.dir.join(key);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("project.yaml"),
+                format!("key: {key}\nprefix: {}\n{policy}", key.to_uppercase()),
+            )
+            .unwrap();
+        }
+        for path in [
+            "projects/secret/theodolite.md",
+            "projects/a_b/theodolite.md",
+            "projects/axb/theodolite.md",
+            "global/theodolite.md",
+        ] {
+            super::super::write(&pm, &Caller::Operator, path, "# Page\ntheodolite\n", None)
+                .unwrap();
+        }
+        let state = root.path().join("state");
+        let paths = |caller: &Caller| -> Vec<String> {
+            let found = search_with_hook(&pm, &state, caller, "theodolite", "", || {}).unwrap();
+            found["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["path"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // The grant reads its project; a stranger reads neither it nor the
+        // project whose key merely resembles it.
+        let mia = Caller::User("mia".to_string());
+        let rob = Caller::User("rob".to_string());
+        let theirs = paths(&mia);
+        assert!(
+            theirs.iter().any(|p| p.starts_with("projects/secret/")),
+            "{theirs:?}"
+        );
+        assert!(
+            theirs.iter().any(|p| p.starts_with("projects/axb/")),
+            "{theirs:?}"
+        );
+        assert!(
+            !theirs.iter().any(|p| p.starts_with("projects/a_b/")),
+            "{theirs:?}"
+        );
+        let mine = paths(&rob);
+        assert!(
+            mine.iter().any(|p| p.starts_with("projects/a_b/")),
+            "{mine:?}"
+        );
+        assert!(
+            !mine.iter().any(|p| p.starts_with("projects/secret/")),
+            "{mine:?}"
+        );
+        assert!(
+            !mine.iter().any(|p| p.starts_with("projects/axb/")),
+            "{mine:?}"
+        );
+        // `global/` has no project, so every caller still searches it.
+        for found in [&theirs, &mine] {
+            assert!(found.iter().any(|p| p.starts_with("global/")), "{found:?}");
+        }
+    }
 
     #[test]
     fn search_retries_when_a_removal_commits_after_hits_are_read() {

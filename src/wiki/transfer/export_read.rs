@@ -206,7 +206,7 @@ fn locate(pm: &Pm, caller: &Caller, path: &str) -> Result<Located> {
         return Err(reject("wiki read '' refused: the root is a directory"));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     match classify(&segs) {
         View::Profile { alias } => {
             if segs.len() != 4 {

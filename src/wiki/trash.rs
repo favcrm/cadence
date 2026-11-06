@@ -84,7 +84,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde_json::{json, Value};
 
-use super::{allowed, git_rel, normalize, vault_dir, Caller, Op, DEPTH_CAP};
+use super::{git_rel, normalize, vault_dir, Caller, Op, DEPTH_CAP};
 use crate::error::{Error, Result};
 use crate::issue::Pm;
 
@@ -1294,7 +1294,7 @@ fn landing_row(
         let segs: Vec<&str> = logical.split('/').collect();
         let path_ok = normalize(logical).is_ok_and(|norm| norm == logical)
             && !logical.is_empty()
-            && allowed(&Caller::Operator, Op::Write, &segs).is_ok();
+            && super::allowed_by_table(&Caller::Operator, Op::Write, &segs).is_ok();
         if !path_ok {
             reason = Some(UNSAFE_ORIGIN);
         }
