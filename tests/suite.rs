@@ -7294,7 +7294,7 @@ mod cad2009_hosted_app_acceptance {
 
         #[test]
         fn cli_cancels_and_releases_only_a_merged_managed_lane() {
-            for merged in [true, false] {
+            for (merged, proved) in [(true, true), (false, true), (true, false)] {
                 let fx = Fixture::new();
                 let repo = fx.root.path().join("repo");
                 fs::create_dir(&repo).unwrap();
@@ -7354,16 +7354,17 @@ mod cad2009_hosted_app_acceptance {
                 lifecycle::activate(&repo, record).unwrap();
 
                 let mut attempts = serde_json::Map::new();
-                attempts.insert(
-                    "CAD-1\u{1}start\u{1}-".into(),
-                    json!({
-                        "operation_id": "op_test", "issue_id": "CAD-1", "action": "start",
-                        "target": null, "assignment_id": "hla_test", "generation": 1,
-                        "claim_id": "hlc_test", "state": "running", "fenced": false,
-                        "reassign_operation_id": null, "worktree": lane, "lane": "test",
-                        "lane_claim": "hlc_test", "lane_generation": 1
-                    }),
-                );
+                let mut attempt = json!({
+                    "operation_id": "op_test", "issue_id": "CAD-1", "action": "start",
+                    "target": null, "assignment_id": "hla_test", "generation": 1,
+                    "claim_id": "hlc_test", "state": "running", "fenced": false,
+                    "reassign_operation_id": null, "worktree": lane, "lane": "test",
+                    "lane_claim": "hlc_test", "lane_generation": 1
+                });
+                if proved {
+                    attempt["handoff"] = json!({"claim_id": "hlc_test", "generation": 1});
+                }
+                attempts.insert("CAD-1\u{1}start\u{1}-".into(), attempt);
                 let ledger = fx.root.path().join(format!(
                     "config/cadence/remote-auth/local-assign-{WORKSPACE}.json"
                 ));
@@ -7472,7 +7473,7 @@ mod cad2009_hosted_app_acceptance {
                     ]);
                 let output = bounded_output(&mut command);
                 server.join().unwrap();
-                if merged {
+                if proved && merged {
                     assert!(
                         output.status.success(),
                         "{}",
@@ -7487,7 +7488,7 @@ mod cad2009_hosted_app_acceptance {
                     let record = lifecycle::managed_record(&repo, &lane).unwrap().unwrap();
                     assert_eq!(record.issue.as_deref(), Some("CAD-1"));
                     assert_eq!(record.state, "released");
-                } else {
+                } else if proved {
                     assert!(!output.status.success());
                     let error = String::from_utf8_lossy(&output.stderr);
                     assert!(error.contains("was cancelled") && error.contains("not shown merged"));
@@ -7495,6 +7496,16 @@ mod cad2009_hosted_app_acceptance {
                     assert_eq!(git(&repo, &["rev-parse", "cadence/test"]), tip);
                     let record = lifecycle::managed_record(&repo, &lane).unwrap().unwrap();
                     assert_eq!(record.issue, None);
+                    assert_eq!(record.state, "active");
+                } else {
+                    // A merged lane is still kept when the claim's history
+                    // cannot prove that no actor ever received it.
+                    assert!(!output.status.success());
+                    let error = String::from_utf8_lossy(&output.stderr);
+                    assert!(error.contains("was cancelled") && error.contains("cannot prove"));
+                    assert!(lane.is_dir());
+                    assert_eq!(git(&repo, &["rev-parse", "cadence/test"]), tip);
+                    let record = lifecycle::managed_record(&repo, &lane).unwrap().unwrap();
                     assert_eq!(record.state, "active");
                 }
             }

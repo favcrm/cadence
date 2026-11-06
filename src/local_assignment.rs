@@ -141,6 +141,10 @@ struct Attempt {
     /// that has never heard of the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_profile: Option<String>,
+    /// Claim-scoped provenance for automatic release. Omitted on legacy rows,
+    /// which an older client interprets as a fence it cannot run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff: Option<Handoff>,
 }
 
 /// Binding as it was when a fresh cancellation reserved its safety marker.
@@ -205,6 +209,20 @@ struct Origin {
     lane: Option<String>,
     #[serde(default)]
     settled: bool,
+}
+
+/// What this client knows about whether a claim was ever handed to an actor.
+/// Written when the claim is taken, before any lane or kickoff, so its absence
+/// is unknown history — never proof that nobody could act.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Handoff {
+    claim_id: String,
+    generation: u64,
+    /// An external session/profile claim can act without this ledger's
+    /// kickoff message, so it never supports automatic release.
+    #[serde(default, skip_serializing_if = "is_false")]
+    external: bool,
 }
 
 /// A distinct create request that the board coalesced into another assignment.
@@ -275,6 +293,38 @@ fn unbound_provisional(attempt: &Attempt) -> bool {
         && attempt.origin_claim_id.is_none()
         && attempt.origin_generation.is_none()
         && attempt.session_profile.is_none()
+}
+
+/// True only when this ledger's own protocol provably never handed the claim
+/// to an actor: a local-agent claim written by this client, no kickoff reserved
+/// or delivered, no origin for that claim, and a marker bound to the claim the
+/// lane was opened under. Legacy, external and unrecorded history is never
+/// proof. The marker is a client-protocol fact, not process containment: an
+/// external writer, another ledger or an older client can still hold authority.
+fn no_actor_handoff(attempt: &Attempt, origins: &BTreeMap<String, Origin>) -> bool {
+    let (Some(handoff), Some(lane_claim), Some(lane_generation)) = (
+        attempt.handoff.as_ref(),
+        attempt.lane_claim.as_deref(),
+        attempt.lane_generation,
+    ) else {
+        return false;
+    };
+    if handoff.external || handoff.claim_id != lane_claim || handoff.generation != lane_generation {
+        return false;
+    }
+    if attempt.kickoff_reserved.is_some()
+        || attempt.kickoff_message.is_some()
+        || attempt.origin_claim_id.is_some()
+        || attempt.origin_generation.is_some()
+    {
+        return false;
+    }
+    let assignment = attempt.assignment_id.as_deref();
+    !origins.values().any(|origin| {
+        Some(origin.assignment_id.as_str()) == assignment
+            && origin.claim_id == handoff.claim_id
+            && origin.generation == handoff.generation
+    })
 }
 
 /// Collapse equivalent custody rows without discarding distinct create receipts.
@@ -348,9 +398,28 @@ fn normalize_assignment_rows(ledger: &mut Ledger, assignment: &str) -> Result<()
     for (key, alias) in aliases {
         ledger.create_aliases.insert(key, alias);
     }
+    // Duplicate rows may disagree about provenance — an older writer of the
+    // same claim could have delivered without recording it. Keep a proof only
+    // when every row carries the same one.
+    let mut handoff: Option<Option<Handoff>> = None;
+    for attempt in ledger
+        .attempts
+        .values()
+        .filter(|attempt| attempt.assignment_id.as_deref() == Some(assignment))
+    {
+        match &handoff {
+            None => handoff = Some(attempt.handoff.clone()),
+            Some(known) if known == &attempt.handoff => {}
+            Some(_) => handoff = Some(None),
+        }
+    }
+    let merged = handoff.flatten();
     ledger.attempts.retain(|key, attempt| {
         key == &keep || attempt.assignment_id.as_deref() != Some(assignment)
     });
+    if let Some(attempt) = ledger.attempts.get_mut(&keep) {
+        attempt.handoff = merged;
+    }
     Ok(())
 }
 
@@ -1280,6 +1349,7 @@ impl<H: CoordHttp> Coordinator<H> {
                         origin_claim_id: None,
                         origin_generation: None,
                         session_profile: None,
+                        handoff: None,
                     })
                     .operation_id
                     .clone()
@@ -1615,11 +1685,26 @@ impl<H: CoordHttp> Coordinator<H> {
                     origin_claim_id: None,
                     origin_generation: None,
                     session_profile: None,
+                    handoff: None,
                 };
                 stamp(&mut attempt, &claimed);
                 ledger
                     .attempts
                     .insert(format!("discovered:{}", claimed.assignment_id), attempt);
+            }
+            let claim = claimed.claim_id.as_deref().ok_or_else(|| {
+                Error::rejected("the claim has no id; provenance was not recorded")
+            })?;
+            for attempt in ledger.attempts.values_mut() {
+                if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
+                    && attempt.claim_id.as_deref() == Some(claim)
+                {
+                    attempt.handoff = Some(Handoff {
+                        claim_id: claim.to_string(),
+                        generation: claimed.generation,
+                        external: profile.is_some(),
+                    });
+                }
             }
             Ok(())
         })
@@ -1671,6 +1756,7 @@ impl<H: CoordHttp> Coordinator<H> {
                 origin_claim_id: None,
                 origin_generation: None,
                 session_profile: None,
+                handoff: None,
             };
             stamp(&mut attempt, assignment);
             ledger

@@ -589,6 +589,17 @@ current clients using the same local ledger; neither the lock nor the marker
 stops an actor, an older command already in flight, or a client using a
 different ledger.
 
+Automatic release of a guarded lane also requires **provenance**: the claim must
+have been taken by this client's local-agent protocol and the ledger must record
+no kickoff reserved or delivered for that claim generation. Current clients write
+that claim-scoped record when they take the claim. Legacy rows, external
+`--profile` sessions and any claim with a recorded kickoff are unknown history:
+the client refuses to delete the lane, keeps the guard, and names the manual
+removal commands. Provenance covers this ledger's own protocol only — an external
+writer, another machine's ledger or an older client that already acted remains
+unknown, so establish that no actor is still using the lane before any manual
+removal.
+
 The board may coalesce different create actions for the same issue and target
 into one assignment. The client keeps each create operation's retry key while
 sharing a single custody record. When such additional receipts are present,
@@ -596,9 +607,18 @@ older clients also refuse that ledger; use a current client rather than deleting
 the receipts or downgrading. They are retired with the ended assignment when
 new work is started.
 
-If the path was never recorded, automatic release and marker reconciliation are
-unavailable: preserve the ledger and inspect the repository's worktrees rather
-than guessing which checkout belongs to the assignment.
+A cancellation that interrupts lane reservation before the worktree path was
+recorded can be reconciled only with that provenance and only when the expected
+checkout path — derived from the recorded repository and lane name — is absent
+and no longer registered with Git:
+
+```sh
+cadence --org <name> agent reconcile-release <assignment-id>
+```
+
+`reconcile-release` deletes nothing and verifies no merge evidence. Without
+provenance, or when the ledger records no repository, it refuses and the guard
+stays; only manual inspection applies.
 
 When a cancellation's outcome is unknown, inspect the named assignment and
 original operation before deciding whether to retry; do not assume it failed.

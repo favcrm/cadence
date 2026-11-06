@@ -135,6 +135,20 @@ fn release_bound<H: CoordHttp>(
             lane.unfinished.as_deref().unwrap_or("<assignment>")
         )));
     }
+    if lane
+        .guarded
+        .as_ref()
+        .is_some_and(|guard| !guard.handoff_proven)
+    {
+        return Err(Error::rejected(format!(
+            "Hosted issue finish did not release the lane for {issue}; this client cannot prove \
+             that the cancelled assignment never handed control to an actor. Cancellation only \
+             fences the board claim, so an actor, an external session or an older client may \
+             still be using the lane. Nothing was removed. Inspect the actor and the worktree \
+             yourself; only then remove it with `git worktree remove <path>` and \
+             `git branch -d <branch>` (`-D` for a squash-merged branch, after verifying the merge)"
+        )));
+    }
     let _assignment_locks = lane
         .assignments
         .iter()
@@ -185,63 +199,111 @@ pub fn reconcile_absent_guard<H: CoordHttp>(
     assignment: &str,
 ) -> Result<Value> {
     coordinator.with_ledger(|ledger| {
-        let mut rows = ledger
+        let keys: Vec<String> = ledger
             .attempts
-            .values_mut()
-            .filter(|attempt| attempt.assignment_id.as_deref() == Some(assignment));
-        let Some(attempt) = rows.next() else {
-            return Err(Error::rejected("the assignment has no local lane record"));
+            .iter()
+            .filter(|(_, attempt)| attempt.assignment_id.as_deref() == Some(assignment))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let [key] = keys.as_slice() else {
+            return Err(Error::rejected(if keys.is_empty() {
+                "the assignment has no local lane record"
+            } else {
+                "the assignment does not have one confirmed terminal lane guard"
+            }));
         };
-        if rows.next().is_some()
-            || !attempt.retired_lane_guard
-            || !attempt_ended(&attempt.state)
-            || attempt.reassign_operation_id.is_some()
-            || attempt.reassign_fingerprint.is_some()
-            || attempt.reassign_expected_generation.is_some()
-        {
+        let proved = {
+            let attempt = ledger
+                .attempts
+                .get(key)
+                .ok_or_else(|| Error::rejected("the assignment record disappeared"))?;
+            if !attempt.retired_lane_guard
+                || !attempt_ended(&attempt.state)
+                || attempt.reassign_operation_id.is_some()
+                || attempt.reassign_fingerprint.is_some()
+                || attempt.reassign_expected_generation.is_some()
+            {
+                return Err(Error::rejected(
+                    "the assignment does not have one confirmed terminal lane guard",
+                ));
+            }
+            let (Some(_), Some(lane_claim), Some(lane_generation)) = (
+                attempt.lane.as_deref(),
+                attempt.lane_claim.as_deref(),
+                attempt.lane_generation,
+            ) else {
+                return Err(Error::rejected("the recorded lane binding is incomplete"));
+            };
+            let current_binding = attempt.claim_id.as_deref() == Some(lane_claim)
+                && attempt.generation == Some(lane_generation);
+            let cancelled_binding = attempt.state == "cancelled"
+                && attempt.fenced
+                && attempt.claim_id.is_none()
+                && lane_generation.checked_add(1) == attempt.generation;
+            if !(current_binding || cancelled_binding) {
+                return Err(Error::rejected("the recorded lane binding is inconsistent"));
+            }
+            no_actor_handoff(attempt, &ledger.origins)
+        };
+        if !proved {
             return Err(Error::rejected(
-                "the assignment does not have one confirmed terminal lane guard",
+                "this client cannot prove that the cancelled assignment never handed control to \
+                 an actor; cancellation only fences the board claim. The guard is kept. Inspect \
+                 the actor and the worktree yourself; only then remove the lane with \
+                 `git worktree remove <path>` and `git branch -d <branch>` (`-D` for a \
+                 squash-merged branch, after verifying the merge)",
             ));
         }
-        let (Some(worktree), Some(lane), Some(lane_claim), Some(lane_generation)) = (
-            attempt.worktree.as_deref(),
-            attempt.lane.as_deref(),
-            attempt.lane_claim.as_deref(),
-            attempt.lane_generation,
-        ) else {
-            return Err(Error::rejected("the recorded lane binding is incomplete"));
+        let attempt = ledger
+            .attempts
+            .get_mut(key)
+            .ok_or_else(|| Error::rejected("the assignment record disappeared"))?;
+        let lane = attempt
+            .lane
+            .clone()
+            .ok_or_else(|| Error::rejected("the recorded lane binding is incomplete"))?;
+        let (root, path) = match attempt.worktree.as_deref() {
+            Some(worktree) => {
+                let path = Path::new(worktree).to_path_buf();
+                let Some(repo) = path.parent().and_then(Path::parent).and_then(Path::parent) else {
+                    return Err(Error::rejected("the recorded lane path has no repository root"));
+                };
+                if layout::worktree_dir(repo, &lane) != path {
+                    return Err(Error::rejected(
+                        "the recorded lane is outside the expected layout",
+                    ));
+                }
+                (worktree::main_root(repo)?, path)
+            }
+            None => {
+                // A reservation interrupted before its path was recorded still
+                // names exactly one expected checkout; prove that one absent.
+                let Some(repo) = ledger.repo.as_deref() else {
+                    return Err(Error::rejected(
+                        "the ledger records no repository, so the partial lane cannot be \
+                         identified; inspect it by hand",
+                    ));
+                };
+                let root = worktree::main_root(Path::new(repo))?;
+                (root.clone(), layout::worktree_dir(&root, &lane))
+            }
         };
-        let current_binding = attempt.claim_id.as_deref() == Some(lane_claim)
-            && attempt.generation == Some(lane_generation);
-        let cancelled_binding = attempt.state == "cancelled"
-            && attempt.fenced
-            && attempt.claim_id.is_none()
-            && lane_generation.checked_add(1) == attempt.generation;
-        if !(current_binding || cancelled_binding) {
-            return Err(Error::rejected("the recorded lane binding is inconsistent"));
-        }
-        let path = Path::new(worktree);
-        if recorded_lane_present(worktree) {
-            return Err(Error::rejected("the lane exists or cannot be inspected"));
-        }
-        let Some(repo) = path.parent().and_then(Path::parent).and_then(Path::parent) else {
-            return Err(Error::rejected("the recorded lane path has no repository root"));
-        };
-        if layout::worktree_dir(repo, lane) != path {
-            return Err(Error::rejected("the recorded lane is outside the expected layout"));
-        }
-        let root = worktree::main_root(repo)?;
-        let expected = layout::worktree_dir(&root, lane);
+        let expected = layout::worktree_dir(&root, &lane);
+        let recorded = path.to_string_lossy().into_owned();
         let listing = crate::issue::finish::git(&root, &["worktree", "list", "--porcelain", "-z"])?;
-        if listing.split('\0').filter_map(|entry| entry.strip_prefix("worktree ")).any(|entry| {
-            let registered = Path::new(entry);
-            crate::issue::finish::same_path(registered, path)
-                || crate::issue::finish::same_path(registered, &expected)
-        }) || recorded_lane_present(worktree) {
+        if listing
+            .split('\0')
+            .filter_map(|entry| entry.strip_prefix("worktree "))
+            .any(|entry| {
+                let registered = Path::new(entry);
+                crate::issue::finish::same_path(registered, &path)
+                    || crate::issue::finish::same_path(registered, &expected)
+            })
+            || recorded_lane_present(&recorded)
+        {
             return Err(Error::rejected("the lane is still present or registered"));
         }
         let issue = attempt.issue_id.clone();
-        let path = worktree.to_string();
         attempt.worktree = None;
         attempt.lane = None;
         attempt.lane_claim = None;
@@ -250,7 +312,7 @@ pub fn reconcile_absent_guard<H: CoordHttp>(
         Ok(json!({
             "assignment_id": assignment,
             "issue": issue,
-            "worktree": path,
+            "worktree": recorded,
             "guard_reconciled": true,
             "removed_worktree": false,
             "deleted_branch": false,
@@ -322,6 +384,9 @@ struct GuardedLane {
     lane_claim: String,
     lane_generation: u64,
     lane: String,
+    /// The claim was provably never handed to an actor by this ledger's own
+    /// protocol; anything else must not authorize deletion.
+    handoff_proven: bool,
 }
 
 enum LaneState {
@@ -449,6 +514,7 @@ fn bound_lane_from_ledger(
                 lane_claim: lane_claim.clone(),
                 lane_generation,
                 lane: candidate.1.clone(),
+                handoff_proven: no_actor_handoff(attempt, &ledger.origins),
             });
         }
         if assignment.is_some_and(|id| attempt.assignment_id.as_deref() == Some(id)) {
@@ -783,7 +849,8 @@ mod tests {
                 "target": null, "assignment_id": "hla_test", "generation": 1,
                 "claim_id": "hlc_test", "state": "running", "fenced": false,
                 "reassign_operation_id": null, "worktree": lane, "lane": "test",
-                "lane_claim": "hlc_test", "lane_generation": 1
+                "lane_claim": "hlc_test", "lane_generation": 1,
+                "handoff": {"claim_id": "hlc_test", "generation": 1}
             }))
             .unwrap();
             ledger
@@ -1840,12 +1907,18 @@ mod tests {
             fx.auth.clone(),
         )
         .unwrap();
-        let result = release_cancelled(&coord, "hla_test", &fx.state)
-            .expect("confirmed cancellation must release the exact merged lane");
-        assert_eq!(result["removed_worktree"], true);
-        assert_eq!(result["deleted_branch"], true);
-        assert!(!path.exists());
-        assert!(git(&fx.repo, &["branch", "--list", &branch]).is_empty());
+        // This activation reserved and handed off a kickoff, so the claim's
+        // provenance can no longer prove that no actor received it.
+        let error = release_cancelled(&coord, "hla_test", &fx.state)
+            .expect_err("a delivered claim must not authorize automatic deletion")
+            .to_string();
+        assert!(error.contains("cannot prove"), "{error}");
+        assert!(path.is_dir());
+        assert!(!git(&fx.repo, &["branch", "--list", &branch]).is_empty());
+        let error = reconcile_absent_guard(&coord, "hla_test")
+            .expect_err("delivered provenance must not reconcile")
+            .to_string();
+        assert!(error.contains("cannot prove"), "{error}");
     }
 
     #[test]
@@ -2192,6 +2265,12 @@ mod tests {
         second.worktree = Some(other.to_str().unwrap().into());
         second.lane = Some("other".into());
         second.lane_claim = Some("hlc_other".into());
+        second.lane_generation = Some(1);
+        second.handoff = Some(Handoff {
+            claim_id: "hlc_other".into(),
+            generation: 1,
+            external: false,
+        });
         ledger
             .attempts
             .insert("discovered:hla_other".into(), second);
@@ -2668,6 +2747,91 @@ mod tests {
                     "{case}: conflicting custody reached the board"
                 );
                 fx.assert_intact(&tip);
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_lane_without_handoff_provenance_is_never_released() {
+        let fx = CancelReleaseFixture::new(true);
+        let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        ledger
+            .attempts
+            .get_mut(&attempt_key("CAD-1", "start", None))
+            .unwrap()
+            .handoff = None;
+        ledger.save(&fx.auth, "ws_test").unwrap();
+        let coord = fx.cancel();
+        let ledger_path = fx.auth.join("local-assign-ws_test.json");
+        let before = fs::read(&ledger_path).unwrap();
+
+        for refused in [
+            release_cancelled(&coord, "hla_test", &fx.state).err(),
+            release(&coord, "CAD-1", Some(fx.lane.as_path()), &fx.state).err(),
+        ] {
+            let error = refused
+                .expect("unproven provenance must refuse deletion")
+                .to_string();
+            assert!(
+                error.contains("cannot prove") && error.contains("git worktree remove"),
+                "{error}"
+            );
+        }
+        fx.assert_intact(&tip);
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+
+        // Even an absent, unregistered lane is not proof on its own.
+        fs::remove_dir_all(&fx.lane).unwrap();
+        git(&fx.repo, &["worktree", "prune", "--expire", "now"]);
+        let error = reconcile_absent_guard(&coord, "hla_test")
+            .expect_err("legacy provenance must not reconcile")
+            .to_string();
+        assert!(error.contains("cannot prove"), "{error}");
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+    }
+
+    #[test]
+    fn partial_reservation_reconciles_only_with_provenance() {
+        for proved in [true, false] {
+            let fx = CancelReleaseFixture::new(true);
+            let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+            ledger.repo = Some(fx.repo.to_str().unwrap().into());
+            let attempt = ledger
+                .attempts
+                .get_mut(&attempt_key("CAD-1", "start", None))
+                .unwrap();
+            attempt.worktree = None;
+            if !proved {
+                attempt.handoff = None;
+            }
+            ledger.save(&fx.auth, "ws_test").unwrap();
+            let coord = fx.cancel();
+            let ledger_path = fx.auth.join("local-assign-ws_test.json");
+
+            assert!(
+                reconcile_absent_guard(&coord, "hla_test").is_err(),
+                "proved={proved}: a present lane must never reconcile"
+            );
+            fs::remove_dir_all(&fx.lane).unwrap();
+            git(&fx.repo, &["worktree", "prune", "--expire", "now"]);
+            if proved {
+                let result = reconcile_absent_guard(&coord, "hla_test")
+                    .expect("a proven partial reservation may be reconciled");
+                assert_eq!(result["guard_reconciled"], true);
+                assert_eq!(result["removed_worktree"], false);
+                let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+                let attempt = &ledger.attempts[&attempt_key("CAD-1", "start", None)];
+                assert!(!attempt.retired_lane_guard);
+                assert!(attempt.lane.is_none());
+                assert!(attempt.lane_claim.is_none());
+            } else {
+                let before = fs::read(&ledger_path).unwrap();
+                let error = reconcile_absent_guard(&coord, "hla_test")
+                    .expect_err("unproven partial reservation must not reconcile")
+                    .to_string();
+                assert!(error.contains("cannot prove"), "{error}");
+                assert_eq!(fs::read(&ledger_path).unwrap(), before);
             }
         }
     }
