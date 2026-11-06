@@ -7,6 +7,7 @@ import {
   type ThreadProjection,
 } from "./contract.ts";
 import { IMAGE_INPUT_UNAVAILABLE } from "./image-limits.ts";
+import { CONTEXT_BUDGET_EXCEEDED_TEXT } from "./model.ts";
 import { appPayload, parseEntryAppScope } from "./operation-scope.ts";
 
 /** The private engine's default retry.maxRetries: attempts 1..3 retry. */
@@ -82,6 +83,8 @@ function createdAt(timestamp: unknown): { created: string } | Record<string, nev
     : {};
 }
 
+type BudgetProof = (entry: EntryRecord, message: string | undefined) => boolean;
+
 /**
  * The entries every thread read reports: the engine's mapping, then the host's
  * projection when it has one, so a paged read and both stream paths agree.
@@ -90,8 +93,9 @@ export function projectedThreadEntries(
   records: readonly EntryRecord[],
   includeThinking: boolean,
   project?: ThreadProjection,
+  budgetProof?: BudgetProof,
 ): ThreadEntry[] {
-  const entries = threadEntries(records, includeThinking);
+  const entries = threadEntries(records, includeThinking, budgetProof);
   return project ? [...project(entries)] : entries;
 }
 
@@ -145,6 +149,7 @@ export async function readAllRecords<C>(scan: EntryScan<C>): Promise<EntryRecord
 export function threadEntries(
   records: readonly EntryRecord[],
   includeThinking: boolean,
+  budgetProof?: BudgetProof,
 ): ThreadEntry[] {
   const entries: ThreadEntry[] = [];
   const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
@@ -287,7 +292,9 @@ export function threadEntries(
           ...createdAt(message.timestamp),
           payload: {
             status: "failed",
-            error: failedTurnReason(message.errorMessage),
+            error: budgetProof?.(record, message.errorMessage)
+              ? CONTEXT_BUDGET_EXCEEDED_TEXT
+              : failedTurnReason(message.errorMessage),
           },
         });
       }

@@ -1,6 +1,7 @@
 import type { Api, Model, Provider } from "@earendil-works/pi-ai";
 import { CLOUDFLARE_AI_API, CLOUDFLARE_PROVIDER_ID } from "agents/models/pi-ai";
 import type { GenerationIdentity } from "./contract.ts";
+import type { ContextBudgetProofs } from "./context-budget-proofs.ts";
 import {
   IMAGE_INPUT_UNAVAILABLE,
   MAX_IMAGE_BASE64_CHARS,
@@ -243,40 +244,83 @@ const IMAGE_REFUSED_NOTICE =
   "[An image was omitted because the selected model cannot read images.]";
 
 /**
+ * The gateway's structured size refusal and its public, actionable projection.
+ * The engine receives a task-bound opaque marker, not this public sentence;
+ * the marker matches neither retry nor context-overflow classifiers.
+ */
+export const CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded";
+export const CONTEXT_BUDGET_EXCEEDED_TEXT =
+  "The context limit was reached. Start a fresh conversation or split the task and retry.";
+
+/**
  * Gateway refusal codes the runtime may name. Anything else stays private: the
- * engine reports a generic failure rather than provider or gateway text.
+ * engine reports a generic failure rather than provider or gateway text. The
+ * context budget is the only one that must also arrive as the gateway's own
+ * structured 400 (`error.type` `invalid_request_error`); the rest name a
+ * provider-side refusal however it arrives.
  */
 const PUBLIC_MODEL_REFUSALS: ReadonlySet<string> = new Set([
   IMAGE_INPUT_UNAVAILABLE,
+  CONTEXT_BUDGET_EXCEEDED,
 ]);
+
+/** One JSON gateway error's own `error` object, when it has one. */
+function gatewayError(
+  body: unknown,
+): { code?: unknown; type?: unknown } | null {
+  if (typeof body !== "object" || body === null || !("error" in body))
+    return null;
+  const failure: unknown = body.error;
+  if (typeof failure !== "object" || failure === null || Array.isArray(failure))
+    return null;
+  return {
+    code: "code" in failure ? failure.code : undefined,
+    type: "type" in failure ? failure.type : undefined,
+  };
+}
 
 /** The refusal code of a JSON gateway error, when it is an allowlisted one. */
 async function publicRefusal(response: Response): Promise<string | null> {
   if (response.ok || !response.headers.get("content-type")?.includes("json"))
     return null;
   try {
-    const body: unknown = await response.clone().json();
-    const code =
-      typeof body === "object" && body !== null && "error" in body
-        ? (body.error as { code?: unknown } | null)?.code
-        : undefined;
-    return typeof code === "string" && PUBLIC_MODEL_REFUSALS.has(code)
-      ? code
-      : null;
+    const failure = gatewayError(await response.clone().json());
+    const code = failure?.code;
+    if (typeof code !== "string" || !PUBLIC_MODEL_REFUSALS.has(code))
+      return null;
+    // The context budget is the gateway's own policy refusal, not a provider's:
+    // its exact status and error type keep a look-alike code from a provider
+    // private. Any other status (such as the 512 KiB read limit) is a different
+    // refusal, so it is left untouched and stays generic.
+    return code === CONTEXT_BUDGET_EXCEEDED &&
+      (response.status !== 400 || failure?.type !== "invalid_request_error")
+      ? null
+      : code;
   } catch {
     return null;
   }
 }
 
 /**
- * Carry an allowlisted refusal code into the engine's private error text, so
- * the failed turn names it. The gateway's own message is dropped, and any other
- * response passes through unchanged.
+ * Carry trusted refusals into the engine without forwarding gateway prose.
+ * Budget refusals need a task-bound proof; absent evidence remains generic.
  */
-function withRefusalCode(response: Response, code: string | null): Response {
+function withRefusalCode(
+  response: Response,
+  code: string | null,
+  budgetMarker?: string,
+): Response {
   if (code === null) return response;
   return Response.json(
-    { error: { code, message: code } },
+    {
+      error: {
+        code,
+        message:
+          code === CONTEXT_BUDGET_EXCEEDED
+            ? (budgetMarker ?? "The model request failed.")
+            : code,
+      },
+    },
     { status: response.status },
   );
 }
@@ -323,6 +367,7 @@ export function meteredBinding(
   identity: () => GenerationIdentity | null,
   onModelResolved?: (model: string) => void,
   maxImagesPerRequest = 1,
+  budgetProofs?: Pick<ContextBudgetProofs, "clear" | "issue">,
 ): MeteredBinding {
   if (
     !Number.isSafeInteger(maxImagesPerRequest) ||
@@ -346,23 +391,27 @@ export function meteredBinding(
         );
       }
       const bounded = boundImageHistory(input, maxImagesPerRequest);
-      let response = await transport.requestModel(
-        bounded,
-        current,
-        options?.signal,
-      );
+      const request = (value: Record<string, unknown>) => {
+        // Recovery can repeat this task after a crash before the error entry
+        // was committed. Never let evidence from the earlier attempt survive.
+        budgetProofs?.clear(current);
+        return transport.requestModel(value, current, options?.signal);
+      };
+      let response = await request(bounded);
       let refusal = await publicRefusal(response);
       // A stored screenshot would otherwise be refused on every later turn,
       // leaving a conversation that can only be reset. History is untouched.
       if (refusal === IMAGE_INPUT_UNAVAILABLE && imagesOnlyInHistory(bounded)) {
-        response = await transport.requestModel(
+        response = await request(
           boundImageHistory(bounded, 0, IMAGE_REFUSED_NOTICE),
-          current,
-          options?.signal,
         );
         refusal = await publicRefusal(response);
       }
-      response = withRefusalCode(response, refusal);
+      const marker =
+        refusal === CONTEXT_BUDGET_EXCEEDED
+          ? budgetProofs?.issue(current)
+          : undefined;
+      response = withRefusalCode(response, refusal, marker);
       const metered = onModelResolved ? captureResolvedModel(response, onModelResolved) : response;
       if (options?.returnRawResponse !== false) return metered;
       return metered.json();

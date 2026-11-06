@@ -55861,6 +55861,39 @@ function assistantIdentityText(context) {
   return text;
 }
 
+// src/context-budget-proofs.ts
+var MARKER = "hosted_context_budget_";
+
+class ContextBudgetProofs {
+  sql;
+  constructor(sql) {
+    this.sql = sql;
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS tenant_context_budget_refusals (
+      conversation TEXT NOT NULL,
+      task TEXT NOT NULL,
+      cutoff TEXT NOT NULL,
+      nonce TEXT NOT NULL,
+      PRIMARY KEY (conversation, task)
+    )`);
+  }
+  clear(identity) {
+    this.sql.exec("DELETE FROM tenant_context_budget_refusals WHERE conversation=? AND task=?", identity.conversation, identity.task);
+  }
+  issue(identity) {
+    const nonce = crypto.randomUUID().replaceAll("-", "");
+    this.sql.exec(`INSERT INTO tenant_context_budget_refusals (conversation,task,cutoff,nonce)
+       VALUES (?,?,?,?)
+       ON CONFLICT(conversation,task) DO UPDATE SET cutoff=excluded.cutoff, nonce=excluded.nonce`, identity.conversation, identity.task, identity.cutoff, nonce);
+    return `${MARKER}${nonce}`;
+  }
+  matches(entry, message) {
+    if (typeof message !== "string" || !message.startsWith(MARKER) || typeof entry.conversationId !== "string" && typeof entry.conversationId !== "number" || typeof entry.byTaskId !== "string" && typeof entry.byTaskId !== "number")
+      return false;
+    const rows = this.sql.exec("SELECT nonce FROM tenant_context_budget_refusals WHERE conversation=? AND task=?", String(entry.conversationId), String(entry.byTaskId)).toArray();
+    return rows.length === 1 && typeof rows[0]?.nonce === "string" && message === `${MARKER}${rows[0].nonce}`;
+  }
+}
+
 // src/tool-policy.ts
 async function withToolAuthority(name, authority, context, execute) {
   const refusal = authority.toolRefusal(name);
@@ -56388,24 +56421,45 @@ function boundImageHistory(input, maxImages, notice = "[An image was omitted fro
   };
 }
 var IMAGE_REFUSED_NOTICE = "[An image was omitted because the selected model cannot read images.]";
+var CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded";
+var CONTEXT_BUDGET_EXCEEDED_TEXT = "The context limit was reached. Start a fresh conversation or split the task and retry.";
 var PUBLIC_MODEL_REFUSALS = new Set([
-  IMAGE_INPUT_UNAVAILABLE
+  IMAGE_INPUT_UNAVAILABLE,
+  CONTEXT_BUDGET_EXCEEDED
 ]);
+function gatewayError(body) {
+  if (typeof body !== "object" || body === null || !("error" in body))
+    return null;
+  const failure = body.error;
+  if (typeof failure !== "object" || failure === null || Array.isArray(failure))
+    return null;
+  return {
+    code: "code" in failure ? failure.code : undefined,
+    type: "type" in failure ? failure.type : undefined
+  };
+}
 async function publicRefusal(response) {
   if (response.ok || !response.headers.get("content-type")?.includes("json"))
     return null;
   try {
-    const body = await response.clone().json();
-    const code = typeof body === "object" && body !== null && "error" in body ? body.error?.code : undefined;
-    return typeof code === "string" && PUBLIC_MODEL_REFUSALS.has(code) ? code : null;
+    const failure = gatewayError(await response.clone().json());
+    const code = failure?.code;
+    if (typeof code !== "string" || !PUBLIC_MODEL_REFUSALS.has(code))
+      return null;
+    return code === CONTEXT_BUDGET_EXCEEDED && (response.status !== 400 || failure?.type !== "invalid_request_error") ? null : code;
   } catch {
     return null;
   }
 }
-function withRefusalCode(response, code) {
+function withRefusalCode(response, code, budgetMarker) {
   if (code === null)
     return response;
-  return Response.json({ error: { code, message: code } }, { status: response.status });
+  return Response.json({
+    error: {
+      code,
+      message: code === CONTEXT_BUDGET_EXCEEDED ? budgetMarker ?? "The model request failed." : code
+    }
+  }, { status: response.status });
 }
 function hasImage(content) {
   return Array.isArray(content) && content.some((part) => typeof part === "object" && part !== null && ("type" in part) && part.type === "image_url");
@@ -56416,7 +56470,7 @@ function imagesOnlyInHistory(input) {
   const messages = input.messages;
   return !hasImage(messages.at(-1)?.content) && messages.some((message) => hasImage(message?.content));
 }
-function meteredBinding(transport, identity, onModelResolved, maxImagesPerRequest = 1) {
+function meteredBinding(transport, identity, onModelResolved, maxImagesPerRequest = 1, budgetProofs) {
   if (!Number.isSafeInteger(maxImagesPerRequest) || maxImagesPerRequest < 1 || maxImagesPerRequest > MAX_IMAGE_PARTS)
     throw new Error("Invalid model image limit.");
   return {
@@ -56432,13 +56486,18 @@ function meteredBinding(transport, identity, onModelResolved, maxImagesPerReques
         }, { status: 409 });
       }
       const bounded = boundImageHistory(input, maxImagesPerRequest);
-      let response = await transport.requestModel(bounded, current, options?.signal);
+      const request = (value) => {
+        budgetProofs?.clear(current);
+        return transport.requestModel(value, current, options?.signal);
+      };
+      let response = await request(bounded);
       let refusal = await publicRefusal(response);
       if (refusal === IMAGE_INPUT_UNAVAILABLE && imagesOnlyInHistory(bounded)) {
-        response = await transport.requestModel(boundImageHistory(bounded, 0, IMAGE_REFUSED_NOTICE), current, options?.signal);
+        response = await request(boundImageHistory(bounded, 0, IMAGE_REFUSED_NOTICE));
         refusal = await publicRefusal(response);
       }
-      response = withRefusalCode(response, refusal);
+      const marker = refusal === CONTEXT_BUDGET_EXCEEDED ? budgetProofs?.issue(current) : undefined;
+      response = withRefusalCode(response, refusal, marker);
       const metered = onModelResolved ? captureResolvedModel(response, onModelResolved) : response;
       if (options?.returnRawResponse !== false)
         return metered;
@@ -57202,8 +57261,8 @@ function toolCallText(name, args) {
 function createdAt(timestamp) {
   return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0 ? { created: new Date(timestamp).toISOString() } : {};
 }
-function projectedThreadEntries(records, includeThinking, project) {
-  const entries = threadEntries(records, includeThinking);
+function projectedThreadEntries(records, includeThinking, project, budgetProof) {
+  const entries = threadEntries(records, includeThinking, budgetProof);
   return project ? [...project(entries)] : entries;
 }
 var RESET_KIND = "pi.reset";
@@ -57221,7 +57280,7 @@ async function readAllRecords(scan) {
   } while (cursor !== undefined);
   return records;
 }
-function threadEntries(records, includeThinking) {
+function threadEntries(records, includeThinking, budgetProof) {
   const entries = [];
   const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
   const all = visible.flatMap((record) => record.kind === RESET_KIND ? [RESET_BOUNDARY, ...record.model ?? []] : record.model ?? []);
@@ -57315,7 +57374,7 @@ function threadEntries(records, includeThinking) {
           ...createdAt(message.timestamp),
           payload: {
             status: "failed",
-            error: failedTurnReason(message.errorMessage)
+            error: budgetProof?.(record, message.errorMessage) ? CONTEXT_BUDGET_EXCEEDED_TEXT : failedTurnReason(message.errorMessage)
           }
         });
       }
@@ -57332,6 +57391,7 @@ class HostedSession extends DurableObject {
   registry = createRegistry();
   options;
   operationScopes;
+  contextBudgetProofs;
   toolAppScope = async (api, context) => {
     const live = await api.snapshot(LiveDoc, api.conversationId, context);
     const run = live?.run;
@@ -57347,6 +57407,7 @@ class HostedSession extends DurableObject {
     if (!ctx.id.name)
       throw new Error("HostedSession requires a named conversation");
     this.operationScopes = new OperationScopes(ctx.storage.sql);
+    this.contextBudgetProofs = new ContextBudgetProofs(ctx.storage.sql);
     const acceptsImages = options.acceptsToolImages === true;
     const model = defaultModel(options.modelAlias, acceptsImages || options.attachedImages !== undefined);
     const authority = {
@@ -57354,7 +57415,7 @@ class HostedSession extends DurableObject {
       authorizeTool: (name) => options.authorizeTool(name)
     };
     const ai = createAI({
-      binding: meteredBinding(options, () => this.generationIdentity(), (served) => this.recordResolvedModel(served), options.maxImagesPerRequest)
+      binding: meteredBinding(options, () => this.generationIdentity(), (served) => this.recordResolvedModel(served), options.maxImagesPerRequest, this.contextBudgetProofs)
     });
     this.models.setProvider(withDefaultModel(ai.provider, model));
     this.registry.install(intentGuard(options.toolRefusal));
@@ -57475,7 +57536,7 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
   }
   async transcript(includeThinking) {
     const conversation = await this.harness.conversation(this.harness.session().id);
-    return projectedThreadEntries(await readAllRecords((cursor, limit) => conversation.entries({ order: "ascending" }, limit, cursor, BACKGROUND_CONTEXT)), includeThinking, this.options.projectThread);
+    return projectedThreadEntries(await readAllRecords((cursor, limit) => conversation.entries({ order: "ascending" }, limit, cursor, BACKGROUND_CONTEXT)), includeThinking, this.options.projectThread, (entry, message) => this.contextBudgetProofs.matches(entry, message));
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;

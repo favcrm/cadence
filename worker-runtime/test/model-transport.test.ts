@@ -1,6 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import type { GenerationIdentity } from "../src/contract.ts";
-import { meteredBinding } from "../src/model.ts";
+import {
+  CONTEXT_BUDGET_EXCEEDED,
+  CONTEXT_BUDGET_EXCEEDED_TEXT,
+  meteredBinding,
+} from "../src/model.ts";
 
 const identity: GenerationIdentity = {
   conversation: "1",
@@ -129,5 +136,123 @@ describe("model transport", () => {
     expect(refused.status).toBe(409);
     expect((await refused.json()).error.code).toBe("resume_unavailable");
     expect(dispatched).toBe(false);
+  });
+});
+
+/** The gateway refusal bodies these cases observe, after the binding relays them. */
+interface GatewayRefusalBody {
+  readonly error: {
+    readonly type?: string;
+    readonly code?: string;
+    readonly message?: string;
+  };
+}
+
+describe("gateway refusals", () => {
+  // The agentic gateway's own structured 400, with text the runtime must never
+  // relay: a path and a byte count the board must not see.
+  const refusal = (
+    code: string,
+    status = 400,
+    type = "invalid_request_error",
+  ): Response =>
+    Response.json(
+      {
+        error: {
+          type,
+          code,
+          message: "Private detail: 273589 bytes from https://gw.internal",
+        },
+      },
+      { status },
+    );
+
+  it("names the trusted context-budget refusal as a terminal failure", async () => {
+    let calls = 0;
+    const marker = "hosted_context_budget_0123456789abcdef0123456789abcdef";
+    const operations: string[] = [];
+    const binding = meteredBinding(
+      {
+        async requestModel() {
+          operations.push("request");
+          calls += 1;
+          return refusal(CONTEXT_BUDGET_EXCEEDED);
+        },
+      },
+      () => identity,
+      undefined,
+      1,
+      {
+        clear: () => {
+          operations.push("clear");
+        },
+        issue: () => {
+          operations.push("issue");
+          return marker;
+        },
+      },
+    );
+    const response = (await binding.run(
+      "default",
+      { messages: [] },
+      { returnRawResponse: true },
+    )) as Response;
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as GatewayRefusalBody;
+    expect(body).toEqual({
+      error: {
+        code: CONTEXT_BUDGET_EXCEEDED,
+        message: marker,
+      },
+    });
+    expect(JSON.stringify(body)).not.toContain("gw.internal");
+    expect(JSON.stringify(body)).not.toContain("273589");
+
+    // The engine classifies the provider text the runtime emitted. Neither a
+    // compaction nor a retry may follow, so no further call is dispatched.
+    // The classifiers read only these fields of a terminal failure.
+    const terminal = {
+      stopReason: "error",
+      errorMessage: body.error.message,
+      provider: "openai",
+    } as unknown as AssistantMessage;
+    expect(isContextOverflow(terminal)).toBe(false);
+    expect(isRetryableAssistantError(terminal)).toBe(false);
+    expect(calls).toBe(1);
+    expect(operations).toEqual(["clear", "request", "issue"]);
+  });
+
+  it("never records budget proof for untrusted HTTP or streamed error text", async () => {
+    const responses = [
+      refusal(CONTEXT_BUDGET_EXCEEDED, 413),
+      refusal(CONTEXT_BUDGET_EXCEEDED, 400, "server_error"),
+      Response.json(
+        { error: { code: "invalid_request", message: CONTEXT_BUDGET_EXCEEDED_TEXT } },
+        { status: 400 },
+      ),
+      new Response(
+        `data: ${JSON.stringify({ error: { message: CONTEXT_BUDGET_EXCEEDED_TEXT } })}\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+      refusal("context_length_exceeded"),
+    ];
+    let issued = 0;
+    for (const upstream of responses) {
+      const binding = meteredBinding(
+        { requestModel: async () => upstream },
+        () => identity,
+        undefined,
+        1,
+        {
+          clear: () => {},
+          issue: () => {
+            issued++;
+            return "unexpected";
+          },
+        },
+      );
+      await binding.run("default", {}, { returnRawResponse: true });
+    }
+    expect(issued).toBe(0);
   });
 });

@@ -130,6 +130,18 @@ the attempt if the callback fails. Attachment bytes are not written to the
 transcript. This callback does not enable image-returning tools; those retain
 their separate `acceptsToolImages` opt-in.
 
+**Context budget.** The gateway refuses a request that exceeds a trusted hosted
+size budget — the serialized context or the fully translated request including
+images — with a JSON 400 whose `error.type` is `invalid_request_error` and
+whose `error.code` is `context_budget_exceeded`. The runtime records a fresh
+task-bound refusal marker before the engine commits the failure. On transcript
+reads it presents `The context limit was reached. Start a fresh conversation
+or split the task and retry.` only when the marker and the entry's authoring
+task agree. The marker survives a restart and is invalidated before a repeated
+generation request, so unrelated HTTP or streamed error text cannot claim this
+reason. The marker triggers neither compaction nor retry. The raw gateway
+text stays private, the limit is unchanged and the task is not narrowed.
+
 **Hosted identity.** A host that has a committed assistant identity may supply
 two optional domain-data callbacks on `HostedSessionOptions`: `identity()`
 returns personal, workspace, company-agent or agent-profile context, and
