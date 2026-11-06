@@ -48,6 +48,8 @@ for (const project of [null, "  ", "ACME", "-invalid", "a".repeat(33), "agents"]
   check(parseTicketProposal({ ...proposal, project }) === null, "invalid project cannot be approved");
 }
 check(parseTicketProposal({ ...proposal, project: `a${"b".repeat(31)}` }) !== null, "a valid 32-character project remains usable");
+const paddedProject = parseTicketProposal({ ...proposal, project: " demo ", ticket: "DEMO-1", run: { state: "finished", reason: null, agent: "Research agent" } });
+check(paddedProject?.project === "demo" && paddedProject.ticket === "DEMO-1", "a previously accepted padded project keeps its created outcome");
 check(parseTicketProposal({ ...proposal, tools: ["web_read", 7] }) === null, "an incomplete tool list makes no proposal");
 check(parseTicketProposal({ ...proposal, tools: [] })?.tools.length === 0, "an empty tool list is a real answer");
 check(parseTicketProposal({ ...proposal, visibility: "private" }) === null, "an audience the card cannot state makes no proposal");

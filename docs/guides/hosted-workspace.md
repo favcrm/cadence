@@ -87,12 +87,12 @@ checked before and after the authority check. Tool handlers receive only the
 neutral invocation identity, clock and cancellation context, not the engine's
 model registry or nested-execution API.
 
-The AgenticOS host's ticket proposal card shows the destination project key,
-the ticket text, the agent, its tools and the company-visible audience before
-the person chooses **Create and assign**. An incomplete or malformed project
-key cannot produce an actionable card. The board still validates and
-authorizes the create; showing a destination neither registers a project nor
-grants access.
+The AgenticOS host's ticket proposal card shows the destination project key
+(trimmed as the board trims it), the ticket text, the agent, its tools and
+the company-visible audience before the person chooses **Create and assign**.
+An incomplete or malformed project key cannot produce an actionable card. The
+board still validates and authorizes the create; showing a destination neither
+registers a project nor grants access.
 
 **Tool images.** A tool may return base64 PNG, JPEG or WebP parts alongside
 text. The runtime accepts at most four image parts and 192 KiB of encoded image

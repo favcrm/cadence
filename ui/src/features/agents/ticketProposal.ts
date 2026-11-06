@@ -33,7 +33,8 @@ export function parseTicketProposal(
 ): TicketProposal | null {
   if (!payload) return null;
   const id = text(payload.id);
-  const project = text(payload.project);
+  // The board trims the create's project before validating and storing it.
+  const project = text(payload.project)?.trim();
   const title = text(payload.title);
   const brief = text(payload.brief);
   const agent = payload.agent;
