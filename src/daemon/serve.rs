@@ -421,6 +421,14 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                     .and_then(Value::as_str)
                     .ok_or_else(|| Error::rejected("Missing 'method'"))?;
                 let params = frame.get("params").cloned().unwrap_or(json!({}));
+                // CAD-2207: a client that predates the fleet list contract is
+                // refused unconditionally — not only when a restricted row
+                // exists — so a binding cannot be created between a check and
+                // this dispatch to hand it a partial fleet, and success vs
+                // refusal does not disclose whether a bound assistant exists.
+                // This is per frame, so a long-lived connection cannot carry
+                // an old capability forward.
+                shared.refuse_legacy_fleet_projection(method, &params)?;
                 // CAD-482: an armed fixture reads `test_caller`; the
                 // asserted identity — and nothing ambient — is the
                 // caller for this one dispatch. The field is refused
@@ -428,10 +436,14 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                 let _scope = crate::test_seam::scope_frame(shared.seam.as_ref(), &frame)?;
                 shared.dispatch(method, &params, peer.pid)
             });
-        let frame = match response {
+        let mut frame = match response {
             Ok(result) => proto::ok(result),
             Err(error) => proto::err(&error),
         };
+        // The response itself identifies the privacy projection contract.
+        // A prior daemon_info reply cannot prove which daemon answered this
+        // frame after a restart.
+        frame["fleet_protocol"] = json!(crate::proto::CLIENT_PROTOCOL);
         // Value's formatter emits small fragments; coalesce socket writes,
         // but flush each frame so a caller need not close or send again.
         if writeln!(writer, "{frame}")
@@ -804,12 +816,20 @@ pub const LAST_RECOVERY_FILE: &str = "last-recovery.json";
 /// read stale pane state as fresh; the turns fence instead.
 const MARKER_TTL_SECS: f64 = 900.0;
 
+/// CAD-2207: v2 shutdown evidence carries the all-live snapshot.
+const SHUTDOWN_FORMAT: &str = "cadence.shutdown/2";
+
 /// What `serve()` carries into `Shared`: this run's instance id plus
 /// the consumed marker (entries and a staleness reason when the marker
 /// itself failed validation).
 pub struct HotStart {
     pub instance: String,
     pub(super) marker: Option<store::ConsumedMarker>,
+    /// CAD-2207: the v2 marker's all-live identities. `None` is an
+    /// older/missing marker; `Some(Err)` is malformed or an explicit
+    /// snapshot failure. Ordinary and bound actors are recorded alike so
+    /// the verdict cannot single out a private assistant.
+    pub(super) live: Option<std::result::Result<Vec<(String, String)>, String>>,
 }
 
 impl HotStart {
@@ -818,6 +838,7 @@ impl HotStart {
         Self {
             instance: Uuid::new_v4().simple().to_string(),
             marker: None,
+            live: None,
         }
     }
 }
@@ -850,72 +871,188 @@ pub(super) fn hot_restart_begin(state_dir: &Path) -> HotStart {
     // Consume-once regardless of what the marker says — a stale or
     // unreadable marker must never be adopted twice.
     let _ = std::fs::remove_file(&path);
-    let marker = raw.and_then(|raw| match serde_json::from_str::<Value>(&raw) {
-        Ok(v) => {
-            let instance = v["instance"].as_str().unwrap_or_default().to_string();
-            let at = v["at"].as_f64().unwrap_or(0.0);
-            let entries = v["entries"]
-                .as_array()
-                .map(|rows| {
-                    rows.iter()
-                        .filter_map(|r| {
-                            Some(store::AdoptEntry {
-                                alias: r["alias"].as_str()?.to_string(),
-                                message_id: r["message_id"].as_str()?.to_string(),
-                                turn_id: r["turn_id"].as_str()?.to_string(),
-                                generation: r["generation"].as_str()?.to_string(),
-                                pane_pid: r["pane_pid"].as_u64()? as u32,
-                                native_session: r["native_session"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string(),
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            // Provenance (does this marker name the run just gone?)
-            // is a separate axis from freshness (is it still inside
-            // the pane-adoption TTL?): expiry must not erase a recorded
-            // drain failure, and a wrong-instance marker must not lend
-            // its failure to this shutdown (CAD-694).
-            let proven = !instance.is_empty() && Some(instance.as_str()) == previous.as_deref();
-            let stale = if !proven {
-                Some("shutdown marker does not match the last recorded daemon run".to_string())
-            } else if epoch_secs() - at > MARKER_TTL_SECS {
-                Some(format!(
-                    "shutdown marker expired ({:.0}s old, bound {:.0}s)",
-                    epoch_secs() - at,
-                    MARKER_TTL_SECS
-                ))
-            } else {
-                None
-            };
-            // `failed` is evidence whenever the marker names the
-            // immediately preceding run — TTL expiry bounds pane
-            // adoption, never the provenance of a recorded failure.
-            let failed = if proven {
-                v["failed"].as_str().map(str::to_string)
-            } else {
-                None
-            };
-            Some(store::ConsumedMarker {
-                instance,
-                entries,
-                stale,
-                failed,
-            })
-        }
-        Err(_) => {
-            eprintln!("hot-restart: unreadable shutdown marker discarded");
-            None
-        }
-    });
+    let (marker, live): (Option<store::ConsumedMarker>, Option<LiveEvidence>) = match raw {
+        None => (None, None),
+        Some(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(v) => match parse_shutdown_marker(&v, previous.as_deref()) {
+                Ok((marker, live)) => (Some(marker), live),
+                Err(reason) => {
+                    eprintln!("hot-restart: invalid shutdown marker: {reason}");
+                    (None, Some(Err("shutdown marker is invalid".to_string())))
+                }
+            },
+            Err(_) => {
+                eprintln!("hot-restart: unreadable shutdown marker discarded");
+                (None, Some(Err("shutdown marker is unreadable".to_string())))
+            }
+        },
+    };
     let instance = Uuid::new_v4().simple().to_string();
     if let Err(e) = write_file_atomic(&state_dir.join(INSTANCE_FILE), &instance) {
         eprintln!("hot-restart: could not record daemon instance: {e}");
     }
-    HotStart { instance, marker }
+    HotStart {
+        instance,
+        marker,
+        live,
+    }
+}
+
+/// CAD-2207: strict, all-or-nothing marker validation. A row that does not
+/// have the exact required shape invalidates the whole marker rather than
+/// silently shortening it. Error text is generic — it is logged, and no
+/// stored alias may reach the log.
+fn parse_shutdown_marker(
+    v: &Value,
+    previous: Option<&str>,
+) -> std::result::Result<(store::ConsumedMarker, Option<LiveEvidence>), String> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "shutdown marker is not an object".to_string())?;
+    let format = match obj.get("format") {
+        None => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => return Err("shutdown marker format is not a string".to_string()),
+    };
+    let v2 = match format {
+        None => false,
+        Some(f) if f == SHUTDOWN_FORMAT => true,
+        Some(_) => return Err("shutdown marker format is unknown".to_string()),
+    };
+    let instance = obj
+        .get("instance")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "shutdown marker has no instance".to_string())?
+        .to_string();
+    let at = obj
+        .get("at")
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| "shutdown marker has no valid timestamp".to_string())?;
+    let entries = match obj.get("entries") {
+        None => Vec::new(),
+        Some(value) => parse_adopt_entries(value)?,
+    };
+    let failed = match obj.get("failed") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err("shutdown marker failure is not a string".to_string()),
+    };
+    let live = if v2 {
+        let rows = parse_live_rows(
+            obj.get("live")
+                .ok_or_else(|| "v2 shutdown marker has no live array".to_string())?,
+        )?;
+        let live_error = match obj.get("live_error") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if s.is_empty() => None,
+            Some(Value::String(_)) => Some(()),
+            Some(_) => return Err("shutdown marker live_error is not a string".to_string()),
+        };
+        match live_error {
+            Some(()) if !rows.is_empty() => {
+                return Err("v2 shutdown marker has both live rows and live_error".to_string())
+            }
+            Some(()) => Some(Err("live snapshot unavailable".to_string())),
+            None => Some(Ok(rows)),
+        }
+    } else {
+        if obj.contains_key("live") || obj.contains_key("live_error") {
+            return Err("legacy shutdown marker carries a live field".to_string());
+        }
+        None
+    };
+    let proven = previous == Some(instance.as_str());
+    let stale = if !proven {
+        Some("shutdown marker does not match the last recorded daemon run".to_string())
+    } else if epoch_secs() - at > MARKER_TTL_SECS {
+        Some(format!(
+            "shutdown marker expired ({:.0}s old, bound {:.0}s)",
+            epoch_secs() - at,
+            MARKER_TTL_SECS
+        ))
+    } else {
+        None
+    };
+    // A foreign marker's panes and live identities are not this stop's
+    // evidence. Its drain failure still binds when provenance matches.
+    let live = if proven { live } else { None };
+    let failed = if proven { failed } else { None };
+    Ok((
+        store::ConsumedMarker {
+            instance,
+            entries,
+            stale,
+            failed,
+        },
+        live,
+    ))
+}
+
+fn parse_adopt_entries(value: &Value) -> std::result::Result<Vec<store::AdoptEntry>, String> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| "shutdown marker entries is not an array".to_string())?;
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        let obj = row
+            .as_object()
+            .ok_or_else(|| "shutdown marker entry is not an object".to_string())?;
+        let text = |key: &str| -> std::result::Result<String, String> {
+            obj.get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| "shutdown marker entry is malformed".to_string())
+        };
+        let native_session = obj
+            .get("native_session")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "shutdown marker entry is malformed".to_string())?
+            .to_string();
+        let pane_pid = obj
+            .get("pane_pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .ok_or_else(|| "shutdown marker entry is malformed".to_string())?;
+        entries.push(store::AdoptEntry {
+            alias: text("alias")?,
+            message_id: text("message_id")?,
+            turn_id: text("turn_id")?,
+            generation: text("generation")?,
+            pane_pid,
+            native_session,
+        });
+    }
+    Ok(entries)
+}
+
+fn parse_live_rows(value: &Value) -> std::result::Result<Vec<(String, String)>, String> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| "shutdown marker live is not an array".to_string())?;
+    let mut live: Vec<(String, String)> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let obj = row
+            .as_object()
+            .ok_or_else(|| "shutdown marker live row is not an object".to_string())?;
+        let alias = obj
+            .get("alias")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "shutdown marker live row is malformed".to_string())?;
+        let uid = obj
+            .get("uid")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "shutdown marker live row is malformed".to_string())?;
+        if live.iter().any(|(seen, _)| seen.as_str() == alias) {
+            return Err("shutdown marker has duplicate live rows".to_string());
+        }
+        live.push((alias.to_string(), uid.to_string()));
+    }
+    Ok(live)
 }
 
 /// The last write of a clean shutdown — after this the daemon exits.
@@ -925,8 +1062,19 @@ pub(super) fn write_shutdown_marker(
     state_dir: &Path,
     instance: &str,
     entries: Vec<store::AdoptEntry>,
+    live: &std::result::Result<Vec<(String, String)>, String>,
 ) {
+    let (live_rows, live_error) = match live {
+        Ok(rows) => (
+            rows.iter()
+                .map(|(alias, uid)| json!({"alias": alias, "uid": uid}))
+                .collect::<Vec<_>>(),
+            Value::Null,
+        ),
+        Err(error) => (Vec::new(), json!(error)),
+    };
     let marker = json!({
+        "format": SHUTDOWN_FORMAT,
         "instance": instance,
         "at": epoch_secs(),
         "entries": entries.iter().map(|e| json!({
@@ -937,6 +1085,8 @@ pub(super) fn write_shutdown_marker(
             "pane_pid": e.pane_pid,
             "native_session": e.native_session,
         })).collect::<Vec<_>>(),
+        "live": live_rows,
+        "live_error": live_error,
     });
     if let Err(e) = write_file_atomic(&state_dir.join(SHUTDOWN_FILE), &marker.to_string()) {
         eprintln!("hot-restart: could not write shutdown marker: {e}");

@@ -78,7 +78,8 @@
 //! `cad2207_effect_alias_reuse_cannot_inherit_the_old_owner`,
 //! `cad2207_retained_event_alias_reuse_cannot_read_the_old_owner_stream`,
 //! `cad2207_retained_mail_alias_reuse_cannot_read_the_old_owner_mail`,
-//! `cad2207_agent_operational_hides_private_native_session_ids`): the
+//! `cad2207_public_update_health_and_profile_lists_withhold_private_runtime`,
+//! `cad2207_public_waiting_shape_is_identical_for_private_and_ordinary_work`): the
 //! member's personal assistant — its alias, private bootstrap profile,
 //! conversation, events and mail — belongs to the VERIFIED (workspace,
 //! member). A proven operator connection, an unproven external harness and a
@@ -104,7 +105,7 @@
 use super::*;
 use crate::test_seam::{scoped, Asserted};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -345,7 +346,16 @@ struct Fx {
     /// Wakes a held revalidate pull when the test releases the barrier.
     barrier: Arc<std::sync::Condvar>,
     stop: Arc<AtomicBool>,
-    _platform: std::thread::JoinHandle<()>,
+    /// CAD-2207: serve each platform request on its own worker thread, so a
+    /// test can hold ONE revalidate pull while an independent pull (the
+    /// racing commit's own re-prove) is still answered. Off by default: every
+    /// other fixture keeps the single-threaded accept loop.
+    concurrent: Arc<AtomicBool>,
+    /// The workers `concurrent` mode spawned — joined at teardown.
+    workers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    /// The accept loop, taken and joined at teardown AFTER `stop` so it cannot
+    /// enqueue a worker once the handle drain begins.
+    platform: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Fx {
@@ -374,12 +384,17 @@ impl Fx {
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let barrier = Arc::new(std::sync::Condvar::new());
+        let concurrent = Arc::new(AtomicBool::new(false));
+        let workers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let platform_thread = {
             let stop = stop.clone();
             let authority = authority.clone();
             let barrier = barrier.clone();
             let issuer = issuer.clone();
             let host = host.clone();
+            let concurrent = concurrent.clone();
+            let workers = workers.clone();
             std::thread::spawn(move || {
                 // The verification key the platform publishes — used to
                 // re-verify member-envelope bearers on the revalidate path.
@@ -390,15 +405,40 @@ impl Fx {
                         break;
                     }
                     if let Ok(Some(request)) = platform.recv_timeout(Duration::from_millis(200)) {
-                        Self::answer_platform(
-                            request,
-                            &authority,
-                            &barrier,
-                            &issuer,
-                            &host,
-                            &public_key,
-                            &verify_public,
-                        );
+                        if concurrent.load(Ordering::SeqCst) {
+                            // Off the accept loop: the handler may park this
+                            // request on the barrier, and the platform must
+                            // still answer an INDEPENDENT pull meanwhile
+                            // (CAD-2207 share-revocation ordering).
+                            let authority = authority.clone();
+                            let barrier = barrier.clone();
+                            let issuer = issuer.clone();
+                            let host = host.clone();
+                            let public_key = public_key.clone();
+                            let verify_public = verify_public.clone();
+                            let handle = std::thread::spawn(move || {
+                                Self::answer_platform(
+                                    request,
+                                    &authority,
+                                    &barrier,
+                                    &issuer,
+                                    &host,
+                                    &public_key,
+                                    &verify_public,
+                                );
+                            });
+                            workers.lock().unwrap().push(handle);
+                        } else {
+                            Self::answer_platform(
+                                request,
+                                &authority,
+                                &barrier,
+                                &issuer,
+                                &host,
+                                &public_key,
+                                &verify_public,
+                            );
+                        }
                     }
                 }
             })
@@ -421,13 +461,18 @@ impl Fx {
             authority,
             barrier,
             stop,
-            _platform: platform_thread,
+            concurrent,
+            workers,
+            platform: Some(platform_thread),
         }
     }
 
     /// Release the held pull and wake the server thread.
     fn release_barrier(&self) {
-        self.authority.lock().unwrap().released = true;
+        self.authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .released = true;
         self.barrier.notify_all();
     }
 
@@ -910,7 +955,35 @@ impl Fx {
 
 impl Drop for Fx {
     fn drop(&mut self) {
+        // Order matters. Stop the accept loop and release any parked pull
+        // FIRST, then join the loop, and only then drain the worker handles: a
+        // drain that ran before the loop stopped could miss a worker the loop
+        // enqueued in between, leaking that thread. Nothing is held while
+        // joining, and a lock poisoned by a panicking test is RECOVERED rather
+        // than panicked on again — a second panic during unwinding would abort
+        // the whole test binary instead of reporting one failure.
         self.stop.store(true, Ordering::SeqCst);
+        {
+            let mut guard = self
+                .authority
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.released = true;
+        }
+        self.barrier.notify_all();
+        if let Some(platform) = self.platform.take() {
+            let _ = platform.join();
+        }
+        let workers: Vec<_> = {
+            let mut guard = self
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        for worker in workers {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -2581,6 +2654,384 @@ fn ordinary_job_list_hides_member_private_job_until_shared() {
 }
 
 // ============================================================================
+// Job-share withdrawal on a member-owned job (independent acceptance).
+//
+// The owner shares with the real `member_job_share` RPC and a second member
+// subscribes with the real `member_job_subscribe` RPC. Before withdrawal the
+// subscriber reads job evidence/events through its SIGNED member envelope and
+// the job/task through its bound assistant's generic verbs. The owner then
+// disables the share; afterwards the subscriber's ASSISTANT reads are
+// refused (the subscriber path requires a live share), no private payload is
+// returned, the owner keeps both surfaces, and an unrelated ordinary job is
+// untouched.
+//
+// Required contract (reviewer-confirmed): withdrawal revokes a NEW/existing
+// subscriber's member-envelope reads too. `member_job_evidence`,
+// `member_job_events` and `member_job_list` must refuse/omit the job after
+// `member_job_share(enabled:false)`, even though the subscription row was not
+// retro-removed. The current source gates those on `job_is_subscriber` alone,
+// so the final block below is the RED acceptance for that fix — it is
+// intentionally expected to fail until the handlers consult the shared flag.
+// The assistant-process (generic) reads ARE share-guarded today and are
+// asserted as regressions above.
+// ============================================================================
+
+#[test]
+fn job_share_withdrawal_revokes_the_subscriber_assistant_reads() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let ben = fx.member_runtime("sub-ben");
+
+    let req = fx.op(
+        "member_job_request",
+        json!({
+            "member_envelope": fx.member_envelope("sub-alice"),
+            "title": "a shared job",
+            "request_key": "cad2207-share-withdrawal-1",
+            "body": "private share body",
+        }),
+    );
+    let job = req["job"]
+        .as_str()
+        .expect("member_job_request returned no job")
+        .to_string();
+    let task = fx
+        .shared
+        .store
+        .tasks_for_job(&job)
+        .expect("the job's tasks could not be read")
+        .first()
+        .expect("the member job created no task")
+        .id
+        .clone();
+
+    fx.op(
+        "member_job_share",
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "job": job}),
+    );
+    fx.op(
+        "member_job_subscribe",
+        json!({"member_envelope": fx.member_envelope("sub-ben"), "job": job}),
+    );
+
+    // ---- authorised before withdrawal: BOTH surfaces --------------------
+    let ben_evidence = fx.op(
+        "member_job_evidence",
+        json!({"member_envelope": fx.member_envelope("sub-ben"), "job": job}),
+    );
+    assert_eq!(
+        ben_evidence["job"].as_str(),
+        Some(job.as_str()),
+        "the live subscriber's member evidence did not name the job: {ben_evidence}"
+    );
+    fx.op(
+        "member_job_events",
+        json!({"member_envelope": fx.member_envelope("sub-ben"), "job": job}),
+    );
+    let ben_show = fx
+        .as_assistant(&ben.alias, "job_show", json!({"job": job}))
+        .unwrap_or_else(|e| {
+            panic!("the subscriber's assistant could not read the shared job: {e}")
+        });
+    assert_eq!(
+        ben_show["job"]["id"].as_str(),
+        Some(job.as_str()),
+        "the subscriber's assistant read a different job record: {ben_show}"
+    );
+    for (method, params) in [
+        ("job_events", json!({"job": job})),
+        ("task_show", json!({"task": task})),
+    ] {
+        assert!(
+            fx.as_assistant(&ben.alias, method, params).is_ok(),
+            "the subscriber's assistant lost {method} while the job was shared"
+        );
+    }
+    // Owner control before withdrawal.
+    assert!(
+        fx.as_assistant(&alice.alias, "job_show", json!({"job": job}))
+            .is_ok(),
+        "the owning assistant could not read its own job before withdrawal"
+    );
+
+    // ---- the owner withdraws through the real member RPC ----------------
+    let withdrawn = fx.op(
+        "member_job_share",
+        json!({
+            "member_envelope": fx.member_envelope("sub-alice"),
+            "job": job,
+            "enabled": false,
+        }),
+    );
+    assert_eq!(
+        withdrawn["shared"].as_bool(),
+        Some(false),
+        "the share withdrawal did not report the disabled state: {withdrawn}"
+    );
+
+    // ---- the subscriber's ASSISTANT reads are refused -------------------
+    let before = fx.tree();
+    for (method, params) in [
+        ("job_show", json!({"job": job})),
+        ("job_events", json!({"job": job})),
+        ("task_show", json!({"task": task})),
+    ] {
+        let refused = fx.as_assistant(&ben.alias, method, params.clone());
+        assert!(
+            refused.is_err(),
+            "the subscriber's assistant kept {method} after share withdrawal: {refused:?}"
+        );
+    }
+    assert_eq!(
+        fx.tree(),
+        before,
+        "a refused post-withdrawal read changed the tracker"
+    );
+
+    // ---- the owner keeps both surfaces; an ordinary job is untouched ----
+    assert!(
+        fx.as_assistant(&alice.alias, "job_show", json!({"job": job}))
+            .is_ok(),
+        "the owning assistant lost its own job after withdrawal"
+    );
+    assert!(
+        fx.as_assistant(&alice.alias, "task_show", json!({"task": task}))
+            .is_ok(),
+        "the owning assistant lost its own task after withdrawal"
+    );
+    let alice_evidence = fx.op(
+        "member_job_evidence",
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "job": job}),
+    );
+    assert_eq!(
+        alice_evidence["job"].as_str(),
+        Some(job.as_str()),
+        "the owner lost its own member evidence after withdrawal: {alice_evidence}"
+    );
+    assert!(
+        fx.call(
+            Asserted::Operator,
+            "job_show",
+            json!({"job": alice.foreign_job})
+        )
+        .is_ok(),
+        "an unrelated ordinary job read broke after the share withdrawal"
+    );
+    assert!(
+        fx.call(
+            Asserted::Agent("ordinary-worker".to_string()),
+            "job_show",
+            json!({"job": alice.foreign_job})
+        )
+        .is_ok(),
+        "the ordinary worker lost its own unrelated job after the withdrawal"
+    );
+
+    // ---- signed member route: TARGET contract (RED until the source fix) --
+    // The reviewer-confirmed contract is that withdrawal revokes the
+    // subscriber's member-envelope reads and list entry too. The current
+    // handlers gate on `job_is_subscriber` alone, so these assertions
+    // intentionally fail today.
+    let before_member = fx.tree();
+    assert!(
+        fx.op_err(
+            "member_job_evidence",
+            json!({"member_envelope": fx.member_envelope("sub-ben"), "job": job}),
+        )
+        .is_err(),
+        "the withdrawn subscriber still read member_job_evidence"
+    );
+    assert!(
+        fx.op_err(
+            "member_job_events",
+            json!({"member_envelope": fx.member_envelope("sub-ben"), "job": job}),
+        )
+        .is_err(),
+        "the withdrawn subscriber still read member_job_events"
+    );
+    let ben_list = fx.op(
+        "member_job_list",
+        json!({"member_envelope": fx.member_envelope("sub-ben")}),
+    );
+    assert!(
+        !ben_list["jobs"].as_array().is_some_and(|jobs| jobs
+            .iter()
+            .any(|listed| listed.as_str() == Some(job.as_str()))),
+        "the withdrawn subscriber's member_job_list still carries the job: {ben_list}"
+    );
+    assert_eq!(
+        fx.tree(),
+        before_member,
+        "a refused withdrawn member read changed the tracker"
+    );
+
+    // Owner positives survive the withdrawal on both member verbs.
+    let alice_list = fx.op(
+        "member_job_list",
+        json!({"member_envelope": fx.member_envelope("sub-alice")}),
+    );
+    assert!(
+        alice_list["jobs"].as_array().is_some_and(|jobs| jobs
+            .iter()
+            .any(|listed| listed.as_str() == Some(job.as_str()))),
+        "the owner lost the job from its own member_job_list: {alice_list}"
+    );
+    fx.op(
+        "member_job_events",
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "job": job}),
+    );
+
+    // A FRESH subscribe after withdrawal is refused (no new subscribers).
+    fx.provision("sub-cid");
+    assert!(
+        fx.op_err(
+            "member_job_subscribe",
+            json!({"member_envelope": fx.member_envelope("sub-cid"), "job": job}),
+        )
+        .is_err(),
+        "a fresh subscribe was admitted after the share was withdrawn"
+    );
+}
+
+/// Share withdrawal does not erase an INDEPENDENT assigned role. The
+/// subscriber's assistant is also the real assignee of one task on the
+/// owner's job (`task_new` is `Rule::OnJob` and writes the `tasks.assignee`
+/// row the target guard reads). After the owner withdraws the share, that
+/// task read stays authorized — pre-existing target policy — while the job
+/// itself and the UNASSIGNED sibling task refuse. Subscription alone is
+/// therefore not a grant.
+#[test]
+fn assigned_task_author_keeps_its_read_after_share_withdrawal() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let alice = fx.member_runtime("sub-alice");
+    let ben = fx.member_runtime("sub-ben");
+
+    let req = fx.op(
+        "member_job_request",
+        json!({
+            "member_envelope": fx.member_envelope("sub-alice"),
+            "title": "an assigned-role job",
+            "request_key": "cad2207-assigned-withdrawal-1",
+            "body": "private body",
+        }),
+    );
+    let job = req["job"]
+        .as_str()
+        .expect("member_job_request returned no job")
+        .to_string();
+    // The draft task the member request created: deliberately unassigned.
+    let unassigned = fx
+        .shared
+        .store
+        .tasks_for_job(&job)
+        .expect("the job's tasks could not be read")
+        .first()
+        .expect("the member job created no task")
+        .id
+        .clone();
+    // A REAL second task assigned to the subscribing member's assistant.
+    // The assignment path requires the worker to be in the job PM's group;
+    // record exactly what a join writes (`params.upstream = <job PM>`).
+    // The privacy guard under test reads `tasks.assignee`, never `upstream`.
+    fx.shared
+        .store
+        .set_params(&ben.alias, &json!({"upstream": alice.alias}))
+        .expect("the fixture could not join the assistant to the job group");
+    let assigned = fx
+        .call(
+            Asserted::Operator,
+            "task_new",
+            json!({
+                "job": job,
+                "title": "assigned to the subscriber",
+                "assignee": ben.alias,
+            }),
+        )
+        .unwrap_or_else(|e| panic!("the operator could not add an assigned task: {e}"));
+    let assigned_task = assigned["task"]["id"]
+        .as_str()
+        .expect("task_new returned no task id")
+        .to_string();
+    assert_eq!(
+        fx.shared
+            .store
+            .task(&assigned_task)
+            .expect("the assigned task could not be read")
+            .assignee
+            .as_deref(),
+        Some(ben.alias.as_str()),
+        "the fixture's assigned role was not recorded on the task row"
+    );
+
+    fx.op(
+        "member_job_share",
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "job": job}),
+    );
+    fx.op(
+        "member_job_subscribe",
+        json!({"member_envelope": fx.member_envelope("sub-ben"), "job": job}),
+    );
+    // Both tasks are readable while the share is live.
+    for task in [&assigned_task, &unassigned] {
+        assert!(
+            fx.as_assistant(&ben.alias, "task_show", json!({"task": task}))
+                .is_ok(),
+            "the subscriber's assistant could not read task '{task}' while the job was shared"
+        );
+    }
+
+    fx.op(
+        "member_job_share",
+        json!({
+            "member_envelope": fx.member_envelope("sub-alice"),
+            "job": job,
+            "enabled": false,
+        }),
+    );
+
+    // The independent assigned role survives the withdrawal.
+    assert!(
+        fx.as_assistant(&ben.alias, "task_show", json!({"task": assigned_task}))
+            .is_ok(),
+        "the assigned task author lost its own task after the owner withdrew the share"
+    );
+    // Subscription alone is not a grant: the job and the unassigned sibling
+    // refuse, and the refusals leave no effect.
+    let before = fx.tree();
+    assert!(
+        fx.as_assistant(&ben.alias, "job_show", json!({"job": job}))
+            .is_err(),
+        "the withdrawn subscriber still read the job record"
+    );
+    assert!(
+        fx.as_assistant(&ben.alias, "job_events", json!({"job": job}))
+            .is_err(),
+        "the withdrawn subscriber still read the job events"
+    );
+    assert!(
+        fx.as_assistant(&ben.alias, "task_show", json!({"task": unassigned}))
+            .is_err(),
+        "the withdrawn subscriber still read an unassigned sibling task"
+    );
+    assert_eq!(fx.tree(), before, "a refused read changed the tracker");
+
+    // Owner controls.
+    assert!(
+        fx.as_assistant(&alice.alias, "job_show", json!({"job": job}))
+            .is_ok(),
+        "the owner lost its job while the share was withdrawn"
+    );
+    assert!(
+        fx.as_assistant(&alice.alias, "task_show", json!({"task": unassigned}))
+            .is_ok(),
+        "the owner lost its unassigned task while the share was withdrawn"
+    );
+}
+
 // CAD-2207 independent negative acceptance — a member's personal assistant
 // (its alias, profile, conversation and event stream) belongs to the VERIFIED
 // (workspace, member), not to whoever holds a generic operator connection.
@@ -3363,12 +3814,14 @@ fn human_room_ask_refuses_a_member_private_assistant() {
     assert_eq!(fx.tree(), before, "a refused room ask changed the tracker");
 }
 
-/// CAD-2207: a member assistant's pending request input is private. The
-/// operator keeps the actionable row (`request` + `method`) but never the
-/// params; approval/answers/steering are blocked before the handle is
-/// claimed; only a decline that is a real negative is preserved. The bound
-/// assistant's own connection still sees its input, and an ordinary agent's
-/// request keeps the normal accept path.
+/// CAD-2207: a member assistant's pending requests and their input are the
+/// member's private context. A generic operator connection cannot list them
+/// and cannot answer ANY decision for them — accept, decline (blind or
+/// answered) and the free-text request included: every path refuses BEFORE a
+/// handle is claimed, with the store's generic lifecycle text, and discloses
+/// no alias, handle or input. The pending request and the underlying tracker
+/// stay untouched. Ordinary agents keep the operator's normal listing and
+/// accept/decline paths.
 #[test]
 fn private_request_input_is_withheld_and_blind_approval_is_refused() {
     let _flag = AssistantFlagOn::arm();
@@ -3379,6 +3832,7 @@ fn private_request_input_is_withheld_and_blind_approval_is_refused() {
     const SAFE_HANDLE: &str = "cad2207-private-request";
     const FREETEXT_HANDLE: &str = "cad2207-private-freetext";
     const ORDINARY_HANDLE: &str = "cad2207-ordinary-request";
+    const ORDINARY_DECLINE_HANDLE: &str = "cad2207-ordinary-decline";
 
     let seed = |handle: &str, alias: &str, method: &str| {
         fx.shared.pending.lock().unwrap().insert(
@@ -3399,37 +3853,122 @@ fn private_request_input_is_withheld_and_blind_approval_is_refused() {
     seed(SAFE_HANDLE, &alice.alias, "cadence/approval");
     seed(FREETEXT_HANDLE, &alice.alias, "item/tool/requestUserInput");
     seed(ORDINARY_HANDLE, "ordinary-worker", "cadence/approval");
+    seed(
+        ORDINARY_DECLINE_HANDLE,
+        "ordinary-worker",
+        "cadence/approval",
+    );
 
     let pending_has = |handle: &str| fx.shared.pending.lock().unwrap().contains_key(handle);
+    let pending_shape = || {
+        let mut rows: Vec<(String, String)> = fx
+            .shared
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(handle, request)| (handle.clone(), request.alias.clone()))
+            .collect();
+        rows.sort();
+        rows
+    };
+    let answered_count = || fx.shared.answered.lock().unwrap().len();
+    let generic_refusal = crate::store::RESTRICTED_LIFECYCLE;
+    let assert_generic = |error: &crate::error::Error, what: &str| {
+        let text = error.to_string();
+        assert_eq!(
+            text, generic_refusal,
+            "{what} did not answer with the generic lifecycle refusal: {text}"
+        );
+        for secret in [
+            alice.alias.as_str(),
+            "sub-alice",
+            SAFE_HANDLE,
+            FREETEXT_HANDLE,
+            PRIVATE_INPUT,
+        ] {
+            assert!(
+                !text.contains(secret),
+                "{what} leaked '{secret}' in its refusal: {text}"
+            );
+        }
+    };
 
-    // ---- the operator's listing keeps the row, not the private input ----
-    let listed = fx
+    let before_pending = pending_shape();
+    let before_answered = answered_count();
+    let before_tree = fx.tree();
+    let before_agent = fx.shared.store.agent(&alice.alias).unwrap().to_json();
+    let before_binding = fx
+        .shared
+        .store
+        .assistant_binding(ORG, "sub-alice")
+        .unwrap()
+        .expect("the fixture binding vanished")
+        .to_json();
+
+    // ---- the generic operator cannot even list the private rows ----
+    let error = fx
         .call(
             Asserted::Operator,
             "agent_requests",
             json!({"alias": alice.alias}),
         )
-        .expect("operator agent_requests refused");
-    assert!(
-        !listed.to_string().contains(PRIVATE_INPUT),
-        "the operator's request listing leaked the private input: {listed}"
+        .expect_err("the generic operator listed a member assistant's pending requests");
+    assert_generic(&error, "agent_requests");
+
+    // ---- every decision — blind or answered, accept or decline, provider or
+    // free-text — is refused before the handle is claimed ----
+    for params in [
+        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "accept"}),
+        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "decline"}),
+        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "accept", "answers": {"q": "a"}}),
+        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "decline", "answers": {"q": "a"}}),
+        json!({"alias": alice.alias, "request": FREETEXT_HANDLE, "decision": "decline"}),
+        json!({"alias": alice.alias, "request": FREETEXT_HANDLE, "answers": {"q": "a"}}),
+    ] {
+        let error = fx
+            .call(Asserted::Operator, "agent_respond", params.clone())
+            .expect_err("an operator decision for a member assistant was accepted");
+        assert_generic(&error, "agent_respond");
+    }
+
+    assert_eq!(
+        pending_shape(),
+        before_pending,
+        "a refused listing/decision changed the pending requests"
     );
-    let row = listed["requests"]
-        .as_array()
-        .and_then(|rows| {
-            rows.iter()
-                .find(|r| r["request"].as_str() == Some(SAFE_HANDLE))
-        })
-        .expect("the private request row disappeared from the operator listing");
-    assert_eq!(row["method"].as_str(), Some("cadence/approval"));
     assert!(
-        row["params"].get("withheld").is_some() && row["params"].get("input").is_none(),
-        "the operator's row did not withhold the private params: {row}"
+        pending_has(SAFE_HANDLE) && pending_has(FREETEXT_HANDLE),
+        "a refused decision consumed a private request"
     );
-    // Positive: the redaction is TARGET-keyed — the same operator listing for
-    // an ordinary agent still carries the real params. (The bound assistant's
-    // own connection cannot reach this verb: `agent_requests` is not in the
-    // member-assist verb whitelist, so that branch has no real surface here.)
+    assert_eq!(
+        answered_count(),
+        before_answered,
+        "a refused decision parked an answer"
+    );
+    assert_eq!(
+        fx.tree(),
+        before_tree,
+        "a refused decision changed the tracker"
+    );
+    assert_eq!(
+        fx.shared.store.agent(&alice.alias).unwrap().to_json(),
+        before_agent,
+        "a refused decision changed the assistant's runtime row"
+    );
+    assert_eq!(
+        fx.shared
+            .store
+            .assistant_binding(ORG, "sub-alice")
+            .unwrap()
+            .expect("the fixture binding vanished")
+            .to_json(),
+        before_binding,
+        "a refused decision changed the member binding"
+    );
+
+    // ---- the same operator listing still carries an ordinary agent's real
+    // params: the refusal is target-keyed, not a blanket denial ----
     let ordinary_listed = fx
         .call(
             Asserted::Operator,
@@ -3441,56 +3980,35 @@ fn private_request_input_is_withheld_and_blind_approval_is_refused() {
         ordinary_listed.to_string().contains(PRIVATE_INPUT),
         "the operator's ordinary-agent request listing lost its params: {ordinary_listed}"
     );
-
-    let before = fx.tree();
-    // ---- blind approval / answers / free-text decline are refused, and
-    // refused BEFORE the handle is claimed ----
-    for params in [
-        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "accept"}),
-        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "accept", "answers": {"q": "a"}}),
-        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "decline", "answers": {"q": "a"}}),
-        json!({"alias": alice.alias, "request": FREETEXT_HANDLE, "decision": "decline"}),
-    ] {
-        let refused = fx.call(Asserted::Operator, "agent_respond", params.clone());
-        assert!(
-            refused.is_err(),
-            "an operator decision the reviewer cannot justify was accepted: {params} -> {refused:?}"
-        );
-    }
     assert!(
-        pending_has(SAFE_HANDLE),
-        "a refused decision consumed the safe request"
-    );
-    assert!(
-        pending_has(FREETEXT_HANDLE),
-        "a refused free-text decline consumed the request"
-    );
-    assert_eq!(fx.tree(), before, "a refused decision changed the tracker");
-
-    // ---- the preserved half: a plain decline that is a real negative ----
-    let declined = fx.call(
-        Asserted::Operator,
-        "agent_respond",
-        json!({"alias": alice.alias, "request": SAFE_HANDLE, "decision": "decline"}),
-    );
-    assert!(
-        declined.is_ok(),
-        "the safe decline (executes nothing) was refused: {declined:?}"
-    );
-    assert!(
-        !pending_has(SAFE_HANDLE),
-        "the safe decline did not consume the request"
+        pending_has(ORDINARY_HANDLE) && pending_has(ORDINARY_DECLINE_HANDLE),
+        "the control listing consumed the ordinary requests"
     );
 
-    // ---- ordinary agents keep the normal accept path ----
-    let ordinary = fx.call(
-        Asserted::Operator,
-        "agent_respond",
-        json!({"alias": "ordinary-worker", "request": ORDINARY_HANDLE, "decision": "accept"}),
-    );
+    // ---- ordinary agents keep the normal accept and decline paths ----
+    let ordinary_accept = fx
+        .call(
+            Asserted::Operator,
+            "agent_respond",
+            json!({"alias": "ordinary-worker", "request": ORDINARY_HANDLE, "decision": "accept"}),
+        )
+        .expect("an ordinary agent's request lost the operator accept path");
+    assert_eq!(ordinary_accept["state"], "answered");
     assert!(
-        ordinary.is_ok(),
-        "an ordinary agent's request lost the operator accept path: {ordinary:?}"
+        !pending_has(ORDINARY_HANDLE),
+        "the ordinary accept did not consume its request"
+    );
+    let ordinary_decline = fx
+        .call(
+            Asserted::Operator,
+            "agent_respond",
+            json!({"alias": "ordinary-worker", "request": ORDINARY_DECLINE_HANDLE, "decision": "decline"}),
+        )
+        .expect("an ordinary agent's request lost the operator decline path");
+    assert_eq!(ordinary_decline["state"], "answered");
+    assert!(
+        !pending_has(ORDINARY_DECLINE_HANDLE),
+        "the ordinary decline did not consume its request"
     );
 }
 
@@ -6558,7 +7076,7 @@ fn queued_member_turn_refused_by_original_credential_at_claim() {
         format!("cred-{sub}"),
         "the queued stamp is not the ORIGINAL issuing credential"
     );
-    let taken = fx.shared.take_app_aware(&rt.alias).unwrap();
+    let (taken, _admission) = fx.shared.take_app_aware(&rt.alias).unwrap();
     let crate::store::Take::Message(taken) = taken else {
         panic!("live queued member turn was not taken");
     };
@@ -6613,7 +7131,7 @@ fn queued_member_turn_refused_by_original_credential_at_claim() {
         "the local binding must remain active for this original-credential case"
     );
 
-    let claimed = fx.shared.take_app_aware(&rt.alias).unwrap();
+    let (claimed, _admission) = fx.shared.take_app_aware(&rt.alias).unwrap();
     assert!(
         !matches!(claimed, crate::store::Take::Message(_)),
         "a queued turn whose original credential is dead was taken as runnable"
@@ -12941,115 +13459,444 @@ fn cad2207_retained_mail_alias_reuse_cannot_read_the_old_owner_mail() {
         .is_some_and(|t| t.contains(ORDINARY_BODY)));
 }
 
-/// CAD-2207: the narrow `agent_operational` projection may keep a member
-/// assistant's busy/liveness attribution but must not expose its raw native
-/// thread/session handles. A boolean `needs_native_resume` preserves enough for
-/// resume; ordinary agents keep their raw handles.
+/// CAD-2207: the public update/health projections and `agent_list`'s
+/// `profiles` list may say generic work is in flight, but they must never
+/// name a bound member assistant, its private message, or its runtime slot.
+/// A real assistant is bound and given a running turn; an ordinary worker
+/// stays visible as the positive control. The update projections must still
+/// report busy so an upgrade cannot read private work as idle.
 #[test]
-fn cad2207_agent_operational_hides_private_native_session_ids() {
+fn cad2207_public_update_health_and_profile_lists_withhold_private_runtime() {
+    const PRIVATE_SUB: &str = "sub-priv-public";
+    const PRIVATE_ALIAS: &str = "assist-agent-sub-priv-public";
+    const PRIVATE_BODY: &str = "cad2207 private in-flight body";
+    const PRIVATE_MSG: &str = "cad2207-private-inflight-msg";
+    const SHARED_PROFILE: &str = "cad2207-shared-profile";
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     with_deferred_service(&fx);
-    let alice = fx.member_runtime("sub-alice");
-    let ben = fx.member_runtime("sub-ben");
+    let rt = fx.member_runtime(PRIVATE_SUB);
+    assert_eq!(
+        rt.alias, PRIVATE_ALIAS,
+        "the fixture bound an unexpected private alias"
+    );
+    assert!(
+        fx.shared
+            .store
+            .assistant_for_alias(PRIVATE_ALIAS)
+            .unwrap()
+            .is_some(),
+        "the private assistant was not really bound"
+    );
+    let private_agent = fx.shared.store.agent(PRIVATE_ALIAS).unwrap();
+    assert_eq!(
+        (
+            private_agent.provider.as_str(),
+            private_agent.endpoint_kind.as_str()
+        ),
+        ("pi", "managed"),
+        "the private assistant has no actor, so it cannot exercise update waiting"
+    );
+
+    // Give the public profile a runtime binding to the private assistant. The
+    // profile itself is a normal shared definition; only its runtime alias is
+    // private and must disappear from the public projection.
+    let created = fx.op(
+        "agent_profile_create",
+        json!({"alias": SHARED_PROFILE, "catalogue": "developer"}),
+    );
+    assert_eq!(
+        created["id"].as_str(),
+        Some(SHARED_PROFILE),
+        "the shared profile was not created: {created}"
+    );
+    let mut private_params = private_agent.params.clone().unwrap_or_else(|| json!({}));
+    private_params["profile"] = json!(SHARED_PROFILE);
+    let private_params = private_params.to_string();
     fx.shared
         .store
         .fixture_write(|tx| {
             tx.execute(
-                "UPDATE agents SET thread_id=?, session_id=?, endpoint=NULL WHERE alias=?",
-                rusqlite::params![
-                    "private-thread-secret",
-                    "private-session-secret",
-                    alice.alias
-                ],
+                "UPDATE agents SET params=? WHERE alias=?",
+                rusqlite::params![private_params, PRIVATE_ALIAS],
             )?;
             tx.execute(
-                "UPDATE agents SET thread_id=?, session_id=?, endpoint=? WHERE alias=?",
+                "INSERT INTO messages(id,alias,body,reply_to,source,state,created,recipient_uid) \
+                 VALUES(?1,?2,?3,NULL,'user','running',?4,?5)",
                 rusqlite::params![
-                    "private-live-thread",
-                    "private-live-session",
-                    "private-endpoint-live",
-                    ben.alias
-                ],
-            )?;
-            tx.execute(
-                "UPDATE agents SET thread_id=?, session_id=?, endpoint=NULL WHERE alias=?",
-                rusqlite::params![
-                    "ordinary-thread-secret",
-                    "ordinary-session-secret",
-                    "ordinary-worker"
+                    PRIVATE_MSG,
+                    PRIVATE_ALIAS,
+                    PRIVATE_BODY,
+                    crate::store::now_public(),
+                    private_agent.uid
                 ],
             )?;
             Ok(())
         })
         .unwrap();
-
-    let operational = fx.op("agent_operational", json!({}));
-    let agents = operational["agents"]
-        .as_array()
-        .expect("agent_operational carries no agents array");
-    fn operational_row<'a>(agents: &'a [Value], alias: &str) -> &'a Value {
-        agents
+    assert!(
+        fx.shared
+            .store
+            .inflight_messages()
+            .unwrap()
             .iter()
-            .find(|row| row["alias"].as_str() == Some(alias))
-            .unwrap_or_else(|| panic!("agent_operational lost '{alias}'"))
+            .any(|(alias, id, _, _)| alias.as_str() == PRIVATE_ALIAS && id == PRIVATE_MSG),
+        "the private running turn was not stored for the update gate"
+    );
+
+    fn busy(value: &Value) -> bool {
+        match value {
+            Value::Number(number) => number.as_u64().is_some_and(|n| n > 0),
+            Value::Bool(flag) => *flag,
+            Value::Array(rows) => !rows.is_empty(),
+            Value::Object(fields) => fields.values().any(busy),
+            Value::String(text) => !text.is_empty(),
+            Value::Null => false,
+        }
     }
-    let private_with_session = operational_row(agents, &alice.alias);
-    assert!(
-        private_with_session["thread_id"].is_null(),
-        "agent_operational exposed a private native thread id: {private_with_session}"
-    );
-    assert!(
-        private_with_session["session_id"].is_null(),
-        "agent_operational exposed a private native session id: {private_with_session}"
-    );
-    assert!(
-        private_with_session["endpoint"].is_null(),
-        "agent_operational exposed a private endpoint handle: {private_with_session}"
-    );
-    assert_eq!(
-        private_with_session["needs_native_resume"],
-        json!(true),
-        "the private agent lost its resume boolean"
-    );
-    let private_live_endpoint = operational_row(agents, &ben.alias);
-    assert!(private_live_endpoint["thread_id"].is_null());
-    assert!(private_live_endpoint["session_id"].is_null());
-    assert!(private_live_endpoint["endpoint"].is_null());
-    assert_eq!(
-        private_live_endpoint["needs_native_resume"],
-        json!(false),
-        "a live private endpoint should project needs_native_resume=false"
-    );
-    let ordinary = operational_row(agents, "ordinary-worker");
-    assert_eq!(
-        ordinary["thread_id"],
-        json!("ordinary-thread-secret"),
-        "ordinary thread id was hidden: {ordinary}"
-    );
-    assert_eq!(
-        ordinary["session_id"],
-        json!("ordinary-session-secret"),
-        "ordinary session id was hidden: {ordinary}"
-    );
-    assert_eq!(
-        ordinary["needs_native_resume"],
-        json!(true),
-        "ordinary projection lost needs_native_resume"
-    );
-    let raw = operational.to_string();
-    for secret in [
-        "private-thread-secret",
-        "private-session-secret",
-        "private-live-thread",
-        "private-live-session",
-        "private-endpoint-live",
-    ] {
+    let busy_signal = |response: &Value| {
+        [
+            "unattributed_work_pending",
+            "private_waiting",
+            "update_waiting",
+            "waiting",
+            "waiting_count",
+            "blockers",
+            "blocked",
+            "busy",
+        ]
+        .iter()
+        .any(|key| response.get(*key).is_some_and(busy))
+    };
+    fn assert_opaque_waiting_row(response: &Value, key: &str, label: &str) {
+        let rows = response[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label} {key} is not an array: {response}"));
         assert!(
-            !raw.contains(secret),
-            "agent_operational serialized a private native handle '{secret}': {operational}"
+            !rows.is_empty(),
+            "{label} {key} hid the private-only in-flight work: {response}"
+        );
+        assert!(
+            rows.iter().any(|row| {
+                row.get("alias").and_then(Value::as_str).is_some()
+                    && row.get("message").and_then(Value::as_str).is_some()
+                    && row.get("state").and_then(Value::as_str).is_some()
+                    && row.get("age_secs").and_then(Value::as_f64).is_some()
+            }),
+            "{label} {key} has no client-visible opaque waiter row: {response}"
+        );
+    }
+
+    for (who, label) in [
+        (Asserted::Operator, "operator"),
+        (Asserted::Unproven, "nonowner"),
+    ] {
+        let health = fx
+            .call(who.clone(), "health", json!({}))
+            .unwrap_or_else(|e| panic!("{label} health refused: {e}"));
+        assert!(
+            busy_signal(&health),
+            "{label} health read private work as idle: {health}"
+        );
+        assert_opaque_waiting_row(&health, "update_waiting", label);
+        for secret in [PRIVATE_ALIAS, PRIVATE_MSG, PRIVATE_BODY] {
+            assert!(
+                !health.to_string().contains(secret),
+                "{label} health exposed private '{secret}': {health}"
+            );
+        }
+
+        let status = fx
+            .call(who.clone(), "update_status", json!({}))
+            .unwrap_or_else(|e| panic!("{label} update_status refused: {e}"));
+        assert!(
+            busy_signal(&status),
+            "{label} update_status read private work as idle: {status}"
+        );
+        assert_opaque_waiting_row(&status, "waiting", label);
+        for secret in [PRIVATE_ALIAS, PRIVATE_MSG, PRIVATE_BODY] {
+            assert!(
+                !status.to_string().contains(secret),
+                "{label} update_status exposed private '{secret}': {status}"
+            );
+        }
+
+        let listed = fx
+            .call(who.clone(), "agent_list", json!({}))
+            .unwrap_or_else(|e| panic!("{label} agent_list refused: {e}"));
+        let aliases: Vec<&str> = listed["agents"]
+            .as_array()
+            .expect("agent_list carries no agents array")
+            .iter()
+            .filter_map(|agent| agent["alias"].as_str())
+            .collect();
+        assert!(
+            aliases.contains(&"ordinary-worker"),
+            "{label} agent_list lost the ordinary worker: {listed}"
+        );
+        assert!(
+            !aliases.contains(&PRIVATE_ALIAS),
+            "{label} agent_list exposed the private assistant row: {listed}"
+        );
+        for secret in [PRIVATE_ALIAS, PRIVATE_MSG, PRIVATE_BODY] {
+            assert!(
+                !listed.to_string().contains(secret),
+                "{label} agent_list exposed private '{secret}': {listed}"
+            );
+        }
+        let profiles = listed["profiles"]
+            .as_array()
+            .expect("agent_list carries no profiles array");
+        let shared = profiles
+            .iter()
+            .find(|profile| profile["id"].as_str() == Some(SHARED_PROFILE))
+            .unwrap_or_else(|| panic!("{label} agent_list lost the shared profile: {listed}"));
+        assert!(
+            !shared["runtimes"]
+                .as_array()
+                .expect("the shared profile carries no runtimes array")
+                .iter()
+                .any(|runtime| runtime.as_str() == Some(PRIVATE_ALIAS)),
+            "{label} agent_list.profiles exposed the private runtime: {shared}"
+        );
+    }
+}
+
+/// CAD-2207: the public update wait list must be ONE generic aggregate row
+/// for any in-flight actor. Private-only and ordinary-only work are therefore
+/// indistinguishable in the meaningful status fields, while neither exposes
+/// its alias, message id, body, a private label or a class-specific flag. The
+/// ordinary agent remains visible in `agent_list`.
+#[test]
+fn cad2207_public_waiting_shape_is_identical_for_private_and_ordinary_work() {
+    const ORDINARY: &str = "cad2207-wait-ordinary";
+    const ORDINARY_MSG: &str = "cad2207-wait-ordinary-msg";
+    const ORDINARY_BODY: &str = "cad2207 ordinary in-flight body";
+    const PRIVATE_SUB: &str = "sub-wait-shape";
+    const PRIVATE_MSG: &str = "cad2207-wait-private-msg";
+    const PRIVATE_BODY: &str = "cad2207 private in-flight body";
+    let _flag = AssistantFlagOn::arm();
+
+    #[derive(Debug, PartialEq)]
+    struct WaitingShape {
+        rows: usize,
+        keys: BTreeSet<String>,
+        state: Option<String>,
+        age_secs_is_number: bool,
+        count: Option<u64>,
+    }
+    fn waiting_shape(response: &Value, key: &str, label: &str) -> WaitingShape {
+        let rows = response[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label} {key} is not an array: {response}"));
+        assert_eq!(
+            rows.len(),
+            1,
+            "{label} {key} must be one aggregate row, not per-actor rows: {response}"
+        );
+        let row = rows[0]
+            .as_object()
+            .unwrap_or_else(|| panic!("{label} {key} row is not an object: {response}"));
+        for field in ["alias", "message", "state"] {
+            assert!(
+                row.get(field).is_some_and(Value::is_string),
+                "{label} {key} row has no string {field}: {response}"
+            );
+        }
+        assert!(
+            row.get("age_secs").and_then(Value::as_u64).is_some(),
+            "{label} {key} row has no nonnegative numeric age_secs: {response}"
+        );
+        let keys: BTreeSet<String> = row.keys().cloned().collect();
+        assert!(
+            !keys.iter().any(|field| {
+                let field = field.to_ascii_lowercase();
+                field.contains("private")
+                    || field.contains("ordinary")
+                    || field.contains("restricted")
+                    || field.contains("unattributed")
+                    || field.contains("class")
+            }),
+            "{label} {key} carries a class-specific field: {response}"
+        );
+        for text in row.values().filter_map(Value::as_str) {
+            let text = text.to_ascii_lowercase();
+            assert!(
+                !text.contains("private")
+                    && !text.contains("ordinary")
+                    && !text.contains("restricted"),
+                "{label} {key} carries a class label: {response}"
+            );
+        }
+        WaitingShape {
+            rows: rows.len(),
+            keys,
+            state: row.get("state").and_then(Value::as_str).map(str::to_string),
+            // Age is a live clock observation, not fixture-stable; only its
+            // nonnegative numeric type is part of the privacy shape.
+            age_secs_is_number: true,
+            count: response.get("waiting_count").and_then(Value::as_u64),
+        }
+    }
+    fn assert_no_class_flag(response: &Value, label: &str) {
+        for key in [
+            "private_waiting",
+            "ordinary_waiting",
+            "unattributed_work_pending",
+            "restricted_work_pending",
+        ] {
+            assert!(
+                response.get(key).is_none(),
+                "{label} exposes class-specific flag '{key}': {response}"
+            );
+        }
+    }
+    fn insert_running(fx: &Fx, alias: &str, id: &str, body: &str) {
+        let uid = fx.shared.store.agent(alias).unwrap().uid;
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "INSERT INTO messages(id,alias,body,reply_to,source,state,created,recipient_uid) \
+                     VALUES(?1,?2,?3,NULL,'user','running',?4,?5)",
+                    rusqlite::params![id, alias, body, crate::store::now_public(), uid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    // Ordinary-only fixture: one ordinary actor with a running turn.
+    let ordinary = Fx::new();
+    with_deferred_service(&ordinary);
+    let ordinary_cwd = ordinary.dir.path().join("ordinary-wait-cwd");
+    std::fs::create_dir_all(&ordinary_cwd).unwrap();
+    ordinary
+        .shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias: ORDINARY,
+            provider: "fake",
+            endpoint_kind: "fake",
+            role: "worker",
+            cwd: ordinary_cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    insert_running(&ordinary, ORDINARY, ORDINARY_MSG, ORDINARY_BODY);
+
+    // Private-only in-flight work: the member assistant is bound and has the
+    // running turn; the ordinary worker only has its queued foreign seed.
+    let private = Fx::new();
+    with_deferred_service(&private);
+    let rt = private.member_runtime(PRIVATE_SUB);
+    let private_alias = rt.alias.clone();
+    insert_running(&private, &private_alias, PRIVATE_MSG, PRIVATE_BODY);
+
+    for (who, label) in [
+        (Asserted::Operator, "operator"),
+        (Asserted::Unproven, "nonowner"),
+    ] {
+        let ordinary_health = ordinary
+            .call(who.clone(), "health", json!({}))
+            .unwrap_or_else(|e| panic!("{label} ordinary health refused: {e}"));
+        let private_health = private
+            .call(who.clone(), "health", json!({}))
+            .unwrap_or_else(|e| panic!("{label} private health refused: {e}"));
+        for response in [&ordinary_health, &private_health] {
+            assert_no_class_flag(response, label);
+            for secret in [
+                ORDINARY,
+                ORDINARY_MSG,
+                ORDINARY_BODY,
+                private_alias.as_str(),
+                PRIVATE_MSG,
+                PRIVATE_BODY,
+            ] {
+                assert!(
+                    !response.to_string().contains(secret),
+                    "{label} health exposed '{secret}': {response}"
+                );
+            }
+        }
+        assert_eq!(
+            waiting_shape(&ordinary_health, "update_waiting", label),
+            waiting_shape(&private_health, "update_waiting", label),
+            "{label} health waiting shapes differ between ordinary and private work"
+        );
+
+        let ordinary_status = ordinary
+            .call(who.clone(), "update_status", json!({}))
+            .unwrap_or_else(|e| panic!("{label} ordinary update_status refused: {e}"));
+        let private_status = private
+            .call(who.clone(), "update_status", json!({}))
+            .unwrap_or_else(|e| panic!("{label} private update_status refused: {e}"));
+        for response in [&ordinary_status, &private_status] {
+            assert_no_class_flag(response, label);
+            for secret in [
+                ORDINARY,
+                ORDINARY_MSG,
+                ORDINARY_BODY,
+                private_alias.as_str(),
+                PRIVATE_MSG,
+                PRIVATE_BODY,
+            ] {
+                assert!(
+                    !response.to_string().contains(secret),
+                    "{label} update_status exposed '{secret}': {response}"
+                );
+            }
+        }
+        assert_eq!(
+            waiting_shape(&ordinary_status, "waiting", label),
+            waiting_shape(&private_status, "waiting", label),
+            "{label} update_status waiting shapes differ between ordinary and private work"
+        );
+
+        let listed = ordinary
+            .call(who, "agent_list", json!({}))
+            .unwrap_or_else(|e| panic!("{label} ordinary agent_list refused: {e}"));
+        assert!(
+            listed["agents"].as_array().is_some_and(|rows| rows
+                .iter()
+                .any(|row| row["alias"].as_str() == Some(ORDINARY))),
+            "{label} ordinary agent_list lost its visible ordinary agent: {listed}"
         );
     }
 }
 
 // CAD-1767 G2: the member-assist-history half (check author, failing first).
+
+// CAD-2207: independent acceptance for LOCAL share-revocation ordering against
+// an in-flight notice turn (see the module header for its narrow scope, the
+// deterministic barrier, the expected red and the run command).
+mod cad2207_share_revocation_ordering;
+// CAD-2207: independent acceptance for the operator's cross-agent work
+// conversation view (`work_conversation_list` / `work_conversation_read`),
+// including durable provenance after an `agents` row is gone (see the module
+// header for its scope, the expected red and the cases it does not cover).
+mod cad2207_activity_privacy;
+mod cad2207_work_conversation_privacy;
+// CAD-2207: independent acceptance for the dispatcher/store lifecycle guards
+// on a member's personal assistant — generic operator verbs and the direct
+// store remove/gc/archive/restore paths refuse it, with ordinary controls and
+// the binding's in-flight fence ordering (see the module header for its
+// narrow scope and the cases it does not claim).
+mod cad2207_lifecycle_guard;
+// CAD-2207: independent acceptance for the legacy topic verbs on a MIXED
+// fleet topic — generic operator membership mutation of a bound assistant,
+// its own publish, and non-owner reads/aggregate counts must refuse or
+// withhold while already-shared history and ordinary peers stay usable (see
+// the module header for its narrow scope and the fixture seam report).
+mod cad2207_topic_privacy;
+// CAD-2207: independent acceptance for the operator SETTINGS and MODEL-DEFAULTS
+// projections on a mixed fleet — observed-model suggestions, live-use counts,
+// profile used-by lists and the settings write's reference refusal must withhold
+// a bound private assistant's alias/subject/model while ordinary rows stay
+// visible, with the refused write proven not to mutate (see the module header
+// for its scope, the profile-pointer limitation and the run command).
+mod cad2207_settings_models_privacy;

@@ -374,6 +374,9 @@ impl Shared {
                 "deliveries": [],
             }));
         }
+        if let crate::peer::AgentCaller::Agent(alias) = &caller {
+            self.refuse_restricted_agent(alias)?;
+        }
         self.may_use_topic(&caller, &topic, "topic_publish")?;
         let (sender_uid, sender_label) = match &caller {
             crate::peer::AgentCaller::Operator => (None, "operator".to_string()),
@@ -391,7 +394,7 @@ impl Shared {
             &sender_label,
             text,
         )?;
-        let stored = self.store.topic_deliveries(&post)?;
+        let stored = self.store.topic_visible_deliveries(&post)?;
         // Wake each notified member after the commit, so its parked actor
         // claims the notice now (the claim consumes it without a turn).
         if fresh {
@@ -456,6 +459,7 @@ impl Shared {
         let client_id = required_str(params, "id")?;
         identifier(client_id, "request ID")?;
         let target = self.resolve_alias(required_str(params, "target")?)?;
+        self.refuse_restricted_agent(&target)?;
         let target_uid = self.store.agent(&target)?.uid;
         if !self.store.topic_is_subscriber(&topic.id, &target_uid)? {
             return Err(Error::rejected(
@@ -464,32 +468,18 @@ impl Shared {
         }
         let post = crate::store::topic_post_id(&topic.id, client_id);
         let request_id = crate::store::topic_request_id(&topic.id, client_id);
-        // Envelope check before any side effect: an existing post under this
-        // client id must match the same target, text and topic.
-        if let Some(existing) = self.store.topic_post_by_id(&post)? {
-            if existing.body != text || existing.sender != "operator" {
-                return Err(Error::rejected(
-                    "Request id was already used with different content",
-                ));
-            }
-            if let Some(bound) = self.store.topic_post_request(&post)? {
-                // A retry names its target again: the bound request must have
-                // been queued to that same UID, or the retry is refused. A
-                // missing or unaddressed request fails closed.
-                let bound_uid = self.store.message(&bound)?.and_then(|m| m.recipient_uid);
-                if bound_uid.as_deref() != Some(target_uid.as_str()) {
-                    return Err(Error::rejected(
-                        "Request id was already used with a different target",
-                    ));
-                }
-                return Ok(json!({
-                    "topic": topic.id,
-                    "message": post,
-                    "request": bound,
-                    "target": {"alias": target, "uid": target_uid},
-                    "duplicate": true,
-                }));
-            }
+        // A retry's target, binding and stored envelope are checked together.
+        if let Some(bound) =
+            self.store
+                .topic_existing_request_for_target(&post, text, &target, &target_uid)?
+        {
+            return Ok(json!({
+                "topic": topic.id,
+                "message": post,
+                "request": bound,
+                "target": {"alias": target, "uid": target_uid},
+                "duplicate": true,
+            }));
         }
         // The one request's body names the group. Its real UTF-8 byte length
         // is checked here, before any post insert or send, so an oversize
@@ -560,63 +550,41 @@ impl Shared {
         if topic.kind == crate::store::human_threads::ROOM_TOPIC_TYPE {
             return self.human_room_agent_read(&caller, &topic, params, limit);
         }
+        if let crate::peer::AgentCaller::Agent(alias) = &caller {
+            self.refuse_restricted_agent(alias)?;
+        }
         self.may_use_topic(&caller, &topic, "topic_read")?;
         let before = optional_i64(params, "before");
         let after = optional_i64(params, "after");
-        let posts = self.store.topic_posts(&topic.id, before, after, limit)?;
+        let posts = self
+            .store
+            .topic_visible_posts(&topic.id, before, after, limit)?;
         let cursor = posts.last().map(|p| p.seq).unwrap_or(0);
         let more_before = match posts.first() {
-            Some(first) => self.store.topic_has_posts_before(&topic.id, first.seq)?,
+            Some(first) => self
+                .store
+                .topic_has_visible_posts_before(&topic.id, first.seq)?,
             None => false,
         };
         let mut out = Vec::with_capacity(posts.len());
         for post in &posts {
             let mut row = post.to_json();
             row["body"] = json!(store::conversations::body(&post.body));
-            let request = self.store.topic_post_request(&post.id)?;
-            let mut receipts = Vec::new();
-            if let Some(req) = &request {
-                // An Ask has one bound request: its one receipt names the
-                // recipient the request was queued to, not every subscriber.
-                let (uid, alias, state) = match self.store.message(req)? {
-                    Some(m) => (m.recipient_uid, m.recipient, m.state),
-                    None => (None, None, "unknown".into()),
-                };
-                let removed = match &uid {
-                    Some(u) => self.store.alias_of_uid(u)?.is_none(),
-                    None => false,
-                };
-                receipts.push(json!({
-                    "uid": uid,
-                    "alias": alias,
-                    "removed": removed,
-                    "message": req,
-                    "state": state,
-                }));
+            let (has_request, request) = self.store.topic_visible_request(&post.id)?;
+            let visible_request = request.as_ref().and_then(|receipt| receipt.message.clone());
+            let receipts = if has_request {
+                request
+                    .into_iter()
+                    .map(|receipt| receipt.to_json())
+                    .collect()
             } else {
-                for d in self.store.topic_deliveries(&post.id)? {
-                    // A queued delivery shows its message row's live state (a
-                    // queued notice is never shown as seen); a pending intent
-                    // shows `pending`.
-                    let state = match &d.message {
-                        Some(id) => self
-                            .store
-                            .message(id)?
-                            .map(|m| m.state)
-                            .unwrap_or_else(|| "unknown".into()),
-                        None => d.state.clone(),
-                    };
-                    let removed = self.store.alias_of_uid(&d.uid)?.is_none();
-                    receipts.push(json!({
-                        "uid": d.uid,
-                        "alias": d.alias,
-                        "removed": removed,
-                        "message": d.message,
-                        "state": state,
-                    }));
-                }
-            }
-            row["request"] = json!(request);
+                self.store
+                    .topic_visible_deliveries(&post.id)?
+                    .into_iter()
+                    .map(|receipt| receipt.to_json())
+                    .collect()
+            };
+            row["request"] = json!(visible_request);
             row["deliveries"] = Value::Array(receipts);
             out.push(row);
         }

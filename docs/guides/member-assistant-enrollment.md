@@ -187,11 +187,35 @@ When an alias is bound to a member assistant, earlier event history and
 unproved legacy effect routing remain withheld rather than being assigned to
 the new assistant by alias alone.
 
-Share revocation is rechecked when a notice is committed and admitted, but it
-is not atomic with provider submission. A notice already admitted can still
-reach the provider after a concurrent revocation. Do not claim a complete
-revocation guarantee from this candidate; same-UID credential custody remains
-the separate CAD-2148 blocker.
+For a subscriber notice whose local admission is held, an owner attempting to
+withdraw the job share receives a refusal while that attempt is in progress;
+the share remains enabled and the owner can retry. Withdrawal also blocks
+subsequent subscriber evidence and event reads, while separately assigned work
+keeps its own authority. This is not a complete revocation guarantee: a queue
+head can change before its own admission, background readers can still load
+queued or retained content, and remote membership revocation is not serialized
+with local submission. Already-sent provider requests cannot be recalled.
+
+For a stable binding, generic non-human topic membership refuses a bound
+assistant, generic topic reads and work-list aggregates omit its posts, and
+ordinary publications do not deliver notices to it. This is still not a
+complete privacy boundary: work-conversation and settings projections can race
+a binding change; topic reads can outlive the snapshot that authorized them;
+and shared topic cursors use global sequence numbers that can reveal
+intervening activity. The topic Ask post and queue writes are not yet one
+transaction. Other legacy paths also need an authorization audit. Do not rely
+on this candidate for owner-only confidentiality until those paths are fixed
+and verified.
+
+In this candidate, native daemons mark privacy-sensitive RPC responses, and
+updated clients refuse unmarked legacy projections. Update status reports an
+incompatible or unavailable daemon instead of claiming it is idle; health
+reports an unavailable waiting list as unknown when the local store cannot be
+read. CLI and board resume, unfence and instruction changes prove the fleet
+protocol on the same connection as the mutation, without reconnecting or
+replaying it. Other mutation paths still need that treatment. These changes do
+not protect an older client talking to an older daemon. Same-UID credential
+custody remains the separate CAD-2148 blocker.
 
 CAD-1817 remains pending genuine candidate acceptance until these observations
 exist. Source review, CI, a credential-free preflight and a Worker conversation

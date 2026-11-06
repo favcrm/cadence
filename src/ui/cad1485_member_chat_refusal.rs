@@ -334,3 +334,6 @@ fn member_chat_refuses_another_members_signed_authority_before_effect() {
 // production wiring. See the module's own docs for what it pins.
 #[path = "cad2207_native_http_acceptance.rs"]
 mod cad2207_native_http_acceptance;
+
+#[path = "cad2207_no_list_acceptance.rs"]
+mod cad2207_no_list_acceptance;

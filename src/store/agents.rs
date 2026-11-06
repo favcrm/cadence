@@ -18,6 +18,14 @@ use super::{now, Store};
 pub(crate) const AGENT_GC_RECORDS_ONLY: &str = "records only: frees no memory and no disk; \
      a removed agent can no longer be resumed";
 
+/// CAD-2207: the one refusal for a generic lifecycle target bound to a
+/// member's personal assistant. Deliberately generic — it names neither
+/// the alias nor the binding nor the member, so a guessed alias learns
+/// only that the target is not generically manageable. The same text is
+/// used by the daemon's controls and by the store's final transactions
+/// (a candidate snapshot may predate the bind).
+pub(crate) const RESTRICTED_LIFECYCLE: &str = "lifecycle target is unavailable to this operation";
+
 /// The agent-state vocabulary — the `agents.state` column values —
 /// for `agent list --state` (CAD-437). `attention` is a fence, `error`
 /// is recorded on the row but never stored as a state.
@@ -1283,6 +1291,13 @@ impl Store {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
+            // CAD-2207: a member-bound assistant's runtime row is the
+            // owner's to remove through its own signed route. Checked in
+            // the same transaction as the delete, so a candidate snapshot
+            // taken before the bind can never remove it either.
+            if self.assistant_for_alias_in(&tx, alias)?.is_some() {
+                return Err(Error::rejected(RESTRICTED_LIFECYCLE));
+            }
             // P-DEL-a: an archived row refuses every delete, `force`
             // included. This check runs before any prune.
             if agent.archived_at.is_some() {
@@ -1592,6 +1607,12 @@ impl Store {
     }
 
     fn archive_plan_in(&self, conn: &impl StoreConn, alias: &str) -> Result<ArchivePlan> {
+        // CAD-2207: plan state (existence, revision, open counts) is the
+        // member's private data. Refuse before reading any of it; apply
+        // and restore re-prove this in their own transactions.
+        if self.assistant_for_alias_in(conn, alias)?.is_some() {
+            return Err(Error::rejected(RESTRICTED_LIFECYCLE));
+        }
         let agent = self.agent_in(conn, alias)?;
         let open_messages: Vec<(String, String)> = conn.query_vec(
             "SELECT id,state FROM messages WHERE alias=? AND source != 'topic_notice'
@@ -1814,6 +1835,13 @@ impl Store {
             else {
                 return Ok(None);
             };
+            // CAD-2207: the automatic sweep never removes a member-bound
+            // assistant's row. Checked inside this transaction, so a
+            // candidate list captured before the bind cannot delete it.
+            // `None` is silent: the timer never names a withheld alias.
+            if self.assistant_for_alias_in(&tx, alias)?.is_some() {
+                return Ok(None);
+            }
             if agent.archived_at.is_some() {
                 return Ok(None);
             }

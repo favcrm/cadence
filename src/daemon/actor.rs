@@ -56,6 +56,9 @@ impl Shared {
         alias: &str,
         enable: bool,
     ) -> Result<bool> {
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(Error::rejected("the daemon is closing; no new actor"));
+        }
         if self.execution_mode.fenced() {
             return Err(crate::backup::portable_fence::fence_refusal("agent start"));
         }
@@ -510,7 +513,8 @@ impl Shared {
                     .wait_if_unchanged(ticket, Instant::now() + self.idle_poll);
                 continue;
             }
-            match self.take_app_aware(alias)? {
+            let (next, taken_admission) = self.take_app_aware(alias)?;
+            match next {
                 Take::Stop => return Ok(()),
                 Take::Empty => {
                     if adapter.disconnected() {
@@ -525,6 +529,32 @@ impl Shared {
                         .wait_if_unchanged(ticket, Instant::now() + self.idle_poll);
                 }
                 Take::Message(message) => {
+                    // Carry a subscriber's claim admission through prompt
+                    // assembly and the provider attempt. If the queue head
+                    // changed during claim, reserve the actual notice now.
+                    let admission = match taken_admission {
+                        Some(admission) => Ok(Some(admission)),
+                        None => self.admit_assist_notice(&message),
+                    }
+                    .and_then(|admission| {
+                        if message.source == "assist_job_event" {
+                            self.member_message_reprove(&message)
+                                .map_err(|error| Error::PreWrite(error.to_string()))?;
+                        }
+                        Ok(admission)
+                    });
+                    let _notice_admission = match admission {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            let reason = error.to_string();
+                            let failed = json!({"status": "failed", "text": "", "error": reason});
+                            self.store
+                                .finish(&message, "failed", &failed, Some(&reason))?;
+                            self.notify_routed_target(&message, &failed);
+                            self.wake();
+                            continue;
+                        }
+                    };
                     // A gate refusal requeues the same message, so its
                     // proven render-miss budget must survive the wait. If a
                     // queued row was cancelled while waiting, start the next
@@ -743,6 +773,10 @@ impl Shared {
                             // after a tool is not offered — retrying
                             // would replay work that already ran, and
                             // that turn stays failed with its limitation.
+                            if message.source == "assist_job_event" {
+                                self.member_message_reprove(&message)
+                                    .map_err(|error| Error::PreWrite(error.to_string()))?;
+                            }
                             let (base, pack) = self.after_session_reset_parts(
                                 &agent,
                                 &message,
@@ -787,6 +821,9 @@ impl Shared {
                                 }
                                 None => prompt,
                             };
+                            if message.source == "assist_job_event" {
+                                self.admit_app_submission(&message)?;
+                            }
                             adapter.run_turn_slotted(
                                 &prompt,
                                 slot.as_deref(),

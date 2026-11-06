@@ -46,9 +46,9 @@ use serde_json::{json, Value};
 use tiny_http::{Header, Request, Response, StatusCode};
 
 use super::{
-    agent_roots, coded_response, guard_fail, header_value, parse_json, pct_decode, proxied_actor,
-    read_body, tailnet_proxy, write_guard, DeviceLogin, DevicePending, HttpResp, ServeOpts,
-    UI_ACTOR,
+    board_peer_agent, coded_response, guard_fail, header_value, parse_json, pct_decode,
+    proxied_actor, read_body, tailnet_proxy, write_guard, DeviceLogin, DevicePending, HttpResp,
+    PeerAgentVerdict, ServeOpts, UI_ACTOR,
 };
 use crate::client;
 use crate::operator_auth::Origin;
@@ -1096,15 +1096,21 @@ pub(super) fn authenticate_peer(
             "session_from_agent",
             &format!("credential entry sign-in refused: this connection is agent '{alias}'"),
         )),
+        Attribution::AgentOpaque => Err(guard_fail(
+            "session_from_agent",
+            "credential entry sign-in refused: this connection is an agent whose identity is restricted",
+        )),
         Attribution::AgentUid => Err(guard_fail(
             "session_from_agent",
             "credential entry sign-in refused: this connection is the agent UID",
         )),
-        Attribution::Unknown(why) | Attribution::Unavailable(why) => Err(guard_fail(
-            "caller_identity",
-            &format!("credential entry sign-in refused: the caller is unattributable — {why}"),
-        )),
-        Attribution::NoAgent | Attribution::Foreign(_) | Attribution::Proxy(_) => Ok(()),
+        Attribution::Unknown(why) | Attribution::Unavailable(why) => {
+            Err(guard_fail(
+                "caller_identity",
+                &format!("credential entry sign-in refused: the caller is unattributable — {why}"),
+            ))
+        }
+        Attribution::NoAgent | Attribution::Proxy(_) => Ok(()),
     }
 }
 
@@ -1544,20 +1550,18 @@ pub(super) fn admit_read(
 pub(super) enum Attribution {
     /// Tied to exactly this agent.
     Agent(String),
+    /// Tied to an agent whose alias this caller may not see (a bound member
+    /// assistant). The board must still refuse/revoke; it never learns the
+    /// identity, pid or state.
+    AgentOpaque,
     /// The kernel says this TCP socket belongs to the configured
     /// agent UID; alias attribution is unavailable across UID.
     AgentUid,
     /// A local process tied to no agent — the operator's browser, a
     /// relay, or a detached agent child alike.
     NoAgent,
-    /// Unattributable, but the connection's client socket is still open
-    /// and belongs to ANOTHER uid — a privilege-separated proxy
-    /// (tailscaled, sshd) whose process this user cannot see.
-    Foreign(String),
-    /// Unattributable in any other way: unreadable ancestry, several
-    /// agents, no daemon — or a client socket that is already gone or is
-    /// this uid's with no visible owner (a sender that closed its end
-    /// early to escape attribution).
+    /// Unattributable: unreadable ancestry, several agents, no daemon, or
+    /// a client socket whose owner cannot be proved.
     Unknown(String),
     /// CAD-1193: a required identity read could not answer inside the
     /// metadata budget — distinct from `Unknown`, which is evidence
@@ -1574,6 +1578,9 @@ pub(super) enum Verdict {
     /// A verified public session's named user (CAD-526).
     Named(Named),
     Agent(String),
+    /// A live session presented by a bound member assistant: revoke it and
+    /// refuse, naming no identity.
+    StolenOpaque,
     /// A live session presented by an agent: revoke it, refuse.
     Stolen(String),
     Refuse(&'static str, String),
@@ -1611,6 +1618,10 @@ pub(super) fn decide(
 ) -> Verdict {
     match (held, attribution) {
         (Some(_), Attribution::Agent(alias)) => Verdict::Stolen(alias),
+        // A bound member assistant's process presented a human session: the
+        // session is revoked exactly as for any agent, but the refusal and
+        // audit name no identity.
+        (Some(_), Attribution::AgentOpaque) => Verdict::StolenOpaque,
         (Some(_), Attribution::AgentUid) => {
             Verdict::Stolen(crate::agent_uid::AGENT_USER.to_string())
         }
@@ -1621,27 +1632,29 @@ pub(super) fn decide(
         (Some(_), Attribution::Proxy(Err(why))) => {
             Verdict::Refuse("caller_identity", format!("board write refused: {why}."))
         }
-        (Some(Held::Named(named)), Attribution::NoAgent | Attribution::Foreign(_)) => {
-            Verdict::Named(named)
-        }
-        (Some(Held::Operator), Attribution::NoAgent | Attribution::Foreign(_)) => {
-            Verdict::Operator(UI_ACTOR.to_string())
-        }
+        (Some(Held::Named(named)), Attribution::NoAgent) => Verdict::Named(named),
+        (Some(Held::Operator), Attribution::NoAgent) => Verdict::Operator(UI_ACTOR.to_string()),
         (Some(Held::Named(_)), Attribution::Unknown(why)) => Verdict::Refuse(
             "caller_identity",
             format!(
                 "board write refused: a board session is honoured only from a caller \
-                 the board can attribute, or another uid's proxy — {why}"
+                     the board can attribute — {why}"
             ),
         ),
         (Some(Held::Operator), Attribution::Unknown(why)) => Verdict::Refuse(
             "caller_identity",
             format!(
                 "board write refused: an operator session is honoured only from a caller \
-                 the board can attribute, or another uid's proxy — {why}"
+                     the board can attribute — {why}"
             ),
         ),
         (None, Attribution::Agent(alias)) => Verdict::Agent(alias),
+        (None, Attribution::AgentOpaque) => Verdict::Refuse(
+            "caller_identity",
+            "board writes from an agent process whose identity is restricted are refused — \
+             it has no visible agent identity and operator authority needs a human session"
+                .to_string(),
+        ),
         (None, Attribution::AgentUid) => Verdict::Refuse(
             "caller_identity",
             "board writes from the agent UID use the daemon socket".to_string(),
@@ -1649,7 +1662,7 @@ pub(super) fn decide(
         (None, Attribution::NoAgent | Attribution::Proxy(_)) => {
             Verdict::Refuse(required.0, required.1.to_string())
         }
-        (None, Attribution::Unknown(why) | Attribution::Foreign(why)) => Verdict::Refuse(
+        (None, Attribution::Unknown(why)) => Verdict::Refuse(
             "caller_identity",
             format!(
                 "board write refused: caller identity underivable — {why}. Writes \
@@ -1798,80 +1811,51 @@ fn attribute(
             header_value(request, "Tailscale-User-Login").as_deref(),
         ));
     }
-    // CAD-1193: under a metadata budget the required `agent_list` read
-    // is itself a dependency — its failure is `Unavailable` (unknown),
-    // distinct from a caller the board could attribute-fail on its own
-    // evidence (a vanished socket is still the caller's `Unknown`).
-    // Unbounded callers keep the exact `Unknown` they had.
-    let roots = match agent_roots(state_dir, budget.copied()) {
-        Ok(roots) => roots,
-        Err(why) if budget.is_some() => return Attribution::Unavailable(why),
+    // CAD-2207: the daemon classifies the concrete live four-tuple against
+    // ALL agent roots and returns an alias only for an ordinary agent; a
+    // bound member assistant resolves to `Opaque`. There is no fallback: a
+    // daemon that cannot answer is an unknown dependency, never a filtered
+    // list read as a complete fleet.
+    let server = match concrete_board_server(opts) {
+        Ok(server) => server,
         Err(why) => {
-            let why = match origin {
-                ReqOrigin::NoSession(p) => format!("{why}. {p}"),
-                ReqOrigin::Known(_) | ReqOrigin::Entry(_) => why,
-            };
-            return match foreign_socket(request, opts) {
-                Some(uid) => Attribution::Foreign(format!("{why} (its socket is uid {uid}'s)")),
-                None => Attribution::Unknown(why),
+            return if budget.is_some() {
+                Attribution::Unavailable(why)
+            } else {
+                Attribution::Unknown(why)
             };
         }
     };
-    let found = Ok::<crate::peer::AgentRoots, String>(roots).and_then(|roots| {
-        let server = concrete_board_server(opts)?;
-        let peer = request
-            .remote_addr()
-            .ok_or_else(|| "the request has no peer address".to_string())?;
-        if roots.is_empty() {
-            // No live agent to tie the peer to — but the connection must
-            // still be one: a loopback client whose socket is already
-            // gone (an early-closed replay by an agent that then exited)
-            // is unattributable, never "tied to no agent" (review round 2).
-            let peer = crate::peer::canonical(*peer);
-            if peer.ip().is_loopback() && crate::peer::client_socket_exact(server, peer)?.is_none()
-            {
-                return Err(format!(
-                    "no local socket is the client end of {peer} → {server}"
-                ));
-            }
-            return Ok(None);
+    let peer = match request.remote_addr() {
+        Some(peer) => *peer,
+        None => {
+            let why = "the request has no peer address".to_string();
+            return if budget.is_some() {
+                Attribution::Unavailable(why)
+            } else {
+                Attribution::Unknown(why)
+            };
         }
-        crate::peer::tcp_peer_agent(server, *peer, &roots)
-    });
-    match found {
-        Ok(Some(alias)) => Attribution::Agent(alias),
-        Ok(None) => Attribution::NoAgent,
+    };
+    match board_peer_agent(state_dir, server, peer, budget.copied()) {
+        Ok(PeerAgentVerdict::Named(alias)) => Attribution::Agent(alias),
+        Ok(PeerAgentVerdict::Opaque) => Attribution::AgentOpaque,
+        Ok(PeerAgentVerdict::None) => Attribution::NoAgent,
         Err(why) => {
             let why = match origin {
                 ReqOrigin::NoSession(p) => format!("{why}. {p}"),
                 ReqOrigin::Known(_) | ReqOrigin::Entry(_) => why,
             };
-            // Only a live client socket of another uid excuses it.
-            match foreign_socket(request, opts) {
-                Some(uid) => Attribution::Foreign(format!("{why} (its socket is uid {uid}'s)")),
-                None => Attribution::Unknown(why),
+            // CAD-2207: a classifier failure is never proof of "not an
+            // agent". A different UID's socket is not an exception — it may
+            // be an agent-uid proxy or an agent that scrubbed its runtime.
+            if budget.is_some() {
+                Attribution::Unavailable(why)
+            } else {
+                Attribution::Unknown(why)
             }
         }
     }
-}
-
-/// The uid owning the peer's still-open client socket when it is not
-/// this process's — a privilege-separated proxy (tailscaled, sshd).
-/// Matched on the full four-tuple (CAD-760); no concrete bound address,
-/// no excuse.
-fn foreign_socket(request: &Request, opts: &ServeOpts) -> Option<u32> {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    let server = concrete_board_server(opts).ok()?;
-    request
-        .remote_addr()
-        .and_then(|peer| {
-            crate::peer::client_socket_exact(server, *peer)
-                .ok()
-                .flatten()
-        })
-        .map(|(_, uid)| uid)
-        .filter(|uid| *uid != euid)
 }
 
 /// What a live session row means for [`decide`]: the operator's on
@@ -1967,6 +1951,20 @@ pub(super) fn board_caller(
                     "an operator session was presented by agent '{alias}' — the session is \
                      revoked. Sign in again with `cadence ui login`"
                 ),
+            ))
+        }
+        Verdict::StolenOpaque => {
+            let token = token.unwrap_or_default();
+            // The audit label is a category, never the restricted agent's alias.
+            let _ = client::rpc(
+                state_dir,
+                "operator_session_stolen",
+                json!({"token": token, "agent": "restricted agent process"}),
+            );
+            Err(guard_fail(
+                "session_from_agent",
+                "an operator session was presented by a restricted agent process — \
+                 the session is revoked. Sign in again with `cadence ui login`",
             ))
         }
         // CAD-1193: a bounded read's unavailable dependency answers
@@ -2235,6 +2233,13 @@ pub(super) fn open(
             alias.clone(),
             format!("sign-in refused: this request comes from agent '{alias}' — the link is spent"),
         )),
+        Attribution::AgentOpaque => Some((
+            "session_from_agent",
+            "restricted agent process".to_string(),
+            "sign-in refused: this request comes from an agent whose identity is \
+             restricted — the link is spent"
+                .to_string(),
+        )),
         Attribution::AgentUid => Some((
             "session_from_agent",
             crate::agent_uid::AGENT_USER.to_string(),
@@ -2244,12 +2249,14 @@ pub(super) fn open(
         // `Unavailable` cannot occur here — this caller passes no
         // budget; it maps to the same refusal as `Unknown` if ever
         // reached so the exchange stays fail-closed.
-        Attribution::Unknown(why) | Attribution::Unavailable(why) => Some((
-            "caller_identity",
-            "unattributable".to_string(),
-            format!("sign-in refused: the board cannot attribute this caller — {why}; the link is spent"),
-        )),
-        Attribution::NoAgent | Attribution::Foreign(_) | Attribution::Proxy(_) => None,
+        Attribution::Unknown(why) | Attribution::Unavailable(why) => {
+            Some((
+                "caller_identity",
+                "unattributable".to_string(),
+                format!("sign-in refused: the board cannot attribute this caller — {why}; the link is spent"),
+            ))
+        }
+        Attribution::NoAgent | Attribution::Proxy(_) => None,
     };
     let opened = client::rpc(
         state_dir,
@@ -2441,6 +2448,11 @@ fn device_attribution(
                  device sign-in is never minted for a pane"
             ),
         )),
+        Attribution::AgentOpaque => Some(guard_fail(
+            "session_from_agent",
+            "sign-in refused: this request comes from an agent whose identity is \
+             restricted — device sign-in is never minted for a pane",
+        )),
         Attribution::AgentUid => Some(guard_fail(
             "session_from_agent",
             "sign-in refused: this request comes from the agent UID — \
@@ -2452,7 +2464,7 @@ fn device_attribution(
             "caller_identity",
             &format!("sign-in refused: the board cannot attribute this caller — {why}"),
         )),
-        Attribution::NoAgent | Attribution::Foreign(_) | Attribution::Proxy(_) => None,
+        Attribution::NoAgent | Attribution::Proxy(_) => None,
     }
 }
 
@@ -2990,26 +3002,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_uid_socket_never_becomes_operator_on_either_fallback_arm() {
-        for fallback in [
-            Attribution::NoAgent,
-            Attribution::Foreign("other uid".into()),
-        ] {
-            let attribution = agent_uid_attribution(Some(2000), Some(2000), fallback);
-            assert_eq!(attribution, Attribution::AgentUid);
-            assert_eq!(
-                decide(
-                    Some(Held::Operator),
-                    attribution.clone(),
-                    ("session", "required"),
-                ),
-                Verdict::Stolen(crate::agent_uid::AGENT_USER.to_string())
-            );
-            assert!(matches!(
-                decide(None, attribution, ("session", "required")),
-                Verdict::Refuse("caller_identity", _)
-            ));
-        }
+    fn agent_uid_socket_never_becomes_operator() {
+        let attribution = agent_uid_attribution(Some(2000), Some(2000), Attribution::NoAgent);
+        assert_eq!(attribution, Attribution::AgentUid);
+        assert_eq!(
+            decide(
+                Some(Held::Operator),
+                attribution.clone(),
+                ("session", "required"),
+            ),
+            Verdict::Stolen(crate::agent_uid::AGENT_USER.to_string())
+        );
+        assert!(matches!(
+            decide(None, attribution, ("session", "required")),
+            Verdict::Refuse("caller_identity", _)
+        ));
         assert_eq!(
             agent_uid_attribution(Some(3000), Some(2000), Attribution::NoAgent),
             Attribution::NoAgent,
@@ -3282,12 +3289,6 @@ mod tests {
             decide(op(), Attribution::NoAgent, required),
             Verdict::Operator(UI_ACTOR.into())
         );
-        // Another uid's live socket (sshd, tailscaled) is excused; a
-        // socket that is gone (an early-closed replay) is not.
-        assert_eq!(
-            decide(op(), Attribution::Foreign("sshd".into()), required),
-            Verdict::Operator(UI_ACTOR.into())
-        );
         assert!(matches!(
             decide(op(), Attribution::Unknown("socket gone".into()), required),
             Verdict::Refuse("caller_identity", _)
@@ -3309,10 +3310,6 @@ mod tests {
         );
         assert!(matches!(
             decide(member(), Attribution::Unknown("x".into()), required),
-            Verdict::Refuse("caller_identity", _)
-        ));
-        assert!(matches!(
-            decide(None, Attribution::Foreign("sshd".into()), required),
             Verdict::Refuse("caller_identity", _)
         ));
         // Without one: never the operator, whatever the peer.

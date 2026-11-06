@@ -40,8 +40,14 @@ impl Shared {
     fn model_defaults_snapshot(self: &Arc<Self>) -> Result<Value> {
         let snapshot = self.store.model_defaults()?;
         let agents = self.store.agents()?;
+        // CAD-2207: the observed-model suggestions are an operator read of the
+        // fleet. A member's personal assistant must not contribute one — a
+        // model only it runs would otherwise surface as a private-only
+        // observation. Ordinary agents keep their suggestions intact.
+        let private = crate::agent_settings::private_aliases(&self.store, &agents)?;
         let observed: Vec<crate::model_defaults::ObservedModel> = agents
             .iter()
+            .filter(|agent| !private.contains(&agent.alias))
             .map(|agent| crate::model_defaults::ObservedModel {
                 provider: agent.provider.as_str(),
                 configured: agent

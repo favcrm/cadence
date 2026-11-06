@@ -73,16 +73,20 @@ fn current(layout: &Layout) -> Value {
     }
 }
 
-/// The daemon's pending update + waiters, or empty when it is not
-/// reachable (nothing is draining then).
-fn pending(state_dir: &Path) -> (Value, Vec<Value>) {
-    match client::rpc(state_dir, "update_status", json!({})) {
-        Ok(status) => (
-            status["pending_update"].clone(),
-            status["waiting"].as_array().cloned().unwrap_or_default(),
-        ),
-        Err(_) => (Value::Null, Vec::new()),
-    }
+/// The daemon's pending update and waiters. An incompatible or unreachable
+/// daemon is unavailable, not evidence that the fleet is idle.
+fn pending(state_dir: &Path) -> Result<(Value, Vec<Value>)> {
+    let status = client::rpc(state_dir, "update_status", json!({}))?;
+    let pending = status
+        .get("pending_update")
+        .ok_or_else(|| Error::internal("update status has no pending_update field"))?
+        .clone();
+    let waiting = status
+        .get("waiting")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::internal("update status has no waiting array"))?
+        .clone();
+    Ok((pending, waiting))
 }
 
 /// How long a cached check stays fresh before the card refreshes it in
@@ -97,7 +101,10 @@ pub(super) fn get(state_dir: &Path) -> HttpResp {
     maybe_refresh_check(state_dir);
     let layout = layout();
     let current = layout.as_ref().map(current).unwrap_or(Value::Null);
-    let (pending, waiting) = pending(state_dir);
+    let (pending, waiting) = match pending(state_dir) {
+        Ok(status) => status,
+        Err(error) => return rpc_err(&error, "update"),
+    };
     let run = update::read_run_log(state_dir);
     adopt_finished_check(&run);
     let check = BOARD_UPDATE.check.lock().unwrap().clone();
@@ -348,23 +355,51 @@ impl UpdateHost for BoardHost {
     fn waiters(&self) -> Result<Vec<Waiter>> {
         let status = match client::rpc(&self.state_dir, "update_status", json!({})) {
             Ok(status) => status,
-            Err(_) => return Ok(Vec::new()),
+            // A down daemon has no work to drain; a daemon that answered with
+            // an error is NOT idle — fail the drain closed.
+            Err(error) if error.to_string().starts_with("Daemon is not reachable") => {
+                return Ok(Vec::new())
+            }
+            Err(error) => return Err(error),
         };
-        Ok(status["waiting"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|r| {
-                        Some(Waiter {
-                            alias: r["alias"].as_str()?.to_string(),
-                            message: r["message"].as_str().unwrap_or_default().to_string(),
-                            state: r["state"].as_str().unwrap_or_default().to_string(),
-                            age_secs: r["age_secs"].as_u64().unwrap_or(0),
-                        })
-                    })
-                    .collect()
+        // CAD-2207: an old daemon's update_status may still carry personal
+        // aliases/message ids. Prove the fleet contract before parsing or
+        // printing any of its rows.
+        client::require_fleet_protocol(&self.state_dir)?;
+        let waiting = status
+            .get("waiting")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| Error::internal("update_status returned no waiting array"))?;
+        waiting
+            .iter()
+            .map(|row| {
+                let row = row.as_object().ok_or_else(|| {
+                    Error::internal("update_status returned a non-object waiting row")
+                })?;
+                let alias = row
+                    .get("alias")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::internal("update_status waiting row has no alias"))?;
+                let message = row
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::internal("update_status waiting row has no message"))?;
+                let state = row
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::internal("update_status waiting row has no state"))?;
+                let age_secs = row
+                    .get("age_secs")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Error::internal("update_status waiting row has no age_secs"))?;
+                Ok(Waiter {
+                    alias: alias.to_string(),
+                    message: message.to_string(),
+                    state: state.to_string(),
+                    age_secs,
+                })
             })
-            .unwrap_or_default())
+            .collect::<Result<Vec<_>>>()
     }
     fn set_pending(&self, _pending: Option<&PendingUpdate>) -> Result<()> {
         Err(Self::not_the_pipeline())
@@ -408,15 +443,21 @@ impl UpdateHost for BoardHost {
 
 /// The draining banner's data, for every page (not just Settings): the
 /// pending update and what it waits on, or null.
-pub(super) fn banner(state_dir: &Path) -> Value {
-    let (pending, waiting) = pending(state_dir);
+pub(super) fn banner(state_dir: &Path) -> Result<Value> {
+    let (pending, waiting) = pending(state_dir)?;
     if pending.is_null() {
-        return Value::Null;
+        return Ok(Value::Null);
     }
-    json!({"pending": pending, "waiting": waiting, "count": waiting.len()})
+    Ok(json!({"pending": pending, "waiting": waiting, "count": waiting.len()}))
 }
 
 /// `GET /api/update/banner` — cheap enough for the SPA to poll.
 pub(super) fn banner_get(state_dir: &Path) -> HttpResp {
-    json_response(banner(state_dir))
+    match banner(state_dir) {
+        Ok(value) => json_response(value),
+        Err(error) => rpc_err(&error, "update"),
+    }
 }
+
+#[cfg(all(test, unix))]
+mod cad2207_mixed_version_update_acceptance;

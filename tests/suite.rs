@@ -2,6 +2,8 @@
 //!
 //! The integration target also carries acceptance checks for changed gates.
 
+mod cad2207_restart_proof_acceptance;
+
 #[test]
 fn an_identifier_is_validated_before_anything_uses_it() {
     assert!(cadence_agent::proto::identifier("cad1234", "issue id").is_ok());

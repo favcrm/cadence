@@ -19,30 +19,33 @@
 //! `X-Cadence-Test-As` assertion header and no caller-chosen environment
 //! alias is used as identity evidence anywhere in this check.
 //!
-//! The bypass this pins: the daemon's `agent_list` now withholds a member's
-//! private assistant row from every caller but that assistant itself. A
-//! board that built its pid→alias attribution roots from that filtered list
+//! The contract this pins: a member's private assistant row — and its
+//! metadata — is withheld from BOTH operator projections (`agent_list` and
+//! the narrow `agent_operational`), while ordinary workers stay visible. A
+//! board that built its pid→alias attribution roots from either projection
 //! would stop recognising the assistant's process, read the human cookie as
 //! the human's own, and relay member authority to the assistant. The board
-//! therefore attributes from the narrow operator-only `agent_operational`
-//! projection, which still carries pid→alias and no profile. Both halves are
-//! asserted against the REAL daemon: the private row is absent from
-//! `agent_list` and present in `agent_operational` (the bypass is live), and
-//! the bad HTTP request is then refused at `board_caller` with the presented
-//! session revoked — the only effect of the board naming the caller as that
-//! agent.
+//! therefore attributes the live TCP four-tuple through the daemon's
+//! all-agent classifier, which reports an opaque generic agent for a private
+//! caller and never its alias. Both halves are asserted against the REAL
+//! daemon: the private row is absent from both operator projections while the
+//! ordinary row stays present, and the bad HTTP request is then refused at
+//! `board_caller` with the presented session revoked — the only effect of the
+//! board placing the caller as an agent.
 //!
 //! The positive control runs first on the same fixture, route, cookie and
 //! fixture authority: the human's own request (from a process tied to no
 //! agent) is admitted and reaches the member surface, so a blanket refusal
 //! cannot pass these checks.
 //!
-//! Deliberately NOT exercised here (reported, never simulated): the
-//! `daemon restart --when-idle` busy snapshot and the owner-authorized
-//! resume are CLI-level paths (`src/cli/daemon.rs`) with their own
-//! acceptance; this HTTP file neither restarts nor resumes the fixture.
-
-#![cfg(all(test, feature = "test-seam"))]
+//! Also pinned here, because it is the same attribution problem: the
+//! `daemon restart --when-idle` gate. The CLI (`src/cli/daemon.rs`) asks the
+//! daemon's `agent_fleet_state`, which must see a member assistant's
+//! in-flight turn as BUSY and must refuse to claim the fleet is resumable
+//! under operator authority — while never naming the assistant. This file
+//! asserts that aggregate against the real daemon; it does not spawn the CLI
+//! process, and the owner-signed resume outcome (the member path that may
+//! report the assistant's real state) is not exercised here.
 
 use super::super::{start, Rig};
 use crate::adapter::Identity;
@@ -59,8 +62,8 @@ use std::process::{Child, Command, Stdio};
 /// before any attribution decision below.
 const PRIVATE_ALIAS: &str = "assist-agent-alice";
 /// The endpoint generation recorded with the process, exactly as an adapter
-/// `open` records one (`agent_operational` carries it so a restart's snapshot
-/// is partitionable). The board's attribution uses the pid, not a generation.
+/// `open` records one. It is fixture bookkeeping for the store's endpoint row;
+/// the board's four-tuple attribution uses the pid, not a generation.
 const ENDPOINT_GENERATION: &str = "cad2207-fixture-generation";
 /// A nonmember alias that must stay observable in the same fixture, so an
 /// empty list or an over-broad filter cannot pass as the private-row filter.
@@ -80,7 +83,8 @@ cat <&3
 /// only claim to a caller is the managed endpoint row the daemon records
 /// below.
 fn spawn_private_assistant(rig: &Rig, token: &str) -> Child {
-    Command::new("/bin/bash")
+    let mut command = Command::new("/bin/bash");
+    command
         .arg("-s")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -89,8 +93,8 @@ fn spawn_private_assistant(rig: &Rig, token: &str) -> Child {
         .env("COOKIE", token)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    crate::reaper::spawn(&mut command)
         .expect("the fixture cannot spawn a private member-assistant process")
 }
 
@@ -210,13 +214,12 @@ fn private_member_assistant_process_cannot_ride_a_humans_board_session() {
     // `managed`, exactly the runtime a bound member assistant gets — is given
     // that process through the store's own guarded `set_identity`, the same
     // API an adapter `open` uses: it records the pid, the pid's `/proc` start
-    // time and a generation inside the arming writer lane. The store's sealed
-    // authorizer refuses raw DML from an unarmed connection, so no fixture SQL
-    // is attempted here.
+    // time and a generation inside the arming writer lane. No identity is
+    // written through raw SQL: the busy-turn row later is seeded through the
+    // store's test-only `fixture_write` façade, which is the supported seam
+    // and still refuses a sealed store.
     let private = spawn_private_assistant(&rig, &token);
     let pid = private.id();
-    let pid_start = crate::peer::proc_starttime(pid)
-        .expect("the private process has no /proc start time to record");
 
     let options = ServeOptions::default();
     options
@@ -251,8 +254,8 @@ fn private_member_assistant_process_cannot_ride_a_humans_board_session() {
         .store
         .register_agent(&NewAgent {
             alias: ORDINARY_ALIAS,
-            provider: "fake",
-            endpoint_kind: "fake",
+            provider: "pi",
+            endpoint_kind: "managed",
             role: "worker",
             cwd: state.to_str().unwrap(),
             sandbox: "read-only",
@@ -263,11 +266,13 @@ fn private_member_assistant_process_cannot_ride_a_humans_board_session() {
         })
         .expect("the fixture cannot register the ordinary control row");
 
-    // ---- The bypass, observed against the real daemon ---------------------
-    // `agent_list` is the profile-bearing list a board might still attribute
-    // from: as the operator it must NOT carry the member's private row. The
-    // narrow operational projection must carry it (pid included), or no
-    // board could ever tie the process to that assistant.
+    // ---- The privacy projection, observed against the real daemon ---------
+    // The agreed public contract: an operator sees ordinary workers in both
+    // the profile-bearing list and the narrow operational projection, but a
+    // member's private assistant row — alias, pid or any other metadata — is
+    // absent from both. The board's four-tuple attribution therefore cannot
+    // ride either projection; the real refusal below proves the daemon's
+    // all-agent classifier still places the live process as an agent.
     let list = scoped(Asserted::Operator, || {
         crate::client::rpc(&state, "agent_list", json!({}))
     })
@@ -293,24 +298,14 @@ fn private_member_assistant_process_cannot_ride_a_humans_board_session() {
             .any(|alias| alias == ORDINARY_ALIAS),
         "the operational projection lost the ordinary row: {operational_aliases:?}"
     );
-    let row = operational["agents"]
-        .as_array()
-        .expect("the operational projection is not a list")
-        .iter()
-        .find(|agent| agent.get("alias").and_then(Value::as_str) == Some(PRIVATE_ALIAS))
-        .unwrap_or_else(|| {
-            panic!(
-                "the operational projection lost the private assistant's pid→alias row — a board attributing from agent_list would read its process as anonymous: {operational}"
-            )
-        });
-    assert_eq!(
-        row["pid"].as_u64(),
-        Some(u64::from(pid)),
-        "the operational projection names another pid: {row}"
+    assert!(
+        !operational_aliases.iter().any(|alias| alias == PRIVATE_ALIAS),
+        "agent_operational still carries the member's private assistant row: {operational_aliases:?}"
     );
-    assert_eq!(row["pid_start"].as_u64(), Some(pid_start), "{row}");
-    assert_eq!(row["endpoint_kind"], "managed", "{row}");
-    assert_eq!(row["generation"], ENDPOINT_GENERATION, "{row}");
+    assert!(
+        !operational.to_string().contains(PRIVATE_ALIAS),
+        "agent_operational still carries the private assistant's alias or metadata: {operational}"
+    );
 
     // ---- THE BAD CASE -----------------------------------------------------
     // The real private assistant process now sends the same member POST with
@@ -328,14 +323,155 @@ fn private_member_assistant_process_cannot_ride_a_humans_board_session() {
         body.get("assistant").is_none(),
         "a refusal returned member assistant state: {body}"
     );
-    // `Verdict::Stolen` is the ONLY branch that revokes the presented token.
-    // A live token here means the board never named the process as the
-    // registered assistant (the filtered-list bypass, or an unknown caller),
-    // whatever status it happened to answer.
+    // `Verdict::Stolen`/`StolenOpaque` are the only branches that revoke the
+    // presented token. A live token here means the board never placed the
+    // process as an agent (a projection-only attribution, or an unknown
+    // caller), whatever status it happened to answer.
     let revoked = crate::client::rpc(&state, "board_session_check", json!({"token": token}))
         .expect("the daemon could not re-check the session after the refusal");
     assert_eq!(
         revoked["valid"], false,
-        "the board did not attribute the request to the registered private assistant: the presented human session was left live (the agent-list-filter bypass)"
+        "the board did not place the private process as an agent: the presented human session was left live (a projection-only attribution cannot satisfy the four-tuple classifier)"
     );
+}
+
+/// CAD-2207: `daemon restart --when-idle` must observe a member assistant's
+/// in-flight turn even though its row is withheld from every operator
+/// projection. The CLI's gate is the daemon's `agent_fleet_state`; this
+/// exercises that aggregate directly against a real daemon, with a live
+/// private process recorded exactly as an adapter `open` records one. It
+/// asserts the aggregate the CLI consumes — busy, the resume verdict, and no
+/// alias — not only the HTTP refusal above.
+#[test]
+fn when_idle_gate_sees_a_busy_private_assistant_without_naming_it() {
+    let _flag = AssistantFlagOn::arm();
+    let rig = start(&["alice"]);
+    let state = rig._dir.path().to_path_buf();
+    let options = ServeOptions::default();
+    options
+        .provider_env
+        .set("CADENCE_PM_DIR", rig.pm.to_str().unwrap());
+    let shared = crate::daemon::Shared::new(&state, &options)
+        .expect("the fixture cannot open a daemon view");
+
+    // The fixture's provisioning stored the member binding; register the
+    // runtime row the daemon lazily creates on the member's first call.
+    let cwd = state.join("cad2207-assistant-cwd");
+    std::fs::create_dir_all(&cwd).expect("the fixture cannot create the assistant cwd");
+    shared
+        .store
+        .register_agent(&NewAgent {
+            alias: PRIVATE_ALIAS,
+            provider: "pi",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .expect("the fixture cannot register the bound assistant's runtime row");
+
+    // A live process, recorded as the runtime's managed endpoint exactly as
+    // an adapter `open` records it: pid, `/proc` start time, generation.
+    let mut private_command = Command::new("/bin/bash");
+    private_command
+        .arg("-s")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut private = crate::reaper::spawn(&mut private_command)
+        .expect("the fixture cannot spawn a private assistant process");
+    shared
+        .store
+        .set_identity(
+            PRIVATE_ALIAS,
+            &Identity {
+                thread_id: String::new(),
+                session_id: String::new(),
+                model: None,
+                effort: None,
+                pid: private.id(),
+                endpoint: None,
+                generation: Some(ENDPOINT_GENERATION.to_string()),
+                attach: None,
+            },
+        )
+        .expect("the fixture cannot record the private process as the runtime's managed endpoint");
+
+    // Mid-launch with one in-flight turn: the live blocker `--when-idle`
+    // must observe. The turn row is seeded through the store's test-only
+    // write hook, not a production writer.
+    const BUSY_TURN: &str = "cad2207-busy-turn";
+    shared
+        .store
+        .set_agent_state(PRIVATE_ALIAS, "starting", None)
+        .expect("the fixture cannot put the private assistant mid-launch");
+    shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "INSERT INTO messages(id,alias,body,reply_to,source,state,created) \
+                 VALUES(?,?,?,NULL,'member','running',?)",
+                rusqlite::params![
+                    BUSY_TURN,
+                    PRIVATE_ALIAS,
+                    "in-flight private turn",
+                    crate::issue::time::now_epoch() as f64
+                ],
+            )?;
+            Ok(())
+        })
+        .expect("the fixture cannot seed the private assistant's in-flight turn");
+
+    let fleet = scoped(Asserted::Operator, || {
+        crate::client::rpc(&state, "agent_fleet_state", json!({}))
+    })
+    .expect("the operator's fleet-state gate was refused");
+    assert_eq!(
+        fleet["busy"], true,
+        "a busy member assistant is invisible to the restart gate — \
+         `daemon restart --when-idle` would restart mid-turn: {fleet}"
+    );
+    assert_eq!(
+        fleet["complete"], false,
+        "the resume verdict claims a restricted runtime can be resumed under \
+         operator authority: {fleet}"
+    );
+    assert!(
+        !fleet.to_string().contains(PRIVATE_ALIAS),
+        "the restart gate named the member's private assistant: {fleet}"
+    );
+
+    // A caller-supplied ignored pair never exempts a private in-flight turn:
+    // even when the operator submits this assistant's REAL (alias,
+    // message_id), the turn still blocks the restart. The answer again names
+    // neither identifier — the pair is the caller's own input, never an
+    // echoed identity.
+    let ignored = scoped(Asserted::Operator, || {
+        crate::client::rpc(
+            &state,
+            "agent_fleet_state",
+            json!({"ignored_stale": [[PRIVATE_ALIAS, BUSY_TURN]]}),
+        )
+    })
+    .expect("the operator's fleet-state gate was refused with an ignored pair");
+    assert_eq!(
+        ignored["busy"], true,
+        "an operator-supplied ignored pair exempted a private in-flight turn — \
+         `daemon restart --when-idle --ignore-stale` would restart mid-turn: {ignored}"
+    );
+    assert_eq!(
+        ignored["complete"], false,
+        "the resume verdict changed when the operator named a private pair: {ignored}"
+    );
+    assert!(
+        !ignored.to_string().contains(PRIVATE_ALIAS) && !ignored.to_string().contains(BUSY_TURN),
+        "the restart gate echoed a private identifier: {ignored}"
+    );
+
+    let _ = private.kill();
+    let _ = private.wait();
 }

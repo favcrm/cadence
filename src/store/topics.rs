@@ -18,6 +18,66 @@ use serde_json::{json, Value};
 use super::{now, Priority, Sender, Store, StoreConn};
 use crate::error::{Error, Result};
 
+// The alias and uid fences are kept in the query itself so classification and
+// the content or receipt it protects share a single SQLite read snapshot.
+const PRIVATE_TOPIC_ALIASES: &str = "SELECT alias FROM assistants
+    UNION SELECT alias FROM assistant_event_fences
+    UNION SELECT alias FROM effect_member_owners
+    UNION SELECT alias FROM assist_notice_deliveries
+    UNION SELECT alias FROM effect_notice_deliveries";
+const PRIVATE_TOPIC_UIDS: &str = "SELECT g.uid FROM agents g JOIN assistants a ON a.alias=g.alias
+    UNION SELECT m.sender_uid FROM messages m JOIN assistants a ON a.alias=m.sender
+      WHERE m.sender_uid IS NOT NULL
+    UNION SELECT m.recipient_uid FROM messages m JOIN assistants a ON a.alias=m.recipient
+      WHERE m.recipient_uid IS NOT NULL
+    UNION SELECT f.agent_uid FROM assistant_event_fences f WHERE f.agent_uid IS NOT NULL
+    UNION SELECT e.agent_uid FROM effect_member_owners e WHERE e.agent_uid IS NOT NULL";
+
+fn visible_topic_post() -> String {
+    format!(
+        "p.sender NOT IN ({PRIVATE_TOPIC_ALIASES}) AND (
+          (p.sender_uid IS NULL AND p.sender IN ('operator', 'daemon'))
+          OR (p.sender_uid IS NOT NULL AND p.sender_uid NOT IN ({PRIVATE_TOPIC_UIDS}))
+        )"
+    )
+}
+
+fn visible_topic_recipient(alias: &str, uid: &str) -> String {
+    format!(
+        "{alias} IS NOT NULL AND {uid} IS NOT NULL
+         AND {alias} NOT IN ({PRIVATE_TOPIC_ALIASES})
+         AND {uid} NOT IN ({PRIVATE_TOPIC_UIDS})
+         AND NOT EXISTS (SELECT 1 FROM agents g WHERE g.uid={uid} AND g.alias<>{alias})
+         AND NOT EXISTS (SELECT 1 FROM agents g WHERE g.alias={alias} AND g.uid<>{uid})"
+    )
+}
+
+fn refuse_private_topic_uid(conn: &impl StoreConn, uid: &str) -> Result<()> {
+    let restricted = conn.query_opt(
+        "SELECT 1 FROM agents g JOIN assistants a ON a.alias=g.alias WHERE g.uid=?1
+         UNION SELECT 1 FROM assistant_event_fences f WHERE f.agent_uid=?1
+         UNION SELECT 1 FROM effect_member_owners e WHERE e.agent_uid=?1
+         LIMIT 1",
+        [uid],
+        |_| Ok(()),
+    )?;
+    if restricted.is_some() {
+        return Err(Error::rejected(super::RESTRICTED_LIFECYCLE));
+    }
+    Ok(())
+}
+
+fn ordinary_topic_subscribers(conn: &impl StoreConn, topic: &str) -> Result<Vec<(String, String)>> {
+    let visible = visible_topic_recipient("a.alias", "a.uid");
+    let sql = format!(
+        "SELECT s.uid,a.alias FROM topic_subscriptions s
+           JOIN agents a ON a.uid=s.uid
+          WHERE s.topic_id=? AND a.archived_at IS NULL AND {visible}
+          ORDER BY s.added,s.uid"
+    );
+    Ok(conn.query_vec(&sql, [topic], |r| Ok((r.get(0)?, r.get(1)?)))?)
+}
+
 /// The schema for v39. Every object is `IF NOT EXISTS`, so a half-applied
 /// migration converges on reopen.
 pub(super) const SCHEMA_V39: &str = "CREATE TABLE IF NOT EXISTS topics(
@@ -103,6 +163,27 @@ pub struct TopicDelivery {
     pub state: String,
 }
 
+/// A receipt and its identity proof from one store snapshot.
+pub(crate) struct VisibleTopicReceipt {
+    pub uid: String,
+    pub alias: String,
+    pub message: Option<String>,
+    pub state: String,
+    pub removed: bool,
+}
+
+impl VisibleTopicReceipt {
+    pub(crate) fn to_json(&self) -> Value {
+        json!({
+            "uid": self.uid,
+            "alias": self.alias,
+            "message": self.message,
+            "state": self.state,
+            "removed": self.removed,
+        })
+    }
+}
+
 /// One transcript row of a topic.
 #[derive(Debug, Clone)]
 pub struct TopicPost {
@@ -179,6 +260,7 @@ impl Store {
     /// Subscribe (or re-subscribe) an agent uid. Idempotent.
     pub fn topic_subscribe(&self, topic: &str, uid: &str) -> Result<()> {
         self.write_tx(|conn| {
+            refuse_private_topic_uid(conn, uid)?;
             let changed = conn.execute(
                 "INSERT OR IGNORE INTO topic_subscriptions(topic_id,uid,added) VALUES(?,?,?)",
                 params![topic, uid, now()],
@@ -198,6 +280,7 @@ impl Store {
     /// Unsubscribe an agent uid. The transcript and delivery history stay.
     pub fn topic_unsubscribe(&self, topic: &str, uid: &str) -> Result<()> {
         self.write_tx(|conn| {
+            refuse_private_topic_uid(conn, uid)?;
             let changed = conn.execute(
                 "DELETE FROM topic_subscriptions WHERE topic_id=? AND uid=?",
                 params![topic, uid],
@@ -214,16 +297,20 @@ impl Store {
         })
     }
 
-    /// Every topic with its member count and newest post seq, newest first.
-    /// Read-only: the work list's group rows.
+    /// Topics with visible post counts and latest visible activity, newest first.
+    /// Read-only: the operator work list's group rows.
     pub fn topic_listing(&self) -> Result<Vec<(Topic, i64, i64, f64)>> {
         self.read_tx(|conn| {
-            Ok(conn.query_vec(
+            let visible = visible_topic_post();
+            let sql = format!(
                 "SELECT t.id,t.type,t.source,t.created,
                         (SELECT COUNT(*) FROM topic_subscriptions s WHERE s.topic_id=t.id),
-                        COALESCE((SELECT MAX(p.seq) FROM topic_posts p WHERE p.topic_id=t.id),0),
-                        COALESCE((SELECT MAX(p.created) FROM topic_posts p WHERE p.topic_id=t.id),t.created)
-                   FROM topics t ORDER BY 6 DESC, t.created DESC",
+                        (SELECT COUNT(*) FROM topic_posts p WHERE p.topic_id=t.id AND {visible}),
+                        COALESCE((SELECT MAX(p.created) FROM topic_posts p WHERE p.topic_id=t.id AND {visible}),t.created)
+                   FROM topics t ORDER BY 7 DESC, t.created DESC"
+            );
+            Ok(conn.query_vec(
+                &sql,
                 [],
                 |r| {
                     Ok((
@@ -341,14 +428,7 @@ impl Store {
              VALUES(?,?,NULL,'daemon',?,?)",
             params![post, topic, body, now()],
         )?;
-        let members: Vec<(String, String)> = tx.query_vec(
-            "SELECT s.uid, a.alias FROM topic_subscriptions s
-               JOIN agents a ON a.uid = s.uid
-              WHERE s.topic_id=? AND a.archived_at IS NULL
-              ORDER BY s.added, s.uid",
-            [topic.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        let members = ordinary_topic_subscribers(tx, &topic)?;
         for (uid, alias) in members {
             let notice = delivery_id(&post, &uid);
             tx.execute(
@@ -421,6 +501,57 @@ impl Store {
         })
     }
 
+    /// Resolve an existing generic-topic Ask only while its target identity,
+    /// binding and stored envelope agree in the same read snapshot.
+    pub(crate) fn topic_existing_request_for_target(
+        &self,
+        post: &str,
+        text: &str,
+        target: &str,
+        target_uid: &str,
+    ) -> Result<Option<String>> {
+        self.read_tx(|conn| {
+            refuse_private_topic_uid(conn, target_uid)?;
+            if self.assistant_for_alias_in(conn, target)?.is_some() {
+                return Err(Error::rejected(super::RESTRICTED_LIFECYCLE));
+            }
+            if self.agent_in(conn, target)?.uid != target_uid {
+                return Err(Error::rejected("topic request target changed"));
+            }
+            let existing: Option<(String, String, Option<String>)> = conn.query_opt(
+                "SELECT body,sender,request_message FROM topic_posts WHERE id=?",
+                [post],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let Some((body, sender, bound)) = existing else {
+                return Ok(None);
+            };
+            if body != text || sender != "operator" {
+                return Err(Error::rejected(
+                    "Request id was already used with different content",
+                ));
+            }
+            let Some(bound) = bound else {
+                return Ok(None);
+            };
+            let recipient: Option<(Option<String>, Option<String>, String)> = conn.query_opt(
+                "SELECT recipient_uid,recipient,alias FROM messages WHERE id=?",
+                [&bound],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if !recipient.is_some_and(|(uid, label, alias)| {
+                uid.as_deref() == Some(target_uid)
+                    && label.as_deref() == Some(target)
+                    && alias == target
+            }) {
+                return Err(Error::rejected(
+                    "Request id was already used with a different target",
+                ));
+            }
+            Ok(Some(bound))
+        })
+    }
+
     /// CAD-810 atomic publish: the post, one intent per current subscriber,
     /// and one daemon-origin topic notice per subscriber are written in ONE
     /// transaction, each notice through the store's own enqueue path (its
@@ -441,6 +572,12 @@ impl Store {
         check_post_body(body)?;
         let post = post_id(topic, client_id);
         self.write_tx(|conn| {
+            if self.assistant_for_alias_in(conn, sender)?.is_some() {
+                return Err(Error::rejected(super::RESTRICTED_LIFECYCLE));
+            }
+            if let Some(uid) = sender_uid {
+                refuse_private_topic_uid(conn, uid)?;
+            }
             let existing: Option<(String, String)> = conn.query_opt(
                 "SELECT body, sender FROM topic_posts WHERE id=?",
                 [post.as_str()],
@@ -459,14 +596,7 @@ impl Store {
                  VALUES(?,?,?,?,?,?)",
                 params![post, topic, sender_uid, sender, body, now()],
             )?;
-            let members: Vec<(String, String)> = conn.query_vec(
-                "SELECT s.uid, a.alias FROM topic_subscriptions s
-                   JOIN agents a ON a.uid = s.uid
-                  WHERE s.topic_id=? AND a.archived_at IS NULL
-              ORDER BY s.added, s.uid",
-                [topic],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
+            let members = ordinary_topic_subscribers(conn, topic)?;
             for (uid, alias) in members {
                 let notice = delivery_id(&post, &uid);
                 conn.execute(
@@ -545,17 +675,9 @@ impl Store {
                  VALUES(?,?,?,?,?,?)",
                 params![id, topic, sender_uid, sender, body, now()],
             )?;
-            // The intent for every current subscriber is written in the SAME
-            // transaction as the post: a crash after this point can never
-            // strand a member, because a retry resumes from these rows.
-            let members: Vec<(String, String)> = conn.query_vec(
-                "SELECT s.uid, a.alias FROM topic_subscriptions s
-                   JOIN agents a ON a.uid = s.uid
-                  WHERE s.topic_id=? AND a.archived_at IS NULL
-              ORDER BY s.added, s.uid",
-                [topic],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
+            // Intents for eligible subscribers are committed with the post.
+            // Bound assistants need a separate member-authorized path.
+            let members = ordinary_topic_subscribers(conn, topic)?;
             for (uid, alias) in members {
                 conn.execute(
                     "INSERT OR IGNORE INTO topic_deliveries(post_id,uid,alias,message_id,state)
@@ -582,9 +704,37 @@ impl Store {
         after: Option<i64>,
         limit: i64,
     ) -> Result<Vec<TopicPost>> {
+        self.topic_posts_filtered(topic, before, after, limit, false)
+    }
+
+    /// A generic reader's page; unproved or private authors are excluded
+    /// before the body, cursor or limit is selected.
+    pub(crate) fn topic_visible_posts(
+        &self,
+        topic: &str,
+        before: Option<i64>,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<TopicPost>> {
+        self.topic_posts_filtered(topic, before, after, limit, true)
+    }
+
+    fn topic_posts_filtered(
+        &self,
+        topic: &str,
+        before: Option<i64>,
+        after: Option<i64>,
+        limit: i64,
+        visible_only: bool,
+    ) -> Result<Vec<TopicPost>> {
         self.read_tx(|conn| {
-            let base =
-                "SELECT seq,id,sender_uid,sender,body,created FROM topic_posts WHERE topic_id=?1";
+            let mut base =
+                "SELECT seq,id,sender_uid,sender,body,created FROM topic_posts p WHERE topic_id=?1"
+                    .to_string();
+            if visible_only {
+                base.push_str(" AND ");
+                base.push_str(&visible_topic_post());
+            }
             let row = |r: &rusqlite::Row<'_>| {
                 Ok(TopicPost {
                     seq: r.get(0)?,
@@ -641,6 +791,68 @@ impl Store {
         })
     }
 
+    /// Generic-reader delivery receipts, including live state and removed
+    /// status, classified and read under the same store snapshot.
+    pub(crate) fn topic_visible_deliveries(&self, post: &str) -> Result<Vec<VisibleTopicReceipt>> {
+        self.read_tx(|conn| {
+            let visible = visible_topic_recipient("d.alias", "d.uid");
+            let sql = format!(
+                "SELECT d.uid,d.alias,d.message_id,
+                        CASE WHEN d.message_id IS NULL THEN d.state ELSE m.state END,
+                        NOT EXISTS(SELECT 1 FROM agents g WHERE g.uid=d.uid)
+                   FROM topic_deliveries d LEFT JOIN messages m ON m.id=d.message_id
+                  WHERE d.post_id=?1 AND {visible}
+                    AND (d.message_id IS NULL OR
+                         (m.id IS NOT NULL AND m.recipient_uid=d.uid AND m.recipient=d.alias))
+                  ORDER BY d.uid"
+            );
+            Ok(conn.query_vec(&sql, [post], |r| {
+                Ok(VisibleTopicReceipt {
+                    uid: r.get(0)?,
+                    alias: r.get(1)?,
+                    message: r.get(2)?,
+                    state: r.get(3)?,
+                    removed: r.get(4)?,
+                })
+            })?)
+        })
+    }
+
+    /// Whether a post has an Ask and, if its recipient is provably ordinary,
+    /// the complete receipt. An unproved Ask never exposes its handle.
+    pub(crate) fn topic_visible_request(
+        &self,
+        post: &str,
+    ) -> Result<(bool, Option<VisibleTopicReceipt>)> {
+        self.read_tx(|conn| {
+            let request: Option<Option<String>> = conn.query_opt(
+                "SELECT request_message FROM topic_posts WHERE id=?",
+                [post],
+                |r| r.get(0),
+            )?;
+            let Some(request) = request.flatten() else {
+                return Ok((false, None));
+            };
+            let visible = visible_topic_recipient("m.recipient", "m.recipient_uid");
+            let sql = format!(
+                "SELECT m.recipient_uid,m.recipient,m.id,m.state,
+                        NOT EXISTS(SELECT 1 FROM agents g WHERE g.uid=m.recipient_uid)
+                   FROM messages m
+                  WHERE m.id=?1 AND m.alias=m.recipient AND {visible}"
+            );
+            let receipt = conn.query_opt(&sql, [&request], |r| {
+                Ok(VisibleTopicReceipt {
+                    uid: r.get(0)?,
+                    alias: r.get(1)?,
+                    message: Some(r.get(2)?),
+                    state: r.get(3)?,
+                    removed: r.get(4)?,
+                })
+            })?;
+            Ok((true, receipt))
+        })
+    }
+
     /// Whether the topic holds any post older than `before` (a seq).
     pub fn topic_has_posts_before(&self, topic: &str, before: i64) -> Result<bool> {
         self.read_tx(|conn| {
@@ -650,6 +862,19 @@ impl Store {
                     params![topic, before],
                     |_| Ok(()),
                 )?
+                .is_some())
+        })
+    }
+
+    /// Whether a generic reader has an older visible post on this topic.
+    pub(crate) fn topic_has_visible_posts_before(&self, topic: &str, before: i64) -> Result<bool> {
+        self.read_tx(|conn| {
+            let visible = visible_topic_post();
+            let sql = format!(
+                "SELECT 1 FROM topic_posts p WHERE topic_id=? AND seq<? AND {visible} LIMIT 1"
+            );
+            Ok(conn
+                .query_opt(&sql, params![topic, before], |_| Ok(()))?
                 .is_some())
         })
     }

@@ -36,22 +36,9 @@ impl Shared {
         )))
     }
 
-    /// Whether `decision: decline` is a REAL negative for this pending method —
-    /// it cancels or denies without executing or steering. A free-text input
-    /// method would treat the word as steering text, so it is not included
-    /// (CAD-2207 keeps only this safe half of the workflow reachable).
-    fn decline_is_negative(method: &str) -> bool {
-        method.starts_with("cadence/")
-            || matches!(
-                method,
-                "item/commandExecution/requestApproval"
-                    | "item/fileChange/requestApproval"
-                    | "session/request_permission"
-            )
-    }
-
     pub(super) fn rpc_respond(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        self.refuse_restricted_agent(&alias)?;
         // Decided before the handle is claimed, so a refused caller
         // consumes nothing and the request stays pending.
         self.authorize_respond(params, peer_pid, &alias)?;
@@ -66,34 +53,6 @@ impl Shared {
         // pending-effect row, not a `pending` entry — the press path
         // decides it (accept is operator-only) and runs the staged call.
         let effect_row = self.store.effect_by_request(handle)?;
-        // CAD-2207: a member assistant's request input is the member's private
-        // context, so a reviewer who cannot inspect it must not approve, answer
-        // or steer it. The owner-verified decision route is not reachable yet
-        // (missing platform/board contract), so approval is explicitly blocked;
-        // only a BARE decline (no answers, no caller-controlled reason) on a
-        // method whose decline is a real negative — which executes nothing — is
-        // preserved.
-        if self.store.assistant_for_alias(&alias)?.is_some() {
-            let negative = answers.is_none()
-                && reason.is_none()
-                && decision == Some("decline")
-                && (effect_row.is_some()
-                    || self
-                        .pending
-                        .lock()
-                        .unwrap()
-                        .get(handle)
-                        .filter(|req| req.alias == alias)
-                        .is_some_and(|req| Self::decline_is_negative(&req.method)));
-            if !negative {
-                return Err(Error::rejected(
-                    "agent respond refused: a member assistant's request input is private, \
-                     so approval, answers or steering are blocked pending the owner-verified \
-                     decision route; only a decline that executes nothing is accepted \
-                     (CAD-2207)",
-                ));
-            }
-        }
         if let Some(row) = effect_row {
             return self.respond_effect(&row, peer_pid, decision, &answers, reason, &alias);
         }

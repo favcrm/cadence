@@ -8,6 +8,13 @@
 //! any guard or validation step, is recorded as an `activity_denied` event
 //! before the error returns. If that record cannot be written the call is
 //! still refused, with a storage-unavailable error.
+//!
+//! CAD-2207: operator authority is not member proof. The store projection
+//! withholds every event written on a bound personal assistant's alias before
+//! filtering, ordering and pagination, so its alias, message ids, timing and
+//! receipts are never a row, cursor, count or hint here. Neither method takes
+//! an alias, and a `sub`/`target` filter can only narrow the already-withheld
+//! page.
 
 use std::sync::Arc;
 

@@ -63,8 +63,8 @@ pub use cloud_agent::{
 };
 #[cfg(test)]
 mod wait_probe;
-pub(crate) use agents::AGENT_GC_RECORDS_ONLY;
 pub use agents::{Agent, ModelDefaultsSnapshot, NewAgent, AGENT_STATES};
+pub(crate) use agents::{AGENT_GC_RECORDS_ONLY, RESTRICTED_LIFECYCLE};
 
 pub const MAX_INSTRUCTIONS_BYTES: usize = 32_000;
 pub mod activity;

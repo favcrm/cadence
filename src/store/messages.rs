@@ -825,6 +825,19 @@ impl Store {
                     ));
                 }
             }
+            if let Some(post) = request_post {
+                let generic_topic = tx
+                    .query_opt(
+                        "SELECT 1 FROM topic_posts p JOIN topics t ON t.id=p.topic_id
+                          WHERE p.id=? AND t.type<>? LIMIT 1",
+                        params![post, super::human_threads::ROOM_TOPIC_TYPE],
+                        |_| Ok(()),
+                    )?
+                    .is_some();
+                if generic_topic && self.assistant_for_alias_in(&tx, alias)?.is_some() {
+                    return Err(Error::rejected(super::RESTRICTED_LIFECYCLE));
+                }
+            }
             let mut named: Vec<&str> = Vec::new();
             for m in steer.supersedes {
                 if !named.contains(&m.as_str()) {

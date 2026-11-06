@@ -308,23 +308,51 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
         // rows); with no daemon running nothing is in flight.
         let status = match client::rpc(self.state_dir, "update_status", json!({})) {
             Ok(status) => status,
-            Err(_) => return Ok(Vec::new()),
+            // A down daemon has no work to drain; a daemon that answered with
+            // an error is NOT idle — fail the drain closed.
+            Err(error) if error.to_string().starts_with("Daemon is not reachable") => {
+                return Ok(Vec::new())
+            }
+            Err(error) => return Err(error),
         };
-        Ok(status["waiting"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|r| {
-                        Some(cadence_agent::update::Waiter {
-                            alias: r["alias"].as_str()?.to_string(),
-                            message: r["message"].as_str().unwrap_or_default().to_string(),
-                            state: r["state"].as_str().unwrap_or_default().to_string(),
-                            age_secs: r["age_secs"].as_u64().unwrap_or(0),
-                        })
-                    })
-                    .collect()
+        // CAD-2207: an old daemon's update_status may still carry personal
+        // aliases/message ids. Prove the fleet contract before parsing or
+        // printing any of its rows.
+        client::require_fleet_protocol(self.state_dir)?;
+        let waiting = status
+            .get("waiting")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| Error::internal("update_status returned no waiting array"))?;
+        waiting
+            .iter()
+            .map(|row| {
+                let row = row.as_object().ok_or_else(|| {
+                    Error::internal("update_status returned a non-object waiting row")
+                })?;
+                let alias = row
+                    .get("alias")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::internal("update_status waiting row has no alias"))?;
+                let message = row
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::internal("update_status waiting row has no message"))?;
+                let state = row
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::internal("update_status waiting row has no state"))?;
+                let age_secs = row
+                    .get("age_secs")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Error::internal("update_status waiting row has no age_secs"))?;
+                Ok(cadence_agent::update::Waiter {
+                    alias: alias.to_string(),
+                    message: message.to_string(),
+                    state: state.to_string(),
+                    age_secs,
+                })
             })
-            .unwrap_or_default())
+            .collect::<Result<Vec<_>>>()
     }
     fn set_pending(&self, pending: Option<&cadence_agent::update::PendingUpdate>) -> Result<()> {
         *self.pending.borrow_mut() = pending.cloned();

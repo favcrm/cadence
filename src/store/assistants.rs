@@ -1005,13 +1005,14 @@ impl Store {
         }
     }
 
-    /// The job ids `(org, sub)` requested or is subscribed to — the union of
-    /// the request ledger and the subscriber set, for `member_job_list`.
+    /// The member's own jobs and subscriptions whose owner still shares them.
     pub fn assist_member_jobs(&self, org: &str, sub: &str) -> Result<Vec<String>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT job FROM assist_requests WHERE org=? AND sub=? \
-             UNION SELECT job FROM job_subscribers WHERE org=? AND sub=?",
+             UNION SELECT s.job FROM job_subscribers s \
+             JOIN assist_job_shares sh ON sh.job=s.job AND sh.org=s.org \
+             WHERE s.org=? AND s.sub=?",
         )?;
         let rows = stmt
             .query_map(params![org, sub, org, sub], |r| r.get(0))?
@@ -1142,6 +1143,18 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Resolve a job's principal without loading its request content.
+    pub(crate) fn assist_request_owner(&self, job: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT org, sub FROM assist_requests WHERE job=? ORDER BY created LIMIT 1",
+            [job],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// The request record bound to `job` (the deferred-commit lookup by

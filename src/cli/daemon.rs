@@ -124,27 +124,79 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
             cadence_agent::backup::refuse_interrupted_restore(&state_dir)?;
             cadence_agent::backup::portable::refuse_if_inactive(&state_dir)?;
             let mut result = client::daemon_start_as(&state_dir, as_identity.as_deref())?;
-            // --resume: once the daemon answers, sweep every agent
-            // with a stored thread and no live endpoint.
+            // --resume: once the daemon answers, sweep ordinary agents with a
+            // stored thread and no live endpoint. Restricted agents are never
+            // resumed by an operator sweep: their owning member route does it.
             if resume {
-                // CAD-2207: the operational projection, not the filtered
-                // list, so a member assistant is not omitted here either.
-                let targets = operational_agents(&state_dir)?
-                    .iter()
-                    .filter(|a| {
-                        a["needs_native_resume"].as_bool().unwrap_or_else(|| {
-                            a["endpoint"].is_null()
-                                && (a["thread_id"].is_string() || a["session_id"].is_string())
-                        })
-                    })
-                    .filter_map(|a| a["alias"].as_str().map(str::to_string))
-                    .collect::<Vec<_>>();
-                result["resume"] = resume_sweep(&state_dir, &targets);
+                let mut resume_result = json!({
+                    "resumed": [], "skipped": [], "fenced": [], "failed": [],
+                });
+                let mut complete = None;
+                match operational_agents(&state_dir) {
+                    Ok(rows) => {
+                        let targets = rows
+                            .iter()
+                            .filter(|a| {
+                                a["needs_native_resume"].as_bool().unwrap_or_else(|| {
+                                    a["endpoint"].is_null()
+                                        && (a["thread_id"].is_string()
+                                            || a["session_id"].is_string())
+                                })
+                            })
+                            .filter_map(|a| a["alias"].as_str().map(str::to_string))
+                            .collect::<Vec<_>>();
+                        resume_result = resume_sweep(&state_dir, &targets);
+                        let ordinary_complete = resume_result["fenced"]
+                            .as_array()
+                            .is_some_and(|rows| rows.is_empty())
+                            && resume_result["failed"]
+                                .as_array()
+                                .is_some_and(|rows| rows.is_empty());
+                        match resume_complete(&state_dir) {
+                            Ok(flag) => {
+                                let complete_flag = flag && ordinary_complete;
+                                complete = Some(complete_flag);
+                                resume_result["complete"] = json!(complete_flag);
+                                if !complete_flag {
+                                    resume_result["incomplete"] = json!(
+                                        "full-fleet resume cannot be completed: some \
+                                         registered agents were not resumed"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                resume_result["snapshot_error"] = json!(error.to_string());
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        resume_result["snapshot_error"] = json!(error.to_string());
+                    }
+                }
+                let unproven = resume_result.get("snapshot_error").is_some() || complete.is_none();
+                result["resume"] = resume_result;
+                print_json(&result);
+                if unproven {
+                    return Err(Error::rejected(
+                        "daemon started, but the resume snapshot could not be proved — \
+                         upgrade the daemon or inspect it, then run `cadence resume --all`",
+                    ));
+                }
+                if complete == Some(false) {
+                    return Err(Error::rejected(
+                        "daemon started, but full-fleet resume is incomplete — some \
+                         registered agents were not resumed",
+                    ));
+                }
+                return Ok(0);
             }
             print_json(&result);
             Ok(0)
         }
         DaemonAction::Status => {
+            // CAD-2207: health can carry in-flight rows; do not read/print an
+            // old daemon's fleet fields without the fleet protocol proof.
+            client::require_fleet_protocol(&state_dir)?;
             let health = client::rpc(&state_dir, "health", json!({}))?;
             print_json(&health);
             Ok(0)
@@ -226,19 +278,90 @@ pub(crate) fn daemon_stop(state_dir: &Path) -> Result<i32> {
 /// `submitted` row under either is stale and can never finish, so waiting
 /// on it is a deadlock (F19). `starting`/`stopping` still hold an actor
 /// mid-transition — their rows stay live blockers.
-/// CAD-2207: the complete narrow operational projection, with a mixed-version
-/// fallback. An older daemon does not serve `agent_operational`; its
-/// `agent_list` is the complete pre-change projection, so restart/resume keeps
-/// its existing behavior. Any other refusal is returned — never an empty fleet.
+/// CAD-2207: the narrow operational projection of ordinary agents. A daemon
+/// that does not serve it is refused: we cannot prove an older `agent_list`
+/// is the complete (unfiltered) view, so a partial fleet must never be used
+/// for a restart/resume snapshot. There is deliberately no `agent_list`
+/// fallback.
 pub(crate) fn operational_agents(state_dir: &Path) -> Result<Vec<Value>> {
-    match client::rpc(state_dir, "agent_operational", json!({})) {
-        Ok(answer) => Ok(answer["agents"].as_array().cloned().unwrap_or_default()),
-        Err(error) if error.to_string().contains("Unknown method") => {
-            let answer = client::rpc(state_dir, "agent_list", json!({}))?;
-            Ok(answer["agents"].as_array().cloned().unwrap_or_default())
-        }
-        Err(error) => Err(error),
+    let answer = client::rpc(state_dir, "agent_operational", json!({})).map_err(|error| {
+        Error::rejected(format!(
+            "this daemon cannot prove the fleet snapshot (agent_operational): {error}; \
+             upgrade the daemon and retry"
+        ))
+    })?;
+    // Strict: a success without an agents array is malformed, never empty.
+    answer
+        .get("agents")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .ok_or_else(|| {
+            Error::rejected(
+                "the daemon's fleet snapshot has no agents array; refusing to read it as empty",
+            )
+        })
+}
+
+/// CAD-2207: the ALL-agent aggregate restart gate. `ignored` is the ordinary
+/// carried-stale pairs to exclude. `busy`/`stale` must be booleans and
+/// `settle`/`drain`/`instance` must be present; a missing field is a hard
+/// refusal, never an implicit clean/idle answer.
+fn fleet_state(
+    state_dir: &Path,
+    ignored: &[(String, String)],
+) -> Result<(bool, bool, String, String, String)> {
+    let ignored = ignored
+        .iter()
+        .map(|(alias, id)| json!([alias, id]))
+        .collect::<Vec<_>>();
+    let answer = client::rpc(
+        state_dir,
+        "agent_fleet_state",
+        json!({"ignored_stale": ignored}),
+    )
+    .map_err(|error| {
+        Error::rejected(format!(
+            "this daemon cannot prove fleet quiescence: {error}; upgrade the daemon and retry"
+        ))
+    })?;
+    let busy = answer
+        .get("busy")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| Error::rejected("agent_fleet_state returned no boolean busy"))?;
+    let stale = answer
+        .get("stale")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| Error::rejected("agent_fleet_state returned no boolean stale"))?;
+    let settle = answer
+        .get("settle")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::rejected("agent_fleet_state returned no settle verdict"))?;
+    if !matches!(settle, "settled" | "pending" | "failed" | "unverified") {
+        return Err(Error::rejected(
+            "agent_fleet_state returned an unknown settle verdict",
+        ));
     }
+    let drain = answer
+        .get("drain")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::rejected("agent_fleet_state returned no drain verdict"))?;
+    if !matches!(drain, "clean" | "failed" | "unverified") {
+        return Err(Error::rejected(
+            "agent_fleet_state returned an unknown drain verdict",
+        ));
+    }
+    let instance = answer
+        .get("instance")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::rejected("agent_fleet_state returned no instance"))?;
+    Ok((
+        busy,
+        stale,
+        settle.to_string(),
+        drain.to_string(),
+        instance.to_string(),
+    ))
 }
 
 pub(crate) fn stale_holder(agent: &Value) -> bool {
@@ -279,14 +402,11 @@ pub(crate) fn busy_agents(
                 _ => {}
             }
         }
-        // In-flight turn on any actor endpoint — the pane probe can
-        // read idle between paste and render, so the message row is
-        // the authoritative in-flight signal. The operational projection
-        // carries the bounded `{id,state}` rows for every agent, including a
-        // member assistant the profile-bearing list withholds, so a restart
-        // can never mistake it for idle. A mixed-version fallback (an older
-        // daemon's list row has no `messages`) keeps the pre-change
-        // per-agent read.
+        // For visible agents, message rows are authoritative even when the
+        // pane probe reads idle between paste and render. The operational
+        // projection withholds member assistants; the separate all-fleet
+        // aggregate must also block a restart for their in-flight work.
+        // A row without `messages` falls back to the per-agent read.
         let mut inflight: Vec<(String, String)> = Vec::new();
         let mut collect = |messages: &[Value]| {
             for m in messages {
@@ -386,6 +506,32 @@ pub(crate) fn daemon_restart(
     as_identity: Option<String>,
 ) -> Result<i32> {
     refuse_restart_over_leftovers(state_dir)?;
+    // CAD-2207: prove the daemon serves the fleet contract before reading its
+    // snapshot. A reachable old daemon is refused without reading/printing its
+    // rows; an offline state dir has nothing to read and may start the new
+    // daemon (its eventual settle verdict is unverified anyway).
+    match client::rpc(state_dir, "daemon_info", json!({})) {
+        Ok(info)
+            if info
+                .get("fleet_protocol")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                < cadence_agent::proto::CLIENT_PROTOCOL =>
+        {
+            return Err(Error::rejected(
+                "this daemon predates the fleet protocol; restart it with its own \
+                 CLI before upgrading from this build",
+            ));
+        }
+        Ok(_) => {}
+        Err(_) if daemon_lock_free(state_dir) => {}
+        Err(_) => {
+            return Err(Error::rejected(
+                "this daemon does not answer and owns the state-dir lock; restart it \
+                 with its own CLI before upgrading from this build",
+            ));
+        }
+    }
     let caller =
         cadence_agent::rollout::resolve_caller(as_identity.as_deref()).map_err(|error| {
             Error::rejected(format!("daemon restart refused before shutdown: {error}"))
@@ -394,36 +540,54 @@ pub(crate) fn daemon_restart(
     // A failed replacement can leave no daemon serving the socket.
     // Preserve semantic refusals, but let transport failure reach the
     // shutdown/lock checks below so rollback can start the old release.
-    // CAD-2207: the complete operational projection; an older daemon that
-    // does not serve it falls back to its pre-change complete `agent_list`.
-    let mut snapshot_verb = "agent_operational";
-    let (before, reachable) = loop {
-        match client::rpc_answer(state_dir, snapshot_verb, json!({})) {
-            Ok(Ok(answer)) => {
-                break (
-                    answer["agents"].as_array().cloned().unwrap_or_default(),
-                    true,
-                )
+    // CAD-2207: the operational projection only. A daemon that does not serve
+    // it cannot prove the fleet snapshot, so the restart refuses before
+    // shutdown rather than assume an older list was complete.
+    let (before, reachable) = match client::rpc_answer(state_dir, "agent_operational", json!({})) {
+        Ok(Ok(answer)) => {
+            let agents = answer
+                .get("agents")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .ok_or_else(|| {
+                    Error::rejected(
+                        "restart: the fleet snapshot has no agents array; refusing to \
+                             read it as empty",
+                    )
+                })?;
+            (agents, true)
+        }
+        Ok(Err(refused)) => {
+            // A daemon that cannot serve the projection proves no fleet
+            // snapshot. --when-idle needs it and refuses; a plain restart
+            // does not use the list for attribution, so it proceeds with
+            // an empty before table and lets the post-start aggregate
+            // gate check the restricted rows. Shutdown still fails closed
+            // on its own caller rule.
+            if when_idle {
+                return Err(Error::rejected(format!(
+                    "when-idle cannot prove the fleet snapshot: {refused}; \
+                         upgrade the daemon or run without --when-idle"
+                )));
             }
-            Ok(Err(refused))
-                if snapshot_verb == "agent_operational"
-                    && refused.to_string().contains("Unknown method") =>
-            {
-                snapshot_verb = "agent_list";
-            }
-            Ok(Err(refused)) => return Err(refused),
-            Err(_) => {
-                // A lost response does not prove the daemon is down. Never
-                // skip --when-idle on a live lock holder whose fleet
-                // snapshot was unavailable.
-                if !daemon_lock_free(state_dir) {
-                    return Err(Error::rejected(
-                        "daemon owns the state-dir lock but does not answer the \
+            eprint_line(
+                "restart: the fleet snapshot is unavailable on this daemon — \
+                     proceeding without a before table; restricted rows are checked \
+                     by the daemon after start",
+            );
+            (Vec::new(), true)
+        }
+        Err(_) => {
+            // A lost response does not prove the daemon is down. Never
+            // skip --when-idle on a live lock holder whose fleet
+            // snapshot was unavailable.
+            if !daemon_lock_free(state_dir) {
+                return Err(Error::rejected(
+                    "daemon owns the state-dir lock but does not answer the \
                          socket — inspect daemon.log before restarting",
-                    ));
-                }
-                break (Vec::new(), false);
+                ));
             }
+            (Vec::new(), false)
         }
     };
     // Stale `(alias, message_id)` pairs observed while waiting — a row
@@ -466,18 +630,45 @@ pub(crate) fn daemon_restart(
                     }
                 }
             }
-            if busy.is_empty() {
+            // CAD-2207: the ALL-agent aggregate is checked server-side; the
+            // carried ordinary stale pairs are passed so --ignore-stale keeps
+            // its meaning. A daemon that cannot answer, or a missing/non-bool
+            // field, is a refusal — never an implicit "idle".
+            let (fleet_busy, fleet_stale, _settle, _drain, _instance) =
+                fleet_state(state_dir, &stale_turns)?;
+            if fleet_stale {
+                return Err(Error::rejected(
+                    "fleet stale in-flight work cannot be carried by an operator restart \
+                     — restart aborted before touching anything; settle it through its \
+                     own authority",
+                ));
+            }
+            if busy.is_empty() && !fleet_busy {
                 break;
             }
             if Instant::now() >= deadline {
+                let mut waiting = busy.join(", ");
+                if fleet_busy {
+                    if !waiting.is_empty() {
+                        waiting.push_str(", ");
+                    }
+                    waiting.push_str("additional fleet work");
+                }
                 return Err(Error::rejected(format!(
                     "fleet still busy after {timeout}s — restart aborted \
-                     before touching anything: {}",
-                    busy.join(", ")
+                     before touching anything: {waiting}"
                 )));
             }
             if Instant::now() >= next_report {
-                eprint_line(&format!("when-idle: waiting on {}", busy.join(", ")));
+                if busy.is_empty() {
+                    eprint_line("when-idle: waiting on fleet work");
+                } else {
+                    eprint_line(&format!(
+                        "when-idle: waiting on {}{}",
+                        busy.join(", "),
+                        if fleet_busy { " and fleet work" } else { "" }
+                    ));
+                }
                 next_report = Instant::now() + Duration::from_secs(30);
             }
             std::thread::sleep(Duration::from_secs(2));
@@ -588,12 +779,17 @@ pub(crate) fn daemon_restart(
         .filter_map(|a| a["alias"].as_str().map(str::to_string))
         .collect();
     let settle_deadline = Instant::now() + Duration::from_secs(120);
-    let after = loop {
-        let after = client::rpc(state_dir, "agent_list", json!({}))?["agents"]
-            .as_array()
+    let (after, settle, drain, fleet_instance) = loop {
+        let list = client::rpc(state_dir, "agent_list", json!({}))?;
+        let after = list
+            .get("agents")
+            .and_then(|value| value.as_array())
             .cloned()
-            .unwrap_or_default();
-        let unsettled = after.iter().any(|a| {
+            .ok_or_else(|| {
+                Error::rejected("restart: the daemon's agent list has no agents array")
+            })?;
+        let (_, _, settle, drain, fleet_instance) = fleet_state(state_dir, &stale_turns)?;
+        let ordinary_unsettled = after.iter().any(|a| {
             let alias = a["alias"].as_str().unwrap_or_default();
             live_before.iter().any(|l| l == alias)
                 && matches!(
@@ -601,8 +797,10 @@ pub(crate) fn daemon_restart(
                     "starting" | "offline"
                 )
         });
-        if !unsettled || Instant::now() >= settle_deadline {
-            break after;
+        let unsettled = ordinary_unsettled || settle == "pending";
+        let terminal = matches!(settle.as_str(), "failed" | "unverified");
+        if !unsettled || terminal || Instant::now() >= settle_deadline {
+            break (after, settle, drain, fleet_instance);
         }
         std::thread::sleep(Duration::from_millis(500));
     };
@@ -668,17 +866,45 @@ pub(crate) fn daemon_restart(
         .collect();
     let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
     let mut bad = start_unbound;
-    // CAD-694: the successor's recovery record is drain evidence the
-    // cursors cannot always carry — a predecessor already dead gave
-    // none, and non-pty endpoints were never scanned. The record is
-    // bound to the instance this start returned; missing, malformed or
-    // mismatched, a failed drain, or any fenced turn fails closed.
-    // An unbound start already reported itself above; its record verdict
-    // would only repeat that, so it is judged only for a spawned start.
+    // CAD-2207: the daemon's generic hidden/ordinary lifecycle and
+    // predecessor drain evidence, bound to the instance this restart
+    // spawned. Missing/malformed evidence is never read as clean, and
+    // the verdict names no alias, uid, count or pane.
     if !start_unbound {
-        if let Some(reason) = recovery_record_verdict(state_dir, started_instance.as_deref()) {
-            eprint_line(&format!("restart: {reason}"));
+        if started_instance.as_deref() != Some(fleet_instance.as_str()) {
+            eprint_line(
+                "restart: the daemon lifecycle evidence is not bound to this restart — \
+                 verdict unverified",
+            );
             bad = true;
+        }
+        match settle.as_str() {
+            "settled" => {}
+            "failed" => {
+                eprint_line("restart: a previously live agent did not settle");
+                bad = true;
+            }
+            "pending" => {
+                eprint_line("restart: lifecycle did not settle before the deadline");
+                bad = true;
+            }
+            _ => {
+                eprint_line("restart: lifecycle could not be verified");
+                bad = true;
+            }
+        }
+        match drain.as_str() {
+            "clean" => {}
+            "failed" => {
+                eprint_line(
+                    "restart: the predecessor's drain failed or recovery fenced in-flight work",
+                );
+                bad = true;
+            }
+            _ => {
+                eprint_line("restart: the predecessor's drain could not be verified");
+                bad = true;
+            }
         }
     }
     for alias in &cursor_misses {
@@ -850,31 +1076,6 @@ pub(crate) fn daemon_restart(
     }
 }
 
-/// The `last-recovery.json` shape the verdict trusts (CAD-694): every
-/// field the writer emits is required and typed, so a truncated,
-/// stale-format or hand-edited record is a parse failure — never clean
-/// evidence. `consumed` stays a raw `Value` because its members are
-/// required-but-nullable (serde `Option` accepts a MISSING key, which
-/// must fail instead).
-#[derive(serde::Deserialize)]
-struct RecoveryRecordView {
-    instance: String,
-    consumed: serde_json::Value,
-    fenced: Vec<FencedRowView>,
-    /// Sibling of `fenced` — required for shape completeness; the
-    /// verdict keys on `fenced` alone.
-    #[allow(dead_code)]
-    unevidenced: Vec<FencedRowView>,
-}
-
-#[derive(serde::Deserialize)]
-struct FencedRowView {
-    alias: String,
-    /// Required for shape completeness; the report lists aliases only.
-    #[allow(dead_code)]
-    message_id: String,
-}
-
 /// The instance id of the daemon a `daemon start` answer spawned.
 /// Only the `started` branch pid-matches its health answer to the
 /// child it spawned; `already_running` carries whichever daemon held
@@ -884,102 +1085,4 @@ pub(crate) fn started_instance(started: &Value) -> Option<String> {
         return None;
     }
     started["health"]["instance"].as_str().map(str::to_string)
-}
-
-/// CAD-694: evaluate the successor daemon's recovery record — drain
-/// evidence the verdict needs independent of the per-alias event
-/// cursors (a predecessor already dead yields none, and non-pty
-/// endpoints were never cursor-covered). `started_id` is the instance
-/// the restart's own start returned (pid-matched health), NOT a file:
-/// a later boot or a pair of failed writes can leave an old, mutually
-/// matching (instance, record) pair on disk, so equality between the
-/// two files proves nothing — only naming THIS successor counts.
-/// `Some(reason)` fails the verdict: the record is absent, unreadable,
-/// wrongly shaped, or bound to a different run; the predecessor's drain
-/// failed; or this recovery fenced any in-flight turn.
-pub(crate) fn recovery_record_verdict(
-    state_dir: &Path,
-    started_id: Option<&str>,
-) -> Option<String> {
-    let Some(started_id) = started_id else {
-        return Some(
-            "the daemon start answer did not name its instance — the predecessor's \
-             drain cannot be verified"
-                .to_string(),
-        );
-    };
-    let Some(current) =
-        std::fs::read_to_string(state_dir.join(cadence_agent::daemon::INSTANCE_FILE))
-            .ok()
-            .map(|s| s.trim().to_string())
-    else {
-        return Some(
-            "the new daemon left no readable instance file — the predecessor's \
-             drain cannot be verified"
-                .to_string(),
-        );
-    };
-    let Some(record) =
-        std::fs::read_to_string(state_dir.join(cadence_agent::daemon::LAST_RECOVERY_FILE))
-            .ok()
-            .and_then(|raw| serde_json::from_str::<RecoveryRecordView>(&raw).ok())
-    else {
-        return Some(
-            "the new daemon left no readable recovery record (missing or malformed) — \
-             the predecessor's drain cannot be verified"
-                .to_string(),
-        );
-    };
-    if current != started_id {
-        return Some(
-            "the recorded daemon instance does not name the run this restart \
-             started — the predecessor's drain cannot be verified"
-                .to_string(),
-        );
-    }
-    if record.instance != started_id {
-        return Some(
-            "the recovery record names a different run than the one this restart \
-             started — the predecessor's drain cannot be verified"
-                .to_string(),
-        );
-    }
-    // `consumed` is null or an object whose `failed` member is present
-    // and null|string — anything else is evidence that did not come
-    // from this build's writer.
-    let failed = match &record.consumed {
-        Value::Null => Ok(None),
-        Value::Object(map) => match (
-            map.get("instance").is_some_and(|v| v.is_string()),
-            map.get("stale")
-                .is_some_and(|v| v.is_string() || v.is_null()),
-            map.get("failed"),
-        ) {
-            (true, true, Some(f)) if f.is_string() || f.is_null() => {
-                Ok(f.as_str().map(str::to_string))
-            }
-            _ => Err("recovery record's `consumed` is malformed"),
-        },
-        _ => Err("recovery record's `consumed` is malformed"),
-    };
-    match failed {
-        Err(why) => Some(format!("{why} — the drain cannot be verified")),
-        Ok(Some(failed)) => Some(format!("the previous daemon's drain failed: {failed}")),
-        Ok(None) => {
-            if record.fenced.is_empty() {
-                None
-            } else {
-                let names = record
-                    .fenced
-                    .iter()
-                    .map(|f| f.alias.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                Some(format!(
-                    "recovery fenced {} in-flight turn(s): {names}",
-                    record.fenced.len()
-                ))
-            }
-        }
-    }
 }

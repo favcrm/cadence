@@ -504,6 +504,11 @@ assistant. A hosted login or profile claim does not automatically attach that
 personal assistant's memory, instructions, tools or MCP connections to an
 external Pi, Claude or Codex session. A profile is not a permission grant.
 
+The ticket author, its owner and a worker's claim are separate facts. Selecting
+a profile must not replace the author or owner. CAD-2061 tracks distinct
+per-session claims; until then a profile-derived claim cannot identify which
+terminal or harness actually performed the work.
+
 Profile claims depend on the deployed board and client versions. An older
 board may still require the member's registered default alias; report that
 refusal rather than borrowing an alias or assuming another board has the

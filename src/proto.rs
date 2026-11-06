@@ -84,7 +84,25 @@ pub fn unwrap(frame: Value) -> Result<Value> {
     })
 }
 
+/// CAD-2207: the wire capability that tells a daemon this client knows the
+/// operator projections withhold member-private assistant rows. Injected by
+/// [`request`] for the two fleet projections only, so every in-repo caller —
+/// CLI, board, remote relay and a long-lived [`crate::client::RpcSession`] —
+/// carries it per request without a per-call-site change. A client that does
+/// not send it is legacy and is refused when there is anything private to
+/// withhold (never handed a partial fleet).
+pub const CLIENT_PROTOCOL: u64 = 2;
+
 pub fn request(method: &str, params: Value) -> Value {
+    let mut params = params;
+    if matches!(method, "agent_list" | "agent_operational") {
+        match params.as_object_mut() {
+            Some(object) => {
+                object.insert("client_protocol".to_string(), json!(CLIENT_PROTOCOL));
+            }
+            None => params = json!({"client_protocol": CLIENT_PROTOCOL}),
+        }
+    }
     json!({"method": method, "params": params})
 }
 

@@ -39,6 +39,146 @@ use super::*;
 
 use crate::board_identity;
 
+/// Keeps a subscriber notice admitted until its provider attempt finishes.
+/// The owner can withdraw a share only when no such notice is being prepared
+/// or submitted for that job. This is local ordering, not remote revocation.
+pub(super) struct AssistNoticeAdmission<'a> {
+    shared: &'a Shared,
+    org: String,
+    job: String,
+}
+
+impl Drop for AssistNoticeAdmission<'_> {
+    fn drop(&mut self) {
+        let mut admissions = self
+            .shared
+            .assist_notice_admissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(jobs) = admissions.get_mut(&self.org) {
+            if let Some(count) = jobs.get_mut(&self.job) {
+                *count -= 1;
+                if *count == 0 {
+                    jobs.remove(&self.job);
+                }
+            }
+            if jobs.is_empty() {
+                admissions.remove(&self.org);
+            }
+        }
+    }
+}
+
+impl Shared {
+    /// Reserve the receipt's job before assembling the provider prompt; the
+    /// caller must re-prove authority while this admission is held.
+    pub(super) fn admit_assist_notice(
+        &self,
+        message: &store::Message,
+    ) -> Result<Option<AssistNoticeAdmission<'_>>> {
+        if message.source != "assist_job_event" {
+            return Ok(None);
+        }
+        let delivery = self
+            .store
+            .assist_notice_delivery(&message.id)?
+            .ok_or_else(|| {
+                Error::PreWrite("assist notice refused: no durable delivery receipt".to_string())
+            })?;
+        if self
+            .store
+            .assist_request_owns(&delivery.org, &delivery.sub, &delivery.job)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.reserve_shared_job(delivery.org, delivery.job)))
+    }
+
+    fn reserve_shared_job(&self, org: String, job: String) -> AssistNoticeAdmission<'_> {
+        let mut admissions = self
+            .assist_notice_admissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *admissions
+            .entry(org.clone())
+            .or_default()
+            .entry(job.clone())
+            .or_default() += 1;
+        AssistNoticeAdmission {
+            shared: self,
+            org,
+            job,
+        }
+    }
+
+    fn admit_member_job_read(
+        &self,
+        org: &str,
+        sub: &str,
+        job: &str,
+    ) -> Result<Option<AssistNoticeAdmission<'_>>> {
+        if self.store.assist_request_owns(org, sub, job)? {
+            return Ok(None);
+        }
+        let admission = self.reserve_shared_job(org.to_string(), job.to_string());
+        if !self.store.job_is_subscriber(job, org, sub)?
+            || !self.store.assist_job_is_shared(job, org)?
+        {
+            return Err(Error::rejected(
+                "member job read refused: the job is not currently shared with this member",
+            ));
+        }
+        Ok(Some(admission))
+    }
+
+    /// Hold a subscriber's live share through the generic work-read handler.
+    /// Ordinary agents and operators keep their existing independent policy.
+    pub(super) fn admit_assist_work_read(
+        &self,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Option<AssistNoticeAdmission<'_>>> {
+        if !matches!(method, "job_show" | "job_events" | "task_show") {
+            return Ok(None);
+        }
+        let alias = match self.caller_identity(peer_pid) {
+            Ok(Caller::Agent(caller)) => caller.agent.alias.clone(),
+            _ => return Ok(None),
+        };
+        let Some(binding) = self.store.assistant_for_alias(&alias)? else {
+            return Ok(None);
+        };
+        let (job, task) = if method == "task_show" {
+            let Some(task) = params.get("task").and_then(Value::as_str) else {
+                return Ok(None);
+            };
+            let Some(job) = self.store.task_job_id(task)? else {
+                return Ok(None);
+            };
+            (job, Some(task))
+        } else {
+            let Some(job) = params.get("job").and_then(Value::as_str) else {
+                return Ok(None);
+            };
+            (job.to_string(), None)
+        };
+        if self.store.caller_has_work_role(&alias, &job, task)? {
+            if self
+                .store
+                .assist_request_owns(&binding.org, &binding.sub, &job)?
+            {
+                return Ok(None);
+            }
+            // The later target check may observe a changed assignment and
+            // instead admit via a live share. Keep withdrawal ordered even
+            // when the role was present at this earlier check.
+            return Ok(Some(self.reserve_shared_job(binding.org, job)));
+        }
+        self.admit_member_job_read(&binding.org, &binding.sub, &job)
+    }
+}
+
 /// Refuse any request field outside `allowed` — the member surface admits
 /// only `member_envelope` plus the verb's own arguments; an unlisted or
 /// identity field is never silently dropped.
@@ -340,12 +480,7 @@ impl Shared {
                     .get("task")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let job_id = self
-                    .store
-                    .task(task_id)
-                    .ok()
-                    .map(|t| t.job_id)
-                    .unwrap_or_default();
+                let job_id = self.store.task_job_id(task_id)?.unwrap_or_default();
                 let owns = self
                     .store
                     .assist_request_owns(&binding.org, &binding.sub, &job_id)
@@ -383,7 +518,7 @@ impl Shared {
             // conversation, its own mail and the jobs bound to it.
             _ => {
                 return Err(Error::rejected(format!(
-                    "assist agent '{alias}' may not call '{method}' — its surface is \
+                    "assist agent may not call '{method}' — its surface is \
                      its own conversation and the jobs bound to it; fleet/issue/wiki/\
                      dispatch/operator effects are refused (member boundary, CAD-1380)"
                 )));
@@ -501,27 +636,24 @@ impl Shared {
         // real store error propagates (fail closed), never a silent Ok.
         let (job, task) = match (job_arg, task_arg) {
             (Some(job), _) => (job.to_string(), None),
-            (None, Some(task)) => match self.store.task(task) {
-                Ok(t) => (t.job_id, Some(task.to_string())),
-                Err(crate::Error::Rejected(_)) => return Ok(()),
-                Err(e) => return Err(e),
+            (None, Some(task)) => match self.store.task_job_id(task)? {
+                Some(job) => (job, Some(task.to_string())),
+                None => return Ok(()),
             },
             (None, None) => return Ok(()),
         };
-        let owner = match self.store.assist_request_for_job(&job) {
-            Ok(Some(owner)) => owner,
-            Ok(None) => return Ok(()),
-            Err(e) => return Err(e),
+        let Some((owner_org, owner_sub)) = self.store.assist_request_owner(&job)? else {
+            return Ok(());
         };
         // The job has a member-owned ledger row, so it is member-private. A
         // missing owner binding can never drop it to ordinary rules.
-        let binding = self.store.assistant_binding(&owner.org, &owner.sub)?;
+        let binding = self.store.assistant_binding(&owner_org, &owner_sub)?;
         self.member_target_read_decision(
             method,
             peer_pid,
             MemberReadTarget::SharedWork,
             binding.as_ref(),
-            &owner.org,
+            &owner_org,
             Some((&job, task.as_deref())),
         )
     }
@@ -659,10 +791,10 @@ impl Shared {
     /// the operator nor an authorized job actor (canonical PM or the assignee
     /// of a task of this job). Nonmember jobs are never withheld.
     pub(super) fn member_job_row_withheld(&self, job: &str, peer_pid: u32) -> Result<bool> {
-        let Some(owner) = self.store.assist_request_for_job(job)? else {
+        let Some((owner_org, owner_sub)) = self.store.assist_request_owner(job)? else {
             return Ok(false);
         };
-        let binding = self.store.assistant_binding(&owner.org, &owner.sub)?;
+        let binding = self.store.assistant_binding(&owner_org, &owner_sub)?;
         match self.connection_caller(peer_pid)? {
             caller_rule::Who::Operator => Ok(false),
             caller_rule::Who::Agent(caller) => {
@@ -672,7 +804,7 @@ impl Shared {
                 if self.caller_holds_job_authority(&caller, job, None)? {
                     return Ok(false);
                 }
-                Ok(!self.caller_is_active_subscriber(&caller, job, &owner.org)?)
+                Ok(!self.caller_is_active_subscriber(&caller, job, &owner_org)?)
             }
             caller_rule::Who::Unproven(_) => Ok(true),
         }
@@ -687,13 +819,7 @@ impl Shared {
         job: &str,
         requested_task: Option<&str>,
     ) -> Result<bool> {
-        if self.store.job(job)?.pm_alias == caller {
-            return Ok(true);
-        }
-        match requested_task {
-            Some(task) => Ok(self.store.task(task)?.assignee.as_deref() == Some(caller)),
-            None => Ok(false),
-        }
+        self.store.caller_has_work_role(caller, job, requested_task)
     }
 
     /// Re-verify the member's signed envelope at the daemon. The config is
@@ -1370,15 +1496,72 @@ impl Shared {
         // A domain-separated 64-hex digest keeps the message id within the
         // 64-char id limit and stays deterministic per intent key.
         let id = crate::operator_auth::digest(&format!("assist-notice:{key}"));
-        let task = match self.store.task(&task_id) {
-            Ok(t) if t.job_id == job => t,
-            _ => {
-                self.store
-                    .finish_assist_job_notification(seq, "unresolved")?;
+        // A subscriber's share and live member authority must be checked
+        // before reading the task or its owner's request. Hold the local
+        // admission until the intent is committed or refused.
+        let (subscriber, _routing_admission) = if target == "subscriber" {
+            let (Some(org), Some(sub), Some(assistant_id)) = (
+                intent_str(p, "org"),
+                intent_str(p, "sub"),
+                intent_str(p, "assistant_id"),
+            ) else {
+                refuse(&self.store)?;
+                return Ok(None);
+            };
+            let admission = if self.store.assist_request_owns(&org, &sub, &job)? {
+                None
+            } else {
+                let admission = self.reserve_shared_job(org.clone(), job.clone());
+                if !self.store.assist_job_is_shared(&job, &org)? {
+                    refuse(&self.store)?;
+                    return Ok(None);
+                }
+                Some(admission)
+            };
+            let Some(binding) = self.store.assistant_by_id(&org, &assistant_id)? else {
+                refuse(&self.store)?;
+                return Ok(None);
+            };
+            if !binding.is_active() || binding.sub != sub {
+                refuse(&self.store)?;
                 return Ok(None);
             }
+            let member = MemberCaller {
+                org,
+                sub,
+                assistant_id: binding.assistant_id.clone(),
+                alias: binding.alias.clone(),
+                conversation_id: binding.conversation_id.clone(),
+                state: binding.state.clone(),
+                credential_id: String::new(),
+            };
+            if self
+                .member_authority_live(
+                    "",
+                    &member,
+                    MemberReprove {
+                        operation: "job_events",
+                        scope: "assist.jobs",
+                        job_id: Some(&job),
+                        op_credential_id: None,
+                    },
+                    "assist notice",
+                )
+                .is_err()
+            {
+                refuse(&self.store)?;
+                return Ok(None);
+            }
+            (Some(binding), admission)
+        } else {
+            (None, None)
         };
-        let Some(owner) = self.store.assist_request_for_job(&job)? else {
+        if self.store.task_job_id(&task_id)?.as_deref() != Some(job.as_str()) {
+            self.store
+                .finish_assist_job_notification(seq, "unresolved")?;
+            return Ok(None);
+        }
+        let Some((owner_org, _)) = self.store.assist_request_owner(&job)? else {
             refuse(&self.store)?;
             return Ok(None);
         };
@@ -1408,7 +1591,7 @@ impl Shared {
                     refuse(&self.store)?;
                     return Ok(None);
                 };
-                if state != "revising" || task.assignee.as_deref() != Some(alias.as_str()) {
+                if state != "revising" || !self.store.task_assigned_to(&task_id, &alias)? {
                     self.store
                         .finish_assist_job_notification(seq, "unresolved")?;
                     return Ok(None);
@@ -1445,49 +1628,11 @@ impl Shared {
                 Ok((!duplicate).then_some(alias))
             }
             "subscriber" => {
-                let (Some(org), Some(sub), Some(assistant_id)) = (
-                    intent_str(p, "org"),
-                    intent_str(p, "sub"),
-                    intent_str(p, "assistant_id"),
-                ) else {
+                let Some(binding) = subscriber else {
                     refuse(&self.store)?;
                     return Ok(None);
                 };
-                if owner.org != org {
-                    refuse(&self.store)?;
-                    return Ok(None);
-                }
-                let Some(binding) = self.store.assistant_by_id(&org, &assistant_id)? else {
-                    refuse(&self.store)?;
-                    return Ok(None);
-                };
-                if !binding.is_active() || binding.sub != sub {
-                    refuse(&self.store)?;
-                    return Ok(None);
-                }
-                // Live jobs-scope proof, outside any store transaction. The
-                // member's original credential is never borrowed.
-                let member = MemberCaller {
-                    org: org.clone(),
-                    sub: sub.clone(),
-                    assistant_id: binding.assistant_id.clone(),
-                    alias: binding.alias.clone(),
-                    conversation_id: binding.conversation_id.clone(),
-                    state: binding.state.clone(),
-                    credential_id: String::new(),
-                };
-                let proof = self.member_authority_live(
-                    "",
-                    &member,
-                    MemberReprove {
-                        operation: "job_events",
-                        scope: "assist.jobs",
-                        job_id: Some(&job),
-                        op_credential_id: None,
-                    },
-                    "assist notice",
-                );
-                if proof.is_err() {
+                if owner_org != binding.org {
                     refuse(&self.store)?;
                     return Ok(None);
                 }
@@ -1549,9 +1694,8 @@ impl Shared {
             .ok_or_else(|| refused("no task"))?;
         let job = self
             .store
-            .task(task_id)
-            .map_err(|_| refused("task unknown"))?
-            .job_id;
+            .task_job_id(task_id)?
+            .ok_or_else(|| refused("task unknown"))?;
         let binding = self
             .store
             .assistant_for_alias(&message.alias)?
@@ -1559,8 +1703,8 @@ impl Shared {
             .ok_or_else(|| refused("binding inactive"))?;
         let owner_ok = self
             .store
-            .assist_request_for_job(&job)?
-            .is_some_and(|o| o.org == binding.org);
+            .assist_request_owner(&job)?
+            .is_some_and(|(org, _)| org == binding.org);
         let member_ok = self
             .store
             .job_is_subscriber(&job, &binding.org, &binding.sub)?
@@ -2390,18 +2534,7 @@ impl Shared {
             params.get("job").and_then(Value::as_str),
         )?;
         let job = required_str(params, "job")?;
-        let owns = self
-            .store
-            .assist_request_owns(&member.org, &member.sub, job)?;
-        let sub = self
-            .store
-            .job_is_subscriber(job, &member.org, &member.sub)?;
-        if !(owns || sub) {
-            return Err(Error::rejected(format!(
-                "member job evidence refused: '{job}' is not a job this member \
-                 owns or subscribes to"
-            )));
-        }
+        let _admission = self.admit_member_job_read(&member.org, &member.sub, job)?;
         // REAL evidence, revision-bound. A task's state derives only from its
         // server-recorded `head_sha` and the verdict current for its revision;
         // a verdict counts only when it names that exact head. `reported` =
@@ -2552,18 +2685,7 @@ impl Shared {
             params.get("job").and_then(Value::as_str),
         )?;
         let job = required_str(params, "job")?;
-        let sub = self
-            .store
-            .job_is_subscriber(job, &member.org, &member.sub)?;
-        let owns = self
-            .store
-            .assist_request_owns(&member.org, &member.sub, job)?;
-        if !(sub || owns) {
-            return Err(Error::rejected(format!(
-                "member job events refused: '{job}' is not a job this member \
-                 owns or subscribes to"
-            )));
-        }
+        let _admission = self.admit_member_job_read(&member.org, &member.sub, job)?;
         // The job's own event stream — work metadata only (kind, revision,
         // task, verdict), never a member's private conversation.
         let after = optional_i64(params, "after").unwrap_or(0);
@@ -2627,8 +2749,29 @@ impl Shared {
                 "member job share refused: '{job}' is not a job this member owns"
             )));
         }
-        self.store
-            .assist_job_share(job, &member.org, &member.sub, enabled)?;
+        if enabled {
+            self.store
+                .assist_job_share(job, &member.org, &member.sub, true)?;
+        } else {
+            // Keep the admission lock through the store commit: a new notice
+            // must either reserve first or re-prove after the withdrawal.
+            let admissions = self
+                .assist_notice_admissions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if admissions
+                .get(&member.org)
+                .is_some_and(|jobs| jobs.contains_key(job))
+            {
+                return Err(Error::gate_coded(
+                    "share_withdrawal_pending",
+                    "A delivery for this job is being submitted; sharing remains on. \
+                     Retry after it finishes.",
+                ));
+            }
+            self.store
+                .assist_job_share(job, &member.org, &member.sub, false)?;
+        }
         Ok(json!({
             "job": job,
             "shared": enabled,
@@ -2764,16 +2907,24 @@ impl Shared {
             crate::assistant_actor::AssistScope::Jobs,
             Some(job),
         )?;
+        // Serialize the entitlement check, job read and subscription commit
+        // against withdrawal. The reservation is scoped to this job.
+        let _admission = self.reserve_shared_job(member.org.clone(), job.to_string());
+        if !self.store.assist_job_is_shared(job, &member.org)? {
+            return Err(Error::rejected(format!(
+                "member job subscribe refused: '{job}' is not shared by its owner"
+            )));
+        }
         // The job must be an assist-bound job in THIS member's org. A
         // missing `assist_requests` row (not assist-bound) refuses; a row
         // naming a different org refuses — a member can only subscribe
         // inside their own organization's shared work.
-        let assist = self.store.assist_request_for_job(job)?.ok_or_else(|| {
+        let (owner_org, _) = self.store.assist_request_owner(job)?.ok_or_else(|| {
             Error::rejected(format!(
                 "member job subscribe refused: '{job}' is not an assist-bound job"
             ))
         })?;
-        if assist.org != member.org {
+        if owner_org != member.org {
             return Err(Error::rejected(format!(
                 "member job subscribe refused: '{job}' is bound to another organization"
             )));
@@ -2784,14 +2935,6 @@ impl Shared {
         if record.is_none() {
             return Err(Error::rejected(format!(
                 "member job subscribe refused: '{job}' has no job record"
-            )));
-        }
-        // The entitlement: the job's owner must have explicitly shared
-        // it inside THIS member's org. Org membership + `assist.jobs`
-        // never substitutes for the owner's authenticated grant.
-        if !self.store.assist_job_is_shared(job, &member.org)? {
-            return Err(Error::rejected(format!(
-                "member job subscribe refused: '{job}' is not shared by its owner"
             )));
         }
         self.store

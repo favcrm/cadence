@@ -27,6 +27,123 @@ fn malformed_daemon_response() -> Error {
     })
 }
 
+/// An earlier daemon_info answer cannot authenticate a later connection.
+/// Sensitive reads accept only a response marked by the daemon that actually
+/// answered it; legacy errors are replaced too, because they may echo data.
+fn protect_private_frame(method: &str, frame: Value) -> Value {
+    let sensitive = matches!(
+        method,
+        "agent_list"
+            | "agent_operational"
+            | "agent_show"
+            | "agent_events"
+            | "agent_inbox"
+            | "agent_requests"
+            | "agent_wait"
+            | "agent_capture"
+            | "agent_probe"
+            | "agent_gc_plan"
+            | "agent_archive_plan"
+            | "agent_settings_get"
+            | "model_defaults_get"
+            | "activity_query"
+            | "activity_export"
+            | "thread_read"
+            | "conversation_list"
+            | "work_conversation_list"
+            | "work_conversation_read"
+            | "topic_read"
+            | "message_list"
+            | "message_read"
+            | "cli_message_inbox"
+            | "cli_message_read"
+            | "job_list"
+            | "job_show"
+            | "job_events"
+            | "task_show"
+            | "human_rooms_list"
+            | "human_room_read"
+            | "human_agents_list"
+            | "human_notifications"
+            | "member_assist_state"
+            | "member_assist_history"
+            | "member_job_list"
+            | "member_job_evidence"
+            | "member_job_events"
+            | "board_peer_agent"
+            | "board_peer_operator"
+            | "update_status"
+    );
+    if method != "health" && !sensitive {
+        return frame;
+    }
+    let valid = match frame.get("ok").and_then(Value::as_bool) {
+        Some(true) => frame.get("result").is_some() && frame.get("error").is_none(),
+        Some(false) => {
+            frame.get("result").is_none()
+                && ["/error/kind", "/error/message"]
+                    .iter()
+                    .all(|field| frame.pointer(field).and_then(Value::as_str).is_some())
+        }
+        None => false,
+    };
+    if !valid {
+        return proto::err(&malformed_daemon_response());
+    }
+    if method == "health" && frame.get("ok").and_then(Value::as_bool) == Some(true) {
+        let healthy = frame
+            .get("result")
+            .and_then(Value::as_object)
+            .is_some_and(|fields| {
+                fields.get("state").and_then(Value::as_str) == Some("ready")
+                    && fields
+                        .get("pid")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|pid| pid > 0)
+            });
+        if !healthy {
+            return proto::err(&malformed_daemon_response());
+        }
+    }
+    if frame
+        .get("fleet_protocol")
+        .and_then(Value::as_u64)
+        .is_some_and(|version| version >= proto::CLIENT_PROTOCOL)
+    {
+        return frame;
+    }
+    if method == "health" && frame.get("ok").and_then(Value::as_bool) == Some(true) {
+        // Keep legacy liveness usable without forwarding its fleet projection,
+        // but never turn a malformed answer into an "already running" daemon.
+        let Some(fields) = frame.get("result").and_then(Value::as_object) else {
+            return proto::err(&malformed_daemon_response());
+        };
+        let Some(pid) = fields
+            .get("pid")
+            .and_then(Value::as_u64)
+            .filter(|pid| *pid > 0)
+        else {
+            return proto::err(&malformed_daemon_response());
+        };
+        if fields.get("state").and_then(Value::as_str) != Some("ready") {
+            return proto::err(&malformed_daemon_response());
+        }
+        let mut health = serde_json::Map::new();
+        health.insert("fleet_status_unavailable".into(), Value::Bool(true));
+        health.insert("state".into(), Value::String("ready".into()));
+        health.insert("pid".into(), Value::from(pid));
+        for key in ["agent_uid", "protocol"] {
+            if let Some(value) = fields.get(key).and_then(Value::as_u64) {
+                health.insert(key.into(), Value::from(value));
+            }
+        }
+        return proto::ok(Value::Object(health));
+    }
+    proto::err(&Error::rejected(
+        "the daemon cannot prove the privacy projection; upgrade it before this read",
+    ))
+}
+
 /// State directory: `$CADENCE_STATE_DIR`, else the resolved home's
 /// `state/` — `$XDG_STATE_HOME/cadence` or `~/.local/state/cadence`
 /// under the legacy layout ([`crate::home`]).
@@ -344,6 +461,34 @@ fn spawn_daemon_run(state_dir: &Path, identity: Option<&str>) -> Result<std::pro
 }
 
 /// Send one request, return the result value or the wire error.
+/// CAD-2207: prove the daemon serves the fleet contract before this client
+/// reads `agent_list`/`agent_operational` or acts on its lifecycle. An older
+/// daemon's projections may still contain personal aliases, so absence of the
+/// field is a hard refusal — never a reason to read and print its rows.
+/// This preflight is not atomic with an operation on a different connection.
+pub fn require_fleet_protocol(state_dir: &Path) -> Result<()> {
+    let info = rpc_timeout(
+        state_dir,
+        "daemon_info",
+        serde_json::json!({}),
+        Duration::from_secs(10),
+    )
+    .map_err(|_| Error::rejected("the daemon's fleet protocol could not be verified"))?;
+    if info
+        .get("fleet_protocol")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        >= proto::CLIENT_PROTOCOL
+    {
+        Ok(())
+    } else {
+        Err(Error::rejected(
+            "the daemon predates the fleet protocol; upgrade the daemon before \
+             listing or resuming agents",
+        ))
+    }
+}
+
 pub fn rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
     rpc_timeout(state_dir, method, params, Duration::from_secs(700))
 }
@@ -386,6 +531,9 @@ pub fn rpc_timeout(
     params: Value,
     timeout: Duration,
 ) -> Result<Value> {
+    if matches!(method, "agent_list" | "agent_operational") {
+        require_fleet_protocol(state_dir)?;
+    }
     proto::unwrap(rpc_frame(state_dir, method, params, timeout)?)
 }
 
@@ -599,7 +747,7 @@ fn rpc_deadline_frame_on(
         None => false,
     };
     if valid {
-        Ok(frame)
+        Ok(protect_private_frame(method, frame))
     } else {
         Err(malformed_daemon_response())
     }
@@ -974,6 +1122,9 @@ pub fn rpc_private_timeout(
 /// included (CAD-384: `daemon restart` must not read a caller-rule
 /// refusal of `shutdown` as "not running").
 pub fn rpc_answer(state_dir: &Path, method: &str, params: Value) -> Result<Result<Value>> {
+    if matches!(method, "agent_list" | "agent_operational") {
+        require_fleet_protocol(state_dir)?;
+    }
     Ok(proto::unwrap(rpc_frame(
         state_dir,
         method,
@@ -1004,13 +1155,18 @@ impl<'a> RpcSession<'a> {
     /// Distinguish a complete daemon answer from an unusable transport frame.
     /// There is no reconnect or replay after a request has been written.
     pub fn answer(&mut self, method: &str, params: Value) -> Result<Result<Value>> {
+        let frame = self.frame(method, params, Duration::from_secs(700))?;
+        Ok(proto::unwrap(protect_private_frame(method, frame)))
+    }
+
+    fn frame(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let mut request = proto::request(method, params);
         if let Some(test_caller) = crate::test_seam::caller_frame(self.state_dir)? {
             request[crate::test_seam::FRAME_FIELD] = test_caller;
         }
         let mut body = request.to_string();
         body.push('\n');
-        let deadline = Instant::now() + Duration::from_secs(700);
+        let deadline = Instant::now() + timeout;
         let fd = self.stream.as_raw_fd();
         write_bounded(fd, body.as_bytes(), deadline)?;
         let line = read_line_with_limit(fd, deadline, RPC_SESSION_FRAME_CAP)?;
@@ -1031,8 +1187,34 @@ impl<'a> RpcSession<'a> {
         if !valid {
             return Err(malformed_daemon_response());
         }
-        Ok(proto::unwrap(frame))
+        Ok(frame)
     }
+}
+
+/// Send a mutation only after the same connection proves the fleet protocol.
+/// A disconnected daemon is not reconnected and the mutation is not replayed.
+pub fn rpc_after_fleet_preflight(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
+    let mut session = RpcSession::connect(state_dir)?;
+    let unavailable = || Error::rejected("the daemon's fleet protocol could not be verified");
+    let frame = session
+        .frame(
+            "daemon_info",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
+        .map_err(|_| unavailable())?;
+    if frame
+        .get("fleet_protocol")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        < proto::CLIENT_PROTOCOL
+    {
+        return Err(unavailable());
+    }
+    if !proto::unwrap(frame).map_err(|_| unavailable())?.is_object() {
+        return Err(unavailable());
+    }
+    session.answer(method, params)?
 }
 
 /// CAD-508 retry budget for connects across the daemon restart window.
@@ -1297,8 +1479,13 @@ fn rpc_exchange(
     writeln!(stream, "{request}")?;
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;
-    serde_json::from_str(&line).map_err(|_| Error::internal("Daemon returned a malformed response"))
+    let frame = serde_json::from_str(&line)
+        .map_err(|_| Error::internal("Daemon returned a malformed response"))?;
+    Ok(protect_private_frame(method, frame))
 }
+
+#[cfg(test)]
+mod cad2207_privacy_projection_acceptance;
 
 #[cfg(test)]
 mod tests {

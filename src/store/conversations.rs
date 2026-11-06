@@ -8,6 +8,18 @@
 //!
 //! App installation conversations (`threads.install_id`) are a separate
 //! namespace and are excluded here: this view is the agent work view only.
+//!
+//! CAD-2207: a member's personal assistant is never part of this view. The
+//! reader resolves ONE durable snapshot ([`PrivateAssistants`]) from the
+//! daemon's own tables and hands it to the [`Scope`] of every query, so a
+//! message that names a bound assistant — as its delivery target, sender or
+//! recipient, by durable uid or by its recorded label — is out of scope at
+//! the SQL level. No alias prefix, request field or "current alias" lookup
+//! decides this: an alias is reusable and an agent row is deletable, so the
+//! proof comes from the `assistants` binding (which outlives its agent row)
+//! and from the identities those rows recorded.
+
+use std::collections::BTreeSet;
 
 use rusqlite::params;
 use serde_json::{json, Value};
@@ -73,6 +85,90 @@ pub struct Scope<'a> {
     pub project_uids: Option<&'a [String]>,
     /// The project's repos as lowercase `owner/name` (task/job fallback).
     pub project_repos: Option<&'a [String]>,
+    /// CAD-2207: the member assistants this reader must never expose. When
+    /// set, every query also drops a message that names a bound assistant,
+    /// and every row whose uid carries no recorded label (ambiguous
+    /// identity, withheld rather than shown as ordinary).
+    pub private: Option<&'a PrivateAssistants>,
+}
+
+/// CAD-2207: the durable evidence that a participant belongs to a member's
+/// personal assistant — one snapshot per list/read, never a claim.
+///
+/// The `assistants` binding keys on an alias and is not foreign-keyed to
+/// `agents`, so it survives an agent-row removal; a revoked or archived
+/// binding is still a member assistant. `uids` adds every runtime uid the
+/// store can prove: the bound alias's live agent row, the uid a message row
+/// recorded under a bound alias (the daemon-derived snapshot of who held
+/// that alias), and the runtime uid a proved read or a staged effect froze.
+///
+/// A uid that only ever carried the alias is therefore still recognised
+/// after its agent row is gone, and an alias reused by a later, unrelated
+/// registration fails closed: the old uid stays in this set.
+#[derive(Debug, Default, Clone)]
+pub struct PrivateAssistants {
+    aliases: BTreeSet<String>,
+    uids: BTreeSet<String>,
+}
+
+impl PrivateAssistants {
+    /// Whether `alias` is a bound member assistant, in any state.
+    pub fn is_alias(&self, alias: &str) -> bool {
+        self.aliases.contains(alias)
+    }
+
+    /// Whether `uid` is a proved runtime of a member assistant.
+    pub fn is_uid(&self, uid: &str) -> bool {
+        self.uids.contains(uid)
+    }
+
+    /// Whether this snapshot proves nothing private at all.
+    pub fn is_empty(&self) -> bool {
+        self.aliases.is_empty() && self.uids.is_empty()
+    }
+}
+
+/// The CAD-2207 exclusion over the `messages` table, as `WHERE` fragments.
+///
+/// Drops a row that names a bound assistant by delivery target (`alias`),
+/// sender or recipient, by durable uid or by recorded label, and a row whose
+/// uid has no recorded label at all: such a row cannot be tied to a binding,
+/// so it is ambiguous provenance and is withheld rather than presented as
+/// ordinary work. Bind values are pushed once and the same placeholders are
+/// reused by every clause. An absent (or empty) snapshot adds nothing.
+fn private_sql(private: Option<&PrivateAssistants>, args: &mut Vec<String>) -> Vec<String> {
+    let Some(private) = private.filter(|snapshot| !snapshot.is_empty()) else {
+        return Vec::new();
+    };
+    let mut clauses = Vec::new();
+    if !private.aliases.is_empty() {
+        let mut marks = Vec::new();
+        for alias in &private.aliases {
+            args.push(alias.clone());
+            marks.push(format!("?{}", args.len()));
+        }
+        let marks = marks.join(",");
+        clauses.push(format!("alias NOT IN ({marks})"));
+        clauses.push(format!("(sender IS NULL OR sender NOT IN ({marks}))"));
+        clauses.push(format!("(recipient IS NULL OR recipient NOT IN ({marks}))"));
+    }
+    if !private.uids.is_empty() {
+        let mut marks = Vec::new();
+        for uid in &private.uids {
+            args.push(uid.clone());
+            marks.push(format!("?{}", args.len()));
+        }
+        let marks = marks.join(",");
+        clauses.push(format!(
+            "(sender_uid IS NULL OR sender_uid NOT IN ({marks}))"
+        ));
+        clauses.push(format!(
+            "(recipient_uid IS NULL OR recipient_uid NOT IN ({marks}))"
+        ));
+    }
+    clauses.push("(sender_uid IS NULL OR sender IS NOT NULL)".to_string());
+    clauses.push("(recipient_uid IS NULL OR recipient IS NOT NULL)".to_string());
+    clauses
 }
 
 /// The shared `WHERE` clause for a message scope. Binds `?1..` for the
@@ -129,6 +225,10 @@ fn scope_sql(scope: &Scope, args: &mut Vec<String>, recipient_only: bool) -> Str
             clauses.push(format!("({who} OR {repo_hit})"));
         }
     }
+    // CAD-2207: the member-assistant exclusion is part of EVERY in-scope
+    // message query, so no pair count, preview, page or paging probe can
+    // see a row the binding owns.
+    clauses.extend(private_sql(scope.private, args));
     if clauses.is_empty() {
         "1=1".to_string()
     } else {
@@ -157,31 +257,102 @@ fn unknown_clause(scope: &Scope, args: &mut Vec<String>) -> String {
 }
 
 impl Store {
+    /// CAD-2207: the durable member-assistant snapshot for one operator
+    /// work list/read. Every part is read from the daemon's own rows, never
+    /// a request field or an alias prefix:
+    ///
+    /// - `assistants.alias` — the binding, in every state (a revoked or
+    ///   archived assistant keeps its alias inside the member boundary);
+    /// - the bound alias's live `agents` row, and the `sender_uid` /
+    ///   `recipient_uid` a message recorded under a bound label — the
+    ///   snapshot of who held that alias at the time, which survives the
+    ///   agent-row removal that would otherwise erase the link;
+    /// - the runtime uid a proved member read (`assistant_event_fences`) or
+    ///   a staged effect (`effect_member_owners`) froze for the binding.
+    ///
+    /// A store error is an error: the view never falls open because the
+    /// binding table could not be read.
+    pub fn private_assistants(&self) -> Result<PrivateAssistants> {
+        self.read_tx(|conn| {
+            let aliases: Vec<String> =
+                conn.query_vec("SELECT alias FROM assistants", [], |r| r.get(0))?;
+            let uids: Vec<String> = conn.query_vec(
+                "SELECT uid FROM (
+                     SELECT g.uid AS uid FROM agents g
+                       JOIN assistants a ON a.alias = g.alias
+                     UNION
+                     SELECT m.sender_uid FROM messages m
+                       WHERE m.sender_uid IS NOT NULL
+                         AND m.sender IN (SELECT alias FROM assistants)
+                     UNION
+                     SELECT m.recipient_uid FROM messages m
+                       WHERE m.recipient_uid IS NOT NULL
+                         AND m.recipient IN (SELECT alias FROM assistants)
+                     UNION
+                     SELECT f.agent_uid FROM assistant_event_fences f
+                       WHERE f.agent_uid IS NOT NULL
+                     UNION
+                     SELECT e.agent_uid FROM effect_member_owners e)
+                 WHERE uid IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(PrivateAssistants {
+                aliases: aliases.into_iter().collect(),
+                uids: uids.into_iter().collect(),
+            })
+        })
+    }
+
     /// Routed copies (`origin` set) among the messages of a pair, keyed by
     /// the original message they answer. Read-only.
+    ///
+    /// CAD-2207: with a private snapshot, a copy is dropped when the copy
+    /// itself or the message it answers names a bound assistant — the routed
+    /// body, result and origin id are that assistant's content, not the
+    /// pair's ordinary traffic.
     pub fn work_conversation_routed_of(
         &self,
         a_uid: &str,
         b_uid: &str,
         origins: &[String],
+        private: Option<&PrivateAssistants>,
     ) -> Result<Vec<Value>> {
         if origins.is_empty() {
             return Ok(Vec::new());
         }
         let marks = vec!["?"; origins.len()].join(",");
+        let mut args: Vec<String> = origins.to_vec();
+        args.extend([
+            a_uid.to_string(),
+            b_uid.to_string(),
+            b_uid.to_string(),
+            a_uid.to_string(),
+        ]);
+        // The same fragment and the same placeholders serve the copy's own
+        // row and the correlated origin row; inside the subquery the
+        // unqualified columns resolve to `o`.
+        let private_where = private_sql(private, &mut args);
+        let mut filter = String::new();
+        for clause in &private_where {
+            filter.push_str(" AND ");
+            filter.push_str(clause);
+        }
+        if !private_where.is_empty() {
+            filter.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM messages o WHERE o.id = messages.origin{})",
+                private_where
+                    .iter()
+                    .map(|clause| format!(" AND {clause}"))
+                    .collect::<String>()
+            ));
+        }
         let sql = format!(
             "SELECT * FROM messages WHERE origin IN ({marks})
-               AND ((sender_uid=? AND recipient_uid=?) OR (sender_uid=? AND recipient_uid=?))
+               AND ((sender_uid=? AND recipient_uid=?) OR (sender_uid=? AND recipient_uid=?)){filter}
              ORDER BY seq"
         );
         self.read_tx(|conn| {
-            let mut args: Vec<String> = origins.to_vec();
-            args.extend([
-                a_uid.to_string(),
-                b_uid.to_string(),
-                b_uid.to_string(),
-                a_uid.to_string(),
-            ]);
             let rows: Vec<Message> =
                 conn.query_vec(&sql, rusqlite::params_from_iter(args.iter()), row_message)?;
             Ok(rows

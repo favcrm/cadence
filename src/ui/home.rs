@@ -305,15 +305,6 @@ pub(super) fn prove_operator_peer(
     if matches!(tailnet_proxy(request, opts), Some(Ok(()))) {
         return Ok(());
     }
-    // The daemon's pid is the daemon-owned fact in `daemon_info` — the
-    // same value `health` reports, read without `health`'s fleet-wide
-    // collection (CAD-1193). Absent or unanswerable in budget it is an
-    // unavailable fact (503 → `operator: null`), never a refusal of a
-    // caller that did nothing wrong.
-    // A bounded courtesy read reports an unreadable fact as
-    // `identity_unavailable` (503 → `operator: null`); an unbounded
-    // guard caller gets the same plain `operator_proof` refusal it
-    // always did.
     let dependency_fail = |why: String| {
         if budget.is_some() {
             unavailable(why)
@@ -321,15 +312,6 @@ pub(super) fn prove_operator_peer(
             refuse(why)
         }
     };
-    let daemon_pid = match budget {
-        Some(b) => b.read(state_dir, "daemon_info", json!({})),
-        None => client::rpc(state_dir, "daemon_info", json!({})),
-    }
-    .ok()
-    .and_then(|h| h["pid"].as_u64())
-    .and_then(|p| u32::try_from(p).ok())
-    .ok_or_else(|| dependency_fail("the daemon's pid cannot be read".to_string()))?;
-    let roots = agent_roots(state_dir, budget.copied()).map_err(dependency_fail)?;
     let peer = request
         .remote_addr()
         .ok_or_else(|| refuse("the request has no peer address".to_string()))?;
@@ -344,10 +326,10 @@ pub(super) fn prove_operator_peer(
     if crate::peer::loopback_ownerless(server, *peer) {
         return Ok(());
     }
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::geteuid() };
-    crate::peer::tcp_peer_operator_proof(server, *peer, uid, daemon_pid, &roots, state_dir)
-        .map_err(refuse)
+    // CAD-2207: the daemon runs the proof against ALL roots, so a bound
+    // member assistant's process is a deny entry the board never has to
+    // enumerate. The answer is a boolean or a fixed refusal; no alias text.
+    super::board_peer_operator(state_dir, server, *peer, budget.copied()).map_err(dependency_fail)
 }
 
 /// Daemon error → HTTP for the relayed operator RPCs.
@@ -906,7 +888,11 @@ pub(super) fn agent_action(
                 );
             }
             let params = json!({"alias": alias, "instructions": text});
-            return match client::rpc(state_dir, "agent_instructions_set", params) {
+            return match client::rpc_after_fleet_preflight(
+                state_dir,
+                "agent_instructions_set",
+                params,
+            ) {
                 Ok(mut out) => {
                     crate::briefing::deliver_job_update(state_dir, alias, text, &mut out);
                     json_response(out)
@@ -916,7 +902,7 @@ pub(super) fn agent_action(
         }
         _ => return err_response(404, "no such agent route"),
     };
-    match client::rpc(state_dir, method, params) {
+    match client::rpc_after_fleet_preflight(state_dir, method, params) {
         Ok(out) => json_response(out),
         Err(e) => rpc_err(&e, method),
     }
