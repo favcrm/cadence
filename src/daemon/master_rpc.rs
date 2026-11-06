@@ -1184,7 +1184,8 @@ impl Shared {
         }
         let pm = self.pm()?;
         let escalated = master::escalations(&self.state_dir);
-        let mut out = issue::summary::since(&pm, since, &escalated)?;
+        let readable = self.readable_projects(peer_pid, "master_summary")?;
+        let mut out = issue::summary::since(&pm, since, &escalated, Some(&readable))?;
         out["routing_backlog"] = json!(self.router_backlog.load(Ordering::SeqCst));
         if post {
             self.store.ensure_thread(ALIAS)?;

@@ -61,18 +61,37 @@ impl Shared {
         }))
     }
 
-    pub(super) fn rpc_monitor_list(self: &Arc<Self>) -> Result<Value> {
+    pub(super) fn rpc_monitor_list(self: &Arc<Self>, peer_pid: u32) -> Result<Value> {
+        // A monitor row names its project, owner and the issue ids it covers,
+        // so a project the caller's policy does not admit contributes no row.
+        let scope = self.project_scope(peer_pid, "monitor list")?;
         let mut monitors = Vec::new();
         for monitor in self.store.monitors()? {
+            if let Some((readable, _)) = scope.as_ref() {
+                if !readable.contains(&monitor.project) {
+                    continue;
+                }
+            }
             let (monitor, coverage, open, total) = self.store.monitor_view(&monitor.id)?;
             monitors.push(monitor.to_json(&coverage, open, total));
         }
         Ok(json!({"monitors": monitors}))
     }
 
-    pub(super) fn rpc_monitor_show(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_monitor_show(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         let id = required_str(params, "monitor")?;
         let (monitor, coverage, open, total) = self.store.monitor_view(id)?;
+        // An unadmitted project answers as an unknown monitor, so the reply
+        // cannot be used to ask whether one exists.
+        if let Some((readable, _)) = self.project_scope(peer_pid, "monitor show")? {
+            if !readable.contains(&monitor.project) {
+                return Err(Error::rejected("monitor show refused: unknown monitor"));
+            }
+        }
         Ok(json!({"monitor": monitor.to_json(&coverage, open, total)}))
     }
 

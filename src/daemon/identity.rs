@@ -4,6 +4,12 @@ use super::*;
 
 use crate::peer::PeerTies;
 
+/// The readable projects and the issue→project map a row filter needs.
+type ProjectScope = (
+    std::collections::BTreeSet<String>,
+    std::collections::HashMap<String, String>,
+);
+
 impl Shared {
     /// Revalidate the snapshotted active strict enrollments against their owner rows
     /// before a slot call: a missing row, a closed endpoint or a changed
@@ -429,6 +435,69 @@ impl Shared {
                  every pane and managed endpoint (caller rule, CAD-149)"
             ))),
         }
+    }
+
+    /// The caller's spelling in a project policy, for a daemon read that names
+    /// a project's content. A connection that proves nothing never reaches a
+    /// spelling: [`agent_caller`] refuses it first.
+    pub(super) fn policy_actor(&self, peer_pid: u32, verb: &str) -> Result<String> {
+        use crate::peer::AgentCaller;
+        match self.agent_caller(peer_pid, verb)? {
+            AgentCaller::Operator => Ok("operator".to_string()),
+            AgentCaller::Agent(alias) => Ok(format!("agents/{alias}")),
+        }
+    }
+
+    /// Refuse a daemon read whose ticket lives in a project the caller's policy
+    /// does not admit — in the same words as an unknown id, so the answer
+    /// cannot be used to ask whether a ticket exists.
+    pub(super) fn admit_issue(&self, peer_pid: u32, verb: &str, issue: &str) -> Result<()> {
+        let actor = self.policy_actor(peer_pid, verb)?;
+        let pm = self.pm()?;
+        let (project, _dir) = crate::issue::write::issue_dir(&pm, issue)?;
+        if crate::project_policy::refused(&pm, &project.key, actor.as_str()) {
+            return Err(Error::rejected(format!("{verb} refused: unknown issue")));
+        }
+        Ok(())
+    }
+
+    /// Every tracker issue mapped to its project, for the row filters that
+    /// carry an issue id rather than a project key.
+    pub(super) fn issue_projects(&self) -> Result<std::collections::HashMap<String, String>> {
+        let pm = self.pm()?;
+        Ok(crate::issue::board::load_all(&pm.dir, None)?
+            .into_iter()
+            .map(|i| (i.front.id, i.project))
+            .collect())
+    }
+
+    /// The readable set and the issue→project map, or `None` when this daemon
+    /// has no tracker at all.
+    ///
+    /// A daemon without a tracker records no projects, so it has no private
+    /// one to withhold: `None` is "nothing to scope", not "scope everything
+    /// away". Every caller that reads a row still checks the ids it can
+    /// resolve, so a row naming an issue the tracker does not know is dropped
+    /// when there is a tracker and kept when there is not.
+    pub(super) fn project_scope(&self, peer_pid: u32, verb: &str) -> Result<Option<ProjectScope>> {
+        if self.pm().is_err() {
+            return Ok(None);
+        }
+        Ok(Some((
+            self.readable_projects(peer_pid, verb)?,
+            self.issue_projects()?,
+        )))
+    }
+
+    /// The projects this connection may read.
+    pub(super) fn readable_projects(
+        &self,
+        peer_pid: u32,
+        verb: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let actor = self.policy_actor(peer_pid, verb)?;
+        let pm = self.pm()?;
+        Ok(crate::project_policy::readable(&pm, actor.as_str()))
     }
 
     /// CAD-506 visibility for one agent's pending provider requests,
