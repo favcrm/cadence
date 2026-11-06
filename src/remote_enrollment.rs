@@ -2458,6 +2458,9 @@ pub struct LoginGrant {
     issuer: String,
     subject_id: String,
     capabilities: Vec<String>,
+    /// The scopes this consent asked for, recorded beside what the issuer
+    /// granted so a narrowed grant is evidence, not an inference (CAD-2213).
+    pub requested: Vec<String>,
     cli_session: Option<CliSession>,
     token: String,
 }
@@ -2668,11 +2671,20 @@ fn login_grant(
         subject_id: field(principal, "subject_id")?.to_owned(),
         capabilities: serde_json::from_value(value["capabilities"].clone())
             .map_err(|_| reject("Invalid hosted login capabilities"))?,
+        requested: Vec::new(),
         cli_session,
         token: field(credential, "access_token")?.to_string(),
     })
 }
 impl LoginGrant {
+    /// The capabilities the issuer actually granted this consent, as the
+    /// credential recorded them. Printed after login so a narrowed grant is
+    /// visible immediately instead of surfacing later as an opaque 401
+    /// (CAD-2213).
+    pub fn capabilities(&self) -> &[String] {
+        &self.capabilities
+    }
+
     /// Write the `hct_` to `cli-<slug>.json` at 0600 (temp file, then
     /// rename), separate from `orgs.json`. Never printed.
     pub fn save_credential(&self, dir: &Path) -> Result<()> {
@@ -2703,7 +2715,8 @@ impl LoginGrant {
         let body = serde_json::to_vec(&json!({"version": VERSION,
             "organization_id": self.organization_id, "organization_slug": self.slug,
             "audience": self.endpoint, "issuer": self.issuer, "subject_id": self.subject_id,
-            "capabilities": self.capabilities, "access_token": self.token,
+            "capabilities": self.capabilities, "requested_capabilities": self.requested,
+            "access_token": self.token,
             "expires_at": self.expires_at, "cli_session": self.cli_session}))
         .map_err(|e| Error::internal(e.to_string()))?;
         let mut file = OpenOptions::new()

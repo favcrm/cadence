@@ -2277,6 +2277,20 @@ fn private_directory(dir: &Path) -> Result<()> {
 
 /// Command use retains the legacy access-only expiry refusal. Offline status
 /// reads the same validated metadata without treating expiry as corrupt storage.
+/// The capabilities the saved credential for `target` carries (CAD-2213).
+///
+/// Read-only and best-effort: a caller uses this to explain a refusal it
+/// already has, never to authorize anything. An unreadable credential yields
+/// an empty set rather than an error that would replace the real one.
+pub fn saved_capabilities(target: &RemoteTarget) -> Vec<String> {
+    let Ok(dir) = crate::remote_auth::auth_dir(None) else {
+        return Vec::new();
+    };
+    load_credential(&dir, target)
+        .map(|cred| cred.capabilities)
+        .unwrap_or_default()
+}
+
 fn load_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
     let cred = read_credential_metadata(dir, target)?;
     if cred.cli_session.is_none() && cred.expires_at <= now()? {
@@ -2326,6 +2340,7 @@ fn read_credential_metadata(dir: &Path, target: &RemoteTarget) -> Result<Credent
         "issuer",
         "subject_id",
         "capabilities",
+        "requested_capabilities",
         "access_token",
         "expires_at",
         "cli_session",

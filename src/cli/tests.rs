@@ -2232,6 +2232,80 @@ fn cloud_connection_lives_under_agent() {
     assert!(!connect.contains("accept-assistant-consent"), "{connect}");
 }
 
+/// CAD-2213: one flag requests every opt-in scope, and the flag itself is
+/// not a hidden alias for one of them.
+#[test]
+fn full_access_requests_every_opt_in_scope_in_one_login() {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let login = cmd.find_subcommand_mut("login").expect("login");
+    let help = login.render_help().to_string();
+    assert!(help.contains("--full-access"), "{help}");
+
+    // A fresh command: rendering help mutates the one above.
+    let fresh = Cli::command();
+    let matches = fresh
+        .try_get_matches_from(["cadence", "login", "--full-access"])
+        .unwrap();
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+    match cli.command {
+        Commands::Login {
+            full_access,
+            web,
+            settings,
+            cloud_agent,
+            audit_approve,
+            ..
+        } => {
+            assert!(full_access);
+            assert!(!web && !settings && !cloud_agent && !audit_approve);
+        }
+        _ => panic!("expected login"),
+    }
+
+    assert_eq!(
+        action_dispatch::login_scopes(false, false, false, false, true),
+        (true, true, true, true)
+    );
+    assert_eq!(
+        action_dispatch::login_scopes(false, false, false, false, false),
+        (false, false, false, false)
+    );
+    assert_eq!(
+        action_dispatch::login_scopes(true, false, false, false, false),
+        (true, false, false, false)
+    );
+    assert_eq!(
+        action_dispatch::missing_full_access(&["cli.read".into(), "audit.approve".into()]),
+        vec![
+            "web.read",
+            "web.prepare",
+            "settings.read",
+            "settings.write",
+            "bridge.enroll",
+            "cloud_agent.read",
+            "cloud_agent.write",
+        ]
+    );
+    assert!(action_dispatch::missing_full_access(
+        &action_dispatch::FULL_ACCESS_SCOPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    )
+    .is_empty());
+    assert_eq!(
+        action_dispatch::requested_scopes(true, false, false, true),
+        vec!["web.read", "web.prepare", "audit.approve"]
+    );
+    assert!(action_dispatch::requested_scopes(false, false, false, false).is_empty());
+    assert_eq!(action_dispatch::login_granted_line(&[]), "none recorded");
+    assert_eq!(
+        action_dispatch::login_granted_line(&["cli.read".to_string(), "audit.approve".to_string()]),
+        "cli.read, audit.approve"
+    );
+}
+
 /// CAD-1885: `cadence login --help` names the grant the code requests.
 #[test]
 fn cloud_agent_login_help_names_all_three_scopes() {

@@ -36,6 +36,79 @@ pub(super) fn issued_session_persistence_error(workspace: &str, dir: &Path, erro
     ))
 }
 
+/// CAD-2213: the opt-in scopes `--full-access` turns on in one consent.
+pub(super) fn login_scopes(
+    web: bool,
+    settings: bool,
+    cloud_agent: bool,
+    audit_approve: bool,
+    full_access: bool,
+) -> (bool, bool, bool, bool) {
+    (
+        web || full_access,
+        settings || full_access,
+        cloud_agent || full_access,
+        audit_approve || full_access,
+    )
+}
+
+/// The granted set, printed after login so a narrowed consent is visible
+/// immediately rather than surfacing later as an opaque 401.
+/// The scopes `--full-access` asks for, so login can name any the issuer
+/// withheld instead of leaving the gap to surface at the next verb
+/// (CAD-2213).
+pub(super) const FULL_ACCESS_SCOPES: &[&str] = &[
+    "web.read",
+    "web.prepare",
+    "settings.read",
+    "settings.write",
+    "bridge.enroll",
+    "cloud_agent.read",
+    "cloud_agent.write",
+    "audit.approve",
+];
+
+/// Requested-but-not-granted scopes, in the order above.
+pub(super) fn missing_full_access(capabilities: &[String]) -> Vec<&'static str> {
+    FULL_ACCESS_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| !capabilities.iter().any(|have| have == scope))
+        .collect()
+}
+
+/// The scopes a login asked for, in a stable order, recorded beside the
+/// granted set (CAD-2213).
+pub(super) fn requested_scopes(
+    web: bool,
+    settings: bool,
+    cloud_agent: bool,
+    audit_approve: bool,
+) -> Vec<String> {
+    let mut scopes = Vec::new();
+    if web {
+        scopes.extend(["web.read", "web.prepare"]);
+    }
+    if settings {
+        scopes.extend(["settings.read", "settings.write"]);
+    }
+    if cloud_agent {
+        scopes.extend(["bridge.enroll", "cloud_agent.read", "cloud_agent.write"]);
+    }
+    if audit_approve {
+        scopes.push("audit.approve");
+    }
+    scopes.into_iter().map(str::to_string).collect()
+}
+
+pub(super) fn login_granted_line(capabilities: &[String]) -> String {
+    if capabilities.is_empty() {
+        "none recorded".to_string()
+    } else {
+        capabilities.join(", ")
+    }
+}
+
 fn show_workspace_handover(slug: &str, stored: &Value, explicit_auth_dir: bool) {
     let selected = stored.get("selected").and_then(Value::as_bool);
     match selected {
@@ -443,6 +516,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             settings,
             cloud_agent,
             audit_approve,
+            full_access,
         } => {
             if *use_ && !*token_stdin {
                 org::refuse_managed_default_change()?;
@@ -461,16 +535,21 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             let issuer = issuer
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            let grant = if *web || *settings || *cloud_agent || *audit_approve {
+            // CAD-2213: `--full-access` is the union of the opt-in scopes, so
+            // one consent can approve, change settings and spend a cloud
+            // agent instead of four logins discovered one failure at a time.
+            let (web, settings, cloud_agent, audit_approve) =
+                login_scopes(*web, *settings, *cloud_agent, *audit_approve, *full_access);
+            let mut grant = if web || settings || cloud_agent || audit_approve {
                 cadence_agent::remote_enrollment::login_portal_scoped(
                     issuer,
                     hint.as_deref().or(slug.as_deref()),
                     &dir,
                     |url, code| show_login_code(url, code, *no_open),
-                    *web,
-                    *settings,
-                    *cloud_agent,
-                    *audit_approve,
+                    web,
+                    settings,
+                    cloud_agent,
+                    audit_approve,
                 )?
             } else if let Some(org) = org.as_deref() {
                 let slug = slug.as_deref().ok_or_else(|| {
@@ -491,6 +570,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     |url, code| show_login_code(url, code, *no_open),
                 )?
             };
+            grant.requested = requested_scopes(web, settings, cloud_agent, audit_approve);
             // Registry replacement and credential save are one recovery
             // unit: a failed credential write restores the old binding, so a
             // replay never leaves a new binding pointing at an old token.
@@ -505,9 +585,31 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 issued_session_persistence_error(&grant.organization_id, &dir, error)
             })?;
             cadence_agent::output::print_format_line(format_args!(
-                "Signed in to {} ({})",
-                grant.slug, grant.endpoint
+                "Signed in to {} ({}); granted: {}",
+                grant.slug,
+                grant.endpoint,
+                login_granted_line(grant.capabilities())
             ));
+            if *full_access {
+                let missing = missing_full_access(grant.capabilities());
+                if !missing.is_empty() {
+                    eprintln!(
+                        "warning: requested {} and the issuer withheld {} — re-run \
+                         `cadence login --full-access` after the workspace grants them",
+                        FULL_ACCESS_SCOPES.join(", "),
+                        missing.join(", ")
+                    );
+                }
+            } else if !web && !settings && !cloud_agent && !audit_approve && org.is_none() {
+                // Only a plain portal login: a scoped or legacy login already
+                // asked for something specific, and `--full-access` conflicts
+                // with the legacy `--org` form.
+                eprintln!(
+                    "note: this login requested board access only; --full-access also requests \
+                     {} (required before approve, settings, web and cloud-agent verbs)",
+                    FULL_ACCESS_SCOPES.join(", ")
+                );
+            }
             show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
             return Ok(0);
         }

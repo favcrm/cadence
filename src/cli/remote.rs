@@ -1368,6 +1368,30 @@ fn ticket_seq(value: u64, flag: &str) -> Result<u64> {
     }
 }
 
+/// Explain a refusal that a narrowed consent caused (CAD-2213): the credential
+/// is valid, it simply never asked for `scope`. Only the uncertain 401 is
+/// enriched — an authorization, availability or mutation-uncertain refusal
+/// already says something true and is left alone.
+fn scope_hint(error: Error, capabilities: &[String], scope: &str, hint: &str) -> Error {
+    if capabilities.iter().any(|c| c == scope)
+        || !error
+            .to_string()
+            .contains("did not confirm why it refused the credential")
+    {
+        return error;
+    }
+    let carried = if capabilities.is_empty() {
+        "none recorded".to_string()
+    } else {
+        capabilities.join(", ")
+    };
+    // Replace, never append: a scope gap is a known cause, so leaving the
+    // "uncertain 401" text in front would still read as an auth outage.
+    Error::rejected(format!(
+        "the remote refused this action because this login does not carry `{scope}` \
+         (it has: {carried}); run `{hint}` once, then repeat the command. Nothing was sent"
+    ))
+}
 /// CAD-1568: `send`/`message send` → `message_send` arguments. Exactly
 /// `{alias, text, message}` crosses the wire — three strings, the same
 /// recipient + body + stable-id the local `agent_send` call would take,
@@ -3265,7 +3289,15 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                 wake_timeout,
                 &binding(project, &repo, issue_arg(issue)?, pr, &head)?,
                 source,
-            )?;
+            )
+            .map_err(|error| {
+                scope_hint(
+                    error,
+                    &cadence_agent::remote_cli::saved_capabilities(target),
+                    "audit.approve",
+                    "cadence login --audit-approve",
+                )
+            })?;
             printed((receipt, 0))
         }
         Commands::Audit {
@@ -3289,7 +3321,15 @@ fn merge_gate(target: &RemoteTarget, command: &Commands, wake_timeout: u64) -> R
                 wake_timeout,
                 &binding(&project, &repo, issue.trim(), *pr, &head)?,
                 source,
-            )?;
+            )
+            .map_err(|error| {
+                scope_hint(
+                    error,
+                    &cadence_agent::remote_cli::saved_capabilities(target),
+                    "audit.approve",
+                    "cadence login --audit-approve",
+                )
+            })?;
             printed((receipt, 0))
         }
         Commands::Audit {
@@ -5116,6 +5156,43 @@ mod read_contract_tests {
         );
         assert!(generic.contains("cadence commands --all"), "{generic}");
         assert!(generic.contains("nothing was sent"), "{generic}");
+    }
+
+    #[test]
+    fn a_scope_gap_refusal_names_the_login_flag_and_the_credential() {
+        let caps = vec!["cli.read".to_string(), "cli.write".to_string()];
+        let uncertain = Error::rejected(
+            "the remote did not confirm why it refused the credential (uncertain, HTTP 401); \
+             nothing was retried",
+        );
+        let hinted = scope_hint(
+            uncertain,
+            &caps,
+            "audit.approve",
+            "cadence login --audit-approve",
+        )
+        .to_string();
+        assert!(
+            hinted.contains("does not carry `audit.approve`"),
+            "{hinted}"
+        );
+        assert!(hinted.contains("cadence login --audit-approve"), "{hinted}");
+        assert!(hinted.contains("cli.read, cli.write"), "{hinted}");
+        // A known cause replaces the uncertain-401 text; it never leads with it.
+        assert!(!hinted.contains("uncertain"), "{hinted}");
+
+        // A credential that carries the scope keeps the original message.
+        let owned = vec!["audit.approve".to_string()];
+        let plain =
+            scope_hint(Error::rejected("boom"), &owned, "audit.approve", "unused").to_string();
+        assert!(plain.contains("boom"), "{plain}");
+        assert!(!plain.contains("does not carry"), "{plain}");
+
+        // A different refusal is never rewritten.
+        let ended = Error::rejected("the remote session ended (authentication, HTTP 401)");
+        let kept = scope_hint(ended, &caps, "audit.approve", "unused").to_string();
+        assert!(kept.contains("session ended"), "{kept}");
+        assert!(!kept.contains("does not carry"), "{kept}");
     }
 
     #[test]
