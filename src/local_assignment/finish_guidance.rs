@@ -135,6 +135,25 @@ fn release_bound<H: CoordHttp>(
             lane.unfinished.as_deref().unwrap_or("<assignment>")
         )));
     }
+    let _assignment_locks = lane
+        .assignments
+        .iter()
+        .map(|id| coordinator.assignment_lock(id))
+        .collect::<Result<Vec<_>>>()?;
+    let lock_and_validate = || {
+        let lock = remote_cli::private_lock(
+            &coordinator.ledger,
+            "local-assign",
+            Instant::now() + Duration::from_secs(5),
+        )?;
+        let ledger = Ledger::load(&coordinator.ledger, &coordinator.org_id)?;
+        if bound_lane_from_ledger(&ledger, issue, selected, assignment)?.as_ref() != Some(&lane) {
+            return Err(Error::rejected(
+                "the hosted lane binding changed before release; nothing was removed",
+            ));
+        }
+        Ok(lock)
+    };
     let mut result = crate::issue::finish::release_hosted_lane(
         issue,
         &lane.root,
@@ -142,6 +161,7 @@ fn release_bound<H: CoordHttp>(
         &lane.branch,
         state_dir,
         prs,
+        &lock_and_validate,
     )?;
     if let Some(guard) = lane.guarded.as_ref() {
         if let Err(error) = clear_released_guard(coordinator, issue, &lane.path, guard) {
@@ -282,15 +302,18 @@ fn clear_released_guard<H: CoordHttp>(
     })
 }
 
+#[derive(PartialEq, Eq)]
 struct BoundLane {
     root: PathBuf,
     path: PathBuf,
     branch: String,
     ended: bool,
     unfinished: Option<String>,
+    assignments: Vec<String>,
     guarded: Option<GuardedLane>,
 }
 
+#[derive(PartialEq, Eq)]
 struct GuardedLane {
     assignment: String,
     generation: u64,
@@ -320,14 +343,58 @@ fn bound_lane<H: CoordHttp>(
     )?;
     let ledger = Ledger::load(&coordinator.ledger, &coordinator.org_id)?;
     drop(lock);
+    bound_lane_from_ledger(&ledger, issue, selected, assignment)
+}
+
+fn bound_lane_from_ledger(
+    ledger: &Ledger,
+    issue: &str,
+    selected: Option<&Path>,
+    assignment: Option<&str>,
+) -> Result<Option<BoundLane>> {
+    let requested = if let Some(id) = assignment {
+        let Some(attempt) = ledger.attempts.values().find(|attempt| {
+            attempt.issue_id == issue && attempt.assignment_id.as_deref() == Some(id)
+        }) else {
+            return Ok(None);
+        };
+        let Some(path) = attempt.worktree.as_deref() else {
+            return Ok(None);
+        };
+        let path = Path::new(path);
+        if selected.is_some_and(|selected| !crate::issue::finish::same_path(path, selected)) {
+            return Ok(None);
+        }
+        Some(path)
+    } else {
+        selected
+    };
     let mut lane = None;
     let mut ended = true;
     let mut unfinished = None;
     let mut guarded = None;
     let mut matched_assignment = assignment.is_none();
+    let mut assignments = Vec::new();
     for attempt in ledger.attempts.values().filter(|a| a.issue_id == issue) {
         if attempt.worktree.is_none() && attempt.claim_id.is_none() {
+            if attempt.retired_lane_guard && attempt.lane.is_some() {
+                return Ok(None);
+            }
             continue;
+        }
+        if let Some(requested) = requested {
+            let Some(path) = attempt.worktree.as_deref() else {
+                return Ok(None);
+            };
+            if !crate::issue::finish::same_path(Path::new(path), requested) {
+                continue;
+            }
+        }
+        let Some(id) = attempt.assignment_id.as_ref() else {
+            return Ok(None);
+        };
+        if !assignments.contains(id) {
+            assignments.push(id.clone());
         }
         // A confirmed cancellation advances the generation and clears the
         // active claim. Only its retained immediately preceding lane binding
@@ -408,6 +475,7 @@ fn bound_lane<H: CoordHttp>(
     let Some((path, lane)) = lane else {
         return Ok(None);
     };
+    assignments.sort_unstable();
     let path = Path::new(path);
     if selected.is_some_and(|requested| !crate::issue::finish::same_path(path, requested)) {
         return Ok(None);
@@ -424,6 +492,7 @@ fn bound_lane<H: CoordHttp>(
         branch,
         ended,
         unfinished,
+        assignments,
         guarded,
     }))
 }
@@ -1572,5 +1641,1059 @@ mod tests {
             assert!(!attempt.retired_lane_guard);
             fx.assert_intact(&tip);
         }
+    }
+
+    #[test]
+    fn unknown_cancellation_before_lane_reservation_blocks_activation() {
+        struct LoseCancellation;
+
+        impl CoordHttp for LoseCancellation {
+            fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
+                assert_eq!(method, "POST");
+                assert!(path.ends_with("/hla_test/reassign"), "{path}");
+                let request = body.expect("cancellation request body");
+                assert_eq!(request["cancel"], true);
+                assert_eq!(request["expected_generation"], 1);
+                Err(Error::unknown("synthetic lost cancellation response"))
+            }
+        }
+
+        let fx = CancelReleaseFixture::new(true);
+        let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let attempt = ledger
+            .attempts
+            .get_mut(&attempt_key("CAD-1", "start", None))
+            .unwrap();
+        attempt.worktree = None;
+        attempt.lane = None;
+        attempt.lane_claim = None;
+        attempt.lane_generation = None;
+        ledger.save(&fx.auth, "ws_test").unwrap();
+        let mut coord =
+            Coordinator::new(LoseCancellation, "ws_test".into(), fx.auth.clone()).unwrap();
+        let error = coord.reassign("hla_test", None, true).unwrap_err();
+        assert_eq!(error.kind(), "unknown");
+
+        let ledger_path = fx.auth.join("local-assign-ws_test.json");
+        let before = fs::read(&ledger_path).unwrap();
+        let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let attempt = &ledger.attempts[&attempt_key("CAD-1", "start", None)];
+        assert!(attempt.retired_lane_guard);
+        assert!(attempt.reassign_operation_id.is_some());
+        assert_eq!(attempt.reassign_expected_generation, Some(1));
+        assert!(attempt.worktree.is_none());
+        assert!(attempt.lane.is_none());
+        let claimed = parse_assignment(&json!({
+            "version": VERSION,
+            "assignment_id": "hla_test",
+            "organization_id": "ws_test",
+            "issue_id": "CAD-1",
+            "action": "start",
+            "execution": "local",
+            "state": "running",
+            "generation": 1,
+            "claim_id": "hlc_test",
+            "target": "usr_test",
+            "created_by_subject_id": "usr_test",
+            "client_agent_id": "worker",
+            "guidance": null,
+            "reported_head_sha": null,
+            "text": null
+        }))
+        .unwrap();
+        assert!(
+            coord.lane_for(&claimed, None).is_err(),
+            "activation must not reserve a lane while cancellation is unresolved"
+        );
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+        fx.assert_intact(&tip);
+    }
+
+    #[test]
+    fn cancellation_waits_for_lane_open_and_preserves_the_recorded_binding() {
+        use std::sync::{mpsc, Arc, Mutex};
+
+        struct ClaimReply(Value);
+
+        impl CoordHttp for ClaimReply {
+            fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
+                assert_eq!(method, "POST");
+                assert!(path.ends_with("/hla_test/claim"), "{path}");
+                assert_eq!(body.unwrap()["expected_generation"], 1);
+                Ok(Reply {
+                    status: 200,
+                    body: self.0.clone(),
+                })
+            }
+        }
+
+        let fx = CancelReleaseFixture::new(true);
+        git(
+            &fx.repo,
+            &["remote", "add", "origin", fx.repo.to_str().unwrap()],
+        );
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let client = ledger.client_agent_id.clone();
+        let attempt = ledger
+            .attempts
+            .get_mut(&attempt_key("CAD-1", "start", None))
+            .unwrap();
+        attempt.worktree = None;
+        attempt.lane = None;
+        attempt.lane_claim = None;
+        attempt.lane_generation = None;
+        ledger.save(&fx.auth, "ws_test").unwrap();
+        let claim = json!({
+            "version": VERSION,
+            "assignment_id": "hla_test",
+            "organization_id": "ws_test",
+            "issue_id": "CAD-1",
+            "action": "start",
+            "execution": "local",
+            "state": "running",
+            "generation": 1,
+            "claim_id": "hlc_test",
+            "target": "usr_test",
+            "created_by_subject_id": "usr_test",
+            "client_agent_id": client,
+            "guidance": null,
+            "reported_head_sha": null,
+            "text": null
+        });
+        let (opening_tx, opening_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let activation_auth = fx.auth.clone();
+        let activation_repo = fx.repo.clone();
+        let activation = std::thread::spawn(move || {
+            let claimed = parse_assignment(&claim).unwrap();
+            let mut coord =
+                Coordinator::new(ClaimReply(claim), "ws_test".into(), activation_auth).unwrap();
+            let continue_rx = Mutex::new(continue_rx);
+            coord.before_lane_open = Some(Arc::new(move || {
+                opening_tx.send(()).unwrap();
+                continue_rx.lock().unwrap().recv().unwrap();
+            }));
+            coord
+                .activate(&claimed, &activation_repo, None, "synthetic", &mut |_| {
+                    Ok(json!({}))
+                })
+                .unwrap()
+        });
+        opening_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let cancellation_auth = fx.auth.clone();
+        let cancellation = std::thread::spawn(move || {
+            let mut coord =
+                Coordinator::new(ReleaseCancelReply, "ws_test".into(), cancellation_auth).unwrap();
+            crate::remote_cli::CREDENTIAL_WAITING.with(|waiting| {
+                *waiting.borrow_mut() = Some(waiting_tx);
+            });
+            coord.reassign("hla_test", None, true).unwrap()
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let attempt = &ledger.attempts[&attempt_key("CAD-1", "start", None)];
+        assert!(
+            attempt.worktree.is_none(),
+            "checkout must not yet be recorded"
+        );
+        assert_eq!(attempt.lane_claim.as_deref(), Some("hlc_test"));
+        assert_eq!(attempt.lane_generation, Some(1));
+
+        continue_tx.send(()).unwrap();
+        let activated = activation.join().unwrap();
+        let cancelled = cancellation.join().unwrap();
+        assert_eq!(cancelled["state"], "cancelled");
+        let path = PathBuf::from(activated["worktree"].as_str().unwrap());
+        let lane = activated["lane"].as_str().unwrap();
+        assert!(path.is_dir());
+        fs::remove_file(path.join(".env")).unwrap();
+        let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let attempt = &ledger.attempts[&attempt_key("CAD-1", "start", None)];
+        assert!(attempt.retired_lane_guard);
+        assert_eq!(attempt.worktree.as_deref(), path.to_str());
+        assert_eq!(attempt.lane.as_deref(), Some(lane));
+        assert_eq!(attempt.lane_claim.as_deref(), Some("hlc_test"));
+        assert_eq!(attempt.lane_generation, Some(1));
+
+        fs::write(path.join("file"), "new lane work\n").unwrap();
+        git(&path, &["add", "file"]);
+        git(&path, &["commit", "-m", "new lane work"]);
+        let branch = format!("cadence/{lane}");
+        git(&fx.repo, &["merge", "--ff-only", &branch]);
+        git(
+            &fx.repo,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        let past = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path.join("file"))
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let coord = Coordinator::new(
+            FakeRemote(Rc::new(Cell::new(0))),
+            "ws_test".into(),
+            fx.auth.clone(),
+        )
+        .unwrap();
+        let result = release_cancelled(&coord, "hla_test", &fx.state)
+            .expect("confirmed cancellation must release the exact merged lane");
+        assert_eq!(result["removed_worktree"], true);
+        assert_eq!(result["deleted_branch"], true);
+        assert!(!path.exists());
+        assert!(git(&fx.repo, &["branch", "--list", &branch]).is_empty());
+    }
+
+    #[test]
+    fn session_lane_open_finishes_before_cancellation_and_remains_releasable() {
+        use std::sync::{mpsc, Arc, Mutex};
+
+        struct SessionList(Value);
+
+        impl CoordHttp for SessionList {
+            fn send(&mut self, method: &str, path: &str, _: Option<&Value>) -> Result<Reply> {
+                assert_eq!(method, "GET");
+                let rows = if path.ends_with("?state=running") {
+                    vec![self.0.clone()]
+                } else {
+                    Vec::new()
+                };
+                Ok(Reply {
+                    status: 200,
+                    body: json!({"version": VERSION, "assignments": rows}),
+                })
+            }
+        }
+
+        let fx = CancelReleaseFixture::new(true);
+        git(
+            &fx.repo,
+            &["remote", "add", "origin", fx.repo.to_str().unwrap()],
+        );
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let attempt = ledger
+            .attempts
+            .get_mut(&attempt_key("CAD-1", "start", None))
+            .unwrap();
+        attempt.worktree = None;
+        attempt.lane = None;
+        attempt.lane_claim = None;
+        attempt.lane_generation = None;
+        ledger.save(&fx.auth, "ws_test").unwrap();
+        let claim = json!({
+            "version": VERSION,
+            "assignment_id": "hla_test",
+            "organization_id": "ws_test",
+            "issue_id": "CAD-1",
+            "action": "start",
+            "execution": "local",
+            "state": "running",
+            "generation": 1,
+            "claim_id": "hlc_test",
+            "target": "usr_test",
+            "created_by_subject_id": "usr_test",
+            "client_agent_id": "session-ap_test",
+            "guidance": null,
+            "reported_head_sha": null,
+            "text": null
+        });
+        let (opening_tx, opening_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let session_auth = fx.auth.clone();
+        let session_repo = fx.repo.clone();
+        let session = std::thread::spawn(move || {
+            let mut coord = Coordinator::open(
+                SessionList(claim),
+                "ws_test".into(),
+                session_auth,
+                Some("usr_test".into()),
+                None,
+                String::new(),
+            )
+            .unwrap();
+            let continue_rx = Mutex::new(continue_rx);
+            coord.before_lane_open = Some(Arc::new(move || {
+                opening_tx.send(()).unwrap();
+                continue_rx.lock().unwrap().recv().unwrap();
+            }));
+            coord
+                .start_session("CAD-1", &session_repo, None, "ap_test", None)
+                .unwrap()
+        });
+        opening_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let cancellation_auth = fx.auth.clone();
+        let cancellation = std::thread::spawn(move || {
+            let mut coord =
+                Coordinator::new(ReleaseCancelReply, "ws_test".into(), cancellation_auth).unwrap();
+            crate::remote_cli::CREDENTIAL_WAITING.with(|waiting| {
+                *waiting.borrow_mut() = Some(waiting_tx);
+            });
+            coord.reassign("hla_test", None, true).unwrap()
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let attempt = &ledger.attempts[&attempt_key("CAD-1", "start", None)];
+        assert!(
+            attempt.worktree.is_none(),
+            "session checkout is not recorded yet"
+        );
+        assert_eq!(attempt.lane_claim.as_deref(), Some("hlc_test"));
+        assert_eq!(attempt.lane_generation, Some(1));
+
+        continue_tx.send(()).unwrap();
+        let started = session.join().unwrap();
+        let cancelled = cancellation.join().unwrap();
+        assert_eq!(cancelled["state"], "cancelled");
+        let path = PathBuf::from(started["worktree"].as_str().unwrap());
+        let lane = started["lane"].as_str().unwrap();
+        assert!(path.is_dir());
+        fs::remove_file(path.join(".env")).unwrap();
+        let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let attempt = &ledger.attempts[&attempt_key("CAD-1", "start", None)];
+        assert!(attempt.retired_lane_guard);
+        assert_eq!(attempt.worktree.as_deref(), path.to_str());
+        assert_eq!(attempt.lane.as_deref(), Some(lane));
+        assert_eq!(attempt.lane_claim.as_deref(), Some("hlc_test"));
+        assert_eq!(attempt.lane_generation, Some(1));
+
+        fs::write(path.join("file"), "session lane work\n").unwrap();
+        git(&path, &["add", "file"]);
+        git(&path, &["commit", "-m", "session lane work"]);
+        let branch = format!("cadence/{lane}");
+        git(&fx.repo, &["merge", "--ff-only", &branch]);
+        git(
+            &fx.repo,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        let past = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path.join("file"))
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let coord = Coordinator::new(
+            FakeRemote(Rc::new(Cell::new(0))),
+            "ws_test".into(),
+            fx.auth.clone(),
+        )
+        .unwrap();
+        let result = release_cancelled(&coord, "hla_test", &fx.state)
+            .expect("confirmed cancellation must release the exact merged session lane");
+        assert_eq!(result["removed_worktree"], true);
+        assert_eq!(result["deleted_branch"], true);
+        assert!(!path.exists());
+        assert!(git(&fx.repo, &["branch", "--list", &branch]).is_empty());
+    }
+
+    #[test]
+    fn confirmed_cancellation_distinguishes_unreserved_and_partially_reserved_lanes() {
+        for partial in [false, true] {
+            let fx = CancelReleaseFixture::new(true);
+            let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+            let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+            let attempt = ledger
+                .attempts
+                .get_mut(&attempt_key("CAD-1", "start", None))
+                .unwrap();
+            attempt.worktree = None;
+            if !partial {
+                attempt.lane = None;
+                attempt.lane_claim = None;
+                attempt.lane_generation = None;
+            }
+            ledger.save(&fx.auth, "ws_test").unwrap();
+
+            let mut coord =
+                Coordinator::new(ReleaseCancelReply, "ws_test".into(), fx.auth.clone()).unwrap();
+            let cancelled = coord.reassign("hla_test", None, true).unwrap();
+            assert_eq!(cancelled["state"], "cancelled");
+            assert_eq!(cancelled["generation"], 2);
+            assert!(cancelled.get("release").is_none());
+            let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+            let attempt = &ledger.attempts[&attempt_key("CAD-1", "start", None)];
+            assert_eq!(attempt.retired_lane_guard, partial);
+            assert!(attempt.reassign_operation_id.is_none());
+            assert!(attempt.reassign_fingerprint.is_none());
+            assert!(attempt.reassign_expected_generation.is_none());
+            assert!(attempt.worktree.is_none());
+            if partial {
+                assert_eq!(attempt.lane.as_deref(), Some("test"));
+                assert_eq!(attempt.lane_claim.as_deref(), Some("hlc_test"));
+                assert_eq!(attempt.lane_generation, Some(1));
+                let calls = Rc::new(Cell::new(0));
+                let mut starter =
+                    Coordinator::new(FakeRemote(calls.clone()), "ws_test".into(), fx.auth.clone())
+                        .unwrap();
+                let before = fs::read(fx.auth.join("local-assign-ws_test.json")).unwrap();
+                assert!(starter.queue("CAD-1", "start", None).is_err());
+                assert_eq!(calls.get(), 0, "replacement must not contact the board");
+                assert_eq!(
+                    fs::read(fx.auth.join("local-assign-ws_test.json")).unwrap(),
+                    before
+                );
+            } else {
+                assert!(attempt.lane.is_none());
+                assert!(attempt.lane_claim.is_none());
+                assert!(attempt.lane_generation.is_none());
+            }
+            assert!(release_cancelled(&coord, "hla_test", &fx.state).is_err());
+            fx.assert_intact(&tip);
+        }
+    }
+
+    #[test]
+    fn hosted_release_rebinds_only_the_matching_active_generic_lifecycle() {
+        use crate::worktree::lifecycle::{self, CheckoutSpec};
+
+        for case in [
+            "matching",
+            "foreign-tool",
+            "wrong-branch",
+            "other-issue",
+            "retained",
+        ] {
+            let fx = CancelReleaseFixture::new(true);
+            let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+            let tool = if case == "foreign-tool" {
+                "another tool"
+            } else {
+                "cadence agent worktree"
+            };
+            let branch = if case == "wrong-branch" {
+                "cadence/other"
+            } else {
+                "cadence/test"
+            };
+            let issue = if case == "other-issue" {
+                Some("CAD-2")
+            } else {
+                None
+            };
+            let record = lifecycle::new_record(CheckoutSpec {
+                repo: &fx.repo,
+                purpose: "development",
+                tool,
+                owner: "synthetic",
+                path: &fx.lane,
+                branch: Some(branch),
+                pinned_sha: &tip,
+                issue,
+            });
+            lifecycle::activate(&fx.repo, record).unwrap();
+            if case == "retained" {
+                lifecycle::transition(&fx.repo, &fx.lane, "retained", Some("keep this lane"))
+                    .unwrap();
+            }
+            let before = lifecycle::managed_record(&fx.repo, &fx.lane)
+                .unwrap()
+                .unwrap();
+            let coord = fx.cancel();
+            let result = release_cancelled(&coord, "hla_test", &fx.state);
+            if case == "matching" {
+                let released = result.expect("matching managed hosted lane should release");
+                assert_eq!(released["removed_worktree"], true);
+                assert_eq!(released["deleted_branch"], true);
+                fx.assert_gone();
+                let after = lifecycle::managed_record(&fx.repo, &fx.lane)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(after.issue.as_deref(), Some("CAD-1"));
+                assert_eq!(after.state, "released");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{case}: incompatible lifecycle must refuse"
+                );
+                fx.assert_intact(&tip);
+                let after = lifecycle::managed_record(&fx.repo, &fx.lane)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "{case}: refusing release must not rebind the lifecycle record"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_discovered_assignment_cannot_be_bypassed_by_queue() {
+        let fx = CancelReleaseFixture::new(true);
+        let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+        fx.cancel();
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let attempt = ledger
+            .attempts
+            .remove(&attempt_key("CAD-1", "start", None))
+            .unwrap();
+        ledger
+            .attempts
+            .insert("discovered:hla_test".into(), attempt);
+        ledger.save(&fx.auth, "ws_test").unwrap();
+        let ledger_path = fx.auth.join("local-assign-ws_test.json");
+        let before = fs::read(&ledger_path).unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let mut coord =
+            Coordinator::new(FakeRemote(calls.clone()), "ws_test".into(), fx.auth.clone()).unwrap();
+        assert!(
+            coord.queue("CAD-1", "start", None).is_err(),
+            "a guarded discovered row must block replacement"
+        );
+        assert_eq!(calls.get(), 0, "replacement must not reach the board");
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+        fx.assert_intact(&tip);
+    }
+
+    #[test]
+    fn exact_lane_selection_releases_only_the_selected_assignment() {
+        let fx = CancelReleaseFixture::new(true);
+        let other = fx.repo.join(".cadence/wt/other");
+        git(
+            &fx.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "cadence/other",
+                other.to_str().unwrap(),
+                "main",
+            ],
+        );
+        fs::write(other.join("file"), "other merged work\n").unwrap();
+        git(&other, &["add", "file"]);
+        git(&other, &["commit", "-m", "other lane work"]);
+        git(&fx.repo, &["merge", "--ff-only", "cadence/other"]);
+        git(
+            &fx.repo,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        let past = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(other.join("file"))
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let first_tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+        let second_tip = git(&fx.repo, &["rev-parse", "cadence/other"]);
+        let coord = fx.cancel();
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let first = ledger.attempts[&attempt_key("CAD-1", "start", None)].clone();
+        let mut second = first.clone();
+        second.assignment_id = Some("hla_other".into());
+        second.worktree = Some(other.to_str().unwrap().into());
+        second.lane = Some("other".into());
+        second.lane_claim = Some("hlc_other".into());
+        ledger
+            .attempts
+            .insert("discovered:hla_other".into(), second);
+        let mut active = first;
+        active.assignment_id = Some("hla_active".into());
+        active.state = "running".into();
+        active.generation = Some(1);
+        active.claim_id = Some("hlc_active".into());
+        active.lane_claim = Some("hlc_active".into());
+        active.lane_generation = Some(1);
+        active.fenced = false;
+        active.retired_lane_guard = false;
+        ledger
+            .attempts
+            .insert("discovered:hla_active".into(), active);
+        ledger.save(&fx.auth, "ws_test").unwrap();
+
+        assert!(
+            release(&coord, "CAD-1", Some(&fx.lane), &fx.state).is_err(),
+            "an active assignment on the selected lane must block release"
+        );
+        fx.assert_intact(&first_tip);
+        assert!(other.is_dir());
+        assert_eq!(git(&fx.repo, &["rev-parse", "cadence/other"]), second_tip);
+
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        ledger.attempts.remove("discovered:hla_active");
+        ledger.save(&fx.auth, "ws_test").unwrap();
+        let first_result = release(&coord, "CAD-1", Some(&fx.lane), &fx.state)
+            .expect("the selected first lane should release independently");
+        assert_eq!(first_result["removed_worktree"], true);
+        assert_eq!(first_result["deleted_branch"], true);
+        fx.assert_gone();
+        assert!(other.is_dir());
+        assert_eq!(git(&fx.repo, &["rev-parse", "cadence/other"]), second_tip);
+
+        let second_result = release_cancelled(&coord, "hla_other", &fx.state)
+            .expect("the exact second assignment should remain releasable");
+        assert_eq!(second_result["removed_worktree"], true);
+        assert_eq!(second_result["deleted_branch"], true);
+        assert!(!other.exists());
+        assert!(git(&fx.repo, &["branch", "--list", "cadence/other"]).is_empty());
+    }
+
+    #[test]
+    fn protected_ignored_file_created_before_final_lock_refuses_without_transition() {
+        use crate::worktree::lifecycle::{self, CheckoutSpec};
+
+        let fx = CancelReleaseFixture::new(true);
+        let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+        let exclude = fx.repo.join(".git/info/exclude");
+        fs::write(&exclude, ".env\n").unwrap();
+        let record = lifecycle::new_record(CheckoutSpec {
+            repo: &fx.repo,
+            purpose: "development",
+            tool: "cadence agent worktree",
+            owner: "synthetic",
+            path: &fx.lane,
+            branch: Some("cadence/test"),
+            pinned_sha: &tip,
+            issue: Some("CAD-1"),
+        });
+        lifecycle::activate(&fx.repo, record).unwrap();
+        let before = lifecycle::managed_record(&fx.repo, &fx.lane)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.state, "active");
+        let coord = fx.cancel();
+        let protected = fx.lane.join(".env");
+        let created = protected.clone();
+        crate::issue::finish::BEFORE_FINAL_LOCK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(created, "operator secret\n").unwrap();
+            }));
+        });
+        let error = release_cancelled(&coord, "hla_test", &fx.state)
+            .expect_err("late protected ignored data must block deletion")
+            .to_string();
+        assert!(error.contains("ignored"), "{error}");
+        assert_eq!(fs::read_to_string(&protected).unwrap(), "operator secret\n");
+        fx.assert_intact(&tip);
+        let after = lifecycle::managed_record(&fx.repo, &fx.lane)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, "active");
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap(),
+            "late refusal must not rebind or transition ownership"
+        );
+    }
+
+    #[test]
+    fn queue_response_coalesces_watcher_custody_without_losing_create_key() {
+        struct WatchBeforeCreateReply {
+            auth: PathBuf,
+            lane: PathBuf,
+            create_key: Rc<std::cell::RefCell<Option<String>>>,
+        }
+
+        impl CoordHttp for WatchBeforeCreateReply {
+            fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
+                assert_eq!(method, "POST");
+                assert!(path.ends_with("/local-assignments"), "{path}");
+                let body = body.expect("create request body");
+                *self.create_key.borrow_mut() =
+                    Some(body["idempotency_key"].as_str().unwrap().into());
+                let observer = Coordinator::new(
+                    FakeRemote(Rc::new(Cell::new(0))),
+                    "ws_test".into(),
+                    self.auth.clone(),
+                )?;
+                let claimed = parse_assignment(&json!({
+                    "version": VERSION, "assignment_id": "hla_test",
+                    "organization_id": "ws_test", "issue_id": "CAD-1",
+                    "action": "start", "execution": "local", "state": "running",
+                    "generation": 1, "claim_id": "hlc_test", "target": "usr_test",
+                    "created_by_subject_id": "usr_test", "client_agent_id": "worker",
+                    "guidance": null, "reported_head_sha": null, "text": null
+                }))?;
+                observer.remember_discovered(&claimed)?;
+                observer.with_ledger(|ledger| {
+                    let attempt = ledger.attempts.get_mut("discovered:hla_test").unwrap();
+                    attempt.worktree = Some(self.lane.to_str().unwrap().into());
+                    attempt.lane = Some("test".into());
+                    attempt.lane_claim = Some("hlc_test".into());
+                    attempt.lane_generation = Some(1);
+                    Ok(())
+                })?;
+                Ok(Reply {
+                    status: 200,
+                    body: json!({
+                        "version": VERSION, "assignment_id": "hla_test",
+                        "organization_id": "ws_test", "issue_id": "CAD-1",
+                        "action": "start", "execution": "local", "state": "waiting",
+                        "generation": 1, "claim_id": null, "target": null,
+                        "created_by_subject_id": "usr_test", "client_agent_id": null,
+                        "guidance": null, "reported_head_sha": null, "text": null
+                    }),
+                })
+            }
+        }
+
+        let fx = CancelReleaseFixture::new(true);
+        let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        ledger.attempts.clear();
+        ledger.save(&fx.auth, "ws_test").unwrap();
+        let create_key = Rc::new(std::cell::RefCell::new(None));
+        let mut coord = Coordinator::new(
+            WatchBeforeCreateReply {
+                auth: fx.auth.clone(),
+                lane: fx.lane.clone(),
+                create_key: create_key.clone(),
+            },
+            "ws_test".into(),
+            fx.auth.clone(),
+        )
+        .unwrap();
+        coord.queue("CAD-1", "start", None).unwrap();
+        let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let rows: Vec<_> = ledger
+            .attempts
+            .values()
+            .filter(|attempt| attempt.assignment_id.as_deref() == Some("hla_test"))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "watcher and create response must not duplicate custody"
+        );
+        let attempt = rows[0];
+        assert_eq!(
+            Some(attempt.operation_id.as_str()),
+            create_key.borrow().as_deref()
+        );
+        assert_eq!(attempt.state, "running");
+        assert_eq!(attempt.generation, Some(1));
+        assert_eq!(attempt.claim_id.as_deref(), Some("hlc_test"));
+        assert_eq!(attempt.worktree.as_deref(), fx.lane.to_str());
+        assert_eq!(attempt.lane.as_deref(), Some("test"));
+        assert_eq!(attempt.lane_claim.as_deref(), Some("hlc_test"));
+        assert_eq!(attempt.lane_generation, Some(1));
+        fx.assert_intact(&tip);
+    }
+
+    #[test]
+    fn cross_action_coalescing_preserves_each_create_key_across_lost_reply_and_retries() {
+        struct CoalescingBoard {
+            original_action: &'static str,
+            requests: Rc<std::cell::RefCell<Vec<Value>>>,
+            lost_other: bool,
+        }
+
+        impl CoordHttp for CoalescingBoard {
+            fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
+                assert_eq!(method, "POST");
+                assert!(path.ends_with("/local-assignments"), "{path}");
+                let request = body.expect("create request body").clone();
+                let action = request["action"].as_str().unwrap().to_owned();
+                self.requests.borrow_mut().push(request);
+                if action != self.original_action && !self.lost_other {
+                    self.lost_other = true;
+                    return Err(Error::unknown("synthetic lost second-create response"));
+                }
+                Ok(Reply {
+                    status: 200,
+                    body: json!({
+                        "version": VERSION, "assignment_id": "hla_test",
+                        "organization_id": "ws_test", "issue_id": "CAD-1",
+                        "action": self.original_action, "execution": "local",
+                        "state": "waiting", "generation": 1, "claim_id": null,
+                        "target": null, "created_by_subject_id": "usr_test",
+                        "client_agent_id": null, "guidance": null,
+                        "reported_head_sha": null, "text": null
+                    }),
+                })
+            }
+        }
+
+        for (first, second) in [("start", "dispatch"), ("dispatch", "start")] {
+            let fx = CancelReleaseFixture::new(true);
+            let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+            let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+            ledger.attempts.clear();
+            ledger.save(&fx.auth, "ws_test").unwrap();
+            let requests = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut coord = Coordinator::new(
+                CoalescingBoard {
+                    original_action: first,
+                    requests: requests.clone(),
+                    lost_other: false,
+                },
+                "ws_test".into(),
+                fx.auth.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                coord.queue("CAD-1", first, None).unwrap().assignment_id,
+                "hla_test"
+            );
+            let lost = coord.queue("CAD-1", second, None).err().unwrap();
+            assert_eq!(lost.kind(), "unknown");
+            assert_eq!(
+                coord.queue("CAD-1", second, None).unwrap().assignment_id,
+                "hla_test"
+            );
+            assert_eq!(
+                coord.queue("CAD-1", first, None).unwrap().assignment_id,
+                "hla_test"
+            );
+            assert_eq!(
+                coord.queue("CAD-1", second, None).unwrap().assignment_id,
+                "hla_test"
+            );
+
+            let requests = requests.borrow();
+            assert_eq!(requests.len(), 5);
+            let keys: Vec<_> = requests
+                .iter()
+                .map(|body| body["idempotency_key"].as_str().unwrap())
+                .collect();
+            assert_ne!(
+                keys[0], keys[1],
+                "different create requests need different keys"
+            );
+            assert_eq!(
+                keys[1], keys[2],
+                "lost second-create response must replay its key"
+            );
+            assert_eq!(keys[0], keys[3], "first request must retain its own key");
+            assert_eq!(keys[1], keys[4], "second request must retain its own key");
+            assert_eq!(requests[0]["action"], first);
+            assert_eq!(requests[1]["action"], second);
+            let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+            assert_eq!(
+                ledger
+                    .attempts
+                    .values()
+                    .filter(|attempt| attempt.assignment_id.as_deref() == Some("hla_test"))
+                    .count(),
+                1
+            );
+            fx.assert_intact(&tip);
+        }
+    }
+
+    #[test]
+    fn guarded_cancellation_blocks_cross_action_queue_before_the_board() {
+        struct LoseCancellation;
+
+        impl CoordHttp for LoseCancellation {
+            fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
+                assert_eq!(method, "POST");
+                assert!(path.ends_with("/hla_test/reassign"), "{path}");
+                assert_eq!(body.unwrap()["cancel"], true);
+                Err(Error::unknown("synthetic lost cancellation response"))
+            }
+        }
+
+        for pending in [true, false] {
+            let fx = CancelReleaseFixture::new(true);
+            let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+            if pending {
+                let mut cancel =
+                    Coordinator::new(LoseCancellation, "ws_test".into(), fx.auth.clone()).unwrap();
+                assert_eq!(
+                    cancel.reassign("hla_test", None, true).unwrap_err().kind(),
+                    "unknown"
+                );
+            } else {
+                fx.cancel();
+            }
+            let ledger_path = fx.auth.join("local-assign-ws_test.json");
+            let before = fs::read(&ledger_path).unwrap();
+            let calls = Rc::new(Cell::new(0));
+            let mut coord =
+                Coordinator::new(FakeRemote(calls.clone()), "ws_test".into(), fx.auth.clone())
+                    .unwrap();
+            assert!(
+                coord.queue("CAD-1", "dispatch", None).is_err(),
+                "cross-action create must not bypass a guarded cancellation"
+            );
+            assert_eq!(calls.get(), 0, "guarded create must not contact the board");
+            assert_eq!(fs::read(&ledger_path).unwrap(), before);
+            fx.assert_intact(&tip);
+        }
+    }
+
+    #[test]
+    fn terminal_coalesced_alias_cannot_discard_an_existing_lane() {
+        for state in ["result", "failed"] {
+            let fx = CancelReleaseFixture::new(true);
+            let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+            let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+            let attempt = ledger
+                .attempts
+                .get_mut(&attempt_key("CAD-1", "start", None))
+                .unwrap();
+            attempt.state = state.to_string();
+            ledger.create_aliases.insert(
+                attempt_key("CAD-1", "dispatch", None),
+                CreateAlias {
+                    operation_id: "op_dispatch_original".into(),
+                    assignment_id: "hla_test".into(),
+                },
+            );
+            ledger.save(&fx.auth, "ws_test").unwrap();
+            let ledger_path = fx.auth.join("local-assign-ws_test.json");
+            let before = fs::read(&ledger_path).unwrap();
+            let calls = Rc::new(Cell::new(0));
+            let mut coord =
+                Coordinator::new(FakeRemote(calls.clone()), "ws_test".into(), fx.auth.clone())
+                    .unwrap();
+            assert!(
+                coord.queue("CAD-1", "dispatch", None).is_err(),
+                "{state}: alias create must not discard the terminal lane binding"
+            );
+            assert_eq!(calls.get(), 0, "{state}: no create may reach the board");
+            assert_eq!(fs::read(&ledger_path).unwrap(), before);
+            fx.assert_intact(&tip);
+        }
+    }
+
+    #[test]
+    fn equivalent_legacy_canonical_rows_preserve_both_create_receipts_and_release() {
+        let fx = CancelReleaseFixture::new(true);
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let original = ledger.attempts[&attempt_key("CAD-1", "start", None)].clone();
+        let start_operation = original.operation_id.clone();
+        let mut duplicate = original;
+        duplicate.action = "dispatch".into();
+        duplicate.operation_id = "op_legacy_dispatch".into();
+        ledger
+            .attempts
+            .insert(attempt_key("CAD-1", "dispatch", None), duplicate);
+        ledger.save(&fx.auth, "ws_test").unwrap();
+
+        let coord = fx.cancel();
+        let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let rows: Vec<_> = ledger
+            .attempts
+            .values()
+            .filter(|attempt| attempt.assignment_id.as_deref() == Some("hla_test"))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "equivalent rows must share one custody record"
+        );
+        let aliases: Vec<_> = ledger
+            .create_aliases
+            .values()
+            .filter(|alias| alias.assignment_id == "hla_test")
+            .collect();
+        assert_eq!(
+            aliases.len(),
+            1,
+            "the other request must remain an alias receipt"
+        );
+        let saved: std::collections::BTreeSet<_> = [
+            rows[0].operation_id.as_str(),
+            aliases[0].operation_id.as_str(),
+        ]
+        .into_iter()
+        .collect();
+        let expected: std::collections::BTreeSet<_> =
+            [start_operation.as_str(), "op_legacy_dispatch"]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            saved, expected,
+            "both original create operation IDs must survive"
+        );
+        assert_eq!(rows[0].worktree.as_deref(), fx.lane.to_str());
+        assert_eq!(rows[0].lane_claim.as_deref(), Some("hlc_test"));
+        assert_eq!(rows[0].lane_generation, Some(1));
+
+        let result = release_cancelled(&coord, "hla_test", &fx.state)
+            .expect("equivalent legacy custody must remain releasable");
+        assert_eq!(result["removed_worktree"], true);
+        assert_eq!(result["deleted_branch"], true);
+        fx.assert_gone();
+    }
+
+    #[test]
+    fn duplicate_assignment_custody_must_agree_before_cancellation() {
+        for case in ["equivalent", "claim", "generation", "lane", "pending"] {
+            let fx = CancelReleaseFixture::new(true);
+            let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+            let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+            let mut duplicate = ledger.attempts[&attempt_key("CAD-1", "start", None)].clone();
+            duplicate.operation_id = "op_discovered".into();
+            match case {
+                "claim" => duplicate.claim_id = Some("hlc_other".into()),
+                "generation" => duplicate.generation = Some(2),
+                "lane" => duplicate.lane = Some("other".into()),
+                "pending" => {
+                    duplicate.reassign_operation_id = Some("op_other".into());
+                    duplicate.reassign_fingerprint = Some("cancel".into());
+                    duplicate.reassign_expected_generation = Some(1);
+                }
+                _ => {}
+            }
+            ledger
+                .attempts
+                .insert("discovered:hla_test".into(), duplicate);
+            ledger.save(&fx.auth, "ws_test").unwrap();
+            if case == "equivalent" {
+                let coord = fx.cancel();
+                let ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+                assert_eq!(
+                    ledger
+                        .attempts
+                        .values()
+                        .filter(|attempt| attempt.assignment_id.as_deref() == Some("hla_test"))
+                        .count(),
+                    1
+                );
+                let result = release_cancelled(&coord, "hla_test", &fx.state)
+                    .expect("equivalent duplicates must retain a releasable binding");
+                assert_eq!(result["removed_worktree"], true);
+                assert_eq!(result["deleted_branch"], true);
+                fx.assert_gone();
+            } else {
+                let calls = Rc::new(Cell::new(0));
+                let mut coord =
+                    Coordinator::new(FakeRemote(calls.clone()), "ws_test".into(), fx.auth.clone())
+                        .unwrap();
+                assert!(coord.reassign("hla_test", None, true).is_err(), "{case}");
+                assert_eq!(
+                    calls.get(),
+                    0,
+                    "{case}: conflicting custody reached the board"
+                );
+                fx.assert_intact(&tip);
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_duplicate_create_keys_refuse_cancellation_without_mutation() {
+        let fx = CancelReleaseFixture::new(true);
+        let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let mut duplicate = ledger.attempts[&attempt_key("CAD-1", "start", None)].clone();
+        duplicate.operation_id = "op_other_create".into();
+        ledger
+            .attempts
+            .insert("another-canonical-key".into(), duplicate);
+        ledger.save(&fx.auth, "ws_test").unwrap();
+        let ledger_path = fx.auth.join("local-assign-ws_test.json");
+        let before = fs::read(&ledger_path).unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let mut coord =
+            Coordinator::new(FakeRemote(calls.clone()), "ws_test".into(), fx.auth.clone()).unwrap();
+        assert!(
+            coord.reassign("hla_test", None, true).is_err(),
+            "ambiguous create receipts must refuse cancellation"
+        );
+        assert_eq!(calls.get(), 0, "ambiguous receipt must not reach the board");
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+        fx.assert_intact(&tip);
     }
 }

@@ -64,6 +64,8 @@ pub(crate) use activity::{comm_of, daemon_view, lane_in_use, with_probe_timeout,
 pub(crate) use evidence::{branch_tip, not_started};
 pub(crate) use git::{default_ref, git, git_branch, merge_rule, merged_claim};
 pub(crate) use guard::cwd_holder_aliases;
+#[cfg(test)]
+pub(crate) use hosted::BEFORE_FINAL_LOCK;
 pub(crate) use hosted::{gh_merged_prs, release_hosted_lane};
 pub(crate) use run::{run, FinishArgs};
 pub use sweep::sweep;

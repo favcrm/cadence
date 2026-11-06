@@ -1358,6 +1358,7 @@ fn begin_release_transaction(
     refused: String,
     allow_legacy_absence: bool,
     allow_already_released: bool,
+    bind_issue: Option<&str>,
     expected: impl FnOnce(Option<&Checkout>) -> Result<bool>,
 ) -> Result<ReleaseGuard> {
     if reason.trim().is_empty() {
@@ -1428,6 +1429,9 @@ fn begin_release_transaction(
         return Err(Error::rejected(refused));
     }
     let record = &mut ledger.records[index];
+    if record.issue.is_none() {
+        record.issue = bind_issue.map(str::to_owned);
+    }
     record.state = "releasing".into();
     record.release_reason = Some(reason.to_string());
     record.updated_at = time::now_epoch();
@@ -1460,12 +1464,49 @@ pub fn begin_release(
         ),
         true,
         false,
+        None,
         |record| {
             Ok(record.is_none_or(|record| {
                 record.purpose == "development"
                     && record.issue.as_deref() == Some(issue)
                     && record.branch.as_deref() == branch
             }))
+        },
+    )
+}
+
+/// Authorize a hosted lane bound by the assignment ledger. Older hosted lanes
+/// were recorded by the generic agent-worktree creator without an issue.
+pub(crate) fn begin_hosted_release(
+    repo: &Path,
+    path: &Path,
+    issue: &str,
+    branch: Option<&str>,
+    reason: &str,
+    before_release: &dyn Fn() -> Result<()>,
+) -> Result<ReleaseGuard> {
+    begin_release_transaction(
+        repo,
+        path,
+        reason,
+        format!(
+            "checkout ownership for {} changed before hosted release of issue {issue}; refusing deletion",
+            path.display()
+        ),
+        true,
+        false,
+        Some(issue),
+        |record| {
+            let allowed = record.is_none_or(|record| {
+                record.purpose == "development"
+                    && record.branch.as_deref() == branch
+                    && (record.issue.as_deref() == Some(issue)
+                        || (record.issue.is_none() && record.tool == "cadence agent worktree"))
+            });
+            if allowed {
+                before_release()?;
+            }
+            Ok(allowed)
         },
     )
 }
@@ -1488,6 +1529,7 @@ pub fn begin_refs_only_finish(
         ),
         true,
         true,
+        None,
         |record| {
             validate_refs_only_finish_target(&root, path, branch)?;
             Ok(record.is_none_or(|record| {
@@ -1519,6 +1561,7 @@ pub fn begin_review_release(
         ),
         false,
         false,
+        None,
         |record| {
             Ok(record.is_some_and(|record| {
                 record.purpose == "review"

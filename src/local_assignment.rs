@@ -143,6 +143,47 @@ struct Attempt {
     session_profile: Option<String>,
 }
 
+/// Binding as it was when a fresh cancellation reserved its safety marker.
+struct CancellationGuardSnapshot {
+    state: String,
+    target: Option<String>,
+    fenced: bool,
+    generation: Option<u64>,
+    claim_id: Option<String>,
+    worktree: Option<String>,
+    lane: Option<String>,
+    lane_claim: Option<String>,
+    lane_generation: Option<u64>,
+}
+
+impl CancellationGuardSnapshot {
+    fn capture(attempt: &Attempt) -> Self {
+        Self {
+            state: attempt.state.clone(),
+            target: attempt.target.clone(),
+            fenced: attempt.fenced,
+            generation: attempt.generation,
+            claim_id: attempt.claim_id.clone(),
+            worktree: attempt.worktree.clone(),
+            lane: attempt.lane.clone(),
+            lane_claim: attempt.lane_claim.clone(),
+            lane_generation: attempt.lane_generation,
+        }
+    }
+
+    fn matches(&self, attempt: &Attempt) -> bool {
+        self.state == attempt.state
+            && self.target == attempt.target
+            && self.fenced == attempt.fenced
+            && self.generation == attempt.generation
+            && self.claim_id == attempt.claim_id
+            && self.worktree == attempt.worktree
+            && self.lane == attempt.lane
+            && self.lane_claim == attempt.lane_claim
+            && self.lane_generation == attempt.lane_generation
+    }
+}
+
 /// The claim a kickoff message was allowed to report. Keyed by message id
 /// so a later reclaim of the same assignment cannot upgrade it.
 #[derive(Clone, Serialize, Deserialize)]
@@ -166,6 +207,14 @@ struct Origin {
     settled: bool,
 }
 
+/// A distinct create request that the board coalesced into another assignment.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateAlias {
+    operation_id: String,
+    assignment_id: String,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Ledger {
@@ -175,9 +224,134 @@ struct Ledger {
     #[serde(default)]
     alias: Option<String>,
     attempts: BTreeMap<String, Attempt>,
+    /// Additional create receipts share the assignment's single custody row.
+    /// Omission keeps ordinary ledgers readable by clients predating this field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    create_aliases: BTreeMap<String, CreateAlias>,
     /// Message id → originating claim. Never rewritten by `stamp`.
     #[serde(default)]
     origins: BTreeMap<String, Origin>,
+}
+
+fn equivalent_custody(a: &Attempt, b: &Attempt) -> bool {
+    a.issue_id == b.issue_id
+        && a.target == b.target
+        && a.assignment_id == b.assignment_id
+        && a.generation == b.generation
+        && a.claim_id == b.claim_id
+        && a.state == b.state
+        && a.fenced == b.fenced
+        && a.reassign_operation_id == b.reassign_operation_id
+        && a.reassign_fingerprint == b.reassign_fingerprint
+        && a.reassign_expected_generation == b.reassign_expected_generation
+        && a.worktree == b.worktree
+        && a.lane == b.lane
+        && a.lane_claim == b.lane_claim
+        && a.lane_generation == b.lane_generation
+        && a.retired_lane_guard == b.retired_lane_guard
+        && a.kickoff_message == b.kickoff_message
+        && a.kickoff_reserved == b.kickoff_reserved
+        && a.origin_claim_id == b.origin_claim_id
+        && a.origin_generation == b.origin_generation
+        && a.session_profile == b.session_profile
+}
+
+fn unbound_provisional(attempt: &Attempt) -> bool {
+    attempt.state == "preparing"
+        && attempt.assignment_id.is_none()
+        && attempt.generation.is_none()
+        && attempt.claim_id.is_none()
+        && !attempt.fenced
+        && attempt.reassign_operation_id.is_none()
+        && attempt.reassign_fingerprint.is_none()
+        && attempt.reassign_expected_generation.is_none()
+        && attempt.worktree.is_none()
+        && attempt.lane.is_none()
+        && attempt.lane_claim.is_none()
+        && attempt.lane_generation.is_none()
+        && !attempt.retired_lane_guard
+        && attempt.kickoff_message.is_none()
+        && attempt.kickoff_reserved.is_none()
+        && attempt.origin_claim_id.is_none()
+        && attempt.origin_generation.is_none()
+        && attempt.session_profile.is_none()
+}
+
+/// Collapse equivalent custody rows without discarding distinct create receipts.
+fn normalize_assignment_rows(ledger: &mut Ledger, assignment: &str) -> Result<()> {
+    let mut rows = ledger
+        .attempts
+        .iter()
+        .filter(|(_, attempt)| attempt.assignment_id.as_deref() == Some(assignment));
+    let Some((first_key, first)) = rows.next() else {
+        return Ok(());
+    };
+    let Some((_, second)) = rows.next() else {
+        return Ok(());
+    };
+    if !equivalent_custody(first, second)
+        || rows.any(|(_, attempt)| !equivalent_custody(first, attempt))
+    {
+        return Err(Error::rejected(format!(
+            "assignment {assignment} has conflicting local records; inspect them before retrying. \
+             No new request was sent"
+        )));
+    }
+    let keep = ledger
+        .attempts
+        .iter()
+        .find(|(key, attempt)| {
+            !key.starts_with("discovered:") && attempt.assignment_id.as_deref() == Some(assignment)
+        })
+        .map_or_else(|| first_key.clone(), |(key, _)| key.clone());
+    let mut aliases = Vec::new();
+    for (key, attempt) in &ledger.attempts {
+        if attempt.assignment_id.as_deref() != Some(assignment) {
+            continue;
+        }
+        if key.starts_with("discovered:") {
+            if key != &format!("discovered:{assignment}") {
+                return Err(Error::rejected(
+                    "the discovered assignment identity is ambiguous",
+                ));
+            }
+            continue;
+        }
+        let mut parts = key.split('\u{1}');
+        if parts.next() != Some(attempt.issue_id.as_str())
+            || parts.next() != Some(attempt.action.as_str())
+            || !parts
+                .next()
+                .is_some_and(|target| target == "-" || hosted_id(target))
+            || parts.next().is_some()
+        {
+            return Err(Error::rejected(
+                "the assignment creation receipt is ambiguous",
+            ));
+        }
+        if key == &keep {
+            continue;
+        }
+        let alias = CreateAlias {
+            operation_id: attempt.operation_id.clone(),
+            assignment_id: assignment.to_string(),
+        };
+        if ledger
+            .create_aliases
+            .get(key)
+            .is_some_and(|saved| saved != &alias)
+        {
+            return Err(Error::rejected("the assignment creation receipt conflicts"));
+        }
+        aliases.push((key.clone(), alias));
+    }
+    for (key, alias) in aliases {
+        ledger.create_aliases.insert(key, alias);
+    }
+    ledger.attempts.retain(|key, attempt| {
+        key == &keep || attempt.assignment_id.as_deref() != Some(assignment)
+    });
+    Ok(())
 }
 
 pub struct Coordinator<H> {
@@ -196,6 +370,9 @@ pub struct Coordinator<H> {
     /// while the ledger lock is not held.
     #[cfg(test)]
     before_reservation: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Test seam: runs after lane reservation, before opening its checkout.
+    #[cfg(test)]
+    before_lane_open: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 fn hosted_id(value: &str) -> bool {
@@ -695,6 +872,7 @@ impl Ledger {
                     repo: None,
                     alias: None,
                     attempts: BTreeMap::new(),
+                    create_aliases: BTreeMap::new(),
                     origins: BTreeMap::new(),
                 });
             }
@@ -760,17 +938,6 @@ fn retire_current_claim(attempt: &mut Attempt) {
 
 fn attempt_ended(state: &str) -> bool {
     matches!(state, "result" | "failed" | "cancelled")
-}
-
-fn active_lane_binding(attempt: &Attempt) -> bool {
-    !attempt.fenced
-        && !attempt_ended(&attempt.state)
-        && attempt.claim_id.is_some()
-        && attempt.claim_id == attempt.lane_claim
-        && attempt.generation.is_some()
-        && attempt.lane_generation == attempt.generation
-        && attempt.worktree.is_some()
-        && attempt.lane.is_some()
 }
 
 fn is_false(value: &bool) -> bool {
@@ -865,6 +1032,8 @@ impl<H: CoordHttp> Coordinator<H> {
             delivery_guard: None,
             #[cfg(test)]
             before_reservation: None,
+            #[cfg(test)]
+            before_lane_open: None,
         })
     }
 
@@ -878,6 +1047,17 @@ impl<H: CoordHttp> Coordinator<H> {
         let out = body(&mut ledger)?;
         ledger.save(&self.ledger, &self.org_id)?;
         Ok(out)
+    }
+    fn assignment_lock(&self, assignment: &str) -> Result<File> {
+        let mut lock_key = Sha256::new();
+        lock_key.update((self.org_id.len() as u64).to_be_bytes());
+        lock_key.update(self.org_id.as_bytes());
+        lock_key.update(assignment.as_bytes());
+        remote_cli::private_lock(
+            &self.ledger,
+            &format!("local-reassign-{:x}", lock_key.finalize()),
+            Instant::now() + Duration::from_secs(5),
+        )
     }
 
     fn base(&self) -> String {
@@ -1005,63 +1185,109 @@ impl<H: CoordHttp> Coordinator<H> {
                 }
             }
             let key = attempt_key(issue, action, target);
-            if ledger.attempts.get(&key).is_some_and(|attempt| {
-                attempt.retired_lane_guard
-                    || attempt.reassign_fingerprint.as_deref() == Some("cancel")
+            if ledger.attempts.values().any(|attempt| {
+                attempt.issue_id == issue
+                    && (attempt.retired_lane_guard
+                        || attempt.reassign_fingerprint.as_deref() == Some("cancel"))
             }) {
                 return Err(Error::rejected(format!(
                     "the previous cancellation for {issue} is not released or reconciled; \
                      inspect its original operation and lane before starting another assignment"
                 )));
             }
-            let finished = ledger.attempts.get(&key).is_some_and(|attempt| {
+            let assignment_id = ledger
+                .create_aliases
+                .get(&key)
+                .map(|alias| alias.assignment_id.clone())
+                .or_else(|| {
+                    ledger
+                        .attempts
+                        .get(&key)
+                        .and_then(|attempt| attempt.assignment_id.clone())
+                });
+            if let Some(id) = &assignment_id {
+                normalize_assignment_rows(ledger, id)?;
+            }
+            if ledger.create_aliases.contains_key(&key) && ledger.attempts.contains_key(&key) {
+                return Err(Error::rejected(
+                    "the assignment creation receipt is ambiguous",
+                ));
+            }
+            let custody_key = if let Some(alias) = ledger.create_aliases.get(&key) {
+                ledger
+                    .attempts
+                    .iter()
+                    .find(|(_, attempt)| {
+                        attempt.assignment_id.as_deref() == Some(alias.assignment_id.as_str())
+                            && attempt.issue_id == issue
+                    })
+                    .map(|(key, _)| key.clone())
+                    .ok_or_else(|| Error::rejected("the assignment creation custody is missing"))?
+            } else {
+                key.clone()
+            };
+            let finished = ledger.attempts.get(&custody_key).is_some_and(|attempt| {
                 matches!(attempt.state.as_str(), "result" | "failed" | "cancelled")
             });
             if finished {
                 let previous_lane = ledger
                     .attempts
-                    .get(&key)
-                    .filter(|attempt| attempt.state == "cancelled")
+                    .get(&custody_key)
                     .and_then(|attempt| attempt.worktree.as_deref());
                 if let Some(path) = previous_lane {
                     if recorded_lane_present(path) {
                         return Err(Error::rejected(format!(
-                            "the previous cancelled lane for {issue} at {path:?} is not released; \
+                            "the previous finished lane for {issue} at {path:?} is not released; \
                              inspect it and use `cadence --org <workspace> issue finish \
                              {issue} --worktree <path>` before starting another assignment"
                         )));
                     }
                 }
-                ledger.attempts.remove(&key);
+                if let Some(attempt) = ledger.attempts.remove(&custody_key) {
+                    if let Some(id) = attempt.assignment_id {
+                        ledger
+                            .create_aliases
+                            .retain(|_, alias| alias.assignment_id != id);
+                    }
+                }
             }
-            let attempt = ledger.attempts.entry(key).or_insert_with(|| Attempt {
-                operation_id: operation_id(),
-                issue_id: issue.to_string(),
-                action: action.to_string(),
-                target: target.map(str::to_string),
-                assignment_id: None,
-                generation: None,
-                claim_id: None,
-                state: "preparing".to_string(),
-                fenced: false,
-                reassign_operation_id: None,
-                reassign_fingerprint: None,
-                reassign_expected_generation: None,
-                worktree: None,
-                lane: None,
-                lane_claim: None,
-                lane_generation: None,
-                retired_lane_guard: false,
-                kickoff_message: None,
-                kickoff_reserved: None,
-                origin_claim_id: None,
-                origin_generation: None,
-                session_profile: None,
-            });
+            let create_id = if let Some(alias) = ledger.create_aliases.get(&key) {
+                alias.operation_id.clone()
+            } else {
+                ledger
+                    .attempts
+                    .entry(key)
+                    .or_insert_with(|| Attempt {
+                        operation_id: operation_id(),
+                        issue_id: issue.to_string(),
+                        action: action.to_string(),
+                        target: target.map(str::to_string),
+                        assignment_id: None,
+                        generation: None,
+                        claim_id: None,
+                        state: "preparing".to_string(),
+                        fenced: false,
+                        reassign_operation_id: None,
+                        reassign_fingerprint: None,
+                        reassign_expected_generation: None,
+                        worktree: None,
+                        lane: None,
+                        lane_claim: None,
+                        lane_generation: None,
+                        retired_lane_guard: false,
+                        kickoff_message: None,
+                        kickoff_reserved: None,
+                        origin_claim_id: None,
+                        origin_generation: None,
+                        session_profile: None,
+                    })
+                    .operation_id
+                    .clone()
+            };
             let mut body = json!({
                 "version": VERSION,
                 "organization_id": self.org_id,
-                "idempotency_key": attempt.operation_id,
+                "idempotency_key": create_id,
                 "issue_id": issue,
                 "action": action,
                 "execution": "local",
@@ -1081,11 +1307,97 @@ impl<H: CoordHttp> Coordinator<H> {
             return Err(assignment_unknown(&self.org_id, &path, Some(&body)));
         }
         let key = attempt_key(issue, action, target);
+        let creation_id = body["idempotency_key"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("assignment creation receipt is missing"))?;
         self.with_ledger(|ledger| {
-            if let Some(attempt) = ledger.attempts.get_mut(&key) {
-                stamp(attempt, &assignment);
+            let discovered_key = format!("discovered:{}", assignment.assignment_id);
+            if let Some(discovered) = ledger.attempts.get(&discovered_key) {
+                if discovered.assignment_id.as_deref() != Some(assignment.assignment_id.as_str())
+                    || discovered.issue_id != issue
+                    || discovered.action != assignment.action
+                {
+                    return Err(Error::rejected("the discovered assignment conflicts"));
+                }
             }
+            normalize_assignment_rows(ledger, &assignment.assignment_id)?;
+            if let Some(alias) = ledger.create_aliases.get(&key) {
+                if alias.operation_id != creation_id
+                    || alias.assignment_id != assignment.assignment_id
+                    || ledger.attempts.contains_key(&key)
+                {
+                    return Err(Error::rejected("the assignment creation receipt changed"));
+                }
+            } else {
+                let attempt = ledger
+                    .attempts
+                    .get(&key)
+                    .filter(|attempt| attempt.operation_id == creation_id)
+                    .ok_or_else(|| Error::rejected("the assignment creation record changed"))?;
+                if attempt.issue_id != issue
+                    || attempt.action != action
+                    || (attempt.assignment_id.is_none()
+                        && (attempt.target.as_deref() != target || !unbound_provisional(attempt)))
+                    || attempt
+                        .assignment_id
+                        .as_ref()
+                        .is_some_and(|id| id != &assignment.assignment_id)
+                {
+                    return Err(Error::rejected(
+                        "the provisional assignment custody changed",
+                    ));
+                }
+                if attempt.assignment_id.is_none() {
+                    let existing = ledger.attempts.iter().find_map(|(existing_key, existing)| {
+                        (existing.assignment_id.as_deref()
+                            == Some(assignment.assignment_id.as_str()))
+                        .then(|| (existing_key.clone(), existing.issue_id == issue))
+                    });
+                    if let Some((existing_key, same_issue)) = existing {
+                        if !same_issue {
+                            return Err(Error::rejected("the existing assignment conflicts"));
+                        }
+                        if existing_key == discovered_key {
+                            let mut discovered =
+                                ledger.attempts.remove(&existing_key).ok_or_else(|| {
+                                    Error::rejected("the discovered assignment disappeared")
+                                })?;
+                            discovered.operation_id = creation_id.to_string();
+                            discovered.action = action.to_string();
+                            ledger.attempts.insert(key.clone(), discovered);
+                        } else {
+                            ledger.attempts.remove(&key);
+                            ledger.create_aliases.insert(
+                                key.clone(),
+                                CreateAlias {
+                                    operation_id: creation_id.to_string(),
+                                    assignment_id: assignment.assignment_id.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            let attempt = if ledger.create_aliases.contains_key(&key) {
+                ledger.attempts.values_mut().find(|attempt| {
+                    attempt.assignment_id.as_deref() == Some(assignment.assignment_id.as_str())
+                        && attempt.issue_id == issue
+                })
+            } else {
+                ledger.attempts.get_mut(&key)
+            }
+            .ok_or_else(|| Error::rejected("the assignment creation custody disappeared"))?;
+            stamp(attempt, &assignment);
             Ok(())
+        })
+        .map_err(|error| {
+            assignment_custody_failed(
+                &self.org_id,
+                "assignment creation",
+                &assignment,
+                &body,
+                error,
+            )
         })?;
         Ok(assignment)
     }
@@ -1272,7 +1584,8 @@ impl<H: CoordHttp> Coordinator<H> {
                 if attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
                     || (attempt.assignment_id.is_none()
                         && attempt.issue_id == claimed.issue_id
-                        && attempt.action == claimed.action)
+                        && attempt.action == claimed.action
+                        && attempt.target == claimed.target)
                 {
                     stamp(attempt, &claimed);
                     found = true;
@@ -1673,7 +1986,8 @@ impl<H: CoordHttp> Coordinator<H> {
             }
             if ledger.attempts.values().any(|attempt| {
                 attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
-                    && attempt.retired_lane_guard
+                    && (attempt.retired_lane_guard
+                        || attempt.reassign_fingerprint.as_deref() == Some("cancel"))
             }) {
                 return Err(Error::rejected(format!(
                     "the earlier lane for {} is not released or reconciled; \
@@ -1813,12 +2127,19 @@ impl<H: CoordHttp> Coordinator<H> {
                 None,
             )?;
         }
+        // A cancellation must not retire this claim between lane reservation
+        // and the checkout/actor handoff being recorded.
+        let _assignment_lock = self.assignment_lock(&current.assignment_id)?;
         let lane = match self.lane_for(&current, name) {
             Ok(lane) => lane,
             Err(error) => {
                 return Err(self.activation_failure(&current, error));
             }
         };
+        #[cfg(test)]
+        if let Some(wait) = self.before_lane_open.clone() {
+            wait();
+        }
         let pinned = self.with_ledger(|ledger| {
             Ok(ledger.attempts.values().find_map(|attempt| {
                 (attempt.assignment_id.as_deref() == Some(current.assignment_id.as_str())
@@ -2218,6 +2539,7 @@ impl<H: CoordHttp> Coordinator<H> {
             .claim_id
             .clone()
             .ok_or_else(|| Error::rejected("the claim has no id; no worktree was created"))?;
+        let _assignment_lock = self.assignment_lock(&claimed.assignment_id)?;
         // The claim is reportable from the moment it exists: a lane that
         // cannot be opened still leaves this session holding the work.
         self.with_ledger(|ledger| {
@@ -2231,6 +2553,10 @@ impl<H: CoordHttp> Coordinator<H> {
             Ok(())
         })?;
         let lane = self.lane_for(&claimed, name)?;
+        #[cfg(test)]
+        if let Some(wait) = self.before_lane_open.clone() {
+            wait();
+        }
         let dir = ensure_lane(&root, &lane, base_ref)?;
         let path = dir.display().to_string();
         self.with_ledger(|ledger| {
@@ -2524,23 +2850,16 @@ impl<H: CoordHttp> Coordinator<H> {
                 return Err(Error::rejected("--to must be a directory user id"));
             }
         }
-        // Serialize only this assignment's reassignment requests, without
-        // holding the ledger lock across the network.
-        let mut lock_key = Sha256::new();
-        lock_key.update((self.org_id.len() as u64).to_be_bytes());
-        lock_key.update(self.org_id.as_bytes());
-        lock_key.update(assignment.as_bytes());
-        let _request_lock = remote_cli::private_lock(
-            &self.ledger,
-            &format!("local-reassign-{:x}", lock_key.finalize()),
-            Instant::now() + Duration::from_secs(5),
-        )?;
+        // Keep reassignment and lane creation for this assignment serialized
+        // without holding the ledger lock across the network.
+        let _request_lock = self.assignment_lock(assignment)?;
         let fingerprint = if cancel {
             "cancel".to_string()
         } else {
             format!("to:{}", target.unwrap_or(""))
         };
         let (operation_id, generation, issue, fresh_guard, fresh) = self.with_ledger(|ledger| {
+            normalize_assignment_rows(ledger, assignment)?;
             let attempt = ledger
                 .attempts
                 .values_mut()
@@ -2576,18 +2895,11 @@ impl<H: CoordHttp> Coordinator<H> {
                     "assignment {assignment} has already ended; no reassignment was sent"
                 )));
             }
-            let fresh_guard = if cancel && !pending && active_lane_binding(attempt) {
-                attempt
-                    .worktree
-                    .clone()
-                    .zip(attempt.lane.clone())
-                    .zip(attempt.lane_claim.clone())
-            } else {
-                None
-            };
-            // Older clients must not read a lane binding that may become
-            // retired while this cancellation is in flight.
-            if cancel && active_lane_binding(attempt) {
+            let fresh_guard =
+                (cancel && !pending).then(|| CancellationGuardSnapshot::capture(attempt));
+            // Older clients must not start or reuse a lane while cancellation
+            // is pending, even before a checkout has been recorded.
+            if cancel {
                 attempt.retired_lane_guard = true;
             }
             if !pending {
@@ -2651,17 +2963,8 @@ impl<H: CoordHttp> Coordinator<H> {
                     {
                         return Err(Error::rejected("the reassignment receipt changed"));
                     }
-                    if let Some(((worktree, lane), claim)) = fresh_guard {
-                        if !attempt.retired_lane_guard
-                            || attempt.fenced
-                            || attempt.state == "cancelled"
-                            || attempt.generation != Some(generation)
-                            || attempt.claim_id.as_deref() != Some(claim.as_str())
-                            || attempt.lane_claim.as_deref() != Some(claim.as_str())
-                            || attempt.lane_generation != Some(generation)
-                            || attempt.lane.as_deref() != Some(lane.as_str())
-                            || attempt.worktree.as_deref() != Some(worktree.as_str())
-                        {
+                    if let Some(snapshot) = fresh_guard {
+                        if !attempt.retired_lane_guard || !snapshot.matches(attempt) {
                             return Err(Error::rejected("the local lane binding changed"));
                         }
                         attempt.retired_lane_guard = false;
@@ -2718,6 +3021,14 @@ impl<H: CoordHttp> Coordinator<H> {
                     && attempt.target == updated.target
                 {
                     attempt.fenced = true;
+                    if cancel
+                        && attempt.worktree.is_none()
+                        && attempt.lane.is_none()
+                        && attempt.lane_claim.is_none()
+                        && attempt.lane_generation.is_none()
+                    {
+                        attempt.retired_lane_guard = false;
+                    }
                 }
             }
             Ok(())

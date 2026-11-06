@@ -6,6 +6,12 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BEFORE_FINAL_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Release `path` (branch `branch`) once its exact tip survives somewhere
 /// durable: an ancestor of `origin/<default>`, or the head of a merged PR on
 /// origin's own GitHub repository (see [`hosted_evidence`]). Nothing is
@@ -18,6 +24,7 @@ pub(crate) fn release_hosted_lane(
     branch: &str,
     state_dir: &Path,
     prs: &dyn Fn(&str, &str) -> Option<Value>,
+    lock_and_validate: &dyn Fn() -> Result<std::fs::File>,
 ) -> Result<Value> {
     if !path.is_dir() {
         return Err(Error::rejected(format!(
@@ -25,7 +32,7 @@ pub(crate) fn release_hosted_lane(
             path.display()
         )));
     }
-    verify_checkout_ownership(root, path, issue, Some(branch))?;
+    verify_hosted_checkout_ownership(root, path, issue, Some(branch))?;
     let t = Target {
         front: Front::new(issue, "hosted lane", "now"),
         dir: PathBuf::new(),
@@ -94,31 +101,54 @@ pub(crate) fn release_hosted_lane(
         (_, Err(why), _) => return Err(refuse(&format!("the branch is not shown merged: {why}"))),
         _ => return Err(refuse("the branch is not shown merged")),
     };
-    // Re-read the inputs the evidence depended on at the destructive boundary.
-    if let Some(reason) = stale_evidence_reason(root, branch, &ev) {
-        return Err(Error::rejected(reason));
-    }
-    match process_use_under(path) {
-        Err(e) => {
+    // These checks run after both coordination and lifecycle locks are held,
+    // immediately before the lifecycle record enters `releasing`.
+    let final_checks = || {
+        if let Some(reason) = stale_evidence_reason(root, branch, &ev) {
+            return Err(Error::rejected(reason));
+        }
+        let view = daemon_view(state_dir);
+        let mut blocks = inspect(&view, state_dir, &t, &ev).blocks;
+        blocks.retain(|block| block.tag != "unmerged-unpushed");
+        if let Some(block) = blocks.into_iter().next() {
+            return Err(refuse(&block.reason));
+        }
+        if let Some(sample) = unexpected_ignored(path)? {
             return Err(refuse(&format!(
-                "Cannot revalidate process use of {} ({e})",
+                "Worktree {} holds ignored files that removal would delete: {sample}",
                 path.display()
-            )))
+            )));
         }
-        Ok(uses)
-            if uses.enumeration_error.is_some() || !uses.cwd.is_empty() || !uses.fd.is_empty() =>
-        {
-            return Err(refuse(&format!("A process is using {}", path.display())))
+        match process_use_under(path) {
+            Err(error) => Err(refuse(&format!(
+                "Cannot revalidate process use of {} ({error})",
+                path.display()
+            ))),
+            Ok(uses)
+                if uses.enumeration_error.is_some()
+                    || !uses.cwd.is_empty()
+                    || !uses.fd.is_empty() =>
+            {
+                Err(refuse(&format!("A process is using {}", path.display())))
+            }
+            Ok(_) => Ok(()),
         }
-        Ok(_) => {}
-    }
-    verify_checkout_ownership(root, path, issue, Some(branch))?;
-    let mut lifecycle = crate::worktree::lifecycle::begin_release(
+    };
+    #[cfg(test)]
+    BEFORE_FINAL_LOCK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    let _assignment_ledger = lock_and_validate()?;
+    verify_hosted_checkout_ownership(root, path, issue, Some(branch))?;
+    let mut lifecycle = crate::worktree::lifecycle::begin_hosted_release(
         root,
         path,
         issue,
         Some(branch),
         &format!("hosted issue finish {issue} for branch {branch}"),
+        &final_checks,
     )?;
     // No `--force`: git itself refuses a dirty or locked worktree.
     let target = path.to_string_lossy().into_owned();

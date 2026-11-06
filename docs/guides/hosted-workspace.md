@@ -574,18 +574,31 @@ still exists and the reason is resolved, use `issue finish` rather than cancelli
 again. If the old lane binding is unavailable or ambiguous, it cannot be
 reconstructed by this command and the lane remains intact.
 While that cancellation is pending or its lane guard remains, starting the same
-issue, action and target is refused rather than overwriting its recovery record,
-even if the path is absent.
+issue is refused for every action and target rather than overwriting its recovery
+record, even if the path is absent.
 
-While a bound cancellation is in flight or its lane remains unreleased, the
-current client records a local safety marker. Older clients reject that
-workspace's assignment ledger instead of treating the retired lane as active;
-use the current client to reconcile and release it. Successful release clears
-the marker only if the recorded binding is unchanged and the path is absent.
+While cancellation is in flight or its lane remains unreleased, the current
+client records a local safety marker. Older clients reject that workspace's
+assignment ledger instead of starting or reusing a retired lane. A confirmed
+cancellation with no lane reservation clears the marker; an incomplete lane
+binding remains guarded for inspection. Successful release clears the marker
+only if the recorded binding is unchanged and the path is absent.
 If that cleanup cannot be confirmed, the release result contains a warning and
-the marker stays. Reassignment serialization covers current clients using the
-same local ledger; neither it nor the marker stops an actor, an older command
-already in flight, or a client using a different ledger.
+the marker stays. Cancellation and lane creation are serialized only for
+current clients using the same local ledger; neither the lock nor the marker
+stops an actor, an older command already in flight, or a client using a
+different ledger.
+
+The board may coalesce different create actions for the same issue and target
+into one assignment. The client keeps each create operation's retry key while
+sharing a single custody record. When such additional receipts are present,
+older clients also refuse that ledger; use a current client rather than deleting
+the receipts or downgrading. They are retired with the ended assignment when
+new work is started.
+
+If the path was never recorded, automatic release and marker reconciliation are
+unavailable: preserve the ledger and inspect the repository's worktrees rather
+than guessing which checkout belongs to the assignment.
 
 When a cancellation's outcome is unknown, inspect the named assignment and
 original operation before deciding whether to retry; do not assume it failed.
