@@ -101,7 +101,7 @@ pub(crate) fn run(
         )));
     }
     let ev = evidence(&probe, remote);
-    let (merged_how, tip, _) = survivability(&ev, &probe);
+    let (merged_how, tip, _) = survivability(&ev, &probe.root, &probe.branch);
     // The --remote coverage decision is probe data too — `gh` runs
     // unlocked. Merge evidence must cover the FETCHED remote tip;
     // survivability's "pushed" is not enough (origin can hold commits

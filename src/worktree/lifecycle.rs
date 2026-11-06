@@ -1017,7 +1017,7 @@ fn record_row(root: &Path, record: &Checkout, trees: &[LiveTree]) -> Value {
                             .as_deref()
                             .and_then(|branch| {
                                 finish::default_ref(root).and_then(|into| {
-                                    finish::merge_rule(root, branch, &tree.head, &into)
+                                    finish::merged_claim(root, branch, &tree.head, &into)
                                 })
                             })
                             .is_some();

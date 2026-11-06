@@ -1528,6 +1528,72 @@ pub(crate) fn approve_answer(body: &Value, binding: &GateBinding, source: &str) 
     })
 }
 
+/// `cadence audit accept-revise` (CAD-2197) for a hosted org: the operator's
+/// acceptance of a workflow review's `revise` at exactly this head. The
+/// acceptance grants nothing by itself — `scripts/enqueue-reviewed` lifts the
+/// workflow-row refusal and still requires every other gate.
+pub fn accept_revise(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    binding: &GateBinding,
+    source: &str,
+) -> Result<Value> {
+    let mut call_args = binding.arguments();
+    call_args.insert("source".into(), json!(source));
+    let body = call(
+        target,
+        wake_timeout,
+        "audit_accept_revise_project",
+        call_args,
+    )?;
+    accept_revise_answer(&body, binding, source)
+}
+
+pub(crate) fn accept_revise_answer(
+    body: &Value,
+    binding: &GateBinding,
+    source: &str,
+) -> Result<Value> {
+    let verb = "audit_accept_revise_project";
+    check_receipt(verb, || {
+        if body["state"].as_str() != Some("recorded")
+            || body["action"].as_str() != Some("accept-revise")
+        {
+            return Err(refuse(format!(
+                "`{verb}` did not record an acceptance: {}",
+                short(body)
+            )));
+        }
+        binding.echoes(body, verb, false)?;
+        if body["issue"].as_str() != Some(binding.issue.as_str()) {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not name issue {}",
+                binding.issue
+            )));
+        }
+        if body["head_sha"].as_str() != Some(binding.head.as_str())
+            || body["scope"]["pr"].as_u64() != Some(binding.pr)
+            || !body["scope"]["repo"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case(&binding.repo))
+        {
+            return Err(refuse(format!(
+                "`{verb}` receipt does not name exactly {}#{} at {}",
+                binding.repo, binding.pr, binding.head
+            )));
+        }
+        if body["source"].as_str() != Some(source) {
+            return Err(refuse(format!("`{verb}` receipt names another source")));
+        }
+        text(body, "approval_id", verb)?;
+        text(body, "recorded_via", verb)?;
+        if !body["duplicate"].is_boolean() {
+            return Err(refuse(format!("`{verb}` receipt has no duplicate flag")));
+        }
+        Ok(body.clone())
+    })
+}
+
 /// `cadence audit findings` (CAD-2201) for a hosted org: the text a workflow
 /// review filed at exactly this head. Owner-only on the tenant; this side
 /// only refuses an answer that names another binding or carries a body the
@@ -1645,6 +1711,39 @@ mod tests {
         foreign["project"] = json!("other");
         let err = approval_answer(&foreign, &binding()).unwrap_err();
         assert!(err.to_string().contains("other"), "{err}");
+    }
+
+    #[test]
+    fn acceptance_receipt_must_name_the_action_head_issue_and_source() {
+        let body = json!({"state": "recorded", "duplicate": false,
+                          "approval_id": "accept-1", "project": "cadence", "issue": "CAD-1",
+                          "action": "accept-revise", "head_sha": HEAD,
+                          "scope": {"repo": "favcrm/cadence", "pr": 7},
+                          "source": "chris in chat", "recorded_via": "hosted-owner-login",
+                          "policy_revision": 1});
+        let accepted = accept_revise_answer(&body, &binding(), "chris in chat").unwrap();
+        assert_eq!(accepted["action"], "accept-revise");
+        assert_eq!(accepted["approval_id"], "accept-1");
+        // A merge receipt is not an acceptance, and another head, issue or
+        // source is another call's answer, never this one's.
+        for (key, value) in [
+            ("action", json!("merge")),
+            ("head_sha", json!(OTHER)),
+            ("issue", json!("CAD-2")),
+            ("source", json!("someone else")),
+            ("approval_id", json!("")),
+        ] {
+            let mut bad = body.clone();
+            bad[key] = value;
+            assert!(
+                accept_revise_answer(&bad, &binding(), "chris in chat").is_err(),
+                "{key}"
+            );
+        }
+        // A receipt with no duplicate flag is not a receipt.
+        let mut no_dup = body.clone();
+        no_dup.as_object_mut().unwrap().remove("duplicate");
+        assert!(accept_revise_answer(&no_dup, &binding(), "chris in chat").is_err());
     }
 
     #[test]

@@ -55,6 +55,34 @@ pub(crate) enum AuditAction {
         #[arg(long)]
         id: Option<String>,
     },
+    /// Hosted only (CAD-2197): record that the operator read a workflow
+    /// review's `revise` at the exact full `--head` of PR `--pr` and accepts
+    /// it. The gate lifts that refusal and no other: an owner's revise, a
+    /// missing check, a scope, readiness or merge approval still refuse. This
+    /// is a separate verb rather than `approve --action accept-revise` so
+    /// `approve` keeps refusing every action but `merge` on a hosted org.
+    AcceptRevise {
+        /// PR number the acceptance covers.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head SHA the acceptance names — a new commit voids it.
+        #[arg(long)]
+        head: String,
+        /// The ticket whose review is accepted. Required: an acceptance that
+        /// cannot name its ticket is not evidence.
+        #[arg(long)]
+        issue: String,
+        /// The issue's project. Never inferred from the repo or the cwd.
+        #[arg(long)]
+        project: String,
+        /// Who accepted and where, and what they read. A claim the record
+        /// carries; never `user` or `daemon`.
+        #[arg(long)]
+        source: String,
+        /// `owner/name` (default: the cwd checkout's github.com origin).
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Read-only (CAD-959): is a merge approval in force for exactly this
     /// full `--head` of PR `--pr`? Prints one JSON object; exits 0 only
     /// for state `in-force`. Reads the store directly and never records.

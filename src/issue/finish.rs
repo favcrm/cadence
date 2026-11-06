@@ -10,8 +10,9 @@
 //! plus a dirty worktree (ignored paths don't count), a branch that
 //! has not started (no commits beyond where it was cut — never
 //! "merged", CAD-275) and a branch whose work survives nowhere —
-//! merged into the repo's default branch by ancestry,
-//! patch-equivalent commits, a squash merge, or a merged PR, or
+//! merged into the repo's default branch by ancestry
+//! or a merged PR whose head is exactly the tip (CAD-2181: never
+//! content inference), or
 //! pushed. A busy owner working ELSEWHERE is not a reason. `--force`
 //! overrides each and is recorded as a `Forced:` trailer on the
 //! finish commit. Refs are kept as history, marked `closed: true`
@@ -61,7 +62,7 @@ use resolve::*;
 
 pub(crate) use activity::{comm_of, daemon_view, lane_in_use, with_probe_timeout, DaemonView};
 pub(crate) use evidence::{branch_tip, not_started};
-pub(crate) use git::{default_ref, git, git_branch, merge_rule};
+pub(crate) use git::{default_ref, git, git_branch, merge_rule, merged_claim};
 pub(crate) use guard::cwd_holder_aliases;
 pub(crate) use hosted::{gh_merged_prs, release_hosted_lane};
 pub(crate) use run::{run, FinishArgs};

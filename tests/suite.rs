@@ -947,6 +947,7 @@ mod cad2081_workflow_verdicts {
                 "tip_fails": case.tip_fails, "tip_sha": case.tip_sha,
                 "approved_head": case.approved_head, "no_qa_evidence": case.no_qa_evidence,
                 "board_asks_qa": case.board_asks_qa, "qa_evidence_url": case.qa_evidence_url,
+                "accepts_revise": case.accepts_revise,
                 "identities": if case.no_identity_map { Value::Null } else {
                     case.identities.clone().unwrap_or_else(Self::identities) },
             });
@@ -1006,6 +1007,7 @@ mod cad2081_workflow_verdicts {
         no_qa_evidence: bool,
         board_asks_qa: bool,
         qa_evidence_url: Option<String>,
+        accepts_revise: Option<Value>,
     }
 
     fn scenario(rows: Vec<Value>) -> Scenario {
@@ -1030,6 +1032,7 @@ mod cad2081_workflow_verdicts {
             no_qa_evidence: false,
             board_asks_qa: false,
             qa_evidence_url: None,
+            accepts_revise: None,
         }
     }
 
@@ -1212,6 +1215,148 @@ mod cad2081_workflow_verdicts {
             scenario(vec![f.std(), revise, f.spec()]),
             "is not a pass",
         );
+    }
+
+    #[test]
+    fn an_operator_acceptance_lifts_only_a_workflow_revise_at_that_head() {
+        let f = Fixture::new();
+        let mut revise = f.spec();
+        revise["outcome"] = json!("revise");
+        revise["title_outcome"] = json!("revise");
+        revise["section_outcome"] = json!("revise");
+        revise["name"] = json!("20261103-000150-spec.md");
+        revise["stamp"] = json!("20261103-000150");
+
+        // Consequential accepts one combined review or both workflow axes, so
+        // an accepted revise is what settles the second axis.
+        let head = f.touch("docs/x.md");
+        let consequential = |rows: Vec<Value>| {
+            let mut case = scenario(rows);
+            case.class = "consequential";
+            case.head = Some(head.clone());
+            case
+        };
+        refused(
+            &f,
+            consequential(vec![f.std(), revise.clone()]),
+            "is not a pass",
+        );
+
+        // CAD-2197: the operator read that finding and accepted it at this head.
+        let mut accepted = consequential(vec![f.std(), revise.clone()]);
+        accepted.accepts_revise = Some(json!({"head": head}));
+        let (code, stdout, stderr) = f.gate(&accepted);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.contains("every rule holds"), "{stdout}");
+        assert!(
+            stdout.contains("accepted workflow revise: accept-1"),
+            "{stdout}"
+        );
+        // CAD-2201: the evidence names the finding, not only the acceptance id.
+        assert!(
+            stdout.contains("findings 20261103-000150-spec.md"),
+            "{stdout}"
+        );
+        // The acceptance is never reported as a passing review.
+        assert!(
+            !stdout.contains("svc_spec spec-security (20261103-000150"),
+            "{stdout}"
+        );
+
+        // Another head's acceptance does not lift this one: a new commit voids it.
+        let mut elsewhere = consequential(vec![f.std(), revise.clone()]);
+        elsewhere.accepts_revise = Some(json!({"head": "f".repeat(40)}));
+        refused(&f, elsewhere, "is not a pass");
+
+        // An acceptance recorded by a surface this board does not have is no
+        // evidence, so the revise still refuses.
+        let mut native = consequential(vec![f.std(), revise.clone()]);
+        native.accepts_revise = Some(json!({"head": head, "recorded_via": "operator-connection"}));
+        refused(&f, native, "is not a pass");
+
+        // It lifts a workflow row only: a person's revise still refuses.
+        let mut owner_revise = f.owner(
+            "20261103-000100-a.md",
+            "20261103-000100",
+            "usr_alice",
+            "alice",
+            "spec-security",
+        );
+        owner_revise["outcome"] = json!("revise");
+        owner_revise["title_outcome"] = json!("revise");
+        owner_revise["section_outcome"] = json!("revise");
+        let mut with_owner = consequential(vec![f.std(), owner_revise]);
+        with_owner.accepts_revise = Some(json!({"head": head}));
+        refused(&f, with_owner, "is not a pass");
+    }
+
+    #[test]
+    fn an_unorderable_workflow_revise_is_never_accepted() {
+        let f = Fixture::new();
+        let head = f.touch("docs/x.md");
+        // No stamp: the row cannot be ordered, so it always refuses — an
+        // acceptance cannot make an unorderable row evidence.
+        let mut loose = f.spec();
+        loose["outcome"] = json!("revise");
+        loose["title_outcome"] = json!("revise");
+        loose["section_outcome"] = json!("revise");
+        loose["name"] = json!("spec.md");
+        loose["stamp"] = Value::Null;
+        let mut case = scenario(vec![f.std(), loose]);
+        case.class = "consequential";
+        case.head = Some(head.clone());
+        case.accepts_revise = Some(json!({"head": head}));
+        refused_all(&f, case, &["is not a pass", "cannot be ordered"]);
+    }
+
+    #[test]
+    fn a_refused_workflow_revise_names_the_head_and_the_accept_command() {
+        let f = Fixture::new();
+        let head = f.touch("docs/x.md");
+        let mut revise = f.spec();
+        revise["outcome"] = json!("revise");
+        revise["title_outcome"] = json!("revise");
+        revise["section_outcome"] = json!("revise");
+        revise["name"] = json!("20261103-000150-spec.md");
+        revise["stamp"] = json!("20261103-000150");
+        let mut case = scenario(vec![f.std(), revise]);
+        case.class = "consequential";
+        case.head = Some(head.clone());
+        refused_all(
+            &f,
+            case,
+            &[
+                "no acceptance is recorded",
+                "cadence audit accept-revise",
+                head.as_str(),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_settled_workflow_revise_answers_the_routine_route() {
+        let f = Fixture::new();
+        let mut revise = f.spec();
+        revise["outcome"] = json!("revise");
+        revise["title_outcome"] = json!("revise");
+        revise["section_outcome"] = json!("revise");
+        revise["name"] = json!("20261103-000150-spec.md");
+        revise["stamp"] = json!("20261103-000150");
+        // A hosted routine PR with no readiness record takes both workflow
+        // axes; an accepted revise settles the axis that did not pass.
+        let head = f.touch("docs/x.md");
+        let routine = |rows: Vec<Value>| {
+            let mut case = scenario(rows);
+            case.class = "routine";
+            case.no_readiness = true;
+            case.head = Some(head.clone());
+            case
+        };
+        refused(&f, routine(vec![f.std(), revise.clone()]), "is not a pass");
+        let mut settled = routine(vec![f.std(), revise]);
+        settled.accepts_revise = Some(json!({"head": head}));
+        let (code, stdout, stderr) = f.gate(&settled);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     }
 
     #[test]
