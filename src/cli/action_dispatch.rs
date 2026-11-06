@@ -575,7 +575,10 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                         missing.join(", ")
                     );
                 }
-            } else {
+            } else if !web && !settings && !cloud_agent && !audit_approve && org.is_none() {
+                // Only a plain portal login: a scoped or legacy login already
+                // asked for something specific, and `--full-access` conflicts
+                // with the legacy `--org` form.
                 eprintln!(
                     "note: this login requested board access only; --full-access also requests \
                      {} (required before approve, settings, web and cloud-agent verbs)",
