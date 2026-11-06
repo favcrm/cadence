@@ -4,6 +4,7 @@ import { displayUiNotice } from "../../lib/uiNotice";
 import { useResource } from "../../lib/useResource";
 import type { ThreadRef } from "../../lib/types";
 import Button from "../../ui/Button";
+import { Select } from "../../ui/Select";
 import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
 import { AssistantActorProvider, type AssistantActorValue } from "../assistant/AssistantIdentity";
@@ -22,7 +23,8 @@ import {
 import { useDockHeight } from "../home/useDockHeight";
 import { threadReader } from "../../lib/resources";
 import { subscribeThreadsChanged } from "../threads/threadsClient";
-import { agentThreadStore, sendToAgent } from "./agentThread";
+import { agentThreadStore, profileThreadStore, sendToAgent } from "./agentThread";
+import { useHostedProfileConversation } from "./useHostedProfileConversation";
 
 /** How a chat page leaves the composer out: a plain reason in its place. */
 export type ChatGate = { title: string; body: string; extra?: ReactNode };
@@ -30,6 +32,7 @@ export type ChatGate = { title: string; body: string; extra?: ReactNode };
 /** One agent's page: Home's conversation and composer, its own details panel. */
 export default function AgentChat({
   alias,
+  hostedProfileId,
   heading,
   gate,
   look,
@@ -43,6 +46,7 @@ export default function AgentChat({
   onOpenIssue,
 }: {
   alias: string;
+  hostedProfileId?: string | undefined;
   heading: ReactNode;
   /** Nothing can answer here, so no composer is offered. */
   gate: ChatGate | null;
@@ -99,7 +103,11 @@ export default function AgentChat({
           </button>
         </header>
         {notices}
-        <AgentConversation alias={alias} gate={gate} look={look} expectation={expectation} attach={attach} block={block} onOpenIssue={onOpenIssue} />
+        {hostedProfileId && gate === null ? (
+          <HostedProfileConversation key={hostedProfileId} profileId={hostedProfileId} alias={alias} look={look} expectation={expectation} attach={attach} block={block} onOpenIssue={onOpenIssue} />
+        ) : (
+          <AgentConversation alias={alias} gate={gate} look={look} expectation={expectation} attach={attach} block={block} onOpenIssue={onOpenIssue} />
+        )}
       </section>
       {panelOpen && (
         <aside className="ag-chat-panel" aria-label={t("{alias} details").replace("{alias}", () => alias)}>
@@ -123,15 +131,45 @@ export default function AgentChat({
   );
 }
 
-function AgentConversation({
-  alias,
-  gate,
-  look,
-  expectation,
-  attach,
-  block,
-  onOpenIssue,
-}: {
+function HostedProfileConversation(props: Omit<AgentConversationProps, "gate" | "conversation"> & { profileId: string }) {
+  const t = useTranslate();
+  const { state, retry, select, startNew, createAnother } = useHostedProfileConversation(props.profileId, props.block);
+  if (state.kind === "ready")
+    return (
+      <>
+        <div className="flex justify-end items-center gap-2 pt-2">
+          {state.options.length > 1 && <Select
+            aria-label={t("Conversation")}
+            size="sm"
+            value={state.conversation}
+            onChange={select}
+            options={state.options.map((option, index) => ({
+              value: option.id,
+              label: `${t("Conversation")} ${index + 1}${option.created ? ` · ${new Date(option.created).toLocaleString()}` : ""}`,
+            }))}
+          />}
+          <Button variant="ghost" size="sm" disabled={props.block !== null} onClick={startNew}>{t("New conversation")}</Button>
+        </div>
+        <AgentConversation {...props} alias={state.name} key={state.conversation} gate={null} conversation={state.conversation} />
+      </>
+    );
+  return (
+    <div className="card p-3.5 mt-3 ag-chat-gate" role="status">
+        {state.kind === "loading" ? (
+          <strong>{t("Reading the thread…")}</strong>
+        ) : (
+          <>
+            <strong>{state.kind === "uncertain" ? t("Conversation creation was not confirmed.") : state.kind === "paused" && props.block ? props.block : t("The thread could not be read —")}</strong>
+            {state.kind === "uncertain" && <p>{t("Check again, or start another conversation; another may already exist.")}</p>}
+            <Button onClick={retry}>{t("Retry")}</Button>
+            {state.kind === "uncertain" && <Button variant="ghost" onClick={createAnother}>{t("Start another conversation")}</Button>}
+          </>
+        )}
+    </div>
+  );
+}
+
+type AgentConversationProps = {
   alias: string;
   gate: ChatGate | null;
   look: AvatarLook;
@@ -139,10 +177,22 @@ function AgentConversation({
   attach: boolean;
   block: string | null;
   onOpenIssue: (id: string) => void;
-}) {
+  conversation?: string | undefined;
+};
+
+function AgentConversation({
+  alias,
+  conversation,
+  gate,
+  look,
+  expectation,
+  attach,
+  block,
+  onOpenIssue,
+}: AgentConversationProps) {
   const t = useTranslate();
   const [sendNote, setSendNote] = useState<string | null>(null);
-  const store = agentThreadStore(alias);
+  const store = conversation ? profileThreadStore(conversation) : agentThreadStore(alias);
   const thread = useResource(store);
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
@@ -150,6 +200,15 @@ function AgentConversation({
   const dockRef = useRef<HTMLDivElement | null>(null);
   const liveAfter = useRef<number | null>(null);
   const onTail = useRef(true);
+  const sendAbort = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    sendAbort.current = controller;
+    return () => {
+      controller.abort();
+      if (sendAbort.current === controller) sendAbort.current = null;
+    };
+  }, [conversation]);
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.asOf !== null && thread.asOf !== undefined;
   if (liveAfter.current === null && loaded) liveAfter.current = lastSeq(thread.data) ?? 0;
@@ -197,7 +256,7 @@ function AgentConversation({
       setLimit((l) => l + WINDOW);
       return;
     }
-    const page = fetchEarlier(threadReader(alias), data);
+    const page = fetchEarlier(threadReader(conversation ? "master" : alias, conversation), data);
     if (!page) {
       store.write((s) => ({ ...(s ?? data), moreBefore: false }));
       return;
@@ -210,17 +269,17 @@ function AgentConversation({
       })
       .catch(() => undefined)
       .finally(() => setLoadingEarlier(false));
-  }, [alias, store, limit]);
+  }, [alias, conversation, store, limit]);
 
   const actor = useMemo<AssistantActorValue>(
     () => ({
-      scope: "workspace",
+      scope: conversation ? null : "workspace",
       alias,
       read: { state: "ready", identity: { name: alias, tone: null, look, revision: 0 } },
       personal: null,
       workspace: null,
     }),
-    [alias, look],
+    [alias, conversation, look],
   );
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
   const failed = gate === null && thread.error !== null && thread.error !== undefined;
@@ -274,7 +333,7 @@ function AgentConversation({
               liveAfter={liveAfter.current ?? 0}
               onOpenIssue={onOpenIssue}
               onRetry={(message: string, text: string, refs?: ThreadRef[], attachments?: { id: string }[]) => {
-                void sendToAgent(alias, text, message, refs, attachments);
+                void sendToAgent(alias, text, message, refs, attachments, conversation, conversation ? sendAbort.current?.signal : undefined);
               }}
               onDiscard={(message: string) => store.write((s) => discardPending(s, message))}
             />
@@ -295,7 +354,7 @@ function AgentConversation({
             </div>
             <SharedComposer
               density="full"
-              storeKey={`threads:${alias}`}
+              storeKey={conversation ? `profile:${conversation}` : `threads:${alias}`}
               block={block}
               // A `/` command is not sent here, and Enter must not look dead.
               onNotice={(notice) =>
@@ -308,7 +367,7 @@ function AgentConversation({
               onSend={({ body, refs, attachments }) => {
                 setSendNote(null);
                 onTail.current = true;
-                void sendToAgent(alias, body, undefined, refs, attachments);
+                void sendToAgent(alias, body, undefined, refs, attachments, conversation, conversation ? sendAbort.current?.signal : undefined);
               }}
               refocusAfterSend
               attach={attach}

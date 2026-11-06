@@ -19,6 +19,14 @@ export function agentThreadStore(alias: string): Resource<ThreadState> {
   )(alias);
 }
 
+/** The hosted profile's selected conversation is never the agent's native thread. */
+export function profileThreadStore(conversation: string): Resource<ThreadState> {
+  return cache.family<string, ThreadState>("profileThread", (key) =>
+    loadThread(threadReader("master", key), cache.peek<ThreadState>(`profileThread:${key}`)?.get().data ?? null),
+  )(conversation);
+}
+
+
 /** Send through the path Threads uses. `message` is the idempotency key, so a
  *  retry of a lost response is one message rather than two. */
 export async function sendToAgent(
@@ -27,14 +35,17 @@ export async function sendToAgent(
   message = newMessageId(),
   refs?: ThreadRef[],
   attachments?: { id: string }[],
+  conversation?: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const body = text.trim();
   if (!body) return;
-  const store = agentThreadStore(alias);
+  const store = conversation ? profileThreadStore(conversation) : agentThreadStore(alias);
   store.write((s) => addPending(s, message, body, Date.now(), refs, attachments));
   try {
     await withPrivateOperation((op) =>
-      api.threadSend(alias, body, message, refs, undefined, undefined, attachments, op),
+      api.threadSend(conversation ? "master" : alias, body, message, refs, undefined, conversation, attachments, op),
+      signal,
     );
     store.write((s) => settlePending(s, message, { ok: true }));
     void store.refresh();
