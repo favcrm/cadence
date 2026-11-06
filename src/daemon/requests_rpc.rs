@@ -38,6 +38,7 @@ impl Shared {
 
     pub(super) fn rpc_respond(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        self.refuse_restricted_agent(&alias)?;
         // Decided before the handle is claimed, so a refused caller
         // consumes nothing and the request stays pending.
         self.authorize_respond(params, peer_pid, &alias)?;
@@ -51,7 +52,8 @@ impl Shared {
         // CAD-506: a `kind:"effect"` handle names a durable
         // pending-effect row, not a `pending` entry — the press path
         // decides it (accept is operator-only) and runs the staged call.
-        if let Some(row) = self.store.effect_by_request(handle)? {
+        let effect_row = self.store.effect_by_request(handle)?;
+        if let Some(row) = effect_row {
             return self.respond_effect(&row, peer_pid, decision, &answers, reason, &alias);
         }
         // Claim the handle atomically: whichever path removes it first

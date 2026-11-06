@@ -630,10 +630,6 @@ impl AgentPids {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
     fn map(&self, keep: impl Fn(&AgentPid) -> bool) -> HashMap<u32, String> {
         self.rows
             .iter()
@@ -703,10 +699,6 @@ pub(crate) struct AgentRoots {
 }
 
 impl AgentRoots {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.panes.is_empty() && self.managed.is_empty()
-    }
-
     /// [`operator_proof`] for `pid` against these roots. The deny lists
     /// are every row that MAY still be its process (CAD-385,
     /// [`AgentPids::fenced`]): a reused pid denies nothing, a row with no
@@ -947,6 +939,101 @@ fn parse_addr(field: &str) -> Option<SocketAddr> {
         _ => return None,
     };
     Some(SocketAddr::new(ip, port))
+}
+
+/// CAD-2207: prove `pid` is the process serving the exact board connection —
+/// it must hold BOTH the listening socket bound to `server` and the accepted
+/// server-side socket of the `(server, peer)` four-tuple. The old check only
+/// looked at the client side, so any caller could name an arbitrary live
+/// socket; owning the server side is what ties the RPC to the request the
+/// board actually serves. Inode 0 (TIME_WAIT) is owned by nobody. A socket
+/// held by another user cannot be proven and refuses.
+pub(crate) fn server_socket_owned_by(
+    server: SocketAddr,
+    peer: SocketAddr,
+    pid: u32,
+) -> Result<(), String> {
+    let server = canonical(server);
+    let peer = canonical(peer);
+    let mut read_any = false;
+    let mut accepted: Vec<u64> = Vec::new();
+    let mut listeners: Vec<u64> = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        read_any = true;
+        accepted.extend(server_socket_inodes(&text, server, peer));
+        listeners.extend(listener_inodes(&text, server));
+    }
+    if !read_any {
+        return Err("/proc/net/tcp and /proc/net/tcp6 are unreadable".to_string());
+    }
+    if accepted.is_empty() {
+        return Err(format!(
+            "no accepted local socket is the server side of {server} → {peer}"
+        ));
+    }
+    if listeners.is_empty() {
+        return Err(format!("no listening socket is bound to {server}"));
+    }
+    if !accepted.iter().any(|inode| pid_holds_socket(pid, *inode)) {
+        return Err(format!(
+            "pid {pid} does not own the accepted server socket of {server} → {peer}"
+        ));
+    }
+    if !listeners.iter().any(|inode| pid_holds_socket(pid, *inode)) {
+        return Err(format!("pid {pid} does not own the listener at {server}"));
+    }
+    Ok(())
+}
+
+/// Every accepted server-side entry for the tuple: local `server`, remote
+/// `peer`, established or half-closed by the client, with a real inode.
+fn server_socket_inodes(table: &str, server: SocketAddr, peer: SocketAddr) -> Vec<u64> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            let local = canonical(parse_addr(cols.get(1)?)?);
+            let remote = canonical(parse_addr(cols.get(2)?)?);
+            let state = *cols.get(3)?;
+            let inode: u64 = cols.get(9)?.parse().ok()?;
+            (local == server && remote == peer && matches!(state, "01" | "08") && inode != 0)
+                .then_some(inode)
+        })
+        .collect()
+}
+
+/// Every listening entry at `server` (state `0A`, remote port 0, real inode).
+/// A shared listener can have more than one inode; any owned by the caller is
+/// proof.
+fn listener_inodes(table: &str, server: SocketAddr) -> Vec<u64> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            let local = canonical(parse_addr(cols.get(1)?)?);
+            let remote = canonical(parse_addr(cols.get(2)?)?);
+            let state = *cols.get(3)?;
+            let inode: u64 = cols.get(9)?.parse().ok()?;
+            (local == server && remote.port() == 0 && state == "0A" && inode != 0).then_some(inode)
+        })
+        .collect()
+}
+
+/// Does `pid` hold `socket:[inode]` in its own fd table right now? An
+/// unreadable fd table is false: it proves nothing and the caller refuses.
+fn pid_holds_socket(pid: u32, inode: u64) -> bool {
+    let want = format!("socket:[{inode}]");
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.flatten().any(|fd| {
+        std::fs::read_link(fd.path()).is_ok_and(|target| target.as_os_str() == want.as_str())
+    })
 }
 
 /// Every visible process holding `socket:[inode]` — more than one when

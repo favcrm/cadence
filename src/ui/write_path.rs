@@ -669,8 +669,8 @@ pub(crate) fn tailnet_proxy(
     })
 }
 
-/// The live agents a write can be attributed to, read over the
-/// daemon's `agent_list` RPC:
+/// The live ordinary agents a write can be attributed to, read over the
+/// daemon's `agent_operational` RPC:
 ///
 /// - registered panes, pane pid → alias — the same rows the daemon's
 ///   slot identity resolves against (`pty` endpoints with a pid and a
@@ -687,14 +687,18 @@ pub(crate) fn tailnet_proxy(
 /// and a row without one — an older daemon's list — refuses a write
 /// tied to it.
 ///
+/// CAD-2207: restricted rows are not in this projection. A board write
+/// attributes its concrete peer through [`board_peer_agent`] instead; this
+/// helper remains for the board's own-process operator status.
+///
 /// No store file means no agent was ever registered here: provably no
-/// agents. A store the daemon cannot answer for is an error.
+/// agents. A daemon that cannot answer is an error, never an empty fleet.
 ///
 /// `budget` bounds this one required identity read when the caller is a
 /// courtesy metadata read (CAD-1193); every guard caller passes
 /// `None` and keeps the full RPC bound. Either way the answer comes
 /// only from the daemon — a failed read maps nothing, so a stalled
-/// `agent_list` denies attribution, it never skips the check.
+/// projection denies attribution, it never skips the check.
 pub(crate) fn agent_roots(
     state_dir: &Path,
     budget: Option<client::MetaBudget>,
@@ -702,10 +706,31 @@ pub(crate) fn agent_roots(
     if !state_dir.join("cadence.sqlite3").exists() {
         return Ok(crate::peer::AgentRoots::default());
     }
-    let listed = match budget {
-        Some(b) => b.read(state_dir, "agent_list", json!({})),
-        None => client::rpc(state_dir, "agent_list", json!({})),
+    // CAD-2207: the operational projection only. A pre-change daemon that
+    // does not serve it is refused: we cannot prove an older `agent_list` is
+    // the complete (unfiltered) view, and a partial fleet must never be read
+    // as attribution evidence. `board_is_operator` turns this into `None`
+    // (unknown), never a positive proof.
+    let read = |verb: &str| match budget {
+        Some(b) => b.read(state_dir, verb, json!({})),
+        None => client::rpc(state_dir, verb, json!({})),
     };
+    // CAD-2207: prove the daemon serves the fleet contract before reading a
+    // projection that an older daemon may fill with personal aliases. The
+    // board turns this error into `None`/unknown, never positive proof.
+    let info = read("daemon_info")
+        .map_err(|e| format!("the daemon cannot prove the fleet protocol ({e})"))?;
+    if info
+        .get("fleet_protocol")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        < crate::proto::CLIENT_PROTOCOL
+    {
+        return Err(
+            "the daemon predates the fleet protocol; upgrade it before listing agents".to_string(),
+        );
+    }
+    let listed = read("agent_operational");
     let list = listed.map_err(|e| format!("the daemon cannot list registered agents ({e})"))?;
     let agents = list["agents"]
         .as_array()
@@ -733,6 +758,79 @@ pub(crate) fn agent_roots(
         panes: crate::peer::AgentPids::classify(panes),
         managed: crate::peer::AgentPids::classify(managed),
     })
+}
+
+/// CAD-2207: what the daemon's all-root classifier said about a concrete
+/// board TCP peer. `Opaque` is an agent whose alias the caller may not see
+/// (a bound member assistant): the board still refuses/revokes, but never
+/// learns the identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PeerAgentVerdict {
+    Named(String),
+    Opaque,
+    None,
+}
+
+/// CAD-2207: ask the daemon to classify the concrete live four-tuple against
+/// ALL agent roots. This replaces the old local `agent_operational`-derived
+/// pid map: the daemon resolves the socket's owners itself, returns an alias
+/// only for an ordinary agent, and returns `Opaque` for a bound assistant.
+/// There is no fallback: a daemon that cannot answer leaves the caller to
+/// fail closed (`Unknown`/`Unavailable`), never to read a filtered list as a
+/// complete fleet.
+pub(crate) fn board_peer_agent(
+    state_dir: &Path,
+    server: std::net::SocketAddr,
+    peer: std::net::SocketAddr,
+    budget: Option<client::MetaBudget>,
+) -> std::result::Result<PeerAgentVerdict, String> {
+    let read = |verb: &str, params: Value| match budget {
+        Some(b) => b.read(state_dir, verb, params),
+        None => client::rpc(state_dir, verb, params),
+    };
+    let answer = read(
+        "board_peer_agent",
+        json!({"server": server.to_string(), "peer": peer.to_string()}),
+    )
+    .map_err(|e| format!("the daemon cannot classify the peer ({e})"))?;
+    match answer.get("agent") {
+        None => Err("the daemon's peer classification is malformed".to_string()),
+        Some(agent) if agent.is_null() => Ok(PeerAgentVerdict::None),
+        Some(agent) => match agent.get("kind").and_then(Value::as_str) {
+            Some("opaque") => Ok(PeerAgentVerdict::Opaque),
+            Some("named") => agent
+                .get("alias")
+                .and_then(Value::as_str)
+                .map(|alias| PeerAgentVerdict::Named(alias.to_string()))
+                .ok_or_else(|| "the daemon's peer classification has no alias".to_string()),
+            _ => Err("the daemon's peer classification has an unknown kind".to_string()),
+        },
+    }
+}
+
+/// CAD-2207: the daemon's all-root positive operator proof for the concrete
+/// board peer. A bound assistant on that ancestry — or any ambiguity — is a
+/// fixed refusal; no alias or pane text is returned.
+pub(crate) fn board_peer_operator(
+    state_dir: &Path,
+    server: std::net::SocketAddr,
+    peer: std::net::SocketAddr,
+    budget: Option<client::MetaBudget>,
+) -> std::result::Result<(), String> {
+    let read = |verb: &str, params: Value| match budget {
+        Some(b) => b.read(state_dir, verb, params),
+        None => client::rpc(state_dir, verb, params),
+    };
+    let answer = read(
+        "board_peer_operator",
+        json!({"server": server.to_string(), "peer": peer.to_string()}),
+    )
+    .map_err(|e| format!("the daemon cannot prove the peer is the operator ({e})"))?;
+    if answer.get("operator").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err("the daemon did not prove the peer is the operator".to_string())
+    }
 }
 
 /// The login lands in a commit `Actor:` trailer — take the first

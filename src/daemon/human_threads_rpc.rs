@@ -133,6 +133,50 @@ fn roster_peer(
 }
 
 impl Shared {
+    /// CAD-2207: the member-private assistant a live agent uid belongs to, if
+    /// any — resolved from the daemon's own agent row and `assistants` binding,
+    /// never a request field.
+    fn member_assistant_for_uid(
+        &self,
+        uid: &str,
+    ) -> Result<Option<crate::store::AssistantBinding>> {
+        let Some(alias) = self.store.alias_of_uid(uid)? else {
+            return Ok(None);
+        };
+        self.store.assistant_for_alias(&alias)
+    }
+
+    /// Whether this verified human session may see an agent uid in a shared
+    /// room. A nonmember agent is fine. A member's personal assistant is
+    /// visible only to that member; every other participant gets it withheld.
+    fn human_may_see_room_agent(
+        &self,
+        current: &super::human_current::CurrentActor,
+        uid: &str,
+    ) -> Result<bool> {
+        Ok(match self.member_assistant_for_uid(uid)? {
+            None => true,
+            Some(binding) => {
+                binding.org == current.scope.organization_id && binding.sub == current.subject
+            }
+        })
+    }
+
+    /// CAD-2207: refuse putting a member's personal assistant into a shared
+    /// room. A room carries no explicit sharing authorization from the member,
+    /// every participant can read the assistant's replies, and a room notice
+    /// queues the assistant a turn. Ordinary workspace agents are untouched.
+    fn refuse_member_assistant_in_room(&self, uid: &str, verb: &str) -> Result<()> {
+        let Some(binding) = self.member_assistant_for_uid(uid)? else {
+            return Ok(());
+        };
+        Err(Error::rejected(format!(
+            "{verb} refused: '{}' is a member's private assistant; a shared room has no \
+             explicit authorization from that member to expose it (CAD-2207)",
+            binding.alias
+        )))
+    }
+
     /// `human_roster_scope {token}` — identity only, for the HTTP layer's
     /// tenancy display. No roster fetch, no authority.
     pub(super) fn rpc_human_roster_scope(&self, params: &Value, peer_pid: u32) -> Result<Value> {
@@ -177,14 +221,20 @@ impl Shared {
 
     /// `human_agents_list {token}` — the current agents by durable uid. The
     /// read is identity-only: no grant, no roster beyond the guard's check.
+    /// CAD-2207: a member's personal assistant is not a roster agent to anyone
+    /// else, so its row is withheld unless this verified human session IS the
+    /// binding's member in the same workspace.
     pub(super) fn rpc_human_agents_list(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
-        let agents: Vec<Value> = self
-            .store
-            .agents()?
-            .into_iter()
-            .map(|a| json!({"uid": a.uid, "alias": a.alias}))
-            .collect();
+        let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        let mut agents: Vec<Value> = Vec::new();
+        for agent in self.store.agents()? {
+            if let Some(binding) = self.store.assistant_for_alias(&agent.alias)? {
+                if binding.org != current.scope.organization_id || binding.sub != current.subject {
+                    continue;
+                }
+            }
+            agents.push(json!({"uid": agent.uid, "alias": agent.alias}));
+        }
         Ok(json!({"agents": agents}))
     }
 
@@ -235,6 +285,17 @@ impl Shared {
         let (topic, alias) = self
             .store
             .human_room_ask_target(&current.actor, room, agent_uid)?;
+        // CAD-2207: a member's personal assistant is not addressable in a
+        // shared room. Its replies would be visible to every participant and
+        // no explicit member authorization exists for that. The member's
+        // signed `member_assist_*` route is the only way to talk to it.
+        if let Some(binding) = self.store.assistant_for_alias(&alias)? {
+            return Err(Error::rejected(format!(
+                "human_room_ask refused: '{}' is a member's private assistant; a shared \
+                 room has no explicit authorization to expose its replies (CAD-2207)",
+                binding.alias
+            )));
+        }
         let post_key = crate::store::topic_post_id(&topic, key);
         let request_id = crate::store::topic_request_id(&topic, key);
         // A retry of a bound Ask must name the same member uid, or it is refused
@@ -313,6 +374,7 @@ impl Shared {
             members.push(RoomMember::Human(roster_peer(&current, &subject)?.id));
         }
         for uid in string_list(params, "agents")? {
+            self.refuse_member_assistant_in_room(&uid, "human group create")?;
             let alias = self
                 .store
                 .alias_of_uid(&uid)?
@@ -325,7 +387,9 @@ impl Shared {
         Ok(json!({"room": room}))
     }
 
-    /// `human_room_read {token, room, before?, limit?}`
+    /// `human_room_read {token, room, before?, limit?}`. CAD-2207: a member's
+    /// personal assistant member and its posts are withheld from every
+    /// participant but that member.
     pub(super) fn rpc_human_room_read(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
         let room = room_param(params)?;
@@ -338,14 +402,105 @@ impl Shared {
         }
         let before = optional_i64(params, "before");
         let members = self.store.human_room_members(&current.actor, room)?;
-        let posts = self
-            .store
-            .human_room_history(&current.actor, room, before, limit)?;
         let can_ask = self.ask_authority(required_str(params, "token")?, peer_pid, &current);
+        // CAD-2207: a personal assistant's presence and posts in a shared room
+        // are withheld from every participant but its own member. A member row
+        // is resolved by its uid; a post is resolved from durable identity so a
+        // removed agents row cannot turn a private post ordinary. Withheld rows
+        // must not shorten the page, so older pages are scanned until `limit`
+        // visible posts (or the history/cap) are reached.
+        let mut member_visibility: std::collections::BTreeMap<String, bool> = Default::default();
+        for uid in members
+            .iter()
+            .filter(|m| m.kind == "agent")
+            .map(|m| m.id.as_str())
+        {
+            if !member_visibility.contains_key(uid) {
+                let visible = self.human_may_see_room_agent(&current, uid)?;
+                member_visibility.insert(uid.to_string(), visible);
+            }
+        }
+        let member_visible = |uid: &str| member_visibility.get(uid).copied().unwrap_or(true);
+        let mut post_visibility: std::collections::BTreeMap<(String, String), bool> =
+            Default::default();
+        let mut visible_posts: Vec<TopicPost> = Vec::new();
+        let mut scan_cursor = before;
+        let mut scanned: i64 = 0;
+        let mut has_more = false;
+        // The oldest seq this scan examined; the next page starts strictly
+        // below it, so a withheld-only tail never strands the client.
+        let mut oldest_examined: Option<i64> = None;
+        while (visible_posts.len() as i64) < limit {
+            let page = self
+                .store
+                .human_room_history(&current.actor, room, scan_cursor, limit)?;
+            if page.is_empty() {
+                has_more = false;
+                break;
+            }
+            let page_len = page.len() as i64;
+            let full = page_len == limit;
+            scanned += page_len;
+            oldest_examined = page.first().map(|post| post.seq);
+            let mut processed = 0i64;
+            let mut last_processed: Option<i64> = None;
+            for post in page.into_iter().rev() {
+                if (visible_posts.len() as i64) >= limit {
+                    break;
+                }
+                processed += 1;
+                last_processed = Some(post.seq);
+                let key = (
+                    post.sender_uid.clone().unwrap_or_default(),
+                    post.sender.clone(),
+                );
+                let visible = if let Some(visible) = post_visibility.get(&key) {
+                    *visible
+                } else {
+                    let visible =
+                        match self.room_post_author(post.sender_uid.as_deref(), &post.sender)? {
+                            super::members_rpc::RoomPostAuthor::Ordinary => true,
+                            super::members_rpc::RoomPostAuthor::Private { org, sub, .. } => {
+                                org == current.scope.organization_id && sub == current.subject
+                            }
+                            super::members_rpc::RoomPostAuthor::Unproven => false,
+                        };
+                    post_visibility.insert(key, visible);
+                    visible
+                };
+                if visible {
+                    visible_posts.push(post);
+                }
+            }
+            if processed < page_len {
+                // Stopped at `limit` inside the page: rows older than the
+                // last examined one still exist.
+                has_more = true;
+                oldest_examined = last_processed;
+                break;
+            }
+            // The whole page was consumed.
+            has_more = full;
+            if !full || scanned >= limit.saturating_mul(8) {
+                break;
+            }
+            scan_cursor = oldest_examined;
+        }
+        visible_posts.reverse();
+        let mut member_rows = Vec::with_capacity(members.len());
+        for member in &members {
+            if member.kind == "agent" && !member_visible(&member.id) {
+                continue;
+            }
+            member_rows.push(member_json(member));
+        }
+        let post_rows: Vec<Value> = visible_posts.iter().map(post_json).collect();
         Ok(json!({
             "room": room,
-            "members": members.iter().map(member_json).collect::<Vec<_>>(),
-            "posts": posts.iter().map(post_json).collect::<Vec<_>>(),
+            "members": member_rows,
+            "posts": post_rows,
+            "cursor": oldest_examined,
+            "has_more": has_more,
             "can_ask": can_ask,
         }))
     }
@@ -526,6 +681,7 @@ impl Shared {
             self.store
                 .human_group_add_human(&current.actor, room, &peer.id)?;
         } else if let Some(uid) = optional_str(params, "agent_uid") {
+            self.refuse_member_assistant_in_room(uid, "human room add")?;
             let alias = self
                 .store
                 .alias_of_uid(uid)?

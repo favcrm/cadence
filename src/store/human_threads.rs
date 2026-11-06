@@ -843,10 +843,16 @@ impl Store {
                 marker,
             } in rows
             {
+                // CAD-2207: a member's personal assistant is not counted as
+                // unread for another member. The stored sender alias is the
+                // durable fallback after its agents row is removed.
                 let unread: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM topic_posts
-                      WHERE topic_id=? AND seq>? AND seq>? AND (sender_uid IS NULL OR sender_uid<>?)",
-                    params![topic, cutoff, marker, actor.id],
+                    "SELECT COUNT(*) FROM topic_posts t
+                      WHERE t.topic_id=? AND t.seq>? AND t.seq>?
+                        AND (t.sender_uid IS NULL OR t.sender_uid<>?)
+                        AND NOT (t.sender IN (SELECT s.alias FROM assistants s
+                                               WHERE s.org=? AND s.sub<>?))",
+                    params![topic, cutoff, marker, actor.id, actor.org, actor.subject],
                     |r| r.get(0),
                 )?;
                 let title = if title.is_empty() {
@@ -1205,7 +1211,9 @@ impl Store {
                           WHERE t.topic_id=r.topic_id AND t.seq>m.cutoff
                             AND t.seq>COALESCE(n.seq,0)
                             AND t.seq>COALESCE(k.seq,0)
-                            AND (t.sender_uid IS NULL OR t.sender_uid<>?)),
+                            AND (t.sender_uid IS NULL OR t.sender_uid<>?)
+                            AND NOT (t.sender IN (SELECT s.alias FROM assistants s
+                                                   WHERE s.org=? AND s.sub<>?))),
                         COALESCE((SELECT MAX(i.seq) FROM human_notification_intents i
                           WHERE i.room=r.id AND i.recipient=m.member
                             AND i.reason IN ('dm','mention') AND i.seq>m.cutoff
@@ -1221,8 +1229,21 @@ impl Store {
                    LEFT JOIN human_notification_reads n ON n.room=r.id AND n.human=?
                   WHERE r.org=? AND EXISTS(SELECT 1 FROM topic_posts t
                     WHERE t.topic_id=r.topic_id AND t.seq>m.cutoff
-                      AND (t.sender_uid IS NULL OR t.sender_uid<>?))",
-                params![actor.id, actor.id, actor.id, actor.id, actor.org, actor.id],
+                      AND (t.sender_uid IS NULL OR t.sender_uid<>?)
+                      AND NOT (t.sender IN (SELECT s.alias FROM assistants s
+                                             WHERE s.org=? AND s.sub<>?)))",
+                params![
+                    actor.id,
+                    actor.org,
+                    actor.subject,
+                    actor.id,
+                    actor.id,
+                    actor.id,
+                    actor.org,
+                    actor.id,
+                    actor.org,
+                    actor.subject
+                ],
                 |r| {
                     Ok((
                         r.get(0)?,

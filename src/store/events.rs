@@ -1563,13 +1563,26 @@ impl Store {
 
     /// Event log page for the `events` API; cursor is the last seq seen.
     pub fn events(&self, alias: &str, after: i64, limit: i64) -> Result<Vec<Event>> {
+        self.events_after(alias, 0, after, limit)
+    }
+
+    /// CAD-2207: forward page above `floor`, the immutable cutoff frozen for
+    /// a bound member assistant. The floor binds before projection/cursor,
+    /// so hidden legacy rows never consume a page or stall the wait loop.
+    pub fn events_after(
+        &self,
+        alias: &str,
+        floor: i64,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>> {
         let conn = self.conn();
         self.events_alias_in(&conn, alias)?;
         let mut stmt = conn.prepare(
             "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
-             WHERE alias=? AND seq>? ORDER BY seq LIMIT ?",
+             WHERE alias=? AND seq>? AND seq>? ORDER BY seq LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![alias, after, limit], row_event)?;
+        let rows = stmt.query_map(params![alias, floor, after, limit], row_event)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1601,13 +1614,20 @@ impl Store {
     /// default `cadence events` page. The DESC scan is what the seq
     /// index gives for free; reversing costs one Vec pass.
     pub fn events_tail(&self, alias: &str, limit: i64) -> Result<Vec<Event>> {
+        self.events_tail_after(alias, 0, limit)
+    }
+
+    /// CAD-2207: tail page above `floor`. `has_older` and the continuation
+    /// row are computed from visible rows only; a legacy same-alias row can
+    /// never be the page's oldest entry.
+    pub fn events_tail_after(&self, alias: &str, floor: i64, limit: i64) -> Result<Vec<Event>> {
         let conn = self.conn();
         self.events_alias_in(&conn, alias)?;
         let mut stmt = conn.prepare(
             "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
-             WHERE alias=? ORDER BY seq DESC LIMIT ?",
+             WHERE alias=? AND seq>? ORDER BY seq DESC LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![alias, limit], row_event)?;
+        let rows = stmt.query_map(params![alias, floor, limit], row_event)?;
         let mut events: Vec<Event> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         events.reverse();
         Ok(events)

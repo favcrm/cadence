@@ -28,6 +28,10 @@ export function Fields({
   const locked = noDragReason(detail);
   const [owner, setOwner] = useState(detail.owner ?? "");
   useEffect(() => setOwner(detail.owner ?? ""), [detail.owner, detail.rev]);
+  const creator =
+    detail.creator?.kind === "person" || detail.creator?.kind === "agent"
+      ? detail.creator.label?.trim() || t(detail.creator.kind === "person" ? "Member" : "Agent")
+      : t("Not recorded");
   const setEpic = (next: string) => {
     const prev = detail.parent;
     const chain = prev
@@ -96,6 +100,10 @@ export function Fields({
           }}
         />
       </label>
+      <dl className="grid gap-1.5">
+        <dt className="slabel">{t("Created by")}</dt>
+        <dd className="m-0 text-secondary text-ink-300 break-words">{creator}</dd>
+      </dl>
       <label className="grid gap-1.5">
         <span className="slabel">{t("Epic")}</span>
         <Select

@@ -8,6 +8,13 @@
 //!
 //! The captured interval is a time bound, not an atomic multi-database
 //! snapshot: each source is read in turn, and `coverage` says so.
+//!
+//! CAD-2207: operator authority is not member proof. Any event written on a
+//! bound personal assistant's alias is excluded from the core projection
+//! before filtering, ordering and pagination, so its alias, message ids,
+//! timing and receipts can never be a row, cursor, count or hint. The alias
+//! set is durable provenance (binding, cutoff, member-owned effect, delivered
+//! notice), so a revoked or reused alias stays withheld.
 
 use std::cmp::Ordering;
 use std::io::Read;
@@ -89,6 +96,23 @@ const PM_ACTIONS: [&str; 11] = [
     "wiki_moved",
     "wiki_removed",
 ];
+/// CAD-2207: the aliases whose event stream belongs to a bound personal
+/// assistant. `activity_query`/`activity_export` are operator surfaces, and
+/// operator authority is not member proof: a row on one of these aliases must
+/// never become an operator-visible row, cursor, count or hint. The set is the
+/// union of every durable provenance record — the binding, its immutable
+/// cutoff, a member-owned effect and a delivered assist notice — so a
+/// revoked/removed binding or an alias reused by a later binding stays
+/// withheld. An alias that was never bound is unaffected. Same-alias history
+/// that predates a binding is withheld too: the stream cannot prove which
+/// principal minted it, so the conservative side is the only safe one.
+const PRIVATE_ALIAS_FILTER: &str = "alias NOT IN (
+        SELECT alias FROM assistants
+        UNION SELECT alias FROM assistant_event_fences
+        UNION SELECT alias FROM effect_member_owners
+        UNION SELECT alias FROM assist_notice_deliveries
+        UNION SELECT alias FROM effect_notice_deliveries
+    )";
 /// Largest `git log` output read for PM receipts. A larger history fails the
 /// page rather than returning a silently partial trail.
 const PM_GIT_OUTPUT_CAP: usize = 16 * 1024 * 1024;
@@ -491,7 +515,7 @@ impl Store {
     ) -> Result<Vec<Row>> {
         let conn = self.conn();
         let (from, until) = (q.from.unwrap_or(0.0), q.until.unwrap_or(0.0));
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT seq, alias, kind, payload, at FROM events
              WHERE kind IN ('queued','activity_denied','activity_export_prepared','conversation_created','pm_mutation_prepared',
                             'app_favorites_saved','app_favorites_default_saved',
@@ -501,8 +525,12 @@ impl Store {
                             'app_run_created','app_run_execution_approved','app_run_cancelled','app_run_step_dispatched',
                             'app_workspace_mutation_prepared','app_workspace_mutation_finished','public_authority_revoked',
                             'board_session_mutation_prepared','board_session_mutation_finished','board_session_security_denied')
-               AND at>=? AND at<=? ORDER BY at, seq",
-        )?;
+               AND at>=? AND at<=?
+               AND {}
+               ORDER BY at, seq",
+            PRIVATE_ALIAS_FILTER
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let raws = stmt.query_map(params![from, until], |r| {
             Ok((
                 r.get::<_, i64>(0)?,

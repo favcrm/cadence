@@ -148,7 +148,7 @@ use report::ReportAction;
 use resume_helpers::session_mismatch;
 use resume_helpers::{
     email_flag_error, fenced_next, finish_resume, refresh_briefing, resume_agent, resume_command,
-    resume_sweep, stop_group,
+    resume_complete, resume_sweep, stop_group,
 };
 use rollout::RolloutAction;
 use secret::SecretAction;

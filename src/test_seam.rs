@@ -276,6 +276,33 @@ pub fn env_armed() -> bool {
     cfg!(feature = "test-seam") && std::env::var_os(ARM_ENV).is_some()
 }
 
+/// CAD-2207: a deterministic, inert-unless-armed pause/release barrier for
+/// black-box lifecycle tests. It can only delay a daemon that has already
+/// armed this state dir and was given `var`; it never decides a result and
+/// carries no caller or authority. It creates `<dir>/entered`, then waits
+/// (bounded) for the test to create `<dir>/release`.
+#[cfg(feature = "test-seam")]
+pub(crate) fn pause_gate(var: &str, state_dir: &Path) {
+    let Some(dir) = std::env::var_os(var) else {
+        return;
+    };
+    if !armed(state_dir) {
+        return;
+    }
+    let dir = PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if std::fs::write(dir.join("entered"), b"").is_err() {
+        return;
+    }
+    let release = dir.join("release");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while !release.is_file() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 // ---------------- implementation ----------------
 
 /// The dispatch/request scope a seam assertion runs under —

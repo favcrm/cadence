@@ -10,6 +10,7 @@ type Preferences = { organization_locale: Locale | null; user_locale: Locale | n
 
 const zhTW: Record<string, string> = {
   "Member": "成員",
+  "Created by": "建立者",
   "Expires {date}": "{date} 到期",
   "Only a workspace owner can manage members.": "只有工作區擁有者可以管理成員。",
   "Your access changed. Reload the page and try again.": "你的存取權限已變更。請重新載入頁面再試。",
@@ -1919,6 +1920,10 @@ Object.assign(zhTW, {
   "Decision": "決定",
   "Denying…": "拒絕中…",
   "Did not apply": "未能套用",
+  "Mark reviewed": "標記為已查閱",
+  "Outcome unknown": "結果未明",
+  "Outcome unknown · reviewed": "結果未明 · 已查閱",
+  "This action's outcome is unknown. Check existing tickets before creating again.": "此操作的結果未明。再次建立前，請先檢查現有議題。",
   "Hide raw": "隱藏原始內容",
   "It is still waiting. Nothing was recorded, so you can decide again.": "此項仍在等待。系統並未記錄任何決定，你可以再次決定。",
   "No fields change.": "沒有欄位變更。",

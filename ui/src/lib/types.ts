@@ -141,6 +141,11 @@ export interface IssueHistoryEntry {
 /** `GET /api/issues/<id>`: the issue-detail contract. Unlike a board card it
  *  has no `counts`; its comments are the recorded `comments` rows. */
 export interface IssueDetail extends Omit<IssueCard, "counts"> {
+  /** Hosted creator attribution, independent of the mutable owner and claim. */
+  creator?:
+    | { kind: "person" | "agent"; id: string; label?: string }
+    | { kind: "unknown" }
+    | null;
   frontmatter: Record<string, unknown>;
   body: string;
   path: string;

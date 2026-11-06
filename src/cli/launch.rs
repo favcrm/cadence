@@ -482,7 +482,11 @@ pub(crate) fn provider_launch(
             }
             let state = show["agent"]["state"].as_str().unwrap_or_default();
             if matches!(state, "stopped" | "offline") {
-                client::rpc(state_dir, "agent_resume", json!({"alias": alias}))?;
+                client::rpc_after_fleet_preflight(
+                    state_dir,
+                    "agent_resume",
+                    json!({"alias": alias}),
+                )?;
             }
             if upstream.is_some() {
                 eprintln!(

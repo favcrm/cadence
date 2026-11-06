@@ -109,6 +109,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     // CAD-1752: the static role catalogue - a read.
     ("agent_roles", Rule::Read),
+    // CAD-2207: the narrow operational projection of ordinary agents; rows
+    // withheld from this projection are covered by the all-root peer verbs.
+    ("agent_operational", Rule::Handler("rpc_agent_operational: operator_connection; restricted rows withheld (CAD-2207 no-list)")),
+    // CAD-2207: one all-root classifier for a concrete live TCP peer. A bound
+    // assistant resolves to an opaque agent marker (no alias/pid/state) so a
+    // board can revoke a human session without learning the identity.
+    ("board_peer_agent", Rule::Handler("rpc_board_peer_agent: operator_connection; all-root peer classifier, opaque for a bound assistant (CAD-2207)")),
+    ("board_peer_operator", Rule::Handler("rpc_board_peer_operator: operator_connection; all-root positive operator proof for a TCP peer (CAD-2207)")),
+    // CAD-2207: all-agent aggregate safety booleans; no restricted-only scope,
+    // no per-agent data. `agent_resume` itself refuses a restricted target and
+    // there is no operator bulk restricted resume.
+    ("agent_fleet_state", Rule::Handler("rpc_agent_fleet_state: operator_connection; ALL-agent busy/stale aggregate, strict (CAD-2207)")),
     // CAD-1989: a hire saves a profile; the operator only.
     (
         "agent_profile_create",

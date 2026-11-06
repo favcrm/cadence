@@ -363,6 +363,435 @@ impl Shared {
         }))
     }
 
+    /// `agent_operational` — the narrow, operator-only operational
+    /// projection of ordinary registered agents (CAD-2207). It carries only
+    /// the process/lifecycle fields fleet lifecycle needs: runtime `alias`,
+    /// uid, pid/start, provider/kind, generation, state, liveness flags, a
+    /// bounded `{id,state}` list of in-flight rows and the unknown-turn
+    /// count. It never carries a display name, avatar, profile, params or
+    /// message body.
+    ///
+    /// CAD-2207 no-list: an agent whose alias has a stored `assistants`
+    /// binding is a member's personal assistant. It is withheld from this
+    /// projection for EVERY caller, the operator and an unproven caller
+    /// included — operator rights are not the member's ownership proof. The
+    /// owner reads through the signed `member_*` route. Ordinary agents keep
+    /// the full row. A board that needs pid→agent attribution uses
+    /// [`Self::rpc_board_peer_agent`], which classifies a concrete live TCP
+    /// peer against ALL roots and returns only an opaque agent marker for a
+    /// bound assistant.
+    pub(super) fn rpc_agent_operational(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("agent operational", params, peer_pid)?;
+        let mut agents: Vec<Value> = Vec::new();
+        for agent in self.store.agents()? {
+            if self.store.assistant_for_alias(&agent.alias)?.is_some() {
+                continue;
+            }
+            let (dead, resumable) = self.agent_liveness(&agent);
+            let unknown = self.store.unknown_messages(&agent.alias)?.len();
+            let in_flight: Vec<Value> = self
+                .store
+                .messages(&agent.alias)?
+                .into_iter()
+                .filter(|m| matches!(m.state.as_str(), "running" | "submitted" | "unknown"))
+                .take(32)
+                .map(|m| json!({"id": m.id, "state": m.state}))
+                .collect();
+            agents.push(json!({
+                "alias": agent.alias,
+                "uid": agent.uid,
+                "provider": agent.provider,
+                "endpoint_kind": agent.endpoint_kind,
+                "state": agent.state,
+                "pid": agent.pid,
+                "pid_start": agent.pid_start,
+                "generation": agent.generation,
+                "thread_id": agent.thread_id,
+                "session_id": agent.session_id,
+                "needs_native_resume": agent.endpoint.is_none()
+                    && (agent.thread_id.is_some() || agent.session_id.is_some()),
+                "endpoint": agent.endpoint,
+                "dead": dead,
+                "resumable": resumable,
+                "busy": !in_flight.is_empty(),
+                "unknown": unknown,
+                "messages": in_flight,
+            }));
+        }
+        Ok(json!({"agents": agents}))
+    }
+
+    /// CAD-2207: the one all-agent classifier a board may use for a concrete
+    /// live TCP four-tuple. It resolves the socket's owning processes the way
+    /// `ss -p` does, walks their ancestry/ptys against EVERY agent root
+    /// (pty panes and managed provider roots), and answers:
+    ///
+    /// - `{"agent": {"kind": "named", "alias": "..."}}` — an ordinary agent,
+    ///   an alias this caller already sees in `agent_operational`;
+    /// - `{"agent": {"kind": "opaque"}}` — an agent whose alias is withheld
+    ///   (a bound member assistant): the board must still treat it as an
+    ///   agent and revoke a human session, but learns no identity;
+    /// - `{"agent": null}` — no agent on the peer.
+    ///
+    /// There is no bound-only verb and no pid list: the caller names a live
+    /// connection, the daemon resolves it. Ambiguity or an unreadable ancestry
+    /// is a fixed generic refusal (never the aliases `peer::tcp_peer_agent`
+    /// keeps internally), so a board fails closed.
+    pub(super) fn rpc_board_peer_agent(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.board_operator("board peer agent", params, peer_pid)?;
+        let server = peer_addr_param(params, "server")?;
+        let peer = peer_addr_param(params, "peer")?;
+        self.verify_board_peer(peer_pid, server, peer)?;
+        let roots = self.all_agent_roots()?;
+        let matched = crate::peer::tcp_peer_agent(server, peer, &roots)
+            .map_err(|_| Error::rejected("peer identity is ambiguous or unprovable"))?;
+        match matched {
+            None => Ok(json!({"agent": Value::Null})),
+            Some(alias) => {
+                if self.store.assistant_for_alias(&alias)?.is_some() {
+                    Ok(json!({"agent": {"kind": "opaque"}}))
+                } else {
+                    Ok(json!({"agent": {"kind": "named", "alias": alias}}))
+                }
+            }
+        }
+    }
+
+    /// CAD-2207: positive operator proof for a concrete board TCP peer, run
+    /// against ALL roots so a bound assistant's process can never prove
+    /// operator authority. The result is only `{"operator": true}` or a
+    /// fixed generic refusal; no alias, pane or enrollment text crosses the
+    /// wire.
+    pub(super) fn rpc_board_peer_operator(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.board_operator("board peer operator", params, peer_pid)?;
+        let server = peer_addr_param(params, "server")?;
+        let peer = peer_addr_param(params, "peer")?;
+        self.verify_board_peer(peer_pid, server, peer)?;
+        let roots = self.all_agent_roots()?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        crate::peer::tcp_peer_operator_proof(
+            server,
+            peer,
+            uid,
+            std::process::id(),
+            &roots,
+            &self.state_dir,
+        )
+        .map_err(|_| Error::rejected("peer is not provably the operator"))?;
+        Ok(json!({"operator": true}))
+    }
+
+    /// CAD-2207: the aggregate restart gate, computed over EVERY agent row,
+    /// ordinary and restricted alike. `ignored_stale` is the ordinary
+    /// `(alias, message_id)` pairs a caller is already carrying under
+    /// `--ignore-stale`; they are excluded, so ordinary ignore semantics
+    /// survive. `busy`/`stale` mirror `busy_agents`: in-flight
+    /// `running`/`submitted`, a pty probe, and the dead/stopped/offline/
+    /// attention holder classification. `starting`/`stopping` are live
+    /// blockers, not stale. The answer has no per-agent data: a caller learns
+    /// only the two aggregate booleans.
+    pub(super) fn rpc_agent_fleet_state(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.board_operator("agent fleet state", params, peer_pid)?;
+        let ignored = ignored_stale_pairs(params)?;
+        let (mut busy, mut stale) = (false, false);
+        for agent in self.store.agents()? {
+            let state = agent.state.as_str();
+            let restricted = self.store.assistant_for_alias(&agent.alias)?.is_some();
+            let (dead, _) = self.agent_liveness(&agent);
+            let has_inflight = self
+                .store
+                .messages(&agent.alias)?
+                .into_iter()
+                .filter(|m| matches!(m.state.as_str(), "running" | "submitted"))
+                // A caller-supplied ignored pair never exempts a private turn.
+                .any(|m| {
+                    restricted
+                        || !ignored
+                            .iter()
+                            .any(|(alias, ignored_id)| alias == &agent.alias && ignored_id == &m.id)
+                });
+            if has_inflight {
+                if matches!(state, "starting" | "stopping") {
+                    busy = true;
+                } else if matches!(state, "stopped" | "offline" | "attention") || dead {
+                    stale = true;
+                } else {
+                    busy = true;
+                }
+            }
+            if agent.endpoint_kind == "pty" && agent.endpoint.is_some() {
+                if let Ok(probe) = self
+                    .adapter_for(&agent.alias)
+                    .and_then(|adapter| adapter.probe())
+                {
+                    if !probe.idle {
+                        busy = true;
+                    }
+                }
+            }
+        }
+        let settle = self.settle_state()?;
+        let drain = self.drain_state();
+        Ok(json!({
+            "busy": busy,
+            "stale": stale,
+            "settle": settle,
+            "drain": drain,
+            "complete": self.resume_complete()?,
+            "instance": self.instance.as_str(),
+        }))
+    }
+
+    /// CAD-2207: one undifferentiated full-fleet resume verdict. `false`
+    /// means at least one actor cannot be resumed under operator authority
+    /// (for example, a member-authorized runtime); the caller gets no
+    /// alias, count, or class field — only the aggregate incompleteness.
+    fn resume_complete(&self) -> Result<bool> {
+        for agent in self.store.agents()? {
+            if self.store.assistant_for_alias(&agent.alias)?.is_some()
+                && registry::has_actor(&agent.provider, &agent.endpoint_kind)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// CAD-2207: did every agent captured live before the restart come back
+    /// live under the SAME immutable uid? This never serializes an alias,
+    /// uid or count: the caller gets one enum. It covers ordinary and bound
+    /// actors alike, so a cold-start verdict is not a private-only oracle.
+    ///
+    /// A marker record is authoritative only when it was STORED by the
+    /// predecessor; missing/old evidence falls back to an all-fleet
+    /// actor-risk check. Actual ownership, thread, adapter endpoint and
+    /// `agent_liveness` decide "live" — a stale `idle`/`busy` label alone
+    /// never settles.
+    fn settle_state(&self) -> Result<&'static str> {
+        const SETTLE_TIMEOUT_SECS: f64 = 120.0;
+        let evidence = self.settle_evidence.lock().unwrap().clone();
+        let Some(evidence) = evidence else {
+            return Ok(if self.fleet_runtime_risk()? {
+                "unverified"
+            } else {
+                "settled"
+            });
+        };
+        let rows = match evidence {
+            Err(_) => return Ok("unverified"),
+            Ok(rows) => rows,
+        };
+        if rows.is_empty() {
+            return Ok("settled");
+        }
+        let deadline = self.started_at + SETTLE_TIMEOUT_SECS;
+        let mut pending = false;
+        for (alias, expected_uid) in rows {
+            let agent = match self.store.agent(&alias) {
+                Ok(agent) => agent,
+                Err(_) => return Ok("failed"),
+            };
+            if agent.uid != expected_uid {
+                return Ok("failed");
+            }
+            let state = agent.state.as_str();
+            if matches!(state, "attention" | "stopped" | "offline") {
+                return Ok("failed");
+            }
+            let ctl = self.lifecycle.lock().unwrap().agents.get(&alias).cloned();
+            let Some(ctl) = ctl else {
+                return Ok("failed");
+            };
+            if ctl_finished(&ctl) {
+                return Ok("failed");
+            }
+            if matches!(state, "starting" | "stopping") {
+                pending = true;
+                continue;
+            }
+            if !matches!(state, "idle" | "busy" | "running" | "waiting_input") {
+                return Ok("failed");
+            }
+            if !agent.enabled {
+                return Ok("failed");
+            }
+            let (dead, _) = self.agent_liveness(&agent);
+            if dead {
+                return Ok("failed");
+            }
+            if ctl.adapter.lock().unwrap().is_none() {
+                return Ok("failed");
+            }
+            if registry::attachable(&agent.provider, &agent.endpoint_kind)
+                && agent.endpoint.is_none()
+            {
+                return Ok("failed");
+            }
+            if agent.endpoint_kind == "pty"
+                && !crate::adapter::pty::pane_alive(&self.state_dir, &alias, &self.provider_env)
+            {
+                return Ok("failed");
+            }
+        }
+        if pending {
+            return Ok(if crate::rollout::unix_now() >= deadline {
+                "unverified"
+            } else {
+                "pending"
+            });
+        }
+        Ok("settled")
+    }
+
+    /// CAD-2207: a cold start with missing/old/malformed evidence cannot
+    /// prove that no actor work existed. Any actor-capable row — ordinary
+    /// or bound — makes the verdict unverified. There is deliberately no
+    /// personal-binding branch here, so the public enum is not a
+    /// private-activity oracle.
+    fn fleet_runtime_risk(&self) -> Result<bool> {
+        for agent in self.store.agents()? {
+            if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// CAD-2207: predecessor drain evidence without a per-alias channel.
+    /// Strictly validates the successor's `last-recovery.json`; missing or
+    /// malformed fields are `unverified`, a recorded drain failure or any
+    /// fenced/unevidenced turn is `failed`, and only a bound clean record
+    /// is `clean`. Aliases in fenced rows are read, never returned.
+    fn drain_state(&self) -> &'static str {
+        let raw =
+            match std::fs::read_to_string(self.state_dir.join(crate::daemon::LAST_RECOVERY_FILE)) {
+                Ok(raw) => raw,
+                Err(_) => return "unverified",
+            };
+        let value: Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(_) => return "unverified",
+        };
+        let Some(obj) = value.as_object() else {
+            return "unverified";
+        };
+        if obj.get("instance").and_then(Value::as_str) != Some(self.instance.as_str()) {
+            return "unverified";
+        }
+        let failed = match obj.get("consumed") {
+            Some(Value::Null) => false,
+            Some(Value::Object(consumed)) => {
+                if !consumed.get("instance").is_some_and(|v| v.is_string())
+                    || !consumed
+                        .get("stale")
+                        .is_some_and(|v| v.is_null() || v.is_string())
+                {
+                    return "unverified";
+                }
+                match consumed.get("failed") {
+                    Some(Value::Null) => false,
+                    Some(Value::String(_)) => true,
+                    _ => return "unverified",
+                }
+            }
+            _ => return "unverified",
+        };
+        let Some(fenced) = recovery_rows(obj.get("fenced")) else {
+            return "unverified";
+        };
+        let Some(unevidenced) = recovery_rows(obj.get("unevidenced")) else {
+            return "unverified";
+        };
+        if failed || !fenced.is_empty() || !unevidenced.is_empty() {
+            "failed"
+        } else {
+            "clean"
+        }
+    }
+
+    /// Every registered agent row as a dead-drop attribution root, ordinary
+    /// and bound alike. Used only inside the daemon by the board peer verbs;
+    /// nothing serializes it.
+    fn all_agent_roots(&self) -> Result<crate::peer::AgentRoots> {
+        let mut panes = Vec::new();
+        let mut managed = Vec::new();
+        for agent in self.store.agents()? {
+            let Some(pid) = agent.pid.and_then(|pid| u32::try_from(pid).ok()) else {
+                continue;
+            };
+            let row = (
+                agent.alias.clone(),
+                pid,
+                agent.pid_start.and_then(|start| u64::try_from(start).ok()),
+            );
+            if agent.endpoint_kind == "pty" && agent.generation.is_some() {
+                panes.push(row);
+            } else if pid > 1
+                && registry::enrolls_build_slots(&agent.provider, &agent.endpoint_kind)
+            {
+                managed.push(row);
+            }
+        }
+        Ok(crate::peer::AgentRoots {
+            panes: crate::peer::AgentPids::classify(panes),
+            managed: crate::peer::AgentPids::classify(managed),
+        })
+    }
+
+    /// CAD-2207: the supplied four-tuple must be the connection THIS board
+    /// process is serving, not a caller-chosen live socket. The Unix peer must
+    /// hold both the listening socket at `server` and the accepted server-side
+    /// socket. Where the state dir has persisted `ui.json`, the server address
+    /// must also match that configured listener; otherwise the server-side
+    /// ownership is the proof. Unprovable or mismatched tuples refuse with
+    /// generic text. Same-UID fd duplication stays a CAD-2148 residual.
+    fn verify_board_peer(
+        &self,
+        peer_pid: u32,
+        server: std::net::SocketAddr,
+        peer: std::net::SocketAddr,
+    ) -> Result<()> {
+        crate::peer::server_socket_owned_by(server, peer, peer_pid).map_err(|_| {
+            Error::rejected("the board peer does not own the live connection's server side")
+        })?;
+        if crate::ui::opts_present(&self.state_dir) {
+            let opts = crate::ui::persisted_opts(&self.state_dir);
+            let host = opts.host.as_deref().unwrap_or("127.0.0.1");
+            let port = opts.port.unwrap_or(3010);
+            let ip: std::net::IpAddr = host
+                .parse()
+                .map_err(|_| Error::rejected("the board's configured listener cannot be proved"))?;
+            let configured = std::net::SocketAddr::new(ip, port);
+            if crate::peer::canonical(configured) != crate::peer::canonical(server) {
+                return Err(Error::rejected(
+                    "the board peer does not match the configured listener",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::operator_connection`] for the board peer verbs: a refusal must
+    /// never echo an agent alias from the caller's ancestry. Identity-field
+    /// refusals keep their specific text; every other reason is generic.
+    fn board_operator(&self, verb: &str, params: &Value, peer_pid: u32) -> Result<()> {
+        self.operator_connection(verb, params, peer_pid)
+            .map_err(|error| {
+                if error.to_string().contains("authority is connection-bound") {
+                    error
+                } else {
+                    Error::rejected(format!(
+                        "{verb} refused: the caller is not provably the operator"
+                    ))
+                }
+            })
+    }
+
     /// CAD-1989: `POST /api/agent-profiles` - a catalogue hire saves a settings
     /// profile and launches nothing. Operator only, by the connection.
     pub(super) fn rpc_agent_profile_create(
@@ -460,6 +889,57 @@ impl Shared {
         } else {
             self.resolve_alias(raw)?
         };
+        // CAD-2207: a bound member assistant may read only events above the
+        // immutable cutoff frozen when its binding was created (or events
+        // minted after it). Legacy same-alias history — including a prior
+        // ordinary agent's — stays withheld. An unprovable binding/fence
+        // refuses rather than serving it; ordinary agents keep the old read.
+        let floor = if daemon {
+            0
+        } else {
+            match self.store.assistant_for_alias(&alias)? {
+                None => 0,
+                Some(binding) => {
+                    let Some(fence) = self
+                        .store
+                        .assistant_event_fence(&binding.org, &binding.sub)?
+                    else {
+                        return Err(Error::rejected(format!(
+                            "agent events refused: the member assistant binding for \
+                             '{alias}' has no event cutoff (CAD-2207)"
+                        )));
+                    };
+                    if fence.alias != binding.alias || fence.assistant_id != binding.assistant_id {
+                        return Err(Error::rejected(format!(
+                            "agent events refused: the member assistant binding for \
+                             '{alias}' does not match its recorded event cutoff (CAD-2207)"
+                        )));
+                    }
+                    let Some(agent) = self.store.agent_opt(&alias)? else {
+                        return Err(Error::rejected(format!(
+                            "agent events refused: the member assistant agent for \
+                             '{alias}' is not registered (CAD-2207)"
+                        )));
+                    };
+                    if let Some(uid) = &fence.agent_uid {
+                        if uid != &agent.uid {
+                            return Err(Error::rejected(format!(
+                                "agent events refused: the member assistant agent for \
+                                 '{alias}' no longer matches its recorded event cutoff \
+                                 (CAD-2207)"
+                            )));
+                        }
+                    } else {
+                        self.store.assistant_event_fence_bind_agent(
+                            &binding.org,
+                            &binding.sub,
+                            &agent.uid,
+                        )?;
+                    }
+                    fence.cutoff_seq
+                }
+            }
+        };
         // CAD-1853 review: the alias' event stream carries cloud request and
         // result detail, so it applies the same source/owner decision as the
         // dedicated cloud read before projecting anything — current READ
@@ -496,7 +976,7 @@ impl Shared {
         // the latest seq, oldest first within it, plus the forward
         // cursor and whether older history exists below the page.
         if params.get("tail").and_then(Value::as_bool).unwrap_or(false) {
-            let mut events = self.store.events_tail(&alias, 51)?;
+            let mut events = self.store.events_tail_after(&alias, floor, 51)?;
             let has_older = events.len() > 50;
             // The store returns oldest first; discard the extra oldest row.
             if has_older {
@@ -527,7 +1007,7 @@ impl Shared {
         }
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
-            let events = self.store.events(&alias, after, 100)?;
+            let events = self.store.events_after(&alias, floor, after, 100)?;
             if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
                 // A waiting read can observe an event about a turn that
                 // settled after this admission was taken — or, on an ordinary
@@ -802,7 +1282,10 @@ impl Shared {
     /// (CAD-251). The drain is a consume: like `agent_inbox_ack`, a
     /// proven **agent** caller may drain only its own inbox — a worker
     /// can never consume another agent's queue — while unattributed and
-    /// operator callers pass as they always have.
+    /// operator callers pass as they always have. A member assistant's
+    /// alias is the exception at dispatch: only that assistant itself may
+    /// list its mailbox (CAD-2207), so an operator is refused before this
+    /// handler runs.
     pub(super) fn rpc_inbox(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         reject_identity_fields(params, "agent_inbox")?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
@@ -1138,6 +1621,17 @@ impl Shared {
     pub(super) fn rpc_unfence(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection_on_agent("agent unfence", params, peer_pid)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-2207: an operator must not fabricate or route a member
+        // assistant's unknown outcomes — the bulk path bypasses the
+        // `message_reconcile` guard. No authorized owner recovery channel
+        // exists yet, so refuse before any mutation.
+        if self.store.assistant_for_alias(&alias)?.is_some() {
+            return Err(Error::rejected(
+                "agent unfence refused: a member assistant's unknown outcomes are private \
+                 to its owning member; no operator recovery channel is authorized \
+                 (CAD-2207)",
+            ));
+        }
         let status = required_str(params, "status")?;
         let note = optional_str(params, "note");
         let by = "operator";
@@ -1661,4 +2155,58 @@ impl Shared {
                 .event_public(&agent.alias, "inbox_unconsumed", health);
         }
     }
+}
+
+/// A concrete `ip:port` four-tuple half from a request field. Never a host
+/// name: the board's bound address is an IP (see `concrete_board_server`), and
+/// a name would have no one destination to match the client socket against.
+fn peer_addr_param(params: &Value, key: &str) -> Result<std::net::SocketAddr> {
+    required_str(params, key)?
+        .parse()
+        .map_err(|_| Error::rejected(format!("'{key}' must be an ip:port socket address")))
+}
+
+/// CAD-2207: the ordinary carried-stale pairs a fleet-state caller asks the
+/// daemon to exclude. Strict: every row is a two-string `[alias, message_id]`
+/// pair; a malformed row refuses rather than silently widening the gate.
+fn ignored_stale_pairs(params: &Value) -> Result<Vec<(String, String)>> {
+    let Some(value) = params.get("ignored_stale") else {
+        return Ok(Vec::new());
+    };
+    let rows = value
+        .as_array()
+        .ok_or_else(|| Error::rejected("ignored_stale must be an array"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let pair = row
+            .as_array()
+            .filter(|pair| pair.len() == 2)
+            .ok_or_else(|| Error::rejected("ignored_stale rows must be [alias, message_id]"))?;
+        let alias = pair[0]
+            .as_str()
+            .ok_or_else(|| Error::rejected("ignored_stale alias must be a string"))?;
+        let id = pair[1]
+            .as_str()
+            .ok_or_else(|| Error::rejected("ignored_stale message id must be a string"))?;
+        out.push((alias.to_string(), id.to_string()));
+    }
+    Ok(out)
+}
+
+/// CAD-2207: strict recovery-record rows for the drain aggregate. A
+/// missing/malformed array or row returns `None` (unverified); the
+/// aliases are used only to decide emptiness and are never returned.
+fn recovery_rows(value: Option<&Value>) -> Option<Vec<(String, String)>> {
+    let rows = value?.as_array()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let obj = row.as_object()?;
+        let alias = obj.get("alias")?.as_str()?;
+        let message_id = obj.get("message_id")?.as_str()?;
+        if alias.is_empty() || message_id.is_empty() {
+            return None;
+        }
+        out.push((alias.to_string(), message_id.to_string()));
+    }
+    Some(out)
 }

@@ -81,6 +81,10 @@ export function noticeText(n: DecisionNotice, t: Say): string {
         .replace("{reason}", t(n.reason ?? "the reason is not recognised"));
     case "unconfirmed":
       return t("{title}: the result could not be confirmed. See Updates.").replace("{title}", iso(n.title));
+    case "unresolved":
+      return t("This action's outcome is unknown. Check existing tickets before creating again.");
+    case "acknowledged":
+      return `${t("Outcome unknown · reviewed")} · ${iso(n.title)}`;
     case "still-waiting":
       return t("It is still waiting. Nothing was recorded, so you can decide again.");
     default:
@@ -227,12 +231,13 @@ export default function StagedWriteDetail({
   const attempt = decisions.attempts.get(id);
   const busy = [...decisions.attempts.values()].find((a) => a.phase === "busy");
   const pending = write?.status === "pending";
+  const unresolved = write?.status === "unresolved";
   const lost = decisions.phase === "unavailable" || attempt?.phase === "access";
   // Our own decision leaves "pending" a moment before the queue advances.
   const mine = useRef<string | null>(null);
   const uncertain = attempt?.phase === "unconfirmed";
   // Unsure of our own decision wins over "decided elsewhere": Check again reports the real outcome.
-  const elsewhere = !lost && !uncertain && !pending && mine.current !== id;
+  const elsewhere = !lost && !uncertain && !pending && !unresolved && mine.current !== id;
   const idRef = useRef(id);
   idRef.current = id;
   const atRef = useRef(at);
@@ -309,7 +314,7 @@ export default function StagedWriteDetail({
     if (clicks > 1 || Date.now() < armedAt.current) return;
     // The click is for the row that was on screen when the handler was made.
     if (forId !== idRef.current) return;
-    if (block !== null || !pending || busy !== undefined || lost || uncertain) return;
+    if (block !== null || (verb === "acknowledge" ? !unresolved : !pending) || busy !== undefined || lost || uncertain) return;
     void run(() => decide(forId, verb));
   };
   const check = () => {
@@ -364,6 +369,10 @@ export default function StagedWriteDetail({
     <p className="issue-peek-note err m-0" role="alert">
       {t("Only the workspace owner can decide this request.")}
     </p>
+  ) : unresolved ? (
+    <p className="issue-peek-note warn m-0" role="alert">
+      {t("This action's outcome is unknown. Check existing tickets before creating again.")}
+    </p>
   ) : elsewhere || attempt?.phase === "elsewhere" ? (
     <p className="issue-peek-note warn m-0" role="alert">
       {t("This was already decided elsewhere. The list has been refreshed.")}
@@ -414,7 +423,17 @@ export default function StagedWriteDetail({
       foot={
         <>
           <div className="crm-drawer-actions">
-            {elsewhere || attempt?.phase === "elsewhere" ? (
+            {unresolved && !lost && !uncertain ? (
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                aria-disabled={block !== null || busy !== undefined || undefined}
+                aria-busy={spin("acknowledge") || undefined}
+                onClick={(e) => act("acknowledge", write.id, e.detail)}
+              >
+                {t("Mark reviewed")}
+              </button>
+            ) : elsewhere || attempt?.phase === "elsewhere" ? (
               <button type="button" className="btn btn-sm btn-primary" onClick={advance}>
                 {t("Continue")}
               </button>

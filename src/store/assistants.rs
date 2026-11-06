@@ -279,6 +279,35 @@ impl Store {
                      updated=? WHERE org=? AND sub=?",
                     params![authority_rev, now, org, sub],
                 )?;
+                // CAD-2207: a binding that predates the fence gets a
+                // fail-closed cutoff here; an existing fence is immutable.
+                let (cutoff, message_cutoff): (i64, i64) = tx.query_row(
+                    "SELECT COALESCE((SELECT MAX(seq) FROM events WHERE alias=?1),0), \
+                            COALESCE((SELECT MAX(seq) FROM messages WHERE alias=?1),0)",
+                    params![existing.alias],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let agent_uid: Option<String> = tx.query_opt(
+                    "SELECT uid FROM agents WHERE alias=?",
+                    params![existing.alias],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO assistant_event_fences(
+                       org,sub,assistant_id,alias,cutoff_seq,message_cutoff_seq,
+                       agent_uid,created)
+                     VALUES(?,?,?,?,?,?,?,?)",
+                    params![
+                        existing.org,
+                        existing.sub,
+                        existing.assistant_id,
+                        existing.alias,
+                        cutoff,
+                        message_cutoff,
+                        agent_uid,
+                        now
+                    ],
+                )?;
                 return Ok(existing);
             }
             // CAD-1420: a NEW binding's daemon-derived alias must not collide
@@ -298,6 +327,38 @@ impl Store {
                 "INSERT INTO assistants(org, sub, assistant_id, alias, state, \
                  authority_rev, created, updated) VALUES(?,?,?,?,'active',?,?,?)",
                 params![org, sub, assistant_id, alias, authority_rev, now, now],
+            )?;
+            // CAD-2207: freeze the alias' event and message sequence in the
+            // SAME transaction as the binding. Prior same-alias history (an
+            // ordinary agent's terminal mail and events) must never be
+            // readable by this assistant; the cutoffs are immutable and are
+            // never inferred from wall time.
+            let (cutoff, message_cutoff): (i64, i64) = tx.query_row(
+                "SELECT COALESCE((SELECT MAX(seq) FROM events WHERE alias=?1),0), \
+                        COALESCE((SELECT MAX(seq) FROM messages WHERE alias=?1),0)",
+                params![alias],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let agent_uid: Option<String> = tx.query_opt(
+                "SELECT uid FROM agents WHERE alias=?",
+                params![alias],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO assistant_event_fences(
+                   org,sub,assistant_id,alias,cutoff_seq,message_cutoff_seq,
+                   agent_uid,created)
+                 VALUES(?,?,?,?,?,?,?,?)",
+                params![
+                    org,
+                    sub,
+                    assistant_id,
+                    alias,
+                    cutoff,
+                    message_cutoff,
+                    agent_uid,
+                    now
+                ],
             )?;
             let binding = tx.query_row(
                 "SELECT * FROM assistants WHERE org=? AND sub=?",
@@ -669,10 +730,31 @@ impl Store {
                     )
                     .optional()?
                     .is_some();
+            // CAD-2207: a subscriber's notice rides the owner's LIVE share —
+            // revoking it must stop a notice queued before revocation. The
+            // owner is always allowed.
+            let owns = tx
+                .query_row(
+                    "SELECT 1 FROM assist_requests WHERE job=? AND org=? AND sub=?",
+                    params![recipient.job, recipient.org, recipient.sub],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            let shared = owns
+                || tx
+                    .query_row(
+                        "SELECT 1 FROM assist_job_shares WHERE job=? AND org=?",
+                        params![recipient.job, recipient.org],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
             // The binding must still be the alias the proof and confinement
             // check selected: a replacement alias is refused, never routed.
             let authorized = owner_org.as_deref() == Some(recipient.org.as_str())
                 && member_ok
+                && shared
                 && binding.as_ref().is_some_and(|(alias, org, sub, state)| {
                     alias == &recipient.alias
                         && org == &recipient.org
@@ -702,6 +784,26 @@ impl Store {
                 None,
                 None,
                 None,
+            )?;
+            // CAD-2207: persist the message→intent association in this same
+            // transaction. A later turn admission requires it for THIS exact
+            // message, recipient tuple and body.
+            tx.execute(
+                "INSERT OR IGNORE INTO assist_notice_deliveries(
+                    message_id,intent_seq,job,task_id,org,sub,assistant_id,alias,body_sha256,created)
+                 VALUES(?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    message_id,
+                    seq,
+                    recipient.job,
+                    task_id,
+                    recipient.org,
+                    recipient.sub,
+                    recipient.assistant_id,
+                    alias,
+                    crate::operator_auth::digest(body),
+                    crate::issue::time::now_epoch() as f64
+                ],
             )?;
             tx.execute(
                 "UPDATE events SET payload=json_set(payload,'$.status','delivered') WHERE seq=?",
@@ -903,13 +1005,14 @@ impl Store {
         }
     }
 
-    /// The job ids `(org, sub)` requested or is subscribed to — the union of
-    /// the request ledger and the subscriber set, for `member_job_list`.
+    /// The member's own jobs and subscriptions whose owner still shares them.
     pub fn assist_member_jobs(&self, org: &str, sub: &str) -> Result<Vec<String>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT job FROM assist_requests WHERE org=? AND sub=? \
-             UNION SELECT job FROM job_subscribers WHERE org=? AND sub=?",
+             UNION SELECT s.job FROM job_subscribers s \
+             JOIN assist_job_shares sh ON sh.job=s.job AND sh.org=s.org \
+             WHERE s.org=? AND s.sub=?",
         )?;
         let rows = stmt
             .query_map(params![org, sub, org, sub], |r| r.get(0))?
@@ -1040,6 +1143,18 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Resolve a job's principal without loading its request content.
+    pub(crate) fn assist_request_owner(&self, job: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT org, sub FROM assist_requests WHERE job=? ORDER BY created LIMIT 1",
+            [job],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// The request record bound to `job` (the deferred-commit lookup by
@@ -1279,4 +1394,188 @@ pub struct AssistRecipient {
     pub org: String,
     pub sub: String,
     pub assistant_id: String,
+}
+
+/// CAD-2207: the durable receipt that one `assist_job_event` message was
+/// minted by [`Store::commit_assist_intent`] for this exact intent,
+/// recipient tuple and body. A notice without one is legacy or forged and is
+/// refused by the daemon's turn admission.
+#[derive(Debug, Clone)]
+pub struct AssistNoticeDelivery {
+    pub message_id: String,
+    pub intent_seq: i64,
+    pub job: String,
+    pub task: String,
+    pub org: String,
+    pub sub: String,
+    pub assistant_id: String,
+    pub alias: String,
+    pub body_sha256: String,
+}
+
+/// CAD-2207: the delivery-receipt table (schema v63).
+pub(crate) const SCHEMA_V63: &str = "
+CREATE TABLE IF NOT EXISTS assist_notice_deliveries(
+  message_id TEXT PRIMARY KEY,
+  intent_seq INTEGER NOT NULL,
+  job TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  org TEXT NOT NULL,
+  sub TEXT NOT NULL,
+  assistant_id TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS effect_notice_deliveries(
+  message_id TEXT PRIMARY KEY,
+  effect_id TEXT NOT NULL,
+  org TEXT NOT NULL,
+  sub TEXT NOT NULL,
+  assistant_id TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS effect_member_owners(
+  effect_id TEXT PRIMARY KEY,
+  org TEXT NOT NULL,
+  sub TEXT NOT NULL,
+  assistant_id TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  agent_uid TEXT NOT NULL,
+  created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS assistant_event_fences(
+  org TEXT NOT NULL,
+  sub TEXT NOT NULL,
+  assistant_id TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  cutoff_seq INTEGER NOT NULL,
+  message_cutoff_seq INTEGER NOT NULL,
+  agent_uid TEXT,
+  created REAL NOT NULL,
+  PRIMARY KEY (org, sub));
+CREATE INDEX IF NOT EXISTS assistant_event_fences_alias
+  ON assistant_event_fences(alias);
+INSERT OR IGNORE INTO assistant_event_fences(
+  org,sub,assistant_id,alias,cutoff_seq,message_cutoff_seq,agent_uid,created)
+SELECT a.org,a.sub,a.assistant_id,a.alias,
+       COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.alias=a.alias),0),
+       COALESCE((SELECT MAX(m.seq) FROM messages m WHERE m.alias=a.alias),0),
+       (SELECT g.uid FROM agents g WHERE g.alias=a.alias),
+       CAST(strftime('%s','now') AS REAL)
+FROM assistants a;
+";
+
+/// CAD-2207: the immutable per-binding read cutoffs. A member assistant
+/// may read only events/messages minted after the value frozen at bind, or
+/// rows proven to name its current runtime uid; an alias reused by a later
+/// registration can never expose a prior principal's history. `agent_uid`
+/// is stamped on the first proved read and must never change.
+#[derive(Debug, Clone)]
+pub struct AssistantEventFence {
+    pub org: String,
+    pub sub: String,
+    pub assistant_id: String,
+    pub alias: String,
+    pub cutoff_seq: i64,
+    pub message_cutoff_seq: i64,
+    pub agent_uid: Option<String>,
+}
+
+impl Store {
+    pub(super) fn assistant_for_alias_in(
+        &self,
+        conn: &impl super::StoreConn,
+        alias: &str,
+    ) -> Result<Option<AssistantBinding>> {
+        match conn.query_row(
+            "SELECT * FROM assistants WHERE alias=?",
+            params![alias],
+            row_binding,
+        ) {
+            Ok(binding) => Ok(Some(binding)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn assistant_event_fence(
+        &self,
+        org: &str,
+        sub: &str,
+    ) -> Result<Option<AssistantEventFence>> {
+        let conn = self.conn();
+        self.assistant_event_fence_in(&conn, org, sub)
+    }
+
+    pub(super) fn assistant_event_fence_in(
+        &self,
+        conn: &impl super::StoreConn,
+        org: &str,
+        sub: &str,
+    ) -> Result<Option<AssistantEventFence>> {
+        Ok(conn
+            .query_row(
+                "SELECT org,sub,assistant_id,alias,cutoff_seq,message_cutoff_seq,agent_uid \
+                 FROM assistant_event_fences WHERE org=? AND sub=?",
+                params![org, sub],
+                |r| {
+                    Ok(AssistantEventFence {
+                        org: r.get(0)?,
+                        sub: r.get(1)?,
+                        assistant_id: r.get(2)?,
+                        alias: r.get(3)?,
+                        cutoff_seq: r.get(4)?,
+                        message_cutoff_seq: r.get(5)?,
+                        agent_uid: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// One-time binding of the fence to the first proved runtime UID; the
+    /// cutoffs themselves never change.
+    pub fn assistant_event_fence_bind_agent(
+        &self,
+        org: &str,
+        sub: &str,
+        agent_uid: &str,
+    ) -> Result<()> {
+        self.write_tx(|tx| {
+            tx.execute(
+                "UPDATE assistant_event_fences SET agent_uid=?3 \
+                 WHERE org=?1 AND sub=?2 AND agent_uid IS NULL",
+                params![org, sub, agent_uid],
+            )?;
+            Ok(())
+        })
+    }
+}
+
+impl Store {
+    /// The committed delivery receipt for `message_id`, or `None` when the
+    /// notice has no durable association (legacy or forged).
+    pub fn assist_notice_delivery(&self, message_id: &str) -> Result<Option<AssistNoticeDelivery>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT message_id,intent_seq,job,task_id,org,sub,assistant_id,alias,body_sha256 \
+                 FROM assist_notice_deliveries WHERE message_id=?",
+                [message_id],
+                |r| {
+                    Ok(AssistNoticeDelivery {
+                        message_id: r.get(0)?,
+                        intent_seq: r.get(1)?,
+                        job: r.get(2)?,
+                        task: r.get(3)?,
+                        org: r.get(4)?,
+                        sub: r.get(5)?,
+                        assistant_id: r.get(6)?,
+                        alias: r.get(7)?,
+                        body_sha256: r.get(8)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
 }

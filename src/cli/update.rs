@@ -162,9 +162,7 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
         pin: args.to.clone(),
     };
     if args.status {
-        let status = client::rpc(state_dir, "update_status", json!({})).unwrap_or_else(
-            |_| json!({"pending_update": Value::Null, "waiting": [], "waiting_count": 0}),
-        );
+        let status = client::rpc(state_dir, "update_status", json!({}))?;
         let guidance = home_dir()
             .map(|home| guidance::readonly(&home))
             .unwrap_or_else(|error| {

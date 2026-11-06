@@ -203,6 +203,53 @@ const write = async (value: string) => {
 const scenario = require("process").argv[2] ?? "all";
 async function run() {
   await render();
+  if (scenario === "all" || scenario === "creator") {
+    const creator = () => {
+      const term = Array.from(host.querySelectorAll("dt")).find(
+        (node) => node.textContent?.trim() === "Created by",
+      );
+      return term?.nextElementSibling?.textContent?.trim();
+    };
+    details["CAD-6"] = Object.assign(detail("CAD-6"), {
+      owner: "engineering",
+      creator: { kind: "person", id: "usr_private_subject", label: "Avery" },
+    });
+    id = "CAD-6";
+    tab = "overview";
+    await render();
+    assert(creator() === "Avery", "the issue shows its verified creator");
+    assert(
+      host.querySelector<HTMLInputElement>("input[aria-label='Owner']")?.value === "engineering",
+      "the mutable owner remains separate from the creator",
+    );
+    assert(!text().includes("usr_private_subject"), "the creator's internal id is not shown");
+
+    details["CAD-7"] = Object.assign(detail("CAD-7"), {
+      creator: { kind: "person", id: "usr_unlabelled_subject" },
+    });
+    id = "CAD-7";
+    await render();
+    assert(creator() === "Member", "an unnamed verified person has a non-identifying label");
+    assert(!text().includes("usr_unlabelled_subject"), "an unnamed creator never falls back to an id");
+
+    details["CAD-8"] = Object.assign(detail("CAD-8"), {
+      creator: { kind: "agent", id: "agent_internal", label: "Reviewer" },
+    });
+    id = "CAD-8";
+    await render();
+    assert(creator() === "Reviewer", "a verified agent is not displayed as the owner");
+
+    details["CAD-9"] = Object.assign(detail("CAD-9"), {
+      creator: { kind: "unknown" },
+    });
+    id = "CAD-9";
+    await render();
+    assert(creator() === "Not recorded", "unknown authorship is not inferred");
+
+    id = "CAD-1";
+    await render();
+    assert(creator() === "Not recorded", "older issues do not gain invented authorship");
+  }
   if (scenario === "all" || scenario === "cold_history") {
     details["CAD-4"] = detail("CAD-4");
     id = "CAD-4";

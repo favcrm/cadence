@@ -474,6 +474,18 @@ read the actual page and cite its canonical path and revision. Wiki and CLI
 scopes are separate, and the target path/project still has to be authorized.
 An issue `status=doing` update is not a local assignment claim or delivery.
 
+On boards that record ticket creators, issue details show **Created by**
+separately from the mutable **Owner** and from an assignment claim. The
+creator is the identity verified for the create request; an unverified
+external session is not presented as an authenticated agent. Older tickets
+and creations without a proved actor show **Not recorded**.
+
+If an older staged ticket creation may have committed but its receipt cannot
+be proved, the decision remains in **To do** as **Outcome unknown**. Check
+existing tickets before creating again; **Mark reviewed** acknowledges the
+uncertainty without approving, denying, or retrying the creation. The reviewed
+outcome remains unknown in **Updates**.
+
 To start the issue on the already connected local default agent, the person
 operating that machine explicitly runs:
 
@@ -505,6 +517,16 @@ instructions. The board checks claim and generation on reports, but the
 profile-derived client ID is not proof of a distinct session identity.
 `--profile` does not read profile content; load it with `context`. Hiring creates only such a profile (CAD-1989): no runtime, provider, sandbox or model is chosen, nothing launches, and `model` stays `inherit` until a runtime resolves it or one is set explicitly. A native board reads a profile the same way with `cadence agent context <alias>`. The
 authenticated caller, not the profile, carries authority.
+
+These are workspace role profiles, not the signed-in person's private
+assistant. A hosted login or profile claim does not automatically attach that
+personal assistant's memory, instructions, tools or MCP connections to an
+external Pi, Claude or Codex session. A profile is not a permission grant.
+
+The ticket author, its owner and a worker's claim are separate facts. Selecting
+a profile must not replace the author or owner. CAD-2061 tracks distinct
+per-session claims; until then a profile-derived claim cannot identify which
+terminal or harness actually performed the work.
 
 Profile claims depend on the deployed board and client versions. An older
 board may still require the member's registered default alias; report that

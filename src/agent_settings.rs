@@ -52,6 +52,34 @@ struct Overlay {
     pins: Vec<Value>,
 }
 
+/// CAD-2207: the registered runtimes a member's `assistants` binding makes
+/// private. A settings snapshot is an operator surface — and a settings grant
+/// can put one in an ordinary agent's hands — so neither holds the member's
+/// ownership proof and these aliases are withheld from every observation in
+/// it. The full fleet still reaches the reference/live-use checks: a mutation
+/// must refuse what it cannot see, never under-count it into success.
+///
+/// Any binding row is proof, whatever its state: a revoked binding still
+/// names the runtime, its profile and its history. A lookup that fails proves
+/// nothing, so it refuses rather than publishing a maybe-private alias.
+pub fn private_aliases(store: &Store, agents: &[Agent]) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for agent in agents {
+        match store.assistant_for_alias(&agent.alias) {
+            Ok(Some(_)) => {
+                out.insert(agent.alias.clone());
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Err(Error::rejected(
+                    "agent privacy is unprovable - settings are withheld",
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn snapshot(pm_dir: &Path, store: &Store, agents: &[Agent]) -> Result<Value> {
     let current = store.settings()?;
     let profiles = profiles_from(&current.doc.profiles)?;
@@ -63,13 +91,17 @@ pub fn snapshot(pm_dir: &Path, store: &Store, agents: &[Agent]) -> Result<Value>
         &profiles,
         policy.as_ref(),
     );
+    let private = private_aliases(store, agents)?;
     Ok(with_retired(
         build_snapshot(
             token,
             &overlay,
             &profiles,
             policy.as_ref(),
-            agents,
+            VisibleAgents {
+                agents,
+                private: &private,
+            },
             pm_dir,
             &store.settings_history(8)?,
         ),
@@ -109,12 +141,14 @@ pub fn save(
     if token != expected {
         return Err(conflict(&token));
     }
+    let private = private_aliases(store, agents)?;
     check_references(
         &present_overlay(&current.doc.model_defaults, policy.as_ref()),
         &overlay,
         &profiles,
         &previous,
         agents,
+        &private,
     )?;
     let mut next_defaults = project_defaults(&current.doc.model_defaults, &overlay)?;
     validate_config(&mut next_defaults)?;
@@ -173,7 +207,10 @@ pub fn save(
             &present_overlay(&saved.doc.model_defaults, saved.doc.pi.as_ref()),
             &profiles,
             saved.doc.pi.as_ref(),
-            agents,
+            VisibleAgents {
+                agents,
+                private: &private,
+            },
             &pm.dir,
             &store.settings_history(8)?,
         ),
@@ -343,6 +380,9 @@ pub fn sync(
             walk_export_dir(&root, harness, false)?;
         }
     }
+    // Resolve the projection before any export write: an unprovable binding
+    // refuses here, rather than after files were already changed.
+    let private = private_aliases(store, agents)?;
     let mut files = Vec::new();
     let mut wrote_export = false;
     for profile in selected {
@@ -388,7 +428,7 @@ pub fn sync(
         }
     })?;
     Ok(json!({
-        "snapshot": build_snapshot(token, &present_overlay(&current.doc.model_defaults, policy.as_ref()), &profiles, policy.as_ref(), agents, &pm.dir, &history),
+        "snapshot": build_snapshot(token, &present_overlay(&current.doc.model_defaults, policy.as_ref()), &profiles, policy.as_ref(), VisibleAgents { agents, private: &private }, &pm.dir, &history),
         "files": files,
     }))
 }
@@ -1020,6 +1060,7 @@ fn check_references(
     profiles: &[Profile],
     previous: &[Profile],
     agents: &[Agent],
+    private: &BTreeSet<String>,
 ) -> Result<()> {
     let next_models = ids_of(&overlay.models);
     let runtime_aliases: Vec<&str> = agents.iter().map(|a| a.alias.as_str()).collect();
@@ -1045,16 +1086,16 @@ fn check_references(
         if let Some(model) = agent_model(agent) {
             if removed_models.contains(&model) {
                 return Err(Error::rejected(format!(
-                    "model '{model}' is still used by active agent '{}'",
-                    agent.alias
+                    "model '{model}' is still used by {}",
+                    referencing_agent(&agent.alias, private)
                 )));
             }
         }
         if let Some(id) = agent_profile(agent) {
             if previous.iter().any(|p| p.id == id) && !profiles.iter().any(|p| p.id == id) {
                 return Err(Error::rejected(format!(
-                    "profile '{id}' is still used by active agent '{}'",
-                    agent.alias
+                    "profile '{id}' is still used by {}",
+                    referencing_agent(&agent.alias, private)
                 )));
             }
         }
@@ -1062,20 +1103,34 @@ fn check_references(
             && !next_harness.contains(agent.provider.as_str())
         {
             return Err(Error::rejected(format!(
-                "harness '{}' still has active agent '{}'",
-                agent.provider, agent.alias
+                "harness '{}' still has {}",
+                agent.provider,
+                referencing_agent(&agent.alias, private)
             )));
         }
         if prev_providers.contains(agent.provider.as_str())
             && !next_providers.contains(agent.provider.as_str())
         {
             return Err(Error::rejected(format!(
-                "provider '{}' still has active agent '{}'",
-                agent.provider, agent.alias
+                "provider '{}' still has {}",
+                agent.provider,
+                referencing_agent(&agent.alias, private)
             )));
         }
     }
     Ok(())
+}
+
+/// CAD-2207: how a blocking runtime is named in a refusal. An ordinary agent
+/// keeps the actionable alias. A member's personal assistant still refuses the
+/// edit — the check runs over the whole fleet — but the message must not turn
+/// an error response into an operator read of that assistant.
+fn referencing_agent(alias: &str, private: &BTreeSet<String>) -> String {
+    if private.contains(alias) {
+        "an active agent".to_string()
+    } else {
+        format!("active agent '{alias}'")
+    }
 }
 
 fn project_defaults(current: &ModelDefaults, overlay: &Overlay) -> Result<ModelDefaults> {
@@ -1516,12 +1571,31 @@ fn project_pi(stored: &Option<PiPolicy>, overlay: &Overlay) -> Result<Option<PiP
     Ok(Some(policy))
 }
 
+struct VisibleAgents<'a> {
+    agents: &'a [Agent],
+    private: &'a BTreeSet<String>,
+}
+
+impl VisibleAgents<'_> {
+    fn iter(&self) -> impl Iterator<Item = &Agent> {
+        self.agents
+            .iter()
+            .filter(|agent| !self.private.contains(&agent.alias))
+    }
+}
+
+/// One settings snapshot body. `agents` is the whole fleet, but the live
+/// observations are counted over the ordinary runtimes only: a member's
+/// personal assistant (in `private`, see [`private_aliases`]) is never an
+/// operator observation — not through `usedBy`, a provider/model `live`
+/// count, or any other agent-derived field. Nothing else in this body is
+/// agent-derived.
 fn build_snapshot(
     token: String,
     overlay: &Overlay,
     profiles: &[Profile],
     policy: Option<&PiPolicy>,
-    agents: &[Agent],
+    agents: VisibleAgents<'_>,
     pm_dir: &Path,
     history: &[Value],
 ) -> Value {
@@ -2816,11 +2890,16 @@ fn refuse_runtime_names(
     Ok(())
 }
 
-/// Every settings profile with the aliases of the runtimes registered
-/// against it (`params.profile == id`). The job is the operator's to read:
-/// `with_job` is false unless the caller proved it. A body that cannot be
-/// parsed is logged and skipped, so one bad row does not fail the list.
+/// Every settings profile with the aliases of the ordinary runtimes
+/// registered against it (`params.profile == id`). The job is the operator's
+/// to read: `with_job` is false unless the caller proved it. A body that
+/// cannot be parsed is logged and skipped, so one bad row does not fail the
+/// list.
+///
+/// CAD-2207: a member's personal assistant is filtered here as well, so no
+/// caller can publish it through `runtimes` by passing the whole fleet.
 pub fn profile_list(store: &Store, agents: &[Agent], with_job: bool) -> Result<Vec<Value>> {
+    let private = private_aliases(store, agents)?;
     let mut out = Vec::new();
     for body in &store.settings()?.doc.profiles {
         let profile = match parse_agent(&body.id, &body.text) {
@@ -2835,7 +2914,9 @@ pub fn profile_list(store: &Store, agents: &[Agent], with_job: bool) -> Result<V
         };
         let runtimes: Vec<String> = agents
             .iter()
-            .filter(|agent| agent_profile(agent) == Some(profile.id.as_str()))
+            .filter(|agent| {
+                agent_profile(agent) == Some(profile.id.as_str()) && !private.contains(&agent.alias)
+            })
             .map(|agent| agent.alias.clone())
             .collect();
         out.push(profile_json(&profile, &runtimes, with_job));

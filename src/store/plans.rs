@@ -351,6 +351,45 @@ impl Store {
         self.task_in(&conn, id)
     }
 
+    /// Resolve authorization scope without reading the task's content.
+    pub(crate) fn task_job_id(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        match conn.query_row("SELECT job_id FROM tasks WHERE id=?", [id], |row| {
+            row.get(0)
+        }) {
+            Ok(job) => Ok(Some(job)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Check the PM or task-assignee role without loading private work text.
+    pub(crate) fn caller_has_work_role(
+        &self,
+        caller: &str,
+        job: &str,
+        task: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND pm_alias=?2) \
+             OR EXISTS(SELECT 1 FROM tasks WHERE id=?3 AND job_id=?1 AND assignee=?2)",
+            params![job, caller, task],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn task_assigned_to(&self, task: &str, alias: &str) -> Result<bool> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=? AND assignee=?)",
+            params![task, alias],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
     /// CAD-160 (ADR-0002 phase 1): the body a task-bound message (`send
     /// --task`, `ask --task`) is delivered as. For an open task it is
     /// the sender's text, then the task's objective, then every

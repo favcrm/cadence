@@ -1716,6 +1716,15 @@ impl Store {
                     tx.commit()?;
                 }
             }
+            if version < 63 {
+                // CAD-2207: the durable message -> delivered assist-intent
+                // receipt. A bound assistant's job notice is admitted only
+                // when this exact message carries the committed association.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::assistants::SCHEMA_V63)?;
+                tx.execute("UPDATE schema_version SET version=63", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

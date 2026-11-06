@@ -1042,7 +1042,7 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
             note,
             no_resume,
         } => {
-            let mut result = client::rpc(
+            let mut result = client::rpc_after_fleet_preflight(
                 &state_dir,
                 "agent_unfence",
                 json!({"alias": alias, "status": status.as_str(),
@@ -1170,7 +1170,7 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                 Some(&file),
                 cadence_agent::store::MAX_INSTRUCTIONS_BYTES as u64,
             )?;
-            let mut out = client::rpc(
+            let mut out = client::rpc_after_fleet_preflight(
                 &state_dir,
                 "agent_instructions_set",
                 json!({"alias": alias, "instructions": text}),

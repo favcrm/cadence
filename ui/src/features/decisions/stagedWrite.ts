@@ -10,10 +10,9 @@
  * `subject` sentence and the raw call, with the summary marked incomplete.
  */
 
-export type StagedStatus = "pending" | "approved" | "denied";
-/** What the owner sees: a failed apply is `approved` with `result.ok === false`. */
-/** `unconfirmed`: approved, but the row carries no `result.ok === true` to say it applied. */
-export type StagedOutcome = "pending" | "applied" | "failed" | "denied" | "unconfirmed";
+export type StagedStatus = "pending" | "approved" | "denied" | "unresolved" | "acknowledged";
+/** Unknown outcomes are distinct from failed, applied and denied writes. */
+export type StagedOutcome = "pending" | "applied" | "failed" | "denied" | "unconfirmed" | "unresolved" | "acknowledged";
 
 export interface StagedChange {
   field: string;
@@ -65,7 +64,7 @@ export interface StagedWrite {
   recordLink: string | null;
 }
 
-const STATUSES: readonly string[] = ["pending", "approved", "denied"];
+const STATUSES: readonly string[] = ["pending", "approved", "denied", "unresolved", "acknowledged"];
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
@@ -262,6 +261,7 @@ export function parseStagedList(body: unknown): StagedWrite[] | null {
 
 export function outcomeOf(write: StagedWrite): StagedOutcome {
   if (write.status === "pending") return "pending";
+  if (write.status === "unresolved" || write.status === "acknowledged") return write.status;
   if (write.status === "denied") return "denied";
   if (write.result?.ok === false) return "failed";
   // Success is only ever what the row says: ok === true (or the ticket a create made).

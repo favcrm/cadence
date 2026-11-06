@@ -28,6 +28,9 @@ struct WorkScope {
     agent_uid: Option<String>,
     project_uids: Option<Vec<String>>,
     project_repos: Option<Vec<String>>,
+    /// CAD-2207: the member assistants this view must never name. One
+    /// durable snapshot per request, shared by every query it makes.
+    private: crate::store::conversations::PrivateAssistants,
 }
 
 impl WorkScope {
@@ -37,6 +40,7 @@ impl WorkScope {
             agent_uid: self.agent_uid.as_deref(),
             project_uids: self.project_uids.as_deref(),
             project_repos: self.project_repos.as_deref(),
+            private: Some(&self.private),
         }
     }
 }
@@ -307,6 +311,15 @@ impl Shared {
         reject_unknown_fields(params, &["alias", "install_id"], "conversation list")?;
         self.operator_chat("conversation list", peer_pid)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-2207: a member assistant's app-thread metadata is the member's
+        // private surface; this operator-chat verb carries no member-envelope
+        // proof, so a private alias is refused before ensure/list writes.
+        if self.store.assistant_for_alias(&alias)?.is_some() {
+            return Err(Error::rejected(
+                "conversation list refused: a member assistant's conversation is \
+                 private to its member (CAD-2207)",
+            ));
+        }
         let install = required_str(params, "install_id")?;
         self.known_install(install)?;
         // General always exists once an installation is proven.
@@ -342,13 +355,25 @@ impl Shared {
         agent: Option<&str>,
         project: Option<&str>,
     ) -> Result<WorkScope> {
+        // CAD-2207: resolve the durable member-assistant snapshot FIRST, so
+        // every filter below and every query this request makes shares one
+        // answer. A store failure is an error: the view never falls open.
+        let private = self.store.private_assistants()?;
         let agent_uid = match agent {
-            Some(alias) => Some(
-                self.store
+            Some(alias) => {
+                let row = self
+                    .store
                     .agent_opt(alias)?
-                    .ok_or_else(|| Error::rejected(format!("Unknown agent '{alias}'")))?
-                    .uid,
-            ),
+                    .ok_or_else(|| Error::rejected(format!("Unknown agent '{alias}'")))?;
+                // A member's private assistant is not a participant of the
+                // operator's cross-agent view. It answers exactly like an
+                // alias that names no live agent, so this verb is not an
+                // existence oracle for the binding.
+                if private.is_uid(&row.uid) || private.is_alias(&row.alias) {
+                    return Err(Error::rejected(format!("Unknown agent '{alias}'")));
+                }
+                Some(row.uid)
+            }
             None => None,
         };
         let (project_uids, project_repos) = match project {
@@ -366,6 +391,11 @@ impl Shared {
                 let projects = crate::issue::project::list(&pm_dir)?;
                 let mut uids = Vec::new();
                 for agent in self.store.agents()? {
+                    // CAD-2207: a bound assistant is in no project's work
+                    // view, so its checkout is never a membership claim.
+                    if private.is_uid(&agent.uid) || private.is_alias(&agent.alias) {
+                        continue;
+                    }
                     let turn = self.turn_project(&agent).map(|turn| turn.key);
                     let claimants = match &turn {
                         Some(_) => Vec::new(),
@@ -386,7 +416,48 @@ impl Shared {
             agent_uid,
             project_uids,
             project_repos,
+            private,
         })
+    }
+
+    /// CAD-2207: one participant as this operator view may show it, or
+    /// `None` when the row must be withheld. A participant is withheld when
+    /// it is a proved member assistant (bound alias, proved runtime uid) —
+    /// and when no durable row identifies it at all: a uid with no live
+    /// alias and no recorded label cannot be tied to a binding or cleared as
+    /// ordinary, so it is ambiguous provenance, withheld rather than
+    /// presented as an ordinary agent.
+    fn work_participant_visible(
+        &self,
+        private: &crate::store::conversations::PrivateAssistants,
+        uid: &str,
+    ) -> Result<Option<Value>> {
+        if private.is_uid(uid) {
+            return Ok(None);
+        }
+        let participant = self.store.participant(uid)?;
+        if participant["alias"].is_null() {
+            return Ok(None);
+        }
+        Ok(Some(participant))
+    }
+
+    /// CAD-2207: the two participants of a pair, or `None` when the pair is
+    /// withheld for either side (see [`Self::work_participant_visible`]).
+    /// The pair id, activity, counts and preview are keyed by these uids, so
+    /// withholding here withholds the whole row — no id or count leaks.
+    fn work_pair_participants(
+        &self,
+        private: &crate::store::conversations::PrivateAssistants,
+        pair: &store::conversations::PairSummary,
+    ) -> Result<Option<[Value; 2]>> {
+        let (Some(a), Some(b)) = (
+            self.work_participant_visible(private, &pair.a_uid)?,
+            self.work_participant_visible(private, &pair.b_uid)?,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some([a, b]))
     }
 
     /// Cloud rows in a cross-agent work conversation obey the same admission
@@ -456,6 +527,13 @@ impl Shared {
             {
                 continue;
             }
+            // CAD-2207: the pair's durable participants decide the row. A
+            // bound member assistant — or a uid no durable row identifies —
+            // is withheld HERE, before the row's counts, preview or id are
+            // even computed.
+            let Some(participants) = self.work_pair_participants(&scope.private, &pair)? else {
+                continue;
+            };
             let (counts, oldest) =
                 self.store
                     .work_conversation_counts(&pair.a_uid, &pair.b_uid, &scope_ref)?;
@@ -509,10 +587,6 @@ impl Shared {
             for (state, n) in counts {
                 state_counts.insert(state, json!(n));
             }
-            let participants = [
-                self.store.participant(&pair.a_uid)?,
-                self.store.participant(&pair.b_uid)?,
-            ];
             rows.push(json!({
                 "id": pair.id,
                 "kind": "pair",
@@ -528,11 +602,20 @@ impl Shared {
         // agents whose checkout is in the project. Project-only filters keep
         // these rows, so they are not skipped by the project filter.
         for thread in self.store.home_threads()? {
+            // CAD-2207: a member assistant's home conversation is its
+            // member's, not an operator row. Its id, alias and activity are
+            // withheld before any other filter looks at it.
+            if scope.private.is_alias(&thread.alias) {
+                continue;
+            }
             if agent.is_some_and(|f| f != thread.alias) {
                 continue;
             }
+            let uid = self.store.agent_opt(&thread.alias)?.map(|a| a.uid);
+            if uid.as_deref().is_some_and(|u| scope.private.is_uid(u)) {
+                continue;
+            }
             if let Some(uids) = &scope.project_uids {
-                let uid = self.store.agent_opt(&thread.alias)?.map(|a| a.uid);
                 if !uid.is_some_and(|u| uids.contains(&u)) {
                     continue;
                 }
@@ -553,37 +636,49 @@ impl Shared {
         }
         // Group rows: a topic whose source is the project (`project:<key>`)
         // or that has an in-scope subscriber. Read-only.
-        for (topic, members, posts, last_at) in self.store.topic_listing()? {
+        for (topic, _members, posts, last_at) in self.store.topic_listing()? {
             // CAD-1412: private human rooms never appear in the legacy list.
             if topic.kind == crate::store::human_threads::ROOM_TOPIC_TYPE {
                 continue;
             }
             let subscribers = self.store.topic_subscribers(&topic.id)?;
+            // CAD-2207: only membership this view may show. A bound member
+            // assistant is not a member here, and neither is a uid no durable
+            // row identifies. `members` reports the visible membership so a
+            // hidden subscriber is never revealed by a count.
+            let mut visible: Vec<(&String, Value)> = Vec::new();
+            for uid in &subscribers {
+                if let Some(participant) = self.work_participant_visible(&scope.private, uid)? {
+                    visible.push((uid, participant));
+                }
+            }
+            if !subscribers.is_empty() && visible.is_empty() {
+                // Every member is withheld: the topic row would be the only
+                // trace of them (its id, source and activity), so it goes too.
+                continue;
+            }
             if let Some(key) = project {
                 let by_source = topic.kind == "project" && topic.source == key;
                 let by_member = scope
                     .project_uids
                     .as_ref()
-                    .is_some_and(|uids| subscribers.iter().any(|u| uids.contains(u)));
+                    .is_some_and(|uids| visible.iter().any(|(uid, _)| uids.contains(*uid)));
                 if !by_source && !by_member {
                     continue;
                 }
             }
             if let Some(uid) = &scope.agent_uid {
-                if !subscribers.iter().any(|u| u == uid) {
+                if !visible.iter().any(|(subscriber, _)| *subscriber == uid) {
                     continue;
                 }
             }
-            let participants: Vec<Value> = subscribers
-                .iter()
-                .map(|uid| self.store.participant(uid))
-                .collect::<Result<_>>()?;
+            let participants: Vec<Value> = visible.into_iter().map(|(_, p)| p).collect();
             rows.push(json!({
                 "id": topic.id,
                 "kind": "group",
                 "type": topic.kind,
                 "source": topic.source,
-                "members": members,
+                "members": participants.len(),
                 "participants": participants,
                 "posts": posts,
                 "last_activity": last_at,
@@ -654,16 +749,23 @@ impl Shared {
 
         // The unknown bucket: its own identity, recipient-scoped read.
         let unknown = id == UNKNOWN_CONVERSATION;
-        let pair = if unknown {
-            None
+        // CAD-2207: a pair this view must withhold answers exactly like an id
+        // that never existed — no alias, count or id is disclosed, and the
+        // same message comes back either way. The participants are resolved
+        // once, from durable evidence, for both this decision and the header.
+        let (pair, participants) = if unknown {
+            (None, Vec::new())
         } else {
-            Some(
-                self.store
-                    .work_conversation_pairs()?
-                    .into_iter()
-                    .find(|p| p.id == id)
-                    .ok_or_else(|| Error::rejected("Unknown conversation"))?,
-            )
+            let found = self
+                .store
+                .work_conversation_pairs()?
+                .into_iter()
+                .find(|p| p.id == id)
+                .ok_or_else(|| Error::rejected("Unknown conversation"))?;
+            let parts = self
+                .work_pair_participants(&scope.private, &found)?
+                .ok_or_else(|| Error::rejected("Unknown conversation"))?;
+            (Some(found), parts.to_vec())
         };
         let messages = match &pair {
             Some(p) => self
@@ -692,9 +794,12 @@ impl Shared {
         // never pays for a cloud proof.
         let page_ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
         let routed = match &pair {
-            Some(p) => self
-                .store
-                .work_conversation_routed_of(&p.a_uid, &p.b_uid, &page_ids)?,
+            Some(p) => self.store.work_conversation_routed_of(
+                &p.a_uid,
+                &p.b_uid,
+                &page_ids,
+                Some(&scope.private),
+            )?,
             None => Vec::new(),
         };
         let mut candidates: Vec<(String, String)> = Vec::new();
@@ -780,11 +885,7 @@ impl Shared {
             }
         }
         let conversation = match &pair {
-            Some(p) => json!({"id": p.id, "kind": "pair",
-            "participants": [
-                self.store.participant(&p.a_uid)?,
-                self.store.participant(&p.b_uid)?,
-            ]}),
+            Some(p) => json!({"id": p.id, "kind": "pair", "participants": participants}),
             None => json!({"id": UNKNOWN_CONVERSATION, "kind": "unknown", "participants": []}),
         };
         Ok(json!({
@@ -827,6 +928,15 @@ impl Shared {
         // CAD-1374: the verified owner human, or `None` for the local operator.
         let human = self.verified_owner_human(params)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-2207: a member assistant's app-thread metadata is the member's
+        // private surface; this operator-chat verb carries no member-envelope
+        // proof, so a private alias is refused before any create.
+        if self.store.assistant_for_alias(&alias)?.is_some() {
+            return Err(Error::rejected(
+                "conversation create refused: a member assistant's conversation is \
+                 private to its member (CAD-2207)",
+            ));
+        }
         // CAD-1772: the master's single Recruit conversation — find or
         // create, no installation. Operator-only like every create above.
         if let Some(kind) = optional_text(params, "kind")? {

@@ -198,6 +198,8 @@ mod lane_relaunch;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
 mod bootstrap_files;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad2207_board_peer_acceptance;
 mod human_current;
 mod human_threads_rpc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -521,6 +523,11 @@ impl Drop for StopReservation<'_> {
 /// generation, pane pid, native session — one row per live PTY alias.
 type ShutdownFacts = HashMap<String, (String, u32, String)>;
 
+/// CAD-2207: all live identities captured at shutdown, or the
+/// generic reason the snapshot could not be proven. Never contains a
+/// caller-supplied value and never serialized outside the local marker.
+type LiveEvidence = std::result::Result<Vec<(String, String)>, String>;
+
 /// CAD-XXXX test seam: the platform membership lookup
 /// `current_public_hash_from` calls when `membership_lookup_for_test` is
 /// set — hash, subject, company, instance in, the fresh role answer or an
@@ -563,6 +570,14 @@ pub struct Shared {
     /// `pid`/`generation`; reading the rows later loses the adoption
     /// record. `None` until shutdown is requested.
     shutdown_facts: Mutex<Option<ShutdownFacts>>,
+    /// CAD-2207: all live identities captured under the lifecycle lock by
+    /// [`Shared::begin_closing`], before actors wake. `Some(Err)` is a
+    /// failed snapshot and makes the successor verdict unverified.
+    shutdown_live: Mutex<Option<LiveEvidence>>,
+    /// CAD-2207: the marker's all-live obligation for this successor.
+    /// `None` is an older/missing marker; `Some(Err)` is malformed or an
+    /// explicit snapshot failure.
+    settle_evidence: Mutex<Option<LiveEvidence>>,
     provider_log_dir: PathBuf,
     pub(crate) state_dir: PathBuf,
     /// Captured at boot from this daemon's provider environment; upload
@@ -805,6 +820,9 @@ pub struct Shared {
     /// HTTP proof in `rpc_member_job_request`. It does not itself hold a store
     /// connection during that HTTP call.
     member_job_lock: Mutex<()>,
+    /// Subscriber notice admissions, keyed by organization and job. A share
+    /// withdrawal holds this mutex through its local commit.
+    assist_notice_admissions: Mutex<HashMap<String, HashMap<String, usize>>>,
     app_release_claim_gate: Option<effect_rpc::EffectExecuteGate>,
     /// CAD-546: the `local` platform's outbox root — what
     /// `platform_outbox` lists. Set by `platform::local::register`
@@ -996,6 +1014,7 @@ impl Shared {
         let HotStart {
             instance,
             mut marker,
+            live,
         } = hot;
         let daemon_id = instance.clone();
         let db_path = state_dir.join("cadence.sqlite3");
@@ -1046,6 +1065,8 @@ impl Shared {
         // taken (the predecessor was already dead) and for endpoints
         // the cursors never covered.
         write_recovery_record(state_dir, &daemon_id, &recovered);
+        #[cfg(feature = "test-seam")]
+        crate::test_seam::pause_gate("CADENCE_TEST_CAD2207_SETTLE_GATE", state_dir);
         if let Some(delay) = opts.startup_delay_for_test {
             std::thread::sleep(delay);
         }
@@ -1164,6 +1185,8 @@ impl Shared {
             // goes stale in minutes and never wedges the fleet.
             draining: Mutex::new(None),
             shutdown_facts: Mutex::new(None),
+            shutdown_live: Mutex::new(None),
+            settle_evidence: Mutex::new(live),
             provider_log_dir,
             state_dir: state_dir.to_path_buf(),
             upload_workspace_dir,
@@ -1279,6 +1302,7 @@ impl Shared {
             host_runs_in_flight: Mutex::new(HashSet::new()),
             app_assistant_lock: Mutex::new(()),
             member_job_lock: Mutex::new(()),
+            assist_notice_admissions: Mutex::new(HashMap::new()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),
@@ -2994,6 +3018,7 @@ impl Shared {
         // before any method runs — so a member agent never widens into
         // generic worker verbs (other agents, issues, wiki, dispatch,
         // operator effects).
+        let _work_read = self.admit_assist_work_read(method, params, peer_pid)?;
         self.member_assist_policy(method, params, peer_pid)?;
         let answer = self.dispatch_method(method, params, peer_pid)?;
         Ok(self.withhold_turn_tokens(answer, peer_pid))
@@ -3054,6 +3079,40 @@ impl Shared {
         answer
     }
 
+    /// CAD-2207: the socket-frame compatibility gate for the two fleet
+    /// projections. A client that does not carry [`crate::proto::CLIENT_PROTOCOL`]
+    /// predates the fleet list contract, so it is refused unconditionally —
+    /// not only when a restricted row exists. That removes both the
+    /// check-then-dispatch TOCTOU (a binding created between the check and the
+    /// filtered list would hand the old board a partial fleet) and the
+    /// existence oracle (success vs refusal no longer says whether a bound
+    /// assistant exists). The wording must never contain "Unknown method", so
+    /// an old board's `agent_list` fallback cannot treat it as an older daemon
+    /// and retry. Every current in-repo client carries the capability through
+    /// `proto::request`.
+    pub(crate) fn refuse_legacy_fleet_projection(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<()> {
+        if !matches!(method, "agent_list" | "agent_operational") {
+            return Ok(());
+        }
+        if params
+            .get("client_protocol")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            >= crate::proto::CLIENT_PROTOCOL
+        {
+            return Ok(());
+        }
+        Err(Error::rejected(format!(
+            "{method} refused: this daemon requires the current fleet client \
+             protocol (client_protocol {}); upgrade the client",
+            crate::proto::CLIENT_PROTOCOL
+        )))
+    }
+
     fn dispatch_method(
         self: &Arc<Self>,
         method: &str,
@@ -3066,10 +3125,38 @@ impl Shared {
         let stamped = self.caller_gate(method, params, peer_pid)?;
         let params = stamped.as_ref().unwrap_or(params);
         self.refuse_legacy_protected_authority(method, params, peer_pid)?;
+        // Generic lifecycle and provider controls do not prove the member
+        // who owns a bound assistant. There is no signed-owner replacement
+        // for these operations yet, so refuse before reading or mutating it.
+        if matches!(
+            method,
+            "agent_ready"
+                | "agent_capture"
+                | "agent_probe"
+                | "agent_set"
+                | "agent_instructions_set"
+                | "agent_unfence"
+                | "agent_stop"
+                | "agent_remove"
+                | "agent_inbox_ack"
+                | "agent_answer"
+                | "agent_recover_submit"
+                | "agent_requests"
+                | "agent_respond"
+                | "topic_subscribe"
+                | "topic_unsubscribe"
+        ) {
+            if let Some(raw) = params.get("alias").and_then(Value::as_str) {
+                let alias = self.resolve_alias(raw)?;
+                self.refuse_restricted_agent(&alias)?;
+            }
+        }
         match method {
             // `pid` is the singleton-lock holder: `daemon start` tells
             // the child it spawned from a daemon that already ran.
             "health" => Ok({
+                let update_waiting = self.inflight_turns().ok();
+                let update_waiting_unavailable = update_waiting.is_none();
                 let (adopted_live, adopted_oldest, adopted_reaped_total) =
                     crate::reaper::adopted_report(5);
                 json!({
@@ -3108,7 +3195,10 @@ impl Shared {
                 // CAD-561: a pending update and what it waits on, so
                 // `cadence daemon status` and the board's banner show it.
                 "pending_update": self.pending_update().map(|p| p.to_json()),
-                "update_waiting": self.inflight_turns().unwrap_or_default(),
+                // CAD-2207: all-fleet aggregate only; a single generic
+                // blocker row when any actor work is in flight.
+                "update_waiting": update_waiting,
+                "update_waiting_unavailable": update_waiting_unavailable,
                 })
             }),
             // Build identity + process start — the deploy-drift check
@@ -3123,6 +3213,9 @@ impl Shared {
                     "build_commit": crate::overview::BUILD_COMMIT,
                     "build_time": crate::overview::BUILD_TIME,
                     "started_at": self.started_at,
+                    // CAD-2207: the new CLI proves this before reading any
+                    // fleet projection; an older daemon answers without it.
+                    "fleet_protocol": crate::proto::CLIENT_PROTOCOL,
                     "connections": connections,
                     // CAD-1193: the lock-holding daemon's own pid — the
                     // same fact `health` reports, without the fleet-wide
@@ -3208,6 +3301,10 @@ impl Shared {
             }
             "agent_register" => self.rpc_register(params, peer_pid),
             "agent_roles" => self.rpc_agent_roles(),
+            "agent_operational" => self.rpc_agent_operational(params, peer_pid),
+            "board_peer_agent" => self.rpc_board_peer_agent(params, peer_pid),
+            "board_peer_operator" => self.rpc_board_peer_operator(params, peer_pid),
+            "agent_fleet_state" => self.rpc_agent_fleet_state(params, peer_pid),
             "agent_profile_create" => self.rpc_agent_profile_create(params, peer_pid),
             "agent_profile_context" => self.rpc_agent_profile_context(params, peer_pid),
             "agent_instructions_set" => self.rpc_instructions_set(params, peer_pid),
@@ -3246,13 +3343,19 @@ impl Shared {
                     .store
                     .last_events_of(&aliases, AUTO_STOP_MARKER_KINDS)
                     .unwrap_or_default();
+                // CAD-2207: the settings-profile projection's `runtimes` may
+                // only name rows this caller can see, so it is built from the
+                // visible set, never the whole store.
+                let mut visible_agents: Vec<Agent> = Vec::new();
                 for agent in listed_agents {
                     if !states.is_empty() && !states.contains(&agent.state) {
                         continue;
                     }
-                    // CAD-1380: a member-private assistant row is withheld from
-                    // every caller but its owner and the operator, before it is
-                    // serialized or counted into `live`.
+                    // CAD-1380/CAD-2207: a member-private assistant row is
+                    // withheld from every caller but that assistant itself —
+                    // the operator included, because operator rights are not
+                    // the member's proof — before it is serialized or counted
+                    // into `live`.
                     if self.member_agent_row_withheld(&agent.alias, peer_pid)? {
                         continue;
                     }
@@ -3262,6 +3365,7 @@ impl Shared {
                     if !kinds.is_empty() && !kinds.contains(&agent.endpoint_kind) {
                         continue;
                     }
+                    visible_agents.push(agent.clone());
                     let mut j = agent.to_json();
                     // The alias's current non-terminal task assignments —
                     // derived from tasks.assignee, never stored.
@@ -3328,7 +3432,7 @@ impl Shared {
                     .count();
                 let profiles = crate::agent_settings::profile_list(
                     &self.store,
-                    &self.store.agents()?,
+                    &visible_agents,
                     self.operator_evidence(peer_pid).is_ok(),
                 )?;
                 Ok(json!({"agents": agents, "live": live, "profiles": profiles}))
@@ -3723,6 +3827,20 @@ impl Shared {
                          (caller rule, CAD-506)"
                     )));
                 }
+                // CAD-2207: a member assistant's request input is the member's
+                // private context. The operator keeps the actionable workflow
+                // (handle + method, so `agent respond` can accept or decline)
+                // but its params are withheld; only the bound assistant itself
+                // reads its own input.
+                let member_private = self.store.assistant_for_alias(&alias)?.is_some();
+                let caller = self.connection_caller(peer_pid)?;
+                let owner_view =
+                    matches!(&caller, caller_rule::Who::Agent(viewer) if viewer == &alias);
+                let redact = member_private && !owner_view;
+                let withheld = json!({
+                    "withheld": "member-private request input; the owning member \
+                                 decides this request (CAD-2207)"
+                });
                 let mut requests: Vec<Value> = self
                     .pending
                     .lock()
@@ -3730,7 +3848,8 @@ impl Shared {
                     .iter()
                     .filter(|(_, req)| req.alias == alias)
                     .map(|(handle, req)| {
-                        json!({"request": handle, "method": req.method, "params": req.params})
+                        json!({"request": handle, "method": req.method,
+                               "params": if redact { withheld.clone() } else { req.params.clone() }})
                     })
                     .collect();
                 // A staged send is a brokered `kind:"effect"` request
@@ -3741,7 +3860,7 @@ impl Shared {
                     if row.state == "waiting" {
                         requests.push(json!({"request": row.request,
                             "method": "cadence/effect",
-                            "params": row.to_record()}));
+                            "params": if redact { withheld.clone() } else { row.to_record() }}));
                     }
                 }
                 Ok(json!({"requests": requests}))
@@ -3961,6 +4080,9 @@ impl Shared {
                 self.operator_connection("agent archive plan", params, peer_pid)?;
                 reject_identity_fields(params, "agent archive plan")?;
                 let aliases = archive_aliases(params)?;
+                for alias in &aliases {
+                    self.refuse_restricted_agent(alias)?;
+                }
                 let lc = self.lifecycle.lock().unwrap();
                 let mut rows = Vec::new();
                 for alias in &aliases {
@@ -3995,6 +4117,9 @@ impl Shared {
                 reject_identity_fields(params, "agent archive")?;
                 let reason = required_str(params, "reason")?.to_string();
                 let expected = archive_expected_digests(params)?;
+                for (alias, _) in &expected {
+                    self.refuse_restricted_agent(alias)?;
+                }
                 let lc = self.lifecycle.lock().unwrap();
                 for (alias, _) in &expected {
                     if lc.owned(alias) || lc.stopping.contains(alias) {
@@ -4020,6 +4145,9 @@ impl Shared {
                 self.operator_connection("agent restore", params, peer_pid)?;
                 reject_identity_fields(params, "agent restore")?;
                 let expected = archive_expected_revs(params)?;
+                for (alias, _) in &expected {
+                    self.refuse_restricted_agent(alias)?;
+                }
                 let lc = self.lifecycle.lock().unwrap();
                 for (alias, _) in &expected {
                     if lc.owned(alias) || lc.stopping.contains(alias) {
@@ -4036,6 +4164,15 @@ impl Shared {
             }
             "agent_resume" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
+                // CAD-2207: a restricted agent is resumed only through its
+                // owning member route; the operator gets no lifecycle action
+                // on it and no withheld-detail claim.
+                if self.store.assistant_for_alias(&alias)?.is_some() {
+                    return Err(Error::rejected(
+                        "a restricted agent is resumed through its owning member route; \
+                         operator resume is refused",
+                    ));
+                }
                 let started = self.try_resume(&alias)?;
                 let state = if started { "starting" } else { "attention" };
                 Ok(json!({"alias": alias, "state": state}))
@@ -4683,17 +4820,74 @@ but the host could not read their list; do not claim to have read them.]";
     /// Snapshotting inside `shutdown` loses that race and
     /// `shutdown_entries` then omits the alias.
     fn begin_closing(&self) {
+        // CAD-2207: capture both pty adoption facts and ALL live
+        // identities under the SAME lifecycle lock. `start_actor_locked`
+        // checks `closing` under that lock, so a start cannot slip between
+        // the snapshot and the close. Capture facts before setting
+        // `closing`: waking actors detaches idle ones and clears
+        // pid/generation.
+        let lifecycle = self.lifecycle.lock().unwrap();
         {
             let mut slot = self.shutdown_facts.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(self.store.pty_endpoint_facts().unwrap_or_default());
             }
         }
+        #[cfg(feature = "test-seam")]
+        crate::test_seam::pause_gate("CADENCE_TEST_CAD2207_BEGIN_CLOSING_GATE", &self.state_dir);
         self.closing.store(true, Ordering::SeqCst);
+        {
+            let mut slot = self.shutdown_live.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(self.live_snapshot(&lifecycle));
+            }
+        }
+        drop(lifecycle);
         self.wake();
         if let Ok(coordinator) = self.protected_runtime() {
             coordinator.stop_all("daemon shutdown");
         }
+    }
+
+    /// All live identities observed at shutdown — ordinary and bound.
+    /// It follows `Lifecycle::agents` (the authoritative ownership map)
+    /// plus every stored row that still advertises an endpoint or a live
+    /// state. Recording all classes keeps the public settle verdict from
+    /// being a private-only activity oracle: a cold start cannot tell a
+    /// missing marker caused by a hidden assistant from one caused by an
+    /// ordinary agent. Every error and every missing uid is a failed
+    /// snapshot; error text is generic and stored only locally.
+    fn live_snapshot(&self, lifecycle: &Lifecycle) -> LiveEvidence {
+        const FAILED: &str = "live identity snapshot failed";
+        let agents = self.store.agents().map_err(|_| FAILED.to_string())?;
+        let mut aliases = std::collections::BTreeSet::new();
+        for alias in lifecycle.agents.keys() {
+            aliases.insert(alias.clone());
+        }
+        for agent in agents {
+            aliases.insert(agent.alias);
+        }
+        let mut live = Vec::new();
+        for alias in aliases {
+            let agent = self.store.agent(&alias).map_err(|_| FAILED.to_string())?;
+            if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+                continue;
+            }
+            let is_live = lifecycle.agents.contains_key(&alias)
+                || agent.endpoint.is_some()
+                || matches!(
+                    agent.state.as_str(),
+                    "starting" | "idle" | "busy" | "running" | "waiting_input" | "stopping"
+                );
+            if !is_live {
+                continue;
+            }
+            if agent.uid.trim().is_empty() {
+                return Err(FAILED.to_string());
+            }
+            live.push((alias, agent.uid));
+        }
+        Ok(live)
     }
 
     /// CAD-561: is a `cadence update` draining the fleet right now?
@@ -4737,8 +4931,13 @@ but the host could not read their list; do not claim to have read them.]";
     /// message on a live actor, with its age. The message row is the
     /// authoritative in-flight signal (the pane probe can read idle
     /// between paste and render).
+    ///
+    /// CAD-2207: the PUBLIC drain surface is all-fleet aggregate. Any
+    /// in-flight actor work yields one generic blocker row — no alias,
+    /// message id, state, count or age — so polling the shape cannot single
+    /// out a member's personal assistant. Ordinary detail remains on
+    /// `agent_show`/`agent_list`. An empty array means no actor work.
     fn inflight_turns(&self) -> Result<Vec<Value>> {
-        let now = crate::rollout::unix_now();
         // CAD-1266: one indexed read of the in-flight rows, filtered to
         // agents that own an actor — not every agent's full history.
         let with_actor: std::collections::HashSet<String> = self
@@ -4748,25 +4947,26 @@ but the host could not read their list; do not claim to have read them.]";
             .filter(|a| registry::has_actor(&a.provider, &a.endpoint_kind))
             .map(|a| a.alias)
             .collect();
-        let mut rows = Vec::new();
-        for (alias, message, state, since) in self.store.inflight_messages()? {
-            if !with_actor.contains(&alias) {
-                continue;
-            }
-            rows.push(json!({
-                "alias": alias,
-                "message": message,
-                "state": state,
-                "age_secs": (now - since).max(0.0).round() as u64,
-            }));
-        }
-        rows.sort_by(|a, b| {
-            b["age_secs"]
-                .as_u64()
-                .cmp(&a["age_secs"].as_u64())
-                .then_with(|| a["alias"].as_str().cmp(&b["alias"].as_str()))
-        });
-        Ok(rows)
+        let any = self
+            .store
+            .inflight_messages()?
+            .into_iter()
+            .any(|(alias, _, _, _)| with_actor.contains(&alias));
+        // CAD-2207: the public drain surface is ALL-fleet aggregate. Any
+        // in-flight actor work yields one generic blocker in the existing
+        // array shape; no alias, message id, state, count or age. This
+        // neither reveals nor hides by agent class, and old consumers still
+        // block on the non-empty array.
+        Ok(if any {
+            vec![json!({
+                "alias": "unattributed work",
+                "message": "pending",
+                "state": "running",
+                "age_secs": 0,
+            })]
+        } else {
+            Vec::new()
+        })
     }
 
     /// Graceful daemon stop: the only path that may write the
@@ -4821,12 +5021,18 @@ but the host could not read their list; do not claim to have read them.]";
                 let _ = handle.join();
             }
         }
-        // LAST: every actor has detached and written its final state,
+        // Every actor has detached and written its final state,
         // so the message rows are settled — and a marker written here
         // can only ever describe a clean stop. A failed sweep commits
         // no refusals, so the file becomes the evidence channel: the
         // next start's recover() fences every unproven row it finds and
         // the restart verdict stays loud.
+        let live_evidence = self
+            .shutdown_live
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Err("live snapshot was not captured".to_string()));
         let entries = match self.store.shutdown_entries(&facts) {
             Ok(entries) => entries,
             Err(e) => {
@@ -4848,7 +5054,7 @@ but the host could not read their list; do not claim to have read them.]";
                 return Err(Error::internal(format!("shutdown entries failed: {e}")));
             }
         };
-        write_shutdown_marker(&self.state_dir, &self.instance, entries);
+        write_shutdown_marker(&self.state_dir, &self.instance, entries, &live_evidence);
         Ok(())
     }
 }

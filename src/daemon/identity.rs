@@ -771,8 +771,27 @@ impl Shared {
             .map(|row| row.alias))
     }
 
-    /// The `agent gc` candidates split by the caller rule: `(permitted,
-    /// not_permitted)` — the same decision `agent remove` makes.
+    /// CAD-2207: is `alias` the runtime row of a member's bound personal
+    /// assistant? Source-verified against the `assistants` table, never a
+    /// name prefix, so row reuse and old aliases cannot dodge or forge it.
+    pub(super) fn restricted_agent(&self, alias: &str) -> Result<bool> {
+        Ok(self.store.assistant_for_alias(alias)?.is_some())
+    }
+
+    /// CAD-2207: refuse a generic lifecycle control whose target is a
+    /// bound member assistant. The signed owner route does not exist yet,
+    /// so generic (operator/PM/self) control fails closed; ordinary agents
+    /// are untouched. The refusal is the store's generic text: it never
+    /// names the alias, the binding or the member.
+    pub(super) fn refuse_restricted_agent(&self, alias: &str) -> Result<()> {
+        if self.restricted_agent(alias)? {
+            return Err(Error::rejected(crate::store::RESTRICTED_LIFECYCLE));
+        }
+        Ok(())
+    }
+
+    /// Public GC candidates split by the caller rule. Member-bound assistants
+    /// are outside this operator view and never generic GC candidates.
     pub(super) fn gc_partition(
         &self,
         caller: &AgentCaller,
@@ -781,6 +800,9 @@ impl Shared {
         let mut permitted = Vec::new();
         let mut not_permitted = Vec::new();
         for agent in self.store.gc_candidates(older_than)? {
+            if self.restricted_agent(&agent.alias)? {
+                continue;
+            }
             let pm = self.effective_pm(&agent)?;
             let allowed = crate::peer::may_mutate_agent(
                 caller,
@@ -804,6 +826,7 @@ impl Shared {
     /// sweep it), `not_permitted` (eligible, but the caller rule keeps
     /// it), or `kept` (the shared predicate keeps it: enabled, gc_keep
     /// or open messages) — with the fields the decision used.
+    /// A bound member assistant appears in none of the public buckets.
     pub(super) fn gc_plan(
         &self,
         caller: &AgentCaller,
@@ -813,6 +836,9 @@ impl Shared {
         let mut not_permitted = Vec::new();
         let mut kept = Vec::new();
         for row in self.store.gc_rows(older_than)? {
+            if self.restricted_agent(&row.agent.alias)? {
+                continue;
+            }
             let mut detail = json!({
                 "alias": row.agent.alias,
                 "state": row.agent.state,

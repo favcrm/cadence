@@ -17,7 +17,7 @@
 //! `refuse_leak` check against the enrolled credential before it
 //! lands.
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -156,6 +156,22 @@ pub(super) const SCHEMA_V18: &str = "CREATE TABLE IF NOT EXISTS platform_effects
         input_summary TEXT NOT NULL,
         artifact TEXT,
         ran_at REAL NOT NULL);";
+
+/// CAD-2207: the member assistant that staged an effect, frozen in the same
+/// transaction as the effect row. An effect staged by an ordinary (unbound)
+/// agent has no owner; if its alias later becomes a member assistant the
+/// owner is unprovable and delivery/read paths fail closed.
+#[derive(Debug, Clone)]
+pub struct EffectMemberOwner {
+    pub effect_id: String,
+    pub org: String,
+    pub sub: String,
+    pub assistant_id: String,
+    pub alias: String,
+    /// The `agents` row uid at stage time — a durable identity, so an alias
+    /// later reused by a different agent row can never inherit the effect.
+    pub agent_uid: String,
+}
 
 /// A `platform_effects` row — the durable pending-effect record of
 /// §5.4. `to_record` renders exactly the shared schema's shape
@@ -402,7 +418,59 @@ impl Store {
                                "account": row.account, "tool": row.tool,
                                "input_summary": row.input_summary}),
             )?;
+            // CAD-2207: freeze the member assistant that staged this effect
+            // in the SAME transaction. An alias is not a durable identity —
+            // an ordinary agent row can outlive its effect and a later member
+            // binding can take the alias — so delivery/admission must compare
+            // this original tuple, never the current alias alone.
+            let owner: Option<(String, String, String, String)> = tx.query_opt(
+                "SELECT a.org,a.sub,a.assistant_id,g.uid FROM assistants a \
+                 JOIN agents g ON g.alias=a.alias \
+                 WHERE a.alias=? AND a.state='active'",
+                params![row.agent],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            if let Some((org, sub, assistant_id, agent_uid)) = owner {
+                tx.execute(
+                    "INSERT OR IGNORE INTO effect_member_owners(
+                       effect_id,org,sub,assistant_id,alias,agent_uid,created)
+                     VALUES(?,?,?,?,?,?,?)",
+                    params![
+                        row.effect_id,
+                        org,
+                        sub,
+                        assistant_id,
+                        row.agent,
+                        agent_uid,
+                        now()
+                    ],
+                )?;
+            }
             Ok((row.clone(), false))
+        })
+    }
+
+    /// CAD-2207: the member assistant that staged `effect_id`, or `None` for
+    /// an effect staged by an ordinary agent or a legacy row.
+    pub fn effect_member_owner(&self, effect_id: &str) -> Result<Option<EffectMemberOwner>> {
+        self.read_tx(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT effect_id,org,sub,assistant_id,alias,agent_uid \
+                     FROM effect_member_owners WHERE effect_id=?1",
+                    params![effect_id],
+                    |r| {
+                        Ok(EffectMemberOwner {
+                            effect_id: r.get(0)?,
+                            org: r.get(1)?,
+                            sub: r.get(2)?,
+                            assistant_id: r.get(3)?,
+                            alias: r.get(4)?,
+                            agent_uid: r.get(5)?,
+                        })
+                    },
+                )
+                .optional()?)
         })
     }
 
@@ -683,11 +751,12 @@ impl Store {
             let Some(row) = row else {
                 return Ok(None);
             };
+            let closed_at = now();
             tx.execute(
                 "UPDATE platform_effects SET state='closed', close_reason=?2,
                          decision=NULL, outcome=NULL, needs_you=0, updated_at=?3
                          WHERE effect_id=?1",
-                params![row.effect_id, reason, now()],
+                params![row.effect_id, reason, closed_at],
             )?;
             Self::event(
                 &tx,
@@ -696,7 +765,19 @@ impl Store {
                 json!({"effect_id": row.effect_id, "request": row.request,
                                "reason": reason}),
             )?;
-            Ok(Some(row))
+            // CAD-2207: hand back the committed row, not the pre-update
+            // image, without a second SELECT. `platform_effects` has no
+            // triggers; this UPDATE names every field it changes, so the
+            // in-memory row matches the committed one exactly (same
+            // `updated_at` value it wrote).
+            let mut closed = row;
+            closed.state = "closed".to_string();
+            closed.close_reason = Some(reason.to_string());
+            closed.decision = None;
+            closed.outcome = None;
+            closed.needs_you = false;
+            closed.updated_at = closed_at;
+            Ok(Some(closed))
         })
     }
 

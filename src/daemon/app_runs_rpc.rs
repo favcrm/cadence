@@ -1988,23 +1988,40 @@ impl Shared {
 }
 
 impl Shared {
-    pub(super) fn take_app_aware(&self, alias: &str) -> Result<Take> {
+    pub(super) fn take_app_aware(
+        &self,
+        alias: &str,
+    ) -> Result<(Take, Option<super::members_rpc::AssistNoticeAdmission<'_>>)> {
         let head = self.store.queued_head(alias)?;
+        let mut notice_admission = None;
+        let mut admitted_id = None;
         // CAD-1380 R1: a queued member turn re-proves its ORIGINAL credential
         // before the generic take. A refused row is failed and retained, never
         // dropped, with a bounded event naming the refusal.
         if let Some(message) = head.as_ref().filter(|m| m.source != "app_run_dispatch") {
-            if let Err(error) = self.member_message_reprove(message) {
-                let reason = error.to_string();
-                let refused = json!({"status": "failed", "text": "", "error": reason});
-                self.store
-                    .finish(message, "failed", &refused, Some(&reason))?;
-                self.store.event_public(
-                    alias,
-                    "member_turn_refused",
-                    json!({"message": message.id, "reason": reason}),
-                )?;
-                return Ok(Take::Empty);
+            let checked = self.admit_assist_notice(message).and_then(|admission| {
+                self.member_message_reprove(message)?;
+                Ok(admission)
+            });
+            match checked {
+                Ok(admission) => {
+                    if admission.is_some() {
+                        admitted_id = Some(message.id.clone());
+                    }
+                    notice_admission = admission;
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    let refused = json!({"status": "failed", "text": "", "error": reason});
+                    self.store
+                        .finish(message, "failed", &refused, Some(&reason))?;
+                    self.store.event_public(
+                        alias,
+                        "member_turn_refused",
+                        json!({"message": message.id, "reason": reason}),
+                    )?;
+                    return Ok((Take::Empty, None));
+                }
             }
         }
         if let Some(message) = head.filter(|m| m.source == "app_run_dispatch") {
@@ -2014,7 +2031,7 @@ impl Shared {
             // cancelled, and no external success is reported.
             let Some((run_id, _)) = self.store.app_message_installation(&message.id)? else {
                 self.store.reject_app_submission(&message.id)?;
-                return Ok(Take::Empty);
+                return Ok((Take::Empty, None));
             };
             let checked = self.store.app_run_show(&run_id)?;
             if let Some(sealed) = checked["approval"]["human"]
@@ -2022,7 +2039,7 @@ impl Shared {
                 .map(|_| &checked["approval"]["human"])
             {
                 if self.fresh_run_human(sealed).is_err() {
-                    return Ok(Take::Empty);
+                    return Ok((Take::Empty, None));
                 }
             }
             let admission = (|| {
@@ -2052,14 +2069,19 @@ impl Shared {
                 })
             })();
             match admission {
-                Ok(take) => Ok(take),
+                Ok(take) => Ok((take, None)),
                 Err(_) => {
                     self.store.reject_app_submission(&message.id)?;
-                    Ok(Take::Empty)
+                    Ok((Take::Empty, None))
                 }
             }
         } else {
-            self.store.take_queued(alias)
+            let take = self.store.take_queued(alias)?;
+            if !matches!(&take, Take::Message(message) if admitted_id.as_deref() == Some(message.id.as_str()))
+            {
+                notice_admission = None;
+            }
+            Ok((take, notice_admission))
         }
     }
     pub(super) fn admit_app_submission(&self, message: &Message) -> Result<()> {

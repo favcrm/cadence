@@ -3,14 +3,43 @@
 
 use super::*;
 
+/// The lifecycle view of one ordinary agent. A member's personal assistant
+/// is withheld from both projections and cannot be resumed by this operator
+/// path; the operational fallback is not authority to act on private rows.
+fn lifecycle_row(state_dir: &Path, alias: &str) -> Result<Value> {
+    match client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
+        Ok(show) => Ok(show),
+        Err(refused) => match client::rpc(state_dir, "agent_operational", json!({})) {
+            Ok(answer) => {
+                let rows = answer["agents"].as_array().cloned().unwrap_or_default();
+                match rows
+                    .into_iter()
+                    .find(|row| row["alias"].as_str() == Some(alias))
+                {
+                    Some(row) => {
+                        let unknown = row["unknown"].clone();
+                        Ok(json!({"agent": row, "unknown": unknown}))
+                    }
+                    None => Err(refused),
+                }
+            }
+            // An older daemon does not serve the projection; the original
+            // refusal is the honest answer (its agent_show has no filter).
+            Err(error) if error.to_string().contains("Unknown method") => Err(refused),
+            Err(error) => Err(error),
+        },
+    }
+}
+
 /// `cadence agent resume`: provider-launch treatment for a reopen —
 /// bounded wait for the endpoint, then attach this terminal by default.
 /// `--detach` or a non-TTY/nested-tmux context prints the attach command
 /// instead. Kinds with nothing attachable (managed stdio, fake) return
 /// the resume receipt immediately — there is no endpoint to wait for.
 pub(crate) fn resume_agent(state_dir: &Path, alias: &str, detach: bool) -> Result<i32> {
-    let result = client::rpc(state_dir, "agent_resume", json!({"alias": alias}))?;
-    let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+    let result =
+        client::rpc_after_fleet_preflight(state_dir, "agent_resume", json!({"alias": alias}))?;
+    let show = lifecycle_row(state_dir, alias)?;
     let agent = &show["agent"];
     let (provider, kind) = (
         agent["provider"].as_str().unwrap_or_default(),
@@ -26,7 +55,7 @@ pub(crate) fn resume_agent(state_dir: &Path, alias: &str, detach: bool) -> Resul
     // Poll until the endpoint is live or the actor gives up.
     let deadline = Instant::now() + Duration::from_secs(30);
     let (agent, unknown) = loop {
-        let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+        let show = lifecycle_row(state_dir, alias)?;
         let agent = show["agent"].clone();
         let state = agent["state"].as_str().unwrap_or_default();
         if agent["endpoint"].is_string() || matches!(state, "stopped" | "offline" | "attention") {
@@ -100,7 +129,7 @@ pub(crate) fn fenced_next(alias: &str, error: &str, unknown: i64) -> Value {
 /// (the pane adopted a different native session) gets an explicit
 /// remove-and-rejoin hint.
 pub(crate) fn resume_one(state_dir: &Path, alias: &str) -> Value {
-    let (agent, unknown) = match client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
+    let (agent, unknown) = match lifecycle_row(state_dir, alias) {
         Ok(show) => (show["agent"].clone(), show["unknown"].as_i64().unwrap_or(0)),
         Err(e) => return json!({"alias": alias, "resumed": false, "error": e.to_string()}),
     };
@@ -160,12 +189,14 @@ pub(crate) fn resume_one(state_dir: &Path, alias: &str) -> Value {
                       "state": "attention", "error": error, "hint": hint});
     }
     let attachable = registry::attachable(provider, kind);
-    if let Err(e) = client::rpc(state_dir, "agent_resume", json!({"alias": alias})) {
+    if let Err(e) =
+        client::rpc_after_fleet_preflight(state_dir, "agent_resume", json!({"alias": alias}))
+    {
         return json!({"alias": alias, "resumed": false, "error": e.to_string()});
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let agent = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
+        let agent = lifecycle_row(state_dir, alias)
             .map(|s| s["agent"].clone())
             .unwrap_or_default();
         let state = agent["state"].as_str().unwrap_or_default();
@@ -229,7 +260,7 @@ pub(crate) fn finish_resume(state_dir: &Path, alias: &str, mut out: Value) -> Va
 pub(crate) fn refresh_briefing(state_dir: &Path, alias: &str) -> Result<Option<PathBuf>> {
     let deadline = Instant::now() + Duration::from_secs(15);
     let agent = loop {
-        let agent = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
+        let agent = lifecycle_row(state_dir, alias)
             .map(|s| s["agent"].clone())
             .unwrap_or_default();
         let state = agent["state"].as_str().unwrap_or_default();
@@ -245,6 +276,11 @@ pub(crate) fn refresh_briefing(state_dir: &Path, alias: &str) -> Result<Option<P
         agent["provider"].as_str().unwrap_or_default(),
         agent["endpoint_kind"].as_str().unwrap_or_default(),
     ) {
+        return Ok(None);
+    }
+    // The narrow operational projection carries no `params`; a member's
+    // personal assistant is private and gets no briefing written from here.
+    if agent.get("params").is_none() {
         return Ok(None);
     }
     let file = client::briefing_path(state_dir, &agent["params"], alias);
@@ -294,6 +330,17 @@ pub(crate) fn resume_sweep(state_dir: &Path, aliases: &[String]) -> Value {
            "fenced": fenced, "failed": failed})
 }
 
+/// CAD-2207: can an operator prove a full-fleet resume? The daemon returns
+/// only an undifferentiated `complete` boolean; no alias, count or class
+/// field. Missing/malformed is an error, never "complete".
+pub(crate) fn resume_complete(state_dir: &Path) -> Result<bool> {
+    let answer = client::rpc(state_dir, "agent_fleet_state", json!({"ignored_stale": []}))?;
+    answer
+        .get("complete")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| Error::internal("agent_fleet_state returned no complete resume verdict"))
+}
+
 /// `cadence resume <group>` / `cadence resume --all`.
 pub(crate) fn resume_command(
     state_dir: &Path,
@@ -302,20 +349,39 @@ pub(crate) fn resume_command(
     detach: bool,
 ) -> Result<i32> {
     if all {
-        let targets = client::rpc(state_dir, "agent_list", json!({}))?["agents"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        client::require_fleet_protocol(state_dir)?;
+        // CAD-2207: ordinary rows only. Restricted agents are never resumed
+        // by an operator sweep; their owning member route does it.
+        let targets = super::daemon::operational_agents(state_dir)?
             .iter()
             .filter(|a| {
-                a["endpoint"].is_null()
-                    && (a["thread_id"].is_string() || a["session_id"].is_string())
+                a["needs_native_resume"].as_bool().unwrap_or_else(|| {
+                    a["endpoint"].is_null()
+                        && (a["thread_id"].is_string() || a["session_id"].is_string())
+                })
             })
             .filter_map(|a| a["alias"].as_str().map(str::to_string))
             .collect::<Vec<_>>();
-        print_json(&resume_sweep(state_dir, &targets));
+        let daemon_complete = resume_complete(state_dir)?;
+        let mut out = resume_sweep(state_dir, &targets);
+        let ordinary_complete = out["fenced"].as_array().is_some_and(|rows| rows.is_empty())
+            && out["failed"].as_array().is_some_and(|rows| rows.is_empty());
+        let complete = daemon_complete && ordinary_complete;
+        out["complete"] = json!(complete);
+        if !complete {
+            out["incomplete"] = json!(
+                "full-fleet resume cannot be completed: some registered agents \
+                 were not resumed"
+            );
+            print_json(&out);
+            return Err(Error::rejected(
+                "full-fleet resume is incomplete — some registered agents were not resumed",
+            ));
+        }
+        print_json(&out);
         return Ok(0);
     }
+    client::require_fleet_protocol(state_dir)?;
     let group = group.expect("clap requires group unless --all");
     // Resolve like join: alias or provider-native id → the PM agent.
     let pm = client::rpc(state_dir, "agent_show", json!({"alias": group})).map_err(|_| {
