@@ -2294,6 +2294,11 @@ fn full_access_requests_every_opt_in_scope_in_one_login() {
             .collect::<Vec<_>>()
     )
     .is_empty());
+    assert_eq!(
+        action_dispatch::requested_scopes(true, false, false, true),
+        vec!["web.read", "web.prepare", "audit.approve"]
+    );
+    assert!(action_dispatch::requested_scopes(false, false, false, false).is_empty());
     assert_eq!(action_dispatch::login_granted_line(&[]), "none recorded");
     assert_eq!(
         action_dispatch::login_granted_line(&["cli.read".to_string(), "audit.approve".to_string()]),

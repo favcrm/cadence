@@ -2340,6 +2340,7 @@ fn read_credential_metadata(dir: &Path, target: &RemoteTarget) -> Result<Credent
         "issuer",
         "subject_id",
         "capabilities",
+        "requested_capabilities",
         "access_token",
         "expires_at",
         "cli_session",

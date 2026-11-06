@@ -77,6 +77,30 @@ pub(super) fn missing_full_access(capabilities: &[String]) -> Vec<&'static str> 
         .collect()
 }
 
+/// The scopes a login asked for, in a stable order, recorded beside the
+/// granted set (CAD-2213).
+pub(super) fn requested_scopes(
+    web: bool,
+    settings: bool,
+    cloud_agent: bool,
+    audit_approve: bool,
+) -> Vec<String> {
+    let mut scopes = Vec::new();
+    if web {
+        scopes.extend(["web.read", "web.prepare"]);
+    }
+    if settings {
+        scopes.extend(["settings.read", "settings.write"]);
+    }
+    if cloud_agent {
+        scopes.extend(["bridge.enroll", "cloud_agent.read", "cloud_agent.write"]);
+    }
+    if audit_approve {
+        scopes.push("audit.approve");
+    }
+    scopes.into_iter().map(str::to_string).collect()
+}
+
 pub(super) fn login_granted_line(capabilities: &[String]) -> String {
     if capabilities.is_empty() {
         "none recorded".to_string()
@@ -516,7 +540,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             // agent instead of four logins discovered one failure at a time.
             let (web, settings, cloud_agent, audit_approve) =
                 login_scopes(*web, *settings, *cloud_agent, *audit_approve, *full_access);
-            let grant = if web || settings || cloud_agent || audit_approve {
+            let mut grant = if web || settings || cloud_agent || audit_approve {
                 cadence_agent::remote_enrollment::login_portal_scoped(
                     issuer,
                     hint.as_deref().or(slug.as_deref()),
@@ -546,6 +570,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     |url, code| show_login_code(url, code, *no_open),
                 )?
             };
+            grant.requested = requested_scopes(web, settings, cloud_agent, audit_approve);
             // Registry replacement and credential save are one recovery
             // unit: a failed credential write restores the old binding, so a
             // replay never leaves a new binding pointing at an old token.
