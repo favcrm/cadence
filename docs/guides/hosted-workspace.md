@@ -540,9 +540,10 @@ the lane this machine started for that issue, and only that lane: it removes the
 worktree and deletes the local branch. It takes no other option; `--force`,
 `--keep-branch`, `--remote`, `--merged` and `--dry-run` are refused on a hosted
 org with nothing removed. The lane is found in this machine's coordinator ledger:
-its claim, generation and lane fields must match the recorded lane, and its
-assignment must have ended (`result`, `failed` or cancelled). An ended row may be
-fenced (`reassign --cancel` fences it); a live row must not be. The command uses
+its claim, generation and lane fields must match the recorded lane. After a
+confirmed cancellation the immediately preceding lane binding is retained for
+guarded release, not execution. The assignment must have ended (`result`,
+`failed` or cancelled); a live row must not be fenced. The command uses
 the native finish in-use guard and refuses, naming the cause, when the worktree
 is dirty (untracked files count whatever `status.showUntrackedFiles` says), has
 recently modified files, a process or agent is inside it, or the branch has not
@@ -564,6 +565,87 @@ nothing is using the lane and that you do not need its ignored files, then
 `git worktree remove <path>` and `git branch -d <branch>` (a squash-merged branch
 refuses `-d`; use `-D` only after verifying the merge). `issue reconcile` stays
 native-only.
+
+If the actor is gone but its assignment never ended, the assignment ID is shown
+by `cadence --org <name> agent assignments`. A client supporting CAD-2203 can
+cancel that exact assignment and attempt the same guarded release in one call:
+
+```sh
+cadence --org <name> agent reassign <assignment-id> --cancel --release-lane
+```
+
+Cancellation fences the claim but **does not stop the actor**; establish that
+it is gone before using this command. The cancellation can succeed even if the
+release is refused, for example because the lane is dirty or its exact tip is not
+shown merged. Inspect the lane and the reported reason before retrying; if it
+still exists and the reason is resolved, use `issue finish` rather than cancelling
+again. If the old lane binding is unavailable or ambiguous, it cannot be
+reconstructed by this command and the lane remains intact.
+While that cancellation is pending or its lane guard remains, starting the same
+issue is refused for every action and target rather than overwriting its recovery
+record, even if the path is absent.
+
+While cancellation is in flight or its lane remains unreleased, the current
+client records a local safety marker. Older clients reject that workspace's
+assignment ledger instead of starting or reusing a retired lane. A confirmed
+cancellation with no lane reservation clears the marker; an incomplete lane
+binding remains guarded for inspection. Successful release clears the marker
+only if the recorded binding is unchanged and the path is absent.
+If that cleanup cannot be confirmed, the release result contains a warning and
+the marker stays. Cancellation and lane creation are serialized only for
+current clients using the same local ledger; neither the lock nor the marker
+stops an actor, an older command already in flight, or a client using a
+different ledger.
+
+Automatic release of a guarded lane also requires **provenance**: the claim must
+have been acquired new by this client's local-agent protocol and the ledger must
+record no kickoff reserved or delivered for that claim generation. The record is
+written when the claim is acquired; replaying a claim that was already on the
+board — legacy, another ledger or a restart — leaves the history unknown. Legacy
+rows, external `--profile` sessions and any claim with a recorded kickoff are
+therefore refused: the client keeps the guard and lane and names the manual
+removal commands. Provenance covers this ledger's own protocol only — an external
+writer, another machine's ledger or an older client that already acted remains
+unknown, so establish that no actor is still using the lane before any manual
+removal.
+
+The board may coalesce different create actions for the same issue and target
+into one assignment. The client keeps each create operation's retry key while
+sharing a single custody record. When such additional receipts are present,
+older clients also refuse that ledger; use a current client rather than deleting
+the receipts or downgrading. They are retired with the ended assignment when
+new work is started.
+
+A cancellation that interrupts lane reservation before the worktree path was
+recorded can be reconciled only with that provenance and only when the expected
+checkout — derived from the repository root recorded with the reservation and
+the lane name — is absent and no longer registered with Git:
+
+```sh
+cadence --org <name> agent reconcile-release <assignment-id>
+```
+
+`reconcile-release` deletes nothing and verifies no merge evidence. Without
+provenance, or when the ledger records no repository, it refuses and the guard
+stays; only manual inspection applies.
+
+When a cancellation's outcome is unknown, inspect the named assignment and
+original operation before deciding whether to retry; do not assume it failed.
+When a retry is appropriate, the same `--cancel --release-lane` command reuses
+the saved operation ID and expected generation. If no correlated confirmation
+is available, the guard remains and release is blocked; a later refusal or
+current assignment snapshot alone does not settle the original request.
+If release already removed the lane but reports that the marker could not be
+cleared, inspect the assignment and checkout, then run:
+
+```sh
+cadence --org <name> agent reconcile-release <assignment-id>
+```
+
+This clears only a matching terminal guard when the lane path is absent and no
+longer registered with Git. It deletes no worktree or branch and does not verify
+merge evidence; its result reports those facts separately. A present, still
+registered, ambiguous or pending lane is refused.
 
 ### Managing agent profiles from the CLI (CAD-2101)
 

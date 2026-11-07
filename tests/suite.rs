@@ -7276,6 +7276,242 @@ mod cad2009_hosted_app_acceptance {
         }
     }
 
+    mod cad2203_hosted_release {
+        use super::*;
+        use cadence_agent::worktree::lifecycle::{self, CheckoutSpec};
+
+        fn git(repo: &Path, args: &[&str]) -> String {
+            let mut command = Command::new("git");
+            command.arg("-C").arg(repo).args(args);
+            let output = bounded_output(&mut command);
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        #[test]
+        fn cli_cancels_and_releases_only_a_merged_managed_lane() {
+            for (merged, proved) in [(true, true), (false, true), (true, false)] {
+                let fx = Fixture::new();
+                let repo = fx.root.path().join("repo");
+                fs::create_dir(&repo).unwrap();
+                git(&repo, &["init", "-b", "main"]);
+                git(&repo, &["config", "user.name", "Synthetic"]);
+                git(&repo, &["config", "user.email", "test@example.invalid"]);
+                git(&repo, &["config", "commit.gpgsign", "false"]);
+                fs::write(repo.join("file"), "base\n").unwrap();
+                git(&repo, &["add", "file"]);
+                git(&repo, &["commit", "-m", "base"]);
+                let lane = repo.join(".cadence/wt/test");
+                fs::create_dir_all(lane.parent().unwrap()).unwrap();
+                git(
+                    &repo,
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        "cadence/test",
+                        lane.to_str().unwrap(),
+                        "main",
+                    ],
+                );
+                fs::write(lane.join("file"), "lane work\n").unwrap();
+                git(&lane, &["add", "file"]);
+                git(&lane, &["commit", "-m", "lane work"]);
+                let tip = git(&repo, &["rev-parse", "cadence/test"]);
+                if merged {
+                    git(&repo, &["merge", "--ff-only", "cadence/test"]);
+                }
+                git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+                git(
+                    &repo,
+                    &[
+                        "symbolic-ref",
+                        "refs/remotes/origin/HEAD",
+                        "refs/remotes/origin/main",
+                    ],
+                );
+                let past = SystemTime::now() - Duration::from_secs(2 * 3600);
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(lane.join("file"))
+                    .unwrap()
+                    .set_modified(past)
+                    .unwrap();
+                let record = lifecycle::new_record(CheckoutSpec {
+                    repo: &repo,
+                    purpose: "development",
+                    tool: "cadence agent worktree",
+                    owner: "synthetic",
+                    path: &lane,
+                    branch: Some("cadence/test"),
+                    pinned_sha: &tip,
+                    issue: None,
+                });
+                lifecycle::activate(&repo, record).unwrap();
+
+                let mut attempts = serde_json::Map::new();
+                let mut attempt = json!({
+                    "operation_id": "op_test", "issue_id": "CAD-1", "action": "start",
+                    "target": null, "assignment_id": "hla_test", "generation": 1,
+                    "claim_id": "hlc_test", "state": "running", "fenced": false,
+                    "reassign_operation_id": null, "worktree": lane, "lane": "test",
+                    "lane_claim": "hlc_test", "lane_generation": 1
+                });
+                if proved {
+                    attempt["handoff"] = json!({"claim_id": "hlc_test", "generation": 1});
+                }
+                attempts.insert("CAD-1\u{1}start\u{1}-".into(), attempt);
+                let ledger = fx.root.path().join(format!(
+                    "config/cadence/remote-auth/local-assign-{WORKSPACE}.json"
+                ));
+                private_file(
+                    &ledger,
+                    &serde_json::to_vec(&json!({
+                        "version": 1, "client_agent_id": "la_test", "repo": repo,
+                        "alias": null, "attempts": attempts, "origins": {}
+                    }))
+                    .unwrap(),
+                );
+
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let tls = Arc::clone(&fx.tls);
+                let server = thread::spawn(move || {
+                    let mut descriptor = libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: descriptor points to one initialized pollfd.
+                    assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 15_000) }, 1);
+                    let (tcp, _) = listener.accept().unwrap();
+                    tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    tcp.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let conn = rustls::ServerConnection::new(tls).unwrap();
+                    let mut stream = rustls::StreamOwned::new(conn, tcp);
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        assert!(header.len() < 16_384);
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).unwrap();
+                        header.push(byte[0]);
+                    }
+                    let header = String::from_utf8(header).unwrap();
+                    let mut lines = header.split("\r\n");
+                    assert_eq!(
+                        lines.next().unwrap(),
+                        format!("POST /__platform/hosted-cadence/{WORKSPACE}/local-assignments/hla_test/reassign HTTP/1.1")
+                    );
+                    let mut length = None;
+                    let mut authorization = None;
+                    for line in lines.filter(|line| !line.is_empty()) {
+                        let (name, value) = line.split_once(':').unwrap();
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                        if name.eq_ignore_ascii_case("authorization") {
+                            authorization = Some(value.trim().to_owned());
+                        }
+                    }
+                    assert_eq!(
+                        authorization.as_deref(),
+                        Some(format!("Bearer {TOKEN}").as_str())
+                    );
+                    let length = length.unwrap();
+                    assert!(length <= 32_768);
+                    let mut bytes = vec![0; length];
+                    stream.read_exact(&mut bytes).unwrap();
+                    let request: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(request["organization_id"], WORKSPACE);
+                    assert_eq!(request["expected_generation"], 1);
+                    assert_eq!(request["cancel"], true);
+                    assert!(request["operation_id"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty()));
+                    let body = serde_json::to_vec(&json!({
+                        "version": "hosted-cadence-local-assignment.v1",
+                        "assignment_id": "hla_test", "organization_id": WORKSPACE,
+                        "issue_id": "CAD-1", "action": "start", "execution": "local",
+                        "state": "cancelled", "generation": 2, "claim_id": null,
+                        "target": null, "created_by_subject_id": "usr_test",
+                        "client_agent_id": null, "guidance": null,
+                        "reported_head_sha": null, "text": null
+                    }))
+                    .unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
+                    stream.flush().unwrap();
+                });
+                let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+                command
+                    .env_clear()
+                    .current_dir(&repo)
+                    .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                    .env("HOME", fx.root.path())
+                    .env("XDG_CONFIG_HOME", fx.root.path().join("config"))
+                    .env("XDG_STATE_HOME", fx.root.path().join("state"))
+                    .env("CADENCE_TEST_TLS_CA", fx.root.path().join("ca.pem"))
+                    .env("CADENCE_TEST_TLS_CONNECT", address.to_string())
+                    .env("CADENCE_JSON", "compact")
+                    .args([
+                        "--org",
+                        ORG,
+                        "agent",
+                        "reassign",
+                        "hla_test",
+                        "--cancel",
+                        "--release-lane",
+                    ]);
+                let output = bounded_output(&mut command);
+                server.join().unwrap();
+                if proved && merged {
+                    assert!(
+                        output.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    assert_eq!(result["assignment"]["state"], "cancelled");
+                    assert_eq!(result["assignment"]["stopped"], false);
+                    assert_eq!(result["release"]["removed_worktree"], true);
+                    assert!(!lane.exists());
+                    assert!(git(&repo, &["branch", "--list", "cadence/test"]).is_empty());
+                    let record = lifecycle::managed_record(&repo, &lane).unwrap().unwrap();
+                    assert_eq!(record.issue.as_deref(), Some("CAD-1"));
+                    assert_eq!(record.state, "released");
+                } else if proved {
+                    assert!(!output.status.success());
+                    let error = String::from_utf8_lossy(&output.stderr);
+                    assert!(error.contains("was cancelled") && error.contains("not shown merged"));
+                    assert!(lane.is_dir());
+                    assert_eq!(git(&repo, &["rev-parse", "cadence/test"]), tip);
+                    let record = lifecycle::managed_record(&repo, &lane).unwrap().unwrap();
+                    assert_eq!(record.issue, None);
+                    assert_eq!(record.state, "active");
+                } else {
+                    // A merged lane is still kept when the claim's history
+                    // cannot prove that no actor ever received it.
+                    assert!(!output.status.success());
+                    let error = String::from_utf8_lossy(&output.stderr);
+                    assert!(error.contains("was cancelled") && error.contains("cannot prove"));
+                    assert!(lane.is_dir());
+                    assert_eq!(git(&repo, &["rev-parse", "cadence/test"]), tip);
+                    let record = lifecycle::managed_record(&repo, &lane).unwrap().unwrap();
+                    assert_eq!(record.state, "active");
+                }
+            }
+        }
+    }
+
     fn assert_unknown(output: &Output, mutation: Mutation, reply: Reply) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
