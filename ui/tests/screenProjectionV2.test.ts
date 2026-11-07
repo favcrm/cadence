@@ -150,11 +150,15 @@ void (async () => {
   // 2. A v2 child receives phase, caption excerpt, refusal, permalink and defaults (no price).
   const v2 = mount(full); v2.port.receive({ v: 1, op: "ready", accepts: ["screen.v2"] });
   const p = v2.port.sent[0] as ScreenPush;
-  // The closed verb set's exact membership is the implementation's own wiring; assert only the
-  // envelope and the security-shaped properties a caller must be able to rely on.
+  // The closed verb set's exact membership and order are the implementation's own wiring; what a
+  // scoped consumer actually gates its UI on is that its feature-critical capabilities are
+  // advertised at all. These four are what the installed Social Content screens require: the
+  // inline consent card (status + allow) and the source flow (show + save).
+  const featureVerbs = ["publish.consent.status", "publish.consent.allow", "social.sources.show", "social.sources.save"];
   check(p.v === 2 && Array.isArray(p.actions) && !p.actions!.some(v => v.startsWith("media.")) &&
     !p.actions!.includes("screen.drawer.context") && !!p.publish_intents,
     "v2 envelope: v 2, intents kept, media verbs and the child-only drawer read are never advertised");
+  for (const verb of featureVerbs) check(p.actions!.includes(verb), `a scoped v2 consumer is offered ${verb}`);
   const byId = new Map(p.runs.map(r => [r.id, r]));
   check(byId.get("run-ready")!.phase === "ready" && byId.get("run-writing")!.phase === "working:produce_text" &&
     byId.get("run-checking")!.phase === "checking" && byId.get("run-failed")!.phase === "failed", "phase from real step receipts");
@@ -212,6 +216,7 @@ void (async () => {
     extras({ contextId: "ctx-b" }));
   check(!("sources" in foreignExtras) && foreignExtras.actions!.length === 0 &&
     foreignExtras.runs.every(r => !("caption_excerpt" in r)), "board reads tagged for another context are never pushed");
+  for (const verb of featureVerbs) check(!foreignExtras.actions!.includes(verb), `an unscoped projection offers no ${verb}`);
   check(!("sources" in screenProjection(installation, "main", "ctx-a", [context], runs, effects, intents, extras({ installId: "inst-2" }))),
     "board reads tagged for another install are never pushed");
   const otherScope = screenProjection(installation, "main", "ctx-b", [context, otherContext], runs, effects, undefined,
