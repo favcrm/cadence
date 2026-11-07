@@ -847,7 +847,6 @@ async function planConsentAllow(ctx: ActionContext, args: Record<string, unknown
       disclosure: [
         say("Standing authorization for linked-device publishing to the named account. Withdraw it any time in AgenticOS."),
         say("Separately approved hosted posts still send without it. Each send uses your AgenticOS balance."),
-        say("Every post is approved here before it is sent."),
       ].join("\n"),
     },
     run: async (): Promise<ActionResult> => {
