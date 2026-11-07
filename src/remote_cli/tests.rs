@@ -5200,6 +5200,51 @@ fn hosted_platform_call_pre_forward_refusals_stay_definite() {
     }
 }
 
+#[test]
+fn app_call_review_validation_refusal_keeps_its_code_without_leaking_server_text() {
+    let refusal = json!({
+        "ok": false,
+        "error": {"code": "validation_failed", "message": "private upstream detail"}
+    });
+    let (listener, seen, server) = finite_worker(2, move |index, socket, _request| {
+        if index == 0 {
+            write_answer(
+                socket,
+                "200 OK",
+                "",
+                &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+            );
+        } else {
+            write_answer(socket, "400 Bad Request", "", &refusal);
+        }
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let args = json!({
+        "operation": "call",
+        "tool": "app_call",
+        "body": {"app": "social-content", "operation": "social.drafts.show", "args": "{}"},
+        "key": "validation-synthetic"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    let error = call_verb_in(
+        &target,
+        "platform_call",
+        args,
+        10,
+        &dir,
+        |_| {},
+        |_| panic!("validation refusal must not be retried"),
+    )
+    .expect_err("invalid arguments must be refused");
+    server.join().unwrap();
+    assert_eq!(error.kind(), "rejected");
+    assert_eq!(error.code(), Some("validation_failed"));
+    assert!(!error.to_string().contains("private upstream detail"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
 /// Exercise the real credential, authorize and multipart upload orchestration.
 /// Client completion ends the fixture; timeouts are loud failure bounds only.
 fn cad2009_artifact_upload_answer(status: &'static str, answer: Value) -> Result<Value> {

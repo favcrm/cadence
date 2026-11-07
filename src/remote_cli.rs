@@ -3919,6 +3919,10 @@ fn platform_error_details(body: Option<&Value>) -> String {
 /// Only fixed app refusal codes cross this boundary; provider text stays private.
 fn app_action_refusal(status: u16, code: Option<&str>) -> Option<Error> {
     let (code, message) = match (status, code) {
+        (400, Some("validation_failed")) => (
+            "validation_failed",
+            "The app action arguments were refused. Use `cadence --org <workspace> app describe <app>` to check the action's required fields.",
+        ),
         (403, Some("owner_required")) => (
             "owner_required",
             "This app action requires the workspace owner. Ask the owner to perform it.",

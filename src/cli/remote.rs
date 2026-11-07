@@ -3088,7 +3088,23 @@ where
             }
             // The ordinary hosted answer is one JSON document under the
             // shared stdout policy, like a local verb's.
+            let exit = if matches!(
+                &command,
+                Commands::App {
+                    action: AppAction::Call { .. }
+                }
+            ) {
+                app_call_receipt_exit(&body)
+            } else {
+                0
+            };
             print_json(&body);
+            if exit != 0 {
+                return Err(Error::invalid(
+                    "staged_action_not_applied",
+                    "The staged action was denied or failed; inspect the returned status.",
+                ));
+            }
             Ok(0)
         }
         cadence_agent::remote_cli::RemoteAnswer::Conflict(body) => {
@@ -3101,6 +3117,27 @@ where
             print_json(&body);
             Ok(5)
         }
+    }
+}
+
+/// A terminal refusal remains nonzero while the action receipt stays visible.
+fn app_call_receipt_exit(body: &Value) -> i32 {
+    let Some(data) = body.get("data").and_then(Value::as_object) else {
+        return 0;
+    };
+    if data.get("staged").and_then(Value::as_bool) == Some(true)
+        && data
+            .get("actionId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        && matches!(
+            data.get("status").and_then(Value::as_str),
+            Some("denied" | "failed")
+        )
+    {
+        3
+    } else {
+        0
     }
 }
 
@@ -3707,6 +3744,32 @@ mod hosted_finish_acceptance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_call_review_denied_or_failed_staged_calls_exit_nonzero() {
+        for status in ["denied", "failed"] {
+            let receipt = json!({"ok": true, "data": {
+                "staged": true, "actionId": "act_synthetic", "status": status, "replayed": true
+            }});
+            assert_eq!(app_call_receipt_exit(&receipt), 3, "{status}");
+        }
+        for status in ["pending", "applied"] {
+            let receipt = json!({"ok": true, "data": {
+                "staged": true, "actionId": "act_synthetic", "status": status, "replayed": true
+            }});
+            assert_eq!(app_call_receipt_exit(&receipt), 0, "{status}");
+        }
+        assert_eq!(
+            app_call_receipt_exit(&json!({"ok": true, "data": {"status": "failed"}})),
+            0
+        );
+        assert_eq!(
+            app_call_receipt_exit(
+                &json!({"ok": true, "data": {"staged": true, "status": "failed"}})
+            ),
+            0
+        );
+    }
     #[test]
     fn accept_revise_is_refused_before_any_request_for_a_managed_caller() {
         let target = cadence_agent::remote_cli::RemoteTarget {

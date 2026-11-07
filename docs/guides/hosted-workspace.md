@@ -472,6 +472,10 @@ Without `--request`, identical actions and arguments use the same derived
 handle and replay. For a deliberate second identical draft, supply a different
 explicit handle; do not change it merely because an outcome is uncertain.
 
+For a staged write, the receipt's status is the outcome: `pending` awaits an
+owner, `applied` was written, and `denied` or `failed` exits nonzero while
+keeping the receipt on stdout.
+
 Managed agents use their own credential for platform and app operations. If
 that credential is unavailable or refused, the CLI does not retry the action
 as the member; a separate human session may use its own authorized access.
