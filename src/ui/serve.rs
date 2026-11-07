@@ -17,7 +17,9 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use super::artifacts;
 use super::cloud_agents;
 use super::human_threads;
-use super::member_view::{member_event, member_running_item, redact_agents_payload};
+use super::member_view::{
+    member_event, member_running_item, redact_agents_payload, retain_readable_tickets,
+};
 use super::notify_service;
 use super::setup::{board_boot_agent_uid, setup_get, setup_refusal, WRITE_LOCK};
 use super::stream::stream_events;
@@ -1886,13 +1888,34 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             });
             if admitted {
                 let pm = Pm::at(pm_dir).ok();
+                // CAD-2187: a count is an answer about a project that exists, so
+                // it is counted over the caller's readable set. Health is a
+                // public probe, so it has no read admission to derive an actor
+                // from — the board caller is resolved directly, and a caller
+                // that cannot be resolved reads nothing rather than everything.
+                let readable = match (
+                    Pm::at(pm_dir),
+                    operator::board_caller(&request, state_dir, opts, false, None),
+                ) {
+                    (Ok(pm), Ok(caller)) => {
+                        super::project_policy::readable(&pm, &operator::caller_spelling(&caller))
+                    }
+                    _ => Default::default(),
+                };
                 let (projects, issues) = match &pm {
-                    Some(pm) => (
-                        project::list(&pm.dir).map(|list| list.len()).unwrap_or(0),
-                        board::load_all(&pm.dir, None)
-                            .map(|list| list.len())
-                            .unwrap_or(0),
-                    ),
+                    Some(pm) => {
+                        let projects = project::list(&pm.dir)
+                            .map(|list| list.iter().filter(|p| readable.contains(&p.key)).count())
+                            .unwrap_or(0);
+                        let issues = board::load_all(&pm.dir, None)
+                            .map(|list| {
+                                list.iter()
+                                    .filter(|v| readable.contains(&v.project))
+                                    .count()
+                            })
+                            .unwrap_or(0);
+                        (projects, issues)
+                    }
                     None => (0, 0),
                 };
                 let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
@@ -2116,10 +2139,31 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
-        "/api/milestones" => send(
-            request,
-            stages::milestones(state_dir, pm_dir, query("project").as_deref()),
-        ),
+        "/api/milestones" => {
+            let resp = match Pm::at(pm_dir) {
+                Err(e) => err_response(503, &e.to_string()),
+                Ok(pm) => match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => {
+                        // CAD-2187: a milestone row names its issues, so a
+                        // project the caller may not read has no milestones for
+                        // them at all.
+                        let readable = super::project_policy::readable(&pm, &actor);
+                        stages::milestones(
+                            state_dir,
+                            pm_dir,
+                            query("project").as_deref(),
+                            &readable,
+                        )
+                    }
+                    Some(Err(resp)) => resp,
+                    None => err_response(503, "read admission is missing"),
+                },
+            };
+            send(request, resp)
+        }
         "/api/agents" => {
             // CAD-1767: running-message text is the operator's; anyone else
             // (fail closed) gets the allowlisted rows.
@@ -2127,6 +2171,28 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             let mut payload = read_model::get(state_dir, pm_dir).agents();
             if !operator {
                 redact_agents_payload(&mut payload);
+            }
+            // CAD-2187: a task row carries the ticket's title and id. A project
+            // the caller cannot read contributes no task at all — the operator
+            // is the one caller for whom nothing is restricted.
+            if !operator {
+                if let (Ok(pm), Some(actor)) = (
+                    Pm::at(pm_dir),
+                    read_admission
+                        .as_ref()
+                        .and_then(|a| operator::read_actor(a, &request, state_dir, opts).ok()),
+                ) {
+                    let readable = super::project_policy::readable(&pm, &actor);
+                    let by_id: std::collections::HashMap<String, String> =
+                        board::load_all(&pm.dir, None)
+                            .map(|all| {
+                                all.into_iter()
+                                    .map(|v| (v.front.id.clone(), v.project.clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    retain_readable_tickets(&mut payload, &readable, &by_id);
+                }
             }
             send(request, json_response(payload))
         }
@@ -2371,10 +2437,29 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // `/api/projects/<key>/workflows[/<name>/preview]` — the
                 // project's workflow templates beside PROJECT.md (CAD-496).
                 if let Some(read) = workflows::read_route(&path) {
-                    match Pm::at(pm_dir) {
-                        Ok(pm) => send(request, workflows::read(&pm, state_dir, &query, read)),
-                        Err(e) => send(request, err_response(503, &e.to_string())),
-                    }
+                    let resp = match Pm::at(pm_dir) {
+                        Ok(pm) => {
+                            let actor = match read_admission
+                                .as_ref()
+                                .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                            {
+                                Some(Ok(actor)) => Some(actor),
+                                Some(Err(resp)) => {
+                                    send(request, resp);
+                                    return;
+                                }
+                                None => None,
+                            };
+                            match actor {
+                                Some(actor) => {
+                                    workflows::read(&pm, state_dir, &query, read, &actor)
+                                }
+                                None => err_response(503, "read admission is missing"),
+                            }
+                        }
+                        Err(e) => err_response(503, &e.to_string()),
+                    };
+                    send(request, resp);
                     return;
                 }
             }
@@ -2586,13 +2671,20 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             // bindings and doctor findings, its runs and its outputs
             // (CAD-557, CAD-563).
             if let Some(read) = apps::read_route(&path) {
-                match Pm::at(pm_dir) {
-                    Ok(pm) => {
-                        let resp = apps::read(&request, &pm, state_dir, opts, &query, read);
-                        send(request, resp);
-                    }
-                    Err(e) => send(request, err_response(503, &e.to_string())),
-                }
+                let resp = match Pm::at(pm_dir) {
+                    Ok(pm) => match read_admission
+                        .as_ref()
+                        .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                    {
+                        Some(Ok(actor)) => {
+                            apps::read(&request, &pm, state_dir, opts, &query, read, &actor)
+                        }
+                        Some(Err(resp)) => resp,
+                        None => err_response(503, "read admission is missing"),
+                    },
+                    Err(e) => err_response(503, &e.to_string()),
+                };
+                send(request, resp);
                 return;
             }
             // `/api/memories/<project>/<slug>` — memory detail.

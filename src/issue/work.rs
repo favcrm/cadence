@@ -1050,11 +1050,22 @@ fn worse(a: &str, b: &str) -> &'static str {
 /// non-epic tasks, size-weighted. A task's explicit assignment overrides
 /// its epic's default. Health uses only work scoped to this checkpoint;
 /// checkpoint status and calendar dates are declared, never inferred.
-pub fn milestones_json(ctx: &Ctx, views: &[View], project_key: Option<&str>) -> Vec<Value> {
+pub fn milestones_json(
+    ctx: &Ctx,
+    views: &[View],
+    project_key: Option<&str>,
+    readable: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<Value> {
+    let may_read = |key: &str| readable.is_none_or(|set| set.contains(key));
     // (project, milestone) → member views, in id order.
     let mut members: BTreeMap<(String, String), Vec<&View>> = BTreeMap::new();
     for v in views {
         if project_key.is_some_and(|p| v.issue.project != p) {
+            continue;
+        }
+        // CAD-2187: a milestone row names its issues, so a project the caller
+        // may not read contributes nothing — not even an empty row.
+        if !may_read(&v.issue.project) {
             continue;
         }
         if let Some((m, _)) = effective_milestone(ctx, v) {
@@ -1068,7 +1079,7 @@ pub fn milestones_json(ctx: &Ctx, views: &[View], project_key: Option<&str>) -> 
     let mut projects: Vec<&String> = ctx.configs.keys().collect();
     projects.sort();
     for key in projects {
-        if project_key.is_some_and(|p| key != p) {
+        if project_key.is_some_and(|p| key != p) || !may_read(key) {
             continue;
         }
         for m in &ctx.config(key).milestones {
@@ -1240,7 +1251,7 @@ pub fn milestone_show(
     id: &str,
     project_key: Option<&str>,
 ) -> Result<Value> {
-    let rows: Vec<Value> = milestones_json(ctx, views, project_key)
+    let rows: Vec<Value> = milestones_json(ctx, views, project_key, None)
         .into_iter()
         .filter(|r| r["id"] == id)
         .collect();
@@ -1875,9 +1886,29 @@ milestones: [{id: m, status: "bo\e[31m\u202egus\a"}]
                 unapproved: None,
             },
         );
-        let rows = milestones_json(&ctx, &vs, None);
+        let rows = milestones_json(&ctx, &vs, None, None);
         let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["m0", "m2", "m10"], "configured first, then found");
+        // CAD-2187: a project the caller may not read contributes no milestone
+        // row at all — not an empty one, which would still name the project.
+        let none = std::collections::BTreeSet::new();
+        assert!(
+            milestones_json(&ctx, &vs, None, Some(&none)).is_empty(),
+            "an empty readable set still produced rows"
+        );
+        let only_other: std::collections::BTreeSet<String> =
+            ["other".to_string()].into_iter().collect();
+        assert!(
+            milestones_json(&ctx, &vs, None, Some(&only_other)).is_empty(),
+            "a restricted project's milestones were served to a stranger"
+        );
+        let mine: std::collections::BTreeSet<String> =
+            ["cadence".to_string()].into_iter().collect();
+        assert_eq!(
+            milestones_json(&ctx, &vs, None, Some(&mine)).len(),
+            rows.len(),
+            "the readable project lost its own milestones"
+        );
         let m2 = &rows[1];
         assert_eq!(m2["title"], "One team");
         // Items: CAD-2 (M done), CAD-3 (M), CAD-6 (S done) → 4 / 7.
@@ -1905,7 +1936,7 @@ milestones: [{id: m, status: "bo\e[31m\u202egus\a"}]
         let vs = views(Path::new("/no-notes"), vec![epic, inherited, explicit]);
         let by_id = vs.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
         let ctx = ctx_for(&by_id);
-        let rows = milestones_json(&ctx, &vs, None);
+        let rows = milestones_json(&ctx, &vs, None, None);
         let m1 = rows.iter().find(|r| r["id"] == "m1").unwrap();
         let m2 = rows.iter().find(|r| r["id"] == "m2").unwrap();
         assert_eq!(
@@ -1948,7 +1979,7 @@ milestones: [{id: m, status: "bo\e[31m\u202egus\a"}]
                 unapproved: None,
             },
         );
-        let row = &milestones_json(&ctx, &vs, None)[0];
+        let row = &milestones_json(&ctx, &vs, None, None)[0];
         assert_eq!(row["owner"], "pm");
         assert_eq!(row["target_date"], "2026-01-31");
         assert_eq!(
@@ -1994,7 +2025,7 @@ milestones: [{id: m, status: "bo\e[31m\u202egus\a"}]
                 unapproved: None,
             },
         );
-        let rows = milestones_json(&ctx, &vs, None);
+        let rows = milestones_json(&ctx, &vs, None, None);
         assert_eq!(rows[0]["status"], "planned");
         assert_eq!(rows[0]["schedule"]["state"], "due_today");
         assert_eq!(rows[0]["progress"]["total_weight"], 0);
@@ -2014,7 +2045,7 @@ milestones: [{id: m, status: "bo\e[31m\u202egus\a"}]
         let vs = views(Path::new("/no-notes"), vec![epic, tagged, foreign]);
         let by_id = vs.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
         let ctx = ctx_for(&by_id);
-        let rows = milestones_json(&ctx, &vs, None);
+        let rows = milestones_json(&ctx, &vs, None, None);
         assert_eq!(
             rows.len(),
             2,

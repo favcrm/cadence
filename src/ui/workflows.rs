@@ -94,7 +94,17 @@ pub(super) fn read(
     state_dir: &std::path::Path,
     query: &dyn Fn(&str) -> Option<String>,
     route: ReadRoute<'_>,
+    actor: &str,
 ) -> HttpResp {
+    // A workflow's title, goal and rendered plan are the project's content;
+    // a caller the project does not admit is told the project is unknown,
+    // exactly as a missing one answers.
+    let key = match &route {
+        ReadRoute::List(key) | ReadRoute::Preview(key, _) => *key,
+    };
+    if super::project_policy::refused(pm, key, actor) {
+        return err_response(404, "unknown project");
+    }
     match route {
         ReadRoute::List(key) => list(pm, state_dir, key),
         ReadRoute::Preview(key, name) => preview(&pm.dir, state_dir, key, name, query),
@@ -311,5 +321,42 @@ pub(super) fn propose(
     ) {
         Ok(out) => json_response(out),
         Err(e) => home::rpc_err(&e, "plan_propose"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::issue::Pm;
+
+    /// A project's workflows are its content: a caller its policy does not
+    /// admit is told the project is unknown, not that it has no workflows.
+    #[test]
+    fn a_restricted_projects_workflows_are_unknown_to_a_stranger() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pm = Pm::init(&dir.path().join("pm")).unwrap();
+        let project = pm.dir.join("secret");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("project.yaml"),
+            "key: secret\nprefix: SEC\npolicy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
+        )
+        .unwrap();
+        let state = dir.path().join("state");
+        let none = |_: &str| None;
+
+        let refused = read(&pm, &state, &none, ReadRoute::List("secret"), "users/rob");
+        assert_eq!(
+            refused.status_code().0,
+            404,
+            "a stranger read the workflows"
+        );
+
+        let admitted = read(&pm, &state, &none, ReadRoute::List("secret"), "users/mia");
+        assert_ne!(
+            admitted.status_code().0,
+            404,
+            "the grant was told the project does not exist"
+        );
     }
 }

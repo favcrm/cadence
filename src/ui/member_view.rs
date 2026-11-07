@@ -120,6 +120,54 @@ pub(crate) fn member_agent_row(row: &Value) -> Value {
     Value::Object(out)
 }
 
+/// Drop everything in the fleet payload that names a ticket the caller cannot
+/// read.
+///
+/// The rule is one sentence — a project the caller's policy does not admit is
+/// absent — and it has four carriers in this payload: each agent's `tasks`,
+/// each agent's `on` binding, the top-level `by_issue` map, and a profile's
+/// `latest_claim.issue_id`. A task whose issue cannot be mapped is dropped too:
+/// an unresolvable id is not evidence that the ticket is readable.
+pub(crate) fn retain_readable_tickets(
+    payload: &mut Value,
+    readable: &std::collections::BTreeSet<String>,
+    project_of_issue: &std::collections::HashMap<String, String>,
+) {
+    let readable_issue = |issue: &str| {
+        project_of_issue
+            .get(issue)
+            .is_some_and(|p| readable.contains(p))
+    };
+
+    if let Some(agents) = payload["agents"].as_array_mut() {
+        for agent in agents {
+            if let Some(tasks) = agent["tasks"].as_array_mut() {
+                tasks.retain(|task| match task["issue"].as_str() {
+                    Some(issue) => readable_issue(issue),
+                    None => true,
+                });
+            }
+            if let Some(on) = agent["on"].as_str() {
+                if project_of_issue.contains_key(on) && !readable_issue(on) {
+                    agent["on"] = Value::Null;
+                }
+            }
+        }
+    }
+    if let Some(by_issue) = payload["by_issue"].as_object_mut() {
+        by_issue.retain(|issue, _| readable_issue(issue));
+    }
+    if let Some(profiles) = payload["profiles"].as_array_mut() {
+        for profile in profiles {
+            if let Some(issue) = profile["latest_claim"]["issue_id"].as_str() {
+                if !readable_issue(issue) {
+                    profile["latest_claim"] = Value::Null;
+                }
+            }
+        }
+    }
+}
+
 /// The fleet payload for a non-operator: every row rebuilt.
 pub(crate) fn redact_agents_payload(payload: &mut Value) {
     if let Some(rows) = payload["agents"].as_array_mut() {
