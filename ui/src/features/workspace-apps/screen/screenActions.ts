@@ -825,6 +825,10 @@ async function planConsentAllow(ctx: ActionContext, args: Record<string, unknown
     return { code: "unavailable", text: "Publishing consent can't be given here yet. Open the account's settings on AgenticOS." };
   if (status.not_ready.includes(destination))
     return { code: "not_ready", text: "That account is still connecting. Try again once it is ready." };
+  // The account must have exactly one authoritative status row for this destination AND toolkit.
+  // An available answer that does not attest this account is incomplete authority, never eligible.
+  if (status.consents.filter(row => row.destination_id === destination && row.toolkit === toolkit).length !== 1)
+    return { code: "unavailable", text: "Couldn't confirm this account's consent status. Try again." };
   let listed: { unavailable: boolean; destinations: { destination_id: string; label: string; toolkit: string }[] };
   try { listed = await workspaceApps.destinations(ctx.installId); }
   catch { return { code: "unavailable", text: "Couldn't check your accounts right now. Try again." }; }

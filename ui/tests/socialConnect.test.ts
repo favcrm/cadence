@@ -399,7 +399,7 @@ async function main() {
   let refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
   assert("code" in refusedPlan && refusedPlan.code === "unavailable", "no capability, no consent");
   replies = {
-    "/publishing/consent": { body: { available: true, consents: [] } },
+    "/publishing/consent": { body: { available: true, consents: [{ destination_id: "d1", toolkit: "instagram", state: "none" }] } },
     "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d2", label: "kowloon", toolkit: "instagram" }] } },
   };
   refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
@@ -410,6 +410,20 @@ async function main() {
   ] } };
   refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
   assert("code" in refusedPlan && refusedPlan.code === "not_found", "an ambiguous match is not granted");
+  // An available answer that does not attest this account is incomplete authority: no card, no POST.
+  replies = {
+    "/publishing/consent": { body: { available: true, consents: [], not_ready: ["n1"] } },
+    "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } },
+  };
+  calls.length = 0;
+  refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
+  assert("code" in refusedPlan && refusedPlan.code === "unavailable", "a status with no row for the account is not eligible");
+  assert(!calls.some(call => call.body !== undefined), "no status row means no consent write");
+  replies["/publishing/consent"] = { body: { available: true, consents: [{ destination_id: "d1", toolkit: "facebook", state: "none" }] } };
+  calls.length = 0;
+  refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
+  assert("code" in refusedPlan && refusedPlan.code === "unavailable", "a row for another toolkit is not this account's row");
+  assert(!calls.some(call => call.body !== undefined), "a wrong-toolkit row means no consent write");
   calls.length = 0;
   refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram", label: "forged" }, {});
   assert("code" in refusedPlan && refusedPlan.code === "bad_args" && calls.length === 0, "a frame-supplied field is refused before any read");
