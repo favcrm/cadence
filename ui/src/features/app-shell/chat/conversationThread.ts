@@ -151,9 +151,10 @@ export function useThreadStream(
                 return data ?? EMPTY_THREAD;
               }
               // A connection snapshot can arrive after a newer identity GET.
-              // Reconcile through the canonical reader instead of rolling back
-              // its opaque revision with an older streamed profile.
-              void resources.masterConversation(conversation).refresh();
+              // Reconcile through the canonical reader rather than rolling back
+              // its opaque revision. If an older read is in flight, invalidate
+              // schedules the trailing read that observes this turn change.
+              void resources.masterConversation(conversation).invalidate();
               if (resources.masterThread.get().data?.conversation === conversation) {
                 resources.masterState.write(() => snapshot);
               }
