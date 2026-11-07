@@ -452,6 +452,10 @@ local device protocol. A connection does not select a Search Console property:
 enrollment links the provider account only, and verified property selection is
 not provided yet.
 
+A replay without a recorded result is not a successful report. Hosted and
+local-device clients refuse to present a missing result as success and do not
+automatically dispatch another read.
+
 ### Owner enrollment from the CLI (Search Console first)
 
 An owner enrolls a provider account from a plain shell, in three steps. The
