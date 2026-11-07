@@ -5,6 +5,7 @@ declare function require(name: string): any;
 const moduleLoader = require("module");
 const originalRequire = moduleLoader.prototype.require;
 moduleLoader.prototype.require = function (this: unknown, id: string) {
+  if (id.endsWith(".css")) return {};
   if (id === "@hugeicons/core-free-icons") return new Proxy({}, { get: () => ({}) });
   if (id === "@hugeicons/react") return { HugeiconsIcon: () => null };
   return originalRequire.apply(this, arguments);
