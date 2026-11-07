@@ -113,8 +113,9 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
         <WorkspaceDialog title={t(view.card.title ?? "Post this now?")} className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
           <div className="wa-stack" data-host-confirm={view.token.slice(0, 8)}>
             {view.card.image && <img src={view.card.image} alt={t("The image that will post")} style={{ maxWidth: "100%", maxHeight: 240, objectFit: "contain", borderRadius: 8 }} />}
-            <p className="wa-caption" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{view.card.caption}</p>
+            {view.card.caption && <p className="wa-caption" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{view.card.caption}</p>}
             <p>{t("To")} <strong>{view.card.target}</strong></p>
+            {view.card.disclosure && <p data-host-disclosure style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{view.card.disclosure}</p>}
             {view.card.detail && <p>{view.card.detail}</p>}
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
               <Button disabled={view.pending} onClick={() => onCancel(view.token)}>{t("Cancel")}</Button>
@@ -125,7 +126,7 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
                   pressed.current = 0;
                   onTap(view.token, event.isTrusted, at);
                 }}>
-                {view.pending ? t("Posting…") : view.label}
+                {view.pending ? t("Working…") : view.label}
               </button>
             </div>
           </div>

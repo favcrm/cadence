@@ -1,5 +1,6 @@
 import type { AppBinding, Installation, PublishDestination } from "./workspaceApps";
 import type { ToastMsg } from "../../ui/Toast";
+import { DRAWER_SURFACE, type ScreenDrawerSize } from "./screen/screenProtocol";
 
 /** CAD-1290: connect Instagram through AgenticOS and choose the publishing account.
  *  CAD-1939: Facebook Pages too, with one publication binding per destination. */
@@ -15,12 +16,56 @@ const OUTCOMES: readonly string[] = ["connected", "failed", "cancelled"];
 /** The params AgenticOS adds to `return_to`; both are removed after they are read. */
 const RETURN_PARAMS = ["aos_connect", "aos_publish", "toolkit"];
 
-/** This board's host-drawn Settings page for the install (`?screen=native`), where the connected
- *  accounts and "Use for publishing" live. The host sends it as `return_to`; AgenticOS refuses any other origin.
- *  Keep the immutable installation pin so a return after reinstall cannot
- *  select the replacement merely because its package key is the same. */
-export function connectReturnTo(origin: string, appKey: string, installId: string): string {
-  return `${origin}/apps/${encodeURIComponent(appKey)}?screen=native&install=${encodeURIComponent(installId)}`;
+/** Where the operator comes back to. `native` is the host-drawn Settings page of this board
+ *  (the native workspace's own callers). `screen` is the app's own screen — the one a
+ *  drawer surface lives on — and `drawer` additionally names the surface to open again, so a
+ *  connect started in the app's drawer returns to that drawer instead of another page. */
+export type ConnectReturnTarget =
+  | { mode: "native" }
+  | { mode: "screen" }
+  | { mode: "drawer"; surface: string; size?: ScreenDrawerSize };
+
+/** This board's install page: its host-drawn Settings page for the install (`?screen=native`),
+ *  the app screen itself, or that screen with the drawer surface the owner connected from.
+ *  AgenticOS refuses any other origin; it keeps the path and query we send. Keep the immutable
+ *  installation pin so a return after reinstall cannot select the replacement merely because
+ *  its package key is the same. */
+export function connectReturnTo(
+  origin: string,
+  appKey: string,
+  installId: string,
+  target: ConnectReturnTarget = { mode: "native" },
+): string {
+  const query = new URLSearchParams();
+  if (target.mode === "native") query.set("screen", "native");
+  else if (target.mode === "drawer" && DRAWER_SURFACE.test(target.surface)) {
+    query.set("drawer", target.surface);
+    if (target.size) query.set("drawer_size", target.size);
+  }
+  query.set("install", installId);
+  return `${origin}/apps/${encodeURIComponent(appKey)}?${query.toString()}`;
+}
+
+/** The query parameters that carry the return drawer back. The board owns them: the app frame
+ *  never writes them, and the shell re-opens the surface only after its own frame handshakes. */
+export const RETURN_DRAWER_PARAMS = ["drawer", "drawer_size"] as const;
+
+/** The drawer surface a connect return asked the board to re-open, or null for a page. A
+ *  surface that is not one a drawer request could name is ignored; the app screen still opens. */
+export function readReturnDrawer(search: string): { surface: string; size?: ScreenDrawerSize } | null {
+  const query = new URLSearchParams(search);
+  const surface = query.get("drawer");
+  if (surface === null || !DRAWER_SURFACE.test(surface)) return null;
+  const size = query.get("drawer_size");
+  return size === "narrow" || size === "wide" ? { surface, size } : { surface };
+}
+
+/** The query with the return-drawer hint removed (the rest is kept). */
+export function withoutReturnDrawer(search: string): string {
+  const query = new URLSearchParams(search);
+  for (const key of RETURN_DRAWER_PARAMS) query.delete(key);
+  const rest = query.toString();
+  return rest ? `?${rest}` : "";
 }
 
 /** The outcome AgenticOS reported on return, only for a publishable toolkit. Anything else is not ours. */
@@ -38,16 +83,22 @@ export function withoutConnectParams(search: string): string {
   return rest ? `?${rest}` : "";
 }
 
-/** After a connect, AgenticOS asks the owner to allow publishing; it reports `allowed` or `skipped`. */
-export function publishAllowed(search: string): boolean {
-  return new URLSearchParams(search).get("aos_publish") === "allowed";
-}
-
-export function connectToast(outcome: ConnectOutcome, allowed = false): ToastMsg {
-  if (outcome === "connected" && allowed) return { kind: "ok", text: "Publishing allowed" };
-  if (outcome === "connected") return { kind: "ok", text: "Account connected" };
+/** What the return says. The URL is a report from another origin, not evidence: `connected` is
+ *  neutral about the account (the scoped account read shows what really exists), and neither a
+ *  connection nor any publishing grant is claimed from a query parameter. */
+export function connectToast(outcome: ConnectOutcome): ToastMsg {
+  if (outcome === "connected") return { kind: "ok", text: "Connection finished — check your accounts" };
   // The cancel signal is unverified upstream: cancelled reads as not connected, like failed.
   return { kind: "err", text: "Connection failed — try again" };
+}
+
+/** A source-save completion may only refresh the primary whose install and context it was made
+ *  in: after the operator switches scope, the settled write must not touch the new screen. */
+export function sameScope(
+  initiating: { installId: string; contextId: string },
+  current: { installId: string; contextId: string } | null,
+): boolean {
+  return current !== null && current.installId === initiating.installId && current.contextId === initiating.contextId;
 }
 
 /** "@harbour" for a handle; a name with spaces is shown as it is. */

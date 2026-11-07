@@ -4,8 +4,8 @@ import { navigate } from "../../../lib/useLocation";
 import { rememberContext } from "../contextSelection";
 import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type PublishDestination, type WorkspaceRun } from "../workspaceApps";
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
-import { accountLabel, connectReturnTo, destinationBindings, isPublishToolkit, sendSlot, bindingToUse } from "../socialConnect";
-import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaImportArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
+import { accountLabel, connectReturnTo, destinationBindings, isPublishToolkit, sendSlot, bindingToUse, type ConnectReturnTarget, type PublishToolkit } from "../socialConnect";
+import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaImportArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type ScreenDrawerSize, type SlotVerb } from "./screenProtocol";
 import type { ScreenActions } from "./screenLifecycle";
 import type { Planner, SlotPlan } from "./screenSlot";
 
@@ -25,6 +25,9 @@ export interface ActionContext {
   onSavedContext?: (saved: AppContext) => void;
   /** Reload the board's data after a write. */
   onChanged: () => void | Promise<void>;
+  /** The board's own translator for host-authored slot text (never frame text);
+   *  absent in tests, where the English key is the answer. */
+  say?: (english: string) => string;
 }
 
 const NO: ActionRefusal = { code: "denied", text: "Only the operator can do that." };
@@ -305,22 +308,85 @@ export const BOARD_LINK_PATHS: readonly string[] = ["/settings/connections"];
 /** The visible target of an external link: its host plus path, which is what the confirm names. */
 export const linkTarget = (href: string): string => { const url = new URL(href); return url.host + url.pathname + url.search; };
 
+/** The owner-scoped publishing consent, exactly as the board reports it. Lines the board cannot
+ *  prove — an older board without the endpoint, a refusal, a malformed answer — are unavailable,
+ *  never "none": the app must be able to tell "no consent" from "unknown". `not_ready` names the
+ *  visible accounts whose provider connection has not resolved yet; they have no consent row and
+ *  the host offers no consent card for them. */
+type ConsentState = "allowed" | "none";
+interface ConsentStatus {
+  available: boolean;
+  consents: { destination_id: string; toolkit: PublishToolkit; state: ConsentState }[];
+  not_ready: string[];
+}
+const CONSENT_UNAVAILABLE: ConsentStatus = { available: false, consents: [], not_ready: [] };
+const CONSENT_DESTINATION = /^[A-Za-z0-9_.-]{1,128}$/;
+const CONSENT_ROWS_MAX = 100;
+
+function readConsentStatus(value: unknown): ConsentStatus | null {
+  if (!isObject(value) || typeof value.available !== "boolean") return null;
+  if (!value.available) return CONSENT_UNAVAILABLE;
+  if (!Array.isArray(value.consents) || value.consents.length > CONSENT_ROWS_MAX) return null;
+  const consents: ConsentStatus["consents"] = [];
+  const seenDestinations = new Set<string>();
+  for (const row of value.consents) {
+    if (!isObject(row) || typeof row.destination_id !== "string" || !CONSENT_DESTINATION.test(row.destination_id) ||
+        seenDestinations.has(row.destination_id) ||
+        !isPublishToolkit(row.toolkit) || (row.state !== "allowed" && row.state !== "none")) return null;
+    seenDestinations.add(row.destination_id);
+    consents.push({ destination_id: row.destination_id, toolkit: row.toolkit, state: row.state });
+  }
+  // Only an ABSENT field is an old host's default; an explicit null or any other shape is
+  // malformed authority and makes the whole answer unknown.
+  const rawNotReady = "not_ready" in value ? value.not_ready : [];
+  if (!Array.isArray(rawNotReady) || rawNotReady.length > CONSENT_ROWS_MAX) return null;
+  const notReady: string[] = [];
+  for (const id of rawNotReady) {
+    if (typeof id !== "string" || !CONSENT_DESTINATION.test(id) || notReady.includes(id)) return null;
+    notReady.push(id);
+  }
+  // A row and its not-ready marker are mutually exclusive; both at once is malformed authority.
+  if (notReady.some(id => consents.some(row => row.destination_id === id))) return null;
+  return { available: true, consents, not_ready: notReady };
+}
+
+/** The board's consent read, or unknown. Never throws: a missing capability degrades to the
+ *  legacy post-connect page instead of failing a connect. */
+async function readConsent(installId: string, signal?: AbortSignal): Promise<ConsentStatus> {
+  try { return readConsentStatus(await workspaceApps.consentStatus(installId, signal)) ?? CONSENT_UNAVAILABLE; }
+  catch { return CONSENT_UNAVAILABLE; }
+}
+
 /** CAD-1290: on a hosted workspace the app's "Manage connections" link opens the AgenticOS Instagram
  *  connect page top-level. The host composes that URL (the frame never builds it); a local board, or
  *  a failure while this continuation is still current, keeps the local connections page.
  *  Pause, reset, and frame close abort the continuation for good. A later response cannot assign,
- *  navigate, or show a link, and re-admission does not revive it. */
-async function connectOrOpen(ctx: ActionContext, args: Record<string, unknown>, ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void; signal?: AbortSignal }): Promise<ActionResult> {
-  // CAD-1939: the connections link may name which toolkit to connect (default Instagram); nothing else takes one.
-  if ("toolkit" in args && (args.url !== "/settings/connections" || !exact(args, ["url", "toolkit"]) || !isPublishToolkit(args.toolkit)))
-    return refuse("bad_args", "That link is not valid.");
+ *  navigate, or show a link, and re-admission does not revive it.
+ *  The return goes to the app screen — or, when the frame is a drawer child, to that drawer surface —
+ *  never to another screen. `inline_consent` is the app's opt-in to the drawer consent step, honoured
+ *  only when the board independently proves the capability exists; otherwise the legacy page runs. */
+async function connectOrOpen(ctx: ActionContext, args: Record<string, unknown>, ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void; signal?: AbortSignal; returnSurface?: string; returnSize?: ScreenDrawerSize }): Promise<ActionResult> {
+  // CAD-1939: the connections link may name which toolkit to connect (default Instagram). The
+  // opt-in may travel with or without that name — Manage/Reconnect send the bare link and keep
+  // the daemon's Instagram default — and neither is valid on any other link.
+  const inline = args.inline_consent === true;
   const toolkit = isPublishToolkit(args.toolkit) ? args.toolkit : undefined;
+  const connectionKeys = [...(toolkit ? ["toolkit"] : []), ...(inline ? ["inline_consent"] : []), "url"];
+  if (args.url === "/settings/connections"
+    ? !exact(args, connectionKeys) || ("toolkit" in args && !toolkit) || ("inline_consent" in args && !inline)
+    : !exact(args, ["url"]))
+    return refuse("bad_args", "That link is not valid.");
   return withPrivateOperation(async (operation) => {
     if (args.url === "/settings/connections") {
       try {
         // CAD-1438: the screen only runs under `/apps/<key>` (uniqueness proven
         // at route level), so the installation's own key is its return path.
-        const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name, ctx.installId), operation.signal, toolkit);
+        const target: ConnectReturnTarget = ui.returnSurface
+          ? { mode: "drawer", surface: ui.returnSurface, ...(ui.returnSize ? { size: ui.returnSize } : {}) }
+          : { mode: "screen" };
+        const inlineConsent = inline && (await readConsent(ctx.installId, operation.signal)).available;
+        operation.assertCurrent();
+        const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name, ctx.installId, target), operation.signal, toolkit, inlineConsent);
         operation.assertCurrent();
         if (reply.hosted && reply.url) { (ui.assign ?? (url => window.location.assign(url)))(reply.url); return { ok: true, data: {} }; }
         // Hosted but no public AgenticOS address: say so, never send the owner to the local page.
@@ -494,6 +560,7 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "screen.drawer.close": () => closeScreenDrawer(args, ui),
     "screen.drawer.context": () => refuse("forbidden", "That drawer context is only readable by its drawer."),
     "social.destinations.list": () => listDestinations(args, ctx),
+    "publish.consent.status": async () => ({ ok: true, data: await readConsent(ctx.installId) }),
     "social.drafts.list": () => socialDraftCall(verb,args,ui),
     "social.drafts.show": () => socialDraftCall(verb,args,ui),
     "social.drafts.create": () => socialDraftCall(verb,args,ui),
@@ -737,6 +804,63 @@ async function planImagePick(_args: Record<string, unknown>, ui?: { actionToken?
   } };
 }
 
+const CONSENT_TOOLKIT: Record<PublishToolkit, string> = { instagram: "Instagram", facebook: "Facebook Page" };
+
+/** `publish.consent.allow`: the owner's per-account publishing consent. The frame names one
+ *  destination; the host re-reads the current tenant list and requires exactly one match, so a
+ *  stale, forged or ambiguous id cannot pick another account. Every word on the card — the
+ *  account, what it may receive, billing and revocation — comes from the host and the verified
+ *  server read, never from the frame, and the write runs only from a tap on that host-drawn
+ *  card. A not-ready account is refused before any card. Success is the authoritative read after
+ *  the write, never the write's own answer; the reply then carries no receipt and the app
+ *  re-reads the status. */
+async function planConsentAllow(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
+  const toolkit = args.toolkit;
+  const destination = args.destination_id;
+  if (!exact(args, ["destination_id", "toolkit"]) || typeof destination !== "string" ||
+      !CONSENT_DESTINATION.test(destination) || !isPublishToolkit(toolkit))
+    return { code: "bad_args", text: "That request is not valid." };
+  const status = await readConsent(ctx.installId);
+  if (!status.available)
+    return { code: "unavailable", text: "Publishing consent can't be given here yet. Open the account's settings on AgenticOS." };
+  if (status.not_ready.includes(destination))
+    return { code: "not_ready", text: "That account is still connecting. Try again once it is ready." };
+  let listed: { unavailable: boolean; destinations: { destination_id: string; label: string; toolkit: string }[] };
+  try { listed = await workspaceApps.destinations(ctx.installId); }
+  catch { return { code: "unavailable", text: "Couldn't check your accounts right now. Try again." }; }
+  const matched = listed.destinations.filter(row => row.destination_id === destination && row.toolkit === toolkit);
+  if (listed.unavailable || matched.length !== 1)
+    return { code: "not_found", text: "That account is no longer connected. Check the accounts and try again." };
+  const account = accountLabel(matched[0].label || destination);
+  const say = ctx.say ?? ((english: string) => english);
+  return {
+    label: say("Authorize this account"),
+    card: {
+      title: say("Authorize linked-device publishing to {account}?").replace("{account}", () => account),
+      target: `${account} · ${say(CONSENT_TOOLKIT[toolkit])}`,
+      caption: "",
+      image: null,
+      disclosure: [
+        say("Standing authorization for linked-device publishing to the named account. Withdraw it any time in AgenticOS."),
+        say("Separately approved hosted posts still send without it. Each send uses your AgenticOS balance."),
+        say("Every post is approved here before it is sent."),
+      ].join("\n"),
+    },
+    run: async (): Promise<ActionResult> => {
+      try {
+        await workspaceApps.consentAllow(ctx.installId, { destination_id: destination });
+      } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+      // A 2xx from the write is not the fact. The status read decides.
+      const after = await readConsent(ctx.installId);
+      const granted = after.available && after.consents.some(row =>
+        row.destination_id === destination && row.toolkit === toolkit && row.state === "allowed");
+      return granted
+        ? { ok: true, data: {} }
+        : { ok: false, refusal: { code: "unconfirmed", text: "Cadence couldn't confirm that consent. Check the account before trying again." } };
+    },
+  };
+}
+
 /** The spend/publish verbs. The set is closed in `screenProtocol`. */
 export function makePlanner(get: () => ActionContext): Planner {
   return (verb: SlotVerb, args, ui) => {
@@ -745,6 +869,7 @@ export function makePlanner(get: () => ActionContext): Planner {
       "run.start": () => planRunStart(get(), args),
       "publish.draft.confirm": () => planConfirmPublish(get(), args, ui?.actionToken),
       "publish.draft.schedule": () => planDraftEffectChange(get(), "publish.draft.schedule", args, ui?.actionToken),
+      "publish.consent.allow": () => planConsentAllow(get(), args),
       "media.original.download": () => planOriginalDownload(get, args, ui),
       "social.image.pick": () => planImagePick(args, ui),
     };
