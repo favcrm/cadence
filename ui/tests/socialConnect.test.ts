@@ -43,11 +43,21 @@ async function main() {
   equal(connectOutcome("?aos_connect=hacked&toolkit=instagram"), null, "an unknown outcome is not ours");
   equal(withoutConnectParams("?aos_connect=connected&toolkit=instagram&screen=native"), "?screen=native", "other params stay");
   equal(withoutConnectParams("?aos_connect=failed&toolkit=instagram"), "", "nothing left");
-  // The URL is a report, not evidence. Assert only the observable category and that a publish
-  // claim in the URL changes nothing about the outcome; the copy itself is not pinned here.
-  equal(connectToast("connected").kind, "ok", "connected reports an informational outcome");
-  equal(connectToast("failed").kind, "err", "failed reports a refusal");
-  equal(connectToast("cancelled").kind, connectToast("failed").kind, "cancelled reads as not connected");
+  // CAD-2221 acceptance: the return wording is neutral. The URL is a report from another origin,
+  // not evidence, so `connected` says only that the round trip finished and sends the operator to
+  // the authoritative account read — never that an account is connected or a grant allowed. The
+  // copy is this function's entire behaviour, so every outcome is pinned, and the claim checks
+  // below state why: a different sentence that reintroduces a claim still fails.
+  equal(connectToast("connected"),
+    { kind: "ok", text: "Connection finished — check your accounts" },
+    "a connected return is informational, not a connection claim");
+  equal(connectToast("failed"), { kind: "err", text: "Connection failed — try again" }, "a failed return is truthful");
+  equal(connectToast("cancelled"), { kind: "err", text: "Connection failed — try again" }, "cancelled reads as not connected");
+  for (const outcome of ["connected", "failed", "cancelled"] as const) {
+    const text = connectToast(outcome).text;
+    assert(!/connected|linked/i.test(text), `the ${outcome} return never claims an account is connected`);
+    assert(!/allow|grant/i.test(text), `the ${outcome} return never claims a publishing grant`);
+  }
   const urlClaim = connectOutcome("?aos_connect=connected&aos_publish=allowed&toolkit=instagram");
   const plainOutcome = connectOutcome("?aos_connect=connected&toolkit=instagram");
   equal(urlClaim, plainOutcome, "a URL's publish claim adds no outcome");

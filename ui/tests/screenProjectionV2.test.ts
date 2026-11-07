@@ -150,15 +150,22 @@ void (async () => {
   // 2. A v2 child receives phase, caption excerpt, refusal, permalink and defaults (no price).
   const v2 = mount(full); v2.port.receive({ v: 1, op: "ready", accepts: ["screen.v2"] });
   const p = v2.port.sent[0] as ScreenPush;
-  // The closed verb set's exact membership and order are the implementation's own wiring; what a
-  // scoped consumer actually gates its UI on is that its feature-critical capabilities are
-  // advertised at all. These four are what the installed Social Content screens require: the
-  // inline consent card (status + allow) and the source flow (show + save).
-  const featureVerbs = ["publish.consent.status", "publish.consent.allow", "social.sources.show", "social.sources.save"];
+  // `actions` is a closed allowlist: the only verbs a scoped child may call. Membership is
+  // therefore asserted exactly, so widening it is a deliberate, reviewed edit rather than an
+  // unnoticed extra verb. Emission order is the implementation's own wiring and is not pinned.
+  // The generic set never carries the per-mount media verbs or the child-only drawer read.
+  const closedVerbs = ["context.defaults.save", "open-link", "publish.consent.allow", "publish.consent.status",
+    "publish.destination.remove", "publish.destination.use", "publish.draft.cancel", "publish.draft.confirm",
+    "publish.draft.reschedule", "publish.draft.schedule", "publish.settings.save", "read.run", "run.start",
+    "screen.drawer.close", "screen.drawer.open", "social.destinations.list", "social.drafts.create",
+    "social.drafts.discard", "social.drafts.list", "social.drafts.publish.stage", "social.drafts.show",
+    "social.drafts.update", "social.image.pick", "social.sources.get", "social.sources.page",
+    "social.sources.save", "social.sources.show"];
   check(p.v === 2 && Array.isArray(p.actions) && !p.actions!.some(v => v.startsWith("media.")) &&
     !p.actions!.includes("screen.drawer.context") && !!p.publish_intents,
     "v2 envelope: v 2, intents kept, media verbs and the child-only drawer read are never advertised");
-  for (const verb of featureVerbs) check(p.actions!.includes(verb), `a scoped v2 consumer is offered ${verb}`);
+  check(JSON.stringify([...p.actions!].sort()) === JSON.stringify(closedVerbs),
+    `the advertised v2 verb set is exactly the closed allowlist: ${[...p.actions!].sort().join()}`);
   const byId = new Map(p.runs.map(r => [r.id, r]));
   check(byId.get("run-ready")!.phase === "ready" && byId.get("run-writing")!.phase === "working:produce_text" &&
     byId.get("run-checking")!.phase === "checking" && byId.get("run-failed")!.phase === "failed", "phase from real step receipts");
@@ -216,7 +223,6 @@ void (async () => {
     extras({ contextId: "ctx-b" }));
   check(!("sources" in foreignExtras) && foreignExtras.actions!.length === 0 &&
     foreignExtras.runs.every(r => !("caption_excerpt" in r)), "board reads tagged for another context are never pushed");
-  for (const verb of featureVerbs) check(!foreignExtras.actions!.includes(verb), `an unscoped projection offers no ${verb}`);
   check(!("sources" in screenProjection(installation, "main", "ctx-a", [context], runs, effects, intents, extras({ installId: "inst-2" }))),
     "board reads tagged for another install are never pushed");
   const otherScope = screenProjection(installation, "main", "ctx-b", [context, otherContext], runs, effects, undefined,
