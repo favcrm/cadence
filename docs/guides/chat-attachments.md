@@ -357,3 +357,20 @@ require the AOS-269 admission extension, a reference-capable published model and
 an enabled, priced image-to-image variant. Earlier native image audiences
 deliberately refuse editing. Do not remove the ceiling or treat source changes
 or an isolated loopback smoke as installation or paid operational verification.
+
+## Reading an attachment back to the board (CAD-2219)
+
+The hosted board serves an operator's own attachment back to the browser at
+`GET /api/chat/attachments/<chf-id>?conversation=<id>`. The route is scoped
+exactly as a send is — the signed-in subject and the resolved conversation — so
+an unknown id, another conversation's row or a missing blob answers `404`. Only
+a raster (PNG/JPEG/WebP), a PDF or an MP4/WebM is served. An SVG upload's
+retained source is never served: the preview is the bounded raster the model was
+shown, when one exists. A PDF is served `inline` with no sandbox policy so the
+browser's own viewer opens it in a new tab; every other kind carries `nosniff`,
+`Content-Security-Policy: sandbox; default-src 'none'` and `private, no-store`.
+
+Video uploads are accepted at up to 20 MiB (text, PDF and raster stay at
+10 MiB). A video is stored and played, never decoded: the model still receives
+its name, size and type only. A local board has no such route, and the client
+keeps the metadata chips there without requesting attachment bytes.

@@ -11,6 +11,9 @@ import TicketProposalCard from "../agents/TicketProposalCard";
 import ArtifactCard from "../canvas/ArtifactCard";
 import ImageBlock from "../canvas/ImageBlock";
 import VideoBlock from "../canvas/VideoBlock";
+import { useImageConversation } from "../canvas/imageConversation";
+import { hostedOrigin } from "../auth/hosted";
+import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import { ThreadPermission } from "./PermissionCard";
 import { isArtifactPutCall, isCardItem, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
 import { carriesSecret } from "../app-shell/chat/directive";
@@ -464,53 +467,74 @@ const SENT_CHIP_LIMIT = 3;
 /** The operator bubble's retained files as the mock's `.sentchips` row:
  *  compact read-only chips — extension tag, name, `size · kind` — that
  *  wrap beside the bubble and collapse past three behind a
- *  keyboard-accessible +N more. Names, sizes and MIMEs only: a chip is
- *  never a link and never carries a token or path; the full name, byte
- *  size and MIME sit on the chip's `title`, so truncation hides nothing
- *  the operator cannot reach. No remove or retry affordance — these
- *  already sent. */
+ *  keyboard-accessible +N more. CAD-2219 adds the file itself above the
+ *  row: an image thumbnail (lightbox on click) or an inline video, and a
+ *  PDF chip opens the board's own inline read in a new tab. A file that
+ *  the board cannot serve keeps the plain chip; no remove or retry
+ *  affordance — these already sent. */
 function AttachmentRows({ files }: { files: EntryAttachment[] }) {
   const t = useTranslate();
+  const conversation = useImageConversation();
+  // The attachment read exists on the hosted board only; a local board keeps
+  // the chips exactly as they were.
+  const hosted = hostedOrigin(typeof window === "undefined" ? null : window.location.hostname);
   const [expanded, setExpanded] = useState(false);
   if (files.length === 0) return null;
   const collapsed = !expanded && files.length > SENT_CHIP_LIMIT;
   const shown = collapsed ? files.slice(0, SENT_CHIP_LIMIT) : files;
   return (
-    <div className="sentchips" data-entry-attachments>
-      {shown.map((f) => (
-        <span
-          key={f.id}
-          className="sentchip"
-          title={`${f.name} · ${f.size} B · ${f.mime}`}
-        >
-          <span className="sentchip-ext num" aria-hidden>
-            {sentExt(f.name)}
-          </span>
-          <span className="sentchip-name">{f.name}</span>
-          <span className="sentchip-meta num">{attachMeta(f.name, f.size, t)}</span>
-        </span>
-      ))}
-      {collapsed && (
-        <button
-          type="button"
-          className="lnk app-chat-more"
-          aria-expanded="false"
-          onClick={() => setExpanded(true)}
-        >
-          +{files.length - shown.length} {t("more")}
-        </button>
-      )}
-      {expanded && files.length > SENT_CHIP_LIMIT && (
-        <button
-          type="button"
-          className="lnk app-chat-more"
-          aria-expanded="true"
-          onClick={() => setExpanded(false)}
-        >
-          {t("Show less")}
-        </button>
-      )}
-    </div>
+    <>
+      <AttachmentMedia files={files} conversation={conversation} hosted={hosted} />
+      <div className="sentchips" data-entry-attachments>
+        {shown.map((f) => {
+          const title = `${f.name} · ${f.size} B · ${f.mime}`;
+          const body = (
+            <>
+              <span className="sentchip-ext num" aria-hidden>
+                {sentExt(f.name)}
+              </span>
+              <span className="sentchip-name">{f.name}</span>
+              <span className="sentchip-meta num">{attachMeta(f.name, f.size, t)}</span>
+            </>
+          );
+          return f.mime === "application/pdf" && hosted && conversation !== null ? (
+            <button
+              key={f.id}
+              type="button"
+              className="sentchip"
+              title={`${title} — ${t("(opens in a new tab)")}`}
+              onClick={() => openAttachmentInTab(f.id, conversation)}
+            >
+              {body}
+            </button>
+          ) : (
+            <span key={f.id} className="sentchip" title={title}>
+              {body}
+            </span>
+          );
+        })}
+        {collapsed && (
+          <button
+            type="button"
+            className="lnk app-chat-more"
+            aria-expanded="false"
+            onClick={() => setExpanded(true)}
+          >
+            +{files.length - shown.length} {t("more")}
+          </button>
+        )}
+        {expanded && files.length > SENT_CHIP_LIMIT && (
+          <button
+            type="button"
+            className="lnk app-chat-more"
+            aria-expanded="true"
+            onClick={() => setExpanded(false)}
+          >
+            {t("Show less")}
+          </button>
+        )}
+      </div>
+    </>
   );
 }
 

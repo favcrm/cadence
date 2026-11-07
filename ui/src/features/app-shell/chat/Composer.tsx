@@ -707,7 +707,7 @@ export default function Composer({
       className="app-chat-attach"
       aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : "unavailable"}`}
       title={attachEnabled
-        ? t("Attach files (up to 10 MiB each)")
+        ? t("Attach files (text or PDF 10 MiB, video 20 MiB)")
         : typeof attach === "object" ? attach.reason : t("Attach is unavailable")}
       disabled={!!block || !attachEnabled}
       onClick={() => fileInput.current?.click()}
