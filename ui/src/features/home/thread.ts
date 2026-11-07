@@ -216,8 +216,15 @@ export function mergeEntries(state: ThreadState | null, incoming: ThreadEntry[])
   };
 }
 
-/** Fold entries and independent cloud-availability frames from the stream. */
-export function reduceFrame(state: ThreadState | null, event: SseEvent): ThreadState {
+/** Fold entries and independent cloud-availability frames from the stream.
+ *  `onEntry` sees each well-formed `entry` frame once, before it is merged —
+ *  the engine's turn-boundary hook (a committed `turn_result` retires the
+ *  live preview), so the parsed entry is not read twice. */
+export function reduceFrame(
+  state: ThreadState | null,
+  event: SseEvent,
+  onEntry?: (entry: ThreadEntry) => void,
+): ThreadState {
   const base = state ?? EMPTY_THREAD;
   if (event.type === "cloud_withheld") {
     let status: unknown;
@@ -241,7 +248,9 @@ export function reduceFrame(state: ThreadState | null, event: SseEvent): ThreadS
     return base;
   }
   const entry = asEntry(parsed);
-  return entry ? mergeEntries(base, [entry]) : base;
+  if (!entry) return base;
+  onEntry?.(entry);
+  return mergeEntries(base, [entry]);
 }
 
 /** A page from `GET /api/threads/<alias>` folded into the state. */

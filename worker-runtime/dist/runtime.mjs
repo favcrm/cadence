@@ -57136,7 +57136,245 @@ var runtimeHealthSkills = skillSource({
   ]
 });
 
+// src/preview.ts
+var ASSISTANT_ENTRY_KIND = "pi.assistant";
+var MAX_PREVIEW_CHARS = 8192;
+var MAX_PREVIEW_BLOCKS = 256;
+var SENSITIVE_KEYS = [
+  { key: "confirm_token", pattern: /confirm_token/i },
+  { key: "request_id", pattern: /request_id/i }
+];
+function capPreview(text) {
+  if (text.length <= MAX_PREVIEW_CHARS)
+    return text;
+  const cut = text.slice(0, MAX_PREVIEW_CHARS);
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 55296 && last <= 56319 ? cut.slice(0, -1) : cut;
+}
+
+class ThreadPreview {
+  blocks = new Map;
+  remaining = MAX_PREVIEW_CHARS;
+  seeded = null;
+  overflowed = false;
+  quarantined = false;
+  frozen = null;
+  get text() {
+    if (this.overflowed)
+      return null;
+    if (this.quarantined)
+      return this.frozen;
+    let joined = "";
+    for (const index of [...this.blocks.keys()].sort((a, b) => a - b)) {
+      const block = this.blocks.get(index);
+      if (block !== undefined && block.kind === "text")
+        joined += block.text;
+    }
+    if (joined.length === 0)
+      return null;
+    let stop = joined.length;
+    let unsafe = false;
+    const brace = joined.indexOf("{");
+    if (brace >= 0) {
+      stop = brace;
+      unsafe = true;
+    }
+    for (const { pattern } of SENSITIVE_KEYS) {
+      const at = joined.search(pattern);
+      if (at >= 0 && at < stop) {
+        stop = at;
+        unsafe = true;
+      }
+    }
+    for (const { key } of SENSITIVE_KEYS) {
+      const most = Math.min(key.length - 1, joined.length);
+      for (let n = most;n > 0; n--) {
+        const start = joined.length - n;
+        if (joined.slice(start).toLowerCase() !== key.slice(0, n))
+          continue;
+        if (start < stop)
+          stop = start;
+        break;
+      }
+    }
+    const safe = capPreview(joined.slice(0, stop));
+    if (unsafe) {
+      this.quarantined = true;
+      this.frozen = safe.length === 0 ? null : safe;
+      return this.frozen;
+    }
+    return safe.length === 0 ? null : safe;
+  }
+  reset() {
+    this.blocks.clear();
+    this.remaining = MAX_PREVIEW_CHARS;
+    this.seeded = null;
+    this.overflowed = false;
+    this.quarantined = false;
+    this.frozen = null;
+  }
+  failClosed() {
+    this.overflowed = true;
+    this.blocks.clear();
+    this.remaining = 0;
+    this.seeded = null;
+    this.quarantined = false;
+    this.frozen = null;
+  }
+  applySnapshot(snapshot) {
+    this.reset();
+    const message = snapshot.generation?.message;
+    if (message !== undefined)
+      this.seed(message);
+  }
+  apply(events) {
+    const committed = new Set;
+    for (const event of events) {
+      if (event.type !== "message_end")
+        continue;
+      const message = event.entry.model?.[0];
+      if (message !== undefined && message.role === "assistant")
+        committed.add(message);
+    }
+    let latest = null;
+    for (const event of events) {
+      if (!this.applyEvent(event, committed))
+        continue;
+      const text = this.text;
+      if (text !== null)
+        latest = text;
+    }
+    return { current: this.text, latest };
+  }
+  applyEvent(event, committed) {
+    switch (event.type) {
+      case "snapshot":
+        this.applySnapshot(event);
+        return true;
+      case "message_start":
+        if (event.message.role === "assistant" && !committed.has(event.message)) {
+          this.seed(event.message);
+          return true;
+        }
+        return false;
+      case "message_update": {
+        let touched = false;
+        for (const change of event.changes)
+          touched = this.applyChange(change) || touched;
+        return touched;
+      }
+      case "message_end": {
+        const message = event.entry.model?.[0];
+        if (message !== undefined && (message === this.seeded || event.entry.kind === ASSISTANT_ENTRY_KIND)) {
+          this.reset();
+          return true;
+        }
+        return false;
+      }
+      case "auto_retry_start":
+      case "deferred_poll":
+        this.reset();
+        return true;
+      case "task_failed":
+        if (event.kind === "pi.generation") {
+          this.reset();
+          return true;
+        }
+        return false;
+      default:
+        return false;
+    }
+  }
+  applyChange(change) {
+    switch (change.type) {
+      case "text_start":
+        if (change.block.type === "text")
+          this.startText(change.contentIndex, change.block.text);
+        else
+          this.markOther(change.contentIndex);
+        return true;
+      case "text_delta":
+        this.appendText(change.contentIndex, change.delta);
+        return true;
+      case "block":
+        this.replaceBlock(change.contentIndex, change.block);
+        return true;
+      case "message":
+        this.seed(change.message);
+        return true;
+      case "thinking_start":
+      case "toolcall_start":
+        this.markOther(change.contentIndex);
+        return true;
+      case "thinking_delta":
+      case "toolcall_delta":
+        return false;
+      default:
+        return false;
+    }
+  }
+  seed(message) {
+    this.reset();
+    if (message.content.length > MAX_PREVIEW_BLOCKS) {
+      this.failClosed();
+      return;
+    }
+    this.seeded = message;
+    for (const [index, block] of message.content.entries()) {
+      if (block.type === "text")
+        this.startText(index, block.text);
+      else
+        this.markOther(index);
+    }
+  }
+  markOther(index) {
+    if (this.overflowed || this.quarantined)
+      return;
+    const existing = this.blocks.get(index);
+    if (existing === undefined && this.blocks.size >= MAX_PREVIEW_BLOCKS) {
+      this.failClosed();
+      return;
+    }
+    if (existing?.kind === "text")
+      this.remaining = Math.min(MAX_PREVIEW_CHARS, this.remaining + existing.text.length);
+    this.blocks.set(index, { kind: "other" });
+  }
+  startText(index, text) {
+    if (this.overflowed || this.quarantined)
+      return;
+    const existing = this.blocks.get(index);
+    if (existing === undefined && this.blocks.size >= MAX_PREVIEW_BLOCKS) {
+      this.failClosed();
+      return;
+    }
+    if (existing?.kind === "text")
+      this.remaining = Math.min(MAX_PREVIEW_CHARS, this.remaining + existing.text.length);
+    this.blocks.set(index, { kind: "text", text: "" });
+    this.appendText(index, text);
+  }
+  replaceBlock(index, block) {
+    if (block.type === "text")
+      this.startText(index, block.text);
+    else
+      this.markOther(index);
+  }
+  appendText(index, delta) {
+    const block = this.blocks.get(index);
+    if (block === undefined || block.kind !== "text")
+      return;
+    if (this.quarantined || delta.length === 0)
+      return;
+    const room = this.remaining;
+    if (room <= 0)
+      return;
+    const addition = delta.length <= room ? delta : delta.slice(0, room);
+    block.text += addition;
+    this.remaining -= addition.length;
+  }
+}
+
 // src/session-stream.ts
+var MAX_QUEUED_BYTES = 256 * 1024;
 function rawSessionFrame(event) {
   const json = JSON.stringify(event, (_key, value) => {
     if (value === null || typeof value !== "object" || Array.isArray(value))
@@ -57155,18 +57393,69 @@ function rawSessionFrame(event) {
 
 `;
 }
-function sessionEventResponse(watch, format) {
+function sessionEventResponse(watch, format, options) {
   const encoder = new TextEncoder;
   let closed = false;
+  let sink = null;
+  let pending = null;
+  let cursor = false;
+  let snapshotComplete = false;
+  let initialDrain = null;
+  let releaseInitialDrain = null;
+  const resumeInitialDrain = () => {
+    const release = releaseInitialDrain;
+    releaseInitialDrain = null;
+    initialDrain = null;
+    release?.();
+  };
+  const closeForBackpressure = () => {
+    if (closed || sink === null)
+      return;
+    closed = true;
+    pending = null;
+    resumeInitialDrain();
+    sink.close();
+    watch.stop();
+  };
+  const flushPreview = () => {
+    if (closed || pending === null || sink === null)
+      return;
+    const { text } = pending;
+    pending = null;
+    sink.enqueue(encoder.encode(`event: preview
+data: ${JSON.stringify({ text })}
+
+`));
+  };
+  const emit = (frame) => {
+    if (closed || sink === null)
+      return false;
+    flushPreview();
+    if (closed)
+      return false;
+    sink.enqueue(encoder.encode(frame));
+    if (frame.startsWith("id: "))
+      cursor = true;
+    if ((sink.desiredSize ?? 0) <= 0 && (cursor || snapshotComplete))
+      closeForBackpressure();
+    return true;
+  };
+  const preview = (text) => {
+    if (closed || sink === null)
+      return false;
+    pending = { text };
+    if ((sink.desiredSize ?? 0) > 0)
+      flushPreview();
+    return !closed;
+  };
   const body = new ReadableStream({
     start(controller) {
-      const emit = (frame) => {
-        if (!closed)
-          controller.enqueue(encoder.encode(frame));
-      };
+      sink = controller;
       const fail = (error) => {
         if (!closed) {
           closed = true;
+          pending = null;
+          resumeInitialDrain();
           controller.error(error);
         }
       };
@@ -57177,25 +57466,45 @@ function sessionEventResponse(watch, format) {
         }
         if (!closed) {
           closed = true;
+          pending = null;
+          resumeInitialDrain();
           controller.close();
         }
       }, fail);
       try {
-        format.snapshot(emit);
+        format.snapshot(emit, preview);
+        snapshotComplete = true;
+        if (closed)
+          return;
+        flushPreview();
+        if (options?.overflow !== "after-cursor" && (controller.desiredSize ?? 0) <= 0) {
+          const drain = Promise.withResolvers();
+          initialDrain = drain.promise;
+          releaseInitialDrain = drain.resolve;
+        }
         watch.start(async (events) => {
+          if (initialDrain !== null)
+            await initialDrain;
           if (!closed)
-            await format.events(events, emit);
+            await format.events(events, emit, preview);
         });
       } catch (error) {
         fail(error);
         watch.stop();
       }
     },
+    pull(controller) {
+      if ((controller.desiredSize ?? 0) > 0)
+        resumeInitialDrain();
+      flushPreview();
+    },
     async cancel() {
       closed = true;
+      pending = null;
+      resumeInitialDrain();
       await watch.stop();
     }
-  });
+  }, { highWaterMark: MAX_QUEUED_BYTES, size: (chunk) => chunk.byteLength });
   return new Response(body, {
     headers: {
       "content-type": "text/event-stream",
@@ -57385,6 +57694,45 @@ function threadEntries(records, includeThinking, budgetProof) {
 
 // src/hosted-session.ts
 var RESOLVED_MODEL_KEY = "tenant_resolved_model";
+function engineBatchChanges(events) {
+  let master = false;
+  let entries = false;
+  for (const event of events) {
+    switch (event.type) {
+      case "snapshot":
+        master = true;
+        entries = true;
+        break;
+      case "run_start":
+      case "submission":
+      case "inbox_update":
+        master = true;
+        break;
+      case "run_end":
+        master = true;
+        entries = true;
+        break;
+      case "turn_end":
+        entries = true;
+        break;
+      case "message_end":
+      case "entry_appended":
+        entries = true;
+        break;
+      case "tool_execution_end":
+        if (event.entry !== undefined)
+          entries = true;
+        break;
+      case "task_failed":
+        if (event.kind === "pi.generation")
+          master = true;
+        break;
+      default:
+        break;
+    }
+  }
+  return { master, entries };
+}
 
 class HostedSession extends DurableObject {
   models = createModels();
@@ -57451,26 +57799,23 @@ class HostedSession extends DurableObject {
     if (url.pathname === "/thread-stream") {
       let emit = function(entry, send) {
         if (entry.seq <= last)
-          return;
-        send(`id: ${entry.seq}
+          return true;
+        if (!send(`id: ${entry.seq}
 event: entry
 data: ${JSON.stringify(entry)}
 
-`);
+`))
+          return false;
         last = entry.seq;
+        return true;
       };
       const thinking = url.searchParams.get("reader") === "owner";
       const requested = Number(url.searchParams.get("after") ?? "0");
       let last = Number.isSafeInteger(requested) && requested > 0 ? requested : 0;
-      let masterFrame;
-      try {
-        const master = this.options.threadContext ? this.validatedThreadContext(await this.options.threadContext()) : null;
-        const status = await this.state();
-        masterFrame = `event: master
-data: ${JSON.stringify(masterState(status.model, status, master?.conversationId ?? null, master?.metadata))}
-
-`;
-      } catch {
+      const stream = await this.harness.session().events();
+      const master = await this.connectionMaster();
+      if (master === null) {
+        await stream.stop();
         return Response.json({
           ok: false,
           error: {
@@ -57479,7 +57824,9 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
           }
         }, { status: 503 });
       }
-      const stream = await this.harness.session().events();
+      const pinned = master.context;
+      const masterFrame = master.frame;
+      let lastMasterFrame = masterFrame;
       let snapshotEntries;
       try {
         snapshotEntries = await this.transcript(thinking);
@@ -57493,20 +57840,50 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
           }
         }, { status: 503 });
       }
+      const preview = new ThreadPreview;
       return sessionEventResponse(stream, {
-        snapshot: (send) => {
-          send(`: connected
+        snapshot: (send, sendPreview) => {
+          if (!send(`: connected
 
-`);
-          send(masterFrame);
+`) || !send(masterFrame))
+            return;
           for (const entry of snapshotEntries)
-            emit(entry, send);
+            if (!emit(entry, send))
+              break;
+          preview.applySnapshot(stream.snapshot);
+          sendPreview(preview.text);
         },
-        events: async (_events, send) => {
-          for (const entry of await this.transcript(thinking))
-            emit(entry, send);
+        events: async (events, send, sendPreview) => {
+          const changes = engineBatchChanges(events);
+          if (changes.master) {
+            const frame = await this.composedMasterFrame(pinned);
+            if (frame !== lastMasterFrame) {
+              lastMasterFrame = frame;
+              if (!send(frame))
+                return;
+            }
+          }
+          const before = preview.text;
+          const batch = preview.apply(events);
+          let shown = before;
+          if (batch.current !== null) {
+            if (batch.current !== before) {
+              sendPreview(batch.current);
+              shown = batch.current;
+            }
+          } else if (before !== null && batch.latest !== null && batch.latest !== before) {
+            sendPreview(batch.latest);
+            shown = batch.latest;
+          }
+          if (changes.entries) {
+            for (const entry of await this.transcript(thinking))
+              if (!emit(entry, send))
+                break;
+          }
+          if (batch.current === null && shown !== null)
+            sendPreview(null);
         }
-      });
+      }, { overflow: "after-cursor" });
     }
     if (url.pathname !== "/events")
       return new Response("not found", { status: 404 });
@@ -57517,7 +57894,8 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
       },
       events: async (events, send) => {
         for (const event of events)
-          send(rawSessionFrame(event));
+          if (!send(rawSessionFrame(event)))
+            break;
       }
     });
   }
@@ -57648,6 +58026,21 @@ data: ${JSON.stringify(masterState(status.model, status, master?.conversationId 
     if (typeof context?.conversationId !== "string" || context.conversationId.length === 0 || metadata === null || typeof metadata !== "object" || Array.isArray(metadata))
       throw new Error("The thread context is malformed.");
     return context;
+  }
+  async connectionMaster() {
+    try {
+      const context = this.options.threadContext ? this.validatedThreadContext(await this.options.threadContext()) : null;
+      return { context, frame: await this.composedMasterFrame(context) };
+    } catch {
+      return null;
+    }
+  }
+  async composedMasterFrame(context) {
+    const status = await this.state();
+    return `event: master
+data: ${JSON.stringify(masterState(status.model, status, context?.conversationId ?? null, context?.metadata))}
+
+`;
   }
   generationIdentity() {
     return readGenerationIdentity(this.ctx.storage.sql);

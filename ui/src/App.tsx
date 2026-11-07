@@ -591,7 +591,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     });
     liveUpdates.current = updates;
     const sub = subscribeSse({
-      url: "/api/stream?entities=1",
+      url: "/api/stream?entities=1&accept_degraded=1",
       events: ["hello", "heartbeat", "issues", "agents", "jobs", "monitoring", "issue", "agent", "agent_meta", "plan", "aggregates", "threads", "master"],
       onEvent: updates.event,
       onOpen: updates.opened,

@@ -274,10 +274,34 @@ replaces the model, provider, session, turn or queue state. An unavailable or
 malformed projection fails the connection with a `503` capability refusal
 instead of serving a stale or partial header. `masterState` applies the same
 precedence to the HTTP header read.
-The composed master frame is serialized once before opening the watch or
-returning SSE `200`. Serialization failures (such as cycles or bigint values)
-and callable root `toJSON` hooks refuse with `503`. Ordinary data fields remain
-allowed; values shadowed by reserved runtime fields do not invalidate the frame.
+The watch attaches before the initial master state is read, closing the gap
+between that read and subscription. The composed frame is serialized before
+SSE `200`, then refreshed on turn and queue transitions. Serialization failures
+(such as cycles or bigint values) and callable root `toJSON` hooks refuse with
+`503`; a later state failure ends the stream. Ordinary fields remain allowed,
+and values shadowed by reserved runtime fields do not invalidate the frame.
+
+The thread stream also sends `preview` events with `{ "text": string | null }`
+for in-flight assistant text. They have no `id` and are not transcript
+entries: retry, cancellation or reconnect can replace them, while the committed
+entry and its `seq` remain authoritative. Thinking and tool arguments are not
+previewed. The preview stops at the first `{` or sensitive confirmation key
+anywhere in a message, including across text blocks; that suffix stays withheld
+until commit. This conservative rule also stops previews at benign braces.
+Preview text and tracked content blocks are bounded; an oversized partial is not
+a substitute for the final answer.
+
+The browser clears a preview as soon as its connection closes, even if the
+status probe cannot answer. The browser opts in to partial board feeds with
+`accept_degraded=1`; when one declares degraded coverage, the recovery refresh
+stays enabled while local invalidations continue. Older browsers remain on
+polling rather than treating the partial feed as complete.
+
+A slow thread reader reconnects from its last received durable `id` after the
+queued data crosses 256 KiB; already queued entries drain before closure. One
+crossing frame, or an oversized initial master frame plus the first entry, can
+exceed that threshold so the cursor can advance. The host must still
+revalidate session, tenant, role and conversation access on delivery.
 
 `HostedSession.recordCount()` reports active stored runtime records, not the
 number of expanded UI transcript parts. A host can combine it with `state()`

@@ -355,9 +355,18 @@ export function subscribeSse(opts: SseOptions): SseSubscription {
         opts.onError?.("reconnecting");
         return;
       }
-      // Retire this source first: its late frames and errors are ignored.
+      // Retire this source first: its late frames, its own repeat errors and
+      // any synchronous re-entry from the error callback are all ignored.
       source = null;
       es.close();
+      // The connection is gone NOW, even though whether a retry can help is
+      // still unknown: report the outage before waiting on the probe, so a
+      // hanging probe cannot leave the link reading as live (and cannot hold
+      // transient in-flight state on screen). stopped/reopening still follow.
+      opts.onError?.("reconnecting");
+      // A callback that closed the subscription owns the outcome now: no
+      // probe, no scheduled reconnect.
+      if (closed) return;
       void probe(url).then((status) => {
         if (closed) return;
         if (isPermanent(status)) {

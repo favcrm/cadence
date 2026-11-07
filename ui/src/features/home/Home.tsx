@@ -551,6 +551,7 @@ const discard = (message: string) => resources.masterThread.write((s) => discard
  */
 const ThreadList = memo(function ThreadList({
   items,
+  conversation,
   limit,
   moreBefore,
   loadingEarlier,
@@ -564,6 +565,9 @@ const ThreadList = memo(function ThreadList({
   stale,
 }: {
   items: ThreadItem[];
+  /** The Home conversation this list shows (CAD-2228): its live preview
+   *  text paints on the turn that is generating. */
+  conversation: string | null;
   limit: number;
   moreBefore: boolean;
   loadingEarlier: boolean;
@@ -649,6 +653,7 @@ const ThreadList = memo(function ThreadList({
       <Conversation
         mode={{ kind: "home" }}
         items={shown}
+        conversation={conversation}
         readOnly={readOnly}
         liveAfter={liveAfter}
         running={working?.message ?? null} /* null while a send is only submitting */
@@ -691,7 +696,7 @@ const ThreadList = memo(function ThreadList({
             // One assistant turn: face, "now", and the typing bubble. HomeList
             // paints it as its own row under the message, and keeps that row's
             // key when the real steps arrive, so the head does not splash.
-            node: needsTypingTurn ? <ThreadTurn items={[]} running /> : <AssistantNameRow at={at} live={live} />,
+            node: needsTypingTurn ? <ThreadTurn items={[]} running previewConversation={conversation} /> : <AssistantNameRow at={at} live={live} />,
             position: below ? "after" : "before",
             ...(anchorItem === null ? { fallback: true as const } : {}),
           };
@@ -1055,7 +1060,7 @@ function MasterHome({
 
   // Live entries: the store opened on the newest page, so the stream
   // resumes after its last seq — never a replay of the history. On a
-  // reconnect `streamInto` resumes with `?after=<last id>` and the
+  // reconnect the subscription resumes with `?after=<last id>` and the
   // reducer dedupes by seq: no gaps, no repeats.
   useThreadStream(
     resources.masterThread,
@@ -1064,6 +1069,11 @@ function MasterHome({
       || !Object.hasOwn(master.data, "actor_identity")
       || thread.data?.conversation !== undefined),
     setLink,
+    undefined,
+    undefined,
+    // CAD-2228: this stream's preview frames are the home conversation's
+    // in-flight text, shown only while that conversation generates.
+    homeConversation ?? null,
   );
 
   // Keep master_state honest: it follows the agents resource's
@@ -1542,6 +1552,7 @@ function MasterHome({
             <ImageConversation.Provider value={homeConversation ?? null}>
             <ThreadList
               items={items}
+              conversation={homeConversation ?? null}
               limit={limit}
               moreBefore={moreBefore}
               loadingEarlier={loadingEarlier}
