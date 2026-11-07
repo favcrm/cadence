@@ -27,6 +27,7 @@
 
 use std::cell::RefCell;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -684,6 +685,7 @@ impl HttpGh {
         let package = self.release_artifact(entry, PACKAGE_ARCHIVE, crate::upgrade::TARGET)?;
         let dir = tempfile::Builder::new()
             .prefix("cadence-release-")
+            .permissions(fs::Permissions::from_mode(0o700))
             .tempdir()?;
         let archive = dir.path().join(PACKAGE_ARCHIVE);
         self.download_artifact(entry, package, &archive)?;

@@ -55,6 +55,15 @@ cadence web unpublish <slug> [--org <org>]
 - `rollback` and `unpublish` ask the owner for approval. They do not act
   directly.
 
+`prepare` stages unpublished files in owner-only directories under the daemon
+state directory. The state directory must be owned by the invoking user and
+not writable by group or others. Its path must not contain symlinks or
+untrusted writable ancestors; a root- or user-owned sticky directory such as
+`/tmp` is allowed. If the path is refused, secure the state directory and its
+ancestors or select a safe state directory before retrying. An existing
+user-owned `web-staging` directory is tightened to `0700` through its opened
+directory handle.
+
 ## Limits
 
 - 2000 files per release, 100 MiB total, 10 MiB per file. The CLI rejects a

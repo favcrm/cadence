@@ -11,6 +11,7 @@
 //! Sandbox startup never writes to the shared home. File match and provider
 //! links are not evidence that a running agent session has reloaded them.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -487,7 +488,10 @@ fn legacy_activated_sync(binary: &Path, home: &Path) -> Value {
             "activated_binary": binary,
         })
     };
-    let staged = match tempfile::tempdir() {
+    let staged = match tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+    {
         Ok(dir) => dir,
         Err(e) => return not_checked(format!("staging home was not created: {e}")),
     };

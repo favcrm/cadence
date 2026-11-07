@@ -529,7 +529,9 @@ impl ReleaseSource for Gh {
                 )));
             }
         }
-        let dir = tempfile::tempdir()?;
+        let dir = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()?;
         self.download(promotion.id, "production-candidate", dir.path())?;
         let receipt = fs::read_to_string(dir.path().join("production-candidate.json"))?;
         let candidate = parse_production_candidate(&receipt, &promotion)?;
@@ -877,6 +879,7 @@ pub struct Captured {
 fn capture_package(dir: &Path) -> Result<Captured> {
     let workspace = tempfile::Builder::new()
         .prefix("cadence-retained-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()?;
     let dest = workspace.path();
     for (name, max) in [
@@ -1856,6 +1859,7 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
                 let id = verify_ci(src, &sha, &mut verified)?;
                 let tmp = tempfile::Builder::new()
                     .prefix("cadence-upgrade-")
+                    .permissions(fs::Permissions::from_mode(0o700))
                     .tempdir()?;
                 src.download(id, &artifact_name(&sha), tmp.path())?;
                 let d = verify_download(src, tmp.path(), &sha, &mut verified)?;

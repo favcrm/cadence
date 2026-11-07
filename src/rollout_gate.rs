@@ -1,5 +1,7 @@
 //! Rollout gate: see the parent module.
 
+use std::os::unix::fs::PermissionsExt;
+
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -771,8 +773,10 @@ pub(super) fn wal_nonempty(path: &Path) -> bool {
 }
 
 pub(super) fn open_peek_copy(path: &Path) -> Result<PeekConn> {
-    let tmp =
-        tempfile::tempdir().map_err(|error| Error::internal(format!("peek copy: {error}")))?;
+    let tmp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .map_err(|error| Error::internal(format!("peek copy: {error}")))?;
     let copy = tmp.path().join("peek.sqlite3");
     std::fs::copy(path, &copy)?;
     for suffix in ["-wal", "-shm"] {

@@ -8,6 +8,7 @@
 //! absent or unpinned image fails closed. Nothing here issues, numbers or
 //! sends a document.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -47,6 +48,7 @@ pub fn intake(file_name: &str, bytes: &[u8]) -> Result<Intake> {
     let runner = runner_dir()?;
     let root = tempfile::Builder::new()
         .prefix("cad1393-intake-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in("/tmp")
         .map_err(|e| Error::internal(format!("cannot create intake staging: {e}")))?;
     let source = root.path().join(file_name);
@@ -147,6 +149,7 @@ fn render(template_docx: &[u8], context: &serde_json::Value, sample: bool) -> Re
     let runner = runner_dir()?;
     let root = tempfile::Builder::new()
         .prefix("cad1393-export-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in("/tmp")
         .map_err(|e| Error::internal(format!("cannot create export staging: {e}")))?;
     let template = root.path().join("template.docx");

@@ -132,6 +132,102 @@ fn platform_call(
     })
 }
 
+/// Validate the pathname ancestors: the daemon reopens the staging root, so
+/// another UID must not be able to replace any component after staging.
+fn trusted_state_dir(path: &Path) -> Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::Component;
+
+    let relative = if path.is_relative() {
+        Some(std::env::current_dir()?.join(path))
+    } else {
+        None
+    };
+    let absolute = relative.as_deref().unwrap_or(path);
+    // Traversal needs search permission, not permission to list each directory.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let access = libc::O_PATH;
+    #[cfg(target_vendor = "apple")]
+    let access = libc::O_SEARCH;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    let access = libc::O_RDONLY;
+    let flags = access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mut dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open("/")?;
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let unsafe_path = || {
+        Error::rejected(format!(
+            "web staging requires an owner-controlled state directory, ancestors not writable \
+             by other users, and no symlinks: {}; secure the path before preparing a site",
+            path.display()
+        ))
+    };
+    let mut meta = dir.metadata()?;
+    for part in absolute.components() {
+        let name = match part {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir => std::ffi::OsStr::new(".."),
+            Component::Prefix(_) => return Err(unsafe_path()),
+        };
+        if (meta.uid() != uid && meta.uid() != 0)
+            || (meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0)
+        {
+            return Err(unsafe_path());
+        }
+        let name = CString::new(name.as_bytes()).map_err(|_| unsafe_path())?;
+        // SAFETY: dir is live, name is NUL-terminated, and openat returns a new fd.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(unsafe_path());
+        }
+        // SAFETY: a successful openat returned a uniquely owned descriptor.
+        dir = unsafe { std::fs::File::from_raw_fd(fd) };
+        meta = dir.metadata()?;
+        if meta.uid() != uid && meta.uid() != 0 {
+            return Err(unsafe_path());
+        }
+    }
+    if meta.uid() != uid || meta.mode() & 0o022 != 0 {
+        return Err(unsafe_path());
+    }
+    Ok(dir)
+}
+
+/// Create or securely tighten the application-owned staging root.
+fn staging_root(state_dir: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let root = state_dir.join(STAGING_DIR);
+    match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&root)?;
+    let meta = dir.metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(Error::rejected(
+            "web staging root is not owned by the current user",
+        ));
+    }
+    if meta.mode() & 0o7777 != 0o700 {
+        // File::set_permissions acts on the pinned fd, not on a replaceable path.
+        dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(root)
+}
+
 /// Freeze output is written under the daemon's state directory, one bounded
 /// token per invocation. The adapter reads it; the CLI never touches the
 /// network for it.
@@ -141,6 +237,10 @@ fn stage(
     slug: &str,
     spa: bool,
 ) -> Result<String> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let _state = trusted_state_dir(state_dir)?;
+    let root = staging_root(state_dir)?;
     let mut random = [0u8; 12];
     getrandom::fill(&mut random)
         .map_err(|_| Error::rejected("unable to create a staging token"))?;
@@ -151,8 +251,15 @@ fn stage(
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     );
-    let dir = state_dir.join(STAGING_DIR).join(&token);
-    std::fs::create_dir_all(dir.join("files"))?;
+    let dir = root.join(&token);
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    if let Err(error) = std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.join("files"))
+    {
+        let _ = std::fs::remove_dir(&dir);
+        return Err(error.into());
+    }
     if let Err(error) = stage_plan(&dir, site, slug, spa) {
         let _ = std::fs::remove_dir_all(&dir);
         return Err(error);
@@ -200,8 +307,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
@@ -221,4 +327,188 @@ fn print_json(value: &Value) -> Result<()> {
             .map_err(|error| Error::internal(error.to_string()))?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, web_publish::FrozenSite) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = root.path().join("state");
+        let source = root.path().join("source");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("index.html"), "synthetic unpublished content").unwrap();
+        let site = web_publish::freeze(&source).unwrap();
+        (root, state, site)
+    }
+
+    #[test]
+    fn web_staging_is_private_under_permissive_umask() {
+        const CHILD: &str = "CADENCE_TEST_WEB_STAGE_UMASK_CHILD";
+        const TEST: &str = "cli::web::tests::web_staging_is_private_under_permissive_umask";
+        if std::env::var_os(CHILD).is_some() {
+            let (root, state, site) = fixture();
+            let control = root.path().join("control");
+            std::fs::create_dir(&control).unwrap();
+            assert_eq!(
+                std::fs::metadata(control).unwrap().permissions().mode() & 0o777,
+                0o775
+            );
+            let token = stage(&state, &site, "synthetic", false).unwrap();
+            let staging = state.join(STAGING_DIR);
+            let dir = staging.join(&token);
+            for path in [&staging, &dir, &dir.join("files")] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+            let file = dir
+                .join("files")
+                .join(web_publish::encode_artifact_path("index.html"));
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "synthetic unpublished content"
+            );
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            remove_staging(&state, &token);
+            assert!(!dir.exists());
+
+            // Existing owner-controlled roots from older versions are tightened safely.
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o775)).unwrap();
+            let token = stage(&state, &site, "synthetic", false).unwrap();
+            assert_eq!(
+                std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            remove_staging(&state, &token);
+            return;
+        }
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("umask 0002 && exec \"$0\" --exact \"$1\" --test-threads=1")
+            .arg(std::env::current_exe().unwrap())
+            .arg(TEST)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("TMPDIR", std::env::temp_dir())
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn web_staging_refuses_unsafe_ancestors_and_existing_files() {
+        let (root, state, site) = fixture();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(stage(&state, &site, "synthetic", false).is_err());
+        assert!(!state.join(STAGING_DIR).exists());
+
+        let ancestor = root.path().join("shared");
+        let nested = ancestor.join("state");
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o775)).unwrap();
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(stage(&nested, &site, "synthetic", false).is_err());
+        assert!(!nested.join(STAGING_DIR).exists());
+
+        let safe = root.path().join("safe");
+        let foreign = root.path().join("foreign");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("sentinel"), "untouched").unwrap();
+        std::os::unix::fs::symlink(&foreign, safe.join(STAGING_DIR)).unwrap();
+        assert!(stage(&safe, &site, "synthetic", false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(foreign.join("sentinel")).unwrap(),
+            "untouched"
+        );
+
+        let planted = root.path().join("planted");
+        std::fs::write(&planted, "untouched").unwrap();
+        assert!(write_private(&planted, b"replacement").is_err());
+        assert_eq!(std::fs::read_to_string(planted).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn web_staging_allows_trusted_search_only_ancestor() {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            const CHILD: &str = "CADENCE_TEST_WEB_SEARCH_ONLY_CHILD";
+            if std::env::var_os(CHILD).is_none() {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "cli::web::tests::web_staging_allows_trusted_search_only_ancestor",
+                        "--test-threads=1",
+                    ])
+                    .env_clear()
+                    .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                    .env("TMPDIR", std::env::temp_dir())
+                    .env(CHILD, "1");
+                // SAFETY: the child only drops its ambient capabilities before exec.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::prctl(
+                            libc::PR_CAP_AMBIENT,
+                            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                            0,
+                            0,
+                            0,
+                        ) == -1
+                        {
+                            let error = std::io::Error::last_os_error();
+                            if error.raw_os_error() != Some(libc::EINVAL) {
+                                return Err(error);
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "stdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+        }
+        let (root, _, site) = fixture();
+        let ancestor = root.path().join("search-only");
+        let state = ancestor.join("state");
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let readable = std::fs::File::open(&ancestor).is_ok();
+        let result = stage(&state, &site, "synthetic", false);
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!readable, "fixture still permits directory reads");
+        }
+        let token = result.unwrap();
+        remove_staging(&state, &token);
+    }
 }
