@@ -259,6 +259,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const projects = projectsState.data ?? [];
   const agents = agentsState.data;
   const [health, setHealth] = useState<Health | null | "unavailable">(null);
+  const [partialUpdates, setPartialUpdates] = useState(false);
   const [updateBanner, setUpdateBanner] = useState<UpdateBanner | null>(null);
   // The open drawer's detail, cached per id: reopening a drawer paints
   // the last payload while it revalidates.
@@ -532,6 +533,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   useEffect(() => {
     const updates = new LiveUpdates({
       resync: reconcile,
+      onDegraded: setPartialUpdates,
       invalidate: (key) => {
         // Main refetches the lane store when a frame names issue, agents,
         // or jobs. Entity patches queue that through LiveUpdates; legacy
@@ -1119,6 +1121,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         </header>
 
         <AssistantUnreadProbes apps={installed} />
+        {partialUpdates && (
+          <p role="status" className="px-4 lg:px-8 py-2 text-label text-warn">
+            {t("Some board updates are not live. This tab checks for changes periodically.")}
+          </p>
+        )}
 
         {updateBanner && (
           <details className="update-notice border-b border-amber-500/30 bg-amber-500/5 px-4 lg:px-8 py-2 text-label text-ink-300">

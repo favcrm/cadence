@@ -1,4 +1,4 @@
-import { useEffect, useRef, useSyncExternalStore } from "react";
+import { useSyncExternalStore } from "react";
 import { onPrivateSessionReset, privateSessionGeneration } from "../../../lib/privateSession";
 import { carriesSecret } from "./directive";
 
@@ -129,33 +129,20 @@ export function applyPreviewFrame(conversation: string | null, data: string): vo
 
 /**
  * The live assistant text for `conversation` while `active` — the surface's
- * own turn state says a turn is generating here. Leaving that turn clears the
- * text (a later turn must not open on the previous one's words), and a text
- * that arrives while no turn is generating is never painted.
+ * own turn state says a turn is generating here. Inactive rows never paint
+ * text; the stream owns clearing so a retiring row cannot erase its successor.
  */
 export function useConversationPreview(conversation: string | null, active: boolean): string | null {
   // `active` is part of the snapshot, not only of the return value: a
   // notification leaves a finished turn's snapshot (null) unchanged, so the
   // transcript does not re-render for text that is not its own — only the
   // turn that is generating sees a new value each frame.
-  const text = useSyncExternalStore(
+  return useSyncExternalStore(
     subscribe,
     () => (active ? previewOf(conversation) : null),
     // Stable identity: a server render and hydration both paint no live text.
     serverPreview,
   );
-  const shown = useRef({ conversation, active });
-  useEffect(() => {
-    const previous = shown.current;
-    shown.current = { conversation, active };
-    if (previous.conversation !== conversation) {
-      // A conversation switch retires the text the other one was painting.
-      if (previous.active) setConversationPreview(previous.conversation, null);
-      return;
-    }
-    if (previous.active && !active) setConversationPreview(conversation, null);
-  }, [active, conversation]);
-  return text;
 }
 
 // A reset abandons every private observation, live text included.

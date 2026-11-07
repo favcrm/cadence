@@ -464,29 +464,30 @@ export class HostedSession<
             masterOperation !== null && source === masterOperation
               ? preview.apply(projected)
               : { current: null, latest: null };
+          // A committed predecessor can share a batch with its successor's
+          // partial. The browser retires a preview on a terminal entry, so
+          // reconcile entries first and then announce the current partial,
+          // even when its text did not change in this batch.
+          if (changes.entries)
+            for (const entry of await this.transcript(thinking))
+              if (!emit(entry, send)) break;
           let shown = before;
           if (batch.current !== null) {
-            if (batch.current !== before) {
+            if (batch.current !== before || changes.entries) {
               sendPreview(batch.current);
               shown = batch.current;
             }
           } else if (
+            !changes.entries &&
             before !== null &&
             batch.latest !== null &&
             batch.latest !== before
           ) {
-            // The final chunk arrived in the commit that completes the
-            // message: show it once, before the committed entry below.
             sendPreview(batch.latest);
             shown = batch.latest;
           }
-          // Only a batch that committed or replaced entries re-reads the
-          // transcript; partial text is not history and must not cost a full
-          // read per chunk per reader.
-          if (changes.entries)
-            for (const entry of await this.transcript(thinking))
-              if (!emit(entry, send)) break;
-          // Entries are reconciled first; only then does transient text clear.
+          // A committed answer replaces its transient text. Its clear follows
+          // the entry, while a successor's partial above stays visible.
           if (batch.current === null && shown !== null) sendPreview(null);
         },
       }, { overflow: "after-cursor" });

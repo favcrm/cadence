@@ -57892,20 +57892,20 @@ data: ${JSON.stringify(entry)}
           const retired = (event) => event.type === "message_end" || event.type === "task_failed" && event.kind === "pi.generation";
           const projected = replacing ? [...events.filter(retired), ...events.filter((event) => !retired(event))] : events;
           const batch = masterOperation !== null && source === masterOperation ? preview.apply(projected) : { current: null, latest: null };
-          let shown = before;
-          if (batch.current !== null) {
-            if (batch.current !== before) {
-              sendPreview(batch.current);
-              shown = batch.current;
-            }
-          } else if (before !== null && batch.latest !== null && batch.latest !== before) {
-            sendPreview(batch.latest);
-            shown = batch.latest;
-          }
           if (changes.entries) {
             for (const entry of await this.transcript(thinking))
               if (!emit(entry, send))
                 break;
+          }
+          let shown = before;
+          if (batch.current !== null) {
+            if (batch.current !== before || changes.entries) {
+              sendPreview(batch.current);
+              shown = batch.current;
+            }
+          } else if (!changes.entries && before !== null && batch.latest !== null && batch.latest !== before) {
+            sendPreview(batch.latest);
+            shown = batch.latest;
           }
           if (batch.current === null && shown !== null)
             sendPreview(null);

@@ -26,6 +26,7 @@ export class LiveUpdates {
     invalidate: (key: string) => void;
     patch: (event: SseEvent, data: Record<string, unknown>) => void;
     resync: () => void;
+    onDegraded?: (degraded: boolean) => void;
     now?: () => number;
     schedule?: (fn: () => void) => ReturnType<typeof setTimeout>;
     cancel?: (timer: ReturnType<typeof setTimeout>) => void;
@@ -50,12 +51,18 @@ export class LiveUpdates {
     try {
       data = JSON.parse(event.data) as Record<string, unknown>;
     } catch {
-      if (event.type === "hello") this.coverage = "degraded";
+      if (event.type === "hello") {
+        this.coverage = "degraded";
+        this.opts.onDegraded?.(true);
+      }
       this.opts.resync();
       return;
     }
     if (!data || typeof data !== "object" || (event.type === "hello" && Array.isArray(data))) {
-      if (event.type === "hello") this.coverage = "degraded";
+      if (event.type === "hello") {
+        this.coverage = "degraded";
+        this.opts.onDegraded?.(true);
+      }
       this.opts.resync();
       return;
     }
@@ -72,6 +79,7 @@ export class LiveUpdates {
       this.coverage = gapped || (claims && data.liveness !== "stream")
         ? "degraded"
         : claims ? "stream" : "unstipulated";
+      this.opts.onDegraded?.(this.coverage === "degraded");
       return;
     }
     if (event.type === "heartbeat") return;

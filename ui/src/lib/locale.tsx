@@ -607,6 +607,7 @@ Object.assign(zhTW, {
 Object.assign(zhTW, {
   "Updating Cadence": "Cadence 正在更新",
   "No active turns remaining": "沒有剩餘的執行回合",
+  "Some board updates are not live. This tab checks for changes periodically.": "部分看板更新不是即時的。此分頁會定期檢查變更。",
   "Customers table — scroll horizontally to reach every column": "客戶表格 — 水平捲動以查看所有欄位",
   "· more on the server": "· 伺服器上還有更多資料",
   "How was consent given? (optional)": "如何取得同意？（選填）",

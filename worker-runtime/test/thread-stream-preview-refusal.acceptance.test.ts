@@ -1566,6 +1566,22 @@ describe("thread stream stale turn", () => {
             "[older commit] the older commit cleared the running turn's preview",
           );
       }
+      // A terminal entry clears the UI's current preview. If it follows B's
+      // first text, the same text must be re-announced before a later delta.
+      const olderEntry = frames.findIndex(
+        (frame) => frame.event === "entry" && frame.id === "1",
+      );
+      if (
+        olderEntry > firstCurrent.index &&
+        olderEntry < until &&
+        !previews.some(
+          (preview) =>
+            preview.index > olderEntry &&
+            preview.index < until &&
+            preview.text === CURRENT_TEXT,
+        )
+      )
+        issues.push("[older commit] the successor preview was not restored after the entry");
     }
     for (const preview of previews)
       if (preview.text !== null && preview.text.includes(STALE_TEXT))
