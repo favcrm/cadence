@@ -132,7 +132,7 @@ export function PublishToInstagram({ installation, bindings, contextId, canWrite
     try {
       // CAD-1438: this panel only mounts on the canonical `/apps/<key>` route
       // (uniqueness proven before mount), so the install's own key is its path.
-      const reply = await workspaceApps.connectLink(installId, connectReturnTo(window.location.origin, installation.name, installId, { mode: "native" }), undefined, toolkit);
+      const reply = await workspaceApps.connectLink(installId, connectReturnTo(window.location.origin, installation.name, installId, { mode: "native" }, contextId ?? undefined), undefined, toolkit);
       if (reply.hosted && reply.url) window.location.assign(reply.url);
       else if (reply.hosted) setNote(CONNECT_UNAVAILABLE);
       else navigate("/settings/connections");

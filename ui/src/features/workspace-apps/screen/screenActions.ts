@@ -386,7 +386,7 @@ async function connectOrOpen(ctx: ActionContext, args: Record<string, unknown>, 
           : { mode: "screen" };
         const inlineConsent = inline && (await readConsent(ctx.installId, operation.signal)).available;
         operation.assertCurrent();
-        const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name, ctx.installId, target), operation.signal, toolkit, inlineConsent);
+        const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name, ctx.installId, target, ctx.contextId), operation.signal, toolkit, inlineConsent);
         operation.assertCurrent();
         if (reply.hosted && reply.url) { (ui.assign ?? (url => window.location.assign(url)))(reply.url); return { ok: true, data: {} }; }
         // Hosted but no public AgenticOS address: say so, never send the owner to the local page.

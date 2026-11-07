@@ -29,12 +29,15 @@ export type ConnectReturnTarget =
  *  the app screen itself, or that screen with the drawer surface the owner connected from.
  *  AgenticOS refuses any other origin; it keeps the path and query we send. Keep the immutable
  *  installation pin so a return after reinstall cannot select the replacement merely because
- *  its package key is the same. */
+ *  its package key is the same. The starting context travels as the board's own `ctx` claim:
+ *  the shell still makes the workspace's active context the authority, but it notices when the
+ *  claim no longer matches instead of silently opening the drawer in another scope. */
 export function connectReturnTo(
   origin: string,
   appKey: string,
   installId: string,
   target: ConnectReturnTarget = { mode: "native" },
+  contextId?: string,
 ): string {
   const query = new URLSearchParams();
   if (target.mode === "native") query.set("screen", "native");
@@ -43,6 +46,7 @@ export function connectReturnTo(
     if (target.size) query.set("drawer_size", target.size);
   }
   query.set("install", installId);
+  if (contextId) query.set("ctx", contextId);
   return `${origin}/apps/${encodeURIComponent(appKey)}?${query.toString()}`;
 }
 

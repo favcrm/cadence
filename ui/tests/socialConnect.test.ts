@@ -72,6 +72,9 @@ async function main() {
   equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "screen" }), "https://ef.cadencecloud.app/apps/social%20content?install=install-1", "a frame returns to the app screen, not the native page");
   equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "drawer", surface: "settings" }), "https://ef.cadencecloud.app/apps/social%20content?drawer=settings&install=install-1", "a drawer connect names its surface");
   equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "drawer", surface: "settings", size: "wide" }), "https://ef.cadencecloud.app/apps/social%20content?drawer=settings&drawer_size=wide&install=install-1", "the width hint travels too");
+  equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "drawer", surface: "settings" }, "ctx1"), "https://ef.cadencecloud.app/apps/social%20content?drawer=settings&install=install-1&ctx=ctx1", "the starting context travels so the shell can notice a changed scope");
+  equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "native" }, "ctx1"), "https://ef.cadencecloud.app/apps/social%20content?screen=native&install=install-1&ctx=ctx1", "the native page carries it too");
+  equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "drawer", surface: "settings" }, ""), "https://ef.cadencecloud.app/apps/social%20content?drawer=settings&install=install-1", "an unknown context is not claimed");
   equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "drawer", surface: "../settings" }), "https://ef.cadencecloud.app/apps/social%20content?install=install-1", "a surface a drawer could not name is dropped, the screen stays");
   equal(readReturnDrawer("?drawer=settings&install=install-1"), { surface: "settings" }, "the hint reads back");
   equal(readReturnDrawer("?drawer=settings&drawer_size=wide&install=install-1"), { surface: "settings", size: "wide" }, "with its width");
@@ -101,7 +104,7 @@ async function main() {
     let opened: string | null = null;
     const fb = await runCall(ctx(), "open-link", { url: "/settings/connections", toolkit: "facebook" }, { showLink: () => {}, assign: (url: string) => { opened = url; } });
     assert(fb.ok && opened !== null, "a Facebook connect opens the host-composed link");
-    equal(calls[0].body, { return_to: "https://ef.cadencecloud.app/apps/social-content?install=inst1", toolkit: "facebook" }, "the toolkit reaches the connect link and a frame returns to the app screen");
+    equal(calls[0].body, { return_to: "https://ef.cadencecloud.app/apps/social-content?install=inst1&ctx=ctx1", toolkit: "facebook" }, "the toolkit reaches the connect link and a frame returns to the app screen in the same context");
     for (const args of [{ url: "/settings/connections", toolkit: "linkedin" }, { url: "https://evil.example/x", toolkit: "facebook" }]) {
       const bad = await runCall(ctx(), "open-link", args, { showLink: () => {} });
       assert(!bad.ok && bad.refusal.code === "bad_args", "an unknown toolkit or a toolkit on another link is refused");
@@ -117,7 +120,7 @@ async function main() {
   const ui = { showLink: (url: string) => { shown = url; }, navigate: (path: string) => { navigated = path; }, assign: (url: string) => { assigned = url; } };
   let result = await runCall(ctx(), "open-link", { url: "/settings/connections" }, ui);
   assert(result.ok && assigned === "https://api.example/account/ws/connections/connect?toolkit=instagram&return_to=x" && shown === null, "hosted opens the AgenticOS link top-level");
-  equal(calls[0], { path: "/api/app-installations/inst1/publishing/connect-link", body: { return_to: "https://ef.cadencecloud.app/apps/social-content?install=inst1" } }, "the host asks with its own canonical return_to");
+  equal(calls[0], { path: "/api/app-installations/inst1/publishing/connect-link", body: { return_to: "https://ef.cadencecloud.app/apps/social-content?install=inst1&ctx=ctx1" } }, "the host asks with its own canonical return_to and context");
   // The frame never supplies the URL: another url is not routed through the connect link.
   assigned = null; calls.length = 0;
   result = await runCall(ctx(), "open-link", { url: "https://evil.example/x" }, ui);
@@ -285,7 +288,7 @@ async function main() {
   calls.length = 0;
   const fromDrawer = await runCall(ctx(), "open-link", { url: "/settings/connections", toolkit: "facebook" }, { ...ui, returnSurface: "settings", returnSize: "wide" });
   assert(fromDrawer.ok, "a drawer connect opens the host-composed link");
-  equal((calls[0].body as Record<string, unknown>).return_to, "https://ef.cadencecloud.app/apps/social-content?drawer=settings&drawer_size=wide&install=inst1", "a drawer connect returns to its own surface and width, not the native page");
+  equal((calls[0].body as Record<string, unknown>).return_to, "https://ef.cadencecloud.app/apps/social-content?drawer=settings&drawer_size=wide&install=inst1&ctx=ctx1", "a drawer connect returns to its own surface and width, not the native page");
 
   // A settled source save may only refresh the primary it was made for.
   const scope = { installId: "inst1", contextId: "ctx1" };
