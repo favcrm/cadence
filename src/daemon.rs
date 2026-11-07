@@ -528,6 +528,17 @@ type ShutdownFacts = HashMap<String, (String, u32, String)>;
 /// caller-supplied value and never serialized outside the local marker.
 type LiveEvidence = std::result::Result<Vec<(String, String)>, String>;
 
+/// Message provenance for a rendered member continuity pack.
+struct ContinuitySources {
+    thread_id: String,
+    message_ids: Vec<String>,
+}
+
+type ContinuityParts = (
+    String,
+    Option<(crate::continuity::Pack, Option<ContinuitySources>)>,
+);
+
 /// CAD-XXXX test seam: the platform membership lookup
 /// `current_public_hash_from` calls when `membership_lookup_for_test` is
 /// set — hash, subject, company, instance in, the fresh role answer or an
@@ -1973,7 +1984,7 @@ impl Shared {
         endpoint_kind: &str,
         message: &Message,
         slot: Option<&str>,
-    ) -> (String, Option<crate::continuity::Pack>) {
+    ) -> Result<ContinuityParts> {
         let body = self.delivery_body(alias, endpoint_kind, message, slot);
         // A new or lost session is decided at open (in memory: the next
         // open decides again); a compaction is a thread note, pending
@@ -1998,20 +2009,50 @@ impl Shared {
                     .then_some(crate::continuity::Reason::Compacted)
             });
         let Some(reason) = due else {
-            return (body, None);
+            return Ok((body, None));
         };
         if !crate::continuity::endpoint_takes_packs(endpoint_kind) {
-            return (body, None);
+            return Ok((body, None));
         }
         let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
-        let built = crate::continuity::assemble(
-            &self.store,
-            pm_dir.as_deref(),
-            alias,
-            reason,
-            &message.id,
-            thread.as_ref(),
-        );
+        let member = match self.store.assistant_for_alias(alias) {
+            Ok(binding) => binding.is_some(),
+            Err(error) => {
+                self.restore_continuity_due(alias, reason);
+                return Err(Error::pre_write(format!(
+                    "continuity context withheld: {error}"
+                )));
+            }
+        };
+        let built = match thread.as_ref() {
+            Some(thread) => match crate::continuity::gather_for(
+                &self.store,
+                pm_dir.as_deref(),
+                alias,
+                &message.id,
+                Some(thread),
+            ) {
+                Ok(sources) => {
+                    if member {
+                        crate::continuity::build_with_message_ids(reason, &sources).map(|built| {
+                            built.map(|(pack, message_ids)| {
+                                let provenance =
+                                    (!message_ids.is_empty()).then(|| ContinuitySources {
+                                        thread_id: thread.id.clone(),
+                                        message_ids,
+                                    });
+                                (pack, provenance)
+                            })
+                        })
+                    } else {
+                        crate::continuity::build(reason, &sources)
+                            .map(|built| built.map(|pack| (pack, None)))
+                    }
+                }
+                Err(error) => Err(error),
+            },
+            None => Ok(None),
+        };
         let pack = match built {
             Ok(Some(pack)) => pack,
             Ok(None) => {
@@ -2027,7 +2068,7 @@ impl Shared {
                         None,
                     );
                 }
-                return (body, None);
+                return Ok((body, None));
             }
             Err(e) => {
                 // One failure per trigger: the note settles it, so a
@@ -2048,10 +2089,18 @@ impl Shared {
                     "failed",
                     Some(&error),
                 );
-                return (body, None);
+                return Ok((body, None));
             }
         };
-        (body, Some(pack))
+        Ok((body, Some(pack)))
+    }
+
+    fn restore_continuity_due(&self, alias: &str, reason: crate::continuity::Reason) {
+        self.continuity_due
+            .lock()
+            .unwrap()
+            .entry(alias.to_string())
+            .or_insert(reason);
     }
 
     /// CAD-1009: the combined prompt existing callers use — the due pack (if
@@ -2066,10 +2115,16 @@ impl Shared {
         message: &Message,
         slot: Option<&str>,
     ) -> String {
-        let (body, pack) = self.continuity_parts(alias, endpoint_kind, message, slot);
-        let Some(pack) = pack else {
+        let (body, pack) = self
+            .continuity_parts(alias, endpoint_kind, message, slot)
+            .expect("test continuity admission");
+        let Some((pack, sources)) = pack else {
             return body;
         };
+        let _admissions = sources.map(|sources| {
+            self.admit_continuity_sources(alias, &sources.thread_id, &sources.message_ids)
+                .expect("test continuity source admission")
+        });
         self.record_continuity(alias, message, &pack);
         pack.wrap(&body)
     }
@@ -2580,7 +2635,7 @@ impl Shared {
         message: &Message,
         slot: Option<&str>,
         refused: &TurnResult,
-    ) -> (String, Option<crate::continuity::Pack>) {
+    ) -> Result<ContinuityParts> {
         let alias = agent.alias.as_str();
         let error = refused
             .error
@@ -2605,7 +2660,7 @@ impl Shared {
                 role: store::ROLE_SYSTEM,
                 kind: store::KIND_MESSAGE,
                 text: &format!(
-                    "The provider refused this session's history ({error}). Started a new provider session and retried the turn once with the mandatory task context; optional continuity history is included only when it fits."
+                    "The provider refused this session's history ({error}). Started a new provider session; a retry uses the mandatory task context and includes optional continuity history only when it fits and remains authorized."
                 ),
                 payload: Some(json!({"event": "provider_session_reset", "message": message.id})),
                 message_id: None,

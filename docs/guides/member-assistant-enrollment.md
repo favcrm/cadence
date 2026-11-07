@@ -203,12 +203,21 @@ the subscriber's unrelated conversation remain available. Re-sharing restores
 the durable subscriber's access, but a client that already advanced a history
 cursor past the hidden entries must rescan to see them.
 
+Before a later provider attempt, a continuity pack reserves the local share for
+each receipt-linked notice turn represented in that pack. If withdrawal commits
+after the notice was selected but before admission, the turn is refused rather
+than submitting that stale context. While the attempt holds an admission, the
+owner receives `share_withdrawal_pending` and sharing stays on; retry after it
+finishes. Continuity admission does not reserve jobs whose turns are excluded
+from the final pack, or when the whole pack is not sent.
+
 This is not a complete revocation guarantee. Historical reads do not re-prove
-each job's remote grant; local withdrawal can race a response or a different
-turn's provider submission. Other background or legacy readers, ambiguous
-provenance, later derived outputs and persistent provider sessions remain
-outside this check. Previously received responses, copied material and
-already-sent provider requests cannot be recalled.
+each job's remote grant, and local withdrawal can race an already selected
+history response. Remote grant withdrawal is not ordered with provider
+submission. Other background or legacy readers, ambiguous provenance, later
+derived outputs and persistent provider sessions remain outside these checks.
+Previously received responses, copied material and already-sent provider
+requests cannot be recalled.
 
 For a stable binding, generic non-human topic membership refuses a bound
 assistant, generic topic reads and work-list aggregates omit its posts, and

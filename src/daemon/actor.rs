@@ -640,16 +640,32 @@ impl Shared {
                         self.turn_slot(&agent, &message)
                     };
                     let mut pending_context: Option<ContextDelivery> = None;
+                    // Keep every included notice source admitted until the
+                    // provider attempt has finished, not just until packing.
+                    let mut _continuity_admissions = None;
                     let prompt = if nudge {
                         message.body.clone()
                     } else {
                         let compacted = self.context_compacted(&message);
-                        let (base, pack) = self.continuity_parts(
+                        let (base, pack) = match self.continuity_parts(
                             alias,
                             &agent.endpoint_kind,
                             &message,
                             slot.as_deref(),
-                        );
+                        ) {
+                            Ok(parts) => parts,
+                            Err(error) => {
+                                let reason = error.to_string();
+                                let failed = json!({"status": "failed", "text": "",
+                                                    "error": reason});
+                                self.store
+                                    .finish(&message, "failed", &failed, Some(&reason))?;
+                                self.notify_routed_target(&message, &failed);
+                                gate_notice = None;
+                                self.wake();
+                                continue;
+                            }
+                        };
                         // The committed actor profile follows the request on
                         // every real turn, including after provider `/new`.
                         // Missing or unreadable profiles fail closed.
@@ -689,7 +705,7 @@ impl Shared {
                         // first. Include it whole only when it still fits;
                         // otherwise omit it whole with a recorded reason and
                         // keep the mandatory task contract and sources.
-                        if let Some(pack) = pack {
+                        if let Some((pack, sources)) = pack {
                             let reserved = pending_context
                                 .as_ref()
                                 .map(|delivery| delivery.reserved_bytes)
@@ -700,6 +716,32 @@ impl Shared {
                             {
                                 self.omit_continuity(alias, &message, &pack, combined);
                             } else {
+                                if let Some(sources) = sources {
+                                    match self.admit_continuity_sources(
+                                        alias,
+                                        &sources.thread_id,
+                                        &sources.message_ids,
+                                    ) {
+                                        Ok(admissions) => _continuity_admissions = Some(admissions),
+                                        Err(error) => {
+                                            self.restore_continuity_due(alias, pack.reason);
+                                            let reason =
+                                                format!("continuity context withheld: {error}");
+                                            let failed = json!({"status": "failed", "text": "",
+                                                                "error": reason});
+                                            self.store.finish(
+                                                &message,
+                                                "failed",
+                                                &failed,
+                                                Some(&reason),
+                                            )?;
+                                            self.notify_routed_target(&message, &failed);
+                                            gate_notice = None;
+                                            self.wake();
+                                            continue;
+                                        }
+                                    }
+                                }
                                 self.record_continuity(alias, &message, &pack);
                                 text = pack.wrap(&text);
                             }
@@ -745,7 +787,9 @@ impl Shared {
                                 slot.as_deref(),
                                 &message.id,
                                 &on_started,
-                            )?;
+                            );
+                            drop(_continuity_admissions.take());
+                            let first = first?;
                             let reset = if nudge {
                                 false
                             } else {
@@ -777,12 +821,25 @@ impl Shared {
                                 self.member_message_reprove(&message)
                                     .map_err(|error| Error::PreWrite(error.to_string()))?;
                             }
-                            let (base, pack) = self.after_session_reset_parts(
+                            let (base, pack) = match self.after_session_reset_parts(
                                 &agent,
                                 &message,
                                 slot.as_deref(),
                                 &first,
-                            );
+                            ) {
+                                Ok(parts) => parts,
+                                Err(error) => {
+                                    let _ = self.store.event_public(
+                                        alias,
+                                        "continuity_pack_failed",
+                                        json!({"message": message.id, "error": error.to_string()}),
+                                    );
+                                    // The first provider attempt already ran.
+                                    // Preserve its result rather than claiming
+                                    // that no request was submitted.
+                                    return Ok(first);
+                                }
+                            };
                             // Same priority as the first attempt: the actor
                             // profile and mandatory task context are planned
                             // against the base body; optional history yields.
@@ -802,8 +859,9 @@ impl Shared {
                                     Ok(None) => base,
                                     Err(error) => return Err(error),
                                 };
+                            let mut _retry_continuity_admissions = None;
                             let prompt = match pack {
-                                Some(pack) => {
+                                Some((pack, sources)) => {
                                     let reserved = pending_context
                                         .as_ref()
                                         .map(|delivery| delivery.reserved_bytes)
@@ -815,6 +873,27 @@ impl Shared {
                                         self.omit_continuity(alias, &message, &pack, combined);
                                         prompt
                                     } else {
+                                        if let Some(sources) = sources {
+                                            match self.admit_continuity_sources(
+                                                alias,
+                                                &sources.thread_id,
+                                                &sources.message_ids,
+                                            ) {
+                                                Ok(admissions) => {
+                                                    _retry_continuity_admissions = Some(admissions);
+                                                }
+                                                Err(error) => {
+                                                    self.restore_continuity_due(alias, pack.reason);
+                                                    let _ = self.store.event_public(
+                                                        alias,
+                                                        "continuity_pack_failed",
+                                                        json!({"message": message.id,
+                                                               "error": format!("continuity context withheld: {error}")}),
+                                                    );
+                                                    return Ok(first);
+                                                }
+                                            }
+                                        }
                                         self.record_continuity(alias, &message, &pack);
                                         pack.wrap(&prompt)
                                     }
@@ -831,6 +910,7 @@ impl Shared {
                                 &on_started,
                             )
                         });
+                    drop(_continuity_admissions.take());
                     adapter.set_unclaimed_ok(false);
                     adapter.set_steer_ok(false);
                     // CAD-250: an unconfirmed nudge paste ends `unknown`,

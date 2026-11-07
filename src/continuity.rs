@@ -804,6 +804,23 @@ enum Part {
 /// to carry; `Err` when the secret scan cannot run (no pack then, never
 /// an unscanned one).
 pub fn build(reason: Reason, sources: &Sources) -> Result<Option<Pack>> {
+    Ok(build_inner(reason, sources, false)?.map(|(pack, _)| pack))
+}
+
+/// Build a member pack and retain the message IDs actually represented in
+/// its final rendered sections, for local share admission before submission.
+pub(crate) fn build_with_message_ids(
+    reason: Reason,
+    sources: &Sources,
+) -> Result<Option<(Pack, Vec<String>)>> {
+    build_inner(reason, sources, true)
+}
+
+fn build_inner(
+    reason: Reason,
+    sources: &Sources,
+    capture_message_ids: bool,
+) -> Result<Option<(Pack, Vec<String>)>> {
     let all = turns(&sources.entries);
     if all.is_empty()
         && sources.older_entries == 0
@@ -864,6 +881,7 @@ pub fn build(reason: Reason, sources: &Sources) -> Result<Option<Pack>> {
     }
     verbatim.reverse();
     let older = &all[..all.len() - verbatim.len()];
+    let mut summary_range = 0..0;
 
     if !older.is_empty() || sources.older_entries > 0 {
         let mut lines: Vec<String> = Vec::new();
@@ -877,6 +895,7 @@ pub fn build(reason: Reason, sources: &Sources) -> Result<Option<Pack>> {
             lines.push(line);
         }
         lines.reverse();
+        summary_range = (older.len() - lines.len())..older.len();
         let mut section = String::new();
         let unlisted = older.len() - lines.len();
         if unlisted > 0 || sources.older_entries > 0 {
@@ -951,16 +970,40 @@ pub fn build(reason: Reason, sources: &Sources) -> Result<Option<Pack>> {
             Part::Summary(_) => {}
         }
     }
-    Ok(Some(Pack {
-        reason,
-        text,
-        sha256,
-        nonce,
-        turns_verbatim: verbatim_n,
-        turns_summarized: all.len() - verbatim_n,
-        plans: plans_n,
-        preferences: prefs,
-    }))
+    let mut message_ids = Vec::new();
+    if capture_message_ids {
+        let mut remember = |turn: &Turn<'_>| {
+            let entry = turn.first;
+            if let Some(id) = entry
+                .message_id
+                .as_deref()
+                .or_else(|| payload_str(entry, "message"))
+            {
+                message_ids.push(id.to_string());
+            }
+        };
+        if parts.iter().any(|part| matches!(part, Part::Summary(_))) {
+            for turn in &all[summary_range] {
+                remember(turn);
+            }
+        }
+        for turn in &all[all.len() - verbatim_n..] {
+            remember(turn);
+        }
+    }
+    Ok(Some((
+        Pack {
+            reason,
+            text,
+            sha256,
+            nonce,
+            turns_verbatim: verbatim_n,
+            turns_summarized: all.len() - verbatim_n,
+            plans: plans_n,
+            preferences: prefs,
+        },
+        message_ids,
+    )))
 }
 
 /// Room the header and end line need: fixed text, a 64-byte alias and

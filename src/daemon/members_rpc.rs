@@ -39,9 +39,9 @@ use super::*;
 
 use crate::board_identity;
 
-/// Keeps a subscriber notice admitted until its provider attempt finishes.
-/// The owner can withdraw a share only when no such notice is being prepared
-/// or submitted for that job. This is local ordering, not remote revocation.
+/// Holds a subscriber's local job share for an admitted read or provider
+/// attempt, including a notice carried in continuity context. Withdrawal is
+/// refused while it is held; remote revocation is not ordered by this guard.
 pub(super) struct AssistNoticeAdmission<'a> {
     shared: &'a Shared,
     org: String,
@@ -183,6 +183,35 @@ impl Shared {
             ));
         }
         Ok(Some(admission))
+    }
+
+    /// Reserve each locally shared job represented in the rendered member
+    /// continuity pack. The caller holds these through provider submission.
+    pub(super) fn admit_continuity_sources(
+        &self,
+        alias: &str,
+        thread_id: &str,
+        message_ids: &[String],
+    ) -> Result<Vec<AssistNoticeAdmission<'_>>> {
+        let binding = self
+            .store
+            .assistant_for_alias(alias)?
+            .filter(|binding| {
+                binding.is_active() && binding.conversation_id.as_deref() == Some(thread_id)
+            })
+            .ok_or_else(|| {
+                Error::rejected("continuity refused: the member assistant binding changed")
+            })?;
+        let jobs = self
+            .store
+            .assist_continuity_notice_jobs(&binding, message_ids)?;
+        let mut admissions = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            if let Some(admission) = self.admit_member_job_read(&binding.org, &binding.sub, &job)? {
+                admissions.push(admission);
+            }
+        }
+        Ok(admissions)
     }
 
     /// Hold a subscriber's live share through the generic work-read handler.
@@ -2836,8 +2865,8 @@ impl Shared {
             self.store
                 .assist_job_share(job, &member.org, &member.sub, true)?;
         } else {
-            // Keep the admission lock through the store commit: a new notice
-            // must either reserve first or re-prove after the withdrawal.
+            // Keep the admission lock through the store commit: a notice or
+            // continuity source either reserves first or re-proves after withdrawal.
             let admissions = self
                 .assist_notice_admissions
                 .lock()
@@ -2848,8 +2877,8 @@ impl Shared {
             {
                 return Err(Error::gate_coded(
                     "share_withdrawal_pending",
-                    "A delivery for this job is being submitted; sharing remains on. \
-                     Retry after it finishes.",
+                    "A delivery or continuity context for this job is being submitted; \
+                     sharing remains on. Retry after it finishes.",
                 ));
             }
             self.store

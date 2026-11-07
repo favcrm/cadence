@@ -1578,4 +1578,49 @@ impl Store {
             )
             .optional()?)
     }
+
+    /// Jobs whose receipt-linked turns are represented in a continuity pack.
+    /// Read receipt metadata only; never re-read a notice body.
+    pub(crate) fn assist_continuity_notice_jobs(
+        &self,
+        binding: &AssistantBinding,
+        ids: &[String],
+    ) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = "?,".repeat(ids.len());
+        let sql = format!(
+            "SELECT DISTINCT job,org,sub,assistant_id,alias \
+             FROM assist_notice_deliveries WHERE message_id IN ({})",
+            &placeholders[..placeholders.len() - 1]
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut jobs = Vec::with_capacity(rows.len());
+        for (job, org, sub, assistant_id, alias) in rows {
+            if org != binding.org
+                || sub != binding.sub
+                || assistant_id != binding.assistant_id
+                || alias != binding.alias
+            {
+                return Err(Error::rejected(
+                    "continuity notice receipt does not match the active assistant",
+                ));
+            }
+            jobs.push(job);
+        }
+        Ok(jobs)
+    }
 }
