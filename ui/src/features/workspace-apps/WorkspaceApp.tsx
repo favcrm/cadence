@@ -25,7 +25,7 @@ import { SlotBindings } from "./SlotBindings";
 import { ReadinessPanel } from "./ReadinessPanel";
 import { TeamSettings } from "./TeamSettings";
 import { PublishToInstagram } from "./PublishToInstagram";
-import { connectOutcome, connectToast, publishAllowed, withoutConnectParams } from "./socialConnect";
+import { connectOutcome, connectToast, sameScope, withoutConnectParams } from "./socialConnect";
 import Toast, { type ToastMsg } from "../../ui/Toast";
 import { declaredSlots } from "./bindingChoices";
 import {
@@ -250,6 +250,8 @@ export default function WorkspaceApp({
   presentation,
   onScreenClosed,
   drawerTarget,
+  restoreDrawer,
+  onRestoreDrawerConsumed,
 }: {
   installId: string;
   viewer: Viewer;
@@ -269,6 +271,11 @@ export default function WorkspaceApp({
   /** CAD-1777 — the shell-owned fixed overlay target for the primary's
    *  child drawer frame; null while it is closed. */
   drawerTarget?: HTMLElement | null;
+  /** A connect that left the board asked the shell to re-open this drawer
+   *  surface on return; null when it named none. */
+  restoreDrawer?: { surface: string; size?: "narrow" | "wide" } | null;
+  /** The screen opened it (or could not mount): drop the URL hint. */
+  onRestoreDrawerConsumed?: () => void;
   /** The screen went away (a refused push, a retired mount): close with it. */
   onScreenClosed?: () => void;
 }) {
@@ -295,6 +302,13 @@ export default function WorkspaceApp({
   const ownerRefreshRequestedVisit = useRef<string | null>(null);
   const identity = useRef(installId);
   identity.current = installId;
+  // The current scope's visit, advanced synchronously when the shell hands a different install or
+  // context. A save completion is stamped with the visit it actually settled in, so a hint that
+  // settled after returning to a scope is kept while an older visit's hint is dropped.
+  const scopeVisit = useRef({ installId, contextId, visit: 0 });
+  if (scopeVisit.current.installId !== installId || scopeVisit.current.contextId !== contextId) {
+    scopeVisit.current = { installId, contextId, visit: scopeVisit.current.visit + 1 };
+  }
   const href = useHref();
   const hrefRef = useRef(href);
   hrefRef.current = href;
@@ -362,15 +376,19 @@ export default function WorkspaceApp({
   const [selectedEffectId, setSelectedEffectId] = useState("");
   const [accessDenied, setAccessDenied] = useState(false);
   const [intentRead, setIntentRead] = useState<IntentRead | undefined>(undefined);
-  // CAD-1290: AgenticOS sends the owner back here with `aos_connect=…`. Say
-  // what happened, drop the params so a reload does not repeat it, and have
-  // the Settings accounts read again.
+  // CAD-1290: AgenticOS sends the owner back here with `aos_connect=…`. Report the return
+  // without claiming an account or a grant (the URL proves neither), drop the params so a
+  // reload does not repeat it, and have the Settings accounts read again.
   const [connectToastMsg, setConnectToastMsg] = useState<ToastMsg | null>(null);
   const [connectReturned, setConnectReturned] = useState(0);
+  // Bumped once per host-confirmed social source save, together with the install/context it
+  // was made in. The primary of that very scope re-reads its sources on the host hint; another
+  // scope drops it.
+  const [socialSources, setSocialSources] = useState<{ installId: string; contextId: string; epoch: number; visit: number } | null>(null);
   useEffect(() => {
     const outcome = connectOutcome(window.location.search);
     if (!outcome) return;
-    setConnectToastMsg(connectToast(outcome, publishAllowed(window.location.search)));
+    setConnectToastMsg(connectToast(outcome));
     setConnectReturned(value => value + 1);
     window.history.replaceState(window.history.state, "", window.location.pathname + withoutConnectParams(window.location.search) + window.location.hash);
     const timer = window.setTimeout(() => setConnectToastMsg(null), 6000);
@@ -809,7 +827,7 @@ export default function WorkspaceApp({
   // a scope change remounts the frame and retires any live slot.
   const actionCtx = useRef<ActionContext | null>(null);
   actionCtx.current = data && data.installation.install_id === installId && !accessDenied
-    ? { installation: data.installation, installId, contextId, runs: data.runs, onChanged: () => refresh(true) } : null;
+    ? { installation: data.installation, installId, contextId, runs: data.runs, onChanged: () => refresh(true), say: t } : null;
   const savedContextHandler = useRef<((saved: AppContext, invocation: SavedContextInvocation) => void) | null>(null);
   savedContextHandler.current = (saved, invocation) => {
     const activeAction = actionCtx.current;
@@ -849,10 +867,26 @@ export default function WorkspaceApp({
         href: hrefRef.current,
         selectionEpoch: userContextIntentEpoch.current,
       };
-      return runCall({ ...action,
+      const result = runCall({ ...action,
         onChanged: () => (mountedOwner.current ? actionCtx.current?.onChanged() : undefined),
         onSavedContext: saved => savedContextHandler.current?.(saved, invocation),
       }, verb, args, ui);
+      // The drawer child and this frame share this host; a confirmed source save must reach
+      // the still-current primary even when the child has already closed and the write only
+      // settled afterwards. Only a real success counts, and only while that same install and
+      // context is still the mounted one — a completion after a scope switch notifies nobody.
+      const initiating = { installId: action.installId, contextId: action.contextId };
+      return verb === "social.sources.save"
+        ? result.then(value => {
+            const current = actionCtx.current;
+            if (value.ok && current && sameScope(initiating, { installId: current.installId, contextId: current.contextId })) {
+              // Capture the visit now: the updater may run after a later transition.
+              const visit = scopeVisit.current.visit;
+              setSocialSources(previous => ({ ...initiating, epoch: (previous?.epoch ?? 0) + 1, visit }));
+            }
+            return value;
+          })
+        : result;
     },
     planner: makePlanner(() => {
       if (!actionCtx.current) throw new Error("no scope");
@@ -1188,7 +1222,7 @@ export default function WorkspaceApp({
       onReinstall={data && reinstallSource ? reinstall(data.installation, reinstallSource) : undefined} />
   );
   const screen = (fallback: React.ReactNode) => projection
-    ? <><ScreenHost projection={projection} fallback={fallback} renderFailure={renderScreenFailure} loadAsset={screenExtras.loadAsset} onToolInvoked={screenExtras.reloadTools} actions={screenActions} onMediaAttach={onMediaAttach} onScreenDrawer={onScreenDrawer} presentation={presentation} drawerTarget={drawerTarget} onNavigation={(navigation) => { if (navigation === null) onScreenClosed?.(); }} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
+    ? <><ScreenHost projection={projection} fallback={fallback} renderFailure={renderScreenFailure} loadAsset={screenExtras.loadAsset} onToolInvoked={screenExtras.reloadTools} actions={screenActions} onMediaAttach={onMediaAttach} onScreenDrawer={onScreenDrawer} presentation={presentation} drawerTarget={drawerTarget} restoreDrawer={restoreDrawer} onRestoreDrawerConsumed={onRestoreDrawerConsumed} socialSources={socialSources} socialVisit={scopeVisit.current.visit} onNavigation={(navigation) => { if (navigation === null) onScreenClosed?.(); }} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}<AppVersion version={data.installation.version} /></h1><Button href="/apps">All apps</Button></header>

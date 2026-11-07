@@ -92,6 +92,11 @@ export const isScreenDrawerVerb = (verb: string): verb is ScreenDrawerVerb =>
   verb === SCREEN_DRAWER_OPEN || verb === SCREEN_DRAWER_CLOSE || verb === SCREEN_DRAWER_CONTEXT;
 /** The closed surface idiom a drawer request may name. */
 export const DRAWER_SURFACE = /^[a-z0-9_-]{1,64}$/;
+/** A host-owned, data-free hint to the PRIMARY app frame: a social source save
+ *  it did not see left its source settings stale. It carries no id, value or
+ *  authority — the frame re-reads through its own normal authorized verbs — and
+ *  a frame (or app version) that does not know it ignores it. */
+export const SOCIAL_SOURCES_INVALIDATED = "cadence-social-sources-invalidated";
 /** SOC-55 — the bounded, non-authoritative context a primary may hand to its
  *  own host-created drawer child. It is plain JSON and never a capability. */
 export const DRAWER_CONTEXT_BYTES = 1024;
@@ -177,8 +182,8 @@ export function parseScreenDrawerCall(verb: ScreenDrawerVerb, args: ActionArgs):
  *  start, the original download and the image picker. Confirm and schedule
  *  also stay slot verbs until every installed app sends them as calls
  *  (Social Content 0.12.10 still sends slots). */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "screen.drawer.context", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.page", "social.sources.get", "social.sources.save", "social.destinations.list", "publish.destination.use", "publish.destination.remove", "publish.settings.save", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.import", "media.chat.attach"] as const;
-export const SLOT_VERBS = ["run.start", "publish.draft.confirm", "publish.draft.schedule", "media.original.download", "social.image.pick"] as const;
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "screen.drawer.context", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.page", "social.sources.get", "social.sources.save", "social.destinations.list", "publish.consent.status", "publish.destination.use", "publish.destination.remove", "publish.settings.save", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.import", "media.chat.attach"] as const;
+export const SLOT_VERBS = ["run.start", "publish.draft.confirm", "publish.draft.schedule", "publish.consent.allow", "media.original.download", "social.image.pick"] as const;
 /** CAD-1365 — the protected original download slot. Qualified per mount
  *  (screen-media.v1 + media.read + live token); never a generic action verb. */
 export const ORIGINAL_DOWNLOAD_VERB = "media.original.download" as const;

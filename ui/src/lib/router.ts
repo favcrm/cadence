@@ -495,8 +495,11 @@ function scopedRoute(route: Route, project: string): Route {
 
 /** Query parameters only the mounted app route owns. `install` is the
  *  CAD-1438 pin of a generated contextual link — the immutable install id
- *  the ctx/conversation/record selectors were minted for. */
-const CRM_APP_PARAMS = ["crm", "record", "ctx", "appview", "segment", "install"] as const;
+ *  the ctx/conversation/record selectors were minted for. `drawer` and
+ *  `drawer_size` are the host's return hint for the drawer surface an app
+ *  asked to open (a connect that leaves the board and comes back); they are
+ *  the app page's alone and never follow the operator elsewhere. */
+const CRM_APP_PARAMS = ["crm", "record", "ctx", "appview", "segment", "install", "drawer", "drawer_size"] as const;
 
 /** Path plus query for a location, keeping query parameters the app does not own. */
 export function locationHref(loc: AppLocation, search = "", from: Route | null = null): string {

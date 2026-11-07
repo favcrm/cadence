@@ -1,6 +1,6 @@
 import { makePlanner, runCall, type ActionContext } from "../src/features/workspace-apps/screen/screenActions";
 import { parseChild } from "../src/features/workspace-apps/screen/screenProtocol";
-import { accountLabel, connectOutcome, connectReturnTo, connectToast, destinationBinding, publishAllowed, publicationBinding, sendSlot, withoutConnectParams } from "../src/features/workspace-apps/socialConnect";
+import { accountLabel, connectOutcome, connectReturnTo, connectToast, destinationBinding, publicationBinding, readReturnDrawer, sameScope, sendSlot, withoutConnectParams, withoutReturnDrawer } from "../src/features/workspace-apps/socialConnect";
 import type { AppBinding, Installation } from "../src/features/workspace-apps/workspaceApps";
 
 // CAD-1290: the hosted connect link, the return signal and "Use for publishing".
@@ -43,14 +43,43 @@ async function main() {
   equal(connectOutcome("?aos_connect=hacked&toolkit=instagram"), null, "an unknown outcome is not ours");
   equal(withoutConnectParams("?aos_connect=connected&toolkit=instagram&screen=native"), "?screen=native", "other params stay");
   equal(withoutConnectParams("?aos_connect=failed&toolkit=instagram"), "", "nothing left");
-  equal(connectToast("connected").text, "Account connected", "connected copy");
-  equal(connectToast("failed").text, "Connection failed — try again", "failed copy");
-  equal(connectToast("connected", publishAllowed("?aos_connect=connected&toolkit=instagram&aos_publish=allowed")).text, "Publishing allowed", "allowed copy");
-  equal(connectToast("connected", publishAllowed("?aos_connect=connected&toolkit=instagram&aos_publish=skipped")).text, "Account connected", "skipped keeps the connected copy");
+  // CAD-2221 acceptance: the return wording is neutral. The URL is a report from another origin,
+  // not evidence, so `connected` says only that the round trip finished and sends the operator to
+  // the authoritative account read — never that an account is connected or a grant allowed. The
+  // copy is this function's entire behaviour, so every outcome is pinned, and the claim checks
+  // below state why: a different sentence that reintroduces a claim still fails.
+  equal(connectToast("connected"),
+    { kind: "ok", text: "Connection finished — check your accounts" },
+    "a connected return is informational, not a connection claim");
+  equal(connectToast("failed"), { kind: "err", text: "Connection failed — try again" }, "a failed return is truthful");
+  equal(connectToast("cancelled"), { kind: "err", text: "Connection failed — try again" }, "cancelled reads as not connected");
+  for (const outcome of ["connected", "failed", "cancelled"] as const) {
+    const text = connectToast(outcome).text;
+    assert(!/connected|linked/i.test(text), `the ${outcome} return never claims an account is connected`);
+    assert(!/allow|grant/i.test(text), `the ${outcome} return never claims a publishing grant`);
+  }
+  const urlClaim = connectOutcome("?aos_connect=connected&aos_publish=allowed&toolkit=instagram");
+  const plainOutcome = connectOutcome("?aos_connect=connected&toolkit=instagram");
+  equal(urlClaim, plainOutcome, "a URL's publish claim adds no outcome");
+  assert(urlClaim !== null && plainOutcome !== null, "both outcomes are ours");
+  equal(connectToast(urlClaim), connectToast(plainOutcome), "a URL's publish claim adds no separate toast");
   equal(withoutConnectParams("?aos_connect=connected&aos_publish=allowed&toolkit=instagram&screen=native"), "?screen=native", "aos_publish leaves the URL");
-  equal(connectToast("cancelled"), connectToast("failed"), "cancelled reads as not connected");
-  // CAD-1438: return_to spells the canonical `/apps/<key>` route.
-  equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1"), "https://ef.cadencecloud.app/apps/social%20content?screen=native&install=install-1", "return_to pins this installation on the board Settings page");
+  // CAD-1438: return_to spells the canonical `/apps/<key>` route. The native workspace keeps its
+  // page; a frame returns to the app screen, or to the drawer surface it connected from, and the
+  // hint is the app page's alone.
+  equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1"), "https://ef.cadencecloud.app/apps/social%20content?screen=native&install=install-1", "native keeps the Settings page and pins the installation");
+  equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "native" }), "https://ef.cadencecloud.app/apps/social%20content?screen=native&install=install-1", "an explicit native target is the same page");
+  equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "screen" }), "https://ef.cadencecloud.app/apps/social%20content?install=install-1", "a frame returns to the app screen, not the native page");
+  equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "drawer", surface: "settings" }), "https://ef.cadencecloud.app/apps/social%20content?drawer=settings&install=install-1", "a drawer connect names its surface");
+  equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "drawer", surface: "settings", size: "wide" }), "https://ef.cadencecloud.app/apps/social%20content?drawer=settings&drawer_size=wide&install=install-1", "the width hint travels too");
+  equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1", { mode: "drawer", surface: "../settings" }), "https://ef.cadencecloud.app/apps/social%20content?install=install-1", "a surface a drawer could not name is dropped, the screen stays");
+  equal(readReturnDrawer("?drawer=settings&install=install-1"), { surface: "settings" }, "the hint reads back");
+  equal(readReturnDrawer("?drawer=settings&drawer_size=wide&install=install-1"), { surface: "settings", size: "wide" }, "with its width");
+  equal(readReturnDrawer("?drawer=settings&drawer_size=enormous"), { surface: "settings" }, "an unknown width falls back to the default panel");
+  equal(readReturnDrawer("?drawer=../etc&install=install-1"), null, "an impossible surface is not a drawer request");
+  equal(readReturnDrawer("?screen=native&install=install-1"), null, "the native page asks for no drawer");
+  equal(withoutReturnDrawer("?drawer=settings&drawer_size=wide&install=install-1&aos_connect=connected"), "?install=install-1&aos_connect=connected", "only the hint leaves the URL");
+  equal(withoutReturnDrawer("?drawer=settings"), "", "nothing left");
   equal([accountLabel("harbour"), accountLabel("@harbour"), accountLabel("Harbour Cafe")], ["@harbour", "@harbour", "Harbour Cafe"], "handles get an @");
   equal(sendSlot(installation), "publication", "one send slot");
   equal(sendSlot({ ...installation, capabilities: {} } as Installation), null, "no send slot");
@@ -72,7 +101,7 @@ async function main() {
     let opened: string | null = null;
     const fb = await runCall(ctx(), "open-link", { url: "/settings/connections", toolkit: "facebook" }, { showLink: () => {}, assign: (url: string) => { opened = url; } });
     assert(fb.ok && opened !== null, "a Facebook connect opens the host-composed link");
-    equal(calls[0].body, { return_to: "https://ef.cadencecloud.app/apps/social-content?screen=native&install=inst1", toolkit: "facebook" }, "the toolkit reaches the connect link");
+    equal(calls[0].body, { return_to: "https://ef.cadencecloud.app/apps/social-content?install=inst1", toolkit: "facebook" }, "the toolkit reaches the connect link and a frame returns to the app screen");
     for (const args of [{ url: "/settings/connections", toolkit: "linkedin" }, { url: "https://evil.example/x", toolkit: "facebook" }]) {
       const bad = await runCall(ctx(), "open-link", args, { showLink: () => {} });
       assert(!bad.ok && bad.refusal.code === "bad_args", "an unknown toolkit or a toolkit on another link is refused");
@@ -88,7 +117,7 @@ async function main() {
   const ui = { showLink: (url: string) => { shown = url; }, navigate: (path: string) => { navigated = path; }, assign: (url: string) => { assigned = url; } };
   let result = await runCall(ctx(), "open-link", { url: "/settings/connections" }, ui);
   assert(result.ok && assigned === "https://api.example/account/ws/connections/connect?toolkit=instagram&return_to=x" && shown === null, "hosted opens the AgenticOS link top-level");
-  equal(calls[0], { path: "/api/app-installations/inst1/publishing/connect-link", body: { return_to: "https://ef.cadencecloud.app/apps/social-content?screen=native&install=inst1" } }, "the host asks with its own canonical return_to");
+  equal(calls[0], { path: "/api/app-installations/inst1/publishing/connect-link", body: { return_to: "https://ef.cadencecloud.app/apps/social-content?install=inst1" } }, "the host asks with its own canonical return_to");
   // The frame never supplies the URL: another url is not routed through the connect link.
   assigned = null; calls.length = 0;
   result = await runCall(ctx(), "open-link", { url: "https://evil.example/x" }, ui);
@@ -249,6 +278,165 @@ async function main() {
     assert(parseChild(message) !== null, `${verb} parses as a call for a Social frame`);
     equal(parseChild(message, ["records.list", verb]), null, `a records frame's ${verb} call never parses (the port closes)`);
   }
+
+  // A connect started in the drawer returns to that drawer surface (the surface is host-derived,
+  // never a frame-supplied name), and the native panel keeps its own page (asserted above).
+  replies = { "/publishing/connect-link": { body: { hosted: true, url: "https://api.example/connect" } } };
+  calls.length = 0;
+  const fromDrawer = await runCall(ctx(), "open-link", { url: "/settings/connections", toolkit: "facebook" }, { ...ui, returnSurface: "settings", returnSize: "wide" });
+  assert(fromDrawer.ok, "a drawer connect opens the host-composed link");
+  equal((calls[0].body as Record<string, unknown>).return_to, "https://ef.cadencecloud.app/apps/social-content?drawer=settings&drawer_size=wide&install=inst1", "a drawer connect returns to its own surface and width, not the native page");
+
+  // A settled source save may only refresh the primary it was made for.
+  const scope = { installId: "inst1", contextId: "ctx1" };
+  assert(sameScope(scope, { installId: "inst1", contextId: "ctx1" }), "the same install and context is the same primary");
+  assert(!sameScope(scope, { installId: "inst1", contextId: "ctx2" }), "another context is not that primary");
+  assert(!sameScope(scope, { installId: "inst2", contextId: "ctx1" }), "another install is not that primary");
+  assert(!sameScope(scope, null), "an unmounted scope notifies nobody");
+
+  // Consent: a board that cannot answer is UNKNOWN — never "no consent".
+  const consentRead = async () => {
+    const read = await runCall(ctx(), "publish.consent.status", {}, ui);
+    return read.ok ? read.data : null;
+  };
+  replies = {};
+  equal(await consentRead(), { available: false, consents: [], not_ready: [] }, "an older board is unknown");
+  const consentRows = [{ destination_id: "d1", toolkit: "instagram", state: "allowed" }, { destination_id: "p1", toolkit: "facebook", state: "none" }];
+  replies = { "/publishing/consent": { body: { available: true, consents: consentRows, not_ready: ["n1"] } } };
+  equal(await consentRead(), { available: true, consents: consentRows, not_ready: ["n1"] }, "the board's consent rows and not-ready accounts reach the app");
+  replies = { "/publishing/consent": { body: { available: true, consents: consentRows } } };
+  equal(await consentRead(), { available: true, consents: consentRows, not_ready: [] }, "an old board without not_ready defaults to none");
+  for (const body of [
+    { available: true, consents: [{ destination_id: "d1", toolkit: "instagram", state: "granted" }] },
+    { available: true, consents: [{ destination_id: "../x", toolkit: "instagram", state: "none" }] },
+    { available: true },
+    { available: false, consents: [{ destination_id: "d1", toolkit: "instagram", state: "none" }] },
+    { available: true, consents: [], not_ready: "n1" },
+    { available: true, consents: [], not_ready: null },
+    { available: true, consents: [], not_ready: ["n1", "n1"] },
+    { available: true, consents: [], not_ready: ["../x"] },
+    { available: true, consents: [{ destination_id: "d1", toolkit: "instagram", state: "allowed" }], not_ready: ["d1"] },
+    { available: true, consents: [
+      { destination_id: "d1", toolkit: "instagram", state: "allowed" },
+      { destination_id: "d1", toolkit: "facebook", state: "none" },
+    ], not_ready: [] },
+  ]) {
+    replies = { "/publishing/consent": { body } };
+    equal(await consentRead(), { available: false, consents: [], not_ready: [] }, `an unprovable answer is unknown: ${JSON.stringify(body)}`);
+  }
+  // A plain member is refused by the board (403), not answered "no consent": the read is unknown,
+  // the slot is never planned, and no write follows.
+  replies = { "/publishing/consent": { status: 403, body: { error: { code: "forbidden" } } },
+    "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } } };
+  equal(await consentRead(), { available: false, consents: [], not_ready: [] }, "a non-owner refusal is unknown, never consent");
+  calls.length = 0;
+  const memberPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
+  assert("code" in memberPlan && memberPlan.code === "unavailable", "a non-owner cannot reach a consent card");
+  assert(!calls.some(call => call.body !== undefined), "no consent write follows a non-owner refusal");
+
+  // A visible account whose provider connection has not resolved gets no consent card and no write.
+  replies = { "/publishing/consent": { body: { available: true, consents: [], not_ready: ["d1"] } },
+    "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } } };
+  calls.length = 0;
+  const pendingPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
+  assert("code" in pendingPlan && pendingPlan.code === "not_ready", "a not-ready account is refused before a consent card");
+  assert(!calls.some(call => call.body !== undefined), "a not-ready account writes no consent");
+
+  // The app's opt-in travels only when the board independently proves the capability. Manage and
+  // Reconnect may send the bare connections link (keeping the daemon's Instagram default).
+  const linkBody = (): Record<string, unknown> => {
+    const call = calls.filter(value => value.path.endsWith("/publishing/connect-link")).pop();
+    assert(call, "the connect link was requested");
+    return call.body as Record<string, unknown>;
+  };
+  replies = { "/publishing/connect-link": { body: { hosted: true, url: "https://api.example/connect" } },
+    "/publishing/consent": { body: { available: true, consents: [] } } };
+  calls.length = 0;
+  assert((await runCall(ctx(), "open-link", { url: "/settings/connections", toolkit: "facebook", inline_consent: true }, ui)).ok, "the opt-in connects");
+  equal(linkBody().inline_consent, true, "the capability was proved: the opt-in reaches the board");
+  calls.length = 0;
+  assert((await runCall(ctx(), "open-link", { url: "/settings/connections", inline_consent: true }, ui)).ok, "the bare Manage/Reconnect link may opt in too");
+  const bareBody = linkBody();
+  equal(bareBody.inline_consent, true, "the proved capability reaches the board on the bare link");
+  assert(!("toolkit" in bareBody), "no toolkit is invented: the daemon keeps its Instagram default");
+  replies = { "/publishing/connect-link": { body: { hosted: true, url: "https://api.example/connect" } } };
+  calls.length = 0;
+  assert((await runCall(ctx(), "open-link", { url: "/settings/connections", toolkit: "facebook", inline_consent: true }, ui)).ok, "an older board still connects");
+  assert(!("inline_consent" in linkBody()), "no proof, no opt-in: the legacy consent page stays");
+  calls.length = 0;
+  assert((await runCall(ctx(), "open-link", { url: "/settings/connections", inline_consent: true }, ui)).ok, "an older board still connects the bare link");
+  assert(!("inline_consent" in linkBody()), "no proof on the bare link either");
+  for (const args of [
+    { url: "/settings/connections", toolkit: "facebook", inline_consent: false },
+    { url: "/settings/connections", inline_consent: false },
+    { url: "/settings/connections", inline_consent: "yes" },
+    { url: "https://evil.example/x", toolkit: "facebook", inline_consent: true },
+    { url: "https://evil.example/x", inline_consent: true },
+    { url: "/settings/connections", toolkit: "linkedin", inline_consent: true },
+  ]) {
+    calls.length = 0;
+    const refused = await runCall(ctx(), "open-link", args as Record<string, unknown>, ui);
+    assert(!refused.ok && refused.refusal.code === "bad_args" && calls.length === 0, `a malformed opt-in is refused: ${JSON.stringify(args)}`);
+  }
+
+  // Per-account consent is a host-drawn slot. The frame names one destination; the host re-reads
+  // the account and writes every word of the decision on its own card, then the app re-reads status.
+  replies = {
+    "/publishing/consent": { body: { available: true, consents: [{ destination_id: "d1", toolkit: "instagram", state: "allowed" }] } },
+    "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } },
+  };
+  const planned = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
+  if ("code" in planned) throw new Error(`consent should plan, was refused: ${JSON.stringify(planned)}`);
+  assert(planned.card, "the consent card is host-drawn");
+  assert(planned.card!.title!.includes("@harbour") && planned.card!.target!.includes("@harbour"), "the host card names the verified account, not frame text");
+  calls.length = 0;
+  const granted = await planned.run();
+  assert(granted.ok && JSON.stringify(granted.data) === "{}", "the reply carries no invented receipt");
+  assert(calls.some(call => call.path.endsWith("/publishing/consent") && JSON.stringify(call.body) === JSON.stringify({ destination_id: "d1" })), "the board derives the connection from the destination");
+  assert(calls[calls.length - 1].body === undefined, "success is the authoritative status read after the write, never the write's own answer");
+  // The write answered 2xx but the authoritative read still shows no consent: not a success.
+  replies = {
+    "/publishing/consent": { body: { available: true, consents: [{ destination_id: "d1", toolkit: "instagram", state: "none" }] } },
+    "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } },
+  };
+  const pending = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
+  if ("code" in pending) throw new Error(`consent should plan, was refused: ${JSON.stringify(pending)}`);
+  const unconfirmed = await pending.run();
+  assert(!unconfirmed.ok && unconfirmed.refusal.code === "unconfirmed", "a write the status does not confirm is never reported as consent");
+  // Unknown capability, an account the board no longer lists, an ambiguous match, or a forged
+  // field: refused, and no consent written.
+  replies = { "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } } };
+  let refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
+  assert("code" in refusedPlan && refusedPlan.code === "unavailable", "no capability, no consent");
+  replies = {
+    "/publishing/consent": { body: { available: true, consents: [{ destination_id: "d1", toolkit: "instagram", state: "none" }] } },
+    "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d2", label: "kowloon", toolkit: "instagram" }] } },
+  };
+  refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
+  assert("code" in refusedPlan && refusedPlan.code === "not_found", "an account the board does not list is not granted");
+  replies["/publishing/destinations"] = { body: { unavailable: false, destinations: [
+    { destination_id: "d1", label: "harbour", toolkit: "instagram" },
+    { destination_id: "d1", label: "harbour", toolkit: "instagram" },
+  ] } };
+  refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
+  assert("code" in refusedPlan && refusedPlan.code === "not_found", "an ambiguous match is not granted");
+  // An available answer that does not attest this account is incomplete authority: no card, no POST.
+  replies = {
+    "/publishing/consent": { body: { available: true, consents: [], not_ready: ["n1"] } },
+    "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } },
+  };
+  calls.length = 0;
+  refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
+  assert("code" in refusedPlan && refusedPlan.code === "unavailable", "a status with no row for the account is not eligible");
+  assert(!calls.some(call => call.body !== undefined), "no status row means no consent write");
+  replies["/publishing/consent"] = { body: { available: true, consents: [{ destination_id: "d1", toolkit: "facebook", state: "none" }] } };
+  calls.length = 0;
+  refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram" }, {});
+  assert("code" in refusedPlan && refusedPlan.code === "unavailable", "a row for another toolkit is not this account's row");
+  assert(!calls.some(call => call.body !== undefined), "a wrong-toolkit row means no consent write");
+  calls.length = 0;
+  refusedPlan = await makePlanner(() => ctx())("publish.consent.allow", { destination_id: "d1", toolkit: "instagram", label: "forged" }, {});
+  assert("code" in refusedPlan && refusedPlan.code === "bad_args" && calls.length === 0, "a frame-supplied field is refused before any read");
 }
 
 main().then(() => console.log("socialConnect ok"));
