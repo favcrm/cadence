@@ -999,6 +999,48 @@ fn verb_for(
             args.insert("payload".into(), Value::Object(payload));
             "settings_agents"
         }
+        Commands::App {
+            action: AppAction::Describe { app },
+        } => {
+            let mut body = serde_json::Map::new();
+            if let Some(app) = app {
+                body.insert("app".into(), json!(app));
+            }
+            let body = Value::Object(body);
+            let key = platform_request_key("app_describe", None, Some(&body), None)?;
+            args.insert("operation".into(), json!("call"));
+            args.insert("tool".into(), json!("app_describe"));
+            args.insert("key".into(), json!(key));
+            args.insert("body".into(), body);
+            "platform_call"
+        }
+        Commands::App {
+            action:
+                AppAction::Call {
+                    app,
+                    operation,
+                    args: input,
+                    request,
+                    reason,
+                },
+        } => {
+            let input = super::platform::parse_platform_input(input)
+                .map_err(|error| Error::invalid("app_call", format!("--args: {error}")))?;
+            let mut body = json!({
+                "app": app,
+                "operation": operation,
+                "args": serde_json::to_string(&input)?,
+            });
+            if let Some(reason) = reason {
+                body["reason"] = json!(reason);
+            }
+            let key = platform_request_key("app_call", None, Some(&body), request.as_deref())?;
+            args.insert("operation".into(), json!("call"));
+            args.insert("tool".into(), json!("app_call"));
+            args.insert("key".into(), json!(key));
+            args.insert("body".into(), body);
+            "platform_call"
+        }
         Commands::Platform { action } => {
             // CAD-1678: a hosted workspace owns its catalog, its accounts and
             // its per-project default, so a flag naming any of them cannot
@@ -1091,18 +1133,12 @@ fn verb_for(
                     // The handle names the retry: an identical call replays the
                     // door's recorded outcome instead of charging again, so a
                     // second intentional run needs a fresh --request.
-                    let key = match request {
-                        Some(request) => {
-                            if !valid_platform_handle(request) {
-                                return Err(Error::invalid(
-                                    "platform_call",
-                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
-                                ));
-                            }
-                            request.clone()
-                        }
-                        None => platform_replay_key(tool, query.as_ref(), body.as_ref()),
-                    };
+                    let key = platform_request_key(
+                        tool,
+                        query.as_ref(),
+                        body.as_ref(),
+                        request.as_deref(),
+                    )?;
                     args.insert("operation".into(), json!("call"));
                     args.insert("tool".into(), json!(tool));
                     args.insert("key".into(), json!(key));
@@ -1218,6 +1254,22 @@ fn valid_platform_handle(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
+fn platform_request_key(
+    tool: &str,
+    query: Option<&Value>,
+    body: Option<&Value>,
+    request: Option<&str>,
+) -> Result<String> {
+    match request {
+        Some(request) if valid_platform_handle(request) => Ok(request.to_owned()),
+        Some(_) => Err(Error::invalid(
+            "platform_call",
+            "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+        )),
+        None => Ok(platform_replay_key(tool, query, body)),
+    }
 }
 
 fn valid_media_job_id(value: &str) -> bool {
@@ -2683,7 +2735,9 @@ where
         }
     }
     if let Commands::App { action } = &command {
-        return super::hosted_app::run(&target, action);
+        if !matches!(action, AppAction::Describe { .. } | AppAction::Call { .. }) {
+            return super::hosted_app::run(&target, action);
+        }
     }
     if let Commands::Restore {
         source,
@@ -2919,20 +2973,57 @@ where
     let platform_key = (verb == "platform_call")
         .then(|| args.get("key").and_then(Value::as_str).map(str::to_string))
         .flatten();
+    let app_action = matches!(
+        args.get("tool").and_then(Value::as_str),
+        Some("app_call" | "app_describe")
+    );
     if verb == "platform_call" {
+        use std::fmt::Write as _;
+
         let op = args
             .get("operation")
             .and_then(Value::as_str)
             .unwrap_or("call");
-        let mut line = format!("cadence platform org={} operation={op}", target.org);
-        if let Some(tool) = args.get("tool").and_then(Value::as_str) {
-            line.push_str(&format!(" tool={tool}"));
+        let (mut line, show_tool) = match &command {
+            Commands::App {
+                action: AppAction::Describe { app: Some(app) },
+            } => (
+                format!(
+                    "cadence app org={} operation=describe app={app:?}",
+                    target.org
+                ),
+                false,
+            ),
+            Commands::App {
+                action: AppAction::Describe { app: None },
+            } => (
+                format!("cadence app org={} operation=describe", target.org),
+                false,
+            ),
+            Commands::App {
+                action: AppAction::Call { app, operation, .. },
+            } => (
+                format!(
+                    "cadence app org={} operation=call app={app:?} action={operation:?}",
+                    target.org
+                ),
+                false,
+            ),
+            _ => (
+                format!("cadence platform org={} operation={op}", target.org),
+                true,
+            ),
+        };
+        if show_tool {
+            if let Some(tool) = args.get("tool").and_then(Value::as_str) {
+                write!(&mut line, " tool={tool}").expect("writing to a string cannot fail");
+            }
         }
         if let Some(key) = platform_key.as_deref() {
-            line.push_str(&format!(" request={key}"));
+            write!(&mut line, " request={key}").expect("writing to a string cannot fail");
         }
         if let Some(job_id) = args.get("jobId").and_then(Value::as_str) {
-            line.push_str(&format!(" job={job_id}"));
+            write!(&mut line, " job={job_id}").expect("writing to a string cannot fail");
         }
         eprint_line(&line);
     }
@@ -2959,7 +3050,7 @@ where
                     target.org
                 ));
             }
-            if let Some(key) = platform_key.filter(|_| error.kind() == "unknown") {
+            if let Some(key) = platform_key.filter(|_| error.kind() == "unknown" && !app_action) {
                 eprint_line(&format!(
                     "remote platform call `{key}` on org `{}` was not confirmed — \
                      reconcile read-only with `cadence --org {} platform status --request {key}` \
@@ -2997,7 +3088,23 @@ where
             }
             // The ordinary hosted answer is one JSON document under the
             // shared stdout policy, like a local verb's.
+            let exit = if matches!(
+                &command,
+                Commands::App {
+                    action: AppAction::Call { .. }
+                }
+            ) {
+                app_call_receipt_exit(&body)
+            } else {
+                0
+            };
             print_json(&body);
+            if exit != 0 {
+                return Err(Error::invalid(
+                    "staged_action_not_applied",
+                    "The staged action was denied or failed; inspect the returned status.",
+                ));
+            }
             Ok(0)
         }
         cadence_agent::remote_cli::RemoteAnswer::Conflict(body) => {
@@ -3010,6 +3117,27 @@ where
             print_json(&body);
             Ok(5)
         }
+    }
+}
+
+/// A terminal refusal remains nonzero while the action receipt stays visible.
+fn app_call_receipt_exit(body: &Value) -> i32 {
+    let Some(data) = body.get("data").and_then(Value::as_object) else {
+        return 0;
+    };
+    if data.get("staged").and_then(Value::as_bool) == Some(true)
+        && data
+            .get("actionId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        && matches!(
+            data.get("status").and_then(Value::as_str),
+            Some("denied" | "failed")
+        )
+    {
+        3
+    } else {
+        0
     }
 }
 
@@ -3616,6 +3744,32 @@ mod hosted_finish_acceptance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_call_review_denied_or_failed_staged_calls_exit_nonzero() {
+        for status in ["denied", "failed"] {
+            let receipt = json!({"ok": true, "data": {
+                "staged": true, "actionId": "act_synthetic", "status": status, "replayed": true
+            }});
+            assert_eq!(app_call_receipt_exit(&receipt), 3, "{status}");
+        }
+        for status in ["pending", "applied"] {
+            let receipt = json!({"ok": true, "data": {
+                "staged": true, "actionId": "act_synthetic", "status": status, "replayed": true
+            }});
+            assert_eq!(app_call_receipt_exit(&receipt), 0, "{status}");
+        }
+        assert_eq!(
+            app_call_receipt_exit(&json!({"ok": true, "data": {"status": "failed"}})),
+            0
+        );
+        assert_eq!(
+            app_call_receipt_exit(
+                &json!({"ok": true, "data": {"staged": true, "status": "failed"}})
+            ),
+            0
+        );
+    }
     #[test]
     fn accept_revise_is_refused_before_any_request_for_a_managed_caller() {
         let target = cadence_agent::remote_cli::RemoteTarget {

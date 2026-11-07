@@ -328,6 +328,7 @@ const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been regist
 const RECONCILE_PROFILE_CREATE: &str = "the profile may or may not have been saved — read `agent profiles` with the same explicit --org before repeating it; the same alias is refused as taken if it landed";
 const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
 const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
+const RECONCILE_APP_ACTION: &str = "the app action may or may not have been applied — inspect the app's records before repeating it; keep the same request and input, and do not use an unrecorded platform status as proof that no app write landed";
 const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
 const RECONCILE_TEAM: &str =
     "the team change may or may not have been applied — inspect `team list` or \
@@ -449,6 +450,16 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                 mutation(settings_reconcile(operation))
             } else {
                 Effect::Read
+            }
+        }
+        Surface::Cli
+            if verb == "platform_call"
+                && arguments.get("operation").and_then(Value::as_str) == Some("call") =>
+        {
+            match arguments.get("tool").and_then(Value::as_str) {
+                Some("app_describe") => Effect::Read,
+                Some("app_call") => mutation(RECONCILE_APP_ACTION),
+                _ => cli_effect(verb),
             }
         }
         Surface::Cli
@@ -3905,6 +3916,46 @@ fn platform_error_details(body: Option<&Value>) -> String {
     out
 }
 
+/// Only fixed app refusal codes cross this boundary; provider text stays private.
+fn app_action_refusal(status: u16, code: Option<&str>) -> Option<Error> {
+    let (code, message) = match (status, code) {
+        (400, Some("validation_failed")) => (
+            "validation_failed",
+            "The app action arguments were refused. Use `cadence --org <workspace> app describe <app>` to check the action's required fields.",
+        ),
+        (403, Some("owner_required")) => (
+            "owner_required",
+            "This app action requires the workspace owner. Ask the owner to perform it.",
+        ),
+        (403, Some("approval_required")) => (
+            "approval_required",
+            "This action is not available through app call. Use the app's own controls or ask the workspace owner.",
+        ),
+        (403, Some("conversation_required")) => (
+            "conversation_required",
+            "This action needs a board conversation. Open the app in the board.",
+        ),
+        (404, Some("app_unavailable")) => (
+            "app_unavailable",
+            "The app is unavailable in this workspace. Use `cadence --org <workspace> app describe` to list available apps.",
+        ),
+        (409, Some("stale_revision")) => (
+            "stale_revision",
+            "The record changed. Read it again and use its current revision for a new request.",
+        ),
+        (400, Some("request_id_reused")) => (
+            "request_id_reused",
+            "This request belongs to different action input. Use a new request only for a deliberate new action.",
+        ),
+        (409, Some("unsupported_verb")) => (
+            "unsupported_verb",
+            "This app does not offer that action. Use `cadence --org <workspace> app describe` to list its actions.",
+        ),
+        _ => return None,
+    };
+    Some(Error::invalid(code, message))
+}
+
 /// CAD-1434 / AOS-243: the correlation a refusal carries, read only when it is
 /// safe to show. `hop` is an allowlisted name (today only the board names a
 /// hop) and `request_id` must be a bounded UUID. Anything else is dropped, so
@@ -5241,10 +5292,16 @@ fn call_verb_until_retry(
     // CAD-2149: a managed session's hosted verbs ride its own credential.
     // `None` means the member's login, as for every human shell.
     let mut on_agent = agent_credential::applies(agent, target, surface, verb);
+    let require_agent = verb == "platform_call" && agent.is_some();
+    if require_agent && on_agent.is_none() {
+        return Err(agent_credential::platform_agent_required());
+    }
     loop {
         request_timeout(deadline, AUTH_TIMEOUT)?;
         let agent_cred = match on_agent {
-            Some(slot) => agent_credential::bearer(slot, target, dir, deadline, &note)?,
+            Some(slot) => {
+                agent_credential::bearer(slot, target, dir, deadline, !require_agent, &note)?
+            }
             None => None,
         };
         let using_agent = agent_cred.is_some();
@@ -5330,6 +5387,12 @@ fn call_verb_until_retry(
             _ => false,
         };
         if refused_agent {
+            if require_agent {
+                return Err(Error::invalid(
+                    agent_credential::HUMAN_SESSION_REQUIRED,
+                    "This platform action requires a person. The member login was not used for the action.",
+                ));
+            }
             if let Some(slot) = on_agent.take() {
                 slot.keep_login(&note, "this workspace has not been updated to accept it");
             }
@@ -5357,10 +5420,12 @@ fn call_verb_until_retry(
                             && answer.get("data").is_some_and(Value::is_object)
                     }) =>
                 {
-                    return Err(Error::unknown(format!(
-                        "remote tool returned no usable receipt — {}",
-                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
-                    )));
+                    if let Some(reconcile) = effect.reconciliation() {
+                        return Err(Error::unknown(format!(
+                            "remote tool returned no usable receipt — {reconcile}"
+                        )));
+                    }
+                    return Err(reject("remote tool returned no usable response"));
                 }
                 Some("status")
                     if !body.as_ref().is_some_and(|answer| {
@@ -5547,7 +5612,8 @@ fn call_verb_until_retry(
             && post_forward_failure(status, body.as_ref(), matches!(surface, Surface::Cli));
         // A funded platform call may still be in progress or uncertain on
         // a same-key replay; preserve its dedicated reconciliation guidance.
-        let platform_outcome_unknown = platform_operation == Some("call")
+        let platform_outcome_unknown = effect.is_mutation()
+            && platform_operation == Some("call")
             && !board_gate_refused(body.as_ref())
             && !tracker_unavailable_before_verb(status, body.as_ref())
             && ((status == 409
@@ -5642,6 +5708,16 @@ fn call_verb_until_retry(
                     .as_deref()
                     .map_or(String::new(), |c| format!(", {c}"))
             )));
+        }
+        if platform_operation == Some("call")
+            && matches!(
+                arguments.get("tool").and_then(Value::as_str),
+                Some("app_call" | "app_describe")
+            )
+        {
+            if let Some(error) = app_action_refusal(status, refusal_code.as_deref()) {
+                return Err(error);
+            }
         }
         match classify(status, retry_after, body) {
             Verdict::Done(Err(_e)) if platform_outcome_unknown => {
