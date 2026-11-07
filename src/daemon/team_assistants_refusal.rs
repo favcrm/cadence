@@ -13877,6 +13877,7 @@ fn cad2207_public_waiting_shape_is_identical_for_private_and_ordinary_work() {
 mod cad2207_continuity_revocation_acceptance;
 mod cad2207_continuity_withdrawal_race;
 mod cad2207_history_revocation_acceptance;
+mod cad2207_history_socket_withdrawal_acceptance;
 mod cad2207_pre_admission_acceptance;
 mod cad2207_queue_head_race_acceptance;
 mod cad2207_share_revocation_ordering;

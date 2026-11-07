@@ -434,24 +434,46 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                 // caller for this one dispatch. The field is refused
                 // everywhere else.
                 let _scope = crate::test_seam::scope_frame(shared.seam.as_ref(), &frame)?;
-                shared.dispatch(method, &params, peer.pid)
+                let result = shared.dispatch(method, &params, peer.pid)?;
+                let admissions = shared.admit_history_response(method, &result)?;
+                Ok((result, admissions))
             });
-        let mut frame = match response {
-            Ok(result) => proto::ok(result),
-            Err(error) => proto::err(&error),
+        let (mut frame, admissions) = match response {
+            Ok((result, admissions)) => (proto::ok(result), admissions),
+            Err(error) => (proto::err(&error), Vec::new()),
         };
         // The response itself identifies the privacy projection contract.
         // A prior daemon_info reply cannot prove which daemon answered this
         // frame after a restart.
         frame["fleet_protocol"] = json!(crate::proto::CLIENT_PROTOCOL);
-        // Value's formatter emits small fragments; coalesce socket writes,
-        // but flush each frame so a caller need not close or send again.
-        if writeln!(writer, "{frame}")
-            .and_then(|()| writer.flush())
-            .is_err()
-        {
-            break;
+        if admissions.is_empty() {
+            // Ordinary replies retain the existing coalesced blocking path.
+            if writeln!(writer, "{frame}")
+                .and_then(|()| writer.flush())
+                .is_err()
+            {
+                break;
+            }
+        } else {
+            // A peer must not keep a job share pinned forever by stopping its
+            // reads. Bound the entire frame write, not each individual chunk,
+            // and restore blocking mode for the next request on this socket.
+            let mut bytes = frame.to_string();
+            bytes.push('\n');
+            if writer.get_ref().set_nonblocking(true).is_err() {
+                break;
+            }
+            let sent = client::write_bounded(
+                writer.get_ref().as_raw_fd(),
+                bytes.as_bytes(),
+                Instant::now() + Duration::from_secs(60),
+            );
+            let restored = writer.get_ref().set_nonblocking(false);
+            if sent.is_err() || restored.is_err() {
+                break;
+            }
         }
+        drop(admissions);
     }
 }
 

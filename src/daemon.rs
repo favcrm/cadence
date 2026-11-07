@@ -2122,7 +2122,7 @@ impl Shared {
             return body;
         };
         let _admissions = sources.map(|sources| {
-            self.admit_continuity_sources(alias, &sources.thread_id, &sources.message_ids)
+            self.admit_retained_notice_sources(alias, &sources.thread_id, &sources.message_ids)
                 .expect("test continuity source admission")
         });
         self.record_continuity(alias, message, &pack);

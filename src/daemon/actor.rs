@@ -717,7 +717,7 @@ impl Shared {
                                 self.omit_continuity(alias, &message, &pack, combined);
                             } else {
                                 if let Some(sources) = sources {
-                                    match self.admit_continuity_sources(
+                                    match self.admit_retained_notice_sources(
                                         alias,
                                         &sources.thread_id,
                                         &sources.message_ids,
@@ -874,7 +874,7 @@ impl Shared {
                                         prompt
                                     } else {
                                         if let Some(sources) = sources {
-                                            match self.admit_continuity_sources(
+                                            match self.admit_retained_notice_sources(
                                                 alias,
                                                 &sources.thread_id,
                                                 &sources.message_ids,

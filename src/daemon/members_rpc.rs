@@ -185,9 +185,9 @@ impl Shared {
         Ok(Some(admission))
     }
 
-    /// Reserve each locally shared job represented in the rendered member
-    /// continuity pack. The caller holds these through provider submission.
-    pub(super) fn admit_continuity_sources(
+    /// Reserve each locally shared job represented in retained member content.
+    /// The caller holds these through the provider attempt or socket delivery.
+    pub(super) fn admit_retained_notice_sources(
         &self,
         alias: &str,
         thread_id: &str,
@@ -200,11 +200,11 @@ impl Shared {
                 binding.is_active() && binding.conversation_id.as_deref() == Some(thread_id)
             })
             .ok_or_else(|| {
-                Error::rejected("continuity refused: the member assistant binding changed")
+                Error::rejected("retained notice refused: the member assistant binding changed")
             })?;
         let jobs = self
             .store
-            .assist_continuity_notice_jobs(&binding, message_ids)?;
+            .assist_notice_jobs_for_messages(&binding, message_ids)?;
         let mut admissions = Vec::with_capacity(jobs.len());
         for job in jobs {
             if let Some(admission) = self.admit_member_job_read(&binding.org, &binding.sub, &job)? {
@@ -212,6 +212,94 @@ impl Shared {
             }
         }
         Ok(admissions)
+    }
+
+    /// Fence the receipt-linked rows in a selected member history response
+    /// until its complete frame reaches the daemon's socket peer. The off-page
+    /// reply watermark is a projection of a row too, so it is admitted with
+    /// the rows actually present in the page.
+    pub(super) fn admit_history_response(
+        &self,
+        method: &str,
+        response: &Value,
+    ) -> Result<Vec<AssistNoticeAdmission<'_>>> {
+        let thread = match method {
+            "member_assist_history" => response.get("conversation"),
+            "thread_read" => response.get("thread"),
+            _ => return Ok(Vec::new()),
+        };
+        let Some(thread) = thread.filter(|thread| !thread.is_null()) else {
+            return if method == "member_assist_history" {
+                Err(Error::rejected(
+                    "history response withheld: no bound conversation",
+                ))
+            } else {
+                Ok(Vec::new())
+            };
+        };
+        let alias = thread
+            .get("alias")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("history response withheld: no thread alias"))?;
+        let thread_id = thread
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("history response withheld: no thread id"))?;
+        let Some(binding) = self.store.assistant_for_alias(alias)? else {
+            return if method == "member_assist_history" {
+                Err(Error::rejected(
+                    "history response withheld: assistant binding changed",
+                ))
+            } else {
+                Ok(Vec::new())
+            };
+        };
+        if !binding.is_active() {
+            return Err(Error::rejected(
+                "history response withheld: assistant binding changed",
+            ));
+        }
+        if binding.conversation_id.as_deref() != Some(thread_id) {
+            return if method == "member_assist_history" {
+                Err(Error::rejected(
+                    "history response withheld: assistant binding changed",
+                ))
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let entries = response
+            .get("entries")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::rejected("history response withheld: missing entries"))?;
+        let mut sequences = Vec::with_capacity(entries.len() + 1);
+        for entry in entries {
+            if entry.get("thread").and_then(Value::as_str) != Some(thread_id) {
+                return Err(Error::rejected(
+                    "history response withheld: mismatched entry thread",
+                ));
+            }
+            let sequence = entry
+                .get("seq")
+                .and_then(Value::as_i64)
+                .filter(|seq| *seq > 0)
+                .ok_or_else(|| {
+                    Error::rejected("history response withheld: invalid entry sequence")
+                })?;
+            sequences.push(sequence);
+        }
+        if let Some(watermark) = response.get("reply_seq") {
+            let watermark = watermark.as_i64().filter(|seq| *seq >= 0).ok_or_else(|| {
+                Error::rejected("history response withheld: invalid reply watermark")
+            })?;
+            if watermark > 0 {
+                sequences.push(watermark);
+            }
+        }
+        sequences.sort_unstable();
+        sequences.dedup();
+        let ids = self.store.thread_entry_message_ids(thread_id, &sequences)?;
+        self.admit_retained_notice_sources(alias, thread_id, &ids)
     }
 
     /// Hold a subscriber's live share through the generic work-read handler.
@@ -2877,8 +2965,8 @@ impl Shared {
             {
                 return Err(Error::gate_coded(
                     "share_withdrawal_pending",
-                    "A delivery or continuity context for this job is being submitted; \
-                     sharing remains on. Retry after it finishes.",
+                    "Information about this job is being delivered; sharing remains on. \
+                     Retry after the delivery finishes.",
                 ));
             }
             self.store

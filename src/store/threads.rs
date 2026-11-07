@@ -790,6 +790,56 @@ impl Store {
         )?)
     }
 
+    /// Resolve the message links for already-selected history rows, without
+    /// reading their bodies. Includes an off-page reply watermark when passed
+    /// by the caller. A disappeared row cannot safely authorize a response
+    /// built from an earlier snapshot.
+    pub(crate) fn thread_entry_message_ids(
+        &self,
+        thread_id: &str,
+        sequences: &[i64],
+    ) -> Result<Vec<String>> {
+        if sequences.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = "?,".repeat(sequences.len());
+        let sql = format!(
+            "SELECT message_id,
+                    CASE WHEN json_valid(payload) THEN
+                        CASE WHEN json_type(payload,'$.message')='text'
+                             THEN json_extract(payload,'$.message') END
+                    END
+             FROM thread_entries WHERE thread_id=? AND seq IN ({})",
+            &placeholders[..placeholders.len() - 1]
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let args = std::iter::once(&thread_id as &dyn rusqlite::ToSql)
+            .chain(sequences.iter().map(|seq| seq as &dyn rusqlite::ToSql));
+        let mut rows = stmt.query(rusqlite::params_from_iter(args))?;
+        let mut found = 0;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next()? {
+            found += 1;
+            let message: Option<String> = row.get(0)?;
+            let payload_message: Option<String> = row.get(1)?;
+            if message.is_some() && payload_message.is_some() && message != payload_message {
+                return Err(Error::rejected(
+                    "history response withheld: entry provenance changed",
+                ));
+            }
+            if let Some(id) = message.or(payload_message) {
+                ids.push(id);
+            }
+        }
+        if found != sequences.len() {
+            return Err(Error::rejected(
+                "history response withheld: a selected entry disappeared",
+            ));
+        }
+        Ok(ids)
+    }
+
     /// Make or find a conversation (CAD-1098). The caller has already
     /// proven the installation, the context and (for a subject) the
     /// campaign. Idempotent kinds race the partial unique indexes plus

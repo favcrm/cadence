@@ -1579,9 +1579,9 @@ impl Store {
             .optional()?)
     }
 
-    /// Jobs whose receipt-linked turns are represented in a continuity pack.
+    /// Jobs whose receipt-linked messages occur in a retained projection.
     /// Read receipt metadata only; never re-read a notice body.
-    pub(crate) fn assist_continuity_notice_jobs(
+    pub(crate) fn assist_notice_jobs_for_messages(
         &self,
         binding: &AssistantBinding,
         ids: &[String],
@@ -1616,7 +1616,7 @@ impl Store {
                 || alias != binding.alias
             {
                 return Err(Error::rejected(
-                    "continuity notice receipt does not match the active assistant",
+                    "notice receipt does not match the active assistant",
                 ));
             }
             jobs.push(job);

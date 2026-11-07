@@ -203,6 +203,14 @@ the subscriber's unrelated conversation remain available. Re-sharing restores
 the durable subscriber's access, but a client that already advanced a history
 cursor past the hidden entries must rescan to see them.
 
+For signed member history and the bound assistant's own thread read, the daemon
+also reserves the current local share for receipt-linked rows in the selected
+response and for its reply watermark, even when that watermark is outside the
+page. A withdrawal that commits before admission causes the stale response to
+be withheld. Once admitted, withdrawal is refused until the frame reaches the
+daemon's local socket peer or the bounded write ends. Unrelated jobs are not
+reserved. A stalled socket write has an absolute 60-second limit.
+
 Before a later provider attempt, a continuity pack reserves the local share for
 each receipt-linked notice turn represented in that pack. If withdrawal commits
 after the notice was selected but before admission, the turn is refused rather
@@ -212,9 +220,10 @@ finishes. Continuity admission does not reserve jobs whose turns are excluded
 from the final pack, or when the whole pack is not sent.
 
 This is not a complete revocation guarantee. Historical reads do not re-prove
-each job's remote grant, and local withdrawal can race an already selected
-history response. Remote grant withdrawal is not ordered with provider
-submission. Other background or legacy readers, ambiguous provenance, later
+each job's remote grant. The board relay can have received a frame before local
+withdrawal and send its HTTP response later; those bytes cannot be recalled.
+Remote grant withdrawal is not ordered with provider submission. Other
+background or legacy readers, binding changes, ambiguous provenance, later
 derived outputs and persistent provider sessions remain outside these checks.
 Previously received responses, copied material and already-sent provider
 requests cannot be recalled.
