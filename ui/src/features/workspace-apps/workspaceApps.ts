@@ -306,9 +306,19 @@ async function request<T>(path: string, signal?: AbortSignal, body?: object): Pr
 /** One of the company's connected Instagram accounts or Facebook Pages (CAD-1290, CAD-1939). */
 export interface PublishDestination { destination_id: string; label: string; toolkit: string }
 export const workspaceApps = {
-  /** CAD-1290: the host-composed AgenticOS connect link; `hosted:false` on a local board. */
-  connectLink: (id: string, returnTo: string, signal?: AbortSignal, toolkit?: string) =>
-    request<{ hosted: boolean; url?: string; unavailable?: boolean }>(`${installation(id)}/publishing/connect-link`, signal, { return_to: returnTo, ...(toolkit ? { toolkit } : {}) }),
+  /** CAD-1290: the host-composed AgenticOS connect link; `hosted:false` on a local board.
+   *  `inlineConsent` is forwarded only when the board's own consent read proves the central
+   *  capability exists, so an older daemon never receives a field it does not accept. */
+  connectLink: (id: string, returnTo: string, signal?: AbortSignal, toolkit?: string, inlineConsent?: boolean) =>
+    request<{ hosted: boolean; url?: string; unavailable?: boolean }>(`${installation(id)}/publishing/connect-link`, signal, { return_to: returnTo, ...(toolkit ? { toolkit } : {}), ...(inlineConsent ? { inline_consent: true } : {}) }),
+  /** The owner-scoped publishing consent read. Its shape is the host's contract with the board:
+   *  `{available, consents:[{destination_id, toolkit, state:"allowed"|"none"}]}`; an older board
+   *  answers 404 and the caller treats that as unavailable, never as "no consent". */
+  consentStatus: (id: string, signal?: AbortSignal) =>
+    request<unknown>(`${installation(id)}/publishing/consent`, signal),
+  /** Ask the board to record the owner's consent for the account this install publishes to. */
+  consentAllow: (id: string, body: { destination_id: string }) =>
+    request<unknown>(`${installation(id)}/publishing/consent`, undefined, body),
   destinations: (id: string, signal?: AbortSignal) =>
     request<{ unavailable: boolean; destinations: PublishDestination[] }>(`${installation(id)}/publishing/destinations`, signal),
   useDestination: (id: string, body: { destination_id: string; toolkit?: string; timezone?: string; request_id?: string; expected_revision?: number; context_id?: string }) =>

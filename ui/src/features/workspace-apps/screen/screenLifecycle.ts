@@ -42,6 +42,11 @@ export interface ScreenActions {
      *  the geometry. Absent (no shell behind this frame) the verb refuses. */
     openScreenDrawer?(surface: string): boolean;
     closeScreenDrawer?(): boolean;
+    /** The surface this frame is mounted as, host-derived; set only for a
+     *  drawer child, so a connect started there returns to that drawer. */
+    returnSurface?: string;
+    /** The width that drawer was opened with, so the return reopens it alike. */
+    returnSize?: ScreenDrawerSize;
   }): Promise<ActionResult>;
   /** Validate a spend verb, fetch what the host must check, and name the work. */
   planner: Planner;

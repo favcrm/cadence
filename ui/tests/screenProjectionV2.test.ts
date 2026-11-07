@@ -150,7 +150,22 @@ void (async () => {
   // 2. A v2 child receives phase, caption excerpt, refusal, permalink and defaults (no price).
   const v2 = mount(full); v2.port.receive({ v: 1, op: "ready", accepts: ["screen.v2"] });
   const p = v2.port.sent[0] as ScreenPush;
-  check(p.v === 2 && p.actions!.join() === "read.run,context.defaults.save,open-link,screen.drawer.open,screen.drawer.close,social.drafts.list,social.drafts.show,social.drafts.create,social.drafts.update,social.drafts.discard,social.drafts.publish.stage,social.sources.show,social.sources.page,social.sources.get,social.sources.save,social.destinations.list,publish.destination.use,publish.destination.remove,publish.settings.save,publish.draft.confirm,publish.draft.schedule,publish.draft.reschedule,publish.draft.cancel,run.start,social.image.pick" && !!p.publish_intents, "v2 envelope: v 2, intents kept, the closed verb list for an operator view");
+  // `actions` is a closed allowlist: the only verbs a scoped child may call. Membership is
+  // therefore asserted exactly, so widening it is a deliberate, reviewed edit rather than an
+  // unnoticed extra verb. Emission order is the implementation's own wiring and is not pinned.
+  // The generic set never carries the per-mount media verbs or the child-only drawer read.
+  const closedVerbs = ["context.defaults.save", "open-link", "publish.consent.allow", "publish.consent.status",
+    "publish.destination.remove", "publish.destination.use", "publish.draft.cancel", "publish.draft.confirm",
+    "publish.draft.reschedule", "publish.draft.schedule", "publish.settings.save", "read.run", "run.start",
+    "screen.drawer.close", "screen.drawer.open", "social.destinations.list", "social.drafts.create",
+    "social.drafts.discard", "social.drafts.list", "social.drafts.publish.stage", "social.drafts.show",
+    "social.drafts.update", "social.image.pick", "social.sources.get", "social.sources.page",
+    "social.sources.save", "social.sources.show"];
+  check(p.v === 2 && Array.isArray(p.actions) && !p.actions!.some(v => v.startsWith("media.")) &&
+    !p.actions!.includes("screen.drawer.context") && !!p.publish_intents,
+    "v2 envelope: v 2, intents kept, media verbs and the child-only drawer read are never advertised");
+  check(JSON.stringify([...p.actions!].sort()) === JSON.stringify(closedVerbs),
+    `the advertised v2 verb set is exactly the closed allowlist: ${[...p.actions!].sort().join()}`);
   const byId = new Map(p.runs.map(r => [r.id, r]));
   check(byId.get("run-ready")!.phase === "ready" && byId.get("run-writing")!.phase === "working:produce_text" &&
     byId.get("run-checking")!.phase === "checking" && byId.get("run-failed")!.phase === "failed", "phase from real step receipts");
