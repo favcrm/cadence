@@ -80,6 +80,27 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: AssistantAction,
     },
+    /// List installed apps, or describe the actions one hosted app offers.
+    Describe {
+        /// Installed app name; omit to list apps.
+        app: Option<String>,
+    },
+    /// Call a hosted app action using its declared arguments.
+    Call {
+        /// Installed app name.
+        app: String,
+        /// Action name from `app describe`.
+        operation: String,
+        /// Action arguments as one JSON object: inline, `@file`, a path, or `-` for stdin.
+        #[arg(long, default_value = "{}")]
+        args: String,
+        /// Stable request handle; keep it and the same arguments if the outcome is uncertain.
+        #[arg(long)]
+        request: Option<String>,
+        /// Reason shown with an action held for an owner's decision.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Stable workspace installation IDs; execution and approval are separate.
     Catalog {
         #[command(subcommand)]
@@ -2541,6 +2562,11 @@ fn run_selected_ticket(state_dir: &Path, action: &RunAction) -> Result<serde_jso
 pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
     use cadence_agent::issue::app;
     let result = match &action {
+        AppAction::Describe { .. } | AppAction::Call { .. } => {
+            return Err(Error::usage(
+                "app describe/call require a hosted workspace; pass --org <workspace>",
+            ));
+        }
         AppAction::Binding { action } => {
             let (method, params) = binding_params(action);
             client::rpc(state_dir, method, params)?

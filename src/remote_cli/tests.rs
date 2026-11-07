@@ -7218,6 +7218,7 @@ mod agent_credential_refusals {
             200 => "200 OK",
             401 => "401 Unauthorized",
             403 => "403 Forbidden",
+            404 => "404 Not Found",
             409 => "409 Conflict",
             500 => "500 Internal Server Error",
             _ => "400 Bad Request",
@@ -7374,6 +7375,18 @@ mod agent_credential_refusals {
     }
 
     const MINT: &str = "agent-credential:login";
+
+    /// A `platform_call` body shaped like the CLI's own `app describe` and
+    /// `app call` commands.
+    fn app_args(tool: &str) -> Value {
+        let body = if tool == "app_call" {
+            json!({"app": "social-content", "operation": "social.drafts.create",
+                "args": "{\"text\":\"synthetic\"}"})
+        } else {
+            json!({"app": "social-content"})
+        };
+        json!({"operation": "call", "tool": tool, "key": "pcli_synthetic_app", "body": body})
+    }
 
     // 1. The agent's own refusals stand.
     #[test]
@@ -7623,5 +7636,242 @@ mod agent_credential_refusals {
         assert_eq!(r.trail()[3..], ["authorize:login", "call:login"]);
         assert_eq!(std::fs::read(&slot.path).unwrap(), cached);
         assert!(r.notes().is_empty());
+    }
+
+    // 7. CAD-2222: a managed session never authorizes a `platform_call` on the
+    // member's login. The hosted board's agent policy owns this family — it
+    // admits some tools, holds others for a person — so a credential the board
+    // will not issue, or one it answers `human_session_required`, fails the
+    // call closed instead of silently acting as the member. A valid agent
+    // credential still serves every one of them, an ordinary verb keeps the
+    // documented fallback, and a human shell keeps running the same calls on
+    // its own login.
+    #[test]
+    fn a_managed_platform_call_never_falls_back_to_the_human_login() {
+        // A tool the board's agent policy does admit, and the catalogue read,
+        // so this is not an app-tool-only rule.
+        fn provider(tool: &str) -> Value {
+            json!({"operation": "call", "tool": tool, "key": "pcli_synthetic_tool",
+                "body": {"limit": 1}})
+        }
+        // (label, arguments): every one of these is a `platform_call`.
+        fn cases() -> Vec<(&'static str, Value)> {
+            vec![
+                ("app_call", app_args("app_call")),
+                ("app_describe", app_args("app_describe")),
+                ("admitted tool", provider("board_pending_actions")),
+                (
+                    "catalog read",
+                    json!({"operation": "tools", "key": "pcli_synthetic_tools"}),
+                ),
+            ]
+        }
+
+        // (a) No agent credential can be minted: 404 (the board has no route)
+        // and 409 `renewable_login_required` (nothing to bind one to).
+        for (label, status, code) in [
+            ("404", 404, "not_found"),
+            (
+                "409 renewable_login_required",
+                409,
+                "renewable_login_required",
+            ),
+        ] {
+            for (case, args) in cases() {
+                let r = rig(8, move |route, _| {
+                    (route == "agent-credential").then(|| Reply::Json(status, refused(code)))
+                });
+                let slot = r.slot(CLAIM, 1);
+                let error = r.send(Some(&slot), "platform_call", args).unwrap_err();
+                // Only the mint rode the login; the call was never sent.
+                assert_eq!(r.trail(), [MINT], "{label} {case}: the login was used");
+                assert_ne!(error.kind(), "unknown", "{label} {case}: {error}");
+            }
+            // The same board keeps today's fallback for an ordinary verb.
+            let r = rig(8, move |route, _| {
+                (route == "agent-credential").then(|| Reply::Json(status, refused(code)))
+            });
+            let slot = r.slot(CLAIM, 1);
+            r.comment(Some(&slot)).unwrap();
+            assert_eq!(
+                r.trail(),
+                [MINT, "authorize:login", "call:login"],
+                "{label}: an ordinary verb must still keep the login"
+            );
+            assert_eq!(r.notes().len(), 1, "{label}: {:?}", r.notes());
+        }
+
+        // (b) The workspace predates the agent identity and refuses the
+        // credential exactly `human_session_required`, at either stage.
+        for stage in ["authorize", "call"] {
+            for (case, args) in cases() {
+                let r = rig(8, move |route, req| {
+                    (agent(req) && route == stage)
+                        .then(|| Reply::Json(403, refused("human_session_required")))
+                });
+                let slot = r.slot(CLAIM, 1);
+                let error = r.send(Some(&slot), "platform_call", args).unwrap_err();
+                assert_ne!(error.kind(), "unknown", "{stage} {case}: {error}");
+                let mut want = vec![MINT, "authorize:A"];
+                if stage == "call" {
+                    want.push("call:A");
+                }
+                assert_eq!(r.trail(), want, "{stage} {case}: the login was used");
+            }
+            // The same answer still falls back for an ordinary verb, once.
+            let r = rig(12, move |route, req| {
+                (agent(req) && route == stage)
+                    .then(|| Reply::Json(403, refused("human_session_required")))
+            });
+            let slot = r.slot(CLAIM, 1);
+            r.comment(Some(&slot)).unwrap();
+            let mut want = vec![MINT, "authorize:A"];
+            if stage == "call" {
+                want.push("call:A");
+            }
+            want.extend(["authorize:login", "call:login"]);
+            assert_eq!(r.trail(), want, "{stage}: an ordinary verb must fall back");
+            assert_eq!(r.notes().len(), 1, "{stage}: {:?}", r.notes());
+        }
+
+        // (c) A valid agent credential still serves every case — including the
+        // admitted tool.
+        for (case, args) in cases() {
+            let r = rig(8, |route, req| {
+                if route != "call" {
+                    return None;
+                }
+                Some(
+                    match req
+                        .body
+                        .pointer("/arguments/operation")
+                        .and_then(Value::as_str)
+                    {
+                        Some("tools") => ok200(json!({"tools": []})),
+                        _ => ok200(json!({"ok": true, "data": {"served": true}})),
+                    },
+                )
+            });
+            let slot = r.slot(CLAIM, 1);
+            let answer = r.send(Some(&slot), "platform_call", args).unwrap();
+            assert!(answer.is_object(), "{case}: {answer}");
+            assert_eq!(r.trail(), [MINT, "authorize:A", "call:A"], "{case}");
+            assert!(r.notes().is_empty(), "{case}: {:?}", r.notes());
+        }
+
+        // (d) A human shell has no managed identity to preserve: the same calls
+        // still run on its login.
+        for (case, args) in cases() {
+            let r = rig(8, |route, req| {
+                if route != "call" {
+                    return None;
+                }
+                Some(
+                    match req
+                        .body
+                        .pointer("/arguments/operation")
+                        .and_then(Value::as_str)
+                    {
+                        Some("tools") => ok200(json!({"tools": []})),
+                        _ => ok200(json!({"ok": true, "data": {"served": true}})),
+                    },
+                )
+            });
+            r.send(None, "platform_call", args).unwrap();
+            assert_eq!(r.trail(), ["authorize:login", "call:login"], "{case}");
+            assert!(r.notes().is_empty(), "{case}: {:?}", r.notes());
+        }
+    }
+
+    // 8. CAD-2222: an app door's own refusal crosses the transport as a fixed
+    // code with fixed text — the consumer-visible safety boundary, not a
+    // wording snapshot. The known codes stay distinguishable, a provider's
+    // arbitrary message text never rides out with them, and none is retried.
+    #[test]
+    fn an_app_tool_refusal_keeps_its_safe_code_and_never_echoes_provider_text() {
+        const PROVIDER_TEXT: &str = "provider-owned diagnostic detail 42";
+        for (status, code) in [
+            (403, "owner_required"),
+            (403, "approval_required"),
+            (404, "app_unavailable"),
+        ] {
+            for tool in ["app_call", "app_describe"] {
+                let body = json!({"ok": false, "error": {"code": code, "message": PROVIDER_TEXT}});
+                let r = rig(8, move |route, _| {
+                    (route == "call").then(|| Reply::Json(status, body.clone()))
+                });
+                // A human shell: this is the transport's own answer, whoever
+                // carried the request.
+                let error = r.send(None, "platform_call", app_args(tool)).unwrap_err();
+                assert_eq!(
+                    error.code(),
+                    Some(code),
+                    "HTTP {status} {code} {tool}: {error}"
+                );
+                assert_ne!(error.kind(), "unknown", "{code} {tool}: {error}");
+                assert!(
+                    !error.to_string().contains(PROVIDER_TEXT),
+                    "{code} {tool}: provider text was echoed: {error}"
+                );
+                assert_eq!(
+                    r.trail(),
+                    ["authorize:login", "call:login"],
+                    "{code} {tool}: the refusal was retried"
+                );
+                assert!(r.notes().is_empty(), "{code} {tool}: {:?}", r.notes());
+            }
+        }
+    }
+
+    // 9. CAD-2222: `app_describe` is a read in the host's tool policy, so an
+    // ambiguous answer — a 5xx, a lost transport, or a 2xx that is not a usable
+    // receipt — cannot have applied anything: it is a failed read.
+    // `app_call` can write, so the same ambiguity is an unknown outcome the
+    // caller must reconcile. Both are attempted once and never replayed.
+    #[test]
+    fn an_ambiguous_app_answer_splits_the_read_from_the_write() {
+        #[derive(Clone, Copy, Debug)]
+        enum Lost {
+            Server,
+            Receipt,
+            Transport,
+        }
+        for (tool, lost) in [
+            ("app_call", Lost::Server),
+            ("app_call", Lost::Receipt),
+            ("app_call", Lost::Transport),
+            ("app_describe", Lost::Server),
+            ("app_describe", Lost::Receipt),
+            ("app_describe", Lost::Transport),
+        ] {
+            let r = rig(8, move |route, req| {
+                if !(agent(req) && route == "call") {
+                    return None;
+                }
+                Some(match lost {
+                    Lost::Server => {
+                        Reply::Json(500, json!({"ok": false, "error": {"code": "unavailable"}}))
+                    }
+                    // A 2xx without the `ok`/`data` receipt shape.
+                    Lost::Receipt => Reply::Json(200, json!({"ok": true})),
+                    Lost::Transport => Reply::Hangup,
+                })
+            });
+            let slot = r.slot(CLAIM, 1);
+            let error = r
+                .send(Some(&slot), "platform_call", app_args(tool))
+                .unwrap_err();
+            let label = format!("{tool} {lost:?}");
+            if tool == "app_call" {
+                assert_eq!(error.kind(), "unknown", "{label}: {error}");
+            } else {
+                assert_ne!(error.kind(), "unknown", "{label}: {error}");
+            }
+            assert_eq!(
+                r.trail(),
+                [MINT, "authorize:A", "call:A"],
+                "{label}: the ambiguous answer was replayed"
+            );
+        }
     }
 }

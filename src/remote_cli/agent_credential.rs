@@ -19,16 +19,13 @@
 //!   has no refresh token: renewal is a fresh mint.
 //!
 //! When it is not used, and what that costs:
-//! - The board has no mint route (404) or the member's login has no renewable
-//!   session (409 `renewable_login_required`): keep the login, one stderr line.
-//! - The board accepts the mint but the TENANT predates the agent identity:
-//!   the first authorize (or call) answers 403 `human_session_required`.
-//!   Keep the login for the rest of the invocation, one stderr line. That is
-//!   the only answer that falls back. A 401, a 403 `forbidden` and everything
-//!   else is the agent's own refusal and is never retried on the login, or the
-//!   refusal would be undone.
-//! - Any other mint failure refuses the verb. It never silently takes the
-//!   member's wider authority, because the failure could be an outage.
+//! - For `platform_call`, an unavailable or refused agent credential stops the
+//!   action. Retrying as the member could give the call a person's authority.
+//! - Other verbs keep the login when the board has no mint route (404), the
+//!   login has no renewable session (409 `renewable_login_required`), or the
+//!   tenant answers `human_session_required`. One stderr line names this.
+//! - A 401, a 403 `forbidden` and every other refusal is never retried on the
+//!   login, or the refusal would be undone.
 
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -133,6 +130,13 @@ pub(super) fn applies<'a>(
     slot.filter(|slot| slot.serves(target) && !stays_on_login(surface, verb) && !slot.declined())
 }
 
+pub(super) fn platform_agent_required() -> Error {
+    Error::invalid(
+        "agent_credential_required",
+        "A managed platform action needs an agent credential; the member login was not used for the action.",
+    )
+}
+
 /// The credential to send now: the cached one while it has time left, else a
 /// fresh mint on the member's login. `Ok(None)` means the login is kept (and
 /// the one line was said); `Err` means nothing was sent.
@@ -141,10 +145,15 @@ pub(super) fn bearer(
     target: &RemoteTarget,
     dir: &Path,
     deadline: Instant,
+    allow_login_fallback: bool,
     note: &impl Fn(&str),
 ) -> Result<Option<Credential>> {
     if slot.declined() {
-        return Ok(None);
+        return if allow_login_fallback {
+            Ok(None)
+        } else {
+            Err(platform_agent_required())
+        };
     }
     let at = now()?;
     if let Some(cached) = read_cached(slot, target, at) {
@@ -156,6 +165,7 @@ pub(super) fn bearer(
             let _ = write_cache(slot, &cred);
             Ok(Some(*cred))
         }
+        Minted::Keep(_) if !allow_login_fallback => Err(platform_agent_required()),
         Minted::Keep(why) => {
             slot.keep_login(note, why);
             Ok(None)

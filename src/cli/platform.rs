@@ -161,13 +161,12 @@ pub(crate) enum PlatformAction {
         /// no query half, so they refuse this flag.
         #[arg(long)]
         query: Option<String>,
-        /// Stable handle for this call. A hosted org replays the recorded
-        /// outcome of the same handle instead of charging twice. A local
-        /// connected read creates a fresh handle when omitted and reports it
-        /// if its outcome is unknown. Other hosted calls derive an omitted
-        /// handle from the tool and input. Inspect `platform status` before
-        /// repeating an uncertain call: an unrecorded retry can start and
-        /// charge new work. Use a fresh handle for a deliberate new call.
+        /// Stable handle for this call. Hosted calls derive one from the tool
+        /// and input when omitted. A connected local read creates a fresh
+        /// handle. For provider/media calls, inspect `platform status` after an
+        /// uncertain result; an unrecorded retry can charge again. App writes
+        /// are not tracked there: inspect the app's records and keep the same
+        /// request and input. Use a fresh handle only for a deliberate new call.
         #[arg(long)]
         request: Option<String>,
         /// Disambiguate when several adapters declare the same tool.

@@ -729,6 +729,30 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             cli.command_path,
         );
     }
+    // Hosted app actions must not fall through to a local daemon.
+    if matches!(
+        &cli.command,
+        Commands::App {
+            action: app::AppAction::Describe { .. } | app::AppAction::Call { .. }
+        }
+    ) {
+        let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker_pin()?)?
+        {
+            org::Resolved::Remote(target) => target,
+            org::Resolved::Local(_) => {
+                return Err(Error::usage(
+                    "app describe/call require a hosted workspace; pass --org <workspace>. Nothing was sent and no daemon was started",
+                ));
+            }
+        };
+        return remote::run(
+            target,
+            cli.command,
+            cli.wake_timeout,
+            cli.state_dir,
+            cli.command_path,
+        );
+    }
     // Published app lifecycle is hosted-only and must refuse before local
     // state/daemon startup, including on a client-only installation.
     if matches!(
