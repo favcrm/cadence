@@ -8,6 +8,7 @@ import type * as Engine from "../src/features/app-shell/chat/conversationThread"
 import type * as Bar from "../src/features/app-shell/chat/TurnBar";
 import type * as Composer from "../src/features/app-shell/chat/Composer";
 import type * as States from "../src/features/app-shell/chat/turnBarState";
+import type * as Preview from "../src/features/app-shell/chat/conversationPreview";
 import type * as Queries from "../src/lib/useResource";
 import type * as Resources from "../src/lib/resources";
 import type { MasterState } from "../src/lib/types";
@@ -25,6 +26,7 @@ const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
 const { conversationThread } = require<typeof Client>("../src/features/app-shell/conversationClient");
 type StreamLink = import("../src/features/app-shell/chat/conversationThread").StreamLink;
 const { useThreadStream } = require<typeof Engine>("../src/features/app-shell/chat/conversationThread");
+const { useConversationPreview } = require<typeof Preview>("../src/features/app-shell/chat/conversationPreview");
 const { TurnBar } = require<typeof Bar>("../src/features/app-shell/chat/TurnBar");
 const ComposerDefault = require<typeof Composer>("../src/features/app-shell/chat/Composer").default;
 const { turnBarState } = require<typeof States>("../src/features/app-shell/chat/turnBarState");
@@ -157,6 +159,41 @@ async function main() {
   await React.act(async () => { emit(`event: master\ndata: ${JSON.stringify(snapshot("m-next"))}\n\n`); });
   await settle();
   assert(host.querySelector("main")?.getAttribute("data-link") === "live", "a late first frame still goes live");
+  // An empty hosted app thread has no persisted thread id yet. Its selected
+  // conversation must be proved by the stream before live text can appear.
+  await React.act(async () => { root.render(null); });
+  const fresh = conversationThread("conv-fresh");
+  fresh.write(() => ({ exists: false, entries: [], pending: [] }));
+  const originalFrame = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = (callback) => {
+    queueMicrotask(() => callback(0));
+    return 1;
+  };
+  function FreshHarness() {
+    const [link, setLink] = React.useState<StreamLink>("reconnecting");
+    useThreadStream(fresh, "/api/threads/master/stream?conversation=conv-fresh", true, setLink, undefined, undefined, "conv-fresh");
+    const preview = useConversationPreview("conv-fresh", true);
+    return React.createElement("main", { "data-link": link }, preview);
+  }
+  await React.act(async () => { root.render(React.createElement(FreshHarness)); });
+  await settle();
+  const freshSnapshot: MasterState = {
+    ...snapshot("m-fresh"),
+    turn: { state: "working", message: "m-fresh", conversation: "conv-fresh" },
+    session: { id: "conv-fresh" },
+    actor_identity: { scope: "personal", conversation_id: "conv-fresh", identity: { name: null, tone: null, look: "robot", revision: 0 } },
+  };
+  await React.act(async () => {
+    emit(`event: master\ndata: ${JSON.stringify({ ...freshSnapshot, session: { id: "other-conversation" } })}\n\nevent: preview\ndata: {"text":"foreign text"}\n\n`);
+  });
+  await settle();
+  assert(host.querySelector("main")?.getAttribute("data-link") === "reconnecting" && !host.textContent?.includes("foreign text"), "an empty thread refuses a mismatched session and its preview");
+  await React.act(async () => {
+    emit(`event: master\ndata: ${JSON.stringify(freshSnapshot)}\n\nevent: preview\ndata: {"text":"first live answer"}\n\n`);
+  });
+  await settle();
+  assert(host.querySelector("main")?.getAttribute("data-link") === "live" && host.textContent?.includes("first live answer"), "a proved empty app thread shows its first live answer");
+  globalThis.requestAnimationFrame = originalFrame;
   off();
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();

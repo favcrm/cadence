@@ -142,9 +142,13 @@ export function useThreadStream(
             if (!accepted) setConversationPreview(previewConversation, null);
             if (Object.hasOwn(snapshot, "actor_identity")) {
               const conversation = snapshot.actor_identity?.conversation_id;
-              if (typeof conversation !== "string" || conversation === "" || conversation !== data?.conversation) {
-                // Fail closed for this connection's previews: the durable
-                // mismatch already marks the link reconnecting.
+              const heldConversation = data?.conversation;
+              const expectedConversation = heldConversation === undefined ? previewConversation : heldConversation;
+              if (typeof conversation !== "string" || conversation === "" || conversation !== expectedConversation ||
+                  (heldConversation === undefined && !accepted)) {
+                // A new app thread has no server thread id until its first
+                // message. Only the selected id, proved by this connection's
+                // session and actor identity, can bind that empty store.
                 accepted = false;
                 setConversationPreview(previewConversation, null);
                 onLink("reconnecting");
@@ -165,7 +169,9 @@ export function useThreadStream(
             settled = true;
             clearTimeout(grace);
             onLink("live");
-            return data ?? EMPTY_THREAD;
+            return data?.conversation === undefined && accepted && previewConversation !== null
+              ? { ...(data ?? EMPTY_THREAD), conversation: previewConversation }
+              : data ?? EMPTY_THREAD;
           }
           const next = reduceFrame(data, event, (entry) => {
             // The committed result ends the turn: the live text it replaces
