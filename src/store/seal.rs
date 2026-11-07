@@ -90,8 +90,9 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// tables; v60 (CAD-1085) adds the connection-dispatch ledger tables; v61
 /// (CAD-1962) adds the imported-media custody tables; v62 (CAD-2042) adds the
 /// retained-source scope columns and page index plus a migration-progress
-/// table. None changes a latch or witness table, so the bound extends to 62.
-pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 62;
+/// table; v63 (CAD-1857) adds `agent_endpoints`. None changes a latch or
+/// witness table, so the bound extends to 63.
+pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 63;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -1742,6 +1743,18 @@ impl Store {
                     |row| row.get(0),
                 )?;
                 if decision_tables != 2 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+            }
+            if *db_schema >= 63 {
+                // v63 adds only the endpoint registry. A hand-made 63
+                // database without it is not the schema this witness accepts.
+                let endpoint_tables: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agent_endpoints'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if endpoint_tables != 1 {
                     return Err(Error::rejected("owner witness database schema is unsupported"));
                 }
             }

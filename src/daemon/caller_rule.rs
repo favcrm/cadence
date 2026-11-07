@@ -465,6 +465,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("monitor_list", Rule::Read),
     ("monitor_show", Rule::Read),
+    ("endpoint_add", Rule::Handler("operator_connection: the operator only (CAD-1857)")),
+    ("endpoint_list", Rule::Read),
+    ("endpoint_show", Rule::Read),
+    ("endpoint_verify", Rule::Handler("operator_connection: the operator only (CAD-1857)")),
+    ("endpoint_enable", Rule::Handler("operator_connection: the operator only (CAD-1857)")),
+    ("endpoint_disable", Rule::Handler("operator_connection: the operator only (CAD-1857)")),
+    ("endpoint_remove", Rule::Handler("operator_connection: the operator only (CAD-1857)")),
     (
         "monitor_heartbeat",
         Rule::Handler(

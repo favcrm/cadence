@@ -47,6 +47,7 @@ const TRACKER_DIR: &str = "portable-tracker";
 const COORDINATION: &[&str] = &[
     "schema_version",
     "agents",
+    "agent_endpoints",
     "messages",
     "events",
     "jobs",
@@ -88,11 +89,33 @@ const DISABLED: &[(&str, &str)] = &[
     ("agents", "enabled"),
     ("monitors", "dispatch_enabled"),
     ("monitors", "auto_dispatch_enabled"),
+    ("agent_endpoints", "verified"),
 ];
+
+/// Text columns forced to a fixed safe value on the private copy and on
+/// import. An imported endpoint must not accept mail until the operator
+/// explicitly enables it again.
+const DISABLED_TEXT: &[(&str, &str, &str)] = &[("agent_endpoints", "state", "disabled")];
 
 /// The fixed catalog of the store tables with their exact columns.
 /// Export and restore refuse any table or column not listed here.
 const CATALOG: &[(&str, &[&str])] = &[
+    (
+        "agent_endpoints",
+        &[
+            "id",
+            "agent_uid",
+            "kind",
+            "slug",
+            "state",
+            "verified",
+            "project",
+            "workflow",
+            "digest",
+            "created",
+            "updated",
+        ],
+    ),
     (
         "agents",
         &[
@@ -2024,7 +2047,11 @@ fn build_package(
         omitted_tables: omitted_names().iter().map(|t| t.to_string()).collect(),
         omitted_rows,
         nulled_columns: NULLED.iter().map(|(t, c)| format!("{t}.{c}")).collect(),
-        disabled_columns: DISABLED.iter().map(|(t, c)| format!("{t}.{c}")).collect(),
+        disabled_columns: DISABLED
+            .iter()
+            .map(|(t, c)| format!("{t}.{c}"))
+            .chain(DISABLED_TEXT.iter().map(|(t, c, _)| format!("{t}.{c}")))
+            .collect(),
         exclusions: package_exclusions,
         redacted_message_bodies: scrub.redacted_message_bodies,
         members,
@@ -2411,7 +2438,19 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         tx.execute(&format!("UPDATE {table} SET {column}=NULL"), [])?;
     }
     for (table, column) in DISABLED {
+        if !table_present(&tx, table)? {
+            continue;
+        }
         tx.execute(&format!("UPDATE {table} SET {column}=0"), [])?;
+    }
+    for (table, column, value) in DISABLED_TEXT {
+        if !table_present(&tx, table)? {
+            continue;
+        }
+        tx.execute(
+            &format!("UPDATE {table} SET {column}=?1"),
+            rusqlite::params![value],
+        )?;
     }
     tx.commit()?;
     conn.execute_batch("VACUUM")?;
@@ -3442,6 +3481,18 @@ fn refuse_nonempty(destination: &Path) -> Result<()> {
     }
 }
 
+/// A coordination package exported before a table existed is still
+/// restorable; the disabled-column checks below only apply where the table
+/// is actually present, so an older package is not refused for a column its
+/// schema never had.
+fn table_present(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |r| r.get::<_, i64>(0),
+    )? > 0)
+}
+
 /// Validate the staged store on the receiver: integrity, FK, schema, the
 /// exact closed catalog, and the cell policy. Source identity is read only
 /// from the manifest, never from the staged store.
@@ -3506,6 +3557,9 @@ fn validate_staged_store(db: &Path, manifest: &PortableManifest) -> Result<()> {
         }
     }
     for (table, column) in DISABLED {
+        if !table_present(&conn, table)? {
+            continue;
+        }
         let on: i64 = conn.query_row(
             &format!("SELECT count(*) FROM {table} WHERE {column}<>0"),
             [],
@@ -3514,6 +3568,21 @@ fn validate_staged_store(db: &Path, manifest: &PortableManifest) -> Result<()> {
         if on > 0 {
             return Err(Error::rejected(format!(
                 "staged store enables {table}.{column}"
+            )));
+        }
+    }
+    for (table, column, value) in DISABLED_TEXT {
+        if !table_present(&conn, table)? {
+            continue;
+        }
+        let on: i64 = conn.query_row(
+            &format!("SELECT count(*) FROM {table} WHERE {column}<>?1"),
+            rusqlite::params![value],
+            |r| r.get(0),
+        )?;
+        if on > 0 {
+            return Err(Error::rejected(format!(
+                "staged store sets {table}.{column} to an enabled value"
             )));
         }
     }
