@@ -999,6 +999,66 @@ fn verb_for(
             args.insert("payload".into(), Value::Object(payload));
             "settings_agents"
         }
+        // CAD-2226: the three owner-enrollment acts ride the existing
+        // `platform_call` relay. The hosted workspace owns its stored login,
+        // its provider consent and every account it links, so a local flag
+        // naming any of them refuses here rather than being dropped from a
+        // request that would then enroll something else.
+        Commands::Connection { action } => {
+            match action {
+                ConnectionAction::Providers => {
+                    args.insert("operation".into(), json!("connection_providers"));
+                }
+                ConnectionAction::Ls => {
+                    args.insert("operation".into(), json!("connection_list"));
+                }
+                ConnectionAction::Enroll {
+                    provider,
+                    scopes,
+                    shape,
+                    agent,
+                    // Hosted enrollment prints the returned link for the
+                    // person's own browser; it never opens one here, so the
+                    // flag selects nothing on the wire.
+                    no_open: _,
+                } => {
+                    if !scopes.is_empty() {
+                        return Err(unsupported(
+                            "connection enroll",
+                            "--scope",
+                            "a hosted enrollment takes the scopes the provider's own consent \
+                             screen grants, never a caller-selected list",
+                        ));
+                    }
+                    if shape.is_some() {
+                        return Err(unsupported(
+                            "connection enroll",
+                            "--shape",
+                            "the hosted server records the shape of the account the provider \
+                             authorizes",
+                        ));
+                    }
+                    if agent.is_some() {
+                        return Err(unsupported(
+                            "connection enroll",
+                            "--agent",
+                            "a hosted enrollment binds the live workspace owner, not a local \
+                             agent alias",
+                        ));
+                    }
+                    if !cadence_agent::remote_cli::connection_toolkit_slug(provider) {
+                        return Err(Error::invalid(
+                            "connection_start",
+                            "toolkit must be 1-64 of a-z 0-9 _ - starting with a-z",
+                        ));
+                    }
+                    args.insert("operation".into(), json!("connection_start"));
+                    args.insert("body".into(), json!({"toolkit": provider}));
+                }
+                _ => return Err(unavailable(command_path)),
+            }
+            "platform_call"
+        }
         Commands::Platform { action } => {
             // CAD-1678: a hosted workspace owns its catalog, its accounts and
             // its per-project default, so a flag naming any of them cannot
@@ -2938,6 +2998,14 @@ where
     ) {
         refuse_managed(&target, "project new")?;
     }
+    // CAD-2226: provider enrollment and the reads around it are the live human
+    // owner's own acts — the same CAD-1586 rule the merge approval and Settings
+    // follow. A managed caller spending the stored login would act as that
+    // owner, so it refuses before a request exists; the board independently
+    // requires a live human owner for the same three operations.
+    if let Some(verb) = connection_owner_verb(&command) {
+        refuse_managed(&target, verb)?;
+    }
     let mut command = command;
     if let Commands::Agent {
         action: AgentAction::Profile { action },
@@ -3035,6 +3103,24 @@ where
                 Err(error) => return remote_failure(error),
             }
             if wiki_text(&command, &body)? {
+                return Ok(0);
+            }
+            // CAD-2226: a hosted enrollment's only useful output is the
+            // one-time provider link the transport verified. Print it for the
+            // person's own browser — this server-side flow never opens one —
+            // and note that it enrolls the account only.
+            if matches!(
+                &command,
+                Commands::Connection {
+                    action: ConnectionAction::Enroll { .. }
+                }
+            ) {
+                print_json(&hosted_enrollment_document(&body)?);
+                eprint_line(
+                    "Open this one-time link in your own browser; no browser was opened here. \
+                     It enrolls the provider account only — selecting a verified property \
+                     (for example a Search Console site) is not part of enrollment.",
+                );
                 return Ok(0);
             }
             if matches!(&command, Commands::Platform { .. }) {
@@ -3448,6 +3534,41 @@ fn refuse_managed(target: &RemoteTarget, command: &str) -> Result<()> {
     Ok(())
 }
 
+/// The connection acts a hosted org serves, named as the stable command a
+/// refusal quotes. Every other `connection` action keeps the local custody
+/// path and refuses on a hosted org rather than half-mapping to a relay
+/// operation that does not exist.
+fn connection_owner_verb(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Connection {
+            action: ConnectionAction::Providers,
+        } => Some("connection providers"),
+        Commands::Connection {
+            action: ConnectionAction::Ls,
+        } => Some("connection ls"),
+        Commands::Connection {
+            action: ConnectionAction::Enroll { .. },
+        } => Some("connection enroll"),
+        _ => None,
+    }
+}
+
+/// CAD-2226: the user-facing success of a hosted enrollment is the one-time
+/// provider link, and only a link the transport verified. It is printed for
+/// the person's own browser — nothing here opens one, logs it or repeats it.
+fn hosted_enrollment_document(body: &Value) -> Result<Value> {
+    let url = cadence_agent::remote_cli::connection_authorization_url(body).ok_or_else(|| {
+        Error::unknown(
+            "remote connection enrollment returned no usable authorization link — the provider \
+             link may or may not exist. An account appears in `cadence --org <org> connection ls` \
+             only after the provider callback completes, so an empty list does not prove no link \
+             was issued; nothing is retried automatically, and starting again is a deliberate new \
+             enrollment",
+        )
+    })?;
+    Ok(json!({ "entry_url": url }))
+}
+
 /// CAD-1593: `restore` against a remote org. Only `--portable` forms exist
 /// remotely — everything else refuses before a request is built, exactly
 /// like the local flag checks, so a misplaced knob is a usage error, never
@@ -3677,6 +3798,65 @@ mod tests {
         let err = refuse_managed(&target, "audit accept-revise").unwrap_err();
         assert!(err.to_string().contains("managed caller"), "{err}");
         assert!(err.to_string().contains("Nothing was sent"), "{err}");
+    }
+
+    /// Through the real hosted call site: the endpoint is unreachable and the
+    /// credential directory is absent, so a missing gate would answer a
+    /// transport error instead of the managed-caller refusal.
+    #[test]
+    fn hosted_owner_enrollment_is_refused_to_a_managed_caller_before_any_request() {
+        let _lock = crate::cli::org::tests::RESOLVE_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CADENCE_ALIAS", "synthetic-worker");
+        let target = || cadence_agent::remote_cli::RemoteTarget {
+            org: "acme".into(),
+            endpoint: "https://127.0.0.1:1".into(),
+            org_id: "ws_synthetic".into(),
+            identity: None,
+        };
+        let enroll = || Commands::Connection {
+            action: ConnectionAction::Enroll {
+                provider: "google_search_console".into(),
+                scopes: Vec::new(),
+                shape: None,
+                agent: None,
+                no_open: true,
+            },
+        };
+        let out = [
+            run(
+                target(),
+                Commands::Connection {
+                    action: ConnectionAction::Providers,
+                },
+                1,
+                None,
+                Some("connection providers".into()),
+            ),
+            run(
+                target(),
+                Commands::Connection {
+                    action: ConnectionAction::Ls,
+                },
+                1,
+                None,
+                Some("connection ls".into()),
+            ),
+            run(
+                target(),
+                enroll(),
+                1,
+                None,
+                Some("connection enroll".into()),
+            ),
+        ];
+        std::env::remove_var("CADENCE_ALIAS");
+        for result in out {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("managed caller"), "{err}");
+            assert!(err.to_string().contains("Nothing was sent"), "{err}");
+        }
     }
 
     #[test]
@@ -3989,6 +4169,218 @@ mod read_contract_tests {
         ] {
             let refused = outcome(&platform(action)).unwrap_err();
             assert!(refused.contains(label), "{label}: {refused}");
+        }
+    }
+
+    fn connection(action: ConnectionAction) -> Commands {
+        Commands::Connection { action }
+    }
+
+    fn enroll(
+        toolkit: &str,
+        scopes: Vec<String>,
+        shape: Option<&str>,
+        agent: Option<&str>,
+        no_open: bool,
+    ) -> Commands {
+        connection(ConnectionAction::Enroll {
+            provider: toolkit.into(),
+            scopes,
+            shape: shape.map(str::to_string),
+            agent: agent.map(str::to_string),
+            no_open,
+        })
+    }
+
+    #[test]
+    fn hosted_connection_owner_reads_map_to_their_relay_operations() {
+        for (action, operation) in [
+            (ConnectionAction::Providers, "connection_providers"),
+            (ConnectionAction::Ls, "connection_list"),
+        ] {
+            let (verb, args) = outcome(&connection(action)).unwrap();
+            assert_eq!(verb, "platform_call");
+            assert_eq!(args["operation"], json!(operation));
+            assert_eq!(
+                args.as_object().unwrap().len(),
+                1,
+                "a hosted connection read carries the operation and nothing else"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_connection_enroll_sends_only_the_exact_toolkit_body() {
+        for no_open in [true, false] {
+            let (verb, args) = outcome(&enroll(
+                "google_search_console",
+                Vec::new(),
+                None,
+                None,
+                no_open,
+            ))
+            .unwrap();
+            assert_eq!(verb, "platform_call");
+            assert_eq!(args["operation"], json!("connection_start"));
+            assert_eq!(
+                args["body"],
+                json!({"toolkit": "google_search_console"}),
+                "the relay admits exactly the toolkit"
+            );
+            assert_eq!(
+                args.as_object().unwrap().len(),
+                2,
+                "--no-open selects nothing on the wire: hosted enrollment never opens a browser"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_connection_enroll_refuses_local_only_flags() {
+        for (label, scopes, shape, agent) in [
+            (
+                "--scope",
+                vec!["search_console.read".to_string()],
+                None,
+                None,
+            ),
+            ("--shape", Vec::new(), Some("token"), None),
+            ("--agent", Vec::new(), None, Some("synthetic-worker")),
+        ] {
+            let refused =
+                outcome(&enroll("google_search_console", scopes, shape, agent, true)).unwrap_err();
+            assert!(refused.contains(label), "{label}: {refused}");
+            assert!(
+                refused.contains("cannot"),
+                "a discarded local flag must refuse, not be dropped: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_connection_enroll_refuses_an_unsafe_toolkit_before_dispatch() {
+        for toolkit in [
+            String::new(),
+            "Google".into(),
+            "../etc".into(),
+            "a b".into(),
+            "UPPER".into(),
+            "a.b".into(),
+            "1abc".into(),
+            "_abc".into(),
+            "a".repeat(65),
+        ] {
+            let refused = outcome(&enroll(&toolkit, Vec::new(), None, None, true)).unwrap_err();
+            assert!(refused.contains("toolkit"), "{toolkit:?}: {refused}");
+        }
+        // The server's own grammar is accepted, hyphens and digits included.
+        let (_, args) = outcome(&enroll(
+            "google-search_console2",
+            Vec::new(),
+            None,
+            None,
+            true,
+        ))
+        .expect("a lowercase identifier toolkit is accepted");
+        assert_eq!(args["body"]["toolkit"], json!("google-search_console2"));
+    }
+
+    #[test]
+    fn hosted_connection_actions_outside_owner_enrollment_stay_unavailable() {
+        // Only the three owner-enrollment acts are routed. Local credential
+        // custody, rotation, revocation and SMTP keep refusing instead of
+        // being half-mapped to a hosted operation that does not exist.
+        for action in [
+            ConnectionAction::Show {
+                connection_id: "con_synthetic".into(),
+            },
+            ConnectionAction::Check {
+                connection_id: "con_synthetic".into(),
+            },
+            ConnectionAction::Revoke {
+                connection_id: "con_synthetic".into(),
+            },
+            ConnectionAction::Manage { no_open: true },
+        ] {
+            let refused = outcome(&connection(action)).unwrap_err();
+            assert!(
+                refused.contains("not available on a remote org"),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_three_owner_enrollment_acts_are_the_managed_caller_gate() {
+        assert_eq!(
+            connection_owner_verb(&connection(ConnectionAction::Providers)),
+            Some("connection providers")
+        );
+        assert_eq!(
+            connection_owner_verb(&connection(ConnectionAction::Ls)),
+            Some("connection ls")
+        );
+        assert_eq!(
+            connection_owner_verb(&enroll(
+                "google_search_console",
+                Vec::new(),
+                None,
+                None,
+                true
+            )),
+            Some("connection enroll")
+        );
+        assert_eq!(
+            connection_owner_verb(&connection(ConnectionAction::Show {
+                connection_id: "con_synthetic".into()
+            })),
+            None
+        );
+        assert_eq!(connection_owner_verb(&Commands::MyWork), None);
+    }
+
+    #[test]
+    fn a_hosted_enrollment_success_is_only_its_validated_link() {
+        let url = "https://provider.example.test/oauth?synthetic=1";
+        let body = json!({"ok": true, "data": {"url": url}});
+        let document = hosted_enrollment_document(&body).expect("a validated HTTPS link succeeds");
+        assert_eq!(document, json!({"entry_url": url}));
+        assert_eq!(
+            document.as_object().unwrap().len(),
+            1,
+            "the link is the only user-facing value, and it is never repeated"
+        );
+        // The opaque query and an explicit valid port are preserved verbatim.
+        for url in [
+            "https://provider.example.test/oauth?a=1&b=%2F&c=two+words",
+            "https://provider.example.test:443/oauth",
+            "https://[2001:db8::1]:8443/oauth",
+        ] {
+            let body = json!({"ok": true, "data": {"url": url}});
+            assert_eq!(
+                hosted_enrollment_document(&body).expect("a valid HTTPS link succeeds"),
+                json!({"entry_url": url})
+            );
+        }
+        for refused in [
+            json!({"ok": true}),
+            json!({"ok": true, "data": {}}),
+            json!({"ok": false, "data": {"url": url}}),
+            json!({"ok": true, "data": {"url": "http://provider.example.test/oauth"}}),
+            json!({"ok": true, "data": {"url": "/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test}not"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:notaport/x"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:999999/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:65536/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://user:secret@provider.example.test/x"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test/\n"}}),
+        ] {
+            assert!(
+                hosted_enrollment_document(&refused).is_err(),
+                "must not report a link it cannot verify: {refused}"
+            );
         }
     }
 

@@ -38,7 +38,9 @@ pub(crate) enum ConnectionAction {
     },
     /// Create a metadata-only protected enrollment request and open the
     /// trusted entry page; the account handle, transport and secret are
-    /// typed there, never here.
+    /// typed there, never here. On a hosted org this starts the workspace
+    /// owner's provider authorization instead and prints its one-time link;
+    /// no browser is opened here.
     Enroll {
         provider: String,
         #[arg(long = "scope")]

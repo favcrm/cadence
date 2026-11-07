@@ -449,7 +449,65 @@ cadence --org acme platform status --tool search_console_report --connection con
 
 The read uses the workspace balance; `--max-charge` belongs to the separate
 local device protocol. A connection does not select a Search Console property:
-enrollment and verified property selection are not yet provided by this CLI.
+enrollment links the provider account only, and verified property selection is
+not provided yet.
+
+### Owner enrollment from the CLI (Search Console first)
+
+An owner enrolls a provider account from a plain shell, in three steps. The
+reads use `cli.read` (or `cli.write`); starting an enrollment is a mutation and
+needs `cli.write`:
+
+```sh
+cadence --org acme connection providers
+cadence --org acme connection ls
+cadence --org acme connection enroll google_search_console --no-open
+```
+
+`connection providers` lists the workspace's open toolkits and their read
+eligibility, including those that cannot yet be enrolled. The status
+`enrollment: available` means a qualified read exists; starting also requires
+the workspace's connector to be configured. The other requested providers
+are not qualified by this build.
+`connection ls` lists the accounts already linked to the workspace — a pending
+authorization the provider has not completed yet does not appear there.
+`connection enroll` answers one document whose `entry_url` is a one-time
+provider authorization link:
+
+```json
+{"entry_url":"https://provider.example/oauth?synthetic-request"}
+```
+
+Open that link yourself, in your own browser. The hosted server never opens a
+browser of its own, and this client prints the link exactly once as the
+successful command's output — it is never written to a log, a receipt, an
+error, or a diagnostic line. `--no-open` is the same behavior here (a hosted
+enrollment never opens a browser either way). Treat the link as a bearer
+secret until it is used. Provider permissions depend on the configured OAuth
+app; inspect the consent screen and do not proceed if it requests more than
+the intended read-only access. This flow does not verify the app's scopes.
+
+The three operations are for the live human workspace owner. A managed caller
+(an agent pane or a grant-bound child) is refused in this client before any
+request exists, because the stored login is the owner's and would otherwise
+act as the owner; the hosted server independently requires a live human owner.
+Local-only enrollment flags refuse instead of being dropped: `--scope` (the
+configured OAuth app determines provider scopes), `--shape` (the server records
+the account shape the provider authorizes) and `--agent` (a hosted enrollment
+binds the owner, not an agent). Enrollment links an account only: choosing a
+verified Search Console property is a separate step this build does not
+provide.
+
+If the answer to `connection enroll` is lost, times out or is otherwise
+uncertain, the client reports an unknown outcome and never retries and never
+claims a link. The link cannot be read back, and `connection ls` lists only
+accounts whose provider callback already completed: an empty list does not
+prove that no link or pending authorization was issued. Starting again is a
+deliberate new enrollment, not a reconciliation step — it can create a second
+one-time link. A hosted server that predates these operations answers the
+unknown operation; that refusal says to update the hosted server first and
+never invents an empty list or a missing link, and the client never falls back
+to the local daemon.
 
 An image submission may return a queued job. Poll its returned `data.job.id`
 with the same workspace and `cli.write` grant, then download a succeeded job's

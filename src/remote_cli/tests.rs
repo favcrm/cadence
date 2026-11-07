@@ -4837,6 +4837,360 @@ fn hosted_connected_read_accepts_a_complete_settled_receipt_and_replay() {
     }
 }
 
+/// CAD-2226: the three owner-enrollment operations ride `platform_call`. A 2xx
+/// is printed only when it carries the complete documented row shape; an
+/// incomplete read is a refusal, never an invented empty list. Unknown additive
+/// fields stay accepted so a newer server is not frozen out.
+#[test]
+fn hosted_connection_reads_require_the_complete_documented_rows() {
+    let provider = json!({
+        "provider": "google_search_console",
+        "descriptor_available": false,
+        "manifest_status": "missing",
+        "reviewed_pin": null,
+        "reported_pin": null,
+        "enrollment": "available",
+        "read": {
+            "slug": "google_search_console",
+            "qualified": true,
+            "pinned": true,
+            "projected": true
+        }
+    });
+    let connection = json!({
+        "id": "con_synthetic",
+        "provider": "google_search_console",
+        "account": "",
+        "kind": "enrolled",
+        "revision": null,
+        "registration_digest": null,
+        "scopes": [],
+        "status": {
+            "adapter_registered": true,
+            "descriptor_available": true,
+            "custody_available": true,
+            "manifest_status": "matched",
+            "reviewed_pin": "google-search-console@1",
+            "reported_pin": "google-search-console@1",
+            "execution_authority": true,
+            "network_checked": false
+        }
+    });
+    let without = |row: &Value, key: &str| {
+        let mut row = row.clone();
+        row.as_object_mut().unwrap().remove(key);
+        row
+    };
+    let mut bad_read = provider.clone();
+    bad_read["read"]
+        .as_object_mut()
+        .unwrap()
+        .remove("projected");
+    let mut bad_descriptor = provider.clone();
+    bad_descriptor["descriptor_available"] = json!("yes");
+    let mut bad_status = connection.clone();
+    bad_status["status"]
+        .as_object_mut()
+        .unwrap()
+        .remove("custody_available");
+    let mut bad_kind = connection.clone();
+    bad_kind["kind"] = json!("enrolled_elsewhere");
+    let mut bad_scopes = connection.clone();
+    bad_scopes["scopes"] = json!([1]);
+    let mut additive_provider = provider.clone();
+    additive_provider
+        .as_object_mut()
+        .unwrap()
+        .insert("future".into(), json!(true));
+    let mut additive_connection = connection.clone();
+    additive_connection
+        .as_object_mut()
+        .unwrap()
+        .insert("future".into(), json!(true));
+
+    let cases: [(&str, &str, Value, Vec<Value>); 2] = [
+        (
+            "connection_providers",
+            "providers",
+            additive_provider,
+            vec![
+                json!({}),
+                without(&provider, "enrollment"),
+                bad_read,
+                bad_descriptor,
+                json!("google_search_console"),
+            ],
+        ),
+        (
+            "connection_list",
+            "connections",
+            additive_connection,
+            vec![
+                json!({}),
+                without(&connection, "revision"),
+                bad_status,
+                bad_kind,
+                bad_scopes,
+                json!("con_synthetic"),
+            ],
+        ),
+    ];
+    for (operation, field, good, bad) in cases {
+        let args = json!({ "operation": operation })
+            .as_object()
+            .cloned()
+            .unwrap();
+        let call = |body: Value| {
+            let (listener, requests, _server) = fake_worker(vec![(200, "", body)]);
+            let target = target(&listener);
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("a");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .unwrap();
+            store_credential(&dir, &target.endpoint);
+            let answer = call_verb_in(
+                &target,
+                "platform_call",
+                args.clone(),
+                10,
+                &dir,
+                |_| {},
+                |_| panic!("a read is never retried"),
+            );
+            assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+            answer
+        };
+        for row in bad {
+            let err = call(json!({"ok": true, "data": { field: [row] }}))
+                .expect_err("an incomplete row proves nothing");
+            assert_eq!(err.kind(), "rejected", "{err}");
+            let text = err.to_string().to_ascii_lowercase();
+            assert!(text.contains("incomplete"), "{text}");
+            assert!(
+                !text.contains("no connections") && !text.contains("no providers"),
+                "an unusable answer must not become an empty list: {text}"
+            );
+        }
+        // A legitimate empty list and a row with tolerable additive fields
+        // both stay valid.
+        for body in [
+            json!({"ok": true, "data": { field: [] }}),
+            json!({"ok": true, "data": { field: [good.clone()], "future": true }}),
+        ] {
+            let answer = call(body.clone()).expect("a complete answer is accepted");
+            assert!(matches!(answer, RemoteAnswer::Ok(received) if received == body));
+        }
+    }
+}
+
+/// Enrollment is a mutation: a 2xx without a verified HTTPS link leaves the
+/// outcome unknown, so this client neither claims a link nor repeats the call.
+#[test]
+fn hosted_connection_start_requires_an_https_link_and_never_retries() {
+    let args = json!({
+        "operation": "connection_start",
+        "body": {"toolkit": "google_search_console"}
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    for body in [
+        json!({"ok": true}),
+        json!({"ok": true, "data": {}}),
+        json!({"ok": true, "data": {"url": "http://provider.example.test/oauth"}}),
+        json!({"ok": true, "data": {"url": "/oauth"}}),
+        json!({"ok": true, "data": {"url": "https://"}}),
+        json!({"ok": true, "data": {"url": "https://provider.example.test:999999/oauth"}}),
+        json!({"ok": true, "data": {"url": "https://provider.example.test:notaport/x"}}),
+        json!({"ok": true, "data": {"url": "https://user:secret@provider.example.test/x"}}),
+        json!({"ok": true, "data": {"url": "not-a-url"}}),
+        json!({"ok": false, "data": {"url": "https://provider.example.test/oauth"}}),
+    ] {
+        let (listener, requests, _server) = fake_worker(vec![(200, "", body.clone())]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+
+        let err = call_verb_in(
+            &target,
+            "platform_call",
+            args.clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("an enrollment start is never retried automatically"),
+        )
+        .expect_err("an unverified link is not a success");
+        assert_eq!(err.kind(), "unknown", "{err}");
+        let text = err.to_string().to_ascii_lowercase();
+        assert!(
+            text.contains("connection ls"),
+            "the link that may exist must be reconciled by a read: {text}"
+        );
+        assert!(
+            !text.contains("https://provider"),
+            "a failed answer must not echo a link it did not verify: {text}"
+        );
+        assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+    }
+
+    let receipt = json!({"ok": true, "data": {
+        "url": "https://provider.example.test/oauth?synthetic=1"
+    }});
+    let (listener, requests, _server) = fake_worker(vec![(200, "", receipt.clone())]);
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+    let answer = call_verb_in(
+        &target,
+        "platform_call",
+        args,
+        10,
+        &dir,
+        |_| {},
+        |_| panic!("an enrollment start is never retried automatically"),
+    )
+    .expect("a verified HTTPS link is the success");
+    assert!(matches!(answer, RemoteAnswer::Ok(body) if body == receipt));
+    assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+}
+
+/// A hosted server that predates these operations answers the unknown
+/// operation. That is a release-order refusal, not an empty list and not a
+/// missing link, and it never falls back to the local daemon.
+#[test]
+fn hosted_connection_operations_refuse_honestly_on_an_older_server() {
+    for (operation, field) in [
+        ("connection_providers", "providers"),
+        ("connection_list", "connections"),
+        ("connection_start", "url"),
+    ] {
+        let args = if operation == "connection_start" {
+            json!({"operation": operation, "body": {"toolkit": "google_search_console"}})
+        } else {
+            json!({ "operation": operation })
+        }
+        .as_object()
+        .cloned()
+        .unwrap();
+        for (status, code) in [
+            (501u16, None),
+            (400, Some("invalid_request")),
+            (400, Some("unknown_verb")),
+        ] {
+            let body = match code {
+                Some(code) => json!({"ok": false, "error": {"code": code}}),
+                None => json!({"ok": false, "error": {"code": "not_implemented"}}),
+            };
+            let (listener, requests, _server) = fake_worker(vec![(status, "", body)]);
+            let target = target(&listener);
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("a");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .unwrap();
+            store_credential(&dir, &target.endpoint);
+
+            let err = call_verb_in(
+                &target,
+                "platform_call",
+                args.clone(),
+                10,
+                &dir,
+                |_| {},
+                |_| panic!("an older server's refusal is not retried"),
+            )
+            .expect_err("an older server cannot serve the operation");
+            assert_eq!(err.kind(), "rejected", "{err}");
+            let text = err.to_string().to_ascii_lowercase();
+            assert!(
+                text.contains("update the hosted server first"),
+                "{operation} {status}: {text}"
+            );
+            assert!(
+                text.contains(operation),
+                "the refusal names the operation the server lacks: {text}"
+            );
+            if operation == "connection_start" {
+                assert!(
+                    text.contains("no authorization link"),
+                    "an older server must not yield an invented link: {text}"
+                );
+            } else {
+                assert!(
+                    text.contains("not an empty list"),
+                    "an older server must not yield an invented empty {field}: {text}"
+                );
+            }
+            assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+        }
+    }
+}
+
+/// An uncertain enrollment start is the same unresolved outcome a lost
+/// response is: never a link, never an automatic second attempt.
+#[test]
+fn hosted_connection_start_uncertainty_is_an_unknown_outcome() {
+    let args = json!({
+        "operation": "connection_start",
+        "body": {"toolkit": "google_search_console"}
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    for (status, body) in [
+        (409u16, json!({"ok": false, "error": {"code": "uncertain"}})),
+        (
+            409,
+            json!({"ok": false, "error": {"code": "idempotency_in_progress"}}),
+        ),
+        (
+            500,
+            json!({"ok": false, "error": {"code": "provider_unavailable"}}),
+        ),
+    ] {
+        let (listener, requests, _server) = fake_worker(vec![(status, "", body)]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+
+        let err = call_verb_in(
+            &target,
+            "platform_call",
+            args.clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("an uncertain start must not be automatically retried"),
+        )
+        .expect_err("an uncertain start has no verified link");
+        assert_eq!(err.kind(), "unknown", "{err}");
+        let text = err.to_string().to_ascii_lowercase();
+        assert!(text.contains("connection ls"), "{text}");
+        assert!(
+            text.contains("does not prove"),
+            "an empty connection list does not prove no link was issued: {text}"
+        );
+        assert!(
+            text.contains("deliberate new enrollment"),
+            "a second start must be described as a deliberate new act, not a retry: {text}"
+        );
+        assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+    }
+}
+
 #[test]
 fn hosted_platform_catalog_in_progress_reply_remains_a_read_refusal() {
     let args = json!({"operation": "tools"}).as_object().cloned().unwrap();
@@ -6456,6 +6810,43 @@ fn cad2127_platform_status_and_artifact_are_read_only_effects() {
             "`platform {operation}` must stay a possible mutation"
         );
     }
+}
+
+// CAD-2226: the owner-enrollment reads change nothing, while starting an
+// enrollment mints a one-time provider link — a possible mutation whose lost
+// answer is reconciled by the connection read, never by `platform status`.
+#[test]
+fn hosted_connection_operations_are_reads_or_a_mutation() {
+    for operation in ["connection_providers", "connection_list"] {
+        let arguments = json!({"operation": operation})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let effect = call_effect(Surface::Cli, "platform_call", &arguments);
+        assert!(
+            matches!(effect, Effect::Read),
+            "`{operation}` must not be treated as a mutation"
+        );
+        assert!(effect.reconciliation().is_none(), "{operation}");
+    }
+
+    let arguments = json!({
+        "operation": "connection_start",
+        "body": {"toolkit": "google_search_console"}
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    let effect = call_effect(Surface::Cli, "platform_call", &arguments);
+    assert!(effect.is_mutation(), "starting an enrollment mints a link");
+    let note = effect
+        .reconciliation()
+        .expect("an uncertain start has a read that reconciles it");
+    assert!(note.contains("connection ls"), "{note}");
+    assert!(
+        !note.contains("platform status"),
+        "an enrollment link is not a platform request: {note}"
+    );
 }
 
 // CAD-2127: a 503 to a read cannot have started or billed anything, so it is

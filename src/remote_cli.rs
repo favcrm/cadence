@@ -182,6 +182,10 @@ pub const REMOTE_VERBS: &[&str] = &[
     // CAD-1678 / AOS-328: the hosted workspace's own tool catalog. `tools`
     // needs `cli.read`, `call` needs `cli.write`; the Worker decides per
     // operation, so this client asks for the historical pair.
+    // CAD-2226: `connection_providers`/`connection_list` are the owner's
+    // reads and `connection_start` the enrollment write; all three are
+    // refused to a managed caller here and the board requires a live human
+    // owner.
     "platform_call",
     // CAD-1946: the merge gate. Reads (cli.read) and the operator's merge
     // approval (`audit.approve`, which only `cadence login --audit-approve`
@@ -328,6 +332,7 @@ const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been regist
 const RECONCILE_PROFILE_CREATE: &str = "the profile may or may not have been saved — read `agent profiles` with the same explicit --org before repeating it; the same alias is refused as taken if it landed";
 const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
 const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
+const RECONCILE_CONNECTION_START: &str = "the provider authorization link may or may not have been created — the account appears in `cadence --org <org> connection ls` only after the provider callback completes, so an empty list does not prove no link was issued. Nothing is retried automatically; start again only as a deliberate new enrollment";
 const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
 const RECONCILE_TEAM: &str =
     "the team change may or may not have been applied — inspect `team list` or \
@@ -451,14 +456,17 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                 Effect::Read
             }
         }
-        Surface::Cli
-            if verb == "platform_call"
-                && matches!(
-                    arguments.get("operation").and_then(Value::as_str),
-                    Some("tools" | "status" | "artifact")
-                ) =>
-        {
-            Effect::Read
+        Surface::Cli if verb == "platform_call" => {
+            match arguments.get("operation").and_then(Value::as_str) {
+                Some(
+                    "tools" | "status" | "artifact" | "connection_providers" | "connection_list",
+                ) => Effect::Read,
+                // CAD-2226: starting an owner enrollment mints a one-time provider
+                // link, so its lost or unusable answer is a possible mutation; the
+                // read above the link (`connection ls`) is what reconciles it.
+                Some("connection_start") => mutation(RECONCILE_CONNECTION_START),
+                _ => cli_effect(verb),
+            }
         }
         Surface::Cli => cli_effect(verb),
         Surface::Wiki => wiki_effect(verb),
@@ -568,6 +576,183 @@ fn tracker_unavailable_before_verb(status: u16, body: Option<&Value>) -> bool {
 /// nothing about the write it answered.
 fn is_object_body(body: Option<&Value>) -> bool {
     body.is_some_and(Value::is_object)
+}
+
+/// CAD-2226: the hosted connection operations answer with the relay's own
+/// `{ok:true,data:…}` envelope. A 2xx proves a read only when the complete
+/// documented row shape is present: an absent, foreign or malformed answer is
+/// not an empty list, and printing one would tell the person their workspace
+/// has no providers or connections when nobody saw the catalog. Unknown
+/// additive fields are tolerated so a newer server is not frozen out; a
+/// missing or mistyped documented field is not.
+fn connection_rows(answer: &Value, field: &str, row_ok: fn(&Value) -> bool) -> bool {
+    answer.get("ok").and_then(Value::as_bool) == Some(true)
+        && answer
+            .get("data")
+            .and_then(|data| data.get(field))
+            .and_then(Value::as_array)
+            .is_some_and(|rows| rows.iter().all(row_ok))
+}
+
+/// The hosted connector toolkit grammar (`connectorToolkitSlugSchema`): a
+/// lowercase identifier of at most 64 characters. The enrollment request, the
+/// provider rows and the enrolled-connection rows all use exactly this
+/// identity grammar. A hosted enrollment sends it verbatim, so a malformed one
+/// must refuse here — the relay would otherwise answer `invalid_request`, and
+/// that answer is reserved below for a server that predates the operation.
+pub fn connection_toolkit_slug(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= 64
+        && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn optional_pin(value: Option<&Value>) -> bool {
+    matches!(value, Some(Value::Null | Value::String(_)))
+}
+
+fn provider_read(read: &Value) -> bool {
+    read.as_object().is_some_and(|read| {
+        read.get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(connection_toolkit_slug)
+            && read.get("qualified").is_some_and(Value::is_boolean)
+            && read.get("pinned").is_some_and(Value::is_boolean)
+            && read.get("projected").is_some_and(Value::is_boolean)
+    })
+}
+
+/// One provider row: the toolkit identity, its manifest state, whether
+/// enrollment can start, and the qualified-read projection (or `null`).
+fn connection_provider_row(row: &Value) -> bool {
+    row.as_object().is_some_and(|row| {
+        row.get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(connection_toolkit_slug)
+            && row
+                .get("descriptor_available")
+                .is_some_and(Value::is_boolean)
+            && matches!(
+                row.get("manifest_status").and_then(Value::as_str),
+                Some("matched" | "missing")
+            )
+            && optional_pin(row.get("reviewed_pin"))
+            && optional_pin(row.get("reported_pin"))
+            && matches!(
+                row.get("enrollment").and_then(Value::as_str),
+                Some("available" | "read_unqualified")
+            )
+            && match row.get("read") {
+                Some(Value::Null) => true,
+                Some(read) => provider_read(read),
+                None => false,
+            }
+    })
+}
+
+/// The nested status of one enrolled connection. The two literal fields are
+/// the projection's own invariant, not a caller preference.
+fn connection_status(status: &Value) -> bool {
+    status.as_object().is_some_and(|status| {
+        status.get("adapter_registered").and_then(Value::as_bool) == Some(true)
+            && status
+                .get("descriptor_available")
+                .is_some_and(Value::is_boolean)
+            && status
+                .get("custody_available")
+                .is_some_and(Value::is_boolean)
+            && matches!(
+                status.get("manifest_status").and_then(Value::as_str),
+                Some("matched" | "missing")
+            )
+            && optional_pin(status.get("reviewed_pin"))
+            && optional_pin(status.get("reported_pin"))
+            && status
+                .get("execution_authority")
+                .is_some_and(Value::is_boolean)
+            && status.get("network_checked").and_then(Value::as_bool) == Some(false)
+    })
+}
+
+/// One enrolled connection row. `account` may be empty (no non-secret display
+/// name recorded); it is never a connected-account id.
+fn connection_row(row: &Value) -> bool {
+    row.as_object().is_some_and(|row| {
+        row.get("id").and_then(Value::as_str).is_some_and(|id| {
+            !id.is_empty() && id.len() <= 256 && id.bytes().all(|byte| byte.is_ascii_graphic())
+        }) && row
+            .get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(connection_toolkit_slug)
+            && row.get("account").is_some_and(Value::is_string)
+            && row.get("kind").and_then(Value::as_str) == Some("enrolled")
+            && row.get("revision").is_some_and(Value::is_null)
+            && row.get("registration_digest").is_some_and(Value::is_null)
+            && row
+                .get("scopes")
+                .and_then(Value::as_array)
+                .is_some_and(|scopes| scopes.iter().all(Value::is_string))
+            && row.get("status").is_some_and(connection_status)
+    })
+}
+
+pub fn connection_providers_answer(answer: &Value) -> bool {
+    connection_rows(answer, "providers", connection_provider_row)
+}
+
+pub fn connection_list_answer(answer: &Value) -> bool {
+    connection_rows(answer, "connections", connection_row)
+}
+
+/// The one-time provider authorization link, only when the answer carries one
+/// this client can hand to a person: HTTPS, a real host, no embedded
+/// credentials, no control byte. Anything else is never printed and never
+/// becomes a success.
+pub fn connection_authorization_url(answer: &Value) -> Option<&str> {
+    if answer.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let url = answer.get("data")?.get("url")?.as_str()?;
+    https_authorization_url(url).then_some(url)
+}
+
+/// The same URI parse the browser-login links use (`remote_auth`), plus the
+/// explicit u16 port fit the URI crate does not enforce: it validates the
+/// authority's characters but accepts `host:999999` as an authority. The
+/// original string is returned unchanged, so a query is never re-encoded.
+fn https_authorization_url(url: &str) -> bool {
+    if url.is_empty() || url.len() > 4096 || !url.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+    {
+        return false;
+    }
+    let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    if uri.scheme_str() != Some("https") {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let raw = authority.as_str();
+    if raw.contains('@') || uri.host().is_none_or(str::is_empty) {
+        return false;
+    }
+    // An IPv6 literal keeps its own colons; its port, if any, follows `]`.
+    let port = match raw.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((_, tail)) => tail.strip_prefix(':'),
+            None => return false,
+        },
+        None => raw.split_once(':').map(|(_, port)| port),
+    };
+    port.is_none_or(|port| {
+        !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok()
+    })
 }
 
 /// The tenant's `requiredText` uses ECMAScript `String.trim`, whose whitespace
@@ -5416,6 +5601,31 @@ fn call_verb_until_retry(
                 {
                     return Err(reject("the remote tool catalog is unavailable"));
                 }
+                Some("connection_providers")
+                    if !body.as_ref().is_some_and(connection_providers_answer) =>
+                {
+                    return Err(reject(
+                        "the hosted connection providers answer is incomplete — \
+                         nothing was listed; no empty catalog is reported",
+                    ));
+                }
+                Some("connection_list") if !body.as_ref().is_some_and(connection_list_answer) => {
+                    return Err(reject(
+                        "the hosted connection list answer is incomplete — \
+                         nothing was listed; no empty connection list is reported",
+                    ));
+                }
+                Some("connection_start")
+                    if !body
+                        .as_ref()
+                        .is_some_and(|answer| connection_authorization_url(answer).is_some()) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote connection enrollment returned no usable authorization \
+                         link — {}",
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                    )));
+                }
                 _ => {}
             }
         }
@@ -5563,18 +5773,21 @@ fn call_verb_until_retry(
             && post_forward_failure(status, body.as_ref(), matches!(surface, Surface::Cli));
         // A funded platform call may still be in progress or uncertain on
         // a same-key replay; preserve its dedicated reconciliation guidance.
-        let platform_outcome_unknown =
-            matches!(platform_operation, Some("call" | "connected_read"))
-                && !board_gate_refused(body.as_ref())
-                && !tracker_unavailable_before_verb(status, body.as_ref())
-                && ((status == 409
-                    && matches!(
-                        refusal_code.as_deref(),
-                        Some("uncertain" | "idempotency_in_progress")
-                    ))
-                    || (status >= 500
-                        && status != 501
-                        && body.as_ref().and_then(|b| b["state"].as_str()).is_none()));
+        // CAD-2226: an uncertain `connection_start` is the same unresolved
+        // outcome — the one-time link may exist but cannot be read back.
+        let platform_outcome_unknown = matches!(
+            platform_operation,
+            Some("call" | "connected_read" | "connection_start")
+        ) && !board_gate_refused(body.as_ref())
+            && !tracker_unavailable_before_verb(status, body.as_ref())
+            && ((status == 409
+                && matches!(
+                    refusal_code.as_deref(),
+                    Some("uncertain" | "idempotency_in_progress")
+                ))
+                || (status >= 500
+                    && status != 501
+                    && body.as_ref().and_then(|b| b["state"].as_str()).is_none()));
         let unknown_correlation = refusal_correlation(body.as_ref());
         // CAD-2101: a board without the profile verbs answers 501; say to
         // update it, not that coordination is unavailable.
@@ -5665,6 +5878,37 @@ fn call_verb_until_retry(
             return Err(reject(format!(
                 "the tenant could not serve `platform {op_name}` (HTTP {status}{}) — update the \
                  tenant server first, then this Cadence client; nothing was started or billed",
+                refusal_code
+                    .as_deref()
+                    .map_or(String::new(), |c| format!(", {c}"))
+            )));
+        }
+        // CAD-2226: a hosted server that predates the owner-enrollment
+        // operations answers the unknown operation with 501 or 400
+        // `invalid_request`/`unknown_verb`. That is a release-order problem:
+        // it is not an empty catalog, not an empty connection list and not a
+        // missing link, so nothing is invented and nothing falls back to the
+        // local daemon.
+        if matches!(
+            platform_operation,
+            Some("connection_providers" | "connection_list" | "connection_start")
+        ) && (status == 501
+            || (status == 400
+                && matches!(
+                    refusal_code.as_deref(),
+                    Some("invalid_request" | "unknown_verb")
+                )))
+        {
+            let operation = platform_operation.unwrap_or_default();
+            let consequence = if operation == "connection_start" {
+                "no authorization link exists and no account was linked"
+            } else {
+                "this is not an empty list"
+            };
+            return Err(reject(format!(
+                "the hosted tenant server does not serve `platform call` operation \
+                 `{operation}` (HTTP {status}{}) — update the hosted server first, then this \
+                 Cadence client; {consequence}",
                 refusal_code
                     .as_deref()
                     .map_or(String::new(), |c| format!(", {c}"))
