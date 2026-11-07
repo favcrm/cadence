@@ -349,7 +349,10 @@ export class HostedSession<
       }
       const pinned = master.context;
       const masterFrame = master.frame;
-      // A later refresh is skipped when it would repeat this exact payload.
+      // The watch snapshot can precede this independently read header. Never
+      // attach one run's partial to another run's current turn.
+      let masterOperation = master.operationId;
+      let previewOperation = this.previewOperation(stream.snapshot.run?.inputs);
       let lastMasterFrame = masterFrame;
       // Read and project before SSE 200, so a failure refuses like the master
       // projection above rather than opening a body that errors and reconnects.
@@ -395,11 +398,11 @@ export class HostedSession<
           // composes under those runtime fields and cannot replace them.
           if (!send(": connected\n\n") || !send(masterFrame)) return;
           for (const entry of snapshotEntries) if (!emit(entry, send)) break;
-          // The watch snapshot is the authoritative in-flight state, so a
-          // reconnect (or an overflow replacement) starts from the engine's
-          // current partial instead of a stale one. It follows the committed
-          // entries and has no `id:`, so it cannot move the durable cursor.
-          preview.applySnapshot(stream.snapshot);
+          // The snapshot and registration are atomic with each other, but the
+          // header was read later. A queued successor may already be running.
+          // Only show a partial whose engine submission proves the same turn.
+          if (masterOperation !== null && previewOperation === masterOperation)
+            preview.applySnapshot(stream.snapshot);
           sendPreview(preview.text);
         },
         events: async (events, send, sendPreview) => {
@@ -415,14 +418,52 @@ export class HostedSession<
           // watch and the stream, so the browser clears its preview and
           // reconnects instead of keeping stale turn controls.
           if (changes.master) {
-            const frame = await this.composedMasterFrame(pinned);
-            if (frame !== lastMasterFrame) {
-              lastMasterFrame = frame;
-              if (!send(frame)) return;
+            const next = await this.composedMasterFrame(pinned);
+            if (next.operationId !== masterOperation) {
+              // Clear before the new header so an old preview is never painted
+              // under its successor, even when the consumer renders each frame.
+              if (preview.text !== null) sendPreview(null);
+              preview.reset();
+              masterOperation = next.operationId;
+            }
+            if (next.frame !== lastMasterFrame) {
+              lastMasterFrame = next.frame;
+              if (!send(next.frame)) return;
             }
           }
+          // The engine reports run boundaries at the end of a commit batch.
+          // Its message changes describe the resulting view, so take the last
+          // boundary first; a replacement snapshot carries its own run.
+          let source = previewOperation;
+          for (const event of events) {
+            if (event.type === "snapshot")
+              source = this.previewOperation(event.run?.inputs);
+            else if (event.type === "run_start")
+              source = this.previewOperation(event.inputs);
+            else if (event.type === "run_end") source = null;
+          }
+          if (source !== previewOperation) {
+            if (preview.text !== null) sendPreview(null);
+            preview.reset();
+          }
+          previewOperation = source;
           const before = preview.text;
-          const batch = preview.apply(events);
+          // Pi reports the resulting partial before the retiring run's
+          // committed entries. On a same-commit run replacement, retire those
+          // entries first so they cannot erase the successor's new partial.
+          const replacing =
+            events.some((event) => event.type === "run_end") &&
+            events.some((event) => event.type === "run_start");
+          const retired = (event: AgentEvent) =>
+            event.type === "message_end" ||
+            (event.type === "task_failed" && event.kind === "pi.generation");
+          const projected = replacing
+            ? [...events.filter(retired), ...events.filter((event) => !retired(event))]
+            : events;
+          const batch =
+            masterOperation !== null && source === masterOperation
+              ? preview.apply(projected)
+              : { current: null, latest: null };
           let shown = before;
           if (batch.current !== null) {
             if (batch.current !== before) {
@@ -793,12 +834,13 @@ export class HostedSession<
   private async connectionMaster(): Promise<{
     readonly context: ThreadContext | null;
     readonly frame: string;
+    readonly operationId: string | null;
   } | null> {
     try {
       const context = this.options.threadContext
         ? this.validatedThreadContext(await this.options.threadContext())
         : null;
-      return { context, frame: await this.composedMasterFrame(context) };
+      return { context, ...(await this.composedMasterFrame(context)) };
     } catch {
       return null;
     }
@@ -815,16 +857,33 @@ export class HostedSession<
    */
   private async composedMasterFrame(
     context: ThreadContext | null,
-  ): Promise<string> {
+  ): Promise<{ readonly frame: string; readonly operationId: string | null }> {
     const status = await this.state();
-    return `event: master\ndata: ${JSON.stringify(
-      masterState(
-        status.model,
-        status,
-        context?.conversationId ?? null,
-        context?.metadata,
-      ),
-    )}\n\n`;
+    return {
+      operationId: status.running ? status.message : null,
+      frame: `event: master\ndata: ${JSON.stringify(
+        masterState(
+          status.model,
+          status,
+          context?.conversationId ?? null,
+          context?.metadata,
+        ),
+      )}\n\n`,
+    };
+  }
+
+  /** Resolve a watch run's first input to the engine's admitted operation id. */
+  private previewOperation(inputs: readonly number[] | undefined): string | null {
+    if (inputs === undefined || inputs.length === 0) return null;
+    try {
+      return readSubmissionRequestId(
+        this.ctx.storage.sql as unknown as TaskSql,
+        String(inputs[0]),
+      );
+    } catch {
+      // An unknown or pruned input cannot safely bind a transient preview.
+      return null;
+    }
   }
 
   /**

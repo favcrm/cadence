@@ -176,6 +176,8 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      * a callable root `toJSON` refuses the frame.
      */
     private composedMasterFrame;
+    /** Resolve a watch run's first input to the engine's admitted operation id. */
+    private previewOperation;
     /**
      * The operation-scoped identity of the model request running right now. It
      * comes from the engine's own running generation checkpoint (task id +

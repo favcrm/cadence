@@ -57826,6 +57826,8 @@ data: ${JSON.stringify(entry)}
       }
       const pinned = master.context;
       const masterFrame = master.frame;
+      let masterOperation = master.operationId;
+      let previewOperation = this.previewOperation(stream.snapshot.run?.inputs);
       let lastMasterFrame = masterFrame;
       let snapshotEntries;
       try {
@@ -57850,21 +57852,46 @@ data: ${JSON.stringify(entry)}
           for (const entry of snapshotEntries)
             if (!emit(entry, send))
               break;
-          preview.applySnapshot(stream.snapshot);
+          if (masterOperation !== null && previewOperation === masterOperation)
+            preview.applySnapshot(stream.snapshot);
           sendPreview(preview.text);
         },
         events: async (events, send, sendPreview) => {
           const changes = engineBatchChanges(events);
           if (changes.master) {
-            const frame = await this.composedMasterFrame(pinned);
-            if (frame !== lastMasterFrame) {
-              lastMasterFrame = frame;
-              if (!send(frame))
+            const next = await this.composedMasterFrame(pinned);
+            if (next.operationId !== masterOperation) {
+              if (preview.text !== null)
+                sendPreview(null);
+              preview.reset();
+              masterOperation = next.operationId;
+            }
+            if (next.frame !== lastMasterFrame) {
+              lastMasterFrame = next.frame;
+              if (!send(next.frame))
                 return;
             }
           }
+          let source = previewOperation;
+          for (const event of events) {
+            if (event.type === "snapshot")
+              source = this.previewOperation(event.run?.inputs);
+            else if (event.type === "run_start")
+              source = this.previewOperation(event.inputs);
+            else if (event.type === "run_end")
+              source = null;
+          }
+          if (source !== previewOperation) {
+            if (preview.text !== null)
+              sendPreview(null);
+            preview.reset();
+          }
+          previewOperation = source;
           const before = preview.text;
-          const batch = preview.apply(events);
+          const replacing = events.some((event) => event.type === "run_end") && events.some((event) => event.type === "run_start");
+          const retired = (event) => event.type === "message_end" || event.type === "task_failed" && event.kind === "pi.generation";
+          const projected = replacing ? [...events.filter(retired), ...events.filter((event) => !retired(event))] : events;
+          const batch = masterOperation !== null && source === masterOperation ? preview.apply(projected) : { current: null, latest: null };
           let shown = before;
           if (batch.current !== null) {
             if (batch.current !== before) {
@@ -58030,17 +58057,29 @@ data: ${JSON.stringify(entry)}
   async connectionMaster() {
     try {
       const context = this.options.threadContext ? this.validatedThreadContext(await this.options.threadContext()) : null;
-      return { context, frame: await this.composedMasterFrame(context) };
+      return { context, ...await this.composedMasterFrame(context) };
     } catch {
       return null;
     }
   }
   async composedMasterFrame(context) {
     const status = await this.state();
-    return `event: master
+    return {
+      operationId: status.running ? status.message : null,
+      frame: `event: master
 data: ${JSON.stringify(masterState(status.model, status, context?.conversationId ?? null, context?.metadata))}
 
-`;
+`
+    };
+  }
+  previewOperation(inputs) {
+    if (inputs === undefined || inputs.length === 0)
+      return null;
+    try {
+      return readSubmissionRequestId(this.ctx.storage.sql, String(inputs[0]));
+    } catch {
+      return null;
+    }
   }
   generationIdentity() {
     return readGenerationIdentity(this.ctx.storage.sql);

@@ -290,6 +290,10 @@ anywhere in a message, including across text blocks; that suffix stays withheld
 until commit. This conservative rule also stops previews at benign braces.
 Preview text and tracked content blocks are bounded; an oversized partial is not
 a substitute for the final answer.
+The run's first engine submission must resolve to the operation in the current
+`master` turn; an older snapshot or buffered batch is suppressed when they
+differ or the submission cannot be resolved. A turn change clears the previous
+preview before the new header is sent.
 
 The browser clears a preview as soon as its connection closes, even if the
 status probe cannot answer. The browser opts in to partial board feeds with

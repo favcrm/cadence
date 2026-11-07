@@ -1,7 +1,7 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { describe, expect, it, mock } from "bun:test";
-import type { PendingOperation, ThreadEntry } from "../src/contract.ts";
+import { BOARD_MESSAGE_KIND, type PendingOperation, type ThreadEntry } from "../src/contract.ts";
 
 /**
  * CAD-2228 acceptance check. Authored by the independent checker, not by the
@@ -45,6 +45,11 @@ import type { PendingOperation, ThreadEntry } from "../src/contract.ts";
  * attached while idle must be told the turn started before it receives a byte
  * of that turn's preview and told the turn settled afterwards; the same holds
  * for a reconnect whose engine snapshot already carries the in-flight message.
+ * A snapshot can also be OLDER than the header: a run that ended before the
+ * connection read its state may still be the snapshot's and the watch's turn,
+ * while another run is the one actually running. That turn's text, in the
+ * snapshot or in a batch the engine buffered before the subscription started,
+ * must never be shown under the running turn's header.
  *
  * Why the positive control comes first: a stream that never previews anything
  * would satisfy every "does not contain" assertion by accident. Every scenario
@@ -485,6 +490,15 @@ type Observation = {
 };
 
 /**
+ * The engine submission and operation id behind these scenarios' in-flight
+ * turn. The stream binds a snapshot's partial to the turn the header reports
+ * through the engine's own submission records, so text alone proves nothing:
+ * each scenario runs as a genuine admitted operation.
+ */
+const PREVIEW_SUBMISSION = 21;
+const PREVIEW_OPERATION = "op-preview";
+
+/**
  * Drive one scenario through the real `/thread-stream` boundary on a fresh
  * connection, a fresh watch snapshot and a fresh in-flight message.
  */
@@ -502,6 +516,9 @@ async function streamScenario(
     snapshot: {
       type: "snapshot" as const,
       entries: [],
+      // The snapshot is the in-flight turn of the operation this scenario runs
+      // as: its run input is the engine submission bound to that operation id.
+      run: { inputs: [PREVIEW_SUBMISSION] },
       tools: [],
       nestedTools: [],
       compactions: [],
@@ -528,10 +545,27 @@ async function streamScenario(
   // keeps every real prototype method in play; the cast names the single
   // method this check calls on an instance whose fields are stubbed.
   const session = Object.assign(Object.create(Session.prototype), {
-    ctx: { storage: { get: async () => undefined } },
+    ctx: {
+      storage: {
+        get: async () => undefined,
+        // The engine's own record binds the snapshot's run input to the
+        // operation id the header reports for this scenario's turn.
+        sql: engineTables([
+          {
+            id: PREVIEW_SUBMISSION,
+            operationId: PREVIEW_OPERATION,
+            text: "Ask for the preview.",
+          },
+        ]),
+      },
+    },
     options: { modelAlias: "alias" },
     harness: {
-      pending: async () => [],
+      // The scenarios' message is written by a turn this conversation is
+      // running, and the snapshot's run names the same operation.
+      pending: async () => [
+        { operationId: PREVIEW_OPERATION, status: "running" as const },
+      ],
       session: () => ({ id: "1", events: async () => watch }),
     },
     // The durable projection has its own tests; this check owns the stream
@@ -706,6 +740,16 @@ function inspect(observation: Observation, issues: string[]): void {
   }
 }
 
+/** How one watch ends, as `sessionEventResponse` reads it. */
+type WatchEnd =
+  | { readonly reason: "session_closed" | "cancelled" }
+  | { readonly reason: "session_failed"; readonly error: unknown };
+
+type WatchListener = (
+  events: readonly unknown[],
+  context: unknown,
+) => Promise<void>;
+
 /**
  * A scripted engine watch: one connection's snapshot plus a handle that
  * delivers batches exactly as the durable engine publishes them. No network,
@@ -713,30 +757,51 @@ function inspect(observation: Observation, issues: string[]): void {
  */
 type WatchDouble = {
   readonly snapshot: Record<string, unknown>;
-  readonly closed: Promise<{ reason: "session_closed" | "cancelled" }>;
-  start(
-    listener: (events: readonly unknown[], context: unknown) => Promise<void>,
-  ): void;
+  readonly closed: Promise<WatchEnd>;
+  start(listener: WatchListener): void;
   stop(): Promise<{ reason: "cancelled" }>;
 };
 
-function watchDouble(snapshot: Record<string, unknown>): {
+function watchDouble(
+  snapshot: Record<string, unknown>,
+  buffered: readonly (readonly unknown[])[] = [],
+): {
   readonly watch: WatchDouble;
   send(events: readonly unknown[]): Promise<void>;
   retire(): void;
 } {
-  const completion = Promise.withResolvers<{
-    reason: "session_closed" | "cancelled";
-  }>();
-  let deliver:
-    | ((events: readonly unknown[], context: unknown) => Promise<void>)
-    | undefined;
+  const completion = Promise.withResolvers<WatchEnd>();
+  let deliver: WatchListener | undefined;
+  /**
+   * Deliveries are serialized, and batches the engine committed between this
+   * watch's atomic capture and the consumer's subscription are replayed first:
+   * that is the real order a reconnecting or slow listener sees, and it makes
+   * the wire order of this check deterministic.
+   */
+  let queue: Promise<void> = Promise.resolve();
+  const enqueue = (events: readonly unknown[]): Promise<void> => {
+    queue = queue.then(async () => {
+      if (deliver === undefined)
+        throw new Error("The watch was never started.");
+      try {
+        await deliver(events, BACKGROUND_CONTEXT);
+      } catch (error) {
+        // A listener failure ends the response exactly like the engine's own
+        // `session_failed`, so a reader never waits on a stream that will not
+        // produce another frame.
+        completion.resolve({ reason: "session_failed", error });
+        throw error;
+      }
+    });
+    return queue;
+  };
   return {
     watch: {
       snapshot,
       closed: completion.promise,
       start(listener) {
         deliver = listener;
+        for (const events of buffered) void enqueue(events).catch(() => {});
       },
       async stop() {
         const end = { reason: "cancelled" as const };
@@ -744,11 +809,7 @@ function watchDouble(snapshot: Record<string, unknown>): {
         return end;
       },
     },
-    async send(events) {
-      if (deliver === undefined)
-        throw new Error("The watch was never started.");
-      await deliver(events, BACKGROUND_CONTEXT);
-    },
+    send: enqueue,
     retire() {
       completion.resolve({ reason: "session_closed" });
     },
@@ -803,10 +864,120 @@ async function openThread(session: BoundarySession): Promise<{
   };
 }
 
+/** The engine's SQL surface this check scripts. */
+type EngineSql = {
+  exec(
+    query: string,
+    ...bindings: (string | number | null)[]
+  ): { toArray(): Record<string, unknown>[] };
+};
+
+/**
+ * A minimal fake of the engine's own persisted tables, answering the queries
+ * `identity.ts` makes. A run's `inputs` are submission ids, so each submission
+ * record maps its id to the request id that this runtime uses as an operation
+ * id and to the entry the input was placed as; that entry repeats the operation
+ * id where a reader derives the binding from the transcript instead.
+ */
+function engineTables(
+  submissions: readonly {
+    readonly id: number;
+    readonly operationId: string;
+    readonly text: string;
+  }[],
+): EngineSql {
+  const submissionsById = new Map<number, Record<string, unknown>>();
+  const entriesById = new Map<number, Record<string, unknown>>();
+  for (const [index, submission] of submissions.entries()) {
+    // Placed-input entries live at their own ids; a commit's entry id is not
+    // one of these, so a reader resolving either cannot confuse the two.
+    const entry = 100 + index + 1;
+    submissionsById.set(submission.id, {
+      id: submission.id,
+      conversationId: 1,
+      type: "input",
+      status: "placed",
+      entry,
+      requestId: submission.operationId,
+    });
+    entriesById.set(entry, {
+      id: entry,
+      kind: BOARD_MESSAGE_KIND,
+      data: { messageId: submission.operationId },
+      model: [{ role: "user", content: submission.text }],
+    });
+  }
+  /** A row's `record` column, as the engine stores it. */
+  const rows = (
+    table: ReadonlyMap<number, Record<string, unknown>>,
+    id: number,
+  ): Record<string, unknown>[] => {
+    const record = table.get(id);
+    return record === undefined ? [] : [{ record: JSON.stringify(record) }];
+  };
+  /** The engine indexes `request_id` as the JSON-encoded operation id. */
+  const indexed = (value: string): string => {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return typeof parsed === "string" ? parsed : value;
+    } catch {
+      return value;
+    }
+  };
+  /** One stored submission's operation id, when its record has one. */
+  const recordRequestId = (row: Record<string, unknown>): unknown => {
+    const stored = row.record;
+    if (typeof stored !== "string") return undefined;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(stored);
+    } catch {
+      return undefined;
+    }
+    return typeof parsed === "object" && parsed !== null && "requestId" in parsed
+      ? parsed.requestId
+      : undefined;
+  };
+  const submissionRows = [...submissionsById.values()].map((record) => ({
+    id: record.id,
+    record: JSON.stringify(record),
+  }));
+  return {
+    exec(query: string, ...bindings: (string | number | null)[]) {
+      const text = query.replace(/\s+/g, " ").trim();
+      const numbers = bindings.filter(
+        (binding): binding is number => typeof binding === "number",
+      );
+      const wanted = bindings.find(
+        (binding): binding is string => typeof binding === "string",
+      );
+      let found: Record<string, unknown>[] = [];
+      if (/sqlite_master/i.test(text)) found = [{ name: "pi_submissions" }];
+      else if (/FROM pi_submissions/i.test(text)) {
+        if (wanted !== undefined && /json_extract/i.test(text))
+          found = submissionRows.some(
+            (row) => recordRequestId(row) === wanted,
+          )
+            ? [{ held: 1 }]
+            : [];
+        else if (wanted !== undefined)
+          found = submissionRows.filter(
+            (row) => recordRequestId(row) === indexed(wanted),
+          );
+        else if (numbers.length === 0) found = submissionRows;
+        else found = numbers.flatMap((id) => rows(submissionsById, id));
+      } else if (/FROM pi_entries/i.test(text)) {
+        found = numbers.flatMap((id) => rows(entriesById, id));
+      }
+      return { toArray: () => found };
+    },
+  };
+}
+
 /**
  * A session boundary whose only real behaviour is `/thread-stream`: the turn
- * facts `state()` reports, one watch per connection, and the durable
- * transcript are scripted by the check.
+ * facts `state()` reports, one watch per connection, the engine's own SQLite
+ * tables and the durable transcript are scripted by the check.
  */
 function boundarySession(
   Session: { prototype: object },
@@ -814,14 +985,23 @@ function boundarySession(
     readonly pending: () => readonly PendingOperation[];
     readonly connect: () => WatchDouble;
     readonly transcript: () => readonly ThreadEntry[];
+    /** The engine's persisted submissions and entries, when the path reads them. */
+    readonly sql?: EngineSql;
   },
 ): BoundarySession {
   return Object.assign(Object.create(Session.prototype), {
-    ctx: { storage: { get: async () => undefined } },
+    ctx: {
+      storage: { get: async () => undefined, sql: script.sql ?? engineTables([]) },
+    },
     options: { modelAlias: "alias" },
     harness: {
       pending: async () => script.pending(),
-      session: () => ({ id: "1", events: async () => script.connect() }),
+      session: () => ({
+        id: "1",
+        events: async () => script.connect(),
+        busy: async () =>
+          script.pending().some((operation) => operation.status === "running"),
+      }),
     },
     transcript: async () => script.transcript(),
   }) as BoundarySession;
@@ -961,6 +1141,11 @@ describe("thread stream master turn state", () => {
       pending: () => pending,
       connect: () => connection.watch,
       transcript: () => committed,
+      // The run start below names submission 1, which the engine's records
+      // bind to the operation id the header must report.
+      sql: engineTables([
+        { id: 1, operationId: "op-run", text: "Ask for the run." },
+      ]),
     });
 
     // Attach while the object is idle: this connection's own master frame has
@@ -1035,6 +1220,11 @@ describe("thread stream master turn state", () => {
       pending: () => pending,
       connect: () => connection.watch,
       transcript: () => committed,
+      // The snapshot's run input is the submission the engine bound to this
+      // connection's running operation.
+      sql: engineTables([
+        { id: 1, operationId: "op-reconnect", text: "Ask for the reconnect." },
+      ]),
     });
 
     const thread = await openThread(session);
@@ -1064,6 +1254,360 @@ describe("thread stream master turn state", () => {
       },
       issues,
     );
+    expect(issues).toEqual([]);
+  });
+});
+
+/** Text only a turn that had already ended could have written. */
+const STALE_TEXT = "Stale turn text that must never reach the board.";
+/** Text the turn that is actually running writes. */
+const CURRENT_TEXT = "Current turn text that must reach the board.";
+/** A later chunk of the running turn's own message. */
+const CURRENT_TAIL = " And its next sentence.";
+
+/**
+ * A stale turn's text must never ride under the header of the turn that is
+ * actually running. The attachment's `master` is the connection's first frame,
+ * so this also covers a snapshot preview that follows it.
+ */
+function inspectNoStaleTurn(
+  frames: readonly Frame[],
+  stale: string,
+  running: string,
+  label: string,
+  issues: string[],
+): void {
+  const header = frames.findIndex(
+    (frame) =>
+      frame.event === "master" &&
+      isWorking(frameBody(frame)) &&
+      turnMessage(frameBody(frame)) === running,
+  );
+  const from = header < 0 ? 0 : header;
+  for (const [index, frame] of frames.entries()) {
+    if (index <= from || frame.event !== "preview") continue;
+    const text = previewText(frame);
+    if (text !== null && text.includes(stale))
+      issues.push(
+        `${label} the stale turn was previewed under ${running}: ${JSON.stringify(text)}`,
+      );
+  }
+}
+
+describe("thread stream stale turn", () => {
+  it("never previews a stale snapshot's turn under the run that is actually running", async () => {
+    // The import has to be dynamic: a static one is hoisted above the
+    // `cloudflare:workers` mock and fails to resolve under `bun test`.
+    const { HostedSession } = await import("../src/hosted-session.ts");
+
+    // The watch captured turn A's in-flight message, but the connection reads
+    // its header after A ended, when turn B is the one running. `run.inputs`
+    // are submission ids; the engine's own records map them to operation ids.
+    const pending: PendingOperation[] = [
+      { operationId: "op-b", status: "running" },
+    ];
+    const committed: ThreadEntry[] = [];
+    const connection = watchDouble({
+      ...idleSnapshot(),
+      run: { inputs: [11] },
+      generation: {
+        attempt: 1,
+        message: assistant([{ type: "text", text: STALE_TEXT }]),
+      },
+    });
+    const session = boundarySession(HostedSession, {
+      pending: () => pending,
+      connect: () => connection.watch,
+      transcript: () => committed,
+      sql: engineTables([
+        { id: 11, operationId: "op-a", text: "Ask for the stale run." },
+        { id: 12, operationId: "op-b", text: "Ask for the current run." },
+      ]),
+    });
+
+    const thread = await openThread(session);
+
+    // Turn B's run start and its own message arrive afterwards.
+    await connection.send([{ type: "run_start", inputs: [12] }]);
+    await connection.send([
+      {
+        type: "message_start",
+        message: assistant([{ type: "text", text: CURRENT_TEXT }]),
+      },
+    ]);
+
+    const record = committedAssistant(CURRENT_TEXT);
+    committed.push({
+      seq: 1,
+      role: "assistant",
+      kind: "message",
+      text: CURRENT_TEXT,
+    });
+    await connection.send([
+      { type: "message_end", entry: record },
+      { type: "entry_appended", entry: record },
+      { type: "turn_end" },
+    ]);
+    pending.length = 0;
+    await connection.send([{ type: "run_end", inputs: [] }]);
+    connection.retire();
+
+    const frames = await thread.frames();
+    const issues: string[] = [];
+    inspectTurnState(
+      frames,
+      {
+        attachedWhile: "working",
+        running: "op-b",
+        prose: CURRENT_TEXT,
+        finalText: CURRENT_TEXT,
+        label: "[stale snapshot]",
+      },
+      issues,
+    );
+    inspectNoStaleTurn(frames, STALE_TEXT, "op-b", "[stale snapshot]", issues);
+    expect(issues).toEqual([]);
+  });
+
+  it("never previews a buffered batch of a run the header has already moved past", async () => {
+    const { HostedSession } = await import("../src/hosted-session.ts");
+
+    const pending: PendingOperation[] = [
+      { operationId: "op-b", status: "running" },
+    ];
+    const committed: ThreadEntry[] = [];
+    // The watch attached during turn A and the engine buffered A's remaining
+    // commit. By the time that batch reaches the listener the header already
+    // reports turn B, so the batch is stale on arrival.
+    const connection = watchDouble(
+      { ...idleSnapshot(), run: { inputs: [11] } },
+      [
+        [
+          {
+            type: "message_start",
+            message: assistant([{ type: "text", text: "" }]),
+          },
+          update(
+            { type: "text_start", contentIndex: 0, block: textBlock("") },
+            { type: "text_delta", contentIndex: 0, delta: STALE_TEXT },
+          ),
+        ],
+      ],
+    );
+    const session = boundarySession(HostedSession, {
+      pending: () => pending,
+      connect: () => connection.watch,
+      transcript: () => committed,
+      sql: engineTables([
+        { id: 11, operationId: "op-a", text: "Ask for the stale run." },
+        { id: 12, operationId: "op-b", text: "Ask for the current run." },
+      ]),
+    });
+
+    const thread = await openThread(session);
+
+    // Turn B's own events follow the stale batch and must still preview.
+    await connection.send([{ type: "run_start", inputs: [12] }]);
+    await connection.send([
+      {
+        type: "message_start",
+        message: assistant([{ type: "text", text: CURRENT_TEXT }]),
+      },
+    ]);
+
+    const record = committedAssistant(CURRENT_TEXT);
+    committed.push({
+      seq: 1,
+      role: "assistant",
+      kind: "message",
+      text: CURRENT_TEXT,
+    });
+    await connection.send([
+      { type: "message_end", entry: record },
+      { type: "entry_appended", entry: record },
+      { type: "turn_end" },
+    ]);
+    pending.length = 0;
+    await connection.send([{ type: "run_end", inputs: [] }]);
+    connection.retire();
+
+    const frames = await thread.frames();
+    const issues: string[] = [];
+    inspectTurnState(
+      frames,
+      {
+        attachedWhile: "working",
+        running: "op-b",
+        prose: CURRENT_TEXT,
+        finalText: CURRENT_TEXT,
+        label: "[stale batch]",
+      },
+      issues,
+    );
+    inspectNoStaleTurn(frames, STALE_TEXT, "op-b", "[stale batch]", issues);
+    expect(issues).toEqual([]);
+  });
+
+  it("keeps the running turn's preview when an older turn's commit lands in the same batch", async () => {
+    const { HostedSession } = await import("../src/hosted-session.ts");
+
+    const pending: PendingOperation[] = [
+      { operationId: "op-b", status: "running" },
+    ];
+    const committed: ThreadEntry[] = [];
+    // The connection attached during B's run; the engine then publishes one
+    // batch in its resulting-view order: B's current message first, the entry
+    // the earlier turn A committed, A's run end, and B's run start.
+    const connection = watchDouble({
+      ...idleSnapshot(),
+      run: { inputs: [12] },
+      generation: {
+        attempt: 1,
+        message: assistant([{ type: "text", text: CURRENT_TEXT }]),
+      },
+    });
+    const session = boundarySession(HostedSession, {
+      pending: () => pending,
+      connect: () => connection.watch,
+      transcript: () => committed,
+      sql: engineTables([
+        { id: 11, operationId: "op-a", text: "Ask for the stale run." },
+        { id: 12, operationId: "op-b", text: "Ask for the current run." },
+      ]),
+    });
+
+    const thread = await openThread(session);
+
+    const staleEntry = {
+      id: 1,
+      conversationId: 1,
+      kind: "pi.assistant",
+      model: [assistant([{ type: "text", text: STALE_TEXT }])],
+    };
+    committed.push({
+      seq: 1,
+      role: "assistant",
+      kind: "message",
+      text: STALE_TEXT,
+    });
+    await connection.send([
+      {
+        type: "message_start",
+        message: assistant([{ type: "text", text: CURRENT_TEXT }]),
+      },
+      { type: "message_end", entry: staleEntry },
+      { type: "run_end", inputs: [11] },
+      { type: "run_start", inputs: [12] },
+    ]);
+
+    // B keeps writing into the message it already had in flight.
+    await connection.send([
+      update({ type: "text_delta", contentIndex: 0, delta: CURRENT_TAIL }),
+    ]);
+
+    const extended = `${CURRENT_TEXT}${CURRENT_TAIL}`;
+    const current = committedAssistant(extended);
+    committed.push({
+      seq: 2,
+      role: "assistant",
+      kind: "message",
+      text: extended,
+    });
+    await connection.send([
+      { type: "message_end", entry: current },
+      { type: "entry_appended", entry: current },
+      { type: "turn_end" },
+    ]);
+    pending.length = 0;
+    await connection.send([{ type: "run_end", inputs: [] }]);
+    connection.retire();
+
+    const frames = await thread.frames();
+    const issues: string[] = [];
+
+    // The header is the turn that is running, and it names it.
+    const header = frames.findIndex(
+      (frame) =>
+        frame.event === "master" &&
+        isWorking(frameBody(frame)) &&
+        turnMessage(frameBody(frame)) === "op-b",
+    );
+    if (header < 0)
+      issues.push("[older commit] the running turn was not reported");
+
+    const previews = frames.flatMap((frame, index) => {
+      if (frame.event !== "preview") return [];
+      return [{ index, text: previewText(frame) }];
+    });
+    const firstCurrent = previews.find(
+      (preview) => preview.text !== null && preview.text.includes(CURRENT_TEXT),
+    );
+    const extendedAt = previews.findIndex(
+      (preview) => preview.text === extended,
+    );
+    if (firstCurrent === undefined)
+      issues.push("[older commit] the running turn's text was never previewed");
+    if (extendedAt < 0)
+      issues.push(
+        `[older commit] the running turn's preview was not extended: ${JSON.stringify(
+          previews.map((preview) => preview.text),
+        )}`,
+      );
+    if (firstCurrent !== undefined && extendedAt >= 0) {
+      // The older commit must not retire the in-flight message: nothing may
+      // clear the running turn's preview between its first frame and its
+      // extension.
+      const until = previews[extendedAt]!.index;
+      for (const preview of previews) {
+        if (preview.index <= firstCurrent.index || preview.index >= until)
+          continue;
+        if (preview.text === null)
+          issues.push(
+            "[older commit] the older commit cleared the running turn's preview",
+          );
+      }
+    }
+    for (const preview of previews)
+      if (preview.text !== null && preview.text.includes(STALE_TEXT))
+        issues.push(
+          `[older commit] the committed older turn leaked into the preview: ${JSON.stringify(preview.text)}`,
+        );
+
+    // The older entry stays durable history, and the last entry is the running
+    // turn's, so the older commit cannot stand in for it.
+    const entries = frames.flatMap((frame) =>
+      frame.event === "entry"
+        ? [{ id: frame.id, text: entryText(frame) }]
+        : [],
+    );
+    if (!entries.some((entry) => entry.id === "1" && entry.text === STALE_TEXT))
+      issues.push("[older commit] the older turn's committed entry was lost");
+    const lastEntry = entries[entries.length - 1];
+    if (
+      lastEntry === undefined ||
+      lastEntry.id !== "2" ||
+      lastEntry.text !== extended
+    )
+      issues.push(
+        "[older commit] the older commit overwrote the running turn's entry",
+      );
+
+    const lastMaster = frames.reduce(
+      (found, frame, index) => (frame.event === "master" ? index : found),
+      -1,
+    );
+    if (extendedAt >= 0) {
+      if (lastMaster <= previews[extendedAt]!.index)
+        issues.push("[older commit] the settled turn was never reported");
+      else if (frameBody(frames[lastMaster]!).turn !== null)
+        issues.push("[older commit] the turn never returned to idle");
+      for (const frame of frames.slice(lastMaster + 1))
+        if (frame.event === "preview" && previewText(frame) !== null)
+          issues.push(
+            "[older commit] a preview survived the settled turn",
+          );
+    }
+
     expect(issues).toEqual([]);
   });
 });
