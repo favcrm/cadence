@@ -131,6 +131,7 @@ var CALL_VERBS = [
 	"social.sources.get",
 	"social.sources.save",
 	"social.destinations.list",
+	"publish.consent.status",
 	"publish.destination.use",
 	"publish.destination.remove",
 	"publish.settings.save",
@@ -147,6 +148,7 @@ var SLOT_VERBS = [
 	"run.start",
 	"publish.draft.confirm",
 	"publish.draft.schedule",
+	"publish.consent.allow",
 	"media.original.download",
 	"social.image.pick"
 ];
@@ -879,7 +881,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 //#region scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
-var CONTRACT = "app-screen-projection-fixtures/9";
+var CONTRACT = "app-screen-projection-fixtures/10";
 var NOW = 1799999e3;
 var SCENARIOS = [
 	"empty",
