@@ -1,7 +1,7 @@
 //! Proven-operator connection management; no agent grants or offline fallback.
 use super::*;
 
-fn validate_connection_id(value: &str) -> Result<&str> {
+pub(super) fn validate_connection_id(value: &str) -> Result<&str> {
     if value.is_empty()
         || value.len() > 128
         || !value

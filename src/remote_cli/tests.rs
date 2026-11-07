@@ -4713,6 +4713,131 @@ fn hosted_platform_in_progress_replay_preserves_same_key_reconciliation() {
 }
 
 #[test]
+fn hosted_connected_read_in_progress_is_an_unknown_outcome() {
+    let args = json!({
+        "operation": "connected_read",
+        "tool": "search_console_report",
+        "connectionId": "con_synthetic",
+        "body": {"site_url": "sc-domain:example.test"},
+        "key": "synthetic-connected-read-1"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    let body = json!({"ok": false, "error": {"code": "idempotency_in_progress"}});
+    let (listener, requests, _server) = fake_worker(vec![(409, "", body)]);
+    let target = target(&listener);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    store_credential(&dir, &target.endpoint);
+
+    let err = call_verb_in(
+        &target,
+        "platform_call",
+        args,
+        10,
+        &dir,
+        |_| {},
+        |_| panic!("an in-progress read must not be automatically retried"),
+    )
+    .expect_err("an in-progress read has no final receipt");
+    assert_eq!(err.kind(), "unknown", "{err}");
+    assert!(err.to_string().contains("platform status"), "{err}");
+    assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn hosted_connected_read_without_a_receipt_is_an_unknown_outcome() {
+    let args = json!({
+        "operation": "connected_read",
+        "tool": "search_console_report",
+        "connectionId": "con_synthetic",
+        "body": {"site_url": "sc-domain:example.test"},
+        "key": "synthetic-connected-read-2"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    for body in [
+        json!({"ok": true}),
+        json!({"ok": true, "data": {}}),
+        json!({"ok": true, "data": {"repeated": true, "result": null}}),
+        json!({"ok": true, "data": {"repeated": true, "result": {"rows": []}}}),
+        json!({"ok": true, "data": {
+            "repeated": true, "result": {"rows": []}, "effect": "read",
+            "price": {"currency": "USD", "scale": 6, "amount": "invalid"}
+        }}),
+    ] {
+        let (listener, requests, _server) = fake_worker(vec![(200, "", body)]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+
+        let err = call_verb_in(
+            &target,
+            "platform_call",
+            args.clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("a missing receipt must not be automatically retried"),
+        )
+        .expect_err("a missing receipt does not prove the read failed");
+        assert_eq!(err.kind(), "unknown", "{err}");
+        assert!(err.to_string().contains("platform status"), "{err}");
+        assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+    }
+}
+
+#[test]
+fn hosted_connected_read_accepts_a_complete_settled_receipt_and_replay() {
+    let args = json!({
+        "operation": "connected_read",
+        "tool": "search_console_report",
+        "connectionId": "con_synthetic",
+        "body": {"site_url": "sc-domain:example.test"},
+        "key": "synthetic-connected-read-3"
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    for repeated in [false, true] {
+        let receipt = json!({"ok": true, "data": {
+            "repeated": repeated,
+            "result": {"rows": []},
+            "effect": "read",
+            "price": {"currency": "USD", "scale": 6, "amount": "0.000025"}
+        }});
+        let (listener, requests, _server) = fake_worker(vec![(200, "", receipt.clone())]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let answer = call_verb_in(
+            &target,
+            "platform_call",
+            args.clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| panic!("a settled read must not be automatically retried"),
+        )
+        .expect("a complete settled receipt is accepted");
+        assert!(matches!(answer, RemoteAnswer::Ok(body) if body == receipt));
+        assert_eq!(hits(&requests.lock().unwrap(), "/__platform/cli/call"), 1);
+    }
+}
+
+#[test]
 fn hosted_platform_catalog_in_progress_reply_remains_a_read_refusal() {
     let args = json!({"operation": "tools"}).as_object().cloned().unwrap();
     let body = json!({

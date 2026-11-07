@@ -415,8 +415,9 @@ returns not found; an unavailable catalog is reported as unavailable rather
 than as an empty list. Hosted calls refuse `--platform`, `--account` and
 `--project` instead of silently changing the selected workspace.
 
-The CLI derives a replay key (`pcli_<sha256>`) from the tool, `--query` and
-`--input`, or accepts an explicit `--request <handle>`. If a call fails with a
+The CLI derives a replay key (`pcli_<sha256>`) from the tool, `--query`,
+`--input` and, for a connected read, `--connection`, or accepts an explicit
+`--request <handle>`. If a call fails with a
 timeout, 5xx or uncertain outcome, inspect its recorded state read-only before
 retrying:
 
@@ -435,6 +436,20 @@ by itself prove that no upstream work occurred if a fault prevented
 persistence, and **replaying `platform call` will start and charge a new call
 when the original request was not recorded**. To deliberately run the same
 input again after a recorded call, pass a fresh `--request <handle>`.
+
+When the workspace has a qualified Search Console tool and an existing
+connection, a read names that connection explicitly. The same connection and
+input are needed to derive and verify its status:
+
+```sh
+REPORT='{"site_url":"sc-domain:example.test","start_date":"2026-01-01","end_date":"2026-01-31","dimensions":["query"]}'
+cadence --org acme platform call search_console_report --connection con_example --input "$REPORT"
+cadence --org acme platform status --tool search_console_report --connection con_example --input "$REPORT"
+```
+
+The read uses the workspace balance; `--max-charge` belongs to the separate
+local device protocol. A connection does not select a Search Console property:
+enrollment and verified property selection are not yet provided by this CLI.
 
 An image submission may return a queued job. Poll its returned `data.job.id`
 with the same workspace and `cli.write` grant, then download a succeeded job's

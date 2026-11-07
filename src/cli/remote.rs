@@ -1048,26 +1048,20 @@ fn verb_for(
                             "a hosted workspace resolves its own project",
                         ));
                     }
-                    // CAD-1974: the connected-read door is the local
-                    // `agenticos-provider` adapter. The hosted board has no
-                    // route for it in this build, so the flags refuse here
-                    // rather than being dropped from a call that then reads
-                    // the wrong account.
-                    if connection.is_some() {
-                        return Err(unsupported(
-                            "platform call",
-                            "--connection",
-                            "a hosted workspace has no connected-read door in this build; \
-                             run the read against the local agenticos-provider account",
-                        ));
-                    }
                     if max_charge.is_some() {
                         return Err(unsupported(
                             "platform call",
                             "--max-charge",
-                            "a hosted workspace has no connected-read door in this build; \
-                             run the read against the local agenticos-provider account",
+                            "a hosted workspace funds calls from its own balance",
                         ));
+                    }
+                    if let Some(id) = connection {
+                        super::connection::validate_connection_id(id).map_err(|_| {
+                            Error::invalid(
+                                "platform_call",
+                                "connection must be 1-128 of A-Z a-z 0-9 _ -",
+                            )
+                        })?;
                     }
                     if !valid_platform_tool_slug(tool) {
                         return Err(Error::invalid(
@@ -1088,6 +1082,11 @@ fn verb_for(
                             "platform call needs --input or, on a hosted org, --query",
                         ));
                     }
+                    if connection.is_some() && (body.is_none() || query.is_some()) {
+                        return Err(Error::usage(
+                            "a hosted connected read takes --input and no --query",
+                        ));
+                    }
                     // The handle names the retry: an identical call replays the
                     // door's recorded outcome instead of charging again, so a
                     // second intentional run needs a fresh --request.
@@ -1101,11 +1100,26 @@ fn verb_for(
                             }
                             request.clone()
                         }
-                        None => platform_replay_key(tool, query.as_ref(), body.as_ref()),
+                        None => platform_replay_key(
+                            tool,
+                            query.as_ref(),
+                            body.as_ref(),
+                            connection.as_deref(),
+                        ),
                     };
-                    args.insert("operation".into(), json!("call"));
+                    args.insert(
+                        "operation".into(),
+                        json!(if connection.is_some() {
+                            "connected_read"
+                        } else {
+                            "call"
+                        }),
+                    );
                     args.insert("tool".into(), json!(tool));
                     args.insert("key".into(), json!(key));
+                    if let Some(connection) = connection {
+                        args.insert("connectionId".into(), json!(connection));
+                    }
                     if let Some(body) = body {
                         args.insert("body".into(), body);
                     }
@@ -1119,6 +1133,7 @@ fn verb_for(
                     tool,
                     input,
                     query,
+                    connection,
                 } => {
                     let body = match input {
                         Some(input) => Some(super::platform::parse_platform_input(input)?),
@@ -1132,6 +1147,19 @@ fn verb_for(
                         return Err(Error::usage(
                             "platform status with --input or --query requires --tool <tool>",
                         ));
+                    }
+                    if let Some(id) = connection {
+                        super::connection::validate_connection_id(id).map_err(|_| {
+                            Error::invalid(
+                                "platform_status",
+                                "connection must be 1-128 of A-Z a-z 0-9 _ -",
+                            )
+                        })?;
+                        if tool.is_none() || body.is_none() || query.is_some() || job.is_some() {
+                            return Err(Error::usage(
+                                "connected-read status takes --connection with --tool and --input, and no --query or --job",
+                            ));
+                        }
                     }
                     let key = match request {
                         Some(request) => {
@@ -1153,6 +1181,7 @@ fn verb_for(
                                 tool.as_deref().unwrap_or_default(),
                                 query.as_ref(),
                                 body.as_ref(),
+                                connection.as_deref(),
                             ))
                         }
                         None => None,
@@ -1189,6 +1218,9 @@ fn verb_for(
                     }
                     if let Some(query) = query {
                         args.insert("query".into(), query);
+                    }
+                    if let Some(connection) = connection {
+                        args.insert("connectionId".into(), json!(connection));
                     }
                 }
                 PlatformAction::Artifact { reference, .. } => {
@@ -1257,12 +1289,19 @@ fn valid_platform_tool_slug(value: &str) -> bool {
 /// from the tool and its input means a resubmitted identical call reads the
 /// door's recorded outcome instead of charging a second time, while a
 /// different input is a different call.
-fn platform_replay_key(tool: &str, query: Option<&Value>, body: Option<&Value>) -> String {
+fn platform_replay_key(
+    tool: &str,
+    query: Option<&Value>,
+    body: Option<&Value>,
+    connection: Option<&str>,
+) -> String {
     use sha2::{Digest, Sha256};
     #[derive(serde::Serialize)]
     struct Material<'a> {
         // The field order preserves the existing BTreeMap serialization.
         body: Option<&'a Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        connection: Option<&'a str>,
         query: Option<&'a Value>,
         tool: &'a str,
     }
@@ -1277,8 +1316,16 @@ fn platform_replay_key(tool: &str, query: Option<&Value>, body: Option<&Value>) 
         }
     }
     let mut writer = HashWriter(Sha256::new());
-    serde_json::to_writer(&mut writer, &Material { body, query, tool })
-        .expect("JSON values serialize to the hash writer");
+    serde_json::to_writer(
+        &mut writer,
+        &Material {
+            body,
+            connection,
+            query,
+            tool,
+        },
+    )
+    .expect("JSON values serialize to the hash writer");
     format!("pcli_{:x}", writer.0.finalize())
 }
 
@@ -3754,6 +3801,62 @@ mod read_contract_tests {
     }
 
     #[test]
+    fn hosted_connected_read_retry_key_binds_the_connection() {
+        let call = |connection: &str| {
+            platform(PlatformAction::Call {
+                tool: "search_console_report".into(),
+                input: Some(r#"{"site_url":"sc-domain:example.test"}"#.into()),
+                query: None,
+                request: None,
+                platform: None,
+                account: None,
+                project: None,
+                connection: Some(connection.into()),
+                max_charge: None,
+            })
+        };
+        let (_, first) = outcome(&call("con_first")).expect("hosted read should be accepted");
+        let (_, repeat) = outcome(&call("con_first")).expect("identical read should be accepted");
+        let (_, different) = outcome(&call("con_second")).expect("other connection is distinct");
+        assert!(valid_platform_handle(first["key"].as_str().unwrap()));
+        assert_eq!(first["key"], repeat["key"]);
+        assert_ne!(first["key"], different["key"]);
+    }
+
+    #[test]
+    fn hosted_connected_read_status_uses_the_same_connection_bound_key() {
+        let input = r#"{"site_url":"sc-domain:example.test"}"#;
+        let call = platform(PlatformAction::Call {
+            tool: "search_console_report".into(),
+            input: Some(input.into()),
+            query: None,
+            request: None,
+            platform: None,
+            account: None,
+            project: None,
+            connection: Some("con_first".into()),
+            max_charge: None,
+        });
+        let (_, call_args) = outcome(&call).unwrap();
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "platform",
+            "status",
+            "--tool",
+            "search_console_report",
+            "--connection",
+            "con_first",
+            "--input",
+            input,
+        ])
+        .expect("status accepts the connection needed to identify the read");
+        let (_, status_args) = outcome(&cli.command).unwrap();
+        assert_eq!(status_args["key"], call_args["key"]);
+        assert_eq!(status_args["connectionId"], "con_first");
+        assert_eq!(status_args["body"], call_args["body"]);
+    }
+
+    #[test]
     fn hosted_platform_replay_key_is_stable_and_input_bound() {
         let (_, args) = outcome(&call_with(
             "generate_image",
@@ -5247,6 +5350,7 @@ mod read_contract_tests {
             tool: tool.map(str::to_string),
             input: input.map(str::to_string),
             query: query.map(str::to_string),
+            connection: None,
         })
     }
 

@@ -5362,6 +5362,22 @@ fn call_verb_until_retry(
                         effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                     )));
                 }
+                Some("connected_read")
+                    if !body.as_ref().is_some_and(|answer| {
+                        crate::platform::agenticos_provider::valid_connected_read_receipt(answer)
+                            && answer.pointer("/data/effect").and_then(Value::as_str)
+                                == Some("read")
+                            && answer.pointer("/data/price").is_some()
+                            && answer
+                                .pointer("/data/result")
+                                .is_some_and(|result| !result.is_null())
+                    }) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote connected read returned no usable settled receipt — {}",
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                    )));
+                }
                 Some("status")
                     if !body.as_ref().is_some_and(|answer| {
                         answer.get("ok").and_then(Value::as_bool) == Some(true)
@@ -5547,17 +5563,18 @@ fn call_verb_until_retry(
             && post_forward_failure(status, body.as_ref(), matches!(surface, Surface::Cli));
         // A funded platform call may still be in progress or uncertain on
         // a same-key replay; preserve its dedicated reconciliation guidance.
-        let platform_outcome_unknown = platform_operation == Some("call")
-            && !board_gate_refused(body.as_ref())
-            && !tracker_unavailable_before_verb(status, body.as_ref())
-            && ((status == 409
-                && matches!(
-                    refusal_code.as_deref(),
-                    Some("uncertain" | "idempotency_in_progress")
-                ))
-                || (status >= 500
-                    && status != 501
-                    && body.as_ref().and_then(|b| b["state"].as_str()).is_none()));
+        let platform_outcome_unknown =
+            matches!(platform_operation, Some("call" | "connected_read"))
+                && !board_gate_refused(body.as_ref())
+                && !tracker_unavailable_before_verb(status, body.as_ref())
+                && ((status == 409
+                    && matches!(
+                        refusal_code.as_deref(),
+                        Some("uncertain" | "idempotency_in_progress")
+                    ))
+                    || (status >= 500
+                        && status != 501
+                        && body.as_ref().and_then(|b| b["state"].as_str()).is_none()));
         let unknown_correlation = refusal_correlation(body.as_ref());
         // CAD-2101: a board without the profile verbs answers 501; say to
         // update it, not that coordination is unavailable.
@@ -5623,6 +5640,16 @@ fn call_verb_until_retry(
                     return Err(reject(why));
                 }
             }
+        }
+        if platform_operation == Some("connected_read")
+            && status == 400
+            && refusal_code.as_deref() == Some("invalid_request")
+        {
+            return Err(Error::invalid(
+                "invalid_request",
+                "the connected read was refused: check the input and connection, or update \
+                 the hosted tenant server if it predates connected-read support",
+            ));
         }
         if matches!(platform_operation, Some("status" | "artifact"))
             && (status == 501
