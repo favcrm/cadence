@@ -17,6 +17,7 @@ import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import { ThreadPermission } from "./PermissionCard";
 import { isArtifactPutCall, isCardItem, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
 import { carriesSecret } from "../app-shell/chat/directive";
+import { useConversationPreview } from "../app-shell/chat/conversationPreview";
 
 /**
  * The one renderer for master-thread entries (CAD-1029). Home renders at
@@ -881,10 +882,19 @@ export function ThreadTurn({
   head = true,
   continued = false,
   copy = true,
+  previewConversation = null,
+  previewTransform,
 }: {
   items: ThreadItem[];
   running?: boolean;
   density?: Density;
+  /** The conversation whose live preview text this turn may paint, when the
+   *  host has one. Absent (an app that never sends previews) changes nothing. */
+  previewConversation?: string | null;
+  /** Presentation rewrite for the live preview, exactly what this surface
+   *  already applies to committed text (an app pane's id redaction). Home
+   *  passes nothing and paints the server's text unchanged. */
+  previewTransform?: (text: string) => string;
   /** Only a transcript with no `turn_result` anywhere may treat its last
    *  worker note as an older answer; a new transcript's intermediate note
    *  must stay in the trace. */
@@ -919,6 +929,12 @@ export function ThreadTurn({
   // Streaming is a turn the host says is running AND that has no answer yet:
   // a turn whose answer already landed keeps its finished look.
   const streaming = running && shown === null;
+  // The assistant's actual in-flight words (CAD-2228), replaced frame by
+  // frame. It paints only while this turn is still generating and has no
+  // committed answer, and it is never presented as a stored reply.
+  const preview = useConversationPreview(previewConversation, streaming);
+  const previewText =
+    preview === null || previewTransform === undefined ? preview : previewTransform(preview);
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,
@@ -952,6 +968,20 @@ export function ThreadTurn({
           failed={shown != null && turnFailure(shown.entry, t) !== null}
           answered={shown != null}
         />
+      )}
+      {/* Its name row and trace say the turn is live; this is the only
+          place its own words appear before the committed answer replaces
+          them. No timestamp, no copy, no stored row. */}
+      {previewText !== null && previewText.trim() !== "" && (
+        <div
+          className={`min-w-0 max-w-[40rem] mt-1 whitespace-pre-wrap break-words text-ink-200 ${
+            density === "compact" ? "text-secondary" : "text-body"
+          }`}
+          data-kind="preview"
+          aria-live="off"
+        >
+          {previewText}
+        </div>
       )}
       {/* Dots, then the current step. Under the trace once steps exist,
           so the disclosure names the turn and the bubble names what is

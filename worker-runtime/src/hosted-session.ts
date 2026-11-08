@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
+  type AgentEvent,
   type Cursor,
   createRegistry,
   Harness,
@@ -68,6 +69,7 @@ import {
   runtimeHealthSkills,
   runtimeProfile,
 } from "./profile.ts";
+import { ThreadPreview } from "./preview.ts";
 import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
@@ -78,6 +80,70 @@ import { projectedThreadEntries, readAllRecords } from "./transcript.ts";
  * Absent until the first call resolves the platform default.
  */
 const RESOLVED_MODEL_KEY = "tenant_resolved_model";
+
+/**
+ * What one engine batch can change for the board's thread stream.
+ *
+ * The engine's batches only say that something changed, so the stream decides
+ * what to re-project from its durable records. Most batches are partial text:
+ * `message_start`, `message_update` (text, thinking or tool-argument deltas),
+ * retries, deferred polls, tool progress, usage and agent-document changes.
+ * Those change neither the header's turn facts nor the committed transcript, so
+ * a token must never cost a full transcript read per reader. The commits below
+ * do change one of them.
+ *
+ * `snapshot` is the engine's overflow replacement, so it can replace both. The
+ * entry-producing events — `message_end`, `entry_appended`, and a
+ * `tool_execution_end` that carries the result entry — reconcile the
+ * transcript, and so do the ends of a run and of a turn: a connection settles
+ * whatever its cursor has not caught up with at the boundary of the work that
+ * produced it, even when the entry's own event was not observable. `run_start`,
+ * `run_end`, `submission` and `inbox_update` change which operations are
+ * running or queued, and a failed generation can park a turn the run did not
+ * end; a queued input has no transcript entry until it is placed.
+ */
+function engineBatchChanges(events: readonly AgentEvent[]): {
+  readonly master: boolean;
+  readonly entries: boolean;
+} {
+  let master = false;
+  let entries = false;
+  for (const event of events) {
+    switch (event.type) {
+      case "snapshot":
+        master = true;
+        entries = true;
+        break;
+      case "run_start":
+      case "submission":
+      case "inbox_update":
+        master = true;
+        break;
+      case "run_end":
+        // The run's inputs settled: its header facts changed and the entries
+        // committed with that settlement are the final ones for the run.
+        master = true;
+        entries = true;
+        break;
+      case "turn_end":
+        entries = true;
+        break;
+      case "message_end":
+      case "entry_appended":
+        entries = true;
+        break;
+      case "tool_execution_end":
+        if (event.entry !== undefined) entries = true;
+        break;
+      case "task_failed":
+        if (event.kind === "pi.generation") master = true;
+        break;
+      default:
+        break;
+    }
+  }
+  return { master, entries };
+}
 
 /**
  * One agent conversation, one Durable Object.
@@ -239,8 +305,11 @@ export class HostedSession<
     // The board's own thread stream: one `entry` frame per stored message,
     // `id:` the entry's `seq` so the client's `?after=` resume skips what it
     // already has. The engine's batches say "something changed", not "which
-    // entry"; the transcript is the authority, so a batch re-reads it and
-    // emits whatever is past `last`.
+    // entry"; the transcript is the authority, so a batch that can have
+    // committed or replaced entries re-reads it and emits whatever is past
+    // `last`. A partial-text batch reads nothing. The `master` frame is
+    // likewise re-sent when a batch changes the turn or queue facts, before any
+    // of that batch's preview text.
     if (url.pathname === "/thread-stream") {
       // Raw thinking is an owner view; anything but an explicit owner reader
       // (set by the trusted HTTP adapter) gets none.
@@ -248,29 +317,25 @@ export class HostedSession<
       const requested = Number(url.searchParams.get("after") ?? "0");
       let last =
         Number.isSafeInteger(requested) && requested > 0 ? requested : 0;
+      // Attach the watch before reading anything else. The engine captures its
+      // snapshot and its registration for later commits atomically, so a run
+      // another participant starts while this connection is being set up is
+      // either already in the state read below or delivered as a batch: there
+      // is no window between a status read and the subscription in which a run
+      // starts unseen. A run that starts later is announced by the fresh
+      // `master` frame its batch sends before any of that run's preview text.
+      const stream = await this.harness.session().events();
       // Read the projection now, at this connection's snapshot. A reconnect
       // reads the host's store again, so a connection never pins an older
-      // revision/avatar/name over a newer committed edit; an unavailable or
-      // malformed projection fails the connection rather than serving a
-      // partial header.
-      let masterFrame: string;
-      try {
-        const master = this.options.threadContext
-          ? this.validatedThreadContext(await this.options.threadContext())
-          : null;
-        const status = await this.state();
-        // Serialize the actual composed payload once, before opening a watch
-        // or returning SSE 200. Metadata may contain non-JSON values, while
-        // reserved fields it cannot override must retain runtime precedence.
-        masterFrame = `event: master\ndata: ${JSON.stringify(
-          masterState(
-            status.model,
-            status,
-            master?.conversationId ?? null,
-            master?.metadata,
-          ),
-        )}\n\n`;
-      } catch {
+      // revision/avatar/name over a newer committed edit; an unavailable,
+      // malformed or unserializable projection fails the connection rather than
+      // serving a partial header. The projection validated here also composes
+      // every later `master` frame on this connection, so a refresh never
+      // reaches for unvalidated host metadata.
+      const master = await this.connectionMaster();
+      if (master === null) {
+        // The watch is this connection's now, so nothing else will stop it.
+        await stream.stop();
         return Response.json(
           {
             ok: false,
@@ -282,9 +347,13 @@ export class HostedSession<
           { status: 503 },
         );
       }
-      // Capture the watch before reading its snapshot so commits between the
-      // initial read and subscription are buffered, not silently missed.
-      const stream = await this.harness.session().events();
+      const pinned = master.context;
+      const masterFrame = master.frame;
+      // The watch snapshot can precede this independently read header. Never
+      // attach one run's partial to another run's current turn.
+      let masterOperation = master.operationId;
+      let previewOperation = this.previewOperation(stream.snapshot.run?.inputs);
+      let lastMasterFrame = masterFrame;
       // Read and project before SSE 200, so a failure refuses like the master
       // projection above rather than opening a body that errors and reconnects.
       // The engine's own snapshot is the active context, which numbers from 1
@@ -305,29 +374,123 @@ export class HostedSession<
           { status: 503 },
         );
       }
-      function emit(entry: ThreadEntry, send: (frame: string) => void): void {
-        if (entry.seq <= last) return;
-        send(
-          `id: ${entry.seq}\nevent: entry\ndata: ${JSON.stringify(entry)}\n\n`,
-        );
+      function emit(
+        entry: ThreadEntry,
+        send: (frame: string) => boolean,
+      ): boolean {
+        if (entry.seq <= last) return true;
+        if (
+          !send(
+            `id: ${entry.seq}\nevent: entry\ndata: ${JSON.stringify(entry)}\n\n`,
+          )
+        )
+          return false;
         last = entry.seq;
+        return true;
       }
+      const preview = new ThreadPreview();
       return sessionEventResponse(stream, {
-        snapshot: (send) => {
-          send(": connected\n\n");
+        snapshot: (send, sendPreview) => {
           // The board flips its link to `live` on a `master` frame and on
           // nothing else, so a stream that never sends one reads
           // "reconnecting" forever — the stale banner then never clears.
           // It reports this object's real turn state. A host projection
           // composes under those runtime fields and cannot replace them.
-          send(masterFrame);
-          for (const entry of snapshotEntries) emit(entry, send);
+          if (!send(": connected\n\n") || !send(masterFrame)) return;
+          for (const entry of snapshotEntries) if (!emit(entry, send)) break;
+          // The snapshot and registration are atomic with each other, but the
+          // header was read later. A queued successor may already be running.
+          // Only show a partial whose engine submission proves the same turn.
+          if (masterOperation !== null && previewOperation === masterOperation)
+            preview.applySnapshot(stream.snapshot);
+          sendPreview(preview.text);
         },
-        events: async (_events, send) => {
-          for (const entry of await this.transcript(thinking))
-            emit(entry, send);
+        events: async (events, send, sendPreview) => {
+          const changes = engineBatchChanges(events);
+          // A turn or queue transition is announced before any transient text
+          // of the same batch, so a viewer that connected while the
+          // conversation was idle never renders preview bytes under an idle
+          // header. The turn facts are re-read from the engine rather than
+          // inferred from the event, so a frame reports only what the durable
+          // records prove; a repeated payload is not sent again, which keeps a
+          // slow reader from accumulating identical header frames. A failing
+          // read is not swallowed: it rejects the listener, which ends the
+          // watch and the stream, so the browser clears its preview and
+          // reconnects instead of keeping stale turn controls.
+          if (changes.master) {
+            const next = await this.composedMasterFrame(pinned);
+            if (next.operationId !== masterOperation) {
+              // Clear before the new header so an old preview is never painted
+              // under its successor, even when the consumer renders each frame.
+              if (preview.text !== null) sendPreview(null);
+              preview.reset();
+              masterOperation = next.operationId;
+            }
+            if (next.frame !== lastMasterFrame) {
+              lastMasterFrame = next.frame;
+              if (!send(next.frame)) return;
+            }
+          }
+          // The engine reports run boundaries at the end of a commit batch.
+          // Its message changes describe the resulting view, so take the last
+          // boundary first; a replacement snapshot carries its own run.
+          let source = previewOperation;
+          for (const event of events) {
+            if (event.type === "snapshot")
+              source = this.previewOperation(event.run?.inputs);
+            else if (event.type === "run_start")
+              source = this.previewOperation(event.inputs);
+            else if (event.type === "run_end") source = null;
+          }
+          if (source !== previewOperation) {
+            if (preview.text !== null) sendPreview(null);
+            preview.reset();
+          }
+          previewOperation = source;
+          const before = preview.text;
+          // Pi reports the resulting partial before the retiring run's
+          // committed entries. On a same-commit run replacement, retire those
+          // entries first so they cannot erase the successor's new partial.
+          const replacing =
+            events.some((event) => event.type === "run_end") &&
+            events.some((event) => event.type === "run_start");
+          const retired = (event: AgentEvent) =>
+            event.type === "message_end" ||
+            (event.type === "task_failed" && event.kind === "pi.generation");
+          const projected = replacing
+            ? [...events.filter(retired), ...events.filter((event) => !retired(event))]
+            : events;
+          const batch =
+            masterOperation !== null && source === masterOperation
+              ? preview.apply(projected)
+              : { current: null, latest: null };
+          // A committed predecessor can share a batch with its successor's
+          // partial. The browser retires a preview on a terminal entry, so
+          // reconcile entries first and then announce the current partial,
+          // even when its text did not change in this batch.
+          if (changes.entries)
+            for (const entry of await this.transcript(thinking))
+              if (!emit(entry, send)) break;
+          let shown = before;
+          if (batch.current !== null) {
+            if (batch.current !== before || changes.entries) {
+              sendPreview(batch.current);
+              shown = batch.current;
+            }
+          } else if (
+            !changes.entries &&
+            before !== null &&
+            batch.latest !== null &&
+            batch.latest !== before
+          ) {
+            sendPreview(batch.latest);
+            shown = batch.latest;
+          }
+          // A committed answer replaces its transient text. Its clear follows
+          // the entry, while a successor's partial above stays visible.
+          if (batch.current === null && shown !== null) sendPreview(null);
         },
-      });
+      }, { overflow: "after-cursor" });
     }
 
     if (url.pathname !== "/events")
@@ -338,7 +501,9 @@ export class HostedSession<
         send(rawSessionFrame({ type: "snapshot", snapshot: stream.snapshot }));
       },
       events: async (events, send) => {
-        for (const event of events) send(rawSessionFrame(event));
+        // A bounded response ends once its queue passes the mark; stop
+        // producing rather than stringifying events no one will receive.
+        for (const event of events) if (!send(rawSessionFrame(event))) break;
       },
     });
   }
@@ -649,6 +814,77 @@ export class HostedSession<
     )
       throw new Error("The thread context is malformed.");
     return context;
+  }
+
+  /**
+   * This connection's first `master` frame and the validated host projection it
+   * composes under, or `null` when either cannot be produced.
+   *
+   * The projection is re-read here, once per connection, so a reconnect never
+   * pins an older revision/avatar/name over a newer committed edit. This
+   * connection serves one conversation, so later frames compose under the same
+   * validated projection. The engine state is read only after the watch this
+   * connection has attached, so an already-running turn is reported truthfully
+   * and no run can begin between that read and the subscription. An
+   * unavailable or malformed projection, an unserializable frame and a failed
+   * state read all return `null` and refuse the connection with `503` rather
+   * than serve a stale or partial header; the caller stops the watch it opened.
+   * After `200`, a failing read rejects the event listener, which ends the
+   * stream exactly like a failed transcript read.
+   */
+  private async connectionMaster(): Promise<{
+    readonly context: ThreadContext | null;
+    readonly frame: string;
+    readonly operationId: string | null;
+  } | null> {
+    try {
+      const context = this.options.threadContext
+        ? this.validatedThreadContext(await this.options.threadContext())
+        : null;
+      return { context, ...(await this.composedMasterFrame(context)) };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * One `master` frame: the engine's current turn and queue facts under the
+   * runtime's own fields, with the host projection this connection validated.
+   *
+   * The state is read for every frame, never derived from an event, so a frame
+   * reports only what the durable records prove. Metadata may contain non-JSON
+   * values, while reserved fields it cannot override retain runtime precedence;
+   * a callable root `toJSON` refuses the frame.
+   */
+  private async composedMasterFrame(
+    context: ThreadContext | null,
+  ): Promise<{ readonly frame: string; readonly operationId: string | null }> {
+    const status = await this.state();
+    return {
+      operationId: status.running ? status.message : null,
+      frame: `event: master\ndata: ${JSON.stringify(
+        masterState(
+          status.model,
+          status,
+          context?.conversationId ?? null,
+          context?.metadata,
+        ),
+      )}\n\n`,
+    };
+  }
+
+  /** Resolve a watch run's first input to the engine's admitted operation id. */
+  private previewOperation(inputs: readonly number[] | undefined): string | null {
+    if (inputs === undefined || inputs.length === 0) return null;
+    try {
+      return readSubmissionRequestId(
+        this.ctx.storage.sql as unknown as TaskSql,
+        String(inputs[0]),
+      );
+    } catch {
+      // An unknown or pruned input cannot safely bind a transient preview.
+      return null;
+    }
   }
 
   /**

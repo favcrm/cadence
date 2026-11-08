@@ -173,6 +173,9 @@ const COMPOSER_ID = "app-shell-chat-box";
 export interface HomeListProps {
   mode: { kind: "home" };
   items: ThreadItem[];
+  /** The Home conversation this list shows; its live preview text (CAD-2228)
+   *  is painted on the turn that is generating. */
+  conversation?: string | null;
   readOnly: boolean;
   liveAfter: number;
   /** The running turn's message id, when a turn runs: a grouped turn uses it
@@ -243,6 +246,7 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
  */
 function HomeList({
   items,
+  conversation = null,
   readOnly,
   liveAfter,
   running = null,
@@ -440,6 +444,7 @@ function HomeList({
               running={busy}
               allowLegacy={allowLegacy}
               onOpenIssue={onOpenIssue}
+              previewConversation={conversation}
               after={
                 <>
                   {answer && (
@@ -507,6 +512,18 @@ function hidden(item: ThreadItem): ThreadItem {
     default:
       return item;
   }
+}
+
+/**
+ * The live preview goes through the same `hideIds` rewrite as committed app
+ * text (CAD-2228). A trailing `ctx-` that has no identifier character yet is
+ * held back: the next frame completes it and the whole identifier is
+ * rewritten, so a chunk boundary can never paint a partial id in place of a
+ * later raw one.
+ */
+function redactPreview(text: string): string {
+  const redacted = hideIds(text);
+  return /\bctx-$/.test(redacted) ? redacted.slice(0, -"ctx-".length) : redacted;
 }
 
 /** The reader's anchor: the first list row still visible at the scroller's
@@ -905,6 +922,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     usable && loaded && thread.data?.missing !== true && draftSubject === null,
     setStreamLink,
     onSnapshot,
+    undefined,
+    // CAD-2228: preview frames on this stream belong to the selected
+    // conversation; with no selected id (legacy chat) none are painted.
+    convId,
   );
 
   const items = threadItems(thread.data);
@@ -2196,6 +2217,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                 allowLegacy={legacyTranscript}
                 copy={false}
                 running={view.running}
+                previewConversation={convId}
+                previewTransform={redactPreview}
                 after={
                   <>
                     {view.cards.map((item) => (
@@ -2260,7 +2283,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           if (reserveTyping && !runViews.some((view) => view.kind === "turn" && view.key === typingKey)) {
             rows.push(
               <li key={typingKey} className="text-secondary text-ink-300 break-words" data-chat-typing>
-                <ThreadTurn items={[]} running density={density} />
+                <ThreadTurn
+                  items={[]}
+                  running
+                  density={density}
+                  previewConversation={convId}
+                  previewTransform={redactPreview}
+                />
               </li>,
             );
           }

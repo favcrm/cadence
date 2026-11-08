@@ -150,6 +150,35 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      */
     private validatedThreadContext;
     /**
+     * This connection's first `master` frame and the validated host projection it
+     * composes under, or `null` when either cannot be produced.
+     *
+     * The projection is re-read here, once per connection, so a reconnect never
+     * pins an older revision/avatar/name over a newer committed edit. This
+     * connection serves one conversation, so later frames compose under the same
+     * validated projection. The engine state is read only after the watch this
+     * connection has attached, so an already-running turn is reported truthfully
+     * and no run can begin between that read and the subscription. An
+     * unavailable or malformed projection, an unserializable frame and a failed
+     * state read all return `null` and refuse the connection with `503` rather
+     * than serve a stale or partial header; the caller stops the watch it opened.
+     * After `200`, a failing read rejects the event listener, which ends the
+     * stream exactly like a failed transcript read.
+     */
+    private connectionMaster;
+    /**
+     * One `master` frame: the engine's current turn and queue facts under the
+     * runtime's own fields, with the host projection this connection validated.
+     *
+     * The state is read for every frame, never derived from an event, so a frame
+     * reports only what the durable records prove. Metadata may contain non-JSON
+     * values, while reserved fields it cannot override retain runtime precedence;
+     * a callable root `toJSON` refuses the frame.
+     */
+    private composedMasterFrame;
+    /** Resolve a watch run's first input to the engine's admitted operation id. */
+    private previewOperation;
+    /**
      * The operation-scoped identity of the model request running right now. It
      * comes from the engine's own running generation checkpoint (task id +
      * transcript cutoff), so provider retries and a crash recovery reuse the
