@@ -1904,9 +1904,9 @@ fn collect_platform_artifact(
     mut fetch: impl FnMut(u64) -> Result<Value>,
 ) -> Result<Value> {
     use sha2::{Digest, Sha256};
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::Write;
     #[cfg(unix)]
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
     if !valid_media_artifact_ref(reference) {
         return Err(Error::invalid(
@@ -1921,12 +1921,18 @@ fn collect_platform_artifact(
         )));
     }
     let (expected_job, expected_digest) = reference.split_once('.').expect("validated ref");
+    // Keep the verified spool on the destination filesystem so it can be
+    // published without exposing a partially copied destination.
+    let parent = out
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
     let mut spool = {
         let mut builder = tempfile::Builder::new();
         builder.prefix(".cadence-media-artifact-");
         #[cfg(unix)]
         builder.permissions(std::fs::Permissions::from_mode(0o600));
-        builder.tempfile().map_err(|e| {
+        builder.tempfile_in(parent).map_err(|e| {
             Error::rejected(format!(
                 "cannot open private media artifact spool: {e}; nothing was written"
             ))
@@ -2051,33 +2057,16 @@ fn collect_platform_artifact(
             "the media artifact's bytes do not match its SHA-256 digest; nothing was written",
         ));
     }
-    spool.seek(SeekFrom::Start(0)).map_err(|e| {
+    spool.as_file().sync_all().map_err(|e| {
         Error::rejected(format!(
-            "cannot rewind media artifact spool: {e}; nothing was written"
+            "cannot sync media artifact spool: {e}; nothing was written"
         ))
     })?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut target_file = options
-        .open(out)
-        .map_err(|e| Error::rejected(format!("cannot create {}: {e}", out.display())))?;
-    if let Err(error) = std::io::copy(&mut spool, &mut target_file).and_then(|copied| {
-        if copied != total {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "verified media spool changed length",
-            ));
-        }
-        target_file.sync_all()
-    }) {
-        let _ = std::fs::remove_file(out);
-        return Err(Error::rejected(format!(
-            "cannot write {}: {error}; partial file removed",
-            out.display()
-        )));
-    }
+    // A concurrent creator must win without being overwritten. Once published,
+    // the destination points to the complete, verified spool.
+    spool
+        .persist_noclobber(out)
+        .map_err(|e| Error::rejected(format!("cannot create {}: {}", out.display(), e.error)))?;
     Ok(json!({
         "ref": reference,
         "jobId": expected_job,
@@ -5644,6 +5633,29 @@ mod read_contract_tests {
         assert!(error.to_string().contains("already exists"), "{error}");
         assert_eq!(served, 0, "no page may be fetched for an existing file");
         assert_eq!(std::fs::read(&out).unwrap(), b"keep me".as_slice());
+    }
+
+    #[test]
+    fn a_destination_created_during_download_is_not_replaced() {
+        let bytes = b"synthetic-video";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("video.mp4");
+        let result = collect_platform_artifact(&reference, &out, |offset| {
+            std::fs::write(&out, b"other writer").unwrap();
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                bytes,
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"other writer");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
