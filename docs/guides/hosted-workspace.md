@@ -474,10 +474,14 @@ cadence --org acme platform call get_media_job --query '{"jobId":"med_job_from_s
 cadence --org acme platform artifact med_job_from_submit.<64-hex-sha256> --out ./circle.png
 ```
 
-`get_media_job` is a live GET of the existing job (it can advance and settle
-that job, never starting a second generation). `platform artifact` streams the
-workspace's retained image bytes, verifies the SHA-256 digest and byte length
-in a private spool, and writes `<out>` only after verification succeeds.
+`get_media_job` is a live GET of the existing image job (it can advance and
+settle that job, never starting a second generation). For a video started by
+`media_generate`, read the existing job with
+`cadence --org acme platform call job_status --input '{"jobId":"med_job_from_submit"}'`.
+`platform artifact` reads retained PNG/JPEG images or MP4/WebM video in bounded
+pages. It verifies the full SHA-256 digest and byte length in a private spool
+before writing `<out>`; images are limited to 10 MiB and videos to 100 MiB.
+Video retrieval also requires a server that supports video artifact pages.
 
 ## A teammate's own-agent collaboration flow
 

@@ -1837,6 +1837,8 @@ fn artifact(
 
 /// Maximum size of a retained media artifact (`10 MiB`, matching `ARTIFACT_BYTES_MAX`).
 const PLATFORM_MEDIA_ARTIFACT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// Video is streamed into custody with a separate 100 MiB limit.
+const PLATFORM_VIDEO_ARTIFACT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 fn remote_platform_artifact<E, P>(
     target: &cadence_agent::remote_cli::RemoteTarget,
@@ -1902,7 +1904,7 @@ fn collect_platform_artifact(
     mut fetch: impl FnMut(u64) -> Result<Value>,
 ) -> Result<Value> {
     use sha2::{Digest, Sha256};
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{Seek, SeekFrom, Write};
     #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -1951,7 +1953,7 @@ fn collect_platform_artifact(
         let mime = data
             .get("mime")
             .and_then(Value::as_str)
-            .filter(|m| matches!(*m, "image/png" | "image/jpeg"))
+            .filter(|m| matches!(*m, "image/png" | "image/jpeg" | "video/mp4" | "video/webm"))
             .ok_or_else(|| {
                 Error::rejected(
                     "remote media artifact has an unsupported or missing MIME type; nothing was written",
@@ -1972,7 +1974,14 @@ fn collect_platform_artifact(
         let total = data
             .get("total")
             .and_then(Value::as_u64)
-            .filter(|t| *t > 0 && *t <= PLATFORM_MEDIA_ARTIFACT_MAX_BYTES)
+            .filter(|t| {
+                let max = if mime.starts_with("video/") {
+                    PLATFORM_VIDEO_ARTIFACT_MAX_BYTES
+                } else {
+                    PLATFORM_MEDIA_ARTIFACT_MAX_BYTES
+                };
+                *t > 0 && *t <= max
+            })
             .ok_or_else(|| {
                 Error::rejected(
                     "remote media artifact total size is missing or out of bounds; nothing was written",
@@ -2047,12 +2056,6 @@ fn collect_platform_artifact(
             "cannot rewind media artifact spool: {e}; nothing was written"
         ))
     })?;
-    let mut verified_bytes = Vec::with_capacity(total as usize);
-    spool.read_to_end(&mut verified_bytes).map_err(|e| {
-        Error::rejected(format!(
-            "cannot read media artifact spool: {e}; nothing was written"
-        ))
-    })?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -2060,10 +2063,15 @@ fn collect_platform_artifact(
     let mut target_file = options
         .open(out)
         .map_err(|e| Error::rejected(format!("cannot create {}: {e}", out.display())))?;
-    if let Err(error) = target_file
-        .write_all(&verified_bytes)
-        .and_then(|()| target_file.sync_all())
-    {
+    if let Err(error) = std::io::copy(&mut spool, &mut target_file).and_then(|copied| {
+        if copied != total {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "verified media spool changed length",
+            ));
+        }
+        target_file.sync_all()
+    }) {
         let _ = std::fs::remove_file(out);
         return Err(Error::rejected(format!(
             "cannot write {}: {error}; partial file removed",
@@ -5543,6 +5551,74 @@ mod read_contract_tests {
     }
 
     #[test]
+    fn a_large_video_artifact_is_verified_before_the_destination_is_created() {
+        let bytes = vec![0x56; 10 * 1024 * 1024 + 1];
+        let (reference, digest) = artifact_ref_for(&bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("video.mp4");
+        let receipt = collect_platform_artifact(&reference, &out, |offset| {
+            assert!(
+                !out.exists(),
+                "unverified video must not reach the destination"
+            );
+            let start = offset as usize;
+            let end = (start + 1024 * 1024).min(bytes.len());
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                &bytes[start..end],
+            ))
+        })
+        .expect("a verified video above the image limit is written");
+        assert_eq!(receipt["mime"], json!("video/mp4"));
+        assert_eq!(receipt["bytes"], json!(bytes.len()));
+        assert_eq!(std::fs::read(&out).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_tampered_video_leaves_no_destination() {
+        let bytes = b"synthetic-webm";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("verified.webm");
+        let (verified, _) = run_artifact_pages(
+            &reference,
+            &good,
+            vec![Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/webm",
+                0,
+                bytes.len() as u64,
+                bytes,
+            ))],
+        );
+        assert!(verified.is_ok());
+        assert_eq!(std::fs::read(&good).unwrap(), bytes);
+        let out = dir.path().join("video.webm");
+        let (result, _) = run_artifact_pages(
+            &reference,
+            &out,
+            vec![Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/webm",
+                0,
+                bytes.len() as u64,
+                b"tampered-webm!",
+            ))],
+        );
+        assert!(result.is_err());
+        assert!(!out.exists());
+    }
+
+    #[test]
     fn an_existing_destination_is_refused_before_any_page_is_fetched() {
         let bytes = b"\x89PNG\r\n\x1a\nsynthetic-provider-image-bytes";
         let (reference, digest) = artifact_ref_for(bytes);
@@ -5724,7 +5800,11 @@ mod read_contract_tests {
 
         // A total of zero or beyond the supported bound cannot be a real
         // artifact, so it is refused before the destination is created.
-        for total in [0u64, PLATFORM_MEDIA_ARTIFACT_MAX_BYTES + 1] {
+        for (total, mime) in [
+            (0u64, "image/png"),
+            (PLATFORM_MEDIA_ARTIFACT_MAX_BYTES + 1, "image/png"),
+            (PLATFORM_VIDEO_ARTIFACT_MAX_BYTES + 1, "video/mp4"),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let out = dir.path().join("image.png");
             let (result, _) = run_artifact_pages(
@@ -5734,7 +5814,7 @@ mod read_contract_tests {
                     &reference,
                     "med_job1",
                     &digest,
-                    "image/png",
+                    mime,
                     0,
                     total,
                     &bytes[..split],
