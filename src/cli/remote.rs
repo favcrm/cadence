@@ -1898,6 +1898,164 @@ where
     Ok(0)
 }
 
+// A private directory on the destination filesystem keeps the spool name
+// inaccessible to other users. Both it and the destination directory stay
+// open: renaming a directory cannot substitute the verified file at publish.
+struct MediaArtifactSpool {
+    parent: std::fs::File,
+    directory: std::fs::File,
+    directory_name: std::ffi::CString,
+    file: Option<std::fs::File>,
+}
+
+impl MediaArtifactSpool {
+    fn new(out: &std::path::Path) -> Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::MetadataExt;
+
+        let parent_path = out
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let parent = std::fs::File::open(parent_path)
+            .map_err(|e| Error::rejected(format!("cannot open destination directory: {e}")))?;
+        let directory_name = std::ffi::CString::new(format!(
+            ".cadence-media-artifact-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .expect("generated directory name contains no NUL");
+        // SAFETY: parent is open and directory_name is a single generated component.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), directory_name.as_ptr(), 0o700) } != 0 {
+            return Err(Error::rejected(format!(
+                "cannot create private media artifact spool: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: open a directory relative to parent, without following a substitute symlink.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                directory_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(Error::rejected(format!(
+                "cannot open private media artifact spool: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: fd was just returned by openat and is not owned elsewhere.
+        let directory = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = directory
+            .metadata()
+            .map_err(|e| Error::rejected(format!("cannot inspect media artifact spool: {e}")))?;
+        // A foreign user could have replaced the name between mkdirat and openat.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(Error::rejected(
+                "media artifact spool directory is not private",
+            ));
+        }
+        let mut spool = Self {
+            parent,
+            directory,
+            directory_name,
+            file: None,
+        };
+        // SAFETY: directory is private and pinned; O_EXCL refuses any existing name.
+        let fd = unsafe {
+            libc::openat(
+                spool.directory.as_raw_fd(),
+                c"artifact".as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(Error::rejected(format!(
+                "cannot open private media artifact spool: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: fd was just returned by openat and is not owned elsewhere.
+        spool.file = Some(unsafe { std::fs::File::from_raw_fd(fd) });
+        Ok(spool)
+    }
+
+    fn publish(&self, out: &std::path::Path) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        self.file
+            .as_ref()
+            .expect("opened spool")
+            .sync_all()
+            .map_err(|e| {
+                Error::rejected(format!(
+                    "cannot sync media artifact spool: {e}; nothing was written"
+                ))
+            })?;
+        let leaf = out
+            .file_name()
+            .and_then(|name| std::ffi::CString::new(name.as_bytes()).ok())
+            .ok_or_else(|| Error::rejected("media artifact destination needs a valid file name"))?;
+        // SAFETY: both directories are pinned, the source is in a private
+        // directory, and linkat refuses an existing destination.
+        let rc = unsafe {
+            libc::linkat(
+                self.directory.as_raw_fd(),
+                c"artifact".as_ptr(),
+                self.parent.as_raw_fd(),
+                leaf.as_ptr(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::rejected(format!(
+                "cannot create {}: {}",
+                out.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MediaArtifactSpool {
+    fn drop(&mut self) {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::MetadataExt;
+
+        // SAFETY: this name is relative to the private directory we opened.
+        unsafe { libc::unlinkat(self.directory.as_raw_fd(), c"artifact".as_ptr(), 0) };
+        // Remove the directory only if its original name still identifies our
+        // pinned directory. A renamed or substituted directory is left alone.
+        let fd = unsafe {
+            libc::openat(
+                self.parent.as_raw_fd(),
+                self.directory_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: fd was just returned by openat and is not owned elsewhere.
+            let current = unsafe { std::fs::File::from_raw_fd(fd) };
+            if let (Ok(a), Ok(b)) = (current.metadata(), self.directory.metadata()) {
+                if a.dev() == b.dev() && a.ino() == b.ino() {
+                    // SAFETY: removes only an empty directory at this basename.
+                    unsafe {
+                        libc::unlinkat(
+                            self.parent.as_raw_fd(),
+                            self.directory_name.as_ptr(),
+                            libc::AT_REMOVEDIR,
+                        )
+                    };
+                }
+            }
+        }
+    }
+}
+
 fn collect_platform_artifact(
     reference: &str,
     out: &std::path::Path,
@@ -1905,8 +2063,6 @@ fn collect_platform_artifact(
 ) -> Result<Value> {
     use sha2::{Digest, Sha256};
     use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     if !valid_media_artifact_ref(reference) {
         return Err(Error::invalid(
@@ -1921,23 +2077,7 @@ fn collect_platform_artifact(
         )));
     }
     let (expected_job, expected_digest) = reference.split_once('.').expect("validated ref");
-    // Keep the verified spool on the destination filesystem so it can be
-    // published without exposing a partially copied destination.
-    let parent = out
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let mut spool = {
-        let mut builder = tempfile::Builder::new();
-        builder.prefix(".cadence-media-artifact-");
-        #[cfg(unix)]
-        builder.permissions(std::fs::Permissions::from_mode(0o600));
-        builder.tempfile_in(parent).map_err(|e| {
-            Error::rejected(format!(
-                "cannot open private media artifact spool: {e}; nothing was written"
-            ))
-        })?
-    };
+    let mut spool = MediaArtifactSpool::new(out)?;
     let mut offset = 0u64;
     let mut pinned_total: Option<u64> = None;
     let mut pinned_mime: Option<String> = None;
@@ -2035,11 +2175,16 @@ fn collect_platform_artifact(
                 "remote media artifact page made no progress or exceeded total; nothing was written",
             ));
         }
-        spool.write_all(&chunk).map_err(|e| {
-            Error::rejected(format!(
-                "cannot write media artifact spool: {e}; nothing was written"
-            ))
-        })?;
+        spool
+            .file
+            .as_mut()
+            .expect("opened spool")
+            .write_all(&chunk)
+            .map_err(|e| {
+                Error::rejected(format!(
+                    "cannot write media artifact spool: {e}; nothing was written"
+                ))
+            })?;
         hasher.update(&chunk);
         offset += chunk.len() as u64;
         if offset == total {
@@ -2057,16 +2202,7 @@ fn collect_platform_artifact(
             "the media artifact's bytes do not match its SHA-256 digest; nothing was written",
         ));
     }
-    spool.as_file().sync_all().map_err(|e| {
-        Error::rejected(format!(
-            "cannot sync media artifact spool: {e}; nothing was written"
-        ))
-    })?;
-    // A concurrent creator must win without being overwritten. Once published,
-    // the destination points to the complete, verified spool.
-    spool
-        .persist_noclobber(out)
-        .map_err(|e| Error::rejected(format!("cannot create {}: {}", out.display(), e.error)))?;
+    spool.publish(out)?;
     Ok(json!({
         "ref": reference,
         "jobId": expected_job,
@@ -5656,6 +5792,48 @@ mod read_contract_tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&out).unwrap(), b"other writer");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_substituted_spool_cannot_publish_unverified_bytes() {
+        let bytes = b"synthetic-video";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("video.mp4");
+        let result = collect_platform_artifact(&reference, &out, |offset| {
+            let stage = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".cadence-media-artifact-")
+                })
+                .expect("the download is staged before fetching");
+            let is_dir = stage.is_dir();
+            std::fs::rename(&stage, dir.path().join("moved-stage")).unwrap();
+            if is_dir {
+                std::fs::create_dir(&stage).unwrap();
+                std::fs::write(stage.join("artifact"), b"substituted").unwrap();
+            } else {
+                std::fs::write(&stage, b"substituted").unwrap();
+            }
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                bytes,
+            ))
+        });
+        if result.is_ok() {
+            assert_eq!(std::fs::read(&out).unwrap(), bytes);
+        } else {
+            assert!(!out.exists(), "a refused download must not publish a file");
+        }
     }
 
     #[test]
