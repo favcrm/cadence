@@ -481,8 +481,10 @@ settle that job, never starting a second generation). For a video started by
 `platform artifact` reads retained PNG/JPEG images or MP4/WebM video in bounded
 pages. It verifies the full SHA-256 digest and byte length in a private spool
 on the destination filesystem, then publishes `<out>` without replacing an
-existing file. Images are limited to 10 MiB and videos to 100 MiB. Video
-retrieval also requires a server that supports video artifact pages.
+existing file. If the destination path changes during publication, the result
+may be uncertain; inspect the original directory before retrying. Images are
+limited to 10 MiB and videos to 100 MiB. Video retrieval also requires a server
+that supports video artifact pages.
 
 ## A teammate's own-agent collaboration flow
 

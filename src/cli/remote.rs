@@ -1982,9 +1982,25 @@ impl MediaArtifactSpool {
         Ok(spool)
     }
 
+    fn parent_matches(&self, out: &std::path::Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let parent = out
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        match (self.parent.metadata(), std::fs::metadata(parent)) {
+            (Ok(pinned), Ok(current)) => {
+                pinned.dev() == current.dev() && pinned.ino() == current.ino()
+            }
+            _ => false,
+        }
+    }
+
     fn publish(&self, out: &std::path::Path) -> Result<()> {
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
 
         self.file
             .as_ref()
@@ -1999,25 +2015,100 @@ impl MediaArtifactSpool {
             .file_name()
             .and_then(|name| std::ffi::CString::new(name.as_bytes()).ok())
             .ok_or_else(|| Error::rejected("media artifact destination needs a valid file name"))?;
-        // SAFETY: both directories are pinned, the source is in a private
-        // directory, and linkat refuses an existing destination.
-        let rc = unsafe {
-            libc::linkat(
-                self.directory.as_raw_fd(),
-                c"artifact".as_ptr(),
-                self.parent.as_raw_fd(),
-                leaf.as_ptr(),
-                0,
-            )
+        if !self.parent_matches(out) {
+            return Err(Error::rejected(
+                "destination directory changed during download; nothing was written",
+            ));
+        }
+        // Prefer a no-replace rename: some filesystems cannot make hard links.
+        // Both directories are pinned and the source is private.
+        let renamed =
+            media_rename_noreplace(self.directory.as_raw_fd(), self.parent.as_raw_fd(), &leaf)
+                .map_err(|e| Error::rejected(format!("cannot create {}: {e}", out.display())))?;
+        if !renamed {
+            // SAFETY: linkat refuses an existing destination and only resolves
+            // the source name inside our pinned private directory.
+            let rc = unsafe {
+                libc::linkat(
+                    self.directory.as_raw_fd(),
+                    c"artifact".as_ptr(),
+                    self.parent.as_raw_fd(),
+                    leaf.as_ptr(),
+                    0,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::rejected(format!(
+                    "cannot create {}: {}",
+                    out.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        let same_file = match (
+            self.file.as_ref().expect("opened spool").metadata(),
+            std::fs::symlink_metadata(out),
+        ) {
+            (Ok(verified), Ok(current)) => {
+                verified.dev() == current.dev() && verified.ino() == current.ino()
+            }
+            _ => false,
         };
-        if rc != 0 {
-            return Err(Error::rejected(format!(
-                "cannot create {}: {}",
-                out.display(),
-                std::io::Error::last_os_error()
+        if !same_file {
+            return Err(Error::unknown(format!(
+                "destination changed during publication; the verified artifact may be in the original directory, not {}; inspect before retrying",
+                out.display()
             )));
         }
         Ok(())
+    }
+}
+
+fn media_rename_noreplace(
+    source: std::os::fd::RawFd,
+    destination: std::os::fd::RawFd,
+    leaf: &std::ffi::CStr,
+) -> std::io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    // SAFETY: both descriptors are open directories and both names are valid C strings.
+    let rc = unsafe {
+        libc::renameat2(
+            source,
+            c"artifact".as_ptr(),
+            destination,
+            leaf.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_vendor = "apple")]
+    // SAFETY: both descriptors are open directories and both names are valid C strings.
+    let rc = unsafe {
+        libc::renameatx_np(
+            source,
+            c"artifact".as_ptr(),
+            destination,
+            leaf.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        if rc == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+        ) {
+            return Ok(false);
+        }
+        Err(error)
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = (source, destination, leaf);
+        Ok(false)
     }
 }
 
@@ -5792,6 +5883,35 @@ mod read_contract_tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&out).unwrap(), b"other writer");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_replaced_destination_directory_is_not_reported_as_success() {
+        let bytes = b"synthetic-video";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("destination");
+        let moved = dir.path().join("moved-destination");
+        std::fs::create_dir(&parent).unwrap();
+        let out = parent.join("video.mp4");
+        let result = collect_platform_artifact(&reference, &out, |offset| {
+            std::fs::rename(&parent, &moved).unwrap();
+            std::fs::create_dir(&parent).unwrap();
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                bytes,
+            ))
+        });
+        assert!(
+            result.is_err(),
+            "the reported path no longer names the pinned directory"
+        );
+        assert!(!out.exists());
     }
 
     #[test]
