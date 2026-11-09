@@ -1055,6 +1055,22 @@ fn verb_for(
                     args.insert("operation".into(), json!("connection_start"));
                     args.insert("body".into(), json!({"toolkit": provider}));
                 }
+                ConnectionAction::Sites { connection_id } => {
+                    args.insert("operation".into(), json!("connection_sites"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                }
+                ConnectionAction::SelectSite {
+                    connection_id,
+                    site_url,
+                } => {
+                    args.insert("operation".into(), json!("connection_select_site"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                    args.insert("body".into(), json!({ "siteUrl": site_url }));
+                }
+                ConnectionAction::Revoke { connection_id } => {
+                    args.insert("operation".into(), json!("connection_revoke"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                }
                 _ => return Err(unavailable(command_path)),
             }
             "platform_call"
@@ -5975,6 +5991,54 @@ mod read_contract_tests {
         match verb_for(command, None) {
             Ok((verb, _)) => panic!("`{verb}` must refuse before any request is built"),
             Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn hosted_connections_map_to_owner_platform_calls() {
+        let cases = [
+            (
+                ConnectionAction::Providers,
+                json!({"operation": "connection_providers"}),
+            ),
+            (
+                ConnectionAction::Ls,
+                json!({"operation": "connection_list"}),
+            ),
+            (
+                ConnectionAction::Revoke {
+                    connection_id: "con_synthetic".into(),
+                },
+                json!({
+                    "operation": "connection_revoke",
+                    "connectionId": "con_synthetic"
+                }),
+            ),
+            (
+                ConnectionAction::Sites {
+                    connection_id: "con_synthetic".into(),
+                },
+                json!({
+                    "operation": "connection_sites",
+                    "connectionId": "con_synthetic"
+                }),
+            ),
+            (
+                ConnectionAction::SelectSite {
+                    connection_id: "con_synthetic".into(),
+                    site_url: "sc-domain:example.test".into(),
+                },
+                json!({
+                    "operation": "connection_select_site",
+                    "connectionId": "con_synthetic",
+                    "body": {"siteUrl": "sc-domain:example.test"}
+                }),
+            ),
+        ];
+        for (action, expected) in cases {
+            let (verb, args) = outcome(&Commands::Connection { action }).unwrap();
+            assert_eq!(verb, "platform_call");
+            assert_eq!(args, expected);
         }
     }
 

@@ -477,9 +477,10 @@ cadence --org acme platform status --tool search_console_report --connection con
 ```
 
 The read uses the workspace balance; `--max-charge` belongs to the separate
-local device protocol. A connection does not select a Search Console property:
-enrollment links the provider account only, and verified property selection is
-not provided yet.
+local device protocol. A connection does not choose a Search Console property
+implicitly: enrollment links the provider account only, and the verified
+property is pinned separately in
+[Workspace connections and Search Console properties](#workspace-connections-and-search-console-properties).
 
 A replay without a recorded result is not a successful report. Hosted and
 local-device clients refuse to present a missing result as success and do not
@@ -528,8 +529,8 @@ Local-only enrollment flags refuse instead of being dropped: `--scope` (the
 configured OAuth app determines provider scopes), `--shape` (the server records
 the account shape the provider authorizes) and `--agent` (a hosted enrollment
 binds the owner, not an agent). Enrollment links an account only: choosing a
-verified Search Console property is a separate step this build does not
-provide.
+verified Search Console property is the separate, owner-only step in
+[Workspace connections and Search Console properties](#workspace-connections-and-search-console-properties).
 
 If the answer to `connection enroll` is lost, times out or is otherwise
 uncertain, the client reports an unknown outcome and never retries and never
@@ -562,6 +563,37 @@ existing file. If the destination path changes during publication, the result
 may be uncertain; inspect the original directory before retrying. Images are
 limited to 10 MiB and videos to 100 MiB. Video retrieval also requires a server
 that supports video artifact pages.
+
+## Workspace connections and Search Console properties
+
+The hosted workspace owns its provider credentials and its enrolled accounts.
+Connection commands are owner-only and require a live human owner's `cli.read`
+/ `cli.write` grant; a member or a managed agent is refused.
+
+After `connection enroll` links a Search Console account (above), the account
+appears in `connection ls` with its exact connection ID. A Search Console
+account can expose several properties, including domain properties
+(`sc-domain:example.test`) and URL-prefix properties (`https://example.test/`).
+List them and pin one:
+
+```sh
+cadence --org acme connection sites <connection-id>
+cadence --org acme connection select-site <connection-id> 'sc-domain:example.test'
+```
+
+The selected property is stored by its exact provider identifier; it is not
+normalized. Only `siteOwner` and `siteFullUser` properties can be selected — a
+restricted or unverified property is refused. Once a property is selected,
+`search_console_report` reads for that connection must use exactly that
+`site_url`; a different value is refused before pricing or dispatch. Selecting
+again replaces the pin.
+
+Revoke the account when it is no longer needed; this disables the provider
+account, revokes its connection grants and drops the selected property:
+
+```sh
+cadence --org acme connection revoke <connection-id>
+```
 
 ## A teammate's own-agent collaboration flow
 

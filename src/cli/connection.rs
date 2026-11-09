@@ -20,6 +20,15 @@ pub(crate) enum ConnectionAction {
     /// List exact authorized account references and built-in Local outbox.
     #[command(visible_alias = "list")]
     Ls,
+    /// List the properties a connected Search Console account can read.
+    Sites { connection_id: String },
+    /// Pin one verified Search Console property for future reports.
+    #[command(name = "select-site")]
+    SelectSite {
+        connection_id: String,
+        /// Exact property identifier (`sc-domain:example.test` or a URL prefix).
+        site_url: String,
+    },
     /// Show one durable connection incarnation.
     Show { connection_id: String },
     /// Enroll an explicitly supported scoped token; grants no workers.
@@ -319,6 +328,12 @@ pub(super) fn run(state_dir: PathBuf, action: ConnectionAction) -> Result<i32> {
     let (method, params) = match action {
         ConnectionAction::Providers => ("connection_providers", json!({})),
         ConnectionAction::Ls => ("connection_list", json!({})),
+        ConnectionAction::Sites { .. } | ConnectionAction::SelectSite { .. } => {
+            return Err(Error::usage(
+                "connection sites/select-site are hosted-workspace operations; \
+                 pass --org <logged-in-workspace>",
+            ));
+        }
         ConnectionAction::Show { connection_id } => {
             ("connection_show", json!({"connection_id":connection_id}))
         }
