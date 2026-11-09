@@ -1,7 +1,7 @@
 //! Proven-operator connection management; no agent grants or offline fallback.
 use super::*;
 
-fn validate_connection_id(value: &str) -> Result<&str> {
+pub(super) fn validate_connection_id(value: &str) -> Result<&str> {
     if value.is_empty()
         || value.len() > 128
         || !value
@@ -38,7 +38,9 @@ pub(crate) enum ConnectionAction {
     },
     /// Create a metadata-only protected enrollment request and open the
     /// trusted entry page; the account handle, transport and secret are
-    /// typed there, never here.
+    /// typed there, never here. On a hosted org this starts the workspace
+    /// owner's provider authorization instead and prints its one-time link;
+    /// no browser is opened here.
     Enroll {
         provider: String,
         #[arg(long = "scope")]

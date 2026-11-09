@@ -444,8 +444,9 @@ returns not found; an unavailable catalog is reported as unavailable rather
 than as an empty list. Hosted calls refuse `--platform`, `--account` and
 `--project` instead of silently changing the selected workspace.
 
-The CLI derives a replay key (`pcli_<sha256>`) from the tool, `--query` and
-`--input`, or accepts an explicit `--request <handle>`. If a call fails with a
+The CLI derives a replay key (`pcli_<sha256>`) from the tool, `--query`,
+`--input` and, for a connected read, `--connection`, or accepts an explicit
+`--request <handle>`. If a call fails with a
 timeout, 5xx or uncertain outcome, inspect its recorded state read-only before
 retrying:
 
@@ -464,6 +465,82 @@ by itself prove that no upstream work occurred if a fault prevented
 persistence, and **replaying `platform call` will start and charge a new call
 when the original request was not recorded**. To deliberately run the same
 input again after a recorded call, pass a fresh `--request <handle>`.
+
+When the workspace has a qualified Search Console tool and an existing
+connection, a read names that connection explicitly. The same connection and
+input are needed to derive and verify its status:
+
+```sh
+REPORT='{"site_url":"sc-domain:example.test","start_date":"2026-01-01","end_date":"2026-01-31","dimensions":["query"]}'
+cadence --org acme platform call search_console_report --connection con_example --input "$REPORT"
+cadence --org acme platform status --tool search_console_report --connection con_example --input "$REPORT"
+```
+
+The read uses the workspace balance; `--max-charge` belongs to the separate
+local device protocol. A connection does not select a Search Console property:
+enrollment links the provider account only, and verified property selection is
+not provided yet.
+
+A replay without a recorded result is not a successful report. Hosted and
+local-device clients refuse to present a missing result as success and do not
+automatically dispatch another read.
+
+### Owner enrollment from the CLI (Search Console first)
+
+An owner enrolls a provider account from a plain shell, in three steps. The
+reads use `cli.read` (or `cli.write`); starting an enrollment is a mutation and
+needs `cli.write`:
+
+```sh
+cadence --org acme connection providers
+cadence --org acme connection ls
+cadence --org acme connection enroll google_search_console --no-open
+```
+
+`connection providers` lists the workspace's open toolkits and their read
+eligibility, including those that cannot yet be enrolled. The status
+`enrollment: available` means a qualified read exists; starting also requires
+the workspace's connector to be configured. The other requested providers
+are not qualified by this build.
+`connection ls` lists the accounts already linked to the workspace — a pending
+authorization the provider has not completed yet does not appear there.
+`connection enroll` answers one document whose `entry_url` is a one-time
+provider authorization link:
+
+```json
+{"entry_url":"https://provider.example/oauth?synthetic-request"}
+```
+
+Open that link yourself, in your own browser. The hosted server never opens a
+browser of its own, and this client prints the link exactly once as the
+successful command's output — it is never written to a log, a receipt, an
+error, or a diagnostic line. `--no-open` is the same behavior here (a hosted
+enrollment never opens a browser either way). Treat the link as a bearer
+secret until it is used. Provider permissions depend on the configured OAuth
+app; inspect the consent screen and do not proceed if it requests more than
+the intended read-only access. This flow does not verify the app's scopes.
+
+The three operations are for the live human workspace owner. A managed caller
+(an agent pane or a grant-bound child) is refused in this client before any
+request exists, because the stored login is the owner's and would otherwise
+act as the owner; the hosted server independently requires a live human owner.
+Local-only enrollment flags refuse instead of being dropped: `--scope` (the
+configured OAuth app determines provider scopes), `--shape` (the server records
+the account shape the provider authorizes) and `--agent` (a hosted enrollment
+binds the owner, not an agent). Enrollment links an account only: choosing a
+verified Search Console property is a separate step this build does not
+provide.
+
+If the answer to `connection enroll` is lost, times out or is otherwise
+uncertain, the client reports an unknown outcome and never retries and never
+claims a link. The link cannot be read back, and `connection ls` lists only
+accounts whose provider callback already completed: an empty list does not
+prove that no link or pending authorization was issued. Starting again is a
+deliberate new enrollment, not a reconciliation step — it can create a second
+one-time link. A hosted server that predates these operations answers the
+unknown operation; that refusal says to update the hosted server first and
+never invents an empty list or a missing link, and the client never falls back
+to the local daemon.
 
 An image submission may return a queued job. Poll its returned `data.job.id`
 with the same workspace and `cli.write` grant, then download a succeeded job's
