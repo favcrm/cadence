@@ -81,6 +81,22 @@ fn tracker_sentinel(
         legacy.through(marker).contains(marker),
         "legacy member lost the tracker sentinel"
     );
+    // The seed also creates VIS-9 (the readable request issue). A tracker scan
+    // can publish it after the streams open, and a queued VIS-9 frame would
+    // then be the member's next frame — mistaken for the change under test.
+    // Tick it with its own marker and consume it before the interval begins.
+    let request_marker = format!("{marker}-9");
+    write_issue(rig, "visible", "VIS-9", &request_marker);
+    for (stream, who) in [
+        (op, "operator"),
+        (entity, "entity member"),
+        (legacy, "legacy member"),
+    ] {
+        assert!(
+            stream.through(&request_marker).contains(&request_marker),
+            "{who} lost the VIS-9 drain"
+        );
+    }
 }
 
 #[test]

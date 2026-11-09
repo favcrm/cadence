@@ -1216,6 +1216,17 @@ fn unreadable_delivery_projection_closes_an_open_member_stream() {
         "operator did not observe the delivery-file tick"
     );
     let delivery_visible = "CAD2215_SCOPED_DELIVERY_ORDINARY";
+    // The seed creates VIS-9 too, and a tracker scan can publish it after the
+    // streams open. Drain it immediately before the measured write: a queued
+    // VIS-9 frame inside the interval would otherwise read as an extra change.
+    let request_marker = format!("{delivery_visible}-9");
+    write_issue(&rig, "visible", "VIS-9", &request_marker);
+    for stream in [&mut entity, &mut legacy] {
+        assert!(
+            stream.through(&request_marker).contains(&request_marker),
+            "member lost the VIS-9 drain before the visible change"
+        );
+    }
     write_issue(&rig, "visible", "VIS-1", delivery_visible);
     assert!(
         op.through(delivery_visible).contains(delivery_visible),
