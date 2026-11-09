@@ -150,6 +150,16 @@ for these local endpoints:
   separate-user credential boundary. Real profiles refuse the split-UID path
   until native session preparation is supported.
 
+Reviewer agents (`role: reviewer`) are the exception on the Pi path: a Pi
+reviewer worker does not inherit the operator's `gh` configuration. The daemon
+pins a private, empty `GH_CONFIG_DIR` under the worker's state directory and
+passes `CADENCE_REVIEWER_GH_TOKEN` as `GH_TOKEN` when the operator has
+provisioned a read-only token. With no such token `gh` is unauthenticated — the
+fail-closed direction, never the operator's account. The token's scope is the
+operator's responsibility; nothing here can verify it. This pin is **Pi only so
+far**: the Claude, Codex and PTY adapters still inherit `HOME`'s `gh` config and
+remain uncovered until CAD-844's remaining slices land.
+
 The remote Devin and cloud sandbox adapters launch no local actor. That does
 not establish what credentials or access the remote runtime receives.
 
