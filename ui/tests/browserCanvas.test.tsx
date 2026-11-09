@@ -175,7 +175,15 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string; signal?: Ab
         { seq: 6, role: "agent", kind: "turn_result", text: "Done again.", message: "m2" },
       );
     }
-    return new Response(JSON.stringify({ conversation: { id: "cm1", alias: "assistant" }, entries, more_before: false }), { status: 200 });
+    const rows = entries.map(({ seq, ...entry }) => ({ ...entry, id: `csrid_fixture_${seq}` }));
+    return new Response(JSON.stringify({
+      conversation: { id: "cm1", alias: "assistant" },
+      entries: rows,
+      cursor: "csc1_fixture_forward",
+      before_cursor: "csc1_fixture_before",
+      more_before: false,
+      more_after: false,
+    }), { status: 200 });
   }
   if (url.pathname.startsWith("/api/artifacts/")) {
     return new Response("<p>hello</p>", { status: 200, headers: { "Content-Type": "text/html" } });

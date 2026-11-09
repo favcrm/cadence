@@ -25,9 +25,10 @@ export function agentCategory(a: Agent): AgentCategory {
     a.fenced ||
     a.unknown > 0 ||
     a.stalled ||
-    ["attention", "error", "waiting_input", "blocked_by_quota"].includes(
-      a.state,
-    ) ||
+    (a.state != null &&
+      ["attention", "error", "waiting_input", "blocked_by_quota"].includes(
+        a.state,
+      )) ||
     a.quota?.state === "blocked" ||
     a.usage_limit?.state === "blocked"
   )
@@ -40,10 +41,13 @@ export function agentCategory(a: Agent): AgentCategory {
   if (
     a.running > 0 ||
     a.queued > 0 ||
-    ["busy", "running", "starting"].includes(a.state)
+    (a.state != null && ["busy", "running", "starting"].includes(a.state))
   )
     return "working";
-  if (a.state === "idle" || a.state === "stopped") return a.state;
+  // Only a reported state names a lifecycle bucket: a scoped row withholds
+  // it, and an absent state is not evidence of idling or stopping.
+  if (a.state === "idle") return "idle";
+  if (a.state === "stopped") return "stopped";
   return "other";
 }
 
@@ -70,11 +74,17 @@ export function agentMatchesFilter(a: Agent, filter: AgentFilter): boolean {
 export function agentHoldsWorkButDead(a: Agent): boolean {
   const holds =
     (a.tasks?.length ?? 0) > 0 || agentOn(a).length > 0 || a.queued > 0;
-  return !agentIsLive(a) && holds;
+  return agentLiveness(a) === false && holds;
 }
 
-function agentIsLive(a: Agent): boolean {
-  return !a.dead && !a.fenced && a.state !== "stopped" && a.state !== "dead";
+/** The daemon's own liveness verdict, when it gave one. A scoped row omits
+ * `dead`/`fenced` (they move on hidden work), so absence is `undefined` —
+ * unavailable, never "alive". */
+function agentLiveness(a: Agent): boolean | undefined {
+  if (a.dead === true || a.fenced === true) return false;
+  if (a.state === "stopped" || a.state === "dead") return false;
+  if (a.dead === false || a.fenced === false) return true;
+  return undefined;
 }
 
 export type AgentLifecycle =
@@ -92,7 +102,13 @@ export function lifecycleOf(a: Agent): AgentLifecycle {
   const category = agentCategory(a);
   if (category === "inbox") return a.queued > 0 ? "stale-inbox" : "normal";
   if (category === "working") return "active";
-  if ((a.tasks?.length ?? 0) > 0 || agentOn(a).length > 0) return "idle-holding";
+  // "Parked on a claim" is an idle verdict. A scoped row reports no state,
+  // and an unknown state is not evidence of idling.
+  if (
+    a.state != null &&
+    ((a.tasks?.length ?? 0) > 0 || agentOn(a).length > 0)
+  )
+    return "idle-holding";
   return "normal";
 }
 

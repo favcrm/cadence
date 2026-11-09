@@ -435,14 +435,11 @@ export interface OverviewProject {
   areas_error?: string | null;
 }
 
-export interface MonitorAlert {
-  seq: number;
+interface MonitorAlertBase {
   monitor: string;
   project: string;
   monitor_owner: string;
   task?: string | null;
-  event_seq: number;
-  fingerprint: string;
   kind: string;
   payload: unknown;
   state: "open" | "acknowledged" | "resolved" | string;
@@ -454,14 +451,30 @@ export interface MonitorAlert {
   next_action: string;
   next_owner: string;
   authority: string;
-  evidence: {
-    monitor: string;
-    alert_seq: number;
-    event_seq: number;
-    fingerprint: string;
-    payload: unknown;
-  };
 }
+
+export type MonitorAlert = MonitorAlertBase & (
+  | {
+      seq: number;
+      event_seq: number;
+      fingerprint: string;
+      id?: never;
+      evidence: {
+        monitor: string;
+        alert_seq: number;
+        event_seq: number;
+        fingerprint: string;
+        payload: unknown;
+      };
+    }
+  | {
+      id: string;
+      seq?: never;
+      event_seq?: never;
+      fingerprint?: never;
+      evidence: { monitor: string; alert: string; payload: unknown };
+    }
+);
 
 export interface MonitorRow {
   id: string;
@@ -473,7 +486,7 @@ export interface MonitorRow {
   last_check_at?: number | null;
   last_success_at?: number | null;
   next_check_at?: number | null;
-  event_cursor: number;
+  event_cursor?: number;
   coverage: string[];
   delivery: { configured: boolean; state: string; push?: boolean; detail?: string };
   dispatch_enabled: boolean;
@@ -638,17 +651,22 @@ export interface StoredAgentProfile {
 }
 
 /** One `/api/agents` row. Generated from the daemon's Rust type, except the
- *  fields re-declared here: a registered agent always reports `provider`,
- *  `endpoint_kind` and `state` (only the Rust row type is lenient), the board
- *  reads the allowance record as the wider `UsageLimit`, and the detail read
- *  merges the launch `params` in. */
+ *  fields re-declared here: a registered agent always reports `provider` and
+ *  `endpoint_kind`, the board reads the allowance record as the wider
+ *  `UsageLimit`, and the detail read merges the launch `params` in.
+ *  CAD-2215: a scoped row reports `state` only when the reader's own work
+ *  proves it (`"busy"`, else `null`) and omits `dead`/`fenced`, so those are
+ *  nullable/optional here — absence is unavailable, never false. */
 export type Agent = Omit<
   Api.AgentRow,
-  "provider" | "endpoint_kind" | "state" | "quota" | "usage_limit" | "model_selection" | "last_activity"
+  "provider" | "endpoint_kind" | "state" | "dead" | "fenced" | "quota" | "usage_limit" | "model_selection" | "last_activity"
 > & {
   provider: string;
   endpoint_kind: string;
-  state: string;
+  /** `"busy"` on work the reader can see running; `null` when unreported. */
+  state: string | null;
+  dead?: boolean | null;
+  fenced?: boolean | null;
   /** Launch params; the detail read carries them. */
   params?: Record<string, unknown>;
   model_selection?: {
@@ -792,13 +810,14 @@ export interface AgentDetail {
     quota?: UsageLimit | null;
     usage_limit?: UsageLimit | null;
     pid?: number | null;
-    state: string;
+    /** `"busy"` on work the reader can see running; `null` when unreported. */
+    state: string | null;
     enabled: boolean;
     error?: string | null;
     endpoint?: string | null;
     params?: Record<string, unknown>;
     generation?: number;
-    dead?: boolean;
+    dead?: boolean | null;
     silent_secs?: number;
     stalled?: boolean;
     capabilities?: Record<string, unknown> | null;
@@ -828,16 +847,17 @@ export interface AgentDetail {
   }[];
   /** Why `events` is empty when the daemon's event read failed. */
   events_error?: string | null;
-  events: {
-    seq: number;
+  events: ({
     alias: string;
     kind: string;
     payload?: Record<string, unknown>;
     job_id?: string | null;
     task_id?: string | null;
     at: string;
-  }[];
-  fenced: boolean;
+  } & ({ seq: number; id?: never; cursor?: never } | { id: string; cursor: string; seq?: never }))[];
+  /** Whether the agent is fenced; `null`/absent for a scoped reader, whose
+   *  daemon reports no state to decide it from. */
+  fenced?: boolean | null;
   recovery?: string | null;
   resume?: string | null;
   tasks?: string[];

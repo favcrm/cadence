@@ -18,6 +18,19 @@ import { StaleChip } from "../../ui/ResourceStatus";
 import MainCiView from "./MainCiView";
 import ProjectScope from "./ProjectScope";
 
+/**
+ * CAD-2215: `MonitorAlert` is a discriminated union. An operator row carries
+ * the legacy numeric `seq`; a reader-scoped row carries the stable keyed `id`
+ * and no global position. `typeof alert.seq === "number"` is the narrowing
+ * test everywhere below.
+ */
+function alertKey(alert: MonitorAlert): string {
+  if (typeof alert.seq === "number") {
+    return `${alert.monitor}-${alert.seq}`;
+  }
+  return alert.id;
+}
+
 const KIND_CHIP: Record<string, string> = {
   merge: "bg-ok/15 text-ok",
   intake: "bg-info/10 text-info",
@@ -235,7 +248,7 @@ function MonitoringView({
             </div>
             {alerts.map((alert) => (
               <MonitorAlertView
-                key={`${alert.monitor}-${alert.seq}`}
+                key={alertKey(alert)}
                 alert={alert}
                 readOnly={readOnly}
                 onAck={onAck}
@@ -251,7 +264,7 @@ function MonitoringView({
             </summary>
             <div className="mt-2 space-y-2">
               {globalAlerts.map((alert) => (
-                <MonitorAlertView key={`${alert.monitor}-${alert.seq}`} alert={alert} readOnly={readOnly} onAck={onAck} />
+                <MonitorAlertView key={alertKey(alert)} alert={alert} readOnly={readOnly} onAck={onAck} />
               ))}
             </div>
           </details>
@@ -290,6 +303,10 @@ function MonitorAlertView({
   const open = alert.state === "open";
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
+  // A scoped row has no numeric position and no global evidence; the ack
+  // route is the operator's, so neither control nor evidence is offered for
+  // the reader-scoped shape.
+  const operatorSeq = typeof alert.seq === "number" ? alert.seq : null;
   const stateLabel = alert.state === "resolved" ? "resolved" : open ? "open" : "acknowledged";
   return (
     <div className="rounded border border-ink-700/70 bg-ink-875 px-3 py-2.5 space-y-1.5">
@@ -302,12 +319,14 @@ function MonitorAlertView({
         <span className="num text-micro text-ink-500">
           {alert.project} · {alert.monitor} · {alert.task ?? t("task unknown")}
         </span>
-        {open && (
+        {open && operatorSeq !== null && (
           <button
             className="chip ml-auto bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-50"
             disabled={readOnly}
             title={block ?? t("acknowledge this durable monitor alert")}
-            onClick={() => onAck(alert.monitor, alert.seq)}
+            onClick={() => {
+              if (operatorSeq !== null) onAck(alert.monitor, operatorSeq);
+            }}
           >
             {t("ack")}
           </button>
@@ -317,9 +336,11 @@ function MonitorAlertView({
       <div className="text-micro text-ink-500">
         {t("next owner")} <span className="text-ink-300">{alert.next_owner}</span> · {alert.authority}
       </div>
-      <div className="text-micro text-ink-600">
-        {t("evidence event")} {alert.event_seq} · {alert.fingerprint}
-      </div>
+      {typeof alert.seq === "number" && (
+        <div className="text-micro text-ink-600">
+          {t("evidence event")} {alert.event_seq} · {alert.fingerprint}
+        </div>
+      )}
     </div>
   );
 }

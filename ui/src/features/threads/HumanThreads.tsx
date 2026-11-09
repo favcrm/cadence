@@ -22,7 +22,6 @@ import {
   type HumanMember,
   type HumanMe,
   type HumanPerson,
-  type HumanPost,
   type HumanRoomPage,
   type HumanRoomSummary,
 } from "./humanThreadsClient";
@@ -63,6 +62,14 @@ export interface HumanRoomState {
 /** A read refused for this room only: not a member, or the room is gone. */
 function isDenial(e: unknown): boolean {
   return e instanceof ApiError && (e.status === 403 || e.message === "Room not found");
+}
+
+function isCursorRefusal(e: unknown): boolean {
+  return e instanceof ApiError && (
+    e.code === "human_room_cursor_invalid"
+    || e.code === "human_room_cursor_numeric"
+    || e.code === "human_room_cursor_format"
+  );
 }
 
 /** The signed-in person from the server. `loading` until the first answer. */
@@ -175,19 +182,32 @@ export function HumanRoomRows({
   );
 }
 
-/** Keep loaded posts by seq (never drop an older page), take the rest fresh. */
+/** Retain a loaded prefix only when the fresh tail overlaps it. */
 function mergePage(cur: HumanRoomPage | null, next: HumanRoomPage): HumanRoomPage {
-  if (!cur) return next;
-  const bySeq = new Map<number, HumanPost>();
-  for (const p of [...cur.posts, ...next.posts]) bySeq.set(p.seq, p);
-  return { ...next, posts: [...bySeq.values()].sort((a, b) => a.seq - b.seq) };
+  if (!cur || cur.room !== next.room || cur.scope_id !== next.scope_id || next.posts.length === 0) return next;
+  const positions = new Map(cur.posts.map((post, index) => [post.id, index]));
+  const shared = next.posts.find((post) => positions.has(post.id));
+  if (!shared) return next;
+  const prefix = cur.posts.slice(0, positions.get(shared.id));
+  const posts = [...prefix, ...next.posts];
+  const sameOldest = posts[0]?.id === cur.posts[0]?.id;
+  return {
+    ...next,
+    before: sameOldest ? cur.before : next.before,
+    more_before: sameOldest ? cur.more_before : next.more_before,
+    posts,
+  };
 }
 
-/** An older page joins the loaded window; the current members and newest posts stay. */
+/** An older page joins the loaded window; current members and tail stay. */
 function mergeOlder(cur: HumanRoomPage, older: HumanRoomPage): HumanRoomPage {
-  const bySeq = new Map<number, HumanPost>();
-  for (const p of [...older.posts, ...cur.posts]) bySeq.set(p.seq, p);
-  return { ...cur, posts: [...bySeq.values()].sort((a, b) => a.seq - b.seq) };
+  const currentIds = new Set(cur.posts.map((post) => post.id));
+  return {
+    ...cur,
+    before: older.before,
+    more_before: older.more_before,
+    posts: [...older.posts.filter((post) => !currentIds.has(post.id)), ...cur.posts],
+  };
 }
 
 /** An open human room: posts, earlier paging, composer and read marks. */
@@ -214,51 +234,112 @@ export function HumanRoomTimeline({
   const [page, setPage] = useState<HumanRoomPage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [denied, setDenied] = useState(false);
-  const [hasOlder, setHasOlder] = useState(true);
   const [olderBusy, setOlderBusy] = useState(false);
-  const [shown, setShown] = useState(0);
+  const [shown, setShown] = useState<string | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
+  const [cursorBlocked, setCursorBlocked] = useState(false);
+  const [visibleId, setVisibleId] = useState<string | null>(null);
+  const [documentVisible, setDocumentVisible] = useState(() => document.visibilityState === "visible");
   const [askTarget, setAskTarget] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const agentsState = useHumanAgents(true);
   // Ask is offered only when the fresh room hint allows it and the target is a current agent.
   const catalog = agentsState.agents ?? [];
-  const askable = page?.can_ask === true ? catalog.filter((a) => page.members.some((m) => m.kind === "agent" && m.id === a.uid)) : [];
+  const currentPage = page?.room === id ? page : null;
+  const askable = currentPage?.can_ask === true ? catalog.filter((a) => currentPage.members.some((m) => m.kind === "agent" && m.id === a.uid)) : [];
   const ask = askable.find((a) => a.uid === askTarget) ?? null;
   // Only the newest read for this room publishes; an older late reply is dropped.
   const latest = useRef(0);
+  const visit = useRef(0);
   const envelope = useRef<{ key: string; id: string } | null>(null);
+  const activeRoom = useRef(id);
+  activeRoom.current = id;
+  const pageRef = useRef(currentPage);
+  pageRef.current = currentPage;
+  const onStateRef = useRef(onState);
+  onStateRef.current = onState;
+  const onChangedRef = useRef(onChanged);
+  onChangedRef.current = onChanged;
+  const cursorBlockedRef = useRef(false);
+  const blockHistory = useCallback((error: unknown) => {
+    latest.current++;
+    cursorBlockedRef.current = true;
+    setCursorBlocked(true);
+    setPage(null);
+    setError(messageOf(error));
+    onStateRef.current({ id, members: null, denied: false });
+  }, [id]);
 
   const load = useCallback(async () => {
+    if (cursorBlockedRef.current) return;
     const n = ++latest.current;
     try {
-      const next = await readHumanRoom(id, { limit: PAGE });
+      let next = await readHumanRoom(id, { limit: PAGE });
       if (n !== latest.current) return;
+      const previous = pageRef.current;
+      if (previous?.room === id && previous.scope_id === next.scope_id && previous.posts.length > 0) {
+        const loadedIds = new Set(previous.posts.map((post) => post.id));
+        let oldest = next;
+        const earlier: HumanRoomPage["posts"][] = [];
+        while (!oldest.posts.some((post) => loadedIds.has(post.id)) && oldest.more_before) {
+          if (!oldest.before) throw new Error("The room returned an invalid history cursor");
+          const older = await readHumanRoom(id, { before: oldest.before, limit: PAGE });
+          if (n !== latest.current) return;
+          if (older.scope_id !== next.scope_id) {
+            blockHistory(new Error("Room access changed while loading history"));
+            return;
+          }
+          earlier.push(older.posts);
+          oldest = older;
+        }
+        if (earlier.length > 0) {
+          next = {
+            ...next,
+            before: oldest.before,
+            more_before: oldest.more_before,
+            posts: [...earlier.reverse().flat(), ...next.posts],
+          };
+        }
+      }
       setPage((cur) => mergePage(cur, next));
       setDenied(false);
       setError(null);
-      onState({ id, members: next.members, denied: false });
+      onStateRef.current({ id, members: next.members, denied: false });
     } catch (e) {
       if (n !== latest.current) return;
+      if (isCursorRefusal(e)) {
+        blockHistory(e);
+        return;
+      }
       if (isDenial(e)) {
         setPage(null);
         setDenied(true);
-        onState({ id, members: null, denied: true });
+        onStateRef.current({ id, members: null, denied: true });
       } else {
         setError(messageOf(e));
       }
     }
-  }, [id, onState]);
+  }, [id, blockHistory]);
 
   // A new room resets the timeline and starts its own authorized poll.
   useEffect(() => {
+    visit.current++;
+    cursorBlockedRef.current = false;
+    setCursorBlocked(false);
     setPage(null);
-    setShown(0);
+    setShown(null);
+    setVisibleId(null);
+    setReadError(null);
     setError(null);
     setDenied(false);
-    setHasOlder(true);
+    setOlderBusy(false);
     void load();
     const timer = window.setInterval(() => void load(), HUMAN_POLL_MS);
-    return () => window.clearInterval(timer);
+    return () => {
+      visit.current++;
+      latest.current++;
+      window.clearInterval(timer);
+    };
   }, [id, load]);
 
   useEffect(() => {
@@ -266,53 +347,103 @@ export function HumanRoomTimeline({
   }, [refresh, load]);
 
   const loadEarlier = () => {
-    if (!page || page.posts.length === 0 || olderBusy) return;
+    if (!currentPage?.before || !currentPage.more_before || olderBusy) return;
+    const before = currentPage.before;
+    const scope = currentPage.scope_id;
+    const room = id;
+    const requestVisit = visit.current;
+    const stillCurrent = () => activeRoom.current === room && visit.current === requestVisit;
     setOlderBusy(true);
-    readHumanRoom(id, { before: page.posts[0].seq, limit: PAGE })
+    readHumanRoom(room, { before, limit: PAGE })
       .then((older) => {
-        setPage((cur) => (cur ? mergeOlder(cur, older) : cur));
-        setHasOlder(older.posts.length === PAGE);
+        if (!stillCurrent()) return;
+        if (older.scope_id !== scope) {
+          blockHistory(new Error("Room access changed while loading history"));
+          return;
+        }
+        setPage((cur) => (cur?.room === room && cur.scope_id === scope && cur.before === before ? mergeOlder(cur, older) : cur));
       })
-      .catch((e: unknown) => setError(messageOf(e)))
-      .finally(() => setOlderBusy(false));
+      .catch((e: unknown) => {
+        if (!stillCurrent()) return;
+        if (isCursorRefusal(e)) blockHistory(e);
+        else setError(messageOf(e));
+      })
+      .finally(() => {
+        if (stillCurrent()) setOlderBusy(false);
+      });
   };
 
-  // CAD-1423: a post is read only when it is actually visible. The timeline
-  // reports the newest visible seq; loading a page never marks it read.
-  const [visibleSeq, setVisibleSeq] = useState(0);
+  // Only an actually visible post can advance the durable read marker.
   const messagesRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    const root = messagesRef.current;
-    if (!root || typeof IntersectionObserver === "undefined") return;
-    const seen = new Map<Element, boolean>();
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) seen.set(entry.target, entry.isIntersecting);
-        let newestVisible = 0;
-        for (const [el, visible] of seen) {
-          const seq = Number((el as HTMLElement).dataset.seq);
-          if (visible && seq > newestVisible) newestVisible = seq;
-        }
-        if (newestVisible > 0) setVisibleSeq((cur) => (newestVisible > cur ? newestVisible : cur));
-      },
-      { root, threshold: 0.5 },
-    );
-    root.querySelectorAll<HTMLElement>("[data-seq]").forEach((el) => observer.observe(el));
-    return () => observer.disconnect();
-  }, [page]);
+    const changed = () => setDocumentVisible(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", changed);
+    return () => document.removeEventListener("visibilitychange", changed);
+  }, []);
   useEffect(() => {
-    if (visibleSeq <= shown) return;
-    setShown(visibleSeq);
-    void markHumanRead(id, visibleSeq)
-      .then(() => onChanged())
-      .catch(() => undefined);
-  }, [visibleSeq, shown, id, onChanged]);
+    const root = messagesRef.current;
+    if (!root || !currentPage || typeof IntersectionObserver === "undefined") return;
+    const candidates = new Set<HTMLElement>();
+    const positions = new Map(currentPage.posts.map((post, index) => [post.id, index]));
+    const measure = () => {
+      const viewport = root.getBoundingClientRect();
+      let newest = -1;
+      for (const element of candidates) {
+        const bounds = element.getBoundingClientRect();
+        const overlap = Math.max(0, Math.min(bounds.bottom, viewport.bottom) - Math.max(bounds.top, viewport.top));
+        const required = Math.min(bounds.height, viewport.height) * 0.5;
+        const index = positions.get(element.dataset.postId ?? "");
+        if (required > 0 && overlap >= required && index !== undefined && index > newest) newest = index;
+      }
+      setVisibleId(newest < 0 ? null : currentPage.posts[newest].id);
+    };
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        const element = entry.target as HTMLElement;
+        if (entry.isIntersecting) candidates.add(element);
+        else candidates.delete(element);
+      }
+      measure();
+    }, { root, threshold: 0 });
+    root.querySelectorAll<HTMLElement>("[data-post-id]").forEach((el) => observer.observe(el));
+    root.addEventListener("scroll", measure, { passive: true });
+    window.addEventListener("resize", measure);
+    const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    resize?.observe(root);
+    return () => {
+      observer.disconnect();
+      resize?.disconnect();
+      root.removeEventListener("scroll", measure);
+      window.removeEventListener("resize", measure);
+    };
+  }, [currentPage]);
+  useEffect(() => {
+    if (!documentVisible || document.visibilityState !== "visible" || !currentPage || !visibleId) return;
+    const index = currentPage.posts.findIndex((post) => post.id === visibleId);
+    const shownIndex = currentPage.posts.findIndex((post) => post.id === shown);
+    if (index < 0 || index <= shownIndex) return;
+    const post = currentPage.posts[index];
+    let live = true;
+    void markHumanRead(id, post.read_cursor)
+      .then(() => {
+        if (!live) return;
+        setShown(post.id);
+        setReadError(null);
+        onChangedRef.current();
+      })
+      .catch((e: unknown) => {
+        if (!live) return;
+        if (isCursorRefusal(e)) blockHistory(e);
+        else setReadError(messageOf(e));
+      });
+    return () => { live = false; };
+  }, [currentPage, visibleId, shown, id, documentVisible, blockHistory]);
 
   return (
     <div className="threads-timeline">
       <header className="threads-head">
         <div className="threads-kicker">Human room</div>
-        <h2>{page ? page.members.map((m) => m.label).join(" ↔ ") : "Loading…"}</h2>
+        <h2>{currentPage ? currentPage.members.map((m) => m.label).join(" ↔ ") : "Loading…"}</h2>
         <div className="threads-head-actions">
           <Button variant="ghost" size="sm" onClick={onOpenContext} className="threads-context-toggle">
             Context
@@ -323,27 +454,38 @@ export function HumanRoomTimeline({
         <p className="threads-note" role="status">You are not a member of this room.</p>
       ) : error !== null ? (
         <p className="threads-note" role="status">This room could not load: {error}</p>
-      ) : page === null ? (
+      ) : currentPage === null ? (
         <p className="threads-note">Loading…</p>
       ) : null}
+      {readError !== null && <p className="threads-note" role="status">Read status could not be updated: {readError}</p>}
+      {cursorBlocked && (
+        <Button variant="ghost" size="sm" onClick={() => {
+          cursorBlockedRef.current = false;
+          setCursorBlocked(false);
+          setError(null);
+          void load();
+        }}>
+          Reload room
+        </Button>
+      )}
       <div className="threads-messages" aria-live="polite" ref={messagesRef}>
         <CredentialRequestList conversationId={id} />
-        {page && hasOlder && page.posts.length > 0 && (
+        {currentPage?.more_before && currentPage.posts.length > 0 && (
           <Button variant="ghost" size="sm" disabled={olderBusy} onClick={loadEarlier}>
             Earlier
           </Button>
         )}
-        {page?.posts.map((p) => {
+        {currentPage?.posts.map((p) => {
           const mine = p.sender.id === me.id;
           return (
-            <article key={p.id} className="threads-msg" data-seq={p.seq} data-role={mine ? "operator" : "member"}>
+            <article key={p.id} className="threads-msg" data-post-id={p.id} data-role={mine ? "operator" : "member"}>
               <Turn who={mine ? "You" : p.sender.label} at={fmtTime(p.created)} me={mine}>
                 {p.body}
               </Turn>
             </article>
           );
         })}
-        {page && page.posts.length === 0 && <p className="threads-note">No posts yet.</p>}
+        {currentPage && currentPage.posts.length === 0 && <p className="threads-note">No posts yet.</p>}
       </div>
       <ThreadComposerFrame
         showModes={!isDm}

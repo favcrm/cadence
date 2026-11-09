@@ -135,7 +135,7 @@ function IssueWorkspace(props: Props) {
 
 function seatOptions(
   agents: AgentsPayload | null,
-): { alias: string; provider: string; state: string }[] {
+): { alias: string; provider: string; state: string | null }[] {
   return (agents?.agents ?? [])
     .filter((a) => a.provider !== "inbox" && !a.dead)
     .map((a) => ({ alias: a.alias, provider: a.provider, state: a.state }));
