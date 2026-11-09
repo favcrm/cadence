@@ -7921,6 +7921,70 @@ mod agent_credential_refusals {
         }
     }
 
+    // 1b. A cached bearer the board stops accepting is dropped and re-minted
+    // once — the cache must not fail every verb until it ages out.
+    #[test]
+    fn a_cached_credential_401_is_dropped_and_re_minted_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let authorizes = AtomicUsize::new(0);
+        let r = rig(12, move |route, req| {
+            // The first send mints and authorizes; the second send's cached
+            // bearer is the one the board refuses.
+            if agent(req)
+                && route == "authorize"
+                && authorizes.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            {
+                return Some(Reply::Json(401, refused("unauthorized")));
+            }
+            None
+        });
+        let slot = r.slot(CLAIM, 1);
+        r.comment(Some(&slot)).unwrap();
+        r.comment(Some(&slot)).unwrap();
+        assert_eq!(
+            r.trail(),
+            vec![
+                MINT,
+                "authorize:A",
+                "call:A",
+                "authorize:A",
+                MINT,
+                "authorize:A",
+                "call:A",
+            ],
+            "cached 401 was not re-minted exactly once"
+        );
+        assert!(r.notes().is_empty(), "{:?}", r.notes());
+    }
+
+    // 1c. A policy 401 is authorization, not a stale bearer: no re-mint.
+    #[test]
+    fn a_policy_401_on_a_cached_credential_is_not_re_minted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let authorizes = AtomicUsize::new(0);
+        let r = rig(8, move |route, req| {
+            if agent(req)
+                && route == "authorize"
+                && authorizes.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            {
+                return Some(Reply::Json(
+                    401,
+                    json!({"ok": false, "error": {
+                        "code": "unauthorized", "reason": "scope_not_granted"}}),
+                ));
+            }
+            None
+        });
+        let slot = r.slot(CLAIM, 1);
+        r.comment(Some(&slot)).unwrap();
+        r.comment(Some(&slot)).unwrap_err();
+        assert_eq!(
+            r.trail(),
+            vec![MINT, "authorize:A", "call:A", "authorize:A"],
+            "a policy 401 was re-minted"
+        );
+    }
+
     // 2. Exactly `human_session_required` falls back, once; nothing else does.
     #[test]
     fn only_exactly_human_session_required_falls_back_and_says_so_once() {

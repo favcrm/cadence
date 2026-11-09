@@ -2945,11 +2945,12 @@ where
     // lands as RemoteOwner: blanket settings authority with no agent
     // grant binding. A managed caller (CADENCE_ALIAS — worker, master or
     // a daemon-approved argv child under CADENCE_GRANT_TOKEN) spending it
-    // would impersonate the human owner. There is no client-side
-    // agents/<h> credential path yet (remote_auth notes per-agent
-    // enrollment is not configured), so remote settings verbs are refused
-    // for managed callers outright — never narrowed to "no grant" and
-    // never silently allowed. Operators on their own shell unaffected.
+    // would impersonate the human owner. Since CAD-2149 a managed session
+    // does hold an agent credential, but that one is deliberately not
+    // owner-class and binds no settings grant, so settings and master
+    // diagnostics are still refused for managed callers outright — never
+    // narrowed to "no grant" and never silently allowed. Operators on their
+    // own shell are unaffected.
     if (matches!(&command, Commands::Settings { .. })
         || matches!(
             &command,
@@ -2965,9 +2966,8 @@ where
             "settings_agent_session_required",
             format!(
                 "remote `{}` refused for a managed caller: the call would spend the \
-             stored owner login — owner-class settings authority an agent can \
-             never hold — and there is no hosted agent-principal credential to \
-             bind a settings grant to yet; the operator runs this from a plain \
+             stored owner login, and owner-class settings authority is never \
+             delegated to an agent credential; the operator runs this from a plain \
              shell, or grant-bound ops run on the local daemon (`cadence \
              settings agents grant request …`)",
                 name(&command)
@@ -4080,6 +4080,51 @@ mod tests {
             let err = result.unwrap_err();
             assert!(err.to_string().contains("managed caller"), "{err}");
             assert!(err.to_string().contains("Nothing was sent"), "{err}");
+        }
+    }
+
+    // CAD-2165: the managed refusal for owner-class settings names the reason
+    // and refuses before any request, including `master resume`.
+    #[test]
+    fn hosted_settings_is_refused_to_a_managed_caller_before_any_request() {
+        let _lock = crate::cli::org::tests::RESOLVE_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CADENCE_ALIAS", "synthetic-worker");
+        let target = || cadence_agent::remote_cli::RemoteTarget {
+            org: "acme".into(),
+            endpoint: "https://127.0.0.1:1".into(),
+            org_id: "ws_synthetic".into(),
+            identity: None,
+        };
+        let out = [
+            run(
+                target(),
+                Commands::Settings {
+                    action: settings::SettingsAction::Agents {
+                        grant: None,
+                        action: settings::AgentsAction::Show,
+                    },
+                },
+                1,
+                None,
+                Some("settings agents show".into()),
+            ),
+            run(
+                target(),
+                Commands::Master {
+                    action: MasterAction::Resume { grant: None },
+                },
+                1,
+                None,
+                Some("master resume".into()),
+            ),
+        ];
+        std::env::remove_var("CADENCE_ALIAS");
+        for result in out {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("managed caller"), "{error}");
+            assert!(error.to_string().contains("never delegated"), "{error}");
         }
     }
 

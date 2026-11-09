@@ -93,6 +93,13 @@ impl AgentSlot {
     pub(super) fn declined(&self) -> bool {
         self.declined.load(Ordering::SeqCst)
     }
+
+    /// The board no longer accepts the cached bearer. Drop it so the next use
+    /// re-mints instead of failing every verb until it ages out of its own
+    /// lifetime.
+    pub(super) fn invalidate(&self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 static BOUND: Mutex<Option<Arc<AgentSlot>>> = Mutex::new(None);
@@ -104,7 +111,14 @@ pub fn bind_managed_session(slot: AgentSlot) {
 }
 
 /// Test seam: forget the bound session, so a test can prove a path binds none.
+///
+/// CAD-2165: debug builds only. A release binary must never carry a hook that
+/// can reset the managed-session binding. `debug_assertions` keeps plain
+/// `cargo test` and `clippy --all-targets` working (the bin tests call it
+/// without the `test-seam` feature) while excluding it from release builds,
+/// which the release seam check is there to enforce.
 #[doc(hidden)]
+#[cfg(any(debug_assertions, feature = "test-seam"))]
 pub fn unbind_managed_session() {
     *BOUND.lock().unwrap_or_else(|error| error.into_inner()) = None;
 }
@@ -133,6 +147,13 @@ pub(super) fn applies<'a>(
     slot.filter(|slot| slot.serves(target) && !stays_on_login(surface, verb) && !slot.declined())
 }
 
+/// Where the bearer came from. A 401 to a fresh mint is the agent's own
+/// refusal, but a 401 to a cached one means the cache went stale.
+pub(super) enum Source {
+    Cached,
+    Minted,
+}
+
 /// The credential to send now: the cached one while it has time left, else a
 /// fresh mint on the member's login. `Ok(None)` means the login is kept (and
 /// the one line was said); `Err` means nothing was sent.
@@ -142,19 +163,19 @@ pub(super) fn bearer(
     dir: &Path,
     deadline: Instant,
     note: &impl Fn(&str),
-) -> Result<Option<Credential>> {
+) -> Result<Option<(Credential, Source)>> {
     if slot.declined() {
         return Ok(None);
     }
     let at = now()?;
     if let Some(cached) = read_cached(slot, target, at) {
-        return Ok(Some(cached));
+        return Ok(Some((cached, Source::Cached)));
     }
     match mint(slot, target, dir, deadline)? {
         Minted::Credential(cred) => {
             // A cache that cannot be written only costs the next process a mint.
             let _ = write_cache(slot, &cred);
-            Ok(Some(*cred))
+            Ok(Some((*cred, Source::Minted)))
         }
         Minted::Keep(why) => {
             slot.keep_login(note, why);
@@ -219,22 +240,41 @@ fn mint(slot: &AgentSlot, target: &RemoteTarget, dir: &Path, deadline: Instant) 
     // good answer out of its own lifetime.
     let at = now()?;
     let code = refusal_fields(answer.as_ref()).0;
-    match (status, code) {
-        (200, _) => validated(slot, target, answer.as_ref(), at)
+    match mint_outcome(status, code) {
+        MintOutcome::Issued => validated(slot, target, answer.as_ref(), at)
             .map(|cred| Minted::Credential(Box::new(cred))),
-        (404, _) => Ok(Minted::Keep("this board does not offer one")),
-        (409, Some("renewable_login_required")) => Ok(Minted::Keep(
-            "your login has no renewable session to bind it to",
-        )),
-        (500..=599, _) => Err(reject(format!(
+        MintOutcome::Keep(why) => Ok(Minted::Keep(why)),
+        MintOutcome::Server => Err(reject(format!(
             "the board could not issue this session's agent credential (HTTP {status}); \
              nothing was sent, and your login was not used in its place — retry later"
         ))),
-        _ => Err(reject(format!(
+        MintOutcome::Refused => Err(reject(format!(
             "the board refused this session's agent credential (HTTP {status}{}); \
              nothing was sent, and your login was not used in its place",
             code.map_or(String::new(), |code| format!(", {code}"))
         ))),
+    }
+}
+
+/// What one mint answer means. Only a `200` issues a credential, and only the
+/// two documented compatibility answers keep the member's login; every other
+/// answer refuses, because falling back would undo a refusal.
+enum MintOutcome {
+    Issued,
+    Keep(&'static str),
+    Server,
+    Refused,
+}
+
+fn mint_outcome(status: u16, code: Option<&str>) -> MintOutcome {
+    match (status, code) {
+        (200, _) => MintOutcome::Issued,
+        (404, _) => MintOutcome::Keep("this board does not offer one"),
+        (409, Some("renewable_login_required")) => {
+            MintOutcome::Keep("your login has no renewable session to bind it to")
+        }
+        (500..=599, _) => MintOutcome::Server,
+        _ => MintOutcome::Refused,
     }
 }
 
@@ -353,6 +393,15 @@ fn write_cache(slot: &AgentSlot, cred: &Credential) -> Result<()> {
         "access_token": cred.access_token,
         "expires_at": cred.expires_at,
     });
+    // A finished assignment leaves a tombstone beside the cache. Check it
+    // before and after publishing, so a write that races the drop can never
+    // leave a token on disk: whichever path runs last removes the cache.
+    let tombstone = slot.path.with_extension("agent.dropped");
+    let ended = || reject("the assignment has ended; the credential was not kept");
+    if fs::symlink_metadata(&tombstone).is_ok() {
+        let _ = fs::remove_file(&slot.path);
+        return Err(ended());
+    }
     let nonce = uuid::Uuid::new_v4().simple();
     let name = slot
         .path
@@ -369,11 +418,77 @@ fn write_cache(slot: &AgentSlot, cred: &Credential) -> Result<()> {
     let result = (|| {
         file.write_all(body.to_string().as_bytes())?;
         file.sync_all()?;
+        if fs::symlink_metadata(&tombstone).is_ok() {
+            return Err(ended());
+        }
         fs::rename(&tmp, &slot.path)?;
+        if fs::symlink_metadata(&tombstone).is_ok() {
+            let _ = fs::remove_file(&slot.path);
+            return Err(ended());
+        }
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // CAD-2165: only the two documented compatibility answers keep the
+    // member's login. A refusal is never turned into a fallback, because that
+    // would undo the refusal.
+    #[test]
+    fn only_404_and_renewable_login_keep_the_login() {
+        assert!(matches!(mint_outcome(200, None), MintOutcome::Issued));
+        assert!(matches!(mint_outcome(404, None), MintOutcome::Keep(_)));
+        assert!(matches!(
+            mint_outcome(409, Some("renewable_login_required")),
+            MintOutcome::Keep(_)
+        ));
+        for (status, code) in [
+            (401, Some("unauthorized")),
+            (403, Some("human_session_required")),
+            (403, Some("forbidden")),
+            (409, Some("other_conflict")),
+            (400, None),
+        ] {
+            assert!(
+                matches!(mint_outcome(status, code), MintOutcome::Refused),
+                "{status} {code:?} must refuse"
+            );
+        }
+        assert!(matches!(mint_outcome(503, None), MintOutcome::Server));
+    }
+
+    // CAD-2165: the drop's tombstone wins over a cache write, so a token
+    // cannot be re-published after the assignment ended.
+    #[test]
+    fn a_tombstoned_assignment_keeps_no_cached_token() {
+        let dir = std::env::temp_dir().join(format!("cad2165-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = RemoteTarget {
+            org: "acme".into(),
+            endpoint: "https://alpha.example".into(),
+            org_id: "ws_alpha".into(),
+            identity: None,
+        };
+        let path = dir.join("msg_1.agent");
+        let slot = AgentSlot::new(path.clone(), &target, "hla_x".into(), "hlc_y".into(), 1);
+        let cred = credential_from(
+            &target,
+            format!("hct_{}", "a".repeat(43)),
+            vec!["cli.read".into()],
+            4_000_000_000,
+        );
+        write_cache(&slot, &cred).unwrap();
+        assert!(path.exists());
+        std::fs::write(path.with_extension("agent.dropped"), b"1\n").unwrap();
+        write_cache(&slot, &cred).unwrap_err();
+        assert!(!path.exists(), "a cache write after the drop kept a token");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

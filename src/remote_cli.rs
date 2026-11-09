@@ -2184,6 +2184,10 @@ fn team_argument_shape(verb: &str, arguments: &Map<String, Value>) -> Result<()>
 pub const REMOTE_SETTINGS_VERB: &str = "settings_agents";
 pub const REMOTE_MASTER_STATUS_VERB: &str = "master_status";
 
+/// A `401`: the bearer is not accepted. A managed caller may drop a cached
+/// agent credential and re-mint once; it must never fall back to the login.
+pub(super) const CREDENTIAL_REJECTED: &str = "credential_rejected";
+
 /// The hosted scope a `settings_agents` operation needs — the AOS-290
 /// operation table in `hosted-cadence-auth.ts` classifies the same names;
 /// anything not an explicit read fails closed as a write.
@@ -3299,6 +3303,19 @@ fn authorize(
     match status {
         200 => envelope_of(surface, body),
         s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
+        401 => {
+            // Only a 401 about the bearer itself may be answered by re-minting
+            // a cached agent credential. A policy 401 (for example
+            // `scope_not_granted`) is authorization and stays final.
+            let (refusal, _) = decode_refusal(status, body.as_ref());
+            match refusal {
+                Refusal::Authentication | Refusal::Uncertain => Err(Error::invalid(
+                    CREDENTIAL_REJECTED,
+                    refusal_error(status, body.as_ref()).to_string(),
+                )),
+                _ => Err(refusal_error(status, body.as_ref())),
+            }
+        }
         403 if refusal_fields(body.as_ref()).0 == Some(agent_credential::HUMAN_SESSION_REQUIRED) => {
             Err(Error::invalid(
                 agent_credential::HUMAN_SESSION_REQUIRED,
@@ -5437,11 +5454,18 @@ fn call_verb_until_retry(
     // CAD-2149: a managed session's hosted verbs ride its own credential.
     // `None` means the member's login, as for every human shell.
     let mut on_agent = agent_credential::applies(agent, target, surface, verb);
+    let mut reissued = false;
     loop {
         request_timeout(deadline, AUTH_TIMEOUT)?;
-        let agent_cred = match on_agent {
-            Some(slot) => agent_credential::bearer(slot, target, dir, deadline, &note)?,
-            None => None,
+        let (agent_cred, from_cache) = match on_agent {
+            Some(slot) => match agent_credential::bearer(slot, target, dir, deadline, &note)? {
+                Some((credential, source)) => (
+                    Some(credential),
+                    matches!(source, agent_credential::Source::Cached),
+                ),
+                None => (None, false),
+            },
+            None => (None, false),
         };
         let using_agent = agent_cred.is_some();
         let cred = match agent_cred {
@@ -5469,17 +5493,11 @@ fn call_verb_until_retry(
         // settings.* scope; `master_status` needs settings.read. A login
         // without the needed scope is refused here, before a request is
         // built — never downgraded to another verb or the local org.
-        if using_agent && (verb == REMOTE_SETTINGS_VERB || verb == REMOTE_MASTER_STATUS_VERB) {
-            return Err(reject(format!(
-                "a managed agent session can't use `{}` — it needs a person's login; \
-                 nothing was sent",
-                if verb == REMOTE_SETTINGS_VERB {
-                    "settings agents"
-                } else {
-                    "master status"
-                }
-            )));
-        }
+        //
+        // CAD-2165: the managed refusal for these owner-class verbs lives in
+        // `cli::remote`, which runs before this call. It is not repeated here:
+        // duplicating it implied a second authority, and the scope checks
+        // below still refuse an agent credential that lacks the operation.
         if verb == REMOTE_SETTINGS_VERB && !cred.capabilities.is_empty() {
             let operation = arguments
                 .get("operation")
@@ -5529,6 +5547,25 @@ fn call_verb_until_retry(
             if let Some(slot) = on_agent.take() {
                 slot.keep_login(&note, "this workspace has not been updated to accept it");
             }
+            continue;
+        }
+        // CAD-2165: a cached bearer the board no longer accepts (rotation or
+        // revocation) is dropped and re-minted once. A freshly minted bearer is
+        // the agent's own refusal and stays final, and a 401 is answered before
+        // the verb runs, so the retry cannot double-apply a write.
+        let rejected_cached = using_agent
+            && from_cache
+            && !reissued
+            && match &answered {
+                Ok((401, ..)) => true,
+                Err(error) => error.code() == Some(CREDENTIAL_REJECTED),
+                _ => false,
+            };
+        if rejected_cached {
+            if let Some(slot) = on_agent {
+                slot.invalidate();
+            }
+            reissued = true;
             continue;
         }
         let (status, retry_after, body) = answered?;
@@ -6357,9 +6394,11 @@ pub fn web_envelope(response: WebResponse) -> Result<Value> {
 }
 
 mod agent_credential;
-pub use agent_credential::{
-    bind_managed_session, bound_session, unbind_managed_session, AgentSlot,
-};
+pub use agent_credential::{bind_managed_session, bound_session, AgentSlot};
+// The test seam is absent from a release or CI-profile build; only a debug
+// build or the explicit `test-seam` feature may reset the session binding.
+#[cfg(any(debug_assertions, feature = "test-seam"))]
+pub use agent_credential::unbind_managed_session;
 pub mod probe;
 
 #[cfg(test)]
