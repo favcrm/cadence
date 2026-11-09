@@ -532,6 +532,30 @@ fn schemed_endpoints() -> Vec<((&'static str, &'static str), &'static str, &'sta
 }
 
 mod board;
+#[cfg(feature = "test-seam")]
+mod cad2215_agent_activity_scope_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad2215_agent_visibility_race_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad2215_cloud_event_revocation_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad2215_job_events_opaque_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad2215_job_read_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad2215_job_snapshot_reproof_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad2215_message_scope_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad2215_monitor_read_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad2215_scoped_agent_events_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad2215_scoped_alert_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad2215_scoped_cursor_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad2215_task_detail_scope_acceptance;
 mod caller;
 mod cloud_hold;
 mod continuity;
