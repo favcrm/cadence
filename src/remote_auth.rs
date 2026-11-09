@@ -264,6 +264,14 @@ fn load(dir: &Path) -> Result<Credential> {
     serde_json::from_slice(&bytes).map_err(|_| rejected("Credential file is invalid"))
 }
 
+fn load_optional(dir: &Path) -> Result<Option<Credential>> {
+    match fs::symlink_metadata(dir.join("credential.json")) {
+        Ok(_) => Ok(Some(load(dir)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn save(dir: &Path, credential: &Credential) -> Result<()> {
     private_dir(dir, true)?;
     let _lock = credential_lock(dir)?;
@@ -662,6 +670,20 @@ pub fn login(issuer: &str, org: &str, dir: &Path, token_stdin: bool, no_open: bo
 }
 
 pub fn status(dir: Option<&Path>, issuer: Option<&str>, org: Option<&str>) -> Result<i32> {
+    let (report, code) = status_report(dir, issuer, org)?;
+    println!("{report}");
+    Ok(code)
+}
+
+/// CAD-1988: the `auth status` report and its exit code, without printing.
+/// An absent credential is the `no_credential` state and an unreadable store
+/// is `unavailable` — never an internal IO error that tells the operator
+/// nothing about the credential.
+pub fn status_report(
+    dir: Option<&Path>,
+    issuer: Option<&str>,
+    org: Option<&str>,
+) -> Result<(Value, i32)> {
     let (credential, source) = if let Some(token) = std::env::var_os("CADENCE_TOKEN") {
         let token = token
             .into_string()
@@ -674,7 +696,32 @@ pub fn status(dir: Option<&Path>, issuer: Option<&str>, org: Option<&str>) -> Re
             .or_else(|| std::env::var("CADENCE_ORG").ok());
         (environment_credential(token, issuer, org)?, "environment")
     } else {
-        let credential = load(&auth_dir(dir)?)?;
+        let stored = auth_dir(dir)?;
+        let credential = match load_optional(&stored) {
+            Ok(Some(credential)) => credential,
+            Ok(None) => {
+                return Ok((
+                    json!({
+                        "state": "no_credential",
+                        "source": "stored",
+                        "live_verified": false,
+                        "note": "no stored legacy credential; sign in with `cadence login`, or name a hosted workspace with `--org <name>`",
+                    }),
+                    1,
+                ))
+            }
+            Err(_) => {
+                return Ok((
+                    json!({
+                        "state": "unavailable",
+                        "source": "stored",
+                        "live_verified": false,
+                        "note": "the saved credential cannot be read; check its permissions or sign in again",
+                    }),
+                    1,
+                ))
+            }
+        };
         if issuer.is_some_and(|i| issuer_origin(i).ok().as_deref() != Some(&credential.issuer))
             || org.is_some_and(|o| o != credential.org)
         {
@@ -693,11 +740,10 @@ pub fn status(dir: Option<&Path>, issuer: Option<&str>, org: Option<&str>) -> Re
         return Err(rejected("Stored credential expired; sign in again (refresh is not supported by this issuer contract)"));
     }
     let principal = verify(&issuer, &credential.org, &credential.token)?;
-    println!(
-        "{}",
-        json!({"authenticated":true,"source":source,"issuer":issuer,"principal":principal,"expires_at":credential.expires_at,"hosted_cadence":"not_configured","note":CONTRACT_NOTE})
-    );
-    Ok(0)
+    Ok((
+        json!({"authenticated":true,"source":source,"issuer":issuer,"principal":principal,"expires_at":credential.expires_at,"hosted_cadence":"not_configured","note":CONTRACT_NOTE}),
+        0,
+    ))
 }
 
 pub fn logout(dir: &Path) -> Result<i32> {
@@ -718,6 +764,22 @@ pub fn logout(dir: &Path) -> Result<i32> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    // CAD-1988: an absent legacy credential is a state the operator can read,
+    // not an internal IO error.
+    #[test]
+    fn status_report_treats_an_absent_legacy_credential_as_no_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cad1988-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (report, code) = status_report(Some(&dir), None, None).unwrap();
+        assert_eq!(report["state"], "no_credential");
+        assert_eq!(report["source"], "stored");
+        assert_eq!(report["live_verified"], false);
+        assert_eq!(code, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn credential(org: &str) -> Credential {
         Credential {
