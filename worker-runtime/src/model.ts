@@ -199,6 +199,19 @@ function splitSummaryMessages(input: Record<string, unknown>): Record<string, un
   return { ...input, messages };
 }
 
+/**
+ * The gateway refuses a body over 256 KiB before dispatch, and its per-message
+ * limit is separate. A summary is assembled from stored history, so splitting
+ * one oversized message is not enough: the assembled request can still exceed
+ * the total. Refuse it here rather than spend a call the gateway must reject.
+ */
+const SUMMARY_BODY_BYTES = 256 * 1024;
+
+/** The JSON body the transport sends, measured the way the gateway reads it. */
+function requestBytes(input: Record<string, unknown>): number {
+  return new TextEncoder().encode(JSON.stringify(input)).length;
+}
+
 const HISTORICAL_TOOL_RESULT_CHARS = 12_000;
 const HISTORICAL_TOOL_RESULT_NOTICE =
   "\n\n[Earlier tool result shortened to save context. This excerpt is incomplete; read the source again before relying on or editing its full contents.]";
@@ -487,8 +500,23 @@ export function meteredBinding(
           { status: 409 },
         );
       }
-      const summary = isCompaction?.(options?.signal) ? splitSummaryMessages(input) : input;
+      const compacting = isCompaction?.(options?.signal) === true;
+      const summary = compacting ? splitSummaryMessages(input) : input;
       const bounded = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
+      if (compacting && requestBytes(bounded) > SUMMARY_BODY_BYTES) {
+        // A refused summary is terminal, and it must not leave an earlier
+        // attempt's evidence behind: nothing was dispatched under it.
+        budgetProofs?.clear(current);
+        return Response.json(
+          {
+            error: {
+              code: CONTEXT_BUDGET_EXCEEDED,
+              message: CONTEXT_BUDGET_EXCEEDED_TEXT,
+            },
+          },
+          { status: 400 },
+        );
+      }
       const request = (value: Record<string, unknown>) => {
         // Recovery can repeat this task after a crash before the error entry
         // was committed. Never let evidence from the earlier attempt survive.

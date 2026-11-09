@@ -56447,6 +56447,10 @@ function splitSummaryMessages(input) {
   }
   return { ...input, messages };
 }
+var SUMMARY_BODY_BYTES = 256 * 1024;
+function requestBytes(input) {
+  return new TextEncoder().encode(JSON.stringify(input)).length;
+}
 var HISTORICAL_TOOL_RESULT_CHARS = 12000;
 var HISTORICAL_TOOL_RESULT_NOTICE = `
 
@@ -56591,8 +56595,18 @@ function meteredBinding(transport, identity, onModelResolved, maxImagesPerReques
           }
         }, { status: 409 });
       }
-      const summary = isCompaction?.(options?.signal) ? splitSummaryMessages(input) : input;
+      const compacting = isCompaction?.(options?.signal) === true;
+      const summary = compacting ? splitSummaryMessages(input) : input;
       const bounded = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
+      if (compacting && requestBytes(bounded) > SUMMARY_BODY_BYTES) {
+        budgetProofs?.clear(current);
+        return Response.json({
+          error: {
+            code: CONTEXT_BUDGET_EXCEEDED,
+            message: CONTEXT_BUDGET_EXCEEDED_TEXT
+          }
+        }, { status: 400 });
+      }
       const request = (value) => {
         budgetProofs?.clear(current);
         return transport.requestModel(value, current, options?.signal);

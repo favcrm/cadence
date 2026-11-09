@@ -118,6 +118,81 @@ describe("model transport", () => {
     expect(resolved).toEqual(["served-json"]);
   });
 
+  it("refuses a summary the gateway's total budget cannot carry, before dispatch", async () => {
+    const sources = [
+      "a".repeat(300_000),
+      "中".repeat(100_000),
+      '"'.repeat(150_000),
+    ];
+    for (const text of sources) {
+      let dispatched = false;
+      const binding = meteredBinding(
+        {
+          async requestModel() {
+            dispatched = true;
+            return new Response("unexpected dispatch");
+          },
+        },
+        () => identity,
+        undefined,
+        1,
+        undefined,
+        () => true,
+      );
+      const response = (await binding.run(
+        "default",
+        {
+          messages: [
+            { role: "system", content: "Summarize the earlier turns." },
+            { role: "user", content: [{ type: "text", text }] },
+          ],
+        },
+        { returnRawResponse: true },
+      )) as Response;
+      expect(response.status).toBe(400);
+      expect((await response.json()).error.code).toBe(CONTEXT_BUDGET_EXCEEDED);
+      expect(dispatched).toBe(false);
+    }
+  });
+
+  it("dispatches a summary that fits, split under the per-message limit", async () => {
+    const seen: Record<string, unknown>[] = [];
+    const binding = meteredBinding(
+      {
+        async requestModel(input) {
+          seen.push(input);
+          return new Response("data: [DONE]\n\n", {
+            headers: { "content-type": "text/event-stream" },
+          });
+        },
+      },
+      () => identity,
+      undefined,
+      1,
+      undefined,
+      () => true,
+    );
+    const response = (await binding.run(
+      "default",
+      {
+        messages: [
+          { role: "system", content: "Summarize the earlier turns." },
+          { role: "user", content: [{ type: "text", text: "b".repeat(100_000) }] },
+        ],
+      },
+      { returnRawResponse: true },
+    )) as Response;
+    expect(response.status).toBe(200);
+    expect(seen).toHaveLength(1);
+    const messages = seen[0]!.messages as { content: string }[];
+    expect(messages).toHaveLength(3);
+    for (const message of messages.slice(1))
+      expect(message.content.length).toBeLessThanOrEqual(64_000);
+    expect(messages.slice(1).map((message) => message.content).join("")).toBe(
+      "b".repeat(100_000),
+    );
+  });
+
   it("refuses an unsupported resume without dispatching a new model request", async () => {
     let dispatched = false;
     const binding = meteredBinding(
