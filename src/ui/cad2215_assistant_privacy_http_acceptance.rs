@@ -101,13 +101,24 @@ fn private_assistant_and_issue_bound_job_are_visible_only_to_owner_and_operator(
     );
     let alias = binding.alias;
 
-    // The real request binds readable VIS-9. The following rebind to SEC-1
-    // is a synthetic policy transition, not a supported rebind API; task
-    // assignment is synthetic. The actual ownership ledger is unchanged.
+    // The real request binds readable VIS-9. The following move to SEC-1 is a
+    // synthetic policy transition, not a supported rebind API; task
+    // assignment is synthetic. The accepted-request row moves with it because
+    // the store treats a job whose queue row names a different issue as
+    // untrusted provenance and denies it to every reader, its owner included
+    // (`PRIVATE_PROVENANCE_CTE`); the ownership ledger itself is unchanged.
     let db = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
     assert_eq!(
         db.execute("UPDATE jobs SET issue_id='SEC-1' WHERE id=?1", [&job])
             .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute(
+            "UPDATE assist_request_queue SET issue='SEC-1' WHERE job_id=?1",
+            [&job]
+        )
+        .unwrap(),
         1
     );
     let task: String = db
@@ -245,10 +256,21 @@ fn shared_project_and_worker_do_not_grant_another_members_assistant_job() {
 
     // Synthetic issue transition and dispatch assignment only; these do not
     // create or replace the real owner/subscriber ledger or claim a rebind API.
+    // The accepted-request row moves with the job so the ledger agrees with
+    // itself: a queue row naming a different issue is untrusted provenance and
+    // is denied to every reader, its owner included.
     let db = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
     assert_eq!(
         db.execute("UPDATE jobs SET issue_id='VIS-1' WHERE id=?1", [&job])
             .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute(
+            "UPDATE assist_request_queue SET issue='VIS-1' WHERE job_id=?1",
+            [&job]
+        )
+        .unwrap(),
         1
     );
     let task: String = db
@@ -365,11 +387,21 @@ fn hosted_cli_paginates_after_private_assistant_job_visibility() {
     assert!(!shared.store.job_is_subscriber(&job, ORG, "ben").unwrap());
 
     // Synthetic issue transition and ordinary-worker assignment; this does
-    // not claim a supported rebind API. Ownership is from the signed request.
+    // not claim a supported rebind API. Ownership is from the signed request,
+    // and the accepted-request row moves with the job so the ledger agrees
+    // with itself.
     let db = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
     assert_eq!(
         db.execute("UPDATE jobs SET issue_id='VIS-1' WHERE id=?1", [&job])
             .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute(
+            "UPDATE assist_request_queue SET issue='VIS-1' WHERE job_id=?1",
+            [&job]
+        )
+        .unwrap(),
         1
     );
     let private_task: String = db

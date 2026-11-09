@@ -114,7 +114,7 @@ impl ThreadStream {
 #[test]
 fn signed_board_thread_pages_and_stream_enforce_project_and_private_ownership() {
     let _flag = AssistantFlagOn::arm();
-    let rig = start(&["ana", "ben"]);
+    let (rig, events) = queue_rig(&["ana", "ben"]);
     let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     let shared = shared(&rig);
@@ -229,7 +229,10 @@ fn signed_board_thread_pages_and_stream_enforce_project_and_private_ownership() 
     }
 
     // A real assistant request supplies the canonical private ownership
-    // ledger and readable issue binding. The dispatch assignment is synthetic.
+    // ledger and readable issue binding. The immediate receipt names no job,
+    // so the canonical id comes from the owner's request list once the
+    // daemon's own promotion worker reports `created`. The dispatch
+    // assignment is synthetic.
     let env = rig.envelope("ana", json!({}), json!({}));
     let (status, requested) = rig.call("job_request", &env,
         &json!({"title":"CAD2215_THREAD_PRIVATE_JOB", "request_key":"cad2215-thread-private", "issue":"VIS-9"}));
@@ -237,7 +240,8 @@ fn signed_board_thread_pages_and_stream_enforce_project_and_private_ownership() 
         status, 200,
         "signed assistant job request failed: {requested}"
     );
-    let job = requested["job"].as_str().expect("canonical job");
+    let job = promoted_job(&rig, &events, "ana", &requested);
+    let job = job.as_str();
     let binding = shared
         .store
         .assistant_binding(ORG, "ana")
@@ -265,6 +269,17 @@ fn signed_board_thread_pages_and_stream_enforce_project_and_private_ownership() 
     assert_eq!(
         db.execute("UPDATE jobs SET issue_id='VIS-1' WHERE id=?1", [job])
             .unwrap(),
+        1
+    );
+    // The accepted-request row moves with the job: a queue row naming a
+    // different issue is untrusted provenance and is denied to every reader,
+    // its owner included.
+    assert_eq!(
+        db.execute(
+            "UPDATE assist_request_queue SET issue='VIS-1' WHERE job_id=?1",
+            [job]
+        )
+        .unwrap(),
         1
     );
     // Independently prove ownership after the project binding is in place.

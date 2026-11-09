@@ -150,11 +150,20 @@ fn signed_board_milestones_and_epics_scope_projects_and_private_job_outcomes() {
     assert!(!shared.store.job_is_subscriber(&job, ORG, "ben").unwrap());
     let db = rusqlite::Connection::open(rig._dir.path().join("cadence.sqlite3")).unwrap();
     // Synthetic issue transition, not a supported rebind API; owner
-    // provenance remains the real signed assistant-request ledger. The hidden
+    // provenance remains the real signed assistant-request ledger, and that
+    // ledger's accepted row moves with the job so the two agree. The hidden
     // task is blocked so operator derived status must actually change.
     assert_eq!(
         db.execute("UPDATE jobs SET issue_id='VIS-2' WHERE id=?1", [&job])
             .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute(
+            "UPDATE assist_request_queue SET issue='VIS-2' WHERE job_id=?1",
+            [&job]
+        )
+        .unwrap(),
         1
     );
     assert!(

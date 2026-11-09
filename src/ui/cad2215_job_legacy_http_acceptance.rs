@@ -233,11 +233,22 @@ fn private_fixture(
     // Every legacy row has a readable issue and task list. Otherwise the
     // pre-existing project/unbound guard would reject before the new guard.
     assert_eq!(db.execute("UPDATE jobs SET issue_id='VIS-1' WHERE id IN ('cad2215-secret-job','cad2215-free-job')", []).unwrap(), 2);
-    // The ownership ledger comes from the real request above. The issue rebind
-    // and worker assignment are synthetic fixture setup, not a supported API.
+    // The ownership ledger comes from the real request above. The issue
+    // transition and worker assignment are synthetic fixture setup, not a
+    // supported API; the accepted-request row moves with the job so the two
+    // agree, because a queue row naming a different issue is untrusted
+    // provenance and is denied to every reader, its owner included.
     assert_eq!(
         db.execute("UPDATE jobs SET issue_id='VIS-1' WHERE id=?1", [&job])
             .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute(
+            "UPDATE assist_request_queue SET issue='VIS-1' WHERE job_id=?1",
+            [&job]
+        )
+        .unwrap(),
         1
     );
     let task: String = db
