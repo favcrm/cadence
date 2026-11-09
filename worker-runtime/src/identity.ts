@@ -122,18 +122,21 @@ export function readCompactionIdentity(sql: TaskSql, taskId: number): Generation
   try {
     const rows = sql
       .exec(
-        `SELECT id, record FROM pi_tasks
+        `SELECT id, conversation_id, record FROM pi_tasks
           WHERE id = ? AND kind = '"pi.compaction"' AND status = 'running'`,
         taskId,
       )
       .toArray();
-    if (rows.length !== 1 || Number(rows[0]?.id) !== taskId) return null;
-    const record = parseRecord(rows[0]?.record);
+    const row = rows[0];
+    if (rows.length !== 1 || row?.id !== taskId) return null;
+    const record = parseRecord(row.record);
     const state = record?.state;
     if (typeof state !== "object" || state === null || Array.isArray(state)) return null;
     const checkpoint = (state as Record<string, unknown>).checkpoint;
     if (
-      record?.kind !== "pi.compaction" ||
+      record?.id !== taskId ||
+      record.conversationId !== row.conversation_id ||
+      record.kind !== "pi.compaction" ||
       (state as Record<string, unknown>).status !== "running" ||
       typeof checkpoint !== "object" ||
       checkpoint === null ||
@@ -142,11 +145,10 @@ export function readCompactionIdentity(sql: TaskSql, taskId: number): Generation
       return null;
     const request = checkpoint as Record<string, unknown>;
     if (request.phase !== "summarize") return null;
-    const part = (value: unknown): string | null => {
-      if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
-        return String(value);
-      return typeof value === "string" && IDENTITY_PART.test(value) ? value : null;
-    };
+    const part = (value: unknown): string | null =>
+      typeof value === "number" && Number.isSafeInteger(value) && value > 0
+        ? String(value)
+        : null;
     const conversation = part(record.conversationId);
     const cutoff = part(request.tail);
     if (conversation === null || cutoff === null) return null;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { readGenerationIdentity, type TaskSql } from "../src/identity.ts";
+import { readCompactionIdentity, readGenerationIdentity, type TaskSql } from "../src/identity.ts";
 
 const sql = (rows: Record<string, unknown>[]): TaskSql => ({
   exec: () => ({ toArray: () => rows }),
@@ -110,5 +110,32 @@ describe("generation identity adapter", () => {
         ]),
       ),
     ).toBeNull();
+  });
+});
+
+describe("compaction identity adapter", () => {
+  const row = (conversationId: unknown, tail: unknown, id: unknown = 9, owner: unknown = 1) => ({
+    id: 9,
+    conversation_id: owner,
+    record: JSON.stringify({
+      id,
+      conversationId,
+      kind: "pi.compaction",
+      state: { status: "running", checkpoint: { phase: "summarize", tail } },
+    }),
+  });
+
+  it("uses the durable task's numeric conversation and checkpoint tail", () => {
+    expect(readCompactionIdentity(sql([row(1, 12)]), 9))
+      .toEqual({ conversation: "1", task: "9", cutoff: "12" });
+  });
+
+  it("refuses malformed or inconsistent durable task identities", () => {
+    for (const invalid of ["not-a-tail", "12", 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, null]) {
+      expect(readCompactionIdentity(sql([row(1, invalid)]), 9)).toBeNull();
+      expect(readCompactionIdentity(sql([row(invalid, 12)]), 9)).toBeNull();
+    }
+    expect(readCompactionIdentity(sql([row(1, 12, 10)]), 9)).toBeNull();
+    expect(readCompactionIdentity(sql([row(1, 12, 9, 2)]), 9)).toBeNull();
   });
 });

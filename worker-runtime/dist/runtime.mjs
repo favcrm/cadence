@@ -56059,25 +56059,22 @@ function readCompactionIdentity(sql, taskId) {
   if (!Number.isSafeInteger(taskId) || taskId <= 0)
     return null;
   try {
-    const rows = sql.exec(`SELECT id, record FROM pi_tasks
+    const rows = sql.exec(`SELECT id, conversation_id, record FROM pi_tasks
           WHERE id = ? AND kind = '"pi.compaction"' AND status = 'running'`, taskId).toArray();
-    if (rows.length !== 1 || Number(rows[0]?.id) !== taskId)
+    const row = rows[0];
+    if (rows.length !== 1 || row?.id !== taskId)
       return null;
-    const record = parseRecord(rows[0]?.record);
+    const record = parseRecord(row.record);
     const state = record?.state;
     if (typeof state !== "object" || state === null || Array.isArray(state))
       return null;
     const checkpoint = state.checkpoint;
-    if (record?.kind !== "pi.compaction" || state.status !== "running" || typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint))
+    if (record?.id !== taskId || record.conversationId !== row.conversation_id || record.kind !== "pi.compaction" || state.status !== "running" || typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint))
       return null;
     const request = checkpoint;
     if (request.phase !== "summarize")
       return null;
-    const part = (value) => {
-      if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
-        return String(value);
-      return typeof value === "string" && IDENTITY_PART.test(value) ? value : null;
-    };
+    const part = (value) => typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? String(value) : null;
     const conversation = part(record.conversationId);
     const cutoff = part(request.tail);
     if (conversation === null || cutoff === null)
