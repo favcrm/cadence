@@ -581,6 +581,9 @@ cadence --org acme connection sites <connection-id>
 cadence --org acme connection select-site <connection-id> 'sc-domain:example.test'
 ```
 
+The site list includes `selected`, the exact property currently pinned or
+`null`.
+
 The selected property is stored by its exact provider identifier; it is not
 normalized. Only `siteOwner` and `siteFullUser` properties can be selected — a
 restricted or unverified property is refused. Once a property is selected,
