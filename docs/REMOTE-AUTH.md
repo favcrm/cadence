@@ -76,11 +76,20 @@ requires both selectors, and is never persisted. Invalid environment credentials
 fail without falling back to stored credentials. `login --token-stdin` explicitly
 uses stdin; browser login explicitly uses a new grant, regardless of environment.
 
-All status checks contact the issuer, so expired/revoked credentials fail on
-the next check. Redirects are refused; bearer credentials are never forwarded
-to another host. CLI network connections require HTTPS origins without paths,
-userinfo, query strings or fragments. No issuer response body or credential is
-printed on errors.
+An issuer-status check contacts the issuer, so an expired or revoked
+ephemeral credential fails on the next check. A saved hosted workspace is
+different: with `--org <name>`, a saved selection, or exactly one registered
+remote, `cadence auth status` reports that session's local state without any
+issuer call — `state`, `scopes`, `access_expires_at`,
+`session_idle_expires_at`, `session_absolute_expires_at` and
+`live_verified: false`. The states are `renewable` and
+`access_valid_until_expiry` (exit 0) and `reauthentication_required`,
+`no_credential`, `invalid_local_credential` and `unavailable` (exit 1). A
+present `CADENCE_TOKEN` still wins, and explicit `--issuer` or `--auth-dir`
+keep the issuer path. Redirects are refused; bearer credentials are never
+forwarded to another host. CLI network connections require HTTPS origins
+without paths, userinfo, query strings or fragments. No issuer response body
+or credential is printed on errors.
 
 ## Storage and logout
 

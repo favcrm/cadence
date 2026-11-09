@@ -4493,6 +4493,17 @@ pub fn local_status(target: &RemoteTarget) -> Value {
     }
 }
 
+/// CAD-1988: the documented `auth status` object for one hosted workspace and
+/// the exit code a status read should carry. Local only; no network call.
+pub fn status_report(dir: &Path, target: &RemoteTarget) -> (Value, i32) {
+    let report = local_status_at(dir, target);
+    let code = match report["state"].as_str() {
+        Some("renewable" | "access_valid_until_expiry") => 0,
+        _ => 1,
+    };
+    (report, code)
+}
+
 /// `local_status` with the credential dir injectable, so tests never touch the
 /// real config directory. Only a missing file is absence. A permission or I/O
 /// error is `unavailable`, never a claim that no credential exists.
