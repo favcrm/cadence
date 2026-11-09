@@ -2266,6 +2266,24 @@ impl Shared {
                          recorded against a different issue",
                     ));
                 }
+                // CAD-2215: a replay must not confirm a request whose job the
+                // member can no longer reach. The job's OWN issue is what a
+                // later read is admitted against, so re-prove it here. This
+                // deliberately does not consult the ownership ledger: the
+                // receipt never depended on the internal job, and the crash
+                // window (queue row not yet completed, issue unchanged) still
+                // replays. Only a job whose issue has become unreadable — the
+                // reachable form of losing access — refuses.
+                if let Ok(job) = self.store.job(&record.planned_job_id) {
+                    if let Some(bound) = job.issue_id.as_deref() {
+                        if self.member_issue_readable(&scope, bound).is_err() {
+                            return Err(Error::rejected(
+                                "member job request replay refused: the job recorded for this \
+                                 request_key is no longer readable",
+                            ));
+                        }
+                    }
+                }
                 record
             }
             None => {

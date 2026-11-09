@@ -4867,7 +4867,17 @@ pub fn cloud_agent_peer_owner(
         }
         found = Some(pin);
     }
-    found.ok_or_else(|| reject("no enrolled cloud-peer credential for this source"))
+    found.ok_or_else(|| {
+        // No record at all is MISSING authority for this source, and the
+        // projection withholds the row and names that reason rather than
+        // failing the page — a page failure would disclose the row's
+        // existence. A present-but-expired or mismatched record stays a
+        // plain refusal: it names a credential the operator must repair.
+        Error::gate_coded(
+            "cloud_agent_authority_missing",
+            "no enrolled cloud-peer credential for this source",
+        )
+    })
 }
 
 fn load_peer(

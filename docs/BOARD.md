@@ -401,7 +401,10 @@ before its effects. It needs the operator-enrolled `hosted-board`
 `assist.revalidate` service credential; a revoked credential, removed member,
 inaccessible issue or unavailable service fails closed. The request does not
 approve or dispatch work. One issue can have only one nonterminal job.
-Replaying a request key cannot retarget it to a different issue.
+Replaying a request key cannot retarget it to a different issue, and a replay
+refuses once the job that request created is bound to an issue the member can
+no longer read. The replay does not depend on the ownership ledger, so a
+request whose promotion was interrupted still replays.
 
 `member_job_list` adds owner-only `requests` rows
 `{request_id, issue, status, job, reason}`, filtered by the issues the member
@@ -549,11 +552,13 @@ positions. `cadence thread show` requires the corresponding per-response
 acknowledgement and refuses an older or malformed daemon page.
 
 This is not yet a complete private-activity boundary. Relayed member and
-`read_as` thread pages still expose global positions. On an ordinary thread,
-cloud admission can also fail because a same-agent row belongs to an
-unverifiable foreign owner on another credential target; that failure can
-reveal the row's existence. The owner identity must be proved independently
-of the hidden row to close that remaining oracle.
+`read_as` thread pages still expose global positions. On an ordinary thread, a
+cloud row whose owner has **no** enrolled credential for the target is
+withheld (`cloud_agent_authority_missing`) instead of failing the page, so its
+presence is not disclosed. A record that exists but has expired, is
+ambiguous, or names another verified owner still refuses the page, and that
+refusal remains an existence signal; proving the owner identity independently
+of the hidden row would close it.
 
 For scoped job-event, agent-event, topic, monitor-alert, human-room,
 member-assistant history and direct-agent thread reads, an operator provisions
