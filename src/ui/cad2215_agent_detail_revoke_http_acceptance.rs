@@ -71,6 +71,7 @@ fn revoke_race_get(port: u16, host: &str, cookie: &str, path: &str) -> (u16, Str
 fn private_assistant_detail_reproves_target_after_binding_revocation() {
     let _flag = AssistantFlagOn::arm();
     let mut rig = start(&["ana"]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     let env = rig.envelope("ana", json!({}), json!({}));
     let (status, state) = rig.call("assist_state", &env, &json!({}));
@@ -208,6 +209,7 @@ fn private_assistant_detail_reproves_target_after_binding_revocation() {
 fn private_assistant_detail_rejects_real_event_guard_failure_after_revocation() {
     let _flag = AssistantFlagOn::arm();
     let mut rig = start(&["ana"]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     let env = rig.envelope("ana", json!({}), json!({}));
     let (status, state) = rig.call("assist_state", &env, &json!({}));
@@ -472,6 +474,9 @@ fn agent_detail_native_role_rig(demoted: Arc<AtomicBool>) -> Rig {
 fn in_flight_operator_agent_detail_rechecks_live_role_after_demotion() {
     let demoted = Arc::new(AtomicBool::new(false));
     let mut rig = agent_detail_native_role_rig(demoted.clone());
+    // Scoped member reads need bound key material before they can be judged
+    // as authorized or refused.
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     let opts = ServeOptions::default();
     opts.provider_env

@@ -157,6 +157,7 @@ fn envelope(rig: &Rig, sub: &str) -> String {
 #[test]
 fn named_member_cannot_acknowledge_a_hidden_or_visible_alert_numerically() {
     let rig = start(&[]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     let member = login(&rig, "cad2215-monitor-member", "member");
     let owner = login(&rig, "cad2215-monitor-owner", "owner");

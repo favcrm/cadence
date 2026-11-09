@@ -26,6 +26,7 @@ fn board_get_status(rig: &Rig, cookie: &str, path: &str) -> (u16, Value) {
 fn signed_board_same_project_does_not_expose_private_job_or_foreign_assistant() {
     let _flag = AssistantFlagOn::arm();
     let (rig, events) = queue_rig(&["ana", "ben"]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     // Make every registered project readable to both members so the actual
     // member SSE admission is a positive control, not a project-wide denial.

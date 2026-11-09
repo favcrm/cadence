@@ -25,6 +25,7 @@ fn row<'a>(payload: &'a Value, collection: &str, id: &str) -> &'a Value {
 fn signed_board_milestones_and_epics_scope_projects_and_private_job_outcomes() {
     let _flag = AssistantFlagOn::arm();
     let (rig, events) = queue_rig(&["ana", "ben"]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     // Seed real declared milestones, epic parents and children on both sides
     // of the existing workspace-visible/private project boundary.

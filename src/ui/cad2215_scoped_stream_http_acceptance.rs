@@ -729,6 +729,7 @@ fn promoted_member_job(
 fn project_reader_gets_no_frame_for_another_members_private_job() {
     let _flag = AssistantFlagOn::arm();
     let (rig, queue_events) = start_queued(&["ana", "ben"]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     freeze_monitors(&rig);
     // The reader may see every project; the hidden unit is the private job
@@ -1442,6 +1443,7 @@ fn unreadable_delivery_projection_closes_an_open_member_stream() {
 fn sequential_shared_worker_private_task_after_visible_completion() {
     let _flag = AssistantFlagOn::arm();
     let (rig, queue_events) = start_queued(&["ana", "ben"]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     freeze_monitors(&rig);
 

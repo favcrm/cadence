@@ -226,6 +226,7 @@ fn board_refuses_each_unacknowledged_agent_relay_without_breaking_operator_recov
         let _ = tx.send((id.to_string(), outcome.to_string()));
     });
     let rig = agent_legacy_rig(flags.clone(), observer);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     // Both members can read the relevant project; private membership of a
     // particular job, not the project policy, is the distinction under test.

@@ -157,6 +157,7 @@ fn signed_assistant_job_reads_require_current_readable_issue_binding_and_authori
 fn signed_idempotent_job_request_replay_requires_current_readable_binding() {
     let _flag = AssistantFlagOn::arm();
     let (rig, events) = queue_rig(&["ana"]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     let args = json!({"title":"CAD2215_REPLAY_PRIVATE_TITLE", "request_key":"cad2215-replay-binding", "issue":"VIS-9"});
     let (status, created) = assist_call(&rig, "ana", "job_request", args.clone());

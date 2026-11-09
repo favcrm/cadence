@@ -212,6 +212,10 @@ impl LocalStream {
 #[test]
 fn anonymous_loopback_reads_cannot_inherit_operator_project_authority() {
     let rig = start(&[]);
+    // Scoped member reads need the operator-provisioned keyring; without it
+    // the daemon answers `scoped_cursor_unavailable`, not an authorization
+    // verdict.
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     let opts = ServeOptions::default();
     opts.provider_env

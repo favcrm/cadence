@@ -266,6 +266,7 @@ fn mixed_version_job_relay_fails_closed_for_http_and_shared_sse() {
     {
         let (observer, outcomes) = queue_observer();
         let rig = start_with_queue_service(&["ana", "ben"], Some(observer), true);
+        let _keys = initialize_queue_keyring(&rig);
         let (job, task) = private_fixture(&rig, &outcomes);
         let ana = login(&rig, "ana", "member");
         let ben = login(&rig, "ben", "member");

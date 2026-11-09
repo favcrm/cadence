@@ -320,6 +320,11 @@ fn seed(rig: &Rig) {
 #[test]
 fn signed_member_cannot_read_private_or_unbound_work_but_owner_can_recover_it() {
     let rig = start(&[]);
+    // Scoped member reads page through the opaque cursor codec, which needs
+    // the operator-provisioned keyring this daemon would carry after
+    // `daemon cursor-key-init`. Without it the daemon answers
+    // `scoped_cursor_unavailable`, which is not an authorization verdict.
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     let member = login(&rig, "cad2215-member", "member");
     let owner = login(&rig, "cad2215-owner", "owner");

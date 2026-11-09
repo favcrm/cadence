@@ -115,6 +115,7 @@ impl ThreadStream {
 fn signed_board_thread_pages_and_stream_enforce_project_and_private_ownership() {
     let _flag = AssistantFlagOn::arm();
     let rig = start(&["ana", "ben"]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     let shared = shared(&rig);
     // Synthetic fixture setup: unattributed task enqueues do not create home threads.

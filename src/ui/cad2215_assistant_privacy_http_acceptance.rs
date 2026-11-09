@@ -61,6 +61,7 @@ fn read_as(rig: &Rig, sub: &str, owner: bool, verb: &str, args: Value) -> (u16, 
 fn private_assistant_and_issue_bound_job_are_visible_only_to_owner_and_operator() {
     let _flag = AssistantFlagOn::arm();
     let (rig, events) = queue_rig(&["ana", "ben"]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     // Ana alone is granted the private project. Ben is a signed member of
     // the same workspace but has neither the project grant nor subscription.
@@ -202,6 +203,7 @@ fn private_assistant_and_issue_bound_job_are_visible_only_to_owner_and_operator(
 fn shared_project_and_worker_do_not_grant_another_members_assistant_job() {
     let _flag = AssistantFlagOn::arm();
     let (rig, events) = queue_rig(&["ana", "ben"]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
 
     // VIS-1 is workspace-visible to both members. The job is nevertheless
@@ -343,6 +345,7 @@ fn shared_project_and_worker_do_not_grant_another_members_assistant_job() {
 fn hosted_cli_paginates_after_private_assistant_job_visibility() {
     let _flag = AssistantFlagOn::arm();
     let (rig, events) = queue_rig(&["ana", "ben"]);
+    let _keys = initialize_queue_keyring(&rig);
     seed(&rig);
     let envelope = rig.envelope("ana", json!({}), json!({}));
     let (status, requested) = rig.call("job_request", &envelope,
