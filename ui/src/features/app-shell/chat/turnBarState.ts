@@ -104,6 +104,15 @@ export function turnBarState(input: TurnBarInput, conversationId: string | null)
     if (reason !== null) return { kind: "failed", reason, message: last.message ?? null };
     if (last.payload?.status === "interrupted" || last.payload?.status === "stopped") return { kind: "stopped" };
   }
+  // A blocking compaction that failed leaves no stored entry, so the runtime
+  // reports it on the master state until a later record owns the thread. It
+  // is the conversation's current condition, not a historic outcome, so a
+  // reload still shows it.
+  const compactionFailure =
+    typeof master?.compaction_failure === "string" ? master.compaction_failure.trim() : "";
+  if (compactionFailure !== "") {
+    return { kind: "failed", reason: compactionFailure, message: null };
+  }
   return { kind: "idle" };
 }
 

@@ -724,6 +724,11 @@ export interface MasterState {
   /** Queued master messages in delivery order (max 20). */
   queue?: { message: string; conversation?: string | null }[];
   queued?: number;
+  /**
+   * The runtime's own sentence for a blocking compaction that failed and left
+   * its run unanswered, or null. Never provider text.
+   */
+  compaction_failure?: string | null;
   /** CAD-1817: the workspace coordinator's committed identity — its own
    *  protected IDENTITY/SOUL projection, never a member's private profile.
    *  Generated as `MasterIdentity` from the daemon's Rust type. */
