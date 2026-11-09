@@ -27,6 +27,8 @@ import type {
   AppsPayload,
   ConnectionPayload,
   ConnectionProvidersPayload,
+  ConnectionSitePayload,
+  ConnectionSitesPayload,
   ConnectionsPayload,
   ConnectionVerificationPayload,
   CredentialRequest,
@@ -1171,6 +1173,20 @@ export const api = {
   /** `GET /api/connections/<id>` — one connection's metadata (operator-only). */
   connection: (id: string) =>
     get<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}`),
+  /**
+   * `GET /api/connections/<id>/sites` — the live Search Console properties
+   * and the current connection-level pin (operator-only). A provider
+   * refusal is an error, never an empty list.
+   */
+  connectionSites: (id: string) =>
+    get<ConnectionSitesPayload>(`/api/connections/${encodeURIComponent(id)}/sites`),
+  /**
+   * `POST /api/connections/<id>/site` — pin one verified Search Console
+   * property (operator-only). The server re-reads the provider list before
+   * storing the exact identifier.
+   */
+  connectionSelectSite: (id: string, body: { site_url: string }) =>
+    post<ConnectionSitePayload>(`/api/connections/${encodeURIComponent(id)}/site`, body),
   /**
    * `POST /api/connections` — enroll a scoped token for a supported
    * provider (CAD-688). Operator-only. The token crosses this one
