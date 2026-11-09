@@ -561,11 +561,25 @@ describe("projectedThreadEntries", () => {
   });
 
   it("names a failed compaction only while its run is unanswered", () => {
+    const failure = { id: 30, message: "Summarization failed: The context limit was reached." };
     const answered = [input("1", "hello"), assistant("2", [{ type: "text", text: "answer" }], "stop")];
-    const failure = "Summarization failed: The context limit was reached.";
     expect(
       projectedThreadEntries(answered, false, undefined, undefined, undefined, failure),
     ).toEqual(threadEntries(answered, false));
+    // A tool round is not an answer, so the run still owes one.
+    const toolRound = [
+      input("1", "read it"),
+      assistant(
+        "2",
+        [{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "ls" } }],
+        "toolUse",
+      ),
+      toolResult("3", "t1", "a.txt"),
+    ];
+    expect(
+      projectedThreadEntries(toolRound, false, undefined, undefined, undefined, failure).at(-1)
+        ?.payload,
+    ).toEqual({ status: "failed", error: "The model request failed." });
     const unanswered = projectedThreadEntries(
       records,
       false,
@@ -574,9 +588,12 @@ describe("projectedThreadEntries", () => {
       undefined,
       failure,
     );
-    expect(unanswered.at(-1)?.payload).toEqual({
-      status: "failed",
-      error: "The model request failed.",
+    expect(unanswered.at(-1)).toEqual({
+      seq: 30,
+      role: "agent",
+      kind: "turn_result",
+      text: "",
+      payload: { status: "failed", error: "The model request failed." },
     });
     expect(
       projectedThreadEntries(
@@ -585,7 +602,7 @@ describe("projectedThreadEntries", () => {
         undefined,
         undefined,
         undefined,
-        `Summarization failed: ${CONTEXT_BUDGET_EXCEEDED_TEXT}`,
+        { id: 30, message: `Compaction failed: ${CONTEXT_BUDGET_EXCEEDED_TEXT}` },
       ).at(-1)?.payload,
     ).toEqual({ status: "failed", error: CONTEXT_BUDGET_EXCEEDED_TEXT });
   });

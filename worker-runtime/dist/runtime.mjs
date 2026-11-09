@@ -56185,9 +56185,12 @@ function readCompactionFailure(sql, conversationId, afterEntryId) {
     const row = rows[0];
     if (row === undefined || !Number.isSafeInteger(row.id))
       return null;
-    if (Number.isSafeInteger(afterEntryId) && Number(row.id) <= afterEntryId)
+    const id = Number(row.id);
+    if (Number.isSafeInteger(afterEntryId) && id <= afterEntryId)
       return null;
     const record = parseRecord(row.record);
+    if (!Number.isSafeInteger(record?.owner))
+      return null;
     const state = record?.state;
     if (typeof state !== "object" || state === null || Array.isArray(state))
       return null;
@@ -56204,7 +56207,7 @@ function readCompactionFailure(sql, conversationId, afterEntryId) {
     if (typeof error !== "object" || error === null || Array.isArray(error))
       return null;
     const message = error.message;
-    return typeof message === "string" && message.length > 0 ? message : null;
+    return typeof message === "string" && message.length > 0 ? { id, message } : null;
   } catch {
     return null;
   }
@@ -57795,15 +57798,15 @@ function projectedThreadEntries(records, includeThinking, project, budgetProof, 
         lastOperator = index;
         break;
       }
-    if (lastOperator !== -1 && !projected.slice(lastOperator + 1).some((entry) => entry.role === "agent"))
+    if (lastOperator !== -1 && !projected.slice(lastOperator + 1).some((entry) => entry.role === "agent" && entry.kind === "turn_result"))
       projected.push({
-        seq: projected.length + 1,
+        seq: failure.id,
         role: "agent",
         kind: "turn_result",
         text: "",
         payload: {
           status: "failed",
-          error: failure.includes(CONTEXT_BUDGET_EXCEEDED_TEXT) ? CONTEXT_BUDGET_EXCEEDED_TEXT : failedTurnReason(failure)
+          error: failure.message.includes(CONTEXT_BUDGET_EXCEEDED_TEXT) ? CONTEXT_BUDGET_EXCEEDED_TEXT : failedTurnReason(failure.message)
         }
       });
   }

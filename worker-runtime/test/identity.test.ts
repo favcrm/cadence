@@ -114,22 +114,38 @@ describe("generation identity adapter", () => {
 });
 
 describe("failed compaction adapter", () => {
-  const task = (id: number, conversationId: number, outcome: unknown) => ({
+  const task = (
+    id: number,
+    conversationId: number,
+    outcome: unknown,
+    owner: unknown = 5,
+  ) => ({
     id,
     record: JSON.stringify({
       conversationId,
       kind: "pi.compaction",
+      ...(owner === null ? {} : { owner }),
       state: { status: "terminal", outcome },
     }),
   });
   const failed = (id: number, conversationId: number, message: string) =>
     task(id, conversationId, { status: "failed", error: { message } });
 
-  it("names the newest failure that no later entry supersedes", () => {
-    expect(readCompactionFailure(sql([failed(30, 1, "Summarization failed.")]), 1, 20))
-      .toBe("Summarization failed.");
-    expect(readCompactionFailure(sql([failed(30, 1, "Summarization failed.")]), 1, 30))
+  it("names the newest blocking failure that no later entry supersedes", () => {
+    expect(readCompactionFailure(sql([failed(30, 1, "Compaction failed.")]), 1, 20))
+      .toEqual({ id: 30, message: "Compaction failed." });
+    expect(readCompactionFailure(sql([failed(30, 1, "Compaction failed.")]), 1, 30))
       .toBeNull();
+  });
+
+  it("ignores a conversation-owned background failure", () => {
+    expect(
+      readCompactionFailure(
+        sql([task(30, 1, { status: "failed", error: { message: "Compaction failed." } }, null)]),
+        1,
+        0,
+      ),
+    ).toBeNull();
   });
 
   it("fails closed on a succeeded, malformed or unreadable task", () => {

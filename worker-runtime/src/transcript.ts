@@ -95,7 +95,7 @@ export function projectedThreadEntries(
   project?: ThreadProjection,
   budgetProof?: BudgetProof,
   settledBudgetProof?: BudgetProof,
-  unansweredCompactionFailure?: string | null,
+  unansweredCompactionFailure?: { readonly id: number; readonly message: string } | null,
 ): ThreadEntry[] {
   const entries = threadEntries(records, includeThinking, budgetProof, settledBudgetProof);
   const projected = project ? [...project(entries)] : entries;
@@ -107,23 +107,27 @@ export function projectedThreadEntries(
         lastOperator = index;
         break;
       }
-    // A run that settled without an answer is the only one a failed
-    // compaction leaves behind: once any entry follows it, that entry owns
-    // the transcript and the failure is history.
+    // A tool round or partial text is not an answer: only a turn result ends
+    // the run. A run that settled without one is the only run a failed
+    // blocking compaction leaves behind.
     if (
       lastOperator !== -1 &&
-      !projected.slice(lastOperator + 1).some((entry) => entry.role === "agent")
+      !projected
+        .slice(lastOperator + 1)
+        .some((entry) => entry.role === "agent" && entry.kind === "turn_result")
     )
       projected.push({
-        seq: projected.length + 1,
+        // The failed task's own record id: greater than every earlier record
+        // and less than every later one, so no later entry reuses it.
+        seq: failure.id,
         role: "agent",
         kind: "turn_result",
         text: "",
         payload: {
           status: "failed",
-          error: failure.includes(CONTEXT_BUDGET_EXCEEDED_TEXT)
+          error: failure.message.includes(CONTEXT_BUDGET_EXCEEDED_TEXT)
             ? CONTEXT_BUDGET_EXCEEDED_TEXT
-            : failedTurnReason(failure),
+            : failedTurnReason(failure.message),
         },
       });
   }

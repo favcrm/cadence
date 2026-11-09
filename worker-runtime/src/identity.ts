@@ -384,21 +384,26 @@ function entryText(model: unknown): string | null {
 }
 
 /**
- * The error message of the newest failed compaction task that no later record
- * supersedes, or `null`.
+ * The newest failed blocking compaction that no later record supersedes, or
+ * `null`.
  *
- * A failed compaction settles its run without an assistant entry, so the board
- * has no other durable trace to name. Record ids come from one monotonic
- * counter, so the newest entry's id orders this failure against everything the
- * transcript already shows: a later entry — a placed summary, an answer, or
- * the next input — means the failure belongs to history, not to the run on
- * screen.
+ * Only a compaction the run itself waited on counts: the engine creates a
+ * blocking threshold compaction as a child of the generation that needs it,
+ * while a background one is conversation-owned and may fail while its
+ * concurrent generation still succeeds. A failed blocking compaction settles
+ * its run without an assistant entry, so the board has no other durable trace
+ * to name.
+ *
+ * Record ids come from one monotonic counter, so the newest entry's id orders
+ * this failure against everything the transcript already shows, and the task's
+ * own id can stand in for a position: it is greater than every earlier record
+ * and less than every later one, so no later entry can ever reuse it.
  */
 export function readCompactionFailure(
   sql: TaskSql,
   conversationId: number,
   afterEntryId: number,
-): string | null {
+): { readonly id: number; readonly message: string } | null {
   if (!Number.isSafeInteger(conversationId) || conversationId <= 0) return null;
   try {
     const rows = sql
@@ -411,8 +416,10 @@ export function readCompactionFailure(
       .toArray();
     const row = rows[0];
     if (row === undefined || !Number.isSafeInteger(row.id)) return null;
-    if (Number.isSafeInteger(afterEntryId) && Number(row.id) <= afterEntryId) return null;
+    const id = Number(row.id);
+    if (Number.isSafeInteger(afterEntryId) && id <= afterEntryId) return null;
     const record = parseRecord(row.record);
+    if (!Number.isSafeInteger(record?.owner)) return null;
     const state = record?.state;
     if (typeof state !== "object" || state === null || Array.isArray(state)) return null;
     const terminal = state as Record<string, unknown>;
@@ -425,7 +432,7 @@ export function readCompactionFailure(
     const error = failed.error;
     if (typeof error !== "object" || error === null || Array.isArray(error)) return null;
     const message = (error as Record<string, unknown>).message;
-    return typeof message === "string" && message.length > 0 ? message : null;
+    return typeof message === "string" && message.length > 0 ? { id, message } : null;
   } catch {
     return null;
   }
