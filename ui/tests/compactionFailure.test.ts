@@ -10,12 +10,19 @@ const FAILURE =
   "The conversation could not be compacted. Start a fresh conversation or split the task and retry.";
 
 const master = (extra: Partial<MasterState>): MasterState =>
-  ({ alias: "master", provider: "cadence", endpoint_kind: "durable_object", live: true, ...extra }) as MasterState;
+  ({
+    alias: "master",
+    provider: "cadence",
+    endpoint_kind: "durable_object",
+    live: true,
+    session: { id: "current" },
+    ...extra,
+  }) as MasterState;
 
-const bar = (state: MasterState | null, entries: ThreadEntry[] = []) =>
+const bar = (state: MasterState | null, entries: ThreadEntry[] = [], conversation: string | null = "current") =>
   turnBarState(
     { master: state, entries, pendingMessages: [], awaitingApproval: false, reconnecting: false },
-    "current",
+    conversation,
   );
 
 // The runtime reports a failed blocking compaction on the master state, and it
@@ -23,7 +30,7 @@ const bar = (state: MasterState | null, entries: ThreadEntry[] = []) =>
 equal(
   bar(master({ compaction_failure: FAILURE })),
   { kind: "failed", reason: FAILURE, message: null },
-  "an unanswered compaction failure is shown with no retry target",
+  "the failure is shown with no retry target",
 );
 equal(
   bar(master({ compaction_failure: "  " })),
@@ -31,6 +38,24 @@ equal(
   "a blank sentence is not a failure",
 );
 equal(bar(master({})), { kind: "idle" }, "no failure field reads as idle");
+
+// Scoping: the sentence belongs to the session that failed, never to a draft
+// or another thread that shares this surface's fallback snapshot.
+equal(
+  bar(master({ compaction_failure: FAILURE, session: { id: "other" } })),
+  { kind: "idle" },
+  "another conversation's snapshot does not show it",
+);
+equal(
+  bar(master({ compaction_failure: FAILURE }), [], null),
+  { kind: "idle" },
+  "an unbound draft shows nothing",
+);
+equal(
+  bar(master({ compaction_failure: FAILURE, endpoint_kind: "agent" })),
+  { kind: "idle" },
+  "a native daemon frame carries no such condition",
+);
 
 // A running turn keeps its own state: the failure is about a settled run.
 equal(

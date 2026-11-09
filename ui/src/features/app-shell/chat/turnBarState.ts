@@ -107,10 +107,16 @@ export function turnBarState(input: TurnBarInput, conversationId: string | null)
   // A blocking compaction that failed leaves no stored entry, so the runtime
   // reports it on the master state until a later record owns the thread. It
   // is the conversation's current condition, not a historic outcome, so a
-  // reload still shows it.
+  // reload still shows it — but only in the conversation whose session it is:
+  // an unbound draft, or another thread's snapshot, never inherits it.
   const compactionFailure =
     typeof master?.compaction_failure === "string" ? master.compaction_failure.trim() : "";
-  if (compactionFailure !== "") {
+  if (
+    compactionFailure !== "" &&
+    conversationId !== null &&
+    master?.endpoint_kind === "durable_object" &&
+    master?.session?.id === conversationId
+  ) {
     return { kind: "failed", reason: compactionFailure, message: null };
   }
   return { kind: "idle" };
