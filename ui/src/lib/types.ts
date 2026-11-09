@@ -1473,6 +1473,13 @@ export interface ConnectionProvider {
   /** Always false: listing providers never checks the network. */
   network_checked: boolean;
   registration_digest: string | null;
+  /** The reviewed connected read this provider serves, or null. */
+  read?: {
+    slug: string;
+    qualified: boolean;
+    pinned: boolean;
+    projected: boolean;
+  } | null;
   verification_support?: ConnectionVerificationSupport | null;
 }
 
@@ -1578,6 +1585,13 @@ export interface Connection {
   revision: number | null;
   registration_digest: string | null;
   scopes: string[];
+  /** The reviewed connected read this account serves, or null. */
+  read?: {
+    slug: string;
+    qualified: boolean;
+    pinned: boolean;
+    projected: boolean;
+  } | null;
   /**
    * Non-secret SMTP sender projection (CAD-785): transport and
    * verified sender from host custody. Absent for other providers —
@@ -1622,6 +1636,23 @@ export interface ConnectionsPayload {
 
 export interface ConnectionPayload {
   connection: Connection;
+}
+
+/** One exact Search Console property the account can read. */
+export interface ConnectionSite {
+  site_url: string;
+  permission_level: string;
+}
+
+/** `GET /api/connections/<id>/sites` — exact properties and the current pin. */
+export interface ConnectionSitesPayload {
+  sites: ConnectionSite[];
+  selected: string | null;
+}
+
+/** `POST /api/connections/<id>/site` — the newly pinned property. */
+export interface ConnectionSitePayload {
+  site: ConnectionSite;
 }
 
 /**

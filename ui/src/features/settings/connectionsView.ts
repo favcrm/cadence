@@ -13,11 +13,14 @@ import { fmtTime } from "../../lib/fmt";
  * nothing here stores a token.
  */
 
-/** Is this connection usable — registered, described and in custody? */
+/** Is this connection usable — registered, described or backed by a qualified
+ *  connected read, and in custody? */
 export function isAvailable(row: Connection): boolean {
+  const described =
+    row.status.descriptor_available === true || row.read?.qualified === true;
   return (
     row.status.adapter_registered === true &&
-    row.status.descriptor_available === true &&
+    described &&
     row.status.custody_available === true
   );
 }
@@ -48,8 +51,10 @@ export function pinWord(status: Pick<Connection["status"], "manifest_status">): 
  */
 export function connectionNeedsAttention(row: Connection): boolean {
   if (row.kind !== "enrolled") return false;
+  if (!isAvailable(row)) return true;
+  if (row.read?.qualified === true) return false;
   const status: string | undefined = row.status.manifest_status;
-  return !isAvailable(row) || (status !== "matched" && status !== "approved");
+  return status !== "matched" && status !== "approved";
 }
 
 export function connectionsNeedingAttention(rows: readonly Connection[]): number {
@@ -60,10 +65,12 @@ export function connectionsNeedingAttention(rows: readonly Connection[]): number
 export function readinessText(row: Connection): string {
   if (isLocalOutbox(row)) return "Built-in — always present, no credential to manage.";
   if (!row.status.adapter_registered) return "Provider is not registered on this daemon.";
-  if (!row.status.descriptor_available)
-    return "Provider has no reviewed descriptor — unavailable.";
   if (row.kind === "enrolled" && !row.status.custody_available)
     return "Credential is missing from custody.";
+  if (row.read?.qualified === true)
+    return `Connected — ${row.read.slug} read is available.`;
+  if (!row.status.descriptor_available)
+    return "Provider has no reviewed descriptor — unavailable.";
   return pinWord(row.status);
 }
 
@@ -80,7 +87,8 @@ export function connectionCapabilities(
   providerName: string,
 ): string | null {
   const found = providers.find((p) => p.provider === providerName);
-  return found ? capabilityWords(found) : null;
+  if (!found) return null;
+  return capabilityWords(found) ?? (found.read?.qualified === true ? found.read.slug : null);
 }
 
 /** Can this provider enroll a token — one shape the wizard offers. */
