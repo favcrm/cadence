@@ -410,6 +410,14 @@ export function readCompactionFailure(sql: TaskSql, conversationId: number): boo
       .toArray();
     const row = rows[0];
     if (row === undefined || !Number.isSafeInteger(row.id)) return false;
+    const id = Number(row.id);
+    // A record written after the failure — a placed summary, an answer, or the
+    // next input — means the failure belongs to history, not to the run on
+    // screen.
+    const latest = sql
+      .exec(`SELECT MAX(id) AS latest FROM pi_entries WHERE conversation_id = ?`, conversationId)
+      .toArray()[0]?.latest;
+    if (typeof latest === "number" && id <= latest) return false;
     const record = parseRecord(row.record);
     const owner = record?.owner;
     if (!Number.isSafeInteger(owner)) return false;
@@ -420,7 +428,7 @@ export function readCompactionFailure(sql: TaskSql, conversationId: number): boo
     const outcome = terminal.outcome;
     if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome)) return false;
     const status = (outcome as Record<string, unknown>).status;
-    if (status !== "failed" && status !== "faulted") return false;
+    if (status !== "failed" && status !== "faulted" && status !== "orphaned") return false;
     const parent = sql
       .exec(`SELECT status FROM pi_tasks WHERE id = ?`, owner as number)
       .toArray()[0];

@@ -128,12 +128,20 @@ describe("failed compaction adapter", () => {
       state: { status: "terminal", outcome },
     }),
   });
-  /** The compaction rows, and the owning generation's own status. */
-  const tasks = (rows: Record<string, unknown>[], ownerStatus = "terminal"): TaskSql => ({
+  /** The compaction rows, the owning generation's status, and the newest entry. */
+  const tasks = (
+    rows: Record<string, unknown>[],
+    ownerStatus = "terminal",
+    latestEntryId = 0,
+  ): TaskSql => ({
     exec(query) {
       return {
         toArray: () =>
-          query.startsWith("SELECT status") ? [{ status: ownerStatus }] : rows,
+          query.startsWith("SELECT status")
+            ? [{ status: ownerStatus }]
+            : query.startsWith("SELECT MAX")
+              ? [{ latest: latestEntryId }]
+              : rows,
       };
     },
   });
@@ -144,6 +152,12 @@ describe("failed compaction adapter", () => {
     expect(readCompactionFailure(tasks([failed(30, 1)]), 1)).toBe(true);
     expect(readCompactionFailure(tasks([failed(30, 1)], "running"), 1)).toBe(false);
     expect(readCompactionFailure(tasks([failed(30, 1, { status: "faulted" })]), 1)).toBe(true);
+    expect(readCompactionFailure(tasks([failed(30, 1, { status: "orphaned" })]), 1)).toBe(true);
+  });
+
+  it("stops reporting once a later record owns the transcript", () => {
+    expect(readCompactionFailure(tasks([failed(30, 1)], "terminal", 30), 1)).toBe(false);
+    expect(readCompactionFailure(tasks([failed(30, 1)], "terminal", 12), 1)).toBe(true);
   });
 
   it("ignores a conversation-owned background failure", () => {

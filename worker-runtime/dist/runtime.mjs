@@ -56190,6 +56190,10 @@ function readCompactionFailure(sql, conversationId) {
     const row = rows[0];
     if (row === undefined || !Number.isSafeInteger(row.id))
       return false;
+    const id = Number(row.id);
+    const latest = sql.exec(`SELECT MAX(id) AS latest FROM pi_entries WHERE conversation_id = ?`, conversationId).toArray()[0]?.latest;
+    if (typeof latest === "number" && id <= latest)
+      return false;
     const record = parseRecord(row.record);
     const owner = record?.owner;
     if (!Number.isSafeInteger(owner))
@@ -56204,7 +56208,7 @@ function readCompactionFailure(sql, conversationId) {
     if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome))
       return false;
     const status = outcome.status;
-    if (status !== "failed" && status !== "faulted")
+    if (status !== "failed" && status !== "faulted" && status !== "orphaned")
       return false;
     const parent = sql.exec(`SELECT status FROM pi_tasks WHERE id = ?`, owner).toArray()[0];
     return parent === undefined || parent.status === "terminal";
@@ -56370,7 +56374,8 @@ function masterState(model, status, conversationId, metadata) {
       since: null
     } : null,
     queue: [],
-    queued: status.queued
+    queued: status.queued,
+    compaction_failure: status.compactionFailure ?? null
   };
   if (typeof state.toJSON === "function")
     throw new TypeError("Master metadata cannot replace root serialization.");

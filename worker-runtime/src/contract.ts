@@ -375,4 +375,6 @@ export interface MasterStatus {
   readonly queued: number;
   /** The running turn's message id. Absent or null means it is not known. */
   readonly message?: string | null;
+  /** The runtime's own sentence for a failed blocking compaction, or null. */
+  readonly compactionFailure?: string | null;
 }
