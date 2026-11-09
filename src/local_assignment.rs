@@ -4104,6 +4104,67 @@ mod cad2009_assignment_acceptance {
     include!("local_assignment/cad2009_confirmed_custody_acceptance.rs");
     include!("local_assignment/cad2096_queue_custody_authored_acceptance.rs");
 
+    /// CAD-2096: the confirmed-but-unsaved queue attempt keeps its durable
+    /// key, so the retry after the local fault is repaired reuses it and the
+    /// board can deduplicate, instead of creating a second assignment.
+    struct Cad2096RetryTransport {
+        lock: PathBuf,
+        keys: Vec<String>,
+        break_first_lock: bool,
+    }
+
+    impl CoordHttp for Cad2096RetryTransport {
+        fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
+            assert_eq!(method, "POST");
+            assert_eq!(path, assignment_prefix(ORG));
+            let key = body.expect("queue body")["idempotency_key"]
+                .as_str()
+                .expect("durable key")
+                .to_owned();
+            self.keys.push(key);
+            if self.break_first_lock {
+                self.break_first_lock = false;
+                fs::remove_file(&self.lock).unwrap();
+                fs::create_dir(&self.lock).unwrap();
+            }
+            let mut receipt = original();
+            receipt["state"] = json!("queued");
+            Ok(Reply {
+                status: 200,
+                body: receipt,
+            })
+        }
+    }
+
+    #[test]
+    fn cad2096_queue_retry_reuses_the_persisted_operation_key() {
+        let authority = tempfile::tempdir().unwrap();
+        fs::set_permissions(authority.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let lock = authority.path().join(".cli-local-assign.lock");
+        let transport = Cad2096RetryTransport {
+            lock: lock.clone(),
+            keys: Vec::new(),
+            break_first_lock: true,
+        };
+        let mut coord = Coordinator::new(transport, ORG.into(), authority.path().into()).unwrap();
+        assert!(coord
+            .queue("SYN-1", "dispatch", Some("user_target"))
+            .is_err());
+        fs::remove_dir(&lock).unwrap();
+        assert!(coord
+            .queue("SYN-1", "dispatch", Some("user_target"))
+            .is_ok());
+        assert_eq!(
+            coord.http.keys.len(),
+            2,
+            "the retry either skipped or replayed the POST"
+        );
+        assert_eq!(
+            coord.http.keys[0], coord.http.keys[1],
+            "the retry must reuse the persisted operation key"
+        );
+    }
+
     fn exercise(mutation: Mutation) {
         for answer in [
             Answer::Lost,
