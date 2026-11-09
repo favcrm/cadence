@@ -15061,306 +15061,313 @@ function abortError(signal) {
   const reason = signal.reason;
   return reason instanceof Error ? reason : new DOMException("The operation was aborted", "AbortError");
 }
-// node_modules/@earendil-works/pi-durable/dist/harness/define.js
-function hook(task, handlers) {
-  return { task: task.definition.name, handlers };
+// node_modules/@earendil-works/pi-durable/dist/harness/compaction.js
+init_estimate();
+
+// node_modules/@earendil-works/pi-ai/dist/utils/retry.js
+function buildProviderErrorPattern(patterns) {
+  return new RegExp(patterns.join("|"), "i");
 }
-// node_modules/@earendil-works/pi-durable/dist/errors.js
-function errorMessage(error) {
-  if (error instanceof Error)
-    return error.message;
-  try {
-    return String(error);
-  } catch {
-    return Object.prototype.toString.call(error);
-  }
+var NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
+  "GoUsageLimitError",
+  "FreeUsageLimitError",
+  "Monthly usage limit reached",
+  "available balance",
+  "insufficient_quota",
+  "out of budget",
+  "quota exceeded",
+  "billing",
+  "subscription_sharing_usage_limit_exceeded",
+  "subscription_sharing_workplace_individual_usage_limit_exceeded"
+]);
+var RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
+  "overloaded",
+  "server_busy",
+  "servers are currently busy",
+  "currently experiencing high demand",
+  "model is at capacity",
+  "rate.?limit",
+  "too many requests",
+  "(?<![a-z0-9])(?:429|500|502|503|504|520|524)(?![a-z0-9])",
+  "service.?(?:is.?)?(?:temporarily.?)?unavailable",
+  "server.?error",
+  "internal.?error",
+  "provider.?returned.?(?:an.?)?error",
+  "exceeded request buffer limit while retrying upstream",
+  "unable to forward upstream",
+  "upstream.?request.?failed",
+  "upstream_stream_read_error",
+  "stream was interrupted",
+  "http/?2 stream failed",
+  "network.?error",
+  "connection.?error",
+  "connection.?refused",
+  "connection.?lost",
+  "other side closed",
+  "fetch failed",
+  "request to \\S+ failed, reason:",
+  "getaddrinfo",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "upstream.?connect",
+  "reset before headers",
+  "socket hang up",
+  "socket connection was closed",
+  "timed? out",
+  "timeout",
+  "terminated",
+  "websocket.?closed",
+  "websocket.?error",
+  "ended without",
+  "stream ended before message_stop",
+  "stream ended before a terminal response event",
+  "http2 request did not get a response",
+  "stream disconnected before completion",
+  "pending stream has been canceled",
+  "retry delay",
+  "you can retry your request",
+  "try your request again",
+  "please retry your request",
+  "ResourceExhausted",
+  "subscription_sharing_usage_unavailable",
+  "subscription_sharing_user_unavailable"
+]);
+var DEFAULT_MAX_AGENT_RETRY_DELAY_MS = 60000;
+function retryDelayMs(policy, attempt) {
+  const delay = policy.baseDelayMs * 2 ** Math.max(0, attempt - 1);
+  const safeDelay = Number.isSafeInteger(delay) ? delay : Number.MAX_SAFE_INTEGER;
+  return Math.min(safeDelay, policy.maxAgentDelayMs ?? DEFAULT_MAX_AGENT_RETRY_DELAY_MS);
+}
+function isRetryableAssistantError(message) {
+  if (message.stopReason !== "error" || !message.errorMessage)
+    return false;
+  const errorMessage = message.errorMessage;
+  if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage))
+    return false;
+  return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
 }
 
-class ReadAfterWrite extends Error {
-  constructor(method) {
-    super(`Tx.${method}() cannot read tables after the first table write`);
-    this.name = "ReadAfterWrite";
-  }
+// node_modules/@earendil-works/pi-durable/dist/entries.js
+function defineEntry(kind) {
+  if (typeof kind !== "string" || kind.length === 0)
+    throw new TypeError("Entry kind must be a non-empty string");
+  return {
+    kind,
+    is: (entry) => entry !== undefined && entry.kind === kind
+  };
+}
+var UserEntry = defineEntry("pi.user");
+var AssistantEntry = defineEntry("pi.assistant");
+var SystemEntry = defineEntry("pi.system");
+var ToolResultEntry = defineEntry("pi.tool-result");
+var ResetEntry = defineEntry("pi.reset");
+var CompactionEntry = defineEntry("pi.compaction");
+
+// node_modules/@earendil-works/pi-durable/dist/tasks.js
+function defineTask(definition) {
+  return { definition };
 }
 
-class StorageRequestError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "StorageRequestError";
-  }
+// node_modules/@earendil-works/pi-durable/dist/ids.js
+function idFromNumber(value) {
+  return value;
+}
+function seqFromNumber(value) {
+  return value;
 }
 
-class SessionFailed extends Error {
-  constructor(cause) {
-    super("Session failed after a storage error; close and reopen it", { cause });
-    this.name = "SessionFailed";
-  }
-}
-
-class ConversationBusy extends Error {
-  conversationId;
-  constructor(conversationId) {
-    super(`Conversation ${conversationId} is busy`);
-    this.name = "ConversationBusy";
-    this.conversationId = conversationId;
-  }
-}
-
-// node_modules/@earendil-works/pi-durable/dist/session/observation.js
-var MAX_PENDING_WATCH_FRAMES = 100;
-var RETIREMENT_OPERATIONS = [["r", null]];
-
-class CommittedStateSource {
-  #attachments = new Set;
-  #release;
-  #value;
-  #cursor = 0;
-  #retired = false;
-  #closed = false;
-  constructor(value, release) {
-    this.#value = value;
-    this.#release = release;
-  }
-  attach() {
-    if (this.#closed)
-      throw new Error("State source is closed");
-    const attachment = new SessionSourceAttachment({ value: this.#value, cursor: this.#cursor }, () => {
-      this.#attachments.delete(attachment);
-      if (this.#attachments.size === 0)
-        this.#finishDisposal();
-    });
-    this.#attachments.add(attachment);
-    return attachment;
-  }
-  advance(value, ops, context) {
-    if (this.#closed || this.#retired)
+// node_modules/@earendil-works/pi-durable/dist/harness/context.js
+var SCAN_PAGE_SIZE = 256;
+var EXCLUDED_STOP_REASONS = new Set(["aborted", "error", "deferred"]);
+var MISSING_RESULT_TEXT = "Tool result unavailable: history ends before this call completed.";
+async function captureContextBounds(storage, conversationId, context, at) {
+  let tail;
+  if (at === undefined) {
+    tail = (await storage.scanEntries({ conversationId }, 1, undefined, context)).items[0]?.id;
+    if (tail === undefined)
       return;
-    this.#value = value;
-    this.#cursor += 1;
-    if (value === null)
-      this.#retired = true;
-    const frame = {
-      cursor: this.#cursor,
-      value,
-      ops,
-      context
-    };
-    for (const attachment of [...this.#attachments])
-      attachment.publish(frame);
+  } else {
+    if (await storage.entry(conversationId, at, context) === undefined) {
+      throw new Error(`Entry ${at} is not visible from conversation ${conversationId}`);
+    }
+    tail = at;
   }
-  closeSession() {
-    if (this.#closed)
-      return;
-    for (const attachment of [...this.#attachments])
-      attachment.dispose();
-    this.#finishDisposal();
-  }
-  #finishDisposal() {
-    if (this.#closed)
-      return;
-    this.#closed = true;
-    this.#value = undefined;
-    const release = this.#release;
-    this.#release = undefined;
-    release?.();
-  }
+  return { head: await storage.findLatestHeadMarker(conversationId, tail, context), tail };
 }
-
-class SessionSourceAttachment {
-  snapshot;
-  #release;
-  #frames = [];
-  #listener;
-  #activated = false;
-  #disposed = false;
-  #scheduled = false;
-  #delivering = false;
-  constructor(snapshot, release) {
-    this.snapshot = snapshot;
-    this.#release = release;
+async function readContextFrom(session, storage, conversationId, context, at, previous) {
+  const bounds = await session.readOnLine(() => captureContextBounds(storage, conversationId, context, at));
+  if (bounds === undefined)
+    return { view: emptyView(), range: undefined };
+  freezeJson(bounds.head);
+  let range;
+  if (previous === undefined || previous.bounds.head?.id !== bounds.head?.id) {
+    range = deriveRange(bounds, freezeJson(await scanRange(storage, conversationId, rangeQuery(bounds), context)));
+  } else if (bounds.tail === previous.bounds.tail) {
+    range = previous;
+  } else if (bounds.tail < previous.bounds.tail) {
+    range = deriveRange(bounds, previous.entries.filter((entry) => entry.id <= bounds.tail));
+  } else {
+    const minEntryId = idFromNumber(previous.bounds.tail + 1);
+    const added = await scanRange(storage, conversationId, { minEntryId, maxEntryId: bounds.tail }, context);
+    range = extendRange(previous, bounds, freezeJson(added));
   }
-  activate(listener) {
-    if (this.#activated)
-      throw new Error("State attachment is already active");
-    if (this.#disposed)
-      throw new Error("State attachment is disposed");
-    this.#activated = true;
-    this.#listener = listener;
-    this.#drain();
+  const { view } = range;
+  return {
+    view: {
+      ...view,
+      entries: [...view.entries],
+      contributions: [...view.contributions],
+      messages: [...view.messages]
+    },
+    range
+  };
+}
+async function readContext(session, storage, conversationId, context, at) {
+  const bounds = await session.readOnLine(() => captureContextBounds(storage, conversationId, context, at));
+  return deriveContext(storage, conversationId, bounds, context);
+}
+async function deriveContext(storage, conversationId, bounds, context) {
+  if (bounds === undefined)
+    return emptyView();
+  return deriveRange(bounds, await scanRange(storage, conversationId, rangeQuery(bounds), context)).view;
+}
+function emptyView() {
+  return { head: undefined, entries: [], contributions: [], messages: [] };
+}
+function deriveRange(bounds, entries) {
+  const edits = new Map;
+  for (const entry of entries)
+    for (const edit of entry.edits ?? [])
+      edits.set(edit.target, edit);
+  const active = selectActive(bounds.head, entries);
+  const contributions = active.map((entry) => contribute(entry, edits.get(entry.id)));
+  const { settled, open } = settle([], contributions.flat());
+  const baseline = findBaseline(bounds.head, active);
+  const messages = leadWithSystem([...settled, ...orderToolResults(open)], baseline);
+  const view = { head: bounds.head, entries: active, contributions, messages };
+  return { bounds, entries, view, edited: new Set(edits.keys()), settled, open, baseline };
+}
+function extendRange(previous, bounds, added) {
+  const entries = [...previous.entries, ...added];
+  if (added.some((entry) => entry.edits !== undefined || entry.head !== undefined || previous.edited.has(entry.id))) {
+    return deriveRange(bounds, entries);
   }
-  publish(frame) {
-    if (this.#disposed)
-      return;
-    this.#frames.push(frame);
-    if (!this.#activated || this.#delivering || this.#scheduled)
-      return;
-    this.#scheduled = true;
-    queueMicrotask(() => {
-      this.#scheduled = false;
-      if (this.#disposed)
-        return;
-      try {
-        this.#drain();
-      } catch {
-        this.dispose();
+  const contributions = added.map((entry) => contribute(entry, undefined));
+  const { settled, open } = settle(previous.settled, [...previous.open, ...contributions.flat()]);
+  const baseline = previous.baseline !== undefined ? previous.baseline : findBaseline(bounds.head, added);
+  const view = {
+    head: bounds.head,
+    entries: [...previous.view.entries, ...added],
+    contributions: [...previous.view.contributions, ...contributions],
+    messages: leadWithSystem([...settled, ...orderToolResults(open)], baseline)
+  };
+  return { bounds, entries, view, edited: previous.edited, settled, open, baseline };
+}
+function findBaseline(head, entries) {
+  for (const entry of entries) {
+    if (head !== undefined && entry.id <= head.id)
+      continue;
+    if (SystemEntry.is(entry))
+      return entry.model?.find((message) => message.role === "system") ?? null;
+    if (head === undefined && carriesSystemMessage(entry))
+      return null;
+  }
+  return;
+}
+function carriesSystemMessage(entry) {
+  const isSystem = (message) => message.role === "system";
+  return (entry.model?.some(isSystem) ?? false) || (entry.edits?.some((edit) => edit.action === "replace" && edit.messages.some(isSystem)) ?? false);
+}
+function leadWithSystem(messages, baseline) {
+  const index = messages.findIndex((message) => message.role === "system");
+  if (index <= 0)
+    return messages;
+  const system = messages[index];
+  if (system !== baseline && messages.slice(0, index).some((message) => message.role !== "user")) {
+    return messages;
+  }
+  return [system, ...messages.slice(0, index), ...messages.slice(index + 1)];
+}
+function contribute(entry, edit) {
+  if (edit?.action === "omit")
+    return Object.freeze([]);
+  const contributed = edit?.action === "replace" ? edit.messages : entry.model ?? [];
+  return Object.freeze(contributed.filter((message) => message.role !== "assistant" || !EXCLUDED_STOP_REASONS.has(message.stopReason)));
+}
+var deeplyFrozen = new WeakSet;
+function freezeJson(value) {
+  if (value === null || typeof value !== "object" || deeplyFrozen.has(value))
+    return value;
+  for (const child of Object.values(value))
+    freezeJson(child);
+  Object.freeze(value);
+  deeplyFrozen.add(value);
+  return value;
+}
+function settle(settled, open) {
+  const last = open.findLastIndex((message) => message.role === "assistant");
+  if (last <= 0)
+    return { settled, open };
+  return { settled: [...settled, ...orderToolResults(open.slice(0, last))], open: open.slice(last) };
+}
+async function activeEntries(storage, conversationId, bounds, context) {
+  if (bounds === undefined)
+    return [];
+  return selectActive(bounds.head, await scanRange(storage, conversationId, rangeQuery(bounds), context));
+}
+function rangeQuery(bounds) {
+  const head = bounds.head;
+  return head === undefined ? { maxEntryId: bounds.tail } : { minEntryId: head.head, maxEntryId: bounds.tail };
+}
+async function scanRange(storage, conversationId, range, context) {
+  const entries = [];
+  let cursor;
+  do {
+    const page = await storage.scanEntries({ conversationId, ...range }, SCAN_PAGE_SIZE, cursor, context);
+    entries.push(...page.items);
+    cursor = page.next;
+  } while (cursor !== undefined);
+  return entries.reverse();
+}
+function selectActive(head, range) {
+  return head === undefined ? range : [head, ...range.filter((entry) => entry.head === undefined)];
+}
+function orderToolResults(messages) {
+  const ordered = [];
+  for (let index = 0;index < messages.length; index++) {
+    const message = messages[index];
+    if (message.role === "toolResult")
+      continue;
+    ordered.push(message);
+    if (message.role !== "assistant")
+      continue;
+    const calls = message.content.filter((content) => content.type === "toolCall");
+    if (calls.length === 0)
+      continue;
+    const results = new Map;
+    for (let next = index + 1;next < messages.length && messages[next].role !== "assistant"; next++) {
+      const candidate = messages[next];
+      if (candidate.role === "toolResult" && !results.has(candidate.toolCallId)) {
+        results.set(candidate.toolCallId, next);
       }
-    });
-  }
-  dispose() {
-    if (this.#disposed)
-      return;
-    this.#disposed = true;
-    this.#frames.length = 0;
-    this.#listener = undefined;
-    const release = this.#release;
-    this.#release = undefined;
-    release?.();
-  }
-  #drain() {
-    const listener = this.#listener;
-    if (listener === undefined || this.#delivering || this.#disposed)
-      return;
-    this.#delivering = true;
-    try {
-      while (!this.#disposed) {
-        const frame = this.#frames.shift();
-        if (frame === undefined)
-          break;
-        listener(frame);
-      }
-    } finally {
-      this.#delivering = false;
+    }
+    for (const call of calls) {
+      const resultIndex = results.get(call.id);
+      ordered.push(resultIndex === undefined ? missingResult(call, message.timestamp) : messages[resultIndex]);
     }
   }
+  return ordered;
 }
-
-class CommittedWatch {
-  #detach;
-  #report;
-  #replace;
-  #closed = Promise.withResolvers();
-  #pending = [];
-  #value;
-  #listener;
-  #started = false;
-  #scheduled = false;
-  #running = false;
-  #retired = false;
-  #end;
-  #cancellationSignal;
-  #cancellationListener;
-  constructor(value, detach, report, replace) {
-    this.#value = value;
-    this.#detach = detach;
-    this.#report = report;
-    this.#replace = replace;
-  }
-  get value() {
-    return this.#value;
-  }
-  get closed() {
-    return this.#closed.promise;
-  }
-  start(listener) {
-    if (this.#started)
-      throw new Error("Watch is already started");
-    if (this.#end !== undefined)
-      throw new Error("Watch is stopped");
-    this.#started = true;
-    this.#listener = listener;
-    if (this.#pending.length > 0)
-      this.#schedule();
-  }
-  stop() {
-    this.#terminate({ reason: "stopped" });
-    return this.#closed.promise;
-  }
-  observeCancellation(signal) {
-    if (this.#cancellationSignal !== undefined)
-      throw new Error("Watch cancellation is already installed");
-    if (this.#end !== undefined)
-      return;
-    this.#cancellationSignal = signal;
-    this.#cancellationListener = () => this.cancel();
-    signal.addEventListener("abort", this.#cancellationListener, { once: true });
-    if (signal.aborted)
-      this.cancel();
-  }
-  cancel() {
-    this.#terminate({ reason: "cancelled" });
-  }
-  closeSession(failure) {
-    this.#terminate(failure === undefined ? { reason: "session_closed" } : { reason: "session_failed", error: failure.error });
-  }
-  advance(value, ops, context) {
-    if (this.#end !== undefined || this.#retired)
-      return;
-    if (value === null)
-      this.#retired = true;
-    if (this.#pending.length >= MAX_PENDING_WATCH_FRAMES) {
-      this.#pending.length = 0;
-      const replacement = this.#replace?.() ?? value;
-      this.#pending.push({ value: replacement, ops: [["r", replacement]], context });
-    } else {
-      this.#pending.push({ value, ops, context });
-    }
-    if (this.#started)
-      this.#schedule();
-  }
-  #schedule() {
-    if (this.#scheduled || this.#running || this.#end !== undefined)
-      return;
-    this.#scheduled = true;
-    queueMicrotask(() => {
-      this.#scheduled = false;
-      this.#drain();
-    });
-  }
-  async#drain() {
-    if (this.#running || this.#end !== undefined || !this.#started)
-      return;
-    this.#running = true;
-    try {
-      while (this.#end === undefined) {
-        const frame = this.#pending.shift();
-        if (frame === undefined)
-          break;
-        this.#value = frame.value;
-        const deliveryContext = withoutAbortSignal(frame.context);
-        try {
-          await this.#listener(frame.value, frame.ops, deliveryContext);
-        } catch (error) {
-          if (this.#end === undefined) {
-            this.#report(error);
-            this.#terminate({ reason: "listener_error", error: toError(error) });
-          }
-          break;
-        }
-        if (frame.value === null) {
-          this.#terminate({ reason: "retired" });
-          break;
-        }
-      }
-    } finally {
-      this.#running = false;
-      if (this.#end === undefined && this.#pending.length > 0)
-        this.#schedule();
-    }
-  }
-  #terminate(end) {
-    if (this.#end !== undefined)
-      return;
-    this.#end = end;
-    this.#detach();
-    this.#pending.length = 0;
-    if (this.#cancellationListener !== undefined) {
-      this.#cancellationSignal?.removeEventListener("abort", this.#cancellationListener);
-    }
-    this.#closed.resolve(end);
-  }
-}
-function toError(error) {
-  return error instanceof Error ? error : new Error(errorMessage(error));
+function missingResult(call, timestamp) {
+  return freezeJson({
+    role: "toolResult",
+    toolCallId: call.id,
+    toolName: call.name,
+    content: [{ type: "text", text: MISSING_RESULT_TEXT }],
+    isError: true,
+    details: { reason: "missing_result" },
+    timestamp
+  });
 }
 // node_modules/@earendil-works/chord/dist/json.js
 var DATA_DESCRIPTOR = {
@@ -17935,9 +17942,9 @@ class StateSubscriber {
   }
   #report(error) {
     try {
-      this.#reportError(toError2(error));
+      this.#reportError(toError(error));
     } catch (reportError) {
-      reportErrorAsync(toError2(reportError));
+      reportErrorAsync(toError(reportError));
     }
   }
 }
@@ -18085,7 +18092,7 @@ class AttachedReplicatedStateImpl {
       this.#cursor = frame.cursor;
       this.#publisher.publish(frame.value, frame.context);
     } catch (error) {
-      this.#fail(toError2(error));
+      this.#fail(toError(error));
     }
   }
   #fail(error) {
@@ -18102,9 +18109,9 @@ class AttachedReplicatedStateImpl {
   }
   #report(error) {
     try {
-      this.#reportError(toError2(error));
+      this.#reportError(toError(error));
     } catch (reportError) {
-      reportErrorAsync(toError2(reportError));
+      reportErrorAsync(toError(reportError));
     }
   }
 }
@@ -18135,7 +18142,7 @@ function reportErrorAsync(error) {
     throw error;
   });
 }
-function toError2(error) {
+function toError(error) {
   return error instanceof Error ? error : new Error(String(error));
 }
 function replicatedState(initialOrSource, options) {
@@ -18146,14 +18153,6 @@ function replicatedState(initialOrSource, options) {
 function isReplicatedStateSource(value) {
   return typeof value.attach === "function";
 }
-// node_modules/@earendil-works/pi-durable/dist/ids.js
-function idFromNumber(value) {
-  return value;
-}
-function seqFromNumber(value) {
-  return value;
-}
-
 // node_modules/@earendil-works/pi-durable/dist/documents.js
 function defineDoc(definition) {
   validateDefinition(definition);
@@ -18238,6 +18237,112 @@ function materializeDocumentValue(definition, record, version, value) {
   return copyJson(definition.migrate(value, version));
 }
 
+// node_modules/@earendil-works/pi-ai/dist/utils/overflow.js
+var OVERFLOW_PATTERNS = [
+  /prompt (?:is )?too long/i,
+  /prompt exceeds max length/i,
+  /request_too_large/i,
+  /input is too long for requested model/i,
+  /exceeds the context window/i,
+  /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i,
+  /input token count.*exceeds the maximum/i,
+  /maximum prompt length is \d+/i,
+  /reduce the length of the messages/i,
+  /maximum context length is \d+ tokens/i,
+  /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i,
+  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i,
+  /exceeds the limit of \d+/i,
+  /exceeds the available context size/i,
+  /greater than the context length/i,
+  /context window exceeds limit/i,
+  /exceeded model token limit/i,
+  /too large for model with \d+ maximum context length/i,
+  /prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i,
+  /model_context_window_exceeded/i,
+  /prompt too long; exceeded (?:max )?context length/i,
+  /range of input length should be/i,
+  /context[_ ]length[_ ]exceeded/i,
+  /too many tokens/i,
+  /token limit exceeded/i,
+  /^(?:[\w -]+ API error \(413\):|413(?:\s|:|$))/i
+];
+var CEREBRAS_BODYLESS_OVERFLOW_PATTERN = /^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i;
+var NON_OVERFLOW_PATTERNS = [
+  /^(Throttling error|Service unavailable):/i,
+  /rate limit/i,
+  /too many requests/i
+];
+function isContextOverflow(message, contextWindow) {
+  if (message.stopReason === "error" && message.errorMessage) {
+    const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage));
+    if (!isNonOverflow) {
+      if (OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage))) {
+        return true;
+      }
+      if (message.provider === "cerebras" && CEREBRAS_BODYLESS_OVERFLOW_PATTERN.test(message.errorMessage)) {
+        return true;
+      }
+    }
+  }
+  if (contextWindow && message.stopReason === "stop") {
+    const inputTokens = message.usage.input + message.usage.cacheRead;
+    if (inputTokens > contextWindow) {
+      return true;
+    }
+  }
+  if (contextWindow && message.stopReason === "length" && message.usage.output === 0) {
+    const inputTokens = message.usage.input + message.usage.cacheRead;
+    if (inputTokens >= contextWindow * 0.99) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// node_modules/@earendil-works/pi-durable/dist/harness/generation.js
+init_transcript();
+
+// node_modules/@earendil-works/pi-durable/dist/errors.js
+function errorMessage(error) {
+  if (error instanceof Error)
+    return error.message;
+  try {
+    return String(error);
+  } catch {
+    return Object.prototype.toString.call(error);
+  }
+}
+
+class ReadAfterWrite extends Error {
+  constructor(method) {
+    super(`Tx.${method}() cannot read tables after the first table write`);
+    this.name = "ReadAfterWrite";
+  }
+}
+
+class StorageRequestError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "StorageRequestError";
+  }
+}
+
+class SessionFailed extends Error {
+  constructor(cause) {
+    super("Session failed after a storage error; close and reopen it", { cause });
+    this.name = "SessionFailed";
+  }
+}
+
+class ConversationBusy extends Error {
+  conversationId;
+  constructor(conversationId) {
+    super(`Conversation ${conversationId} is busy`);
+    this.name = "ConversationBusy";
+    this.conversationId = conversationId;
+  }
+}
+
 // node_modules/@earendil-works/pi-durable/dist/timers.js
 var MAX_TIMER_DELAY = 2147483647;
 var inWorkers = typeof navigator !== "undefined" && navigator.userAgent === "Cloudflare-Workers";
@@ -18294,11 +18399,268 @@ function hostTimers(setTimer, report) {
   };
 }
 
+// node_modules/@earendil-works/pi-durable/dist/session/observation.js
+var MAX_PENDING_WATCH_FRAMES = 100;
+var RETIREMENT_OPERATIONS = [["r", null]];
+
+class CommittedStateSource {
+  #attachments = new Set;
+  #release;
+  #value;
+  #cursor = 0;
+  #retired = false;
+  #closed = false;
+  constructor(value, release) {
+    this.#value = value;
+    this.#release = release;
+  }
+  attach() {
+    if (this.#closed)
+      throw new Error("State source is closed");
+    const attachment = new SessionSourceAttachment({ value: this.#value, cursor: this.#cursor }, () => {
+      this.#attachments.delete(attachment);
+      if (this.#attachments.size === 0)
+        this.#finishDisposal();
+    });
+    this.#attachments.add(attachment);
+    return attachment;
+  }
+  advance(value, ops, context) {
+    if (this.#closed || this.#retired)
+      return;
+    this.#value = value;
+    this.#cursor += 1;
+    if (value === null)
+      this.#retired = true;
+    const frame = {
+      cursor: this.#cursor,
+      value,
+      ops,
+      context
+    };
+    for (const attachment of [...this.#attachments])
+      attachment.publish(frame);
+  }
+  closeSession() {
+    if (this.#closed)
+      return;
+    for (const attachment of [...this.#attachments])
+      attachment.dispose();
+    this.#finishDisposal();
+  }
+  #finishDisposal() {
+    if (this.#closed)
+      return;
+    this.#closed = true;
+    this.#value = undefined;
+    const release = this.#release;
+    this.#release = undefined;
+    release?.();
+  }
+}
+
+class SessionSourceAttachment {
+  snapshot;
+  #release;
+  #frames = [];
+  #listener;
+  #activated = false;
+  #disposed = false;
+  #scheduled = false;
+  #delivering = false;
+  constructor(snapshot, release) {
+    this.snapshot = snapshot;
+    this.#release = release;
+  }
+  activate(listener) {
+    if (this.#activated)
+      throw new Error("State attachment is already active");
+    if (this.#disposed)
+      throw new Error("State attachment is disposed");
+    this.#activated = true;
+    this.#listener = listener;
+    this.#drain();
+  }
+  publish(frame) {
+    if (this.#disposed)
+      return;
+    this.#frames.push(frame);
+    if (!this.#activated || this.#delivering || this.#scheduled)
+      return;
+    this.#scheduled = true;
+    queueMicrotask(() => {
+      this.#scheduled = false;
+      if (this.#disposed)
+        return;
+      try {
+        this.#drain();
+      } catch {
+        this.dispose();
+      }
+    });
+  }
+  dispose() {
+    if (this.#disposed)
+      return;
+    this.#disposed = true;
+    this.#frames.length = 0;
+    this.#listener = undefined;
+    const release = this.#release;
+    this.#release = undefined;
+    release?.();
+  }
+  #drain() {
+    const listener = this.#listener;
+    if (listener === undefined || this.#delivering || this.#disposed)
+      return;
+    this.#delivering = true;
+    try {
+      while (!this.#disposed) {
+        const frame = this.#frames.shift();
+        if (frame === undefined)
+          break;
+        listener(frame);
+      }
+    } finally {
+      this.#delivering = false;
+    }
+  }
+}
+
+class CommittedWatch {
+  #detach;
+  #report;
+  #replace;
+  #closed = Promise.withResolvers();
+  #pending = [];
+  #value;
+  #listener;
+  #started = false;
+  #scheduled = false;
+  #running = false;
+  #retired = false;
+  #end;
+  #cancellationSignal;
+  #cancellationListener;
+  constructor(value, detach, report, replace) {
+    this.#value = value;
+    this.#detach = detach;
+    this.#report = report;
+    this.#replace = replace;
+  }
+  get value() {
+    return this.#value;
+  }
+  get closed() {
+    return this.#closed.promise;
+  }
+  start(listener) {
+    if (this.#started)
+      throw new Error("Watch is already started");
+    if (this.#end !== undefined)
+      throw new Error("Watch is stopped");
+    this.#started = true;
+    this.#listener = listener;
+    if (this.#pending.length > 0)
+      this.#schedule();
+  }
+  stop() {
+    this.#terminate({ reason: "stopped" });
+    return this.#closed.promise;
+  }
+  observeCancellation(signal) {
+    if (this.#cancellationSignal !== undefined)
+      throw new Error("Watch cancellation is already installed");
+    if (this.#end !== undefined)
+      return;
+    this.#cancellationSignal = signal;
+    this.#cancellationListener = () => this.cancel();
+    signal.addEventListener("abort", this.#cancellationListener, { once: true });
+    if (signal.aborted)
+      this.cancel();
+  }
+  cancel() {
+    this.#terminate({ reason: "cancelled" });
+  }
+  closeSession(failure) {
+    this.#terminate(failure === undefined ? { reason: "session_closed" } : { reason: "session_failed", error: failure.error });
+  }
+  advance(value, ops, context) {
+    if (this.#end !== undefined || this.#retired)
+      return;
+    if (value === null)
+      this.#retired = true;
+    if (this.#pending.length >= MAX_PENDING_WATCH_FRAMES) {
+      this.#pending.length = 0;
+      const replacement = this.#replace?.() ?? value;
+      this.#pending.push({ value: replacement, ops: [["r", replacement]], context });
+    } else {
+      this.#pending.push({ value, ops, context });
+    }
+    if (this.#started)
+      this.#schedule();
+  }
+  #schedule() {
+    if (this.#scheduled || this.#running || this.#end !== undefined)
+      return;
+    this.#scheduled = true;
+    queueMicrotask(() => {
+      this.#scheduled = false;
+      this.#drain();
+    });
+  }
+  async#drain() {
+    if (this.#running || this.#end !== undefined || !this.#started)
+      return;
+    this.#running = true;
+    try {
+      while (this.#end === undefined) {
+        const frame = this.#pending.shift();
+        if (frame === undefined)
+          break;
+        this.#value = frame.value;
+        const deliveryContext = withoutAbortSignal(frame.context);
+        try {
+          await this.#listener(frame.value, frame.ops, deliveryContext);
+        } catch (error) {
+          if (this.#end === undefined) {
+            this.#report(error);
+            this.#terminate({ reason: "listener_error", error: toError2(error) });
+          }
+          break;
+        }
+        if (frame.value === null) {
+          this.#terminate({ reason: "retired" });
+          break;
+        }
+      }
+    } finally {
+      this.#running = false;
+      if (this.#end === undefined && this.#pending.length > 0)
+        this.#schedule();
+    }
+  }
+  #terminate(end) {
+    if (this.#end !== undefined)
+      return;
+    this.#end = end;
+    this.#detach();
+    this.#pending.length = 0;
+    if (this.#cancellationListener !== undefined) {
+      this.#cancellationSignal?.removeEventListener("abort", this.#cancellationListener);
+    }
+    this.#closed.resolve(end);
+  }
+}
+function toError2(error) {
+  return error instanceof Error ? error : new Error(errorMessage(error));
+}
+
 // node_modules/@earendil-works/pi-durable/dist/types.js
 var ROOT_CONVERSATION_ID = 1;
 
 // node_modules/@earendil-works/pi-durable/dist/session/forks.js
-var SCAN_PAGE_SIZE = 256;
+var SCAN_PAGE_SIZE2 = 256;
 async function prepareForkDocumentCopies(storage, parentConversationId, at, childConversationId, context) {
   const entry = await storage.entry(parentConversationId, at, context);
   if (entry === undefined)
@@ -18312,7 +18674,7 @@ async function prepareForkDocumentCopies(storage, parentConversationId, at, chil
 async function collectCopies(storage, scope, at, policy, childConversationId, copies, copiedAddresses, context) {
   let cursor;
   do {
-    const page = await storage.scanDocuments({ scope, at }, SCAN_PAGE_SIZE, cursor, context);
+    const page = await storage.scanDocuments({ scope, at }, SCAN_PAGE_SIZE2, cursor, context);
     for (const source of page.items) {
       if (source.scope.kind !== "conversation" || source.fork !== policy)
         continue;
@@ -19980,6 +20342,295 @@ function applyWrap(items, target, wrap, nameOf, report) {
     items.delete(target);
     report(error);
   }
+}
+
+// node_modules/@earendil-works/pi-durable/dist/harness/inbox.js
+var InboxDoc = defineDoc({
+  kind: "pi.inbox",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({ items: [] }),
+  checkpointWhen: (value) => value.items.length === 0
+});
+async function prepareBoundary(tx, conversationId, modes) {
+  const head = (await tx.latestHeadMarker(conversationId))?.head;
+  const inbox = await tx.doc(InboxDoc, conversationId);
+  return {
+    conversationId,
+    inbox,
+    steeringMode: modes.steeringMode,
+    followUpMode: modes.followUpMode,
+    head
+  };
+}
+async function applyBoundary(tx, boundary, at, now) {
+  const { conversationId, inbox } = boundary;
+  const items = inbox.items;
+  const reset = hasQueuedReset(items);
+  const final = at === "final" || reset;
+  const pick = (mode, queueMode) => {
+    const indexes = items.flatMap((item, index) => item.mode === mode ? [index] : []);
+    return queueMode === "all" ? indexes : indexes.slice(0, 1);
+  };
+  const writes = items.flatMap((item, index) => item.mode === "write" ? [index] : []);
+  const users = [...pick("steer", boundary.steeringMode), ...final ? pick("followUp", boundary.followUpMode) : []];
+  users.sort((a, b) => a - b);
+  for (const index of writes) {
+    const item = items[index];
+    const draft = item.entry;
+    if (isStale(boundary, draft)) {
+      tx.settleSubmission(item.id, { status: "unanswered", reason: "stale" });
+      continue;
+    }
+    const entry = await tx.appendEntry(conversationId, draft);
+    if (draft.head !== undefined)
+      boundary.head = draft.head === "self" ? entry.id : draft.head;
+    tx.placeSubmission(item.id, entry.id);
+  }
+  const placed = [];
+  for (const index of users) {
+    const item = items[index];
+    const entry = await appendInput(tx, conversationId, item.content, item.entry, now);
+    tx.placeSubmission(item.id, entry.id);
+    placed.push(item.id);
+  }
+  const removed = [...writes, ...users].sort((a, b) => b - a);
+  for (const index of removed)
+    items.splice(index, 1);
+  return { users: placed, reset };
+}
+function appendInput(tx, conversationId, content, entry, now) {
+  const message = { role: "user", content, timestamp: now };
+  if (entry === undefined)
+    return tx.appendEntry(UserEntry, conversationId, { model: [message] });
+  return tx.appendEntry(conversationId, { ...pickInputEntry(entry), model: [message] });
+}
+function pickInputEntry({ kind, data }) {
+  const picked = data === undefined ? { kind } : { kind, data };
+  return copyJson(picked, { omitUndefinedProperties: true });
+}
+function isDisplayOnly(entry) {
+  return entry.model === undefined && entry.head === undefined && entry.edits === undefined;
+}
+function hasQueuedReset(items) {
+  return items.some((item) => item.mode === "write" && item.entry.head === "self");
+}
+function isStale(boundary, entry) {
+  return typeof entry.head === "number" && boundary.head !== undefined && entry.head < boundary.head;
+}
+async function removeInboxItem(tx, conversationId, id) {
+  const items = (await tx.doc(InboxDoc, conversationId)).items;
+  const index = items.findIndex((item) => item.id === id);
+  if (index >= 0)
+    items.splice(index, 1);
+}
+async function withdrawQueuedInputs(tx, conversationId, reason = "aborted") {
+  const items = (await tx.doc(InboxDoc, conversationId)).items;
+  for (let index = items.length - 1;index >= 0; index--) {
+    const item = items[index];
+    if (item.mode === "write")
+      continue;
+    tx.settleSubmission(item.id, { status: "unanswered", reason });
+    items.splice(index, 1);
+  }
+}
+
+// node_modules/@earendil-works/pi-durable/dist/harness/json.js
+function assignJson(target, key, value) {
+  const slots = target;
+  const current = slots[key];
+  if (isRecord(current) && isRecord(value)) {
+    for (const name of Object.keys(current))
+      if (!Object.hasOwn(value, name))
+        delete current[name];
+    for (const [name, child] of Object.entries(value))
+      assignJson(current, name, child);
+    return;
+  }
+  if (Array.isArray(current) && Array.isArray(value) && current.length <= value.length) {
+    const items = current;
+    for (let index = 0;index < value.length; index++) {
+      if (index < items.length)
+        assignJson(items, index, value[index]);
+      else
+        items.push(value[index]);
+    }
+    return;
+  }
+  if (current !== value)
+    slots[key] = value;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// node_modules/@earendil-works/pi-durable/dist/harness/prompt.js
+init_transcript();
+function replaySections(messages) {
+  const shown = new Map;
+  for (const message of messages) {
+    if (message.role !== "system" || message.sections === undefined)
+      continue;
+    for (const [key, value] of Object.entries(message.sections)) {
+      if (value === null)
+        shown.delete(key);
+      else
+        shown.set(key, value);
+    }
+  }
+  return shown;
+}
+async function renderSections(sections, input, shown, report, context) {
+  const desired = new Map;
+  for (const section of sections) {
+    let text;
+    try {
+      text = await section.render(input, context);
+    } catch (error) {
+      if (context.abortSignal?.aborted)
+        throw error;
+      report(error, section);
+      const kept = shown.get(section.key);
+      if (kept !== undefined)
+        desired.set(section.key, kept);
+      continue;
+    }
+    if (text === undefined)
+      continue;
+    desired.set(section.key, section.tag === false ? text : `<${section.key}>
+${text}
+</${section.key}>`);
+  }
+  return desired;
+}
+function planSystemEntries(view, desired, tools, timestamp) {
+  const head = view.head;
+  if (head !== undefined && !view.entries.some((entry) => SystemEntry.is(entry) && entry.id > head.id)) {
+    const edits = view.entries.filter((entry) => SystemEntry.is(entry)).map((entry) => ({ target: entry.id, action: "omit" }));
+    const baseline = systemEntry(Object.fromEntries(desired), { toolsRemoved: [], toolsAdded: tools.map(toToolDeclaration) }, timestamp);
+    return [edits.length === 0 ? baseline : { ...baseline, edits }];
+  }
+  const sections = planSections(replaySections(view.messages), desired);
+  const changes = planTools(getCurrentTools(view.messages), tools);
+  if (changes.toolsRemoved.length === 0 && changes.toolsAdded.length === 0) {
+    return sections.map((patch) => systemEntry(patch, undefined, timestamp));
+  }
+  if (sections.length === 0)
+    return [systemEntry(undefined, changes, timestamp)];
+  return sections.map((patch, index) => systemEntry(patch, index === sections.length - 1 ? changes : undefined, timestamp));
+}
+function planTools(offered, desired) {
+  const wanted = new Map(desired.map((tool) => [tool.name, tool]));
+  const kept = offered.filter((tool) => {
+    const next = wanted.get(tool.name);
+    return next !== undefined && declarationsEqual(tool, next);
+  });
+  const keptNames = new Set(kept.map((tool) => tool.name));
+  const added = desired.filter((tool) => !keptNames.has(tool.name));
+  const replayed = [...kept, ...added];
+  if (replayed.some((tool, index) => tool.name !== desired[index].name)) {
+    return {
+      toolsRemoved: offered.map((tool) => ({ name: tool.name })),
+      toolsAdded: desired.map(toToolDeclaration)
+    };
+  }
+  return {
+    toolsRemoved: offered.filter((tool) => !keptNames.has(tool.name)).map((tool) => ({ name: tool.name })),
+    toolsAdded: added.map(toToolDeclaration)
+  };
+}
+function planSections(shown, desired) {
+  const patchedOrder = [
+    ...[...shown.keys()].filter((key) => desired.has(key)),
+    ...[...desired.keys()].filter((key) => !shown.has(key))
+  ];
+  const desiredOrder = [...desired.keys()];
+  if (patchedOrder.some((key, index) => key !== desiredOrder[index])) {
+    return [Object.fromEntries([...shown.keys()].map((key) => [key, null])), Object.fromEntries(desired)];
+  }
+  const patch = {};
+  for (const [key, value] of shown) {
+    const next = desired.get(key);
+    if (next !== value)
+      patch[key] = next ?? null;
+  }
+  for (const [key, value] of desired)
+    if (!shown.has(key))
+      patch[key] = value;
+  return Object.keys(patch).length === 0 ? [] : [patch];
+}
+function systemEntry(sections, tools, timestamp) {
+  const message = {
+    role: "system",
+    content: "",
+    ...sections === undefined ? {} : { sections },
+    ...tools === undefined || tools.toolsRemoved.length === 0 ? {} : { toolsRemoved: tools.toolsRemoved },
+    ...tools === undefined || tools.toolsAdded.length === 0 ? {} : { toolsAdded: tools.toolsAdded },
+    timestamp
+  };
+  return { model: [message] };
+}
+
+// node_modules/@earendil-works/pi-ai/dist/utils/uuid.js
+var MAX_UUID_V7_TIMESTAMP = 281474976710655;
+var MAX_SEQUENCE = (1n << 41n) - 1n;
+var lastOrdinaryTimestamp = -1;
+var sequence;
+function uuidv7(timestampMs) {
+  const requestedTimestamp = timestampMs ?? Date.now();
+  if (!Number.isInteger(requestedTimestamp) || requestedTimestamp < 0 || requestedTimestamp > MAX_UUID_V7_TIMESTAMP) {
+    throw new RangeError(`UUIDv7 timestamp must be an integer between 0 and ${MAX_UUID_V7_TIMESTAMP}`);
+  }
+  const effectiveTimestamp = timestampMs === undefined ? Math.max(requestedTimestamp, lastOrdinaryTimestamp) : timestampMs;
+  if (timestampMs === undefined)
+    lastOrdinaryTimestamp = effectiveTimestamp;
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  if (sequence === undefined) {
+    sequence = BigInt(bytes[1]) << 32n | BigInt(bytes[2]) << 24n | BigInt(bytes[3]) << 16n | BigInt(bytes[4]) << 8n | BigInt(bytes[5]);
+  } else {
+    if (sequence === MAX_SEQUENCE)
+      throw new RangeError("UUIDv7 generator sequence exhausted");
+    sequence++;
+  }
+  const timestamp = BigInt(effectiveTimestamp);
+  for (let index = 5;index >= 0; index--) {
+    bytes[index] = Number(timestamp >> BigInt((5 - index) * 8)) & 255;
+  }
+  bytes[6] = 112 | Number(sequence >> 37n & 0x0fn);
+  bytes[7] = Number(sequence >> 29n & 0xffn);
+  bytes[8] = 128 | Number(sequence >> 23n & 0x3fn);
+  bytes[9] = Number(sequence >> 15n & 0xffn);
+  bytes[10] = Number(sequence >> 7n & 0xffn);
+  bytes[11] = Number((sequence & 0x7fn) << 1n) | bytes[11] & 1;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+}
+
+// node_modules/@earendil-works/pi-durable/dist/harness/provider.js
+var ProviderDoc = defineDoc({
+  kind: "pi.provider",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({ sessionId: uuidv7() }),
+  checkpointWhen: () => true
+});
+async function ensureProviderSessionId(runtime, context) {
+  const existing = await runtime.snapshot(ProviderDoc, runtime.conversationId, context);
+  if (existing !== undefined)
+    return existing.sessionId;
+  let created;
+  await runtime.commit(async (tx) => {
+    created = (await tx.doc(ProviderDoc, runtime.conversationId)).sessionId;
+    return;
+  }, context);
+  if (created === undefined)
+    throw new Error(`Conversation ${runtime.conversationId} has no provider session ID`);
+  return created;
 }
 
 // node_modules/@earendil-works/chord/dist/output.js
@@ -28004,696 +28655,59 @@ ${JSON.stringify(toolCall.arguments, null, 2)}`;
   throw new Error(errorMessage);
 }
 
-// node_modules/@earendil-works/pi-durable/dist/entries.js
-function defineEntry(kind) {
-  if (typeof kind !== "string" || kind.length === 0)
-    throw new TypeError("Entry kind must be a non-empty string");
-  return {
-    kind,
-    is: (entry) => entry !== undefined && entry.kind === kind
-  };
-}
-var UserEntry = defineEntry("pi.user");
-var AssistantEntry = defineEntry("pi.assistant");
-var SystemEntry = defineEntry("pi.system");
-var ToolResultEntry = defineEntry("pi.tool-result");
-var ResetEntry = defineEntry("pi.reset");
-var CompactionEntry = defineEntry("pi.compaction");
-
-// node_modules/@earendil-works/pi-durable/dist/tasks.js
-function defineTask(definition) {
-  return { definition };
-}
-
 // node_modules/@earendil-works/pi-durable/dist/truncate.js
 var DEFAULT_MAX_LINES = 2000;
 var DEFAULT_MAX_BYTES = 50 * 1024;
 
-// node_modules/@earendil-works/pi-durable/dist/harness/json.js
-function assignJson(target, key, value) {
-  const slots = target;
-  const current = slots[key];
-  if (isRecord(current) && isRecord(value)) {
-    for (const name of Object.keys(current))
-      if (!Object.hasOwn(value, name))
-        delete current[name];
-    for (const [name, child] of Object.entries(value))
-      assignJson(current, name, child);
-    return;
-  }
-  if (Array.isArray(current) && Array.isArray(value) && current.length <= value.length) {
-    const items = current;
-    for (let index = 0;index < value.length; index++) {
-      if (index < items.length)
-        assignJson(items, index, value[index]);
-      else
-        items.push(value[index]);
-    }
-    return;
-  }
-  if (current !== value)
-    slots[key] = value;
-}
-function isRecord(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-// node_modules/@earendil-works/pi-ai/dist/utils/overflow.js
-var OVERFLOW_PATTERNS = [
-  /prompt (?:is )?too long/i,
-  /prompt exceeds max length/i,
-  /request_too_large/i,
-  /input is too long for requested model/i,
-  /exceeds the context window/i,
-  /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i,
-  /input token count.*exceeds the maximum/i,
-  /maximum prompt length is \d+/i,
-  /reduce the length of the messages/i,
-  /maximum context length is \d+ tokens/i,
-  /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i,
-  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i,
-  /exceeds the limit of \d+/i,
-  /exceeds the available context size/i,
-  /greater than the context length/i,
-  /context window exceeds limit/i,
-  /exceeded model token limit/i,
-  /too large for model with \d+ maximum context length/i,
-  /prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i,
-  /model_context_window_exceeded/i,
-  /prompt too long; exceeded (?:max )?context length/i,
-  /range of input length should be/i,
-  /context[_ ]length[_ ]exceeded/i,
-  /too many tokens/i,
-  /token limit exceeded/i,
-  /^(?:[\w -]+ API error \(413\):|413(?:\s|:|$))/i
-];
-var CEREBRAS_BODYLESS_OVERFLOW_PATTERN = /^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i;
-var NON_OVERFLOW_PATTERNS = [
-  /^(Throttling error|Service unavailable):/i,
-  /rate limit/i,
-  /too many requests/i
-];
-function isContextOverflow(message, contextWindow) {
-  if (message.stopReason === "error" && message.errorMessage) {
-    const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage));
-    if (!isNonOverflow) {
-      if (OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage))) {
-        return true;
-      }
-      if (message.provider === "cerebras" && CEREBRAS_BODYLESS_OVERFLOW_PATTERN.test(message.errorMessage)) {
-        return true;
-      }
-    }
-  }
-  if (contextWindow && message.stopReason === "stop") {
-    const inputTokens = message.usage.input + message.usage.cacheRead;
-    if (inputTokens > contextWindow) {
-      return true;
-    }
-  }
-  if (contextWindow && message.stopReason === "length" && message.usage.output === 0) {
-    const inputTokens = message.usage.input + message.usage.cacheRead;
-    if (inputTokens >= contextWindow * 0.99) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// node_modules/@earendil-works/pi-ai/dist/utils/retry.js
-function buildProviderErrorPattern(patterns) {
-  return new RegExp(patterns.join("|"), "i");
-}
-var NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
-  "GoUsageLimitError",
-  "FreeUsageLimitError",
-  "Monthly usage limit reached",
-  "available balance",
-  "insufficient_quota",
-  "out of budget",
-  "quota exceeded",
-  "billing",
-  "subscription_sharing_usage_limit_exceeded",
-  "subscription_sharing_workplace_individual_usage_limit_exceeded"
-]);
-var RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
-  "overloaded",
-  "server_busy",
-  "servers are currently busy",
-  "currently experiencing high demand",
-  "model is at capacity",
-  "rate.?limit",
-  "too many requests",
-  "(?<![a-z0-9])(?:429|500|502|503|504|520|524)(?![a-z0-9])",
-  "service.?(?:is.?)?(?:temporarily.?)?unavailable",
-  "server.?error",
-  "internal.?error",
-  "provider.?returned.?(?:an.?)?error",
-  "exceeded request buffer limit while retrying upstream",
-  "unable to forward upstream",
-  "upstream.?request.?failed",
-  "upstream_stream_read_error",
-  "stream was interrupted",
-  "http/?2 stream failed",
-  "network.?error",
-  "connection.?error",
-  "connection.?refused",
-  "connection.?lost",
-  "other side closed",
-  "fetch failed",
-  "request to \\S+ failed, reason:",
-  "getaddrinfo",
-  "ENOTFOUND",
-  "EAI_AGAIN",
-  "upstream.?connect",
-  "reset before headers",
-  "socket hang up",
-  "socket connection was closed",
-  "timed? out",
-  "timeout",
-  "terminated",
-  "websocket.?closed",
-  "websocket.?error",
-  "ended without",
-  "stream ended before message_stop",
-  "stream ended before a terminal response event",
-  "http2 request did not get a response",
-  "stream disconnected before completion",
-  "pending stream has been canceled",
-  "retry delay",
-  "you can retry your request",
-  "try your request again",
-  "please retry your request",
-  "ResourceExhausted",
-  "subscription_sharing_usage_unavailable",
-  "subscription_sharing_user_unavailable"
-]);
-var DEFAULT_MAX_AGENT_RETRY_DELAY_MS = 60000;
-function retryDelayMs(policy, attempt) {
-  const delay = policy.baseDelayMs * 2 ** Math.max(0, attempt - 1);
-  const safeDelay = Number.isSafeInteger(delay) ? delay : Number.MAX_SAFE_INTEGER;
-  return Math.min(safeDelay, policy.maxAgentDelayMs ?? DEFAULT_MAX_AGENT_RETRY_DELAY_MS);
-}
-function isRetryableAssistantError(message) {
-  if (message.stopReason !== "error" || !message.errorMessage)
-    return false;
-  const errorMessage = message.errorMessage;
-  if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage))
-    return false;
-  return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
-}
-
-// node_modules/@earendil-works/pi-durable/dist/harness/generation.js
-init_transcript();
-
-// node_modules/@earendil-works/pi-durable/dist/harness/compaction.js
-init_estimate();
-
-// node_modules/@earendil-works/pi-durable/dist/harness/context.js
-var SCAN_PAGE_SIZE2 = 256;
-var EXCLUDED_STOP_REASONS = new Set(["aborted", "error", "deferred"]);
-var MISSING_RESULT_TEXT = "Tool result unavailable: history ends before this call completed.";
-async function captureContextBounds(storage, conversationId, context, at) {
-  let tail;
-  if (at === undefined) {
-    tail = (await storage.scanEntries({ conversationId }, 1, undefined, context)).items[0]?.id;
-    if (tail === undefined)
-      return;
-  } else {
-    if (await storage.entry(conversationId, at, context) === undefined) {
-      throw new Error(`Entry ${at} is not visible from conversation ${conversationId}`);
-    }
-    tail = at;
-  }
-  return { head: await storage.findLatestHeadMarker(conversationId, tail, context), tail };
-}
-async function readContextFrom(session, storage, conversationId, context, at, previous) {
-  const bounds = await session.readOnLine(() => captureContextBounds(storage, conversationId, context, at));
-  if (bounds === undefined)
-    return { view: emptyView(), range: undefined };
-  freezeJson(bounds.head);
-  let range;
-  if (previous === undefined || previous.bounds.head?.id !== bounds.head?.id) {
-    range = deriveRange(bounds, freezeJson(await scanRange(storage, conversationId, rangeQuery(bounds), context)));
-  } else if (bounds.tail === previous.bounds.tail) {
-    range = previous;
-  } else if (bounds.tail < previous.bounds.tail) {
-    range = deriveRange(bounds, previous.entries.filter((entry) => entry.id <= bounds.tail));
-  } else {
-    const minEntryId = idFromNumber(previous.bounds.tail + 1);
-    const added = await scanRange(storage, conversationId, { minEntryId, maxEntryId: bounds.tail }, context);
-    range = extendRange(previous, bounds, freezeJson(added));
-  }
-  const { view } = range;
-  return {
-    view: {
-      ...view,
-      entries: [...view.entries],
-      contributions: [...view.contributions],
-      messages: [...view.messages]
-    },
-    range
-  };
-}
-async function readContext(session, storage, conversationId, context, at) {
-  const bounds = await session.readOnLine(() => captureContextBounds(storage, conversationId, context, at));
-  return deriveContext(storage, conversationId, bounds, context);
-}
-async function deriveContext(storage, conversationId, bounds, context) {
-  if (bounds === undefined)
-    return emptyView();
-  return deriveRange(bounds, await scanRange(storage, conversationId, rangeQuery(bounds), context)).view;
-}
-function emptyView() {
-  return { head: undefined, entries: [], contributions: [], messages: [] };
-}
-function deriveRange(bounds, entries) {
-  const edits = new Map;
-  for (const entry of entries)
-    for (const edit of entry.edits ?? [])
-      edits.set(edit.target, edit);
-  const active = selectActive(bounds.head, entries);
-  const contributions = active.map((entry) => contribute(entry, edits.get(entry.id)));
-  const { settled, open } = settle([], contributions.flat());
-  const baseline = findBaseline(bounds.head, active);
-  const messages = leadWithSystem([...settled, ...orderToolResults(open)], baseline);
-  const view = { head: bounds.head, entries: active, contributions, messages };
-  return { bounds, entries, view, edited: new Set(edits.keys()), settled, open, baseline };
-}
-function extendRange(previous, bounds, added) {
-  const entries = [...previous.entries, ...added];
-  if (added.some((entry) => entry.edits !== undefined || entry.head !== undefined || previous.edited.has(entry.id))) {
-    return deriveRange(bounds, entries);
-  }
-  const contributions = added.map((entry) => contribute(entry, undefined));
-  const { settled, open } = settle(previous.settled, [...previous.open, ...contributions.flat()]);
-  const baseline = previous.baseline !== undefined ? previous.baseline : findBaseline(bounds.head, added);
-  const view = {
-    head: bounds.head,
-    entries: [...previous.view.entries, ...added],
-    contributions: [...previous.view.contributions, ...contributions],
-    messages: leadWithSystem([...settled, ...orderToolResults(open)], baseline)
-  };
-  return { bounds, entries, view, edited: previous.edited, settled, open, baseline };
-}
-function findBaseline(head, entries) {
-  for (const entry of entries) {
-    if (head !== undefined && entry.id <= head.id)
-      continue;
-    if (SystemEntry.is(entry))
-      return entry.model?.find((message) => message.role === "system") ?? null;
-    if (head === undefined && carriesSystemMessage(entry))
-      return null;
-  }
-  return;
-}
-function carriesSystemMessage(entry) {
-  const isSystem = (message) => message.role === "system";
-  return (entry.model?.some(isSystem) ?? false) || (entry.edits?.some((edit) => edit.action === "replace" && edit.messages.some(isSystem)) ?? false);
-}
-function leadWithSystem(messages, baseline) {
-  const index = messages.findIndex((message) => message.role === "system");
-  if (index <= 0)
-    return messages;
-  const system = messages[index];
-  if (system !== baseline && messages.slice(0, index).some((message) => message.role !== "user")) {
-    return messages;
-  }
-  return [system, ...messages.slice(0, index), ...messages.slice(index + 1)];
-}
-function contribute(entry, edit) {
-  if (edit?.action === "omit")
-    return Object.freeze([]);
-  const contributed = edit?.action === "replace" ? edit.messages : entry.model ?? [];
-  return Object.freeze(contributed.filter((message) => message.role !== "assistant" || !EXCLUDED_STOP_REASONS.has(message.stopReason)));
-}
-var deeplyFrozen = new WeakSet;
-function freezeJson(value) {
-  if (value === null || typeof value !== "object" || deeplyFrozen.has(value))
-    return value;
-  for (const child of Object.values(value))
-    freezeJson(child);
-  Object.freeze(value);
-  deeplyFrozen.add(value);
-  return value;
-}
-function settle(settled, open) {
-  const last = open.findLastIndex((message) => message.role === "assistant");
-  if (last <= 0)
-    return { settled, open };
-  return { settled: [...settled, ...orderToolResults(open.slice(0, last))], open: open.slice(last) };
-}
-async function activeEntries(storage, conversationId, bounds, context) {
-  if (bounds === undefined)
-    return [];
-  return selectActive(bounds.head, await scanRange(storage, conversationId, rangeQuery(bounds), context));
-}
-function rangeQuery(bounds) {
-  const head = bounds.head;
-  return head === undefined ? { maxEntryId: bounds.tail } : { minEntryId: head.head, maxEntryId: bounds.tail };
-}
-async function scanRange(storage, conversationId, range, context) {
-  const entries = [];
-  let cursor;
-  do {
-    const page = await storage.scanEntries({ conversationId, ...range }, SCAN_PAGE_SIZE2, cursor, context);
-    entries.push(...page.items);
-    cursor = page.next;
-  } while (cursor !== undefined);
-  return entries.reverse();
-}
-function selectActive(head, range) {
-  return head === undefined ? range : [head, ...range.filter((entry) => entry.head === undefined)];
-}
-function orderToolResults(messages) {
-  const ordered = [];
-  for (let index = 0;index < messages.length; index++) {
-    const message = messages[index];
-    if (message.role === "toolResult")
-      continue;
-    ordered.push(message);
-    if (message.role !== "assistant")
-      continue;
-    const calls = message.content.filter((content) => content.type === "toolCall");
-    if (calls.length === 0)
-      continue;
-    const results = new Map;
-    for (let next = index + 1;next < messages.length && messages[next].role !== "assistant"; next++) {
-      const candidate = messages[next];
-      if (candidate.role === "toolResult" && !results.has(candidate.toolCallId)) {
-        results.set(candidate.toolCallId, next);
-      }
-    }
-    for (const call of calls) {
-      const resultIndex = results.get(call.id);
-      ordered.push(resultIndex === undefined ? missingResult(call, message.timestamp) : messages[resultIndex]);
-    }
-  }
-  return ordered;
-}
-function missingResult(call, timestamp) {
-  return freezeJson({
-    role: "toolResult",
-    toolCallId: call.id,
-    toolName: call.name,
-    content: [{ type: "text", text: MISSING_RESULT_TEXT }],
-    isError: true,
-    details: { reason: "missing_result" },
-    timestamp
-  });
-}
-
-// node_modules/@earendil-works/pi-ai/dist/utils/uuid.js
-var MAX_UUID_V7_TIMESTAMP = 281474976710655;
-var MAX_SEQUENCE = (1n << 41n) - 1n;
-var lastOrdinaryTimestamp = -1;
-var sequence;
-function uuidv7(timestampMs) {
-  const requestedTimestamp = timestampMs ?? Date.now();
-  if (!Number.isInteger(requestedTimestamp) || requestedTimestamp < 0 || requestedTimestamp > MAX_UUID_V7_TIMESTAMP) {
-    throw new RangeError(`UUIDv7 timestamp must be an integer between 0 and ${MAX_UUID_V7_TIMESTAMP}`);
-  }
-  const effectiveTimestamp = timestampMs === undefined ? Math.max(requestedTimestamp, lastOrdinaryTimestamp) : timestampMs;
-  if (timestampMs === undefined)
-    lastOrdinaryTimestamp = effectiveTimestamp;
-  const bytes = new Uint8Array(16);
-  globalThis.crypto.getRandomValues(bytes);
-  if (sequence === undefined) {
-    sequence = BigInt(bytes[1]) << 32n | BigInt(bytes[2]) << 24n | BigInt(bytes[3]) << 16n | BigInt(bytes[4]) << 8n | BigInt(bytes[5]);
-  } else {
-    if (sequence === MAX_SEQUENCE)
-      throw new RangeError("UUIDv7 generator sequence exhausted");
-    sequence++;
-  }
-  const timestamp = BigInt(effectiveTimestamp);
-  for (let index = 5;index >= 0; index--) {
-    bytes[index] = Number(timestamp >> BigInt((5 - index) * 8)) & 255;
-  }
-  bytes[6] = 112 | Number(sequence >> 37n & 0x0fn);
-  bytes[7] = Number(sequence >> 29n & 0xffn);
-  bytes[8] = 128 | Number(sequence >> 23n & 0x3fn);
-  bytes[9] = Number(sequence >> 15n & 0xffn);
-  bytes[10] = Number(sequence >> 7n & 0xffn);
-  bytes[11] = Number((sequence & 0x7fn) << 1n) | bytes[11] & 1;
-  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
-  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
-}
-
-// node_modules/@earendil-works/pi-durable/dist/harness/provider.js
-var ProviderDoc = defineDoc({
-  kind: "pi.provider",
+// node_modules/@earendil-works/pi-durable/dist/harness/usage.js
+var UsageDoc = defineDoc({
+  kind: "pi.usage",
   version: 1,
   scope: "conversation",
   history: "latest",
   fork: "initial",
-  initial: () => ({ sessionId: uuidv7() }),
+  initial: () => ({ models: {}, tools: {} }),
   checkpointWhen: () => true
 });
-async function ensureProviderSessionId(runtime, context) {
-  const existing = await runtime.snapshot(ProviderDoc, runtime.conversationId, context);
-  if (existing !== undefined)
-    return existing.sessionId;
-  let created;
-  await runtime.commit(async (tx) => {
-    created = (await tx.doc(ProviderDoc, runtime.conversationId)).sessionId;
-    return;
-  }, context);
-  if (created === undefined)
-    throw new Error(`Conversation ${runtime.conversationId} has no provider session ID`);
-  return created;
+async function recordUsage(tx, conversationId, bucket, key, usage) {
+  const totals = (await tx.doc(UsageDoc, conversationId))[bucket];
+  const total = Object.hasOwn(totals, key) ? totals[key] : undefined;
+  if (total === undefined)
+    totals[key] = copyJson(usage, { omitUndefinedProperties: true });
+  else
+    addUsage(total, usage);
 }
-
-// node_modules/@earendil-works/pi-durable/dist/harness/submissions.js
-init_dist();
-
-// node_modules/@earendil-works/pi-durable/dist/harness/inbox.js
-var InboxDoc = defineDoc({
-  kind: "pi.inbox",
-  version: 1,
-  scope: "conversation",
-  history: "latest",
-  fork: "initial",
-  initial: () => ({ items: [] }),
-  checkpointWhen: (value) => value.items.length === 0
-});
-async function prepareBoundary(tx, conversationId, modes) {
-  const head = (await tx.latestHeadMarker(conversationId))?.head;
-  const inbox = await tx.doc(InboxDoc, conversationId);
-  return {
-    conversationId,
-    inbox,
-    steeringMode: modes.steeringMode,
-    followUpMode: modes.followUpMode,
-    head
-  };
+function addUsage(total, usage) {
+  total.input += usage.input;
+  total.output += usage.output;
+  total.cacheRead += usage.cacheRead;
+  total.cacheWrite += usage.cacheWrite;
+  total.totalTokens += usage.totalTokens;
+  if (usage.cacheWrite1h !== undefined)
+    total.cacheWrite1h = (total.cacheWrite1h ?? 0) + usage.cacheWrite1h;
+  if (usage.reasoning !== undefined)
+    total.reasoning = (total.reasoning ?? 0) + usage.reasoning;
+  total.cost.input += usage.cost.input;
+  total.cost.output += usage.cost.output;
+  total.cost.cacheRead += usage.cost.cacheRead;
+  total.cost.cacheWrite += usage.cost.cacheWrite;
+  total.cost.total += usage.cost.total;
 }
-async function applyBoundary(tx, boundary, at, now) {
-  const { conversationId, inbox } = boundary;
-  const items = inbox.items;
-  const reset = hasQueuedReset(items);
-  const final = at === "final" || reset;
-  const pick = (mode, queueMode) => {
-    const indexes = items.flatMap((item, index) => item.mode === mode ? [index] : []);
-    return queueMode === "all" ? indexes : indexes.slice(0, 1);
-  };
-  const writes = items.flatMap((item, index) => item.mode === "write" ? [index] : []);
-  const users = [...pick("steer", boundary.steeringMode), ...final ? pick("followUp", boundary.followUpMode) : []];
-  users.sort((a, b) => a - b);
-  for (const index of writes) {
-    const item = items[index];
-    const draft = item.entry;
-    if (isStale(boundary, draft)) {
-      tx.settleSubmission(item.id, { status: "unanswered", reason: "stale" });
-      continue;
-    }
-    const entry = await tx.appendEntry(conversationId, draft);
-    if (draft.head !== undefined)
-      boundary.head = draft.head === "self" ? entry.id : draft.head;
-    tx.placeSubmission(item.id, entry.id);
-  }
-  const placed = [];
-  for (const index of users) {
-    const item = items[index];
-    const entry = await appendInput(tx, conversationId, item.content, item.entry, now);
-    tx.placeSubmission(item.id, entry.id);
-    placed.push(item.id);
-  }
-  const removed = [...writes, ...users].sort((a, b) => b - a);
-  for (const index of removed)
-    items.splice(index, 1);
-  return { users: placed, reset };
-}
-function appendInput(tx, conversationId, content, entry, now) {
-  const message = { role: "user", content, timestamp: now };
-  if (entry === undefined)
-    return tx.appendEntry(UserEntry, conversationId, { model: [message] });
-  return tx.appendEntry(conversationId, { ...pickInputEntry(entry), model: [message] });
-}
-function pickInputEntry({ kind, data }) {
-  const picked = data === undefined ? { kind } : { kind, data };
-  return copyJson(picked, { omitUndefinedProperties: true });
-}
-function isDisplayOnly(entry) {
-  return entry.model === undefined && entry.head === undefined && entry.edits === undefined;
-}
-function hasQueuedReset(items) {
-  return items.some((item) => item.mode === "write" && item.entry.head === "self");
-}
-function isStale(boundary, entry) {
-  return typeof entry.head === "number" && boundary.head !== undefined && entry.head < boundary.head;
-}
-async function removeInboxItem(tx, conversationId, id) {
-  const items = (await tx.doc(InboxDoc, conversationId)).items;
-  const index = items.findIndex((item) => item.id === id);
-  if (index >= 0)
-    items.splice(index, 1);
-}
-async function withdrawQueuedInputs(tx, conversationId, reason = "aborted") {
-  const items = (await tx.doc(InboxDoc, conversationId)).items;
-  for (let index = items.length - 1;index >= 0; index--) {
-    const item = items[index];
-    if (item.mode === "write")
-      continue;
-    tx.settleSubmission(item.id, { status: "unanswered", reason });
-    items.splice(index, 1);
-  }
-}
-
-// node_modules/@earendil-works/pi-durable/dist/harness/telemetry.js
-init_dist();
-var entry = {
-  description: "A transcript entry was committed; content remains in the transcript.",
-  attributes: {
-    "entry.id": { type: "number", required: true, description: "Transcript entry ID.", cardinality: "high" },
-    "entry.kind": { type: "string", required: true, description: "Entry kind." }
-  }
-};
-var reportAttributes = {
-  type: {
-    type: "string",
-    required: true,
-    description: "ReportInfo type.",
-    values: [
-      "session_failed",
-      "task_faulted",
-      "task_parked",
-      "migration_failed",
-      "task_outdated",
-      "task_error",
-      "extension_error",
-      "host_error",
-      "listener_error"
-    ]
-  },
-  reason: {
-    type: "string",
-    required: false,
-    description: "Fixed report reason, when present.",
-    values: ["threw", "restart_limit", "missing_task", "incompatible_task"]
-  },
-  extension: { type: "string", required: false, description: "Registered extension name, when present." },
-  "task.id": { type: "number", required: false, description: "Task ID, when present.", cardinality: "high" }
-};
-var report = {
-  description: "A report was raised; no error payload is recorded.",
-  attributes: reportAttributes
-};
-var submission = {
-  description: "A submission was settled.",
-  attributes: {
-    "submission.id": { type: "number", required: true, description: "Submission ID.", cardinality: "high" },
-    status: { type: "string", required: true, values: ["done", "unanswered"], description: "Settlement." },
-    "answer.entry_id": { type: "number", required: false, description: "Answer entry ID.", cardinality: "high" }
-  }
-};
-var DURABLE_TELEMETRY_SCHEMA = defineTelemetrySchema({
-  version: 1,
-  spans: {
-    "pi.durable.submit": {
-      description: "Public submission admission and its commit. Inputs start root traces linked to their callers; writes are children. Internal admissions emit phase events only.",
-      parents: { kind: "any" },
-      startAttributes: {
-        "submission.type": {
-          type: "string",
-          required: true,
-          values: ["input", "write"],
-          description: "Submission type."
-        },
-        "conversation.id": { type: "number", required: true, description: "Conversation ID.", cardinality: "high" }
-      },
-      endAttributes: {
-        "submission.id": { type: "number", description: "Admitted submission ID.", cardinality: "high" },
-        result: {
-          type: "string",
-          values: ["queued", "placed", "done"],
-          description: "Admission result; stale writes report done."
-        }
-      },
-      events: { "pi.durable.entry": entry, "pi.durable.submission": submission, "pi.durable.report": report },
-      status: { default: "ok", errorWhen: "Admission failed." }
-    },
-    "pi.durable.phase": {
-      description: "One task phase invocation, including its decision commit, never a wait or restart.",
-      parents: { kind: "any" },
-      startAttributes: {
-        "task.id": { type: "number", required: true, description: "Task ID.", cardinality: "high" },
-        "task.name": { type: "string", required: true, description: "Registered task name." },
-        phase: { type: "string", required: true, description: "Invoked checkpoint phase." },
-        kind: { type: "string", required: true, values: ["run", "abort"], description: "Invocation kind." },
-        attempt: { type: "number", required: false, description: "Checkpoint attempt, when present." },
-        resumed: {
-          type: "boolean",
-          required: true,
-          description: "First invocation of a task loaded in this process."
-        }
-      },
-      endAttributes: {
-        outcome: { type: "string", description: "next=<phase>, waiting, sleeping, done, faulted, or aborted." },
-        "tool.name": { type: "string", description: "Called tool name." },
-        "tool.call_id": { type: "string", description: "Transcript tool call ID.", cardinality: "high" }
-      },
-      events: {
-        "pi.durable.entry": entry,
-        "pi.durable.submission": submission,
-        "pi.durable.report": report,
-        "pi.durable.checkpoint": {
-          description: "The running checkpoint's phase changed while the invocation continued.",
-          attributes: { phase: { type: "string", required: true, description: "Committed checkpoint phase." } }
-        },
-        "pi.durable.replay": {
-          description: "A nested tool call was answered from its stored result.",
-          attributes: { "tool.name": { type: "string", required: true, description: "Called tool name." } }
-        }
-      },
-      status: {
-        default: "ok",
-        errorWhen: "Faulted, failed, and orphaned outcomes use task_faulted, task_failed, and task_orphaned with a diagnostic capped at 500 characters. Aborted outcomes keep status ok."
-      }
-    }
-  },
-  metrics: {
-    "pi.durable.reports": {
-      kind: "counter",
-      description: "Reports raised, grouped by their fixed ReportInfo type.",
-      attributes: { type: reportAttributes.type }
-    },
-    "pi.durable.phase.duration": {
-      kind: "histogram",
-      unit: "ms",
-      description: "Duration of a phase invocation and its decision commit.",
-      attributes: {
-        task: { type: "string", required: true, description: "Registered task name." },
-        phase: { type: "string", required: true, description: "Invoked checkpoint phase." },
-        outcome: { type: "string", required: true, description: "Phase outcome." }
-      }
-    },
-    "pi.durable.tasks.active": {
-      kind: "upDownCounter",
-      description: "Live tasks held by this Harness; decremented at terminal settlement or close.",
-      attributes: { task: { type: "string", required: true, description: "Registered task name." } }
+function addUsageState(sum, state) {
+  for (const bucket of ["models", "tools"]) {
+    for (const [key, usage] of Object.entries(state[bucket])) {
+      const total = Object.hasOwn(sum[bucket], key) ? sum[bucket][key] : undefined;
+      if (total !== undefined)
+        addUsage(total, usage);
+      else
+        Object.defineProperty(sum[bucket], key, {
+          value: structuredClone(usage),
+          enumerable: true,
+          writable: true
+        });
     }
   }
-});
+}
 
 // node_modules/@earendil-works/pi-durable/dist/harness/util.js
 class Waiters {
@@ -28751,1316 +28765,6 @@ function closedError(session) {
 }
 function optionalExtension(extension) {
   return extension === undefined ? {} : { extension };
-}
-
-// node_modules/@earendil-works/pi-durable/dist/harness/submissions.js
-class Submissions {
-  #telemetry;
-  #session;
-  #storage;
-  #now;
-  #queueModes;
-  #resume;
-  #waiters = new Waiters;
-  #closed = false;
-  constructor(session, storage, now, queueModes, resume, telemetry = NOOP_TELEMETRY_CONTEXT) {
-    this.#telemetry = telemetry;
-    this.#session = session;
-    this.#storage = storage;
-    this.#now = now;
-    this.#queueModes = queueModes;
-    this.#resume = resume;
-    session.observeCommits((publication) => this.#observe(publication));
-    session.subscribeClose(() => {
-      this.#closed = true;
-      this.#waiters.rejectAll(closedError(this.#session));
-    });
-  }
-  async submit(conversationId, draft, context) {
-    this.#resume();
-    const parent = draft.type === "input" ? this.#telemetry : context.telemetry;
-    return createTypedSpanStarter(parent, [DURABLE_TELEMETRY_SCHEMA])("pi.durable.submit", {
-      "submission.type": draft.type,
-      "conversation.id": conversationId
-    }, async (span) => {
-      if (draft.type === "input")
-        span.addLink({ context: context.telemetry });
-      try {
-        const { id, status } = await this.#session.commitWith((tx) => admitSubmission(tx, conversationId, draft, this.#now(), this.#queueModes(), span), withTelemetry(span, context));
-        span.setAttributes({ "submission.id": id, result: status });
-        return new SubmissionHandle(id, this);
-      } catch (error) {
-        span.setStatus({ status: "error" });
-        throw error;
-      }
-    });
-  }
-  async get(id, context) {
-    const record = await this.#session.readOnLine(() => this.#storage.submission(id, context));
-    return record === undefined ? undefined : new SubmissionHandle(record.id, this);
-  }
-  async status(id, context) {
-    const record = await this.#session.readOnLine(() => this.#storage.submission(id, context));
-    if (record === undefined)
-      throw new Error(`Submission ${id} does not exist`);
-    return record;
-  }
-  async wait(id, context) {
-    this.#resume();
-    const found = await this.#session.readOnLine(async () => {
-      const record = await this.#storage.submission(id, context);
-      if (record === undefined)
-        throw new Error(`Submission ${id} does not exist`);
-      if (isSettled(record))
-        return { promise: Promise.resolve(record) };
-      if (this.#closed)
-        throw closedError(this.#session);
-      return { promise: this.#waiters.add(id, context) };
-    });
-    return found.promise;
-  }
-  abort(id, context, conversationId) {
-    return this.#session.commitWith(async (tx) => {
-      const record = await tx.submission(id);
-      if (record === undefined || conversationId !== undefined && record.conversationId !== conversationId) {
-        return "not_found";
-      }
-      if (record.status === "queued") {
-        tx.settleSubmission(id, { status: "unanswered", reason: "aborted" });
-        await removeInboxItem(tx, record.conversationId, id);
-        return "aborted";
-      }
-      return record.status === "placed" ? "already_placed" : "settled";
-    }, context);
-  }
-  #observe(publication) {
-    for (const change of publication.changes) {
-      if (change.type !== "submission" || !isSettled(change.value))
-        continue;
-      this.#waiters.resolve(change.value.id, change.value);
-    }
-  }
-}
-
-class SubmissionHandle {
-  id;
-  #submissions;
-  constructor(id, submissions) {
-    this.id = id;
-    this.#submissions = submissions;
-  }
-  status(context) {
-    return this.#submissions.status(this.id, context);
-  }
-  wait(context) {
-    return this.#submissions.wait(this.id, context);
-  }
-  async abort(context) {
-    const result = await this.#submissions.abort(this.id, context);
-    if (result === "not_found")
-      throw new Error(`Submission ${this.id} does not exist`);
-    return result;
-  }
-}
-function isSettled(record) {
-  return record.status === "done" || record.status === "unanswered";
-}
-function checkInputEntry(entry) {
-  const { kind } = entry;
-  if (typeof kind !== "string" || kind.length === 0 || kind.startsWith("pi.")) {
-    throw new TypeError(`An input entry's kind must be a non-empty string not starting with "pi.", got ${String(kind)}`);
-  }
-}
-async function admitSubmission(tx, conversationId, draft, now, queueModes, span) {
-  if (draft.type === "input" && draft.entry !== undefined)
-    checkInputEntry(draft.entry);
-  if (draft.requestId !== undefined) {
-    const existing = await tx.submissionByRequest(conversationId, draft.requestId);
-    if (existing !== undefined) {
-      if (existing.type !== draft.type) {
-        throw new Error(`Request ${draft.requestId} already identifies a submission of type ${existing.type}`);
-      }
-      return { id: existing.id, status: existing.status === "unanswered" ? "done" : existing.status };
-    }
-  }
-  const fields = { conversationId, requestId: draft.requestId, trace: span?.propagation?.inject(span) };
-  if (draft.type === "write" && isDisplayOnly(draft.entry) && !hasQueuedReset((await tx.doc(InboxDoc, conversationId)).items)) {
-    const entry = await tx.appendEntry(conversationId, draft.entry);
-    const write = { ...fields, type: "write", status: "done", entry: entry.id };
-    return { id: (await tx.createSubmission(write)).id, status: "done" };
-  }
-  const live = await tx.doc(LiveDoc, conversationId);
-  const busy = live.run !== undefined;
-  if (draft.type === "input" && draft.whenBusy === "steer" && live.run !== undefined && span?.propagation !== undefined) {
-    const run = await tx.task(live.run.taskId);
-    if (run?.trace !== undefined)
-      span.addLink({ context: span.propagation.extract(run.trace) });
-  }
-  if (busy && draft.type === "input" && draft.whenBusy === "reject")
-    throw new ConversationBusy(conversationId);
-  const boundary = busy ? undefined : await prepareBoundary(tx, conversationId, queueModes);
-  if (boundary === undefined || boundary.inbox.items.length > 0) {
-    const { id } = await tx.createSubmission({
-      ...fields,
-      type: draft.type,
-      status: "queued"
-    });
-    const value = copyJson(draft.type === "write" ? draft.entry : draft.content, {
-      omitUndefinedProperties: true
-    });
-    const items = (boundary?.inbox ?? await tx.doc(InboxDoc, conversationId)).items;
-    if (draft.type === "write")
-      items.push({ id, mode: "write", entry: value });
-    else {
-      const mode = draft.whenBusy === "steer" ? "steer" : "followUp";
-      const content = value;
-      const entry = draft.entry === undefined ? {} : { entry: pickInputEntry(draft.entry) };
-      items.push({ id, mode, content, ...entry });
-    }
-    if (boundary === undefined)
-      return { id, status: "queued" };
-    const { users } = await applyBoundary(tx, boundary, "final", now);
-    if (users.length > 0)
-      await startRun(tx, conversationId, live, users);
-    return { id, status: draft.type === "write" ? "done" : users.at(-1) === id ? "placed" : "queued" };
-  }
-  if (draft.type === "write") {
-    if (isStale(boundary, draft.entry)) {
-      const stale = { status: "unanswered", reason: "stale" };
-      return {
-        id: (await tx.createSubmission({ ...fields, type: "write", ...stale })).id,
-        status: "done"
-      };
-    }
-    const entry = await tx.appendEntry(conversationId, draft.entry);
-    const write = { ...fields, type: "write", status: "done", entry: entry.id };
-    return { id: (await tx.createSubmission(write)).id, status: "done" };
-  }
-  const entry = await appendInput(tx, conversationId, draft.content, draft.entry, now);
-  const input = { ...fields, type: "input", status: "placed", entry: entry.id };
-  const { id } = await tx.createSubmission(input);
-  await startRun(tx, conversationId, live, [id]);
-  return { id, status: "placed" };
-}
-
-// node_modules/@earendil-works/pi-durable/dist/harness/usage.js
-var UsageDoc = defineDoc({
-  kind: "pi.usage",
-  version: 1,
-  scope: "conversation",
-  history: "latest",
-  fork: "initial",
-  initial: () => ({ models: {}, tools: {} }),
-  checkpointWhen: () => true
-});
-async function recordUsage(tx, conversationId, bucket, key, usage) {
-  const totals = (await tx.doc(UsageDoc, conversationId))[bucket];
-  const total = Object.hasOwn(totals, key) ? totals[key] : undefined;
-  if (total === undefined)
-    totals[key] = copyJson(usage, { omitUndefinedProperties: true });
-  else
-    addUsage(total, usage);
-}
-function addUsage(total, usage) {
-  total.input += usage.input;
-  total.output += usage.output;
-  total.cacheRead += usage.cacheRead;
-  total.cacheWrite += usage.cacheWrite;
-  total.totalTokens += usage.totalTokens;
-  if (usage.cacheWrite1h !== undefined)
-    total.cacheWrite1h = (total.cacheWrite1h ?? 0) + usage.cacheWrite1h;
-  if (usage.reasoning !== undefined)
-    total.reasoning = (total.reasoning ?? 0) + usage.reasoning;
-  total.cost.input += usage.cost.input;
-  total.cost.output += usage.cost.output;
-  total.cost.cacheRead += usage.cost.cacheRead;
-  total.cost.cacheWrite += usage.cost.cacheWrite;
-  total.cost.total += usage.cost.total;
-}
-function addUsageState(sum, state) {
-  for (const bucket of ["models", "tools"]) {
-    for (const [key, usage] of Object.entries(state[bucket])) {
-      const total = Object.hasOwn(sum[bucket], key) ? sum[bucket][key] : undefined;
-      if (total !== undefined)
-        addUsage(total, usage);
-      else
-        Object.defineProperty(sum[bucket], key, {
-          value: structuredClone(usage),
-          enumerable: true,
-          writable: true
-        });
-    }
-  }
-}
-
-// node_modules/@earendil-works/pi-durable/dist/harness/compaction.js
-var TOOL_RESULT_MAX_CHARS = 2000;
-var SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
-
-<summary>
-`;
-var SUMMARY_SUFFIX = `
-</summary>`;
-var SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
-
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
-var SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work. If the conversation starts with an earlier summary, preserve its information and fold the newer messages into it.
-
-Use this EXACT format:
-
-## Goal
-[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
-
-## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned by user]
-- [Or "(none)" if none were mentioned]
-
-## Progress
-### Done
-- [x] [Completed tasks/changes]
-
-### In Progress
-- [ ] [Current work]
-
-### Blocked
-- [Issues preventing progress, if any]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale]
-
-## Next Steps
-1. [Ordered list of what should happen next]
-
-## Critical Context
-- [Any data, examples, or references needed to continue]
-- [Or "(none)" if not applicable]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
-var CompactionTask = defineTask({
-  name: "pi.compaction",
-  version: 1,
-  initial: () => ({ phase: "select" }),
-  phases: {
-    select: async (task, runtime, context) => {
-      const { conversationId } = runtime;
-      const agent = await runtime.agent(context);
-      const settings = runtime.settings;
-      const ref = agent.model;
-      const model = ref === undefined ? undefined : runtime.models.getModel(ref.provider, ref.modelId);
-      if (ref === undefined || model === undefined)
-        return failNoModel(runtime, ref, context);
-      const policy = compactionPolicy(settings, ref);
-      const view = await runtime.context(conversationId, context);
-      const cut = selectCut(view, policy.keepRecentTokens);
-      if (cut === undefined)
-        return complete(runtime, context);
-      const firstKept = view.entries[cut].id;
-      const { reason, instructions } = task.input;
-      const compaction = {
-        reason,
-        entries: view.entries.slice(0, cut),
-        messages: summarizedMessages(view, cut),
-        firstKept,
-        ...instructions === undefined ? {} : { instructions }
-      };
-      let decision;
-      await runtime.hooks.each("beforeCompact", async (hook) => {
-        if (decision === undefined)
-          decision = await hook(compaction, runtime, context);
-      });
-      if (decision !== undefined && "decline" in decision)
-        return complete(runtime, context);
-      if (decision !== undefined)
-        return place(runtime, firstKept, decision.summary, context);
-      const request = {
-        attempt: 1,
-        model: ref,
-        thinkingLevel: agent.thinkingLevel,
-        streamOptions: settings.stream,
-        maxTokens: Math.min(Math.floor(0.8 * policy.reserveTokens), model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY),
-        tail: view.entries.reduce((tail, entry) => entry.id > tail ? entry.id : tail, firstKept),
-        firstKept
-      };
-      await runtime.commit(() => ({ status: "running", checkpoint: { phase: "summarize", ...request } }), context);
-    },
-    summarize: async (task, runtime, context) => {
-      const { phase: _, ...request } = task.state.checkpoint;
-      const { model: ref, thinkingLevel, streamOptions, maxTokens, tail, firstKept, attempt } = request;
-      const model = runtime.models.getModel(ref.provider, ref.modelId);
-      if (model === undefined)
-        return failNoModel(runtime, ref, context);
-      const view = await runtime.context(runtime.conversationId, context, { at: tail });
-      const cut = view.entries.findIndex((entry) => entry.id === firstKept);
-      const now = runtime.now();
-      const messages = [
-        { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT, timestamp: now },
-        {
-          role: "user",
-          content: [{ type: "text", text: summaryPrompt(summarizedMessages(view, cut), task.input.instructions) }],
-          timestamp: now
-        }
-      ];
-      const { deferred: _deferred, ...forwarded } = streamOptions;
-      const options = {
-        ...forwarded,
-        cacheRetention: "none",
-        maxTokens,
-        signal: runtime.signal,
-        telemetry: context.telemetry,
-        sessionId: await ensureProviderSessionId(runtime, context),
-        ...thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }
-      };
-      const message = await runtime.models.completeSimple(model, { messages }, options);
-      runtime.signal.throwIfAborted();
-      const summary = summaryText(message);
-      const policy = runtime.settings.retry;
-      const retry = message.stopReason === "error" && isRetryableAssistantError(message) && policy.enabled && attempt <= policy.maxRetries;
-      const until = retry ? runtime.now() + retryDelayMs(policy, attempt) : 0;
-      await runtime.commit(async (tx, current) => {
-        await recordUsage(tx, runtime.conversationId, "models", `${message.provider}/${message.model}`, message.usage);
-        const live = await tx.doc(LiveDoc, runtime.conversationId);
-        if (summary !== undefined)
-          return placeSummary(tx, runtime, current, live, firstKept, summary);
-        if (retry) {
-          const status = compactionStatus(live, runtime.taskId);
-          if (status !== undefined)
-            status.retry = { at: until, error: message.errorMessage ?? "" };
-          const checkpoint = { phase: "retry", ...request, until };
-          return { status: "sleeping", checkpoint, until };
-        }
-        const text = summaryFailure(message);
-        failCompactionStatus(live, runtime.taskId, text);
-        return {
-          status: "terminal",
-          outcome: { status: "failed", error: { message: text, detail: { reason: "model_error" } } }
-        };
-      }, context);
-    },
-    retry: async (task, runtime, context) => {
-      const { phase: _, until, ...request } = task.state.checkpoint;
-      if (until > runtime.now())
-        return runtime.sleepUntil(until, task.state.checkpoint, context);
-      const attempt = request.attempt + 1;
-      await runtime.commit(async (tx) => {
-        const status = compactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
-        if (status !== undefined) {
-          status.attempt = attempt;
-          delete status.retry;
-        }
-        return { status: "running", checkpoint: { phase: "summarize", ...request, attempt } };
-      }, context);
-    }
-  },
-  abort: async (_task, runtime, context) => {
-    await runtime.commit(async (tx) => {
-      removeCompactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
-      return { status: "terminal", outcome: { status: "aborted" } };
-    }, context);
-  }
-});
-async function createCompaction(tx, conversationId, input, owner) {
-  const ownership = owner === undefined ? { kind: "conversation" } : { kind: "task", taskId: owner };
-  const background = owner === undefined && input.reason !== "manual";
-  const taskId = await tx.createTask(CompactionTask, input, { ownership, conversationId, background });
-  const status = { taskId, reason: input.reason, blocking: owner !== undefined, attempt: 1 };
-  addCompactionStatus(await tx.doc(LiveDoc, conversationId), status);
-  return taskId;
-}
-function compactionPolicy(settings, model) {
-  const { modelOverrides, ...policy } = settings.compaction;
-  const override = modelOverrides?.[`${model.provider}/${model.modelId}`];
-  return {
-    enabled: override?.enabled ?? policy.enabled,
-    reserveTokens: override?.reserveTokens ?? policy.reserveTokens,
-    keepRecentTokens: override?.keepRecentTokens ?? policy.keepRecentTokens,
-    backgroundTokens: override?.backgroundTokens ?? policy.backgroundTokens
-  };
-}
-function selectCut(view, keepRecentTokens) {
-  const { contributions } = view;
-  const start = view.head === undefined ? 0 : 1;
-  const candidates = [];
-  for (let index = start;index < contributions.length; index++) {
-    if (isCandidate(contributions, index))
-      candidates.push(index);
-  }
-  let kept = 0;
-  let cut;
-  for (let index = contributions.length - 1;index >= start; index--) {
-    for (const message of contributions[index])
-      kept += estimateMessageTokens(message);
-    if (kept < keepRecentTokens)
-      continue;
-    cut = candidates.find((candidate) => candidate >= index) ?? candidates.at(-1);
-    break;
-  }
-  if (cut === undefined)
-    return;
-  for (let index = start;index < cut; index++)
-    if (contributions[index].length > 0)
-      return cut;
-  return;
-}
-function isCandidate(contributions, index) {
-  const first = contributions[index][0];
-  if (first?.role === "assistant")
-    return true;
-  if (first?.role !== "user")
-    return false;
-  let calls = new Set;
-  for (let before = index - 1;before >= 0; before--) {
-    const assistant = contributions[before].findLast((message) => message.role === "assistant");
-    if (assistant === undefined)
-      continue;
-    calls = new Set(assistant.content.flatMap((content) => content.type === "toolCall" ? [content.id] : []));
-    break;
-  }
-  if (calls.size === 0)
-    return true;
-  for (let after = index;after < contributions.length; after++) {
-    for (const [position, message] of contributions[after].entries()) {
-      if (message.role === "assistant" && (after > index || position > 0))
-        return true;
-      if (message.role === "toolResult" && calls.has(message.toolCallId))
-        return false;
-    }
-  }
-  return true;
-}
-function summarizedMessages(view, cut) {
-  return orderToolResults(view.contributions.slice(0, cut).flat());
-}
-function estimateContext(view, extra) {
-  let measured;
-  const after = view.head?.id ?? Number.NEGATIVE_INFINITY;
-  for (let index = view.entries.length - 1;index >= 0 && measured === undefined; index--) {
-    if (view.entries[index].id <= after)
-      continue;
-    measured = view.contributions[index].findLast((message) => message.role === "assistant" && calculateContextTokens(message.usage) > 0);
-  }
-  const from = measured === undefined ? 0 : view.messages.lastIndexOf(measured) + 1;
-  let tokens = measured === undefined ? 0 : calculateContextTokens(measured.usage);
-  for (const message of view.messages.slice(from))
-    tokens += estimateMessageTokens(message);
-  for (const message of extra)
-    tokens += estimateMessageTokens(message);
-  return tokens;
-}
-function summaryText(message) {
-  if (message.stopReason !== "stop" || message.content.some((content) => content.type === "toolCall"))
-    return;
-  const text = message.content.flatMap((content) => content.type === "text" ? [content.text] : []).join(`
-`).trim();
-  return text.length === 0 ? undefined : text;
-}
-function summaryFailure(message) {
-  if (message.stopReason === "error" || message.stopReason === "aborted") {
-    return `Summarization failed: ${message.errorMessage ?? message.stopReason}`;
-  }
-  if (message.stopReason === "length")
-    return "Summarization hit the token limit; the summary is incomplete";
-  if (message.content.some((content) => content.type === "toolCall"))
-    return "Summarization attempted to call a tool";
-  return "Summarization produced no text";
-}
-function summaryPrompt(messages, instructions) {
-  const focus = instructions === undefined ? "" : `
-
-Additional focus: ${instructions}`;
-  return `<conversation>
-${serializeConversation(messages)}
-</conversation>
-
-${SUMMARIZATION_PROMPT}${focus}`;
-}
-function serializeConversation(messages) {
-  const parts = [];
-  for (const message of messages) {
-    if (message.role === "user") {
-      const text = contentText2(message.content);
-      if (text.length > 0)
-        parts.push(`[User]: ${text}`);
-    } else if (message.role === "assistant") {
-      const text = message.content.flatMap((content) => content.type === "text" ? [content.text] : []);
-      const calls = message.content.flatMap((content) => content.type === "toolCall" ? [
-        `${content.name}(${Object.entries(content.arguments).map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(", ")})`
-      ] : []);
-      if (text.length > 0)
-        parts.push(`[Assistant]: ${text.join(`
-`)}`);
-      if (calls.length > 0)
-        parts.push(`[Assistant tool calls]: ${calls.join("; ")}`);
-    } else if (message.role === "toolResult") {
-      const text = contentText2(message.content);
-      if (text.length > 0)
-        parts.push(`[Tool result]: ${truncate(text, TOOL_RESULT_MAX_CHARS)}`);
-    }
-  }
-  return parts.join(`
-
-`);
-}
-function contentText2(content) {
-  if (typeof content === "string")
-    return content;
-  return content.flatMap((block) => block.type === "text" && block.text !== undefined ? [block.text] : []).join(`
-`);
-}
-function truncate(text, maxChars) {
-  if (text.length <= maxChars)
-    return text;
-  return `${text.slice(0, maxChars)}
-
-[... ${text.length - maxChars} more characters truncated]`;
-}
-async function place(runtime, firstKept, summary, context) {
-  await runtime.commit(async (tx, current) => placeSummary(tx, runtime, current, await tx.doc(LiveDoc, runtime.conversationId), firstKept, summary), context);
-}
-async function placeSummary(tx, runtime, current, live, firstKept, summary) {
-  removeCompactionStatus(live, runtime.taskId);
-  delete live.compactionFailure;
-  const text = `${SUMMARY_PREFIX}${summary}${SUMMARY_SUFFIX}`;
-  const entry = {
-    kind: CompactionEntry.kind,
-    head: firstKept,
-    model: [{ role: "user", content: [{ type: "text", text }], timestamp: runtime.now() }],
-    data: { reason: current.input.reason }
-  };
-  const result = current.owner === undefined ? {
-    submissionId: (await admitSubmission(tx, runtime.conversationId, { type: "write", requestId: `compaction:${runtime.taskId}`, entry }, runtime.now(), runtime.settings)).id
-  } : { entryId: (await tx.appendEntry(runtime.conversationId, entry)).id };
-  return { status: "terminal", outcome: { status: "completed", result } };
-}
-async function complete(runtime, context) {
-  await runtime.commit(async (tx) => {
-    removeCompactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
-    return { status: "terminal", outcome: { status: "completed", result: {} } };
-  }, context);
-}
-async function failNoModel(runtime, ref, context) {
-  const message = ref === undefined ? "No model is configured" : `Model ${ref.provider}/${ref.modelId} is not available`;
-  await runtime.commit(async (tx) => {
-    failCompactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId, message);
-    return { status: "terminal", outcome: { status: "failed", error: { message, detail: { reason: "no_model" } } } };
-  }, context);
-}
-
-// node_modules/@earendil-works/pi-durable/dist/harness/prompt.js
-init_transcript();
-function replaySections(messages) {
-  const shown = new Map;
-  for (const message of messages) {
-    if (message.role !== "system" || message.sections === undefined)
-      continue;
-    for (const [key, value] of Object.entries(message.sections)) {
-      if (value === null)
-        shown.delete(key);
-      else
-        shown.set(key, value);
-    }
-  }
-  return shown;
-}
-async function renderSections(sections, input, shown, report, context) {
-  const desired = new Map;
-  for (const section of sections) {
-    let text;
-    try {
-      text = await section.render(input, context);
-    } catch (error) {
-      if (context.abortSignal?.aborted)
-        throw error;
-      report(error, section);
-      const kept = shown.get(section.key);
-      if (kept !== undefined)
-        desired.set(section.key, kept);
-      continue;
-    }
-    if (text === undefined)
-      continue;
-    desired.set(section.key, section.tag === false ? text : `<${section.key}>
-${text}
-</${section.key}>`);
-  }
-  return desired;
-}
-function planSystemEntries(view, desired, tools, timestamp) {
-  const head = view.head;
-  if (head !== undefined && !view.entries.some((entry) => SystemEntry.is(entry) && entry.id > head.id)) {
-    const edits = view.entries.filter((entry) => SystemEntry.is(entry)).map((entry) => ({ target: entry.id, action: "omit" }));
-    const baseline = systemEntry(Object.fromEntries(desired), { toolsRemoved: [], toolsAdded: tools.map(toToolDeclaration) }, timestamp);
-    return [edits.length === 0 ? baseline : { ...baseline, edits }];
-  }
-  const sections = planSections(replaySections(view.messages), desired);
-  const changes = planTools(getCurrentTools(view.messages), tools);
-  if (changes.toolsRemoved.length === 0 && changes.toolsAdded.length === 0) {
-    return sections.map((patch) => systemEntry(patch, undefined, timestamp));
-  }
-  if (sections.length === 0)
-    return [systemEntry(undefined, changes, timestamp)];
-  return sections.map((patch, index) => systemEntry(patch, index === sections.length - 1 ? changes : undefined, timestamp));
-}
-function planTools(offered, desired) {
-  const wanted = new Map(desired.map((tool) => [tool.name, tool]));
-  const kept = offered.filter((tool) => {
-    const next = wanted.get(tool.name);
-    return next !== undefined && declarationsEqual(tool, next);
-  });
-  const keptNames = new Set(kept.map((tool) => tool.name));
-  const added = desired.filter((tool) => !keptNames.has(tool.name));
-  const replayed = [...kept, ...added];
-  if (replayed.some((tool, index) => tool.name !== desired[index].name)) {
-    return {
-      toolsRemoved: offered.map((tool) => ({ name: tool.name })),
-      toolsAdded: desired.map(toToolDeclaration)
-    };
-  }
-  return {
-    toolsRemoved: offered.filter((tool) => !keptNames.has(tool.name)).map((tool) => ({ name: tool.name })),
-    toolsAdded: added.map(toToolDeclaration)
-  };
-}
-function planSections(shown, desired) {
-  const patchedOrder = [
-    ...[...shown.keys()].filter((key) => desired.has(key)),
-    ...[...desired.keys()].filter((key) => !shown.has(key))
-  ];
-  const desiredOrder = [...desired.keys()];
-  if (patchedOrder.some((key, index) => key !== desiredOrder[index])) {
-    return [Object.fromEntries([...shown.keys()].map((key) => [key, null])), Object.fromEntries(desired)];
-  }
-  const patch = {};
-  for (const [key, value] of shown) {
-    const next = desired.get(key);
-    if (next !== value)
-      patch[key] = next ?? null;
-  }
-  for (const [key, value] of desired)
-    if (!shown.has(key))
-      patch[key] = value;
-  return Object.keys(patch).length === 0 ? [] : [patch];
-}
-function systemEntry(sections, tools, timestamp) {
-  const message = {
-    role: "system",
-    content: "",
-    ...sections === undefined ? {} : { sections },
-    ...tools === undefined || tools.toolsRemoved.length === 0 ? {} : { toolsRemoved: tools.toolsRemoved },
-    ...tools === undefined || tools.toolsAdded.length === 0 ? {} : { toolsAdded: tools.toolsAdded },
-    timestamp
-  };
-  return { model: [message] };
-}
-
-// node_modules/@earendil-works/pi-durable/dist/harness/generation.js
-var DEFAULT_POLL_AFTER_MS = 5000;
-var GenerationTask = defineTask({
-  name: "pi.generation",
-  version: 1,
-  initial: () => ({ phase: "prepare", attempt: 1 }),
-  phases: {
-    prepare: async (task, runtime, context) => {
-      const { conversationId } = runtime;
-      const agent = await runtime.agent(context);
-      const settings = runtime.settings;
-      const { model, thinkingLevel } = agent;
-      const resolved = model === undefined ? undefined : runtime.models.getModel(model.provider, model.modelId);
-      if (model === undefined || resolved === undefined)
-        return failNoModel2(runtime, model, context);
-      const { attempt, compacted, overflow, threshold: blocked } = task.state.checkpoint;
-      if (compacted !== undefined && overflow !== undefined) {
-        const [outcome] = await runtime.outcomes([compacted], context);
-        if (outcome?.status !== "completed" || outcome.result.entryId === undefined) {
-          return failModelError(runtime, overflow, context);
-        }
-      }
-      if (compacted !== undefined && blocked === true) {
-        const [outcome] = await runtime.outcomes([compacted], context);
-        if (outcome !== undefined && outcome.status !== "completed") {
-          return failModelError(runtime, compactionFailure(outcome), context);
-        }
-      }
-      const view = await runtime.context(conversationId, context);
-      const shown = replaySections(view.messages);
-      let env;
-      try {
-        env = await runtime.env(context);
-      } catch (error) {
-        if (context.abortSignal?.aborted)
-          throw error;
-        runtime.report(error, { type: "host", callback: "env" });
-      }
-      const input = { conversationId, agent, env, shown: Object.fromEntries(shown), read: runtime };
-      const desired = await renderSections(agent.sections, input, shown, (error, section) => runtime.report(error, {
-        type: "extension",
-        ...optionalExtension(sectionExtension(agent, section.key))
-      }), context);
-      const entries = planSystemEntries(view, desired, agent.tools, runtime.now());
-      const threshold = compacted === undefined ? thresholdCompaction(view, entries, resolved.contextWindow, compactionPolicy(settings, model)) : undefined;
-      if (threshold === "blocking") {
-        await runtime.commit(async (tx) => {
-          const child = await createCompaction(tx, conversationId, { reason: "threshold" }, runtime.taskId);
-          const checkpoint = { phase: "prepare", attempt, compacted: child, threshold: true };
-          return { status: "waiting", checkpoint, on: [child], policy: "allSettled" };
-        }, context);
-        return;
-      }
-      await runtime.commit(async (tx) => {
-        let cutoff = (await tx.scanEntries({ conversationId }, 1)).items[0]?.id;
-        for (const entry of entries)
-          cutoff = (await tx.appendEntry(SystemEntry, conversationId, entry)).id;
-        if (cutoff === undefined)
-          throw new Error(`Conversation ${conversationId} has no entries to send`);
-        if (threshold === "background" && (await tx.doc(LiveDoc, conversationId)).compactions === undefined) {
-          await createCompaction(tx, conversationId, { reason: "threshold" });
-        }
-        const request = {
-          attempt,
-          ...compacted === undefined ? {} : { compacted },
-          model,
-          thinkingLevel,
-          streamOptions: settings.stream,
-          cutoff
-        };
-        return { status: "running", checkpoint: { phase: "request", ...request } };
-      }, context);
-    },
-    request: async (task, runtime, context) => {
-      const { attempt, compacted, model: ref, thinkingLevel, streamOptions, cutoff } = task.state.checkpoint;
-      const conversationId = runtime.conversationId;
-      await runtime.commit(async (tx) => {
-        const live = await tx.doc(LiveDoc, conversationId);
-        await convertPartial(tx, live, conversationId);
-        live.generation = { attempt };
-        return;
-      }, context);
-      const model = runtime.models.getModel(ref.provider, ref.modelId);
-      if (model === undefined)
-        return failNoModel2(runtime, ref, context);
-      const view = await runtime.context(conversationId, context, { at: cutoff });
-      let messages = view.messages;
-      await runtime.hooks.each("beforeRequest", async (hook) => {
-        const replaced = await hook({ messages }, runtime, context);
-        if (replaced !== undefined)
-          messages = replaced.messages;
-      });
-      const options = {
-        ...streamOptions,
-        signal: runtime.signal,
-        telemetry: context.telemetry,
-        sessionId: await ensureProviderSessionId(runtime, context),
-        ...thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }
-      };
-      const message = await streamResponse(runtime, model, messages, options, attempt, context);
-      const request = { attempt, compacted, model: ref, cutoff, messages: view.messages };
-      await classify(runtime, request, message, context);
-    },
-    retry: async (task, runtime, context) => {
-      const { attempt, compacted, until } = task.state.checkpoint;
-      if (until > runtime.now())
-        return runtime.sleepUntil(until, task.state.checkpoint, context);
-      await runtime.commit(async (tx) => {
-        (await tx.doc(LiveDoc, runtime.conversationId)).generation = { attempt: attempt + 1 };
-        const checkpoint = {
-          phase: "prepare",
-          attempt: attempt + 1,
-          ...compacted === undefined ? {} : { compacted }
-        };
-        return { status: "running", checkpoint };
-      }, context);
-    },
-    poll: async (task, runtime, context) => {
-      const { attempt, compacted, model: ref, cutoff, handle, pollAt } = task.state.checkpoint;
-      if (pollAt > runtime.now())
-        return runtime.sleepUntil(pollAt, task.state.checkpoint, context);
-      const model = runtime.models.getModel(ref.provider, ref.modelId);
-      if (model === undefined)
-        return failNoModel2(runtime, ref, context);
-      const message = await runtime.models.fetchDeferred(model, handle, {
-        signal: runtime.signal,
-        telemetry: context.telemetry
-      });
-      const request = { attempt, compacted, model: ref, cutoff, pollAt };
-      await classify(runtime, request, message, context);
-    },
-    tools: async (task, runtime, context) => {
-      const { assistant, tools, pending } = task.state.checkpoint;
-      const [next, ...rest] = pending;
-      if (next === undefined)
-        return finishToolRound(runtime, assistant, tools, context);
-      await runtime.commit(async (tx) => {
-        const live = await tx.doc(LiveDoc, runtime.conversationId);
-        const taskId = await createToolTask(tx, runtime, assistant, next);
-        const slot = live.tools?.find((slot) => slot.callId === next && slot.taskId === undefined);
-        if (slot !== undefined)
-          slot.taskId = taskId;
-        const checkpoint = {
-          phase: "tools",
-          assistant,
-          tools: [...tools, taskId],
-          pending: rest
-        };
-        return { status: "waiting", checkpoint, on: [taskId], policy: "allSettled" };
-      }, context);
-    }
-  },
-  abort: async (task, runtime, context) => {
-    const checkpoint = task.state.checkpoint;
-    if (checkpoint.phase === "poll") {
-      const model = runtime.models.getModel(checkpoint.model.provider, checkpoint.model.modelId);
-      if (model !== undefined) {
-        try {
-          await runtime.models.cancelDeferred(model, checkpoint.handle, {
-            signal: runtime.signal,
-            telemetry: context.telemetry
-          });
-        } catch (error) {
-          runtime.report(error, { type: "host", callback: "models" });
-        }
-      }
-    }
-    const conversationId = runtime.conversationId;
-    const unstarted = checkpoint.phase === "tools" ? await readCalls(runtime, checkpoint.assistant, checkpoint.pending, context) : [];
-    await runtime.commit(async (tx) => {
-      const live = await tx.doc(LiveDoc, conversationId);
-      await convertPartial(tx, live, conversationId);
-      for (const call of unstarted) {
-        const result = harnessError("aborted", `Tool ${call.name} was aborted`);
-        await appendToolResult(tx, conversationId, call, result, { timestamp: runtime.now() });
-      }
-      endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "aborted" });
-      return { status: "terminal", outcome: { status: "aborted" } };
-    }, context);
-  }
-});
-async function readCalls(runtime, assistant, callIds, context) {
-  const message = (await runtime.entry(AssistantEntry, assistant, context))?.model?.[0];
-  const calls = message?.role === "assistant" ? message.content.filter((content) => content.type === "toolCall") : [];
-  return callIds.flatMap((id) => calls.filter((call) => call.id === id).slice(0, 1));
-}
-function createToolTask(tx, runtime, assistant, callId) {
-  return tx.createTask(ToolTask, { kind: "model", assistant, callId }, { ownership: { kind: "task", taskId: runtime.taskId } });
-}
-function thresholdCompaction(view, planned, contextWindow, policy) {
-  if (!policy.enabled || contextWindow <= 0)
-    return;
-  const tokens = estimateContext(view, planned.flatMap((entry) => entry.model ?? []));
-  const blocking = contextWindow - policy.reserveTokens;
-  const background = blocking - policy.backgroundTokens;
-  const over = tokens > blocking ? "blocking" : policy.backgroundTokens > 0 && tokens > background ? "background" : undefined;
-  if (over === undefined || selectCut(view, policy.keepRecentTokens) === undefined)
-    return;
-  return over;
-}
-function compactionFailure(outcome) {
-  switch (outcome.status) {
-    case "failed":
-    case "faulted":
-      return `Compaction failed: ${outcome.error.message}`;
-    case "orphaned":
-      return `Compaction failed: ${outcome.reason}`;
-    case "aborted":
-      return "Compaction was aborted";
-  }
-}
-async function failModelError(runtime, text, context) {
-  await runtime.commit(async (tx) => {
-    const failure = await prepareFailure(tx, runtime);
-    const live = await tx.doc(LiveDoc, runtime.conversationId);
-    await endFailedRun(tx, runtime, live, failure, { status: "unanswered", reason: "model_error", detail: text });
-    return {
-      status: "terminal",
-      outcome: { status: "failed", error: { message: text, detail: { reason: "model_error" } } }
-    };
-  }, context);
-}
-async function failNoModel2(runtime, ref, context) {
-  const message = ref === undefined ? "No model is configured" : `Model ${ref.provider}/${ref.modelId} is not available`;
-  await runtime.commit(async (tx) => {
-    const failure = await prepareFailure(tx, runtime);
-    const live = await tx.doc(LiveDoc, runtime.conversationId);
-    await endFailedRun(tx, runtime, live, failure, { status: "unanswered", reason: "no_model" });
-    return { status: "terminal", outcome: { status: "failed", error: { message, detail: { reason: "no_model" } } } };
-  }, context);
-}
-async function prepareFailure(tx, runtime) {
-  const settings = runtime.settings;
-  const policy = settings.afterFailedRun;
-  if (policy !== "continue")
-    return { policy };
-  return { policy, boundary: await prepareBoundary(tx, runtime.conversationId, settings) };
-}
-async function endFailedRun(tx, runtime, live, failure, settlement) {
-  const conversationId = runtime.conversationId;
-  endRun(tx, live, runtime.taskId, settlement);
-  if (failure.policy === "withdraw")
-    await withdrawQueuedInputs(tx, conversationId, "run_failed");
-  if (failure.boundary === undefined)
-    return;
-  const { users } = await applyBoundary(tx, failure.boundary, "final", runtime.now());
-  if (users.length > 0)
-    await startRun(tx, conversationId, live, users);
-}
-async function convertPartial(tx, live, conversationId) {
-  const partial = live.generation?.message;
-  if (partial === undefined)
-    return;
-  const message = copyJson(partial);
-  await appendAssistant(tx, conversationId, { ...message, stopReason: "aborted" });
-}
-async function streamResponse(runtime, model, messages, options, attempt, context) {
-  const interval = runtime.settings.progress.partialIntervalMs;
-  let pending;
-  let timer;
-  let inFlight;
-  let stopped = false;
-  const flush = () => {
-    timer = undefined;
-    const partial = pending;
-    pending = undefined;
-    if (partial === undefined || stopped)
-      return;
-    inFlight = (async () => {
-      const message = copyJson(partial, { omitUndefinedProperties: true });
-      await runtime.commit(async (tx) => {
-        const live = await tx.doc(LiveDoc, runtime.conversationId);
-        live.generation ??= { attempt };
-        assignJson(live.generation, "message", message);
-        return;
-      }, context);
-    })().catch((error) => {
-      if (!runtime.signal.aborted)
-        runtime.report(error);
-    }).finally(() => {
-      inFlight = undefined;
-      if (pending !== undefined && !stopped)
-        timer = runtime.setTimer(flush, interval);
-    });
-  };
-  try {
-    const events = runtime.models.streamSimple(model, { messages: [...messages] }, options);
-    for await (const event of events) {
-      if (event.type === "done" || event.type === "error" || event.partial.content.length === 0)
-        continue;
-      pending = event.partial;
-      if (timer === undefined && inFlight === undefined)
-        timer = runtime.setTimer(flush, interval);
-    }
-    return await events.result();
-  } finally {
-    stopped = true;
-    timer?.();
-    await inFlight;
-  }
-}
-async function classify(runtime, request, message, context) {
-  runtime.signal.throwIfAborted();
-  const conversationId = runtime.conversationId;
-  const { attempt, compacted, model: ref, cutoff } = request;
-  if (message.stopReason === "deferred" && message.deferred !== undefined) {
-    const handle = message.deferred;
-    const pollAt = Math.max(runtime.now() + (handle.pollAfterMs ?? DEFAULT_POLL_AFTER_MS), request.pollAt === undefined ? Number.NEGATIVE_INFINITY : request.pollAt + 1);
-    await runtime.commit(async (tx) => {
-      (await tx.doc(LiveDoc, conversationId)).generation = { attempt, deferred: { pollAt } };
-      const checkpoint = {
-        phase: "poll",
-        attempt,
-        ...compacted === undefined ? {} : { compacted },
-        model: ref,
-        cutoff,
-        handle,
-        pollAt
-      };
-      return { status: "sleeping", checkpoint, until: pollAt };
-    }, context);
-    return;
-  }
-  await runtime.hooks.each("afterResponse", (hook) => hook(message, runtime, context));
-  const calls = message.content.filter((content) => content.type === "toolCall");
-  if (message.stopReason === "toolUse" && calls.length > 0) {
-    return startToolRound(runtime, request, message, calls, context);
-  }
-  if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse") {
-    return answer(runtime, message, context);
-  }
-  const settings = runtime.settings;
-  const overflow = message.stopReason === "error" && isContextOverflow(message);
-  const compaction = compactionPolicy(settings, ref);
-  if (overflow && compacted === undefined && compaction.enabled) {
-    const view = await runtime.context(conversationId, context, { at: cutoff });
-    if (selectCut(view, compaction.keepRecentTokens) !== undefined) {
-      const text = message.errorMessage ?? "Context overflow";
-      await runtime.commit(async (tx) => {
-        const live = await tx.doc(LiveDoc, conversationId);
-        await appendAssistant(tx, conversationId, message);
-        delete live.generation;
-        const child = await createCompaction(tx, conversationId, { reason: "overflow" }, runtime.taskId);
-        const checkpoint = { phase: "prepare", attempt, compacted: child, overflow: text };
-        return { status: "waiting", checkpoint, on: [child], policy: "allSettled" };
-      }, context);
-      return;
-    }
-  }
-  const policy = settings.retry;
-  const retry = message.stopReason === "error" && !overflow && isRetryableAssistantError(message) && policy.enabled && attempt <= policy.maxRetries;
-  const until = retry ? runtime.now() + retryDelayMs(policy, attempt) : 0;
-  await runtime.commit(async (tx) => {
-    const failure = retry ? undefined : await prepareFailure(tx, runtime);
-    const live = await tx.doc(LiveDoc, conversationId);
-    await appendAssistant(tx, conversationId, message);
-    if (failure === undefined) {
-      live.generation = { attempt, retry: { at: until, error: message.errorMessage ?? "" } };
-      const checkpoint = {
-        phase: "retry",
-        attempt,
-        ...compacted === undefined ? {} : { compacted },
-        until
-      };
-      return { status: "sleeping", checkpoint, until };
-    }
-    const text = message.errorMessage ?? `Model response ended with stop reason ${message.stopReason}`;
-    await endFailedRun(tx, runtime, live, failure, { status: "unanswered", reason: "model_error", detail: text });
-    return {
-      status: "terminal",
-      outcome: { status: "failed", error: { message: text, detail: { reason: "model_error" } } }
-    };
-  }, context);
-}
-async function answer(runtime, message, context) {
-  let continuation;
-  await runtime.hooks.each("onYield", async (hook) => {
-    if (continuation !== undefined)
-      return;
-    continuation = (await hook(message, runtime, context))?.continue;
-  });
-  const conversationId = runtime.conversationId;
-  await runtime.commit(async (tx) => {
-    const boundary = await prepareBoundary(tx, conversationId, runtime.settings);
-    const live = await tx.doc(LiveDoc, conversationId);
-    const entry = await appendAssistant(tx, conversationId, message);
-    const result = { status: "terminal", outcome: { status: "completed", result: { entryId: entry.id } } };
-    const { users, reset } = await applyBoundary(tx, boundary, "final", runtime.now());
-    if (continuation !== undefined && users.length === 0 && !reset) {
-      const user = { role: "user", content: continuation, timestamp: runtime.now() };
-      await tx.appendEntry(UserEntry, conversationId, { model: [user] });
-      handOver(live, runtime.taskId, await createGeneration(tx, conversationId));
-      delete live.generation;
-      return result;
-    }
-    endRun(tx, live, runtime.taskId, { status: "done", answer: entry.id });
-    if (users.length > 0)
-      await startRun(tx, conversationId, live, users);
-    return result;
-  }, context);
-}
-async function startToolRound(runtime, request, message, calls, context) {
-  const conversationId = runtime.conversationId;
-  const messages = request.messages ?? (await runtime.context(conversationId, context, { at: request.cutoff })).messages;
-  const offered = new Set(getCurrentTools(messages).map((tool) => tool.name));
-  const tools = (await runtime.agent(context)).tools;
-  const sequential = runtime.settings.toolExecution === "sequential" || calls.some((call) => offered.has(call.name) && tools.find((tool) => tool.name === call.name)?.executionMode === "sequential");
-  await runtime.commit(async (tx) => {
-    const live = await tx.doc(LiveDoc, conversationId);
-    const entry = await appendAssistant(tx, conversationId, message);
-    const slots = [];
-    const tools = [];
-    const pending = [];
-    for (const call of calls) {
-      if (!offered.has(call.name)) {
-        const unavailable = harnessError("tool_unavailable", `Tool ${call.name} is not available`);
-        const result = await appendToolResult(tx, conversationId, call, unavailable, { timestamp: runtime.now() });
-        slots.push({ callId: call.id, name: call.name, status: "done", entry: result.id });
-        continue;
-      }
-      if (sequential && tools.length > 0) {
-        pending.push(call.id);
-        slots.push({ callId: call.id, name: call.name, status: "pending" });
-        continue;
-      }
-      const taskId = await createToolTask(tx, runtime, entry.id, call.id);
-      tools.push(taskId);
-      slots.push({ callId: call.id, name: call.name, taskId, status: "pending" });
-    }
-    delete live.generation;
-    live.tools = slots;
-    const checkpoint = { phase: "tools", assistant: entry.id, tools, pending };
-    return { status: "waiting", checkpoint, on: tools, policy: "allSettled" };
-  }, context);
-}
-async function finishToolRound(runtime, assistant, tools, context) {
-  const conversationId = runtime.conversationId;
-  const controls = new Map;
-  const outcomes = await runtime.outcomes(tools, context);
-  tools.forEach((id, index) => {
-    const outcome = outcomes[index];
-    controls.set(id, outcome.status === "completed" && outcome.result.kind !== "nested" ? outcome.result.control : undefined);
-  });
-  const slots = (await runtime.snapshot(LiveDoc, conversationId, context))?.tools ?? [];
-  const results = slots.flatMap((slot) => slot.entry === undefined ? [] : [slot.entry]);
-  await runtime.hooks.each("afterTools", (hook) => hook(assistant, results, runtime, context));
-  const terminate = slots.length > 0 && slots.every((slot) => slot.taskId !== undefined && controls.get(slot.taskId)?.terminate === true);
-  const added = [...controls.values()].flatMap((control) => control?.addTools ?? []);
-  const handoff = [...controls.values()].findLast((control) => control?.handoff !== undefined)?.handoff;
-  await runtime.commit(async (tx) => {
-    const boundary = await prepareBoundary(tx, conversationId, runtime.settings);
-    if (added.length > 0)
-      await addTools(tx, conversationId, added);
-    const live = await tx.doc(LiveDoc, conversationId);
-    const now = runtime.now();
-    if (terminate || handoff !== undefined) {
-      if (handoff !== undefined) {
-        const message = { role: "user", content: handoff, timestamp: now };
-        const entry = await tx.appendEntry(ResetEntry, conversationId, { head: "self", model: [message] });
-        boundary.head = entry.id;
-      }
-      const { users } = await applyBoundary(tx, boundary, "final", now);
-      endRun(tx, live, runtime.taskId, { status: "done", answer: assistant });
-      if (users.length > 0)
-        await startRun(tx, conversationId, live, users);
-    } else {
-      const { users, reset } = await applyBoundary(tx, boundary, "postTools", now);
-      if (reset) {
-        endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "reset" });
-        if (users.length > 0)
-          await startRun(tx, conversationId, live, users);
-      } else {
-        delete live.tools;
-        delete live.nestedTools;
-        if (live.run?.taskId === runtime.taskId)
-          live.run.inputs.push(...users);
-        handOver(live, runtime.taskId, await createGeneration(tx, conversationId));
-      }
-    }
-    return { status: "terminal", outcome: { status: "completed", result: { entryId: assistant } } };
-  }, context);
-}
-async function appendAssistant(tx, conversationId, message) {
-  await recordUsage(tx, conversationId, "models", `${message.provider}/${message.model}`, message.usage);
-  return tx.appendEntry(AssistantEntry, conversationId, { model: [message] });
-}
-async function startRun(tx, conversationId, live, inputs) {
-  live.run = { taskId: await createGeneration(tx, conversationId, { submissionIds: inputs }), inputs };
-}
-function createGeneration(tx, conversationId, telemetry = {}) {
-  return tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" }, conversationId, ...telemetry });
-}
-function handOver(live, from, to) {
-  if (live.run?.taskId === from)
-    live.run.taskId = to;
-}
-
-// node_modules/@earendil-works/pi-durable/dist/harness/live.js
-var LiveDoc = defineDoc({
-  kind: "pi.live",
-  version: 1,
-  scope: "conversation",
-  history: "latest",
-  fork: "initial",
-  initial: () => ({}),
-  checkpointWhen: (value) => value.generation === undefined && !(value.tools ?? []).some((slot) => slot.status === "running") && !(value.nestedTools ?? []).some((slot) => slot.status === "running")
-});
-var RUN_TASK_KINDS = new Set(["pi.generation"]);
-var TOOL_TASK_KIND = "pi.tool";
-var COMPACTION_TASK_KIND = "pi.compaction";
-function endRun(tx, live, taskId, settlement) {
-  if (live.run?.taskId === taskId) {
-    for (const id of live.run.inputs)
-      tx.settleSubmission(id, settlement);
-    delete live.run;
-  }
-  delete live.generation;
-  delete live.tools;
-  delete live.nestedTools;
-}
-function addCompactionStatus(live, status) {
-  live.compactions ??= [];
-  live.compactions.push(status);
-}
-function compactionStatus(live, taskId) {
-  return live.compactions?.find((status) => status.taskId === taskId);
-}
-function removeCompactionStatus(live, taskId) {
-  const statuses = live.compactions;
-  if (statuses === undefined)
-    return;
-  const index = statuses.findIndex((status) => status.taskId === taskId);
-  if (index >= 0)
-    statuses.splice(index, 1);
-  if (statuses.length === 0)
-    delete live.compactions;
-}
-function failCompactionStatus(live, taskId, error) {
-  const status = compactionStatus(live, taskId);
-  if (status !== undefined)
-    live.compactionFailure = { taskId: status.taskId, reason: status.reason, error };
-  removeCompactionStatus(live, taskId);
-}
-function toolSlot(live, taskId) {
-  const slot = live.tools?.find((each) => each.taskId === taskId);
-  if (slot !== undefined || live.nestedTools === undefined)
-    return slot;
-  const nested = live.nestedTools;
-  let low = 0;
-  let high = nested.length - 1;
-  while (low <= high) {
-    const middle = low + high >>> 1;
-    const candidate = nested[middle];
-    if (candidate.taskId === taskId)
-      return candidate;
-    if (candidate.taskId < taskId)
-      low = middle + 1;
-    else
-      high = middle - 1;
-  }
-  return;
-}
-function finishSlot(slot) {
-  slot.status = "done";
-  clearProgress(slot);
-}
-function removeNestedSlots(live, taskId) {
-  const nested = live.nestedTools;
-  if (nested === undefined)
-    return;
-  const removed = new Set([taskId]);
-  for (const slot of nested)
-    if (removed.has(slot.parentTaskId))
-      removed.add(slot.taskId);
-  for (let index = nested.length - 1;index >= 0; index--) {
-    if (removed.has(nested[index].parentTaskId))
-      nested.splice(index, 1);
-  }
-  if (nested.length === 0)
-    delete live.nestedTools;
-}
-function clearProgress(slot) {
-  delete slot.output;
-  delete slot.droppedBytes;
-  delete slot.droppedLines;
-  delete slot.details;
-  delete slot.diagnostics;
-}
-async function settleSchedulerOutcome(tx, record, outcome) {
-  if (record.kind === TOOL_TASK_KIND) {
-    const live = await tx.doc(LiveDoc, record.conversationId);
-    const slot = toolSlot(live, record.id);
-    if (slot !== undefined)
-      finishSlot(slot);
-    removeNestedSlots(live, record.id);
-    return;
-  }
-  if (record.kind === COMPACTION_TASK_KIND) {
-    const error = outcome.status === "faulted" ? outcome.error.message : outcome.reason;
-    failCompactionStatus(await tx.doc(LiveDoc, record.conversationId), record.id, error);
-    return;
-  }
-  if (!RUN_TASK_KINDS.has(record.kind))
-    return;
-  const live = await tx.doc(LiveDoc, record.conversationId);
-  if (live.run?.taskId !== record.id)
-    return;
-  await convertPartial(tx, live, record.conversationId);
-  endRun(tx, live, record.id, outcome.status === "faulted" ? { status: "unanswered", reason: "faulted", detail: outcome.error.message } : { status: "unanswered", reason: outcome.reason });
 }
 
 // node_modules/@earendil-works/pi-durable/dist/harness/tool.js
@@ -30689,6 +29393,1301 @@ function jsonEqual(a, b) {
   return keys.length === Object.keys(b).length && keys.every((key) => Object.hasOwn(b, key) && jsonEqual(a[key], b[key]));
 }
 
+// node_modules/@earendil-works/pi-durable/dist/harness/generation.js
+var DEFAULT_POLL_AFTER_MS = 5000;
+var GenerationTask = defineTask({
+  name: "pi.generation",
+  version: 1,
+  initial: () => ({ phase: "prepare", attempt: 1 }),
+  phases: {
+    prepare: async (task, runtime, context) => {
+      const { conversationId } = runtime;
+      const agent = await runtime.agent(context);
+      const settings = runtime.settings;
+      const { model, thinkingLevel } = agent;
+      const resolved = model === undefined ? undefined : runtime.models.getModel(model.provider, model.modelId);
+      if (model === undefined || resolved === undefined)
+        return failNoModel(runtime, model, context);
+      const { attempt, compacted, overflow, threshold: blocked } = task.state.checkpoint;
+      if (compacted !== undefined && overflow !== undefined) {
+        const [outcome] = await runtime.outcomes([compacted], context);
+        if (outcome?.status !== "completed" || outcome.result.entryId === undefined) {
+          return failModelError(runtime, overflow, context);
+        }
+      }
+      if (compacted !== undefined && blocked === true) {
+        const [outcome] = await runtime.outcomes([compacted], context);
+        if (outcome !== undefined && outcome.status !== "completed") {
+          return failModelError(runtime, compactionFailure(outcome), context);
+        }
+      }
+      const view = await runtime.context(conversationId, context);
+      const shown = replaySections(view.messages);
+      let env;
+      try {
+        env = await runtime.env(context);
+      } catch (error) {
+        if (context.abortSignal?.aborted)
+          throw error;
+        runtime.report(error, { type: "host", callback: "env" });
+      }
+      const input = { conversationId, agent, env, shown: Object.fromEntries(shown), read: runtime };
+      const desired = await renderSections(agent.sections, input, shown, (error, section) => runtime.report(error, {
+        type: "extension",
+        ...optionalExtension(sectionExtension(agent, section.key))
+      }), context);
+      const entries = planSystemEntries(view, desired, agent.tools, runtime.now());
+      const threshold = compacted === undefined ? thresholdCompaction(view, entries, resolved.contextWindow, compactionPolicy(settings, model)) : undefined;
+      if (threshold === "blocking") {
+        await runtime.commit(async (tx) => {
+          const child = await createCompaction(tx, conversationId, { reason: "threshold" }, runtime.taskId);
+          const checkpoint = { phase: "prepare", attempt, compacted: child, threshold: true };
+          return { status: "waiting", checkpoint, on: [child], policy: "allSettled" };
+        }, context);
+        return;
+      }
+      await runtime.commit(async (tx) => {
+        let cutoff = (await tx.scanEntries({ conversationId }, 1)).items[0]?.id;
+        for (const entry of entries)
+          cutoff = (await tx.appendEntry(SystemEntry, conversationId, entry)).id;
+        if (cutoff === undefined)
+          throw new Error(`Conversation ${conversationId} has no entries to send`);
+        if (threshold === "background" && (await tx.doc(LiveDoc, conversationId)).compactions === undefined) {
+          await createCompaction(tx, conversationId, { reason: "threshold" });
+        }
+        const request = {
+          attempt,
+          ...compacted === undefined ? {} : { compacted },
+          model,
+          thinkingLevel,
+          streamOptions: settings.stream,
+          cutoff
+        };
+        return { status: "running", checkpoint: { phase: "request", ...request } };
+      }, context);
+    },
+    request: async (task, runtime, context) => {
+      const { attempt, compacted, model: ref, thinkingLevel, streamOptions, cutoff } = task.state.checkpoint;
+      const conversationId = runtime.conversationId;
+      await runtime.commit(async (tx) => {
+        const live = await tx.doc(LiveDoc, conversationId);
+        await convertPartial(tx, live, conversationId);
+        live.generation = { attempt };
+        return;
+      }, context);
+      const model = runtime.models.getModel(ref.provider, ref.modelId);
+      if (model === undefined)
+        return failNoModel(runtime, ref, context);
+      const view = await runtime.context(conversationId, context, { at: cutoff });
+      let messages = view.messages;
+      await runtime.hooks.each("beforeRequest", async (hook) => {
+        const replaced = await hook({ messages }, runtime, context);
+        if (replaced !== undefined)
+          messages = replaced.messages;
+      });
+      const options = {
+        ...streamOptions,
+        signal: runtime.signal,
+        telemetry: context.telemetry,
+        sessionId: await ensureProviderSessionId(runtime, context),
+        ...thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }
+      };
+      const message = await streamResponse(runtime, model, messages, options, attempt, context);
+      const request = { attempt, compacted, model: ref, cutoff, messages: view.messages };
+      await classify(runtime, request, message, context);
+    },
+    retry: async (task, runtime, context) => {
+      const { attempt, compacted, until } = task.state.checkpoint;
+      if (until > runtime.now())
+        return runtime.sleepUntil(until, task.state.checkpoint, context);
+      await runtime.commit(async (tx) => {
+        (await tx.doc(LiveDoc, runtime.conversationId)).generation = { attempt: attempt + 1 };
+        const checkpoint = {
+          phase: "prepare",
+          attempt: attempt + 1,
+          ...compacted === undefined ? {} : { compacted }
+        };
+        return { status: "running", checkpoint };
+      }, context);
+    },
+    poll: async (task, runtime, context) => {
+      const { attempt, compacted, model: ref, cutoff, handle, pollAt } = task.state.checkpoint;
+      if (pollAt > runtime.now())
+        return runtime.sleepUntil(pollAt, task.state.checkpoint, context);
+      const model = runtime.models.getModel(ref.provider, ref.modelId);
+      if (model === undefined)
+        return failNoModel(runtime, ref, context);
+      const message = await runtime.models.fetchDeferred(model, handle, {
+        signal: runtime.signal,
+        telemetry: context.telemetry
+      });
+      const request = { attempt, compacted, model: ref, cutoff, pollAt };
+      await classify(runtime, request, message, context);
+    },
+    tools: async (task, runtime, context) => {
+      const { assistant, tools, pending } = task.state.checkpoint;
+      const [next, ...rest] = pending;
+      if (next === undefined)
+        return finishToolRound(runtime, assistant, tools, context);
+      await runtime.commit(async (tx) => {
+        const live = await tx.doc(LiveDoc, runtime.conversationId);
+        const taskId = await createToolTask(tx, runtime, assistant, next);
+        const slot = live.tools?.find((slot) => slot.callId === next && slot.taskId === undefined);
+        if (slot !== undefined)
+          slot.taskId = taskId;
+        const checkpoint = {
+          phase: "tools",
+          assistant,
+          tools: [...tools, taskId],
+          pending: rest
+        };
+        return { status: "waiting", checkpoint, on: [taskId], policy: "allSettled" };
+      }, context);
+    }
+  },
+  abort: async (task, runtime, context) => {
+    const checkpoint = task.state.checkpoint;
+    if (checkpoint.phase === "poll") {
+      const model = runtime.models.getModel(checkpoint.model.provider, checkpoint.model.modelId);
+      if (model !== undefined) {
+        try {
+          await runtime.models.cancelDeferred(model, checkpoint.handle, {
+            signal: runtime.signal,
+            telemetry: context.telemetry
+          });
+        } catch (error) {
+          runtime.report(error, { type: "host", callback: "models" });
+        }
+      }
+    }
+    const conversationId = runtime.conversationId;
+    const unstarted = checkpoint.phase === "tools" ? await readCalls(runtime, checkpoint.assistant, checkpoint.pending, context) : [];
+    await runtime.commit(async (tx) => {
+      const live = await tx.doc(LiveDoc, conversationId);
+      await convertPartial(tx, live, conversationId);
+      for (const call of unstarted) {
+        const result = harnessError("aborted", `Tool ${call.name} was aborted`);
+        await appendToolResult(tx, conversationId, call, result, { timestamp: runtime.now() });
+      }
+      endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "aborted" });
+      return { status: "terminal", outcome: { status: "aborted" } };
+    }, context);
+  }
+});
+async function readCalls(runtime, assistant, callIds, context) {
+  const message = (await runtime.entry(AssistantEntry, assistant, context))?.model?.[0];
+  const calls = message?.role === "assistant" ? message.content.filter((content) => content.type === "toolCall") : [];
+  return callIds.flatMap((id) => calls.filter((call) => call.id === id).slice(0, 1));
+}
+function createToolTask(tx, runtime, assistant, callId) {
+  return tx.createTask(ToolTask, { kind: "model", assistant, callId }, { ownership: { kind: "task", taskId: runtime.taskId } });
+}
+function thresholdCompaction(view, planned, contextWindow, policy) {
+  if (!policy.enabled || contextWindow <= 0)
+    return;
+  const tokens = estimateContext(view, planned.flatMap((entry) => entry.model ?? []));
+  const blocking = contextWindow - policy.reserveTokens;
+  const background = blocking - policy.backgroundTokens;
+  const over = tokens > blocking ? "blocking" : policy.backgroundTokens > 0 && tokens > background ? "background" : undefined;
+  if (over === undefined || selectCut(view, policy.keepRecentTokens) === undefined)
+    return;
+  return over;
+}
+function compactionFailure(outcome) {
+  switch (outcome.status) {
+    case "failed":
+    case "faulted":
+      return `Compaction failed: ${outcome.error.message}`;
+    case "orphaned":
+      return `Compaction failed: ${outcome.reason}`;
+    case "aborted":
+      return "Compaction was aborted";
+  }
+}
+async function failModelError(runtime, text, context) {
+  await runtime.commit(async (tx) => {
+    const failure = await prepareFailure(tx, runtime);
+    const live = await tx.doc(LiveDoc, runtime.conversationId);
+    await endFailedRun(tx, runtime, live, failure, { status: "unanswered", reason: "model_error", detail: text });
+    return {
+      status: "terminal",
+      outcome: { status: "failed", error: { message: text, detail: { reason: "model_error" } } }
+    };
+  }, context);
+}
+async function failNoModel(runtime, ref, context) {
+  const message = ref === undefined ? "No model is configured" : `Model ${ref.provider}/${ref.modelId} is not available`;
+  await runtime.commit(async (tx) => {
+    const failure = await prepareFailure(tx, runtime);
+    const live = await tx.doc(LiveDoc, runtime.conversationId);
+    await endFailedRun(tx, runtime, live, failure, { status: "unanswered", reason: "no_model" });
+    return { status: "terminal", outcome: { status: "failed", error: { message, detail: { reason: "no_model" } } } };
+  }, context);
+}
+async function prepareFailure(tx, runtime) {
+  const settings = runtime.settings;
+  const policy = settings.afterFailedRun;
+  if (policy !== "continue")
+    return { policy };
+  return { policy, boundary: await prepareBoundary(tx, runtime.conversationId, settings) };
+}
+async function endFailedRun(tx, runtime, live, failure, settlement) {
+  const conversationId = runtime.conversationId;
+  endRun(tx, live, runtime.taskId, settlement);
+  if (failure.policy === "withdraw")
+    await withdrawQueuedInputs(tx, conversationId, "run_failed");
+  if (failure.boundary === undefined)
+    return;
+  const { users } = await applyBoundary(tx, failure.boundary, "final", runtime.now());
+  if (users.length > 0)
+    await startRun(tx, conversationId, live, users);
+}
+async function convertPartial(tx, live, conversationId) {
+  const partial = live.generation?.message;
+  if (partial === undefined)
+    return;
+  const message = copyJson(partial);
+  await appendAssistant(tx, conversationId, { ...message, stopReason: "aborted" });
+}
+async function streamResponse(runtime, model, messages, options, attempt, context) {
+  const interval = runtime.settings.progress.partialIntervalMs;
+  let pending;
+  let timer;
+  let inFlight;
+  let stopped = false;
+  const flush = () => {
+    timer = undefined;
+    const partial = pending;
+    pending = undefined;
+    if (partial === undefined || stopped)
+      return;
+    inFlight = (async () => {
+      const message = copyJson(partial, { omitUndefinedProperties: true });
+      await runtime.commit(async (tx) => {
+        const live = await tx.doc(LiveDoc, runtime.conversationId);
+        live.generation ??= { attempt };
+        assignJson(live.generation, "message", message);
+        return;
+      }, context);
+    })().catch((error) => {
+      if (!runtime.signal.aborted)
+        runtime.report(error);
+    }).finally(() => {
+      inFlight = undefined;
+      if (pending !== undefined && !stopped)
+        timer = runtime.setTimer(flush, interval);
+    });
+  };
+  try {
+    const events = runtime.models.streamSimple(model, { messages: [...messages] }, options);
+    for await (const event of events) {
+      if (event.type === "done" || event.type === "error" || event.partial.content.length === 0)
+        continue;
+      pending = event.partial;
+      if (timer === undefined && inFlight === undefined)
+        timer = runtime.setTimer(flush, interval);
+    }
+    return await events.result();
+  } finally {
+    stopped = true;
+    timer?.();
+    await inFlight;
+  }
+}
+async function classify(runtime, request, message, context) {
+  runtime.signal.throwIfAborted();
+  const conversationId = runtime.conversationId;
+  const { attempt, compacted, model: ref, cutoff } = request;
+  if (message.stopReason === "deferred" && message.deferred !== undefined) {
+    const handle = message.deferred;
+    const pollAt = Math.max(runtime.now() + (handle.pollAfterMs ?? DEFAULT_POLL_AFTER_MS), request.pollAt === undefined ? Number.NEGATIVE_INFINITY : request.pollAt + 1);
+    await runtime.commit(async (tx) => {
+      (await tx.doc(LiveDoc, conversationId)).generation = { attempt, deferred: { pollAt } };
+      const checkpoint = {
+        phase: "poll",
+        attempt,
+        ...compacted === undefined ? {} : { compacted },
+        model: ref,
+        cutoff,
+        handle,
+        pollAt
+      };
+      return { status: "sleeping", checkpoint, until: pollAt };
+    }, context);
+    return;
+  }
+  await runtime.hooks.each("afterResponse", (hook) => hook(message, runtime, context));
+  const calls = message.content.filter((content) => content.type === "toolCall");
+  if (message.stopReason === "toolUse" && calls.length > 0) {
+    return startToolRound(runtime, request, message, calls, context);
+  }
+  if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse") {
+    return answer(runtime, message, context);
+  }
+  const settings = runtime.settings;
+  const overflow = message.stopReason === "error" && isContextOverflow(message);
+  const compaction = compactionPolicy(settings, ref);
+  if (overflow && compacted === undefined && compaction.enabled) {
+    const view = await runtime.context(conversationId, context, { at: cutoff });
+    if (selectCut(view, compaction.keepRecentTokens) !== undefined) {
+      const text = message.errorMessage ?? "Context overflow";
+      await runtime.commit(async (tx) => {
+        const live = await tx.doc(LiveDoc, conversationId);
+        await appendAssistant(tx, conversationId, message);
+        delete live.generation;
+        const child = await createCompaction(tx, conversationId, { reason: "overflow" }, runtime.taskId);
+        const checkpoint = { phase: "prepare", attempt, compacted: child, overflow: text };
+        return { status: "waiting", checkpoint, on: [child], policy: "allSettled" };
+      }, context);
+      return;
+    }
+  }
+  const policy = settings.retry;
+  const retry = message.stopReason === "error" && !overflow && isRetryableAssistantError(message) && policy.enabled && attempt <= policy.maxRetries;
+  const until = retry ? runtime.now() + retryDelayMs(policy, attempt) : 0;
+  await runtime.commit(async (tx) => {
+    const failure = retry ? undefined : await prepareFailure(tx, runtime);
+    const live = await tx.doc(LiveDoc, conversationId);
+    await appendAssistant(tx, conversationId, message);
+    if (failure === undefined) {
+      live.generation = { attempt, retry: { at: until, error: message.errorMessage ?? "" } };
+      const checkpoint = {
+        phase: "retry",
+        attempt,
+        ...compacted === undefined ? {} : { compacted },
+        until
+      };
+      return { status: "sleeping", checkpoint, until };
+    }
+    const text = message.errorMessage ?? `Model response ended with stop reason ${message.stopReason}`;
+    await endFailedRun(tx, runtime, live, failure, { status: "unanswered", reason: "model_error", detail: text });
+    return {
+      status: "terminal",
+      outcome: { status: "failed", error: { message: text, detail: { reason: "model_error" } } }
+    };
+  }, context);
+}
+async function answer(runtime, message, context) {
+  let continuation;
+  await runtime.hooks.each("onYield", async (hook) => {
+    if (continuation !== undefined)
+      return;
+    continuation = (await hook(message, runtime, context))?.continue;
+  });
+  const conversationId = runtime.conversationId;
+  await runtime.commit(async (tx) => {
+    const boundary = await prepareBoundary(tx, conversationId, runtime.settings);
+    const live = await tx.doc(LiveDoc, conversationId);
+    const entry = await appendAssistant(tx, conversationId, message);
+    const result = { status: "terminal", outcome: { status: "completed", result: { entryId: entry.id } } };
+    const { users, reset } = await applyBoundary(tx, boundary, "final", runtime.now());
+    if (continuation !== undefined && users.length === 0 && !reset) {
+      const user = { role: "user", content: continuation, timestamp: runtime.now() };
+      await tx.appendEntry(UserEntry, conversationId, { model: [user] });
+      handOver(live, runtime.taskId, await createGeneration(tx, conversationId));
+      delete live.generation;
+      return result;
+    }
+    endRun(tx, live, runtime.taskId, { status: "done", answer: entry.id });
+    if (users.length > 0)
+      await startRun(tx, conversationId, live, users);
+    return result;
+  }, context);
+}
+async function startToolRound(runtime, request, message, calls, context) {
+  const conversationId = runtime.conversationId;
+  const messages = request.messages ?? (await runtime.context(conversationId, context, { at: request.cutoff })).messages;
+  const offered = new Set(getCurrentTools(messages).map((tool) => tool.name));
+  const tools = (await runtime.agent(context)).tools;
+  const sequential = runtime.settings.toolExecution === "sequential" || calls.some((call) => offered.has(call.name) && tools.find((tool) => tool.name === call.name)?.executionMode === "sequential");
+  await runtime.commit(async (tx) => {
+    const live = await tx.doc(LiveDoc, conversationId);
+    const entry = await appendAssistant(tx, conversationId, message);
+    const slots = [];
+    const tools = [];
+    const pending = [];
+    for (const call of calls) {
+      if (!offered.has(call.name)) {
+        const unavailable = harnessError("tool_unavailable", `Tool ${call.name} is not available`);
+        const result = await appendToolResult(tx, conversationId, call, unavailable, { timestamp: runtime.now() });
+        slots.push({ callId: call.id, name: call.name, status: "done", entry: result.id });
+        continue;
+      }
+      if (sequential && tools.length > 0) {
+        pending.push(call.id);
+        slots.push({ callId: call.id, name: call.name, status: "pending" });
+        continue;
+      }
+      const taskId = await createToolTask(tx, runtime, entry.id, call.id);
+      tools.push(taskId);
+      slots.push({ callId: call.id, name: call.name, taskId, status: "pending" });
+    }
+    delete live.generation;
+    live.tools = slots;
+    const checkpoint = { phase: "tools", assistant: entry.id, tools, pending };
+    return { status: "waiting", checkpoint, on: tools, policy: "allSettled" };
+  }, context);
+}
+async function finishToolRound(runtime, assistant, tools, context) {
+  const conversationId = runtime.conversationId;
+  const controls = new Map;
+  const outcomes = await runtime.outcomes(tools, context);
+  tools.forEach((id, index) => {
+    const outcome = outcomes[index];
+    controls.set(id, outcome.status === "completed" && outcome.result.kind !== "nested" ? outcome.result.control : undefined);
+  });
+  const slots = (await runtime.snapshot(LiveDoc, conversationId, context))?.tools ?? [];
+  const results = slots.flatMap((slot) => slot.entry === undefined ? [] : [slot.entry]);
+  await runtime.hooks.each("afterTools", (hook) => hook(assistant, results, runtime, context));
+  const terminate = slots.length > 0 && slots.every((slot) => slot.taskId !== undefined && controls.get(slot.taskId)?.terminate === true);
+  const added = [...controls.values()].flatMap((control) => control?.addTools ?? []);
+  const handoff = [...controls.values()].findLast((control) => control?.handoff !== undefined)?.handoff;
+  await runtime.commit(async (tx) => {
+    const boundary = await prepareBoundary(tx, conversationId, runtime.settings);
+    if (added.length > 0)
+      await addTools(tx, conversationId, added);
+    const live = await tx.doc(LiveDoc, conversationId);
+    const now = runtime.now();
+    if (terminate || handoff !== undefined) {
+      if (handoff !== undefined) {
+        const message = { role: "user", content: handoff, timestamp: now };
+        const entry = await tx.appendEntry(ResetEntry, conversationId, { head: "self", model: [message] });
+        boundary.head = entry.id;
+      }
+      const { users } = await applyBoundary(tx, boundary, "final", now);
+      endRun(tx, live, runtime.taskId, { status: "done", answer: assistant });
+      if (users.length > 0)
+        await startRun(tx, conversationId, live, users);
+    } else {
+      const { users, reset } = await applyBoundary(tx, boundary, "postTools", now);
+      if (reset) {
+        endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "reset" });
+        if (users.length > 0)
+          await startRun(tx, conversationId, live, users);
+      } else {
+        delete live.tools;
+        delete live.nestedTools;
+        if (live.run?.taskId === runtime.taskId)
+          live.run.inputs.push(...users);
+        handOver(live, runtime.taskId, await createGeneration(tx, conversationId));
+      }
+    }
+    return { status: "terminal", outcome: { status: "completed", result: { entryId: assistant } } };
+  }, context);
+}
+async function appendAssistant(tx, conversationId, message) {
+  await recordUsage(tx, conversationId, "models", `${message.provider}/${message.model}`, message.usage);
+  return tx.appendEntry(AssistantEntry, conversationId, { model: [message] });
+}
+async function startRun(tx, conversationId, live, inputs) {
+  live.run = { taskId: await createGeneration(tx, conversationId, { submissionIds: inputs }), inputs };
+}
+function createGeneration(tx, conversationId, telemetry = {}) {
+  return tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" }, conversationId, ...telemetry });
+}
+function handOver(live, from, to) {
+  if (live.run?.taskId === from)
+    live.run.taskId = to;
+}
+
+// node_modules/@earendil-works/pi-durable/dist/harness/live.js
+var LiveDoc = defineDoc({
+  kind: "pi.live",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({}),
+  checkpointWhen: (value) => value.generation === undefined && !(value.tools ?? []).some((slot) => slot.status === "running") && !(value.nestedTools ?? []).some((slot) => slot.status === "running")
+});
+var RUN_TASK_KINDS = new Set(["pi.generation"]);
+var TOOL_TASK_KIND = "pi.tool";
+var COMPACTION_TASK_KIND = "pi.compaction";
+function endRun(tx, live, taskId, settlement) {
+  if (live.run?.taskId === taskId) {
+    for (const id of live.run.inputs)
+      tx.settleSubmission(id, settlement);
+    delete live.run;
+  }
+  delete live.generation;
+  delete live.tools;
+  delete live.nestedTools;
+}
+function addCompactionStatus(live, status) {
+  live.compactions ??= [];
+  live.compactions.push(status);
+}
+function compactionStatus(live, taskId) {
+  return live.compactions?.find((status) => status.taskId === taskId);
+}
+function removeCompactionStatus(live, taskId) {
+  const statuses = live.compactions;
+  if (statuses === undefined)
+    return;
+  const index = statuses.findIndex((status) => status.taskId === taskId);
+  if (index >= 0)
+    statuses.splice(index, 1);
+  if (statuses.length === 0)
+    delete live.compactions;
+}
+function failCompactionStatus(live, taskId, error) {
+  const status = compactionStatus(live, taskId);
+  if (status !== undefined)
+    live.compactionFailure = { taskId: status.taskId, reason: status.reason, error };
+  removeCompactionStatus(live, taskId);
+}
+function toolSlot(live, taskId) {
+  const slot = live.tools?.find((each) => each.taskId === taskId);
+  if (slot !== undefined || live.nestedTools === undefined)
+    return slot;
+  const nested = live.nestedTools;
+  let low = 0;
+  let high = nested.length - 1;
+  while (low <= high) {
+    const middle = low + high >>> 1;
+    const candidate = nested[middle];
+    if (candidate.taskId === taskId)
+      return candidate;
+    if (candidate.taskId < taskId)
+      low = middle + 1;
+    else
+      high = middle - 1;
+  }
+  return;
+}
+function finishSlot(slot) {
+  slot.status = "done";
+  clearProgress(slot);
+}
+function removeNestedSlots(live, taskId) {
+  const nested = live.nestedTools;
+  if (nested === undefined)
+    return;
+  const removed = new Set([taskId]);
+  for (const slot of nested)
+    if (removed.has(slot.parentTaskId))
+      removed.add(slot.taskId);
+  for (let index = nested.length - 1;index >= 0; index--) {
+    if (removed.has(nested[index].parentTaskId))
+      nested.splice(index, 1);
+  }
+  if (nested.length === 0)
+    delete live.nestedTools;
+}
+function clearProgress(slot) {
+  delete slot.output;
+  delete slot.droppedBytes;
+  delete slot.droppedLines;
+  delete slot.details;
+  delete slot.diagnostics;
+}
+async function settleSchedulerOutcome(tx, record, outcome) {
+  if (record.kind === TOOL_TASK_KIND) {
+    const live = await tx.doc(LiveDoc, record.conversationId);
+    const slot = toolSlot(live, record.id);
+    if (slot !== undefined)
+      finishSlot(slot);
+    removeNestedSlots(live, record.id);
+    return;
+  }
+  if (record.kind === COMPACTION_TASK_KIND) {
+    const error = outcome.status === "faulted" ? outcome.error.message : outcome.reason;
+    failCompactionStatus(await tx.doc(LiveDoc, record.conversationId), record.id, error);
+    return;
+  }
+  if (!RUN_TASK_KINDS.has(record.kind))
+    return;
+  const live = await tx.doc(LiveDoc, record.conversationId);
+  if (live.run?.taskId !== record.id)
+    return;
+  await convertPartial(tx, live, record.conversationId);
+  endRun(tx, live, record.id, outcome.status === "faulted" ? { status: "unanswered", reason: "faulted", detail: outcome.error.message } : { status: "unanswered", reason: outcome.reason });
+}
+
+// node_modules/@earendil-works/pi-durable/dist/harness/submissions.js
+init_dist();
+
+// node_modules/@earendil-works/pi-durable/dist/harness/telemetry.js
+init_dist();
+var entry = {
+  description: "A transcript entry was committed; content remains in the transcript.",
+  attributes: {
+    "entry.id": { type: "number", required: true, description: "Transcript entry ID.", cardinality: "high" },
+    "entry.kind": { type: "string", required: true, description: "Entry kind." }
+  }
+};
+var reportAttributes = {
+  type: {
+    type: "string",
+    required: true,
+    description: "ReportInfo type.",
+    values: [
+      "session_failed",
+      "task_faulted",
+      "task_parked",
+      "migration_failed",
+      "task_outdated",
+      "task_error",
+      "extension_error",
+      "host_error",
+      "listener_error"
+    ]
+  },
+  reason: {
+    type: "string",
+    required: false,
+    description: "Fixed report reason, when present.",
+    values: ["threw", "restart_limit", "missing_task", "incompatible_task"]
+  },
+  extension: { type: "string", required: false, description: "Registered extension name, when present." },
+  "task.id": { type: "number", required: false, description: "Task ID, when present.", cardinality: "high" }
+};
+var report = {
+  description: "A report was raised; no error payload is recorded.",
+  attributes: reportAttributes
+};
+var submission = {
+  description: "A submission was settled.",
+  attributes: {
+    "submission.id": { type: "number", required: true, description: "Submission ID.", cardinality: "high" },
+    status: { type: "string", required: true, values: ["done", "unanswered"], description: "Settlement." },
+    "answer.entry_id": { type: "number", required: false, description: "Answer entry ID.", cardinality: "high" }
+  }
+};
+var DURABLE_TELEMETRY_SCHEMA = defineTelemetrySchema({
+  version: 1,
+  spans: {
+    "pi.durable.submit": {
+      description: "Public submission admission and its commit. Inputs start root traces linked to their callers; writes are children. Internal admissions emit phase events only.",
+      parents: { kind: "any" },
+      startAttributes: {
+        "submission.type": {
+          type: "string",
+          required: true,
+          values: ["input", "write"],
+          description: "Submission type."
+        },
+        "conversation.id": { type: "number", required: true, description: "Conversation ID.", cardinality: "high" }
+      },
+      endAttributes: {
+        "submission.id": { type: "number", description: "Admitted submission ID.", cardinality: "high" },
+        result: {
+          type: "string",
+          values: ["queued", "placed", "done"],
+          description: "Admission result; stale writes report done."
+        }
+      },
+      events: { "pi.durable.entry": entry, "pi.durable.submission": submission, "pi.durable.report": report },
+      status: { default: "ok", errorWhen: "Admission failed." }
+    },
+    "pi.durable.phase": {
+      description: "One task phase invocation, including its decision commit, never a wait or restart.",
+      parents: { kind: "any" },
+      startAttributes: {
+        "task.id": { type: "number", required: true, description: "Task ID.", cardinality: "high" },
+        "task.name": { type: "string", required: true, description: "Registered task name." },
+        phase: { type: "string", required: true, description: "Invoked checkpoint phase." },
+        kind: { type: "string", required: true, values: ["run", "abort"], description: "Invocation kind." },
+        attempt: { type: "number", required: false, description: "Checkpoint attempt, when present." },
+        resumed: {
+          type: "boolean",
+          required: true,
+          description: "First invocation of a task loaded in this process."
+        }
+      },
+      endAttributes: {
+        outcome: { type: "string", description: "next=<phase>, waiting, sleeping, done, faulted, or aborted." },
+        "tool.name": { type: "string", description: "Called tool name." },
+        "tool.call_id": { type: "string", description: "Transcript tool call ID.", cardinality: "high" }
+      },
+      events: {
+        "pi.durable.entry": entry,
+        "pi.durable.submission": submission,
+        "pi.durable.report": report,
+        "pi.durable.checkpoint": {
+          description: "The running checkpoint's phase changed while the invocation continued.",
+          attributes: { phase: { type: "string", required: true, description: "Committed checkpoint phase." } }
+        },
+        "pi.durable.replay": {
+          description: "A nested tool call was answered from its stored result.",
+          attributes: { "tool.name": { type: "string", required: true, description: "Called tool name." } }
+        }
+      },
+      status: {
+        default: "ok",
+        errorWhen: "Faulted, failed, and orphaned outcomes use task_faulted, task_failed, and task_orphaned with a diagnostic capped at 500 characters. Aborted outcomes keep status ok."
+      }
+    }
+  },
+  metrics: {
+    "pi.durable.reports": {
+      kind: "counter",
+      description: "Reports raised, grouped by their fixed ReportInfo type.",
+      attributes: { type: reportAttributes.type }
+    },
+    "pi.durable.phase.duration": {
+      kind: "histogram",
+      unit: "ms",
+      description: "Duration of a phase invocation and its decision commit.",
+      attributes: {
+        task: { type: "string", required: true, description: "Registered task name." },
+        phase: { type: "string", required: true, description: "Invoked checkpoint phase." },
+        outcome: { type: "string", required: true, description: "Phase outcome." }
+      }
+    },
+    "pi.durable.tasks.active": {
+      kind: "upDownCounter",
+      description: "Live tasks held by this Harness; decremented at terminal settlement or close.",
+      attributes: { task: { type: "string", required: true, description: "Registered task name." } }
+    }
+  }
+});
+
+// node_modules/@earendil-works/pi-durable/dist/harness/submissions.js
+class Submissions {
+  #telemetry;
+  #session;
+  #storage;
+  #now;
+  #queueModes;
+  #resume;
+  #waiters = new Waiters;
+  #closed = false;
+  constructor(session, storage, now, queueModes, resume, telemetry = NOOP_TELEMETRY_CONTEXT) {
+    this.#telemetry = telemetry;
+    this.#session = session;
+    this.#storage = storage;
+    this.#now = now;
+    this.#queueModes = queueModes;
+    this.#resume = resume;
+    session.observeCommits((publication) => this.#observe(publication));
+    session.subscribeClose(() => {
+      this.#closed = true;
+      this.#waiters.rejectAll(closedError(this.#session));
+    });
+  }
+  async submit(conversationId, draft, context) {
+    this.#resume();
+    const parent = draft.type === "input" ? this.#telemetry : context.telemetry;
+    return createTypedSpanStarter(parent, [DURABLE_TELEMETRY_SCHEMA])("pi.durable.submit", {
+      "submission.type": draft.type,
+      "conversation.id": conversationId
+    }, async (span) => {
+      if (draft.type === "input")
+        span.addLink({ context: context.telemetry });
+      try {
+        const { id, status } = await this.#session.commitWith((tx) => admitSubmission(tx, conversationId, draft, this.#now(), this.#queueModes(), span), withTelemetry(span, context));
+        span.setAttributes({ "submission.id": id, result: status });
+        return new SubmissionHandle(id, this);
+      } catch (error) {
+        span.setStatus({ status: "error" });
+        throw error;
+      }
+    });
+  }
+  async get(id, context) {
+    const record = await this.#session.readOnLine(() => this.#storage.submission(id, context));
+    return record === undefined ? undefined : new SubmissionHandle(record.id, this);
+  }
+  async status(id, context) {
+    const record = await this.#session.readOnLine(() => this.#storage.submission(id, context));
+    if (record === undefined)
+      throw new Error(`Submission ${id} does not exist`);
+    return record;
+  }
+  async wait(id, context) {
+    this.#resume();
+    const found = await this.#session.readOnLine(async () => {
+      const record = await this.#storage.submission(id, context);
+      if (record === undefined)
+        throw new Error(`Submission ${id} does not exist`);
+      if (isSettled(record))
+        return { promise: Promise.resolve(record) };
+      if (this.#closed)
+        throw closedError(this.#session);
+      return { promise: this.#waiters.add(id, context) };
+    });
+    return found.promise;
+  }
+  abort(id, context, conversationId) {
+    return this.#session.commitWith(async (tx) => {
+      const record = await tx.submission(id);
+      if (record === undefined || conversationId !== undefined && record.conversationId !== conversationId) {
+        return "not_found";
+      }
+      if (record.status === "queued") {
+        tx.settleSubmission(id, { status: "unanswered", reason: "aborted" });
+        await removeInboxItem(tx, record.conversationId, id);
+        return "aborted";
+      }
+      return record.status === "placed" ? "already_placed" : "settled";
+    }, context);
+  }
+  #observe(publication) {
+    for (const change of publication.changes) {
+      if (change.type !== "submission" || !isSettled(change.value))
+        continue;
+      this.#waiters.resolve(change.value.id, change.value);
+    }
+  }
+}
+
+class SubmissionHandle {
+  id;
+  #submissions;
+  constructor(id, submissions) {
+    this.id = id;
+    this.#submissions = submissions;
+  }
+  status(context) {
+    return this.#submissions.status(this.id, context);
+  }
+  wait(context) {
+    return this.#submissions.wait(this.id, context);
+  }
+  async abort(context) {
+    const result = await this.#submissions.abort(this.id, context);
+    if (result === "not_found")
+      throw new Error(`Submission ${this.id} does not exist`);
+    return result;
+  }
+}
+function isSettled(record) {
+  return record.status === "done" || record.status === "unanswered";
+}
+function checkInputEntry(entry) {
+  const { kind } = entry;
+  if (typeof kind !== "string" || kind.length === 0 || kind.startsWith("pi.")) {
+    throw new TypeError(`An input entry's kind must be a non-empty string not starting with "pi.", got ${String(kind)}`);
+  }
+}
+async function admitSubmission(tx, conversationId, draft, now, queueModes, span) {
+  if (draft.type === "input" && draft.entry !== undefined)
+    checkInputEntry(draft.entry);
+  if (draft.requestId !== undefined) {
+    const existing = await tx.submissionByRequest(conversationId, draft.requestId);
+    if (existing !== undefined) {
+      if (existing.type !== draft.type) {
+        throw new Error(`Request ${draft.requestId} already identifies a submission of type ${existing.type}`);
+      }
+      return { id: existing.id, status: existing.status === "unanswered" ? "done" : existing.status };
+    }
+  }
+  const fields = { conversationId, requestId: draft.requestId, trace: span?.propagation?.inject(span) };
+  if (draft.type === "write" && isDisplayOnly(draft.entry) && !hasQueuedReset((await tx.doc(InboxDoc, conversationId)).items)) {
+    const entry = await tx.appendEntry(conversationId, draft.entry);
+    const write = { ...fields, type: "write", status: "done", entry: entry.id };
+    return { id: (await tx.createSubmission(write)).id, status: "done" };
+  }
+  const live = await tx.doc(LiveDoc, conversationId);
+  const busy = live.run !== undefined;
+  if (draft.type === "input" && draft.whenBusy === "steer" && live.run !== undefined && span?.propagation !== undefined) {
+    const run = await tx.task(live.run.taskId);
+    if (run?.trace !== undefined)
+      span.addLink({ context: span.propagation.extract(run.trace) });
+  }
+  if (busy && draft.type === "input" && draft.whenBusy === "reject")
+    throw new ConversationBusy(conversationId);
+  const boundary = busy ? undefined : await prepareBoundary(tx, conversationId, queueModes);
+  if (boundary === undefined || boundary.inbox.items.length > 0) {
+    const { id } = await tx.createSubmission({
+      ...fields,
+      type: draft.type,
+      status: "queued"
+    });
+    const value = copyJson(draft.type === "write" ? draft.entry : draft.content, {
+      omitUndefinedProperties: true
+    });
+    const items = (boundary?.inbox ?? await tx.doc(InboxDoc, conversationId)).items;
+    if (draft.type === "write")
+      items.push({ id, mode: "write", entry: value });
+    else {
+      const mode = draft.whenBusy === "steer" ? "steer" : "followUp";
+      const content = value;
+      const entry = draft.entry === undefined ? {} : { entry: pickInputEntry(draft.entry) };
+      items.push({ id, mode, content, ...entry });
+    }
+    if (boundary === undefined)
+      return { id, status: "queued" };
+    const { users } = await applyBoundary(tx, boundary, "final", now);
+    if (users.length > 0)
+      await startRun(tx, conversationId, live, users);
+    return { id, status: draft.type === "write" ? "done" : users.at(-1) === id ? "placed" : "queued" };
+  }
+  if (draft.type === "write") {
+    if (isStale(boundary, draft.entry)) {
+      const stale = { status: "unanswered", reason: "stale" };
+      return {
+        id: (await tx.createSubmission({ ...fields, type: "write", ...stale })).id,
+        status: "done"
+      };
+    }
+    const entry = await tx.appendEntry(conversationId, draft.entry);
+    const write = { ...fields, type: "write", status: "done", entry: entry.id };
+    return { id: (await tx.createSubmission(write)).id, status: "done" };
+  }
+  const entry = await appendInput(tx, conversationId, draft.content, draft.entry, now);
+  const input = { ...fields, type: "input", status: "placed", entry: entry.id };
+  const { id } = await tx.createSubmission(input);
+  await startRun(tx, conversationId, live, [id]);
+  return { id, status: "placed" };
+}
+
+// node_modules/@earendil-works/pi-durable/dist/harness/compaction.js
+var TOOL_RESULT_MAX_CHARS = 2000;
+var SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
+
+<summary>
+`;
+var SUMMARY_SUFFIX = `
+</summary>`;
+var SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
+
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
+var SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work. If the conversation starts with an earlier summary, preserve its information and fold the newer messages into it.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+var CompactionTask = defineTask({
+  name: "pi.compaction",
+  version: 1,
+  initial: () => ({ phase: "select" }),
+  phases: {
+    select: async (task, runtime, context) => {
+      const { conversationId } = runtime;
+      const agent = await runtime.agent(context);
+      const settings = runtime.settings;
+      const ref = agent.model;
+      const model = ref === undefined ? undefined : runtime.models.getModel(ref.provider, ref.modelId);
+      if (ref === undefined || model === undefined)
+        return failNoModel2(runtime, ref, context);
+      const policy = compactionPolicy(settings, ref);
+      const view = await runtime.context(conversationId, context);
+      const cut = selectCut(view, policy.keepRecentTokens);
+      if (cut === undefined)
+        return complete(runtime, context);
+      const firstKept = view.entries[cut].id;
+      const { reason, instructions } = task.input;
+      const compaction = {
+        reason,
+        entries: view.entries.slice(0, cut),
+        messages: summarizedMessages(view, cut),
+        firstKept,
+        ...instructions === undefined ? {} : { instructions }
+      };
+      let decision;
+      await runtime.hooks.each("beforeCompact", async (hook) => {
+        if (decision === undefined)
+          decision = await hook(compaction, runtime, context);
+      });
+      if (decision !== undefined && "decline" in decision)
+        return complete(runtime, context);
+      if (decision !== undefined)
+        return place(runtime, firstKept, decision.summary, context);
+      const request = {
+        attempt: 1,
+        model: ref,
+        thinkingLevel: agent.thinkingLevel,
+        streamOptions: settings.stream,
+        maxTokens: Math.min(Math.floor(0.8 * policy.reserveTokens), model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY),
+        tail: view.entries.reduce((tail, entry) => entry.id > tail ? entry.id : tail, firstKept),
+        firstKept
+      };
+      await runtime.commit(() => ({ status: "running", checkpoint: { phase: "summarize", ...request } }), context);
+    },
+    summarize: async (task, runtime, context) => {
+      const { phase: _, ...request } = task.state.checkpoint;
+      const { model: ref, thinkingLevel, streamOptions, maxTokens, tail, firstKept, attempt } = request;
+      const model = runtime.models.getModel(ref.provider, ref.modelId);
+      if (model === undefined)
+        return failNoModel2(runtime, ref, context);
+      const view = await runtime.context(runtime.conversationId, context, { at: tail });
+      const cut = view.entries.findIndex((entry) => entry.id === firstKept);
+      const now = runtime.now();
+      const messages = [
+        { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT, timestamp: now },
+        {
+          role: "user",
+          content: [{ type: "text", text: summaryPrompt(summarizedMessages(view, cut), task.input.instructions) }],
+          timestamp: now
+        }
+      ];
+      const { deferred: _deferred, ...forwarded } = streamOptions;
+      const options = {
+        ...forwarded,
+        cacheRetention: "none",
+        maxTokens,
+        signal: runtime.signal,
+        telemetry: context.telemetry,
+        sessionId: await ensureProviderSessionId(runtime, context),
+        ...thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }
+      };
+      const message = await runtime.models.completeSimple(model, { messages }, options);
+      runtime.signal.throwIfAborted();
+      const summary = summaryText(message);
+      const policy = runtime.settings.retry;
+      const retry = message.stopReason === "error" && isRetryableAssistantError(message) && policy.enabled && attempt <= policy.maxRetries;
+      const until = retry ? runtime.now() + retryDelayMs(policy, attempt) : 0;
+      await runtime.commit(async (tx, current) => {
+        await recordUsage(tx, runtime.conversationId, "models", `${message.provider}/${message.model}`, message.usage);
+        const live = await tx.doc(LiveDoc, runtime.conversationId);
+        if (summary !== undefined)
+          return placeSummary(tx, runtime, current, live, firstKept, summary);
+        if (retry) {
+          const status = compactionStatus(live, runtime.taskId);
+          if (status !== undefined)
+            status.retry = { at: until, error: message.errorMessage ?? "" };
+          const checkpoint = { phase: "retry", ...request, until };
+          return { status: "sleeping", checkpoint, until };
+        }
+        const text = summaryFailure(message);
+        failCompactionStatus(live, runtime.taskId, text);
+        return {
+          status: "terminal",
+          outcome: { status: "failed", error: { message: text, detail: { reason: "model_error" } } }
+        };
+      }, context);
+    },
+    retry: async (task, runtime, context) => {
+      const { phase: _, until, ...request } = task.state.checkpoint;
+      if (until > runtime.now())
+        return runtime.sleepUntil(until, task.state.checkpoint, context);
+      const attempt = request.attempt + 1;
+      await runtime.commit(async (tx) => {
+        const status = compactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
+        if (status !== undefined) {
+          status.attempt = attempt;
+          delete status.retry;
+        }
+        return { status: "running", checkpoint: { phase: "summarize", ...request, attempt } };
+      }, context);
+    }
+  },
+  abort: async (_task, runtime, context) => {
+    await runtime.commit(async (tx) => {
+      removeCompactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
+      return { status: "terminal", outcome: { status: "aborted" } };
+    }, context);
+  }
+});
+async function createCompaction(tx, conversationId, input, owner) {
+  const ownership = owner === undefined ? { kind: "conversation" } : { kind: "task", taskId: owner };
+  const background = owner === undefined && input.reason !== "manual";
+  const taskId = await tx.createTask(CompactionTask, input, { ownership, conversationId, background });
+  const status = { taskId, reason: input.reason, blocking: owner !== undefined, attempt: 1 };
+  addCompactionStatus(await tx.doc(LiveDoc, conversationId), status);
+  return taskId;
+}
+function compactionPolicy(settings, model) {
+  const { modelOverrides, ...policy } = settings.compaction;
+  const override = modelOverrides?.[`${model.provider}/${model.modelId}`];
+  return {
+    enabled: override?.enabled ?? policy.enabled,
+    reserveTokens: override?.reserveTokens ?? policy.reserveTokens,
+    keepRecentTokens: override?.keepRecentTokens ?? policy.keepRecentTokens,
+    backgroundTokens: override?.backgroundTokens ?? policy.backgroundTokens
+  };
+}
+function selectCut(view, keepRecentTokens) {
+  const { contributions } = view;
+  const start = view.head === undefined ? 0 : 1;
+  const candidates = [];
+  for (let index = start;index < contributions.length; index++) {
+    if (isCandidate(contributions, index))
+      candidates.push(index);
+  }
+  let kept = 0;
+  let cut;
+  for (let index = contributions.length - 1;index >= start; index--) {
+    for (const message of contributions[index])
+      kept += estimateMessageTokens(message);
+    if (kept < keepRecentTokens)
+      continue;
+    cut = candidates.find((candidate) => candidate >= index) ?? candidates.at(-1);
+    break;
+  }
+  if (cut === undefined)
+    return;
+  for (let index = start;index < cut; index++)
+    if (contributions[index].length > 0)
+      return cut;
+  return;
+}
+function isCandidate(contributions, index) {
+  const first = contributions[index][0];
+  if (first?.role === "assistant")
+    return true;
+  if (first?.role !== "user")
+    return false;
+  let calls = new Set;
+  for (let before = index - 1;before >= 0; before--) {
+    const assistant = contributions[before].findLast((message) => message.role === "assistant");
+    if (assistant === undefined)
+      continue;
+    calls = new Set(assistant.content.flatMap((content) => content.type === "toolCall" ? [content.id] : []));
+    break;
+  }
+  if (calls.size === 0)
+    return true;
+  for (let after = index;after < contributions.length; after++) {
+    for (const [position, message] of contributions[after].entries()) {
+      if (message.role === "assistant" && (after > index || position > 0))
+        return true;
+      if (message.role === "toolResult" && calls.has(message.toolCallId))
+        return false;
+    }
+  }
+  return true;
+}
+function summarizedMessages(view, cut) {
+  return orderToolResults(view.contributions.slice(0, cut).flat());
+}
+function estimateContext(view, extra) {
+  let measured;
+  const after = view.head?.id ?? Number.NEGATIVE_INFINITY;
+  for (let index = view.entries.length - 1;index >= 0 && measured === undefined; index--) {
+    if (view.entries[index].id <= after)
+      continue;
+    measured = view.contributions[index].findLast((message) => message.role === "assistant" && calculateContextTokens(message.usage) > 0);
+  }
+  const from = measured === undefined ? 0 : view.messages.lastIndexOf(measured) + 1;
+  let tokens = measured === undefined ? 0 : calculateContextTokens(measured.usage);
+  for (const message of view.messages.slice(from))
+    tokens += estimateMessageTokens(message);
+  for (const message of extra)
+    tokens += estimateMessageTokens(message);
+  return tokens;
+}
+function summaryText(message) {
+  if (message.stopReason !== "stop" || message.content.some((content) => content.type === "toolCall"))
+    return;
+  const text = message.content.flatMap((content) => content.type === "text" ? [content.text] : []).join(`
+`).trim();
+  return text.length === 0 ? undefined : text;
+}
+function summaryFailure(message) {
+  if (message.stopReason === "error" || message.stopReason === "aborted") {
+    return `Summarization failed: ${message.errorMessage ?? message.stopReason}`;
+  }
+  if (message.stopReason === "length")
+    return "Summarization hit the token limit; the summary is incomplete";
+  if (message.content.some((content) => content.type === "toolCall"))
+    return "Summarization attempted to call a tool";
+  return "Summarization produced no text";
+}
+function summaryPrompt(messages, instructions) {
+  const focus = instructions === undefined ? "" : `
+
+Additional focus: ${instructions}`;
+  return `<conversation>
+${serializeConversation(messages)}
+</conversation>
+
+${SUMMARIZATION_PROMPT}${focus}`;
+}
+function serializeConversation(messages) {
+  const parts = [];
+  for (const message of messages) {
+    if (message.role === "user") {
+      const text = contentText2(message.content);
+      if (text.length > 0)
+        parts.push(`[User]: ${text}`);
+    } else if (message.role === "assistant") {
+      const text = message.content.flatMap((content) => content.type === "text" ? [content.text] : []);
+      const calls = message.content.flatMap((content) => content.type === "toolCall" ? [
+        `${content.name}(${Object.entries(content.arguments).map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(", ")})`
+      ] : []);
+      if (text.length > 0)
+        parts.push(`[Assistant]: ${text.join(`
+`)}`);
+      if (calls.length > 0)
+        parts.push(`[Assistant tool calls]: ${calls.join("; ")}`);
+    } else if (message.role === "toolResult") {
+      const text = contentText2(message.content);
+      if (text.length > 0)
+        parts.push(`[Tool result]: ${truncate(text, TOOL_RESULT_MAX_CHARS)}`);
+    }
+  }
+  return parts.join(`
+
+`);
+}
+function contentText2(content) {
+  if (typeof content === "string")
+    return content;
+  return content.flatMap((block) => block.type === "text" && block.text !== undefined ? [block.text] : []).join(`
+`);
+}
+function truncate(text, maxChars) {
+  if (text.length <= maxChars)
+    return text;
+  return `${text.slice(0, maxChars)}
+
+[... ${text.length - maxChars} more characters truncated]`;
+}
+async function place(runtime, firstKept, summary, context) {
+  await runtime.commit(async (tx, current) => placeSummary(tx, runtime, current, await tx.doc(LiveDoc, runtime.conversationId), firstKept, summary), context);
+}
+async function placeSummary(tx, runtime, current, live, firstKept, summary) {
+  removeCompactionStatus(live, runtime.taskId);
+  delete live.compactionFailure;
+  const text = `${SUMMARY_PREFIX}${summary}${SUMMARY_SUFFIX}`;
+  const entry = {
+    kind: CompactionEntry.kind,
+    head: firstKept,
+    model: [{ role: "user", content: [{ type: "text", text }], timestamp: runtime.now() }],
+    data: { reason: current.input.reason }
+  };
+  const result = current.owner === undefined ? {
+    submissionId: (await admitSubmission(tx, runtime.conversationId, { type: "write", requestId: `compaction:${runtime.taskId}`, entry }, runtime.now(), runtime.settings)).id
+  } : { entryId: (await tx.appendEntry(runtime.conversationId, entry)).id };
+  return { status: "terminal", outcome: { status: "completed", result } };
+}
+async function complete(runtime, context) {
+  await runtime.commit(async (tx) => {
+    removeCompactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
+    return { status: "terminal", outcome: { status: "completed", result: {} } };
+  }, context);
+}
+async function failNoModel2(runtime, ref, context) {
+  const message = ref === undefined ? "No model is configured" : `Model ${ref.provider}/${ref.modelId} is not available`;
+  await runtime.commit(async (tx) => {
+    failCompactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId, message);
+    return { status: "terminal", outcome: { status: "failed", error: { message, detail: { reason: "no_model" } } } };
+  }, context);
+}
+// node_modules/@earendil-works/pi-durable/dist/harness/define.js
+function hook(task, handlers) {
+  return { task: task.definition.name, handlers };
+}
 // node_modules/@earendil-works/pi-durable/dist/harness/view.js
 var MOUNTED = [
   AgentDoc,
@@ -55863,6 +55862,7 @@ function assistantIdentityText(context) {
 
 // src/context-budget-proofs.ts
 var MARKER = "hosted_context_budget_";
+var OVERFLOW_SUFFIX = ":context_length_exceeded";
 
 class ContextBudgetProofs {
   sql;
@@ -55884,13 +55884,26 @@ class ContextBudgetProofs {
     this.sql.exec(`INSERT INTO tenant_context_budget_refusals (conversation,task,cutoff,nonce)
        VALUES (?,?,?,?)
        ON CONFLICT(conversation,task) DO UPDATE SET cutoff=excluded.cutoff, nonce=excluded.nonce`, identity.conversation, identity.task, identity.cutoff, nonce);
-    return `${MARKER}${nonce}`;
+    return `${MARKER}${nonce}${OVERFLOW_SUFFIX}`;
   }
   matches(entry, message) {
     if (typeof message !== "string" || !message.startsWith(MARKER) || typeof entry.conversationId !== "string" && typeof entry.conversationId !== "number" || typeof entry.byTaskId !== "string" && typeof entry.byTaskId !== "number")
       return false;
     const rows = this.sql.exec("SELECT nonce FROM tenant_context_budget_refusals WHERE conversation=? AND task=?", String(entry.conversationId), String(entry.byTaskId)).toArray();
-    return rows.length === 1 && typeof rows[0]?.nonce === "string" && message === `${MARKER}${rows[0].nonce}`;
+    if (rows.length !== 1 || typeof rows[0]?.nonce !== "string")
+      return false;
+    const issued = `${MARKER}${rows[0].nonce}`;
+    return message === issued || message === `${issued}${OVERFLOW_SUFFIX}`;
+  }
+  settled(entry, message) {
+    if (!this.matches(entry, message))
+      return false;
+    const conversation = Number(entry.conversationId);
+    const task = Number(entry.byTaskId);
+    if (!Number.isSafeInteger(conversation) || !Number.isSafeInteger(task))
+      return false;
+    const rows = this.sql.exec("SELECT status FROM pi_tasks WHERE id=? AND conversation_id=?", task, conversation).toArray();
+    return rows.length === 1 && rows[0]?.status === "terminal";
   }
 }
 
@@ -56041,6 +56054,38 @@ function readGenerationIdentity(sql) {
     return null;
   }
   return { conversation, task, cutoff: cutoffValue };
+}
+function readCompactionIdentity(sql, taskId) {
+  if (!Number.isSafeInteger(taskId) || taskId <= 0)
+    return null;
+  try {
+    const rows = sql.exec(`SELECT id, record FROM pi_tasks
+          WHERE id = ? AND kind = '"pi.compaction"' AND status = 'running'`, taskId).toArray();
+    if (rows.length !== 1 || Number(rows[0]?.id) !== taskId)
+      return null;
+    const record = parseRecord(rows[0]?.record);
+    const state = record?.state;
+    if (typeof state !== "object" || state === null || Array.isArray(state))
+      return null;
+    const checkpoint = state.checkpoint;
+    if (record?.kind !== "pi.compaction" || state.status !== "running" || typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint))
+      return null;
+    const request = checkpoint;
+    if (request.phase !== "summarize")
+      return null;
+    const part = (value) => {
+      if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+        return String(value);
+      return typeof value === "string" && IDENTITY_PART.test(value) ? value : null;
+    };
+    const conversation = part(record.conversationId);
+    const cutoff = part(request.tail);
+    if (conversation === null || cutoff === null)
+      return null;
+    return { conversation, task: String(taskId), cutoff };
+  } catch {
+    return null;
+  }
 }
 function readSubmissionEntry(sql, submissionId) {
   const unavailable = () => new Error(`Submission "${submissionId}" has no readable placed entry.`);
@@ -56377,6 +56422,70 @@ function captureResolvedModel(response, onModelResolved) {
     headers: response.headers
   });
 }
+function splitSummaryMessages(input) {
+  if (!Array.isArray(input.messages) || input.messages.length !== 2)
+    return input;
+  const [system, user] = input.messages;
+  if (typeof system !== "object" || system === null || system.role !== "system" || typeof user !== "object" || user === null || user.role !== "user")
+    return input;
+  let text;
+  if (typeof user.content === "string")
+    text = user.content;
+  else if (Array.isArray(user.content) && user.content.length === 1 && user.content[0]?.type === "text" && typeof user.content[0].text === "string")
+    text = user.content[0].text;
+  else
+    return input;
+  const limit = 64000;
+  if (text.length <= limit)
+    return input;
+  const messages = [system];
+  for (let start = 0;start < text.length; ) {
+    let end = Math.min(start + limit, text.length);
+    const last = text.charCodeAt(end - 1);
+    const next = text.charCodeAt(end);
+    if (last >= 55296 && last <= 56319 && next >= 56320 && next <= 57343)
+      end--;
+    messages.push({ ...user, content: text.slice(start, end) });
+    start = end;
+  }
+  return { ...input, messages };
+}
+var HISTORICAL_TOOL_RESULT_CHARS = 12000;
+var HISTORICAL_TOOL_RESULT_NOTICE = `
+
+[Earlier tool result shortened to save context. This excerpt is incomplete; read the source again before relying on or editing its full contents.]`;
+function boundToolHistory(input) {
+  if (!Array.isArray(input.messages))
+    return input;
+  const original = input.messages;
+  let completed = -1;
+  for (let index = original.length - 1;index >= 0; index--) {
+    const message = original[index];
+    if (typeof message === "object" && message !== null && !Array.isArray(message) && "role" in message && message.role === "assistant" && "content" in message && typeof message.content === "string" && message.content.length > 0 && (!("tool_calls" in message) || message.tool_calls === null || Array.isArray(message.tool_calls) && message.tool_calls.length === 0)) {
+      completed = index;
+      break;
+    }
+  }
+  if (completed < 0)
+    return input;
+  let messages;
+  for (let index = 0;index < completed; index++) {
+    const message = original[index];
+    if (typeof message !== "object" || message === null || Array.isArray(message) || !("role" in message) || message.role !== "tool" || !("content" in message) || typeof message.content !== "string" || message.content.length <= HISTORICAL_TOOL_RESULT_CHARS)
+      continue;
+    let end = HISTORICAL_TOOL_RESULT_CHARS;
+    const previous = message.content.charCodeAt(end - 1);
+    const next = message.content.charCodeAt(end);
+    if (previous >= 55296 && previous <= 56319 && next >= 56320 && next <= 57343)
+      end--;
+    messages ??= original.slice();
+    messages[index] = {
+      ...message,
+      content: message.content.slice(0, end) + HISTORICAL_TOOL_RESULT_NOTICE
+    };
+  }
+  return messages === undefined ? input : { ...input, messages };
+}
 function boundImageHistory(input, maxImages, notice = "[An image was omitted from this request to fit the image limit.]") {
   if (!Array.isArray(input.messages))
     return input;
@@ -56470,12 +56579,12 @@ function imagesOnlyInHistory(input) {
   const messages = input.messages;
   return !hasImage(messages.at(-1)?.content) && messages.some((message) => hasImage(message?.content));
 }
-function meteredBinding(transport, identity, onModelResolved, maxImagesPerRequest = 1, budgetProofs) {
+function meteredBinding(transport, identity, onModelResolved, maxImagesPerRequest = 1, budgetProofs, isCompaction) {
   if (!Number.isSafeInteger(maxImagesPerRequest) || maxImagesPerRequest < 1 || maxImagesPerRequest > MAX_IMAGE_PARTS)
     throw new Error("Invalid model image limit.");
   return {
     async run(_model, input, options) {
-      const current = identity();
+      const current = identity(options?.signal);
       if (!current) {
         return Response.json({
           success: false,
@@ -56485,7 +56594,8 @@ function meteredBinding(transport, identity, onModelResolved, maxImagesPerReques
           }
         }, { status: 409 });
       }
-      const bounded = boundImageHistory(input, maxImagesPerRequest);
+      const summary = isCompaction?.(options?.signal) ? splitSummaryMessages(input) : input;
+      const bounded = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
       const request = (value) => {
         budgetProofs?.clear(current);
         return transport.requestModel(value, current, options?.signal);
@@ -56519,6 +56629,65 @@ function meteredBinding(transport, identity, onModelResolved, maxImagesPerReques
     },
     aiGatewayLogId: null
   };
+}
+
+// src/model-task-context.ts
+class ModelTaskContext {
+  phases = new WeakMap;
+  calls = new WeakMap;
+  startSpan = async (options, callback) => {
+    const span = {
+      startSpan: this.startSpan,
+      addLink() {},
+      addEvent() {},
+      setAttributes() {},
+      setStatus() {}
+    };
+    const attributes = options.attributes;
+    const task = attributes?.["task.id"];
+    const name = attributes?.["task.name"];
+    const phase = attributes?.phase;
+    if (options.name === "pi.durable.phase" && attributes?.kind === "run" && typeof task === "number" && Number.isSafeInteger(task) && task > 0) {
+      if (name === "pi.generation" && phase === "request")
+        this.phases.set(span, { kind: "generation", task });
+      else if (name === "pi.compaction" && phase === "summarize")
+        this.phases.set(span, { kind: "compaction", task });
+    }
+    return callback(span);
+  };
+  telemetry = { startSpan: this.startSpan };
+  install(models) {
+    const stream = models.streamSimple.bind(models);
+    const complete = models.completeSimple.bind(models);
+    models.streamSimple = (model, context, options) => {
+      this.bind(options, "generation");
+      return stream(model, context, options);
+    };
+    models.completeSimple = (model, context, options) => {
+      this.bind(options, "compaction");
+      return complete(model, context, options);
+    };
+  }
+  bind(options, kind) {
+    const signal = options?.signal;
+    if (!signal)
+      return;
+    const phase = options.telemetry && this.phases.get(options.telemetry);
+    const call = phase?.kind === kind ? phase : kind === "generation" && phase === undefined ? { kind } : null;
+    if (this.calls.has(signal)) {
+      const previous = this.calls.get(signal);
+      if (!previous || !call || previous.kind !== call.kind || previous.task !== call.task) {
+        this.calls.set(signal, null);
+        return;
+      }
+    }
+    this.calls.set(signal, call);
+  }
+  read(signal) {
+    if (!signal || signal.aborted)
+      return null;
+    return this.calls.get(signal) ?? null;
+  }
 }
 
 // src/operation-scope.ts
@@ -57570,8 +57739,8 @@ function toolCallText(name, args) {
 function createdAt(timestamp) {
   return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0 ? { created: new Date(timestamp).toISOString() } : {};
 }
-function projectedThreadEntries(records, includeThinking, project, budgetProof) {
-  const entries = threadEntries(records, includeThinking, budgetProof);
+function projectedThreadEntries(records, includeThinking, project, budgetProof, settledBudgetProof) {
+  const entries = threadEntries(records, includeThinking, budgetProof, settledBudgetProof);
   return project ? [...project(entries)] : entries;
 }
 var RESET_KIND = "pi.reset";
@@ -57589,7 +57758,7 @@ async function readAllRecords(scan) {
   } while (cursor !== undefined);
   return records;
 }
-function threadEntries(records, includeThinking, budgetProof) {
+function threadEntries(records, includeThinking, budgetProof, settledBudgetProof) {
   const entries = [];
   const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
   const all = visible.flatMap((record) => record.kind === RESET_KIND ? [RESET_BOUNDARY, ...record.model ?? []] : record.model ?? []);
@@ -57674,7 +57843,7 @@ function threadEntries(records, includeThinking, budgetProof) {
           ...operator && payload !== undefined ? { payload } : {}
         });
       }
-      if (message.role === "assistant" && terminalError(all, position)) {
+      if (message.role === "assistant" && (terminalError(all, position) || message.stopReason === "error" && all[position + 1] === undefined && settledBudgetProof?.(record, message.errorMessage) === true)) {
         entries.push({
           seq: entries.length + 1,
           role: "agent",
@@ -57724,8 +57893,10 @@ function engineBatchChanges(events) {
           entries = true;
         break;
       case "task_failed":
-        if (event.kind === "pi.generation")
+        if (event.kind === "pi.generation") {
           master = true;
+          entries = true;
+        }
         break;
       default:
         break;
@@ -57740,6 +57911,7 @@ class HostedSession extends DurableObject {
   options;
   operationScopes;
   contextBudgetProofs;
+  modelTaskContext = new ModelTaskContext;
   toolAppScope = async (api, context) => {
     const live = await api.snapshot(LiveDoc, api.conversationId, context);
     const run = live?.run;
@@ -57763,11 +57935,43 @@ class HostedSession extends DurableObject {
       authorizeTool: (name) => options.authorizeTool(name)
     };
     const ai = createAI({
-      binding: meteredBinding(options, () => this.generationIdentity(), (served) => this.recordResolvedModel(served), options.maxImagesPerRequest, this.contextBudgetProofs)
+      binding: meteredBinding(options, (signal) => this.modelIdentity(signal), (served) => this.recordResolvedModel(served), options.maxImagesPerRequest, this.contextBudgetProofs, (signal) => this.modelTaskContext.read(signal)?.kind === "compaction")
     });
     this.models.setProvider(withDefaultModel(ai.provider, model));
     this.registry.install(intentGuard(options.toolRefusal));
     this.registry.install(runtimeProfile);
+    this.registry.install({
+      name: "hosted-preserve-active-operation",
+      hooks: [
+        hook(CompactionTask, {
+          beforeCompact: async (candidate, api, context) => {
+            try {
+              const conversation = await this.harness.conversation(this.harness.session().id);
+              if (conversation.id !== api.conversationId)
+                return { decline: true };
+              const view = await conversation.context(context);
+              const firstKept = view.entries.findIndex((entry) => entry.id === candidate.firstKept);
+              if (firstKept < 0)
+                return { decline: true };
+              let completed = -1;
+              for (let index = view.contributions.length - 1;index >= 0; index--) {
+                if (view.contributions[index].some((message) => message.role === "assistant" && (message.stopReason === "stop" || message.stopReason === "length") && !message.content.some((part) => part.type === "toolCall"))) {
+                  completed = index;
+                  break;
+                }
+              }
+              for (let index = completed + 1;index < firstKept; index++) {
+                if (view.contributions[index].some((message) => message.role === "user" || message.role === "toolResult" || message.role === "assistant" && message.content.some((part) => part.type === "toolCall")))
+                  return { decline: true };
+              }
+              return;
+            } catch {
+              return { decline: true };
+            }
+          }
+        })
+      ]
+    });
     if (options.identity) {
       const identityMessages = new WeakSet;
       const identitySnapshots = new IdentitySnapshots(ctx.storage.sql);
@@ -57780,13 +57984,19 @@ class HostedSession extends DurableObject {
       return operationIds.length === 0 ? Promise.resolve([]) : options.attachedImages({ operationIds, app }, signal);
     }, options.maxImagesPerRequest));
     guardOperationRequests(this.models, operationMessages);
+    this.modelTaskContext.install(this.models);
     for (const group of options.tools) {
       this.registry.install(runtimeExtension(group, authority, this.toolAppScope, acceptsImages));
     }
     this.harness = new PiHarness({
       harness: async ({ storage, context, onWake }) => {
         this.registry.install(authorizeExtension(await skills([operationalSkills, runtimeHealthSkills, companyOutputSkills]), authority));
-        return Harness.open(storage, { models: this.models, registry: this.registry, onWake }, context);
+        return Harness.open(storage, {
+          models: this.models,
+          registry: this.registry,
+          onWake,
+          telemetry: this.modelTaskContext.telemetry
+        }, context);
       },
       defaults: { model }
     });
@@ -57941,7 +58151,7 @@ data: ${JSON.stringify(entry)}
   }
   async transcript(includeThinking) {
     const conversation = await this.harness.conversation(this.harness.session().id);
-    return projectedThreadEntries(await readAllRecords((cursor, limit) => conversation.entries({ order: "ascending" }, limit, cursor, BACKGROUND_CONTEXT)), includeThinking, this.options.projectThread, (entry, message) => this.contextBudgetProofs.matches(entry, message));
+    return projectedThreadEntries(await readAllRecords((cursor, limit) => conversation.entries({ order: "ascending" }, limit, cursor, BACKGROUND_CONTEXT)), includeThinking, this.options.projectThread, (entry, message) => this.contextBudgetProofs.matches(entry, message), (entry, message) => this.contextBudgetProofs.settled(entry, message));
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;
@@ -58081,8 +58291,15 @@ data: ${JSON.stringify(masterState(status.model, status, context?.conversationId
       return null;
     }
   }
-  generationIdentity() {
-    return readGenerationIdentity(this.ctx.storage.sql);
+  modelIdentity(signal) {
+    const call = this.modelTaskContext.read(signal);
+    if (!call)
+      return null;
+    const sql = this.ctx.storage.sql;
+    if (call.kind === "compaction")
+      return readCompactionIdentity(sql, call.task);
+    const identity = readGenerationIdentity(sql);
+    return call.task === undefined || identity?.task === String(call.task) ? identity : null;
   }
   async isBusy() {
     return this.harness.session().busy();

@@ -27,6 +27,7 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      */
     private readonly operationScopes;
     private readonly contextBudgetProofs;
+    private readonly modelTaskContext;
     /** The app scope of the operation that owns one tool call, read from the engine. */
     private readonly toolAppScope;
     private readonly harness;
@@ -179,13 +180,11 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
     /** Resolve a watch run's first input to the engine's admitted operation id. */
     private previewOperation;
     /**
-     * The operation-scoped identity of the model request running right now. It
-     * comes from the engine's own running generation checkpoint (task id +
-     * transcript cutoff), so provider retries and a crash recovery reuse the
-     * same funding key while a tool round gets a new one. No running generation,
-     * or more than one, is a refusal — never a guessed key.
+     * Resolve the engine invocation that made this exact model call. Generation
+     * retains its existing fail-closed uniqueness check; compaction must present
+     * the task id attested by its own phase before its checkpoint can fund a call.
      */
-    private generationIdentity;
+    private modelIdentity;
     /** Whether a run is in flight. */
     isBusy(): Promise<boolean>;
     /**

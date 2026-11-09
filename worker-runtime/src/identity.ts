@@ -111,6 +111,51 @@ export function readGenerationIdentity(
   return { conversation, task, cutoff: cutoffValue };
 }
 
+/**
+ * The summarization request of the exact compaction task attested by the
+ * engine's current phase, or nothing. A task's pinned tail does not change on
+ * a retry or after recovery, and its task id is distinct from the generation
+ * waiting for it.
+ */
+export function readCompactionIdentity(sql: TaskSql, taskId: number): GenerationIdentity | null {
+  if (!Number.isSafeInteger(taskId) || taskId <= 0) return null;
+  try {
+    const rows = sql
+      .exec(
+        `SELECT id, record FROM pi_tasks
+          WHERE id = ? AND kind = '"pi.compaction"' AND status = 'running'`,
+        taskId,
+      )
+      .toArray();
+    if (rows.length !== 1 || Number(rows[0]?.id) !== taskId) return null;
+    const record = parseRecord(rows[0]?.record);
+    const state = record?.state;
+    if (typeof state !== "object" || state === null || Array.isArray(state)) return null;
+    const checkpoint = (state as Record<string, unknown>).checkpoint;
+    if (
+      record?.kind !== "pi.compaction" ||
+      (state as Record<string, unknown>).status !== "running" ||
+      typeof checkpoint !== "object" ||
+      checkpoint === null ||
+      Array.isArray(checkpoint)
+    )
+      return null;
+    const request = checkpoint as Record<string, unknown>;
+    if (request.phase !== "summarize") return null;
+    const part = (value: unknown): string | null => {
+      if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+        return String(value);
+      return typeof value === "string" && IDENTITY_PART.test(value) ? value : null;
+    };
+    const conversation = part(record.conversationId);
+    const cutoff = part(request.tail);
+    if (conversation === null || cutoff === null) return null;
+    return { conversation, task: String(taskId), cutoff };
+  } catch {
+    return null;
+  }
+}
+
 /** The engine's stored pieces of one entry: its kind, its data and its messages. */
 export interface StoredEntryData {
   readonly kind: unknown;

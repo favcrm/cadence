@@ -3,11 +3,11 @@
   "NOTICE": "e92e2bb2ed5f38da3bd75551427d604ecf1d02d9aa8064a06ef72deda08a25f1",
   "THIRD_PARTY_NOTICES.txt": "43933b33533456cba6de1839a043ccd034b7283efd655dee95f6ba767febb756",
   "contract.d.ts": "71aac7292cf89e2c18e2e3aa191a7dc0622c4b4352512ee00d7a6c416e1cc5e2",
-  "hosted-session.d.ts": "98b55eeded899863f3f685e0d8f751c2c1f67a223fcd12c7d9cb823b6e61966c",
+  "hosted-session.d.ts": "3cae63ad193a6958563de7ce51b6ab7b2d38e4c82133bb1e7c55dfc878f91c25",
   "index.d.ts": "767ce3cadae0e2fd3ac4c45030b4787a0595291d4debb415642d449bce1cf026",
   "master.d.ts": "c13c08a9e52b447df43a67054249a06f4c6bcc8bfae1d704a63751c080ca1dcc",
   "package.json": "170f882743033fb998a955cb81f8368fd448346c4346c98e60749b9e1e1ce09f",
-  "runtime.mjs": "bd20d52262b90dce29ead73fce24986df7dd04bab3421abce3bf36575aebbf1e",
+  "runtime.mjs": "0643e705e3fc6b74cad401978fbc7a703dab950195bc8ba70619bd566b110c19",
   "testing.d.ts": "5197b92b4a4a5963a43796a89a670135ae439aa7526d6542d98d0749e3e6aa32",
   "testing.mjs": "bfd63e34eed96ecb5843d1faf14facf3b5e7ce5edbb57b480dde3fad6f99b9bd",
   "tool-policy.d.ts": "63d82b8bdd16393562c43aec10454e263434b3ecf581338a03469661ac706583"
