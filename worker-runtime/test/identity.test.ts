@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { readCompactionIdentity, readGenerationIdentity, type TaskSql } from "../src/identity.ts";
+import { readCompactionFailure, readCompactionIdentity, readGenerationIdentity, type TaskSql } from "../src/identity.ts";
 
 const sql = (rows: Record<string, unknown>[]): TaskSql => ({
   exec: () => ({ toArray: () => rows }),
@@ -108,6 +108,55 @@ describe("generation identity adapter", () => {
             }),
           },
         ]),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("failed compaction adapter", () => {
+  const task = (id: number, conversationId: number, outcome: unknown) => ({
+    id,
+    record: JSON.stringify({
+      conversationId,
+      kind: "pi.compaction",
+      state: { status: "terminal", outcome },
+    }),
+  });
+  const failed = (id: number, conversationId: number, message: string) =>
+    task(id, conversationId, { status: "failed", error: { message } });
+
+  it("names the newest failure that no later entry supersedes", () => {
+    expect(readCompactionFailure(sql([failed(30, 1, "Summarization failed.")]), 1, 20))
+      .toBe("Summarization failed.");
+    expect(readCompactionFailure(sql([failed(30, 1, "Summarization failed.")]), 1, 30))
+      .toBeNull();
+  });
+
+  it("fails closed on a succeeded, malformed or unreadable task", () => {
+    expect(
+      readCompactionFailure(
+        sql([task(30, 1, { status: "completed" })]),
+        1,
+        0,
+      ),
+    ).toBeNull();
+    expect(readCompactionFailure(sql([{ id: 30, record: "{" }]), 1, 0)).toBeNull();
+    expect(
+      readCompactionFailure(
+        sql([task(30, 1, { status: "failed", error: {} })]),
+        1,
+        0,
+      ),
+    ).toBeNull();
+    expect(
+      readCompactionFailure(
+        {
+          exec() {
+            throw new Error("no such table: pi_tasks");
+          },
+        },
+        1,
+        0,
       ),
     ).toBeNull();
   });

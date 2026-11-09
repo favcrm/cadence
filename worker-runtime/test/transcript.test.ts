@@ -559,4 +559,34 @@ describe("projectedThreadEntries", () => {
     expect(given).toEqual(app);
     expect(seen[0]?.payload?.app).toEqual(app);
   });
+
+  it("names a failed compaction only while its run is unanswered", () => {
+    const answered = [input("1", "hello"), assistant("2", [{ type: "text", text: "answer" }], "stop")];
+    const failure = "Summarization failed: The context limit was reached.";
+    expect(
+      projectedThreadEntries(answered, false, undefined, undefined, undefined, failure),
+    ).toEqual(threadEntries(answered, false));
+    const unanswered = projectedThreadEntries(
+      records,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      failure,
+    );
+    expect(unanswered.at(-1)?.payload).toEqual({
+      status: "failed",
+      error: "The model request failed.",
+    });
+    expect(
+      projectedThreadEntries(
+        records,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        `Summarization failed: ${CONTEXT_BUDGET_EXCEEDED_TEXT}`,
+      ).at(-1)?.payload,
+    ).toEqual({ status: "failed", error: CONTEXT_BUDGET_EXCEEDED_TEXT });
+  });
 });

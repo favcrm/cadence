@@ -95,9 +95,39 @@ export function projectedThreadEntries(
   project?: ThreadProjection,
   budgetProof?: BudgetProof,
   settledBudgetProof?: BudgetProof,
+  unansweredCompactionFailure?: string | null,
 ): ThreadEntry[] {
   const entries = threadEntries(records, includeThinking, budgetProof, settledBudgetProof);
-  return project ? [...project(entries)] : entries;
+  const projected = project ? [...project(entries)] : entries;
+  const failure = unansweredCompactionFailure ?? null;
+  if (failure !== null) {
+    let lastOperator = -1;
+    for (let index = projected.length - 1; index >= 0; index--)
+      if (projected[index]!.role === "operator") {
+        lastOperator = index;
+        break;
+      }
+    // A run that settled without an answer is the only one a failed
+    // compaction leaves behind: once any entry follows it, that entry owns
+    // the transcript and the failure is history.
+    if (
+      lastOperator !== -1 &&
+      !projected.slice(lastOperator + 1).some((entry) => entry.role === "agent")
+    )
+      projected.push({
+        seq: projected.length + 1,
+        role: "agent",
+        kind: "turn_result",
+        text: "",
+        payload: {
+          status: "failed",
+          error: failure.includes(CONTEXT_BUDGET_EXCEEDED_TEXT)
+            ? CONTEXT_BUDGET_EXCEEDED_TEXT
+            : failedTurnReason(failure),
+        },
+      });
+  }
+  return projected;
 }
 
 /** The engine's reset record: earlier entries leave the model's context, not storage. */

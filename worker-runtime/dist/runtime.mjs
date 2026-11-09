@@ -56175,6 +56175,40 @@ function entryText(model) {
     return null;
   return message.content;
 }
+function readCompactionFailure(sql, conversationId, afterEntryId) {
+  if (!Number.isSafeInteger(conversationId) || conversationId <= 0)
+    return null;
+  try {
+    const rows = sql.exec(`SELECT id, record FROM pi_tasks
+          WHERE conversation_id = ? AND kind = '"pi.compaction"' AND status = 'terminal'
+          ORDER BY id DESC LIMIT 1`, conversationId).toArray();
+    const row = rows[0];
+    if (row === undefined || !Number.isSafeInteger(row.id))
+      return null;
+    if (Number.isSafeInteger(afterEntryId) && Number(row.id) <= afterEntryId)
+      return null;
+    const record = parseRecord(row.record);
+    const state = record?.state;
+    if (typeof state !== "object" || state === null || Array.isArray(state))
+      return null;
+    const terminal = state;
+    if (terminal.status !== "terminal")
+      return null;
+    const outcome = terminal.outcome;
+    if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome))
+      return null;
+    const failed = outcome;
+    if (failed.status !== "failed")
+      return null;
+    const error = failed.error;
+    if (typeof error !== "object" || error === null || Array.isArray(error))
+      return null;
+    const message = error.message;
+    return typeof message === "string" && message.length > 0 ? message : null;
+  } catch {
+    return null;
+  }
+}
 function parseRecord(stored) {
   if (typeof stored !== "string")
     return null;
@@ -57750,9 +57784,30 @@ function toolCallText(name, args) {
 function createdAt(timestamp) {
   return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0 ? { created: new Date(timestamp).toISOString() } : {};
 }
-function projectedThreadEntries(records, includeThinking, project, budgetProof, settledBudgetProof) {
+function projectedThreadEntries(records, includeThinking, project, budgetProof, settledBudgetProof, unansweredCompactionFailure) {
   const entries = threadEntries(records, includeThinking, budgetProof, settledBudgetProof);
-  return project ? [...project(entries)] : entries;
+  const projected = project ? [...project(entries)] : entries;
+  const failure = unansweredCompactionFailure ?? null;
+  if (failure !== null) {
+    let lastOperator = -1;
+    for (let index = projected.length - 1;index >= 0; index--)
+      if (projected[index].role === "operator") {
+        lastOperator = index;
+        break;
+      }
+    if (lastOperator !== -1 && !projected.slice(lastOperator + 1).some((entry) => entry.role === "agent"))
+      projected.push({
+        seq: projected.length + 1,
+        role: "agent",
+        kind: "turn_result",
+        text: "",
+        payload: {
+          status: "failed",
+          error: failure.includes(CONTEXT_BUDGET_EXCEEDED_TEXT) ? CONTEXT_BUDGET_EXCEEDED_TEXT : failedTurnReason(failure)
+        }
+      });
+  }
+  return projected;
 }
 var RESET_KIND = "pi.reset";
 var COMPACTION_KIND = "pi.compaction";
@@ -58162,7 +58217,8 @@ data: ${JSON.stringify(entry)}
   }
   async transcript(includeThinking) {
     const conversation = await this.harness.conversation(this.harness.session().id);
-    return projectedThreadEntries(await readAllRecords((cursor, limit) => conversation.entries({ order: "ascending" }, limit, cursor, BACKGROUND_CONTEXT)), includeThinking, this.options.projectThread, (entry, message) => this.contextBudgetProofs.matches(entry, message), (entry, message) => this.contextBudgetProofs.settled(entry, message));
+    const records = await readAllRecords((cursor, limit) => conversation.entries({ order: "ascending" }, limit, cursor, BACKGROUND_CONTEXT));
+    return projectedThreadEntries(records, includeThinking, this.options.projectThread, (entry, message) => this.contextBudgetProofs.matches(entry, message), (entry, message) => this.contextBudgetProofs.settled(entry, message), readCompactionFailure(this.ctx.storage.sql, conversation.id, records.at(-1)?.id ?? 0));
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;

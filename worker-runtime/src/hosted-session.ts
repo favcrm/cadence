@@ -35,6 +35,7 @@ import {
   type AppScopeResolver,
 } from "./engine.ts";
 import {
+  readCompactionFailure,
   readCompactionIdentity,
   readGenerationIdentity,
   readHeldSubmission,
@@ -594,19 +595,25 @@ export class HostedSession<
     const conversation = await this.harness.conversation(
       this.harness.session().id,
     );
-    return projectedThreadEntries(
-      await readAllRecords<Cursor>((cursor, limit) =>
-        conversation.entries(
-          { order: "ascending" },
-          limit,
-          cursor,
-          BACKGROUND_CONTEXT,
-        ),
+    const records = await readAllRecords<Cursor>((cursor, limit) =>
+      conversation.entries(
+        { order: "ascending" },
+        limit,
+        cursor,
+        BACKGROUND_CONTEXT,
       ),
+    );
+    return projectedThreadEntries(
+      records,
       includeThinking,
       this.options.projectThread,
       (entry, message) => this.contextBudgetProofs.matches(entry, message),
       (entry, message) => this.contextBudgetProofs.settled(entry, message),
+      readCompactionFailure(
+        this.ctx.storage.sql as unknown as TaskSql,
+        conversation.id,
+        records.at(-1)?.id ?? 0,
+      ),
     );
   }
 

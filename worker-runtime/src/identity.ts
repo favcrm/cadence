@@ -383,6 +383,54 @@ function entryText(model: unknown): string | null {
   return message.content;
 }
 
+/**
+ * The error message of the newest failed compaction task that no later record
+ * supersedes, or `null`.
+ *
+ * A failed compaction settles its run without an assistant entry, so the board
+ * has no other durable trace to name. Record ids come from one monotonic
+ * counter, so the newest entry's id orders this failure against everything the
+ * transcript already shows: a later entry — a placed summary, an answer, or
+ * the next input — means the failure belongs to history, not to the run on
+ * screen.
+ */
+export function readCompactionFailure(
+  sql: TaskSql,
+  conversationId: number,
+  afterEntryId: number,
+): string | null {
+  if (!Number.isSafeInteger(conversationId) || conversationId <= 0) return null;
+  try {
+    const rows = sql
+      .exec(
+        `SELECT id, record FROM pi_tasks
+          WHERE conversation_id = ? AND kind = '"pi.compaction"' AND status = 'terminal'
+          ORDER BY id DESC LIMIT 1`,
+        conversationId,
+      )
+      .toArray();
+    const row = rows[0];
+    if (row === undefined || !Number.isSafeInteger(row.id)) return null;
+    if (Number.isSafeInteger(afterEntryId) && Number(row.id) <= afterEntryId) return null;
+    const record = parseRecord(row.record);
+    const state = record?.state;
+    if (typeof state !== "object" || state === null || Array.isArray(state)) return null;
+    const terminal = state as Record<string, unknown>;
+    if (terminal.status !== "terminal") return null;
+    const outcome = terminal.outcome;
+    if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome))
+      return null;
+    const failed = outcome as Record<string, unknown>;
+    if (failed.status !== "failed") return null;
+    const error = failed.error;
+    if (typeof error !== "object" || error === null || Array.isArray(error)) return null;
+    const message = (error as Record<string, unknown>).message;
+    return typeof message === "string" && message.length > 0 ? message : null;
+  } catch {
+    return null;
+  }
+}
+
 /** One stored `record` column's parsed JSON body, or `null` when it is not one. */
 function parseRecord(stored: unknown): Record<string, unknown> | null {
   if (typeof stored !== "string") return null;

@@ -80,7 +80,7 @@ afterEach(async () => {
 
 async function session(
   respond: (requests: readonly RequestRecord[]) => Response | Promise<Response>,
-  options: { keepRecentTokens?: number; artifact?: string } = {},
+  options: { keepRecentTokens?: number; artifact?: string; reserveTokens?: number } = {},
 ) {
   const { HostedSession } = await import("../src/hosted-session.ts");
   const database = new Database(":memory:");
@@ -141,7 +141,7 @@ async function session(
       telemetry: wired.modelTaskContext.telemetry,
       settings: () => ({
         retry: { enabled: false },
-        compaction: { backgroundTokens: 0, keepRecentTokens: options.keepRecentTokens ?? 20_000 },
+        compaction: { backgroundTokens: 0, keepRecentTokens: options.keepRecentTokens ?? 20_000, ...(options.reserveTokens === undefined ? {} : { reserveTokens: options.reserveTokens }) },
       }),
     },
     BACKGROUND_CONTEXT,
@@ -297,6 +297,26 @@ describe("gateway byte-budget recovery", () => {
     expect(run.requests).toHaveLength(4);
     expect(failed(await run.hosted.transcript(false)).at(-1)?.payload?.error)
       .toBe(CONTEXT_BUDGET_EXCEEDED_TEXT);
+  });
+
+  it("names a failed blocking threshold compaction that settles without an answer", async () => {
+    const run = await session(
+      (requests) => {
+        if (requests.length === 1) return answer("Earlier answer.");
+        if (requests.length === 2)
+          return Response.json({ error: { message: "private summary failure" } }, { status: 500 });
+        return answer("Unexpected generation.");
+      },
+      { keepRecentTokens: 1, reserveTokens: 1_000_000 },
+    );
+    await (await run.submit("Earlier work.")).wait(BACKGROUND_CONTEXT);
+    await (await run.submit("Continue.")).wait(BACKGROUND_CONTEXT);
+    // The threshold compacts before the second generation, so the failed
+    // summary is the last request and no answer follows it.
+    expect(run.requests).toHaveLength(2);
+    const thread = await run.hosted.transcript(false);
+    expect(failed(thread).at(-1)?.payload?.error).toBe("The model request failed.");
+    expect(JSON.stringify(thread)).not.toContain("private summary failure");
   });
 
   it("reports a failed summary without retrying the generation", async () => {
