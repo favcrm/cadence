@@ -4102,7 +4102,7 @@ mod cad2009_assignment_acceptance {
 
     include!("local_assignment/cad2009_activation_acceptance.rs");
     include!("local_assignment/cad2009_confirmed_custody_acceptance.rs");
-    include!("local_assignment/cad2096_queue_custody_acceptance.rs");
+    include!("local_assignment/cad2096_queue_custody_authored_acceptance.rs");
 
     fn exercise(mutation: Mutation) {
         for answer in [
