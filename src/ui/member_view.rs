@@ -17,10 +17,15 @@ pub(crate) fn member_running_item(item: &Value) -> Value {
     })
 }
 
-/// The fleet-row fields a non-operator keeps: identity, runtime state,
+/// The fleet-row fields a non-operator keeps: identity, the scoped status,
 /// counts, model and effort facts, ids and timing - what the roster, the
 /// cards and the agent page read. Any field not named here is dropped, so a
 /// field added to the row later stays hidden from members by default.
+///
+/// CAD-2215: `state` here is never the stored one. The daemon's scoped rows
+/// carry [`crate::daemon`]'s visible-work derivation and the board rows are
+/// re-derived by `serve::scope_member_agents`; `dead` is absent because it
+/// moves on the unknown-message fence.
 const MEMBER_ROW_FIELDS: &[&str] = &[
     "alias",
     "provider",
@@ -56,7 +61,6 @@ const MEMBER_ROW_FIELDS: &[&str] = &[
     "recovery",
     "resume",
     "resume_hint",
-    "dead",
     "inbox",
     "last_activity",
     "silent_secs",
@@ -139,7 +143,7 @@ pub(crate) fn redact_agents_payload(payload: &mut Value) {
 /// anything a payload gains later is dropped by default. Top level: the
 /// ids, kind and time. Payload: only these scalar fields; every other one
 /// (`result`, `text`, `body`, `before`/`after`, …) is dropped.
-const MEMBER_EVENT_FIELDS: &[&str] = &["seq", "alias", "kind", "job_id", "task_id", "at"];
+const MEMBER_EVENT_FIELDS: &[&str] = &["id", "cursor", "alias", "kind", "job_id", "task_id", "at"];
 const MEMBER_EVENT_PAYLOAD: &[&str] = &[
     "message",
     "turn_id",
@@ -190,14 +194,17 @@ pub(crate) fn member_event(event: &Value) -> Value {
 /// read agent threads, but never the operator-only entries
 /// (`store::operator_only_kind`: artifact cards, hire proposals) and never
 /// the master's Home conversation. Fail closed: only a proven operator
-/// gets the page whole. Whether this is the master's Home is decided from the
-/// DAEMON's reply (the resolved `alias` and the thread's `install_id`), never
-/// from the URL's spelling: an absent field counts as Home. It edits `page`
-/// in place; the stream collects the page's seqs itself so its cursor still
-/// advances past what was hidden.
+/// gets the page whole. Home versus app comes from the daemon's scoped
+/// `_member_app` marker, not a URL or hidden thread metadata. Older daemon
+/// replies use the resolved alias and install_id; an absent field is Home.
 pub(super) fn member_view(page: &mut Value) {
+    let app_thread = page["_member_app"].as_bool() == Some(true);
+    if let Some(fields) = page.as_object_mut() {
+        fields.remove("_member_app");
+    }
     let resolved_master = page["alias"].as_str().is_none_or(crate::master::is_master);
     let home = resolved_master
+        && !app_thread
         && page["thread"].as_object().is_none_or(|t| {
             t.get("install_id")
                 .is_none_or(|i| i.is_null() || i.as_str() == Some(crate::store::RECRUIT_INSTALL))

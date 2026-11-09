@@ -213,8 +213,10 @@ fn hash_dir(dir: &Path, h: &mut DefaultHasher) {
 }
 
 /// An issue folder's stamp: `issue.md`, `comments/` and `artifacts/` —
-/// the three things [`board::load_issue`] reads.
-fn folder_stamp(dir: &Path) -> u64 {
+/// the three things [`board::load_issue`] reads. The shared entity diff and a
+/// reader's own card diff use the same stamp, so a body/comment/artifact edit
+/// that leaves the card text unchanged still moves it.
+pub(super) fn folder_stamp(dir: &Path) -> u64 {
     let mut h = DefaultHasher::new();
     hash_meta(&dir.join("issue.md"), &mut h);
     hash_dir(&dir.join("comments"), &mut h);
@@ -814,6 +816,14 @@ struct Watch {
 /// learns a client hung up.
 pub(super) const HEARTBEAT: &str = "";
 
+/// The end of one watcher write batch on the subscriber channel. Every frame
+/// a tick produces is sent under the hub lock, but a receiver can wake after
+/// the first of them, so "nothing more is queued right now" proves nothing.
+/// A reader that must decide a whole tick at once (the member stream) waits
+/// for this marker; a reader that forwards each frame as it comes (the
+/// operator stream) drops it. It is never written to a socket.
+pub(super) const BATCH_END: &str = "\u{0}batch_end";
+
 fn frame(event: &str, data: &Value) -> Arc<str> {
     format!("event: {event}\ndata: {data}\n\n").into()
 }
@@ -1127,10 +1137,11 @@ impl Model {
         project: Option<&str>,
         snap: &DaemonSnap,
         readable: Option<&BTreeSet<String>>,
+        scoped_jobs: Option<(&board::JobOutcomes, u64)>,
     ) -> BoardRead {
         let mut t = lock(&self.tracker);
         t.refresh(&pm.dir);
-        let jobs = (&snap.outcomes, snap.jobs_fp.unwrap_or(0));
+        let jobs = scoped_jobs.unwrap_or((&snap.outcomes, snap.jobs_fp.unwrap_or(0)));
         let (_, views) = t.views(pm, project, Some(jobs), readable);
         BoardRead {
             views,
@@ -1147,13 +1158,19 @@ impl Model {
     /// the agent strip.
     pub(super) fn board(&self, pm: &Pm, project: Option<&str>) -> BoardRead {
         let snap = self.daemon_snap();
-        self.board_with(pm, project, &snap, None)
+        self.board_with(pm, project, &snap, None, None)
     }
 
     /// Restrict raw issues before deriving relationships, roll-ups and card counts.
-    pub(super) fn board_readable(&self, pm: &Pm, readable: &BTreeSet<String>) -> BoardRead {
+    pub(super) fn board_readable(
+        &self,
+        pm: &Pm,
+        project: Option<&str>,
+        readable: &BTreeSet<String>,
+        scoped_jobs: (&board::JobOutcomes, u64),
+    ) -> BoardRead {
         let snap = self.daemon_snap();
-        self.board_with(pm, None, &snap, Some(readable))
+        self.board_with(pm, project, &snap, Some(readable), Some(scoped_jobs))
     }
 
     /// `/api/agents`, with the snapshot's [`Self::freshness`] keys:
@@ -1193,7 +1210,7 @@ impl Model {
 
     // CI observations move delivery state without moving an agent or
     // tracker issue. Atomic replacement must invalidate cached decisions.
-    fn delivery_stamp(&self) -> u64 {
+    pub(super) fn delivery_stamp(&self) -> u64 {
         let mut h = DefaultHasher::new();
         hash_meta(&self.state_dir.join("delivery.json"), &mut h);
         h.finish()
@@ -1455,9 +1472,14 @@ impl Model {
     }
 
     fn master_fp(&self) -> Option<u64> {
-        client::rpc(&self.state_dir, "master_stamp", json!({}))
-            .ok()
-            .map(|l| value_fp(&l))
+        self.master_stamp().map(|l| value_fp(&l))
+    }
+
+    /// The raw `master_stamp` behind a `master` frame. A reader that may see
+    /// only part of it (a signed member sees the turn, not the operator's
+    /// transcript) decides from these fields itself.
+    pub(super) fn master_stamp(&self) -> Option<Value> {
+        client::rpc(&self.state_dir, "master_stamp", json!({})).ok()
     }
 
     fn monitoring_fp(&self) -> Option<u64> {
@@ -1472,7 +1494,7 @@ impl Model {
         let Ok(pm) = Pm::at(&self.pm_dir) else {
             return (HashMap::new(), HashMap::new());
         };
-        let read = self.board_with(&pm, None, snap, None);
+        let read = self.board_with(&pm, None, snap, None, None);
         let by_id = read.by_id();
         let ctx = read.ctx(&by_id);
         let mut cards = HashMap::new();
@@ -1541,6 +1563,10 @@ impl Model {
             if frames.is_empty() {
                 continue;
             }
+            // The marker is part of the same lock-held send, so a subscriber
+            // that sees it has seen every frame of this tick — no scheduling
+            // assumption about how far the sender has got.
+            frames.push(Arc::<str>::from(BATCH_END));
             let mut hub = lock(&self.hub);
             hub.subs
                 .retain(|tx| frames.iter().all(|f| tx.send(f.clone()).is_ok()));

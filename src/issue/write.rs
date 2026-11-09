@@ -31,9 +31,11 @@ pub(crate) use done::{
     mark_done_on_merge_waiting_with, stage, RealWait, WaitClock,
 };
 pub use done::{mark_done_on_merge, mark_done_on_merge_waiting, DoneWriteFailure};
+#[cfg(all(test, feature = "test-seam"))]
+pub use edit::keyed_commit_seam::{arm_keyed_commit_after_success, KeyedCommitSeam};
 pub use edit::{
-    add_comment, add_ref, add_report, attach, attach_bytes, close_ref, link, patch_issue,
-    set_fields, set_fields_if_rev, tag_edit, IssuePatch,
+    add_comment, add_comment_keyed, add_ref, add_report, attach, attach_bytes, close_ref, link,
+    patch_issue, set_fields, set_fields_if_rev, tag_edit, IssuePatch,
 };
 pub(crate) use edit::{
     apply_link, check_set_gates, comment_author, commit_front_with_comment, new_ref, sets_done,
@@ -43,7 +45,9 @@ pub use new::{master_issue_new_limits, new_issue};
 pub(crate) use plan::{check_structure, create_granted_plan, granted_semantics, GrantedPreview};
 pub use plan::{create_plan, decide_plan};
 use projects::check_component;
-pub(crate) use projects::{check_tags, issue_dir, load_front, save_front, split_tags};
+pub(crate) use projects::{
+    check_tags, checked_project_dirs, issue_dir, load_front, save_front, split_tags,
+};
 pub use projects::{
     private_available, project_add, set_acceptance, set_project_policy, set_project_remote,
     PRIVATE_UNAVAILABLE,

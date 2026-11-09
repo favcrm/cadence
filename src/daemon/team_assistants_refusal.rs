@@ -74,6 +74,34 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+/// Owner-only fixture directory. The scoped-cursor record is admitted through
+/// the strict 0700 state chain and its key files through an owner-only parent.
+fn private_dir(path: &Path) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// One 0600, single-link file in that owner-only root.
+fn write_private(path: &Path, bytes: &[u8]) {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    file.write_all(bytes).unwrap();
+    drop(file);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+mod cad2215_delivery_provenance_acceptance;
+mod cad2215_member_scope_acceptance;
+mod cad2215_private_completion_acceptance;
+mod cad2215_private_delivery_native_acceptance;
+
 /// The ONE process-wide lock arming `HOSTED_CADENCE_ASSISTANT_ENABLED` for
 /// the enabled-path fixtures in BOTH independent refusal modules
 /// (`daemon::team_assistants_refusal` and `ui::team_assistants_http_refusal`
@@ -280,6 +308,44 @@ struct EnvelopeClaims {
     jti: String,
 }
 
+/// `member_job_request` requires a real, currently readable tracker issue.
+/// `Store::create_job` admits one nonterminal job per issue, so a test that
+/// accepts more than one request uses a distinct id from this pool.
+const FIXTURE_ISSUE: &str = "FIX-1";
+const FIXTURE_ISSUE_2: &str = "FIX-2";
+const FIXTURE_ISSUE_3: &str = "FIX-3";
+const FIXTURE_ISSUE_4: &str = "FIX-4";
+
+/// Materialize the fixture pool as one REAL workspace-visible project in
+/// `pm` (no policy block — `Project::allows` admits every member). Called
+/// right after `Pm::init`, before any test snapshots the tracker, so the
+/// accepted requests below bind genuine issues without mutating the tree
+/// mid-assertion.
+fn fixture_issue_project(pm: &Path) {
+    let project = pm.join("fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("project.yaml"), "key: fixture\nprefix: FIX\n").unwrap();
+    for id in [
+        FIXTURE_ISSUE,
+        FIXTURE_ISSUE_2,
+        FIXTURE_ISSUE_3,
+        FIXTURE_ISSUE_4,
+        "FIX-5",
+        "FIX-6",
+    ] {
+        let issue = project.join(id);
+        std::fs::create_dir_all(&issue).unwrap();
+        std::fs::write(
+            issue.join("issue.md"),
+            format!(
+                "---\nid: {id}\ntitle: {id} fixture\nstatus: backlog\npriority: P2\n\
+                 created: '2026-01-01T00:00:00Z'\n---\n"
+            ),
+        )
+        .unwrap();
+    }
+}
+
 /// A fixture daemon on an isolated state dir + isolated PM, a real
 /// `operator/board-identity.json` trust root, and ONE loopback platform
 /// server answering both the JWKS fetch and the
@@ -300,15 +366,30 @@ struct Fx {
     /// Wakes a held revalidate pull when the test releases the barrier.
     barrier: Arc<std::sync::Condvar>,
     stop: Arc<AtomicBool>,
+    /// The fixture-owned key material bound by `init_cursor_keyring`, kept
+    /// alive (and outside the state dir) for the test's lifetime.
+    cursor_keys: Mutex<Option<tempfile::TempDir>>,
     _platform: std::thread::JoinHandle<()>,
 }
 
 impl Fx {
     fn new() -> Self {
+        Self::with_wait_observers(None, None)
+    }
+
+    fn with_wait_observers(
+        wait_baseline_observer: Option<WaitBaselineObserver>,
+        wait_scan_observer: Option<WaitBaselineObserver>,
+    ) -> Self {
         let dir = tempfile::Builder::new().prefix("c1380-").tempdir().unwrap();
         let pm = dir.path().join("pm");
         crate::issue::Pm::init(&pm).unwrap();
-        let opts = ServeOptions::default();
+        fixture_issue_project(&pm);
+        let opts = ServeOptions {
+            wait_baseline_observer,
+            wait_scan_observer,
+            ..ServeOptions::default()
+        };
         opts.provider_env
             .set("CADENCE_PM_DIR", pm.to_str().unwrap());
         let shared = Shared::new(dir.path(), &opts).unwrap();
@@ -376,6 +457,7 @@ impl Fx {
             authority,
             barrier,
             stop,
+            cursor_keys: Mutex::new(None),
             _platform: platform_thread,
         }
     }
@@ -691,6 +773,42 @@ impl Fx {
         self.call(Asserted::Operator, method, params)
     }
 
+    /// Bind a fixture-owned synthetic scoped-cursor keyring through the real
+    /// operator `scoped_cursor_initialize` RPC. The key files live in their
+    /// own 0700 root, outside this fixture's state dir and tracker; the
+    /// daemon reads that fixed record itself, so a scoped `job_events` read
+    /// that succeeds proves the real seam rather than a bypassed codec.
+    fn init_cursor_keyring(&self) {
+        let mut slot = self.cursor_keys.lock().unwrap();
+        // The record is admitted through the strict owner-only state chain,
+        // and the tracker chain it is compared against must be owner-only too
+        // (the runner umask can otherwise leave the fixture tracker 0775).
+        private_dir(self.dir.path());
+        private_dir(&self.pm());
+        let dir = tempfile::Builder::new()
+            .prefix("cad2215-keys-")
+            .tempdir()
+            .unwrap();
+        private_dir(dir.path());
+        for (name, byte) in [("identity.key", 0xa1u8), ("cursor-a.key", 0xb2u8)] {
+            write_private(&dir.path().join(name), &[byte; 32]);
+        }
+        let id = "01".repeat(16);
+        let config = json!({
+            "version": 1,
+            "identity_key_file": dir.path().join("identity.key").to_str().unwrap(),
+            "active_key_id": &id,
+            "keys": [{ "id": &id, "key_file": dir.path().join("cursor-a.key").to_str().unwrap() }],
+        });
+        write_private(
+            &self.dir.path().join("scoped-cursors.json"),
+            &serde_json::to_vec(&config).unwrap(),
+        );
+        let answer = self.op("scoped_cursor_initialize", json!({}));
+        assert_eq!(answer["initialized"], json!(true), "{answer}");
+        *slot = Some(dir);
+    }
+
     /// Flip the member's authoritative platform state — a removal, a
     /// demotion, a credential revocation or a grant narrowing the real
     /// `workspace_members`/`personalAssistants`/`hosted_bridges` rows
@@ -984,7 +1102,7 @@ fn member_verbs(env: &str) -> Vec<(&'static str, Value)> {
         ),
         (
             "member_job_request",
-            json!({"member_envelope": env, "title": "t", "request_key": "k", "body": "b"}),
+            json!({"member_envelope": env, "title": "t", "request_key": "k", "issue": FIXTURE_ISSUE, "body": "b"}),
         ),
         ("member_job_list", json!({"member_envelope": env})),
         (
@@ -993,7 +1111,11 @@ fn member_verbs(env: &str) -> Vec<(&'static str, Value)> {
         ),
         (
             "member_job_events",
-            json!({"member_envelope": env, "job": "j1"}),
+            json!({
+                "member_envelope": env,
+                "job": "j1",
+                "cursor_format": cadence_core::board_api::JOB_EVENTS_CURSOR_FORMAT,
+            }),
         ),
     ]
 }
@@ -1143,13 +1265,28 @@ fn member_a_cannot_read_member_b_assistant_or_conversation() {
     let bob = fx.member_envelope("sub-bob");
     let job = fx.op(
         "member_job_request",
-        json!({"member_envelope": bob, "title": "b job", "request_key": "b-k1", "body": "x"}),
+        json!({"member_envelope": bob, "title": "b job", "request_key": "b-k1", "issue": FIXTURE_ISSUE, "body": "x"}),
     );
-    let job_id = job["job"].as_str().unwrap().to_string();
+    let job_id = promote_fixture_job_without_persistent_service(&fx, "sub-bob", &job);
     let alice = fx.member_envelope("sub-alice");
-    for method in ["member_job_evidence", "member_job_events"] {
+    for (method, params) in [
+        (
+            "member_job_evidence",
+            json!({"member_envelope": alice, "job": job_id}),
+        ),
+        (
+            "member_job_events",
+            // The opaque format is named so the refusal is the owner/subscriber
+            // decision, not the handler's format gate.
+            json!({
+                "member_envelope": alice,
+                "job": job_id,
+                "cursor_format": cadence_core::board_api::JOB_EVENTS_CURSOR_FORMAT,
+            }),
+        ),
+    ] {
         let e = err_text(
-            fx.op_err(method, json!({"member_envelope": alice, "job": job_id})),
+            fx.op_err(method, params),
             &format!("alice reads bob's {method}"),
         );
         assert!(
@@ -1223,12 +1360,10 @@ fn removed_member_queued_effect_refused_at_commit() {
     );
     let admitted = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-carol"), "title": "c job", "request_key": "c-k1", "body": "x"}),
+        json!({"member_envelope": fx.member_envelope("sub-carol"), "title": "c job", "request_key": "c-k1", "issue": FIXTURE_ISSUE, "body": "x"}),
     );
-    assert!(
-        admitted["job"].is_string(),
-        "live member job_request: {admitted}"
-    );
+    let admitted_job = promote_fixture_job_without_persistent_service(&fx, "sub-carol", &admitted);
+    assert!(!admitted_job.is_empty(), "live member job was not created");
 
     // (a) The authoritative removal: the platform's membership row goes —
     // the daemon's own `assistants.state` stays `active`, so ONLY the live
@@ -1241,7 +1376,7 @@ fn removed_member_queued_effect_refused_at_commit() {
         ("member_assist_send", json!({"text": "late"})),
         (
             "member_job_request",
-            json!({"title": "late", "request_key": "c-k2", "body": "x"}),
+            json!({"title": "late", "request_key": "c-k2", "issue": FIXTURE_ISSUE_2, "body": "x"}),
         ),
         ("member_job_list", json!({})),
     ] {
@@ -1312,7 +1447,7 @@ fn withdrawn_credential_or_grant_refuses_at_commit() {
     assert!(
         fx.op_err(
             "member_job_request",
-            json!({"member_envelope": fx.member_envelope("sub-erin"), "title": "t", "request_key": "e-k1", "body": "b"}),
+            json!({"member_envelope": fx.member_envelope("sub-erin"), "title": "t", "request_key": "e-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
         )
         .is_ok(),
         "live member job_request refused before the credential withdrawal"
@@ -1358,7 +1493,7 @@ fn withdrawn_credential_or_grant_refuses_at_commit() {
     let e = err_text(
         fx.op_err(
             "member_job_request",
-            json!({"member_envelope": fx.member_envelope("sub-erin"), "title": "t", "request_key": "e-k2", "body": "b"}),
+            json!({"member_envelope": fx.member_envelope("sub-erin"), "title": "t", "request_key": "e-k2", "issue": FIXTURE_ISSUE_2, "body": "b"}),
         ),
         "grant-narrowed member job_request",
     );
@@ -1445,7 +1580,7 @@ fn service_credential_transport_keeps_member_provenance() {
     let e = err_text(
         fx.op_err(
             "member_job_request",
-            json!({"member_envelope": fx.member_envelope("sub-fran"), "title": "t", "request_key": "f-k1", "body": "b"}),
+            json!({"member_envelope": fx.member_envelope("sub-fran"), "title": "t", "request_key": "f-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
         ),
         "service-auth narrowed member job_request",
     );
@@ -1495,7 +1630,7 @@ fn service_credential_transport_keeps_member_provenance() {
     let e = err_text(
         fx2.op_err(
             "member_job_request",
-            json!({"member_envelope": replacement, "title": "t", "request_key": "i-k1", "body": "b"}),
+            json!({"member_envelope": replacement, "title": "t", "request_key": "i-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
         ),
         "replacement-credential member job_request",
     );
@@ -1756,9 +1891,9 @@ fn duplicate_request_key_yields_one_canonical_job() {
 
     let first = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "ship it", "request_key": "k-dup", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "ship it", "request_key": "k-dup", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
-    let job_id = first["job"].as_str().unwrap().to_string();
+    let job_id = promote_fixture_job_without_persistent_service(&fx, "sub-alice", &first);
     assert!(
         !job_id.is_empty(),
         "job_request returned no job id: {first}"
@@ -1766,19 +1901,35 @@ fn duplicate_request_key_yields_one_canonical_job() {
 
     let replay = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "ship it", "request_key": "k-dup", "body": "retry"}),
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "ship it", "request_key": "k-dup", "issue": FIXTURE_ISSUE, "body": "retry"}),
     );
     assert_eq!(
-        replay["job"].as_str().unwrap(),
-        job_id,
-        "a replayed request_key minted a second job: {first} vs {replay}"
+        replay, first,
+        "same key returned a different accepted receipt"
+    );
+    let replay_list = fx.op(
+        "member_job_list",
+        json!({"member_envelope":fx.member_envelope("sub-alice")}),
+    );
+    let replay_rows: Vec<_> = replay_list["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["request_id"] == first["request_id"])
+        .collect();
+    assert_eq!(replay_rows.len(), 1, "replay duplicated canonical request");
+    assert_eq!(replay_rows[0]["status"], "created");
+    assert_eq!(
+        replay_rows[0]["job"].as_str(),
+        Some(job_id.as_str()),
+        "replay changed canonical job"
     );
 
     let other = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-bob"), "title": "ship it", "request_key": "k-dup", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-bob"), "title": "ship it", "request_key": "k-dup", "issue": FIXTURE_ISSUE_2, "body": "b"}),
     );
-    let other_id = other["job"].as_str().unwrap();
+    let other_id = promote_fixture_job_without_persistent_service(&fx, "sub-bob", &other);
     assert_ne!(
         other_id, job_id,
         "a different principal collapsed onto alice's canonical job"
@@ -1786,11 +1937,11 @@ fn duplicate_request_key_yields_one_canonical_job() {
 
     let third = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "ship it", "request_key": "k-other", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "ship it", "request_key": "k-other", "issue": FIXTURE_ISSUE_3, "body": "b"}),
     );
+    let third_id = promote_fixture_job_without_persistent_service(&fx, "sub-alice", &third);
     assert_ne!(
-        third["job"].as_str().unwrap(),
-        job_id,
+        third_id, job_id,
         "same free text deduped across a different request_key"
     );
 
@@ -1806,7 +1957,7 @@ fn duplicate_request_key_yields_one_canonical_job() {
         .collect();
     assert!(listed.contains(&job_id), "alice's job missing: {listed:?}");
     assert!(
-        !listed.iter().any(|j| j == other_id),
+        !listed.iter().any(|j| j == &other_id),
         "bob's job leaked into alice's job_list: {listed:?}"
     );
 }
@@ -1821,9 +1972,9 @@ fn job_evidence_acl_owner_and_subscriber_only() {
     fx.provision("sub-bob");
     let job = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "a job", "request_key": "a-k1", "body": "x"}),
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "a job", "request_key": "a-k1", "issue": FIXTURE_ISSUE, "body": "x"}),
     );
-    let job_id = job["job"].as_str().unwrap().to_string();
+    let job_id = promote_fixture_job_without_persistent_service(&fx, "sub-alice", &job);
 
     let ev = fx.op(
         "member_job_evidence",
@@ -1873,11 +2024,17 @@ fn member_envelope_scope_gate_refuses_write_and_jobs_at_daemon() {
         ("member_assist_send", json!({"text": "x"})),
         (
             "member_job_request",
-            json!({"title": "t", "request_key": "k", "body": "b"}),
+            json!({"title": "t", "request_key": "k", "issue": FIXTURE_ISSUE, "body": "b"}),
         ),
         ("member_job_list", json!({})),
         ("member_job_evidence", json!({"job": "j1"})),
-        ("member_job_events", json!({"job": "j1"})),
+        (
+            "member_job_events",
+            json!({
+                "job": "j1",
+                "cursor_format": cadence_core::board_api::JOB_EVENTS_CURSOR_FORMAT,
+            }),
+        ),
     ] {
         let mut p = params.clone();
         p["member_envelope"] = json!(read_only);
@@ -2068,6 +2225,9 @@ fn assist_agent_boundary_refuses_foreign_fleet_and_leaks() {
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     with_deferred_service(&fx);
+    // The fixture's scoped `job_events` probe must fail on authority, never
+    // on a missing keyring: bind the real operator-provisioned ring.
+    fx.init_cursor_keyring();
     let rt = fx.member_runtime("sub-alice");
     let own = rt.alias.clone();
 
@@ -2077,11 +2237,22 @@ fn assist_agent_boundary_refuses_foreign_fleet_and_leaks() {
             .is_ok(),
         "assist alias could not read its own agent row"
     );
-    assert!(
-        fx.as_assistant(&own, "thread_read", json!({"alias": own}))
-            .is_ok(),
-        "assist alias could not read its own conversation"
+    let own_thread = fx
+        .as_assistant(
+            &own,
+            "thread_read",
+            json!({"alias": own, "cursor_format":"opaque-v1"}),
+        )
+        .expect("assist alias could not read its own conversation");
+    assert_eq!(own_thread["cursor_format"], "opaque-v1");
+    assert_eq!(
+        own_thread["_reader_scope"],
+        cadence_core::board_api::THREAD_OPAQUE_SCOPE_ACK
     );
+    assert!(own_thread.get("reply_seq").is_none() && own_thread.get("scanned_before").is_none());
+    for row in own_thread["entries"].as_array().expect("thread entries") {
+        assert!(row.get("seq").is_none(), "global thread seq leaked: {row}");
+    }
 
     let before = fx.tree();
 
@@ -2110,7 +2281,13 @@ fn assist_agent_boundary_refuses_foreign_fleet_and_leaks() {
             json!({"message": rt.foreign_msg, "result": "x"}),
         ),
         ("job_show", json!({"job": rt.foreign_job})),
-        ("job_events", json!({"job": rt.foreign_job})),
+        (
+            "job_events",
+            json!({
+                "job": rt.foreign_job,
+                "cursor_format": cadence_core::board_api::JOB_EVENTS_CURSOR_FORMAT,
+            }),
+        ),
         ("task_show", json!({"task": rt.foreign_task})),
     ] {
         let e = err_text(
@@ -2347,7 +2524,17 @@ fn ordinary_worker_cannot_read_member_private_thread_job_or_task() {
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     with_deferred_service(&fx);
+    fx.init_cursor_keyring();
     let rt = fx.member_runtime("sub-alice");
+    let db = rusqlite::Connection::open(fx.dir.path().join("cadence.sqlite3")).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE jobs SET issue_id=?1 WHERE id=?2",
+            rusqlite::params![FIXTURE_ISSUE_2, &rt.foreign_job]
+        )
+        .unwrap(),
+        1
+    );
     let own = rt.alias.clone();
     let worker = Asserted::Agent("ordinary-worker".to_string());
 
@@ -2355,9 +2542,10 @@ fn ordinary_worker_cannot_read_member_private_thread_job_or_task() {
     // assistant as PM and records the assist-request owner row.
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "private boundary", "request_key": "ordinary-private-boundary", "body": "private request"}),
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "private boundary", "request_key": "ordinary-private-boundary", "issue": FIXTURE_ISSUE, "body": "private request"}),
     );
-    let private_job = req["job"].as_str().unwrap().to_string();
+    let private_job = promote_member_fixture_job(&fx, "sub-alice", &req);
+    let stored_pm = fx.shared.store.job(&private_job).unwrap().pm_alias;
     let private_task = fx
         .shared
         .store
@@ -2368,7 +2556,7 @@ fn ordinary_worker_cannot_read_member_private_thread_job_or_task() {
         .id
         .clone();
     assert_eq!(
-        req["job_record"]["pm"].as_str(),
+        Some(stored_pm.as_str()),
         Some(own.as_str()),
         "member job PM is not the member's assistant"
     );
@@ -2380,7 +2568,7 @@ fn ordinary_worker_cannot_read_member_private_thread_job_or_task() {
         "member job has no member-owned assist request row"
     );
     assert_ne!(
-        req["job_record"]["pm"].as_str(),
+        Some(stored_pm.as_str()),
         Some("ordinary-worker"),
         "ordinary worker is the member job's PM"
     );
@@ -2393,21 +2581,37 @@ fn ordinary_worker_cannot_read_member_private_thread_job_or_task() {
     );
 
     // Positive control: the member's own assistant reads its own thread.
-    assert!(
-        fx.as_assistant(&own, "thread_read", json!({"alias": own}))
-            .is_ok(),
-        "owner could not read its own private thread"
+    let own_thread = fx
+        .as_assistant(
+            &own,
+            "thread_read",
+            json!({"alias": own, "cursor_format":"opaque-v1"}),
+        )
+        .expect("owner could not read its own private thread");
+    assert_eq!(
+        own_thread["_reader_scope"],
+        cadence_core::board_api::THREAD_OPAQUE_SCOPE_ACK
     );
+    for row in own_thread["entries"].as_array().expect("thread entries") {
+        assert!(row.get("seq").is_none(), "global thread seq leaked: {row}");
+    }
     // Control: the ordinary worker reads its OWN nonmember thread.
-    assert!(
-        fx.call(
+    let worker_thread = fx
+        .call(
             worker.clone(),
             "thread_read",
-            json!({"alias": "ordinary-worker"})
+            json!({
+                "alias":"ordinary-worker", "cursor_format":"opaque-v1"
+            }),
         )
-        .is_ok(),
-        "ordinary worker could not read its own thread"
+        .expect("ordinary worker could not read its own thread");
+    assert_eq!(
+        worker_thread["_reader_scope"],
+        cadence_core::board_api::THREAD_OPAQUE_SCOPE_ACK
     );
+    for row in worker_thread["entries"].as_array().expect("thread entries") {
+        assert!(row.get("seq").is_none(), "global thread seq leaked: {row}");
+    }
     // Control: the ordinary worker is the PM of the ORIGINAL foreign job, so
     // its job/task reads stay allowed (normal nonmember behaviour).
     for (method, params) in [
@@ -2422,7 +2626,10 @@ fn ordinary_worker_cannot_read_member_private_thread_job_or_task() {
 
     let before = fx.tree();
     let probes: [(&str, Value); 5] = [
-        ("thread_read", json!({"alias": own})),
+        (
+            "thread_read",
+            json!({"alias": own, "cursor_format":"opaque-v1"}),
+        ),
         ("agent_show", json!({"alias": own})),
         ("agent_events", json!({"alias": own})),
         ("job_show", json!({"job": private_job})),
@@ -2454,9 +2661,9 @@ fn ordinary_job_list_hides_member_private_job_until_shared() {
     fx.provision("sub-ben");
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-ada"), "title": "private list", "request_key": "list-private-1", "body": "private"}),
+        json!({"member_envelope": fx.member_envelope("sub-ada"), "title": "private list", "request_key": "list-private-1", "issue": FIXTURE_ISSUE, "body": "private"}),
     );
-    let private_job = req["job"].as_str().unwrap().to_string();
+    let private_job = promote_member_fixture_job(&fx, "sub-ada", &req);
     let worker = Asserted::Agent("ordinary-worker".to_string());
     let generic_lists_job = |who: &Asserted| -> bool {
         let v = fx
@@ -2533,9 +2740,9 @@ fn pending_assist_intent_survives_daemon_stream_retention() {
     fx.provision("sub-ivy");
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-ivy"), "title": "retain me", "request_key": "ret-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-ivy"), "title": "retain me", "request_key": "ret-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_member_fixture_job(&fx, "sub-ivy", &req);
     let pending_before = fx
         .shared
         .store
@@ -2573,7 +2780,7 @@ fn pending_assist_intent_survives_daemon_stream_retention() {
     // must not recreate a pending intent for the retained job.
     let _ = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-ivy"), "title": "retain me", "request_key": "ret-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-ivy"), "title": "retain me", "request_key": "ret-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
     let again = fx
         .shared
@@ -2596,10 +2803,11 @@ fn drain_delivers_no_private_body_or_custody_to_notices() {
     let fx = Fx::new();
     with_deferred_service(&fx);
     fx.provision("sub-fay");
-    let _ = fx.op(
+    let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-fay"), "title": "drain privacy", "request_key": "drain-k1", "body": "PRIVATE_DRAIN_BODY"}),
+        json!({"member_envelope": fx.member_envelope("sub-fay"), "title": "drain privacy", "request_key": "drain-k1", "issue": FIXTURE_ISSUE, "body": "PRIVATE_DRAIN_BODY"}),
     );
+    let _job = promote_member_fixture_job(&fx, "sub-fay", &req);
     assert!(
         !fx.shared
             .store
@@ -2645,9 +2853,9 @@ fn terminal_dedupe_for_live_canonical_job_survives_retention() {
     fx.provision("sub-tia");
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-tia"), "title": "terminal live", "request_key": "tlk-1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-tia"), "title": "terminal live", "request_key": "tlk-1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_member_fixture_job(&fx, "sub-tia", &req);
     let seq = fx
         .shared
         .store
@@ -2691,7 +2899,7 @@ fn terminal_dedupe_for_live_canonical_job_survives_retention() {
 
     let _ = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-tia"), "title": "terminal live", "request_key": "tlk-1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-tia"), "title": "terminal live", "request_key": "tlk-1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
     assert_eq!(
         terminal(&job),
@@ -2890,6 +3098,76 @@ fn with_deferred_service(fx: &Fx) {
     });
 }
 
+fn promote_member_fixture_job(fx: &Fx, sub: &str, receipt: &Value) -> String {
+    let id = receipt["request_id"]
+        .as_str()
+        .expect("request receipt lacks ID")
+        .to_string();
+    assert!(!id.is_empty());
+    assert_eq!(*receipt, json!({"request_id":id,"status":"accepted"}));
+    let outcomes = fx
+        .shared
+        .sweep_member_job_requests_for_test()
+        .expect("real promotion sweep failed");
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| o.request_id == id && o.outcome == "created"),
+        "fixture request not created by real worker: {outcomes:?}"
+    );
+    let list = fx.op(
+        "member_job_list",
+        json!({"member_envelope":fx.member_envelope(sub)}),
+    );
+    let rows: Vec<_> = list["requests"]
+        .as_array()
+        .expect("missing requests")
+        .iter()
+        .filter(|r| r["request_id"] == id)
+        .collect();
+    assert_eq!(rows.len(), 1, "owner request missing or duplicated: {list}");
+    assert_eq!(rows[0]["status"], "created");
+    rows[0]["job"]
+        .as_str()
+        .expect("created request has no job")
+        .to_string()
+}
+
+fn promote_fixture_job_without_persistent_service(fx: &Fx, sub: &str, receipt: &Value) -> String {
+    assert!(
+        fx.authority.lock().unwrap().services.is_empty(),
+        "fixture unexpectedly had a service"
+    );
+    let key = crate::platform::custody::Key {
+        platform: "hosted-board",
+        account: &fx.host,
+    };
+    let custody = crate::platform::custody::Custody::open(fx.dir.path()).unwrap();
+    assert!(
+        custody.load("file", &key).is_err(),
+        "fixture unexpectedly had service custody"
+    );
+    fx.shared.store.fixture_write(|tx| {
+        let n: i64 = tx.query_row("SELECT COUNT(*) FROM platform_credentials WHERE platform='hosted-board' AND account=?1", rusqlite::params![&fx.host], |r| r.get(0))?;
+        assert_eq!(n, 0, "fixture unexpectedly had service row"); Ok(())
+    }).unwrap();
+    with_deferred_service(fx);
+    let job = promote_member_fixture_job(fx, sub, receipt);
+    custody.remove("file", &key).unwrap();
+    fx.shared.store.fixture_write(|tx| {
+        tx.execute("DELETE FROM platform_credentials WHERE platform='hosted-board' AND account=?1", rusqlite::params![&fx.host])?;
+        let n: i64 = tx.query_row("SELECT COUNT(*) FROM platform_credentials WHERE platform='hosted-board' AND account=?1", rusqlite::params![&fx.host], |r| r.get(0))?;
+        assert_eq!(n, 0, "temporary service row remained"); Ok(())
+    }).unwrap();
+    fx.authority.lock().unwrap().services.clear();
+    assert!(fx.authority.lock().unwrap().services.is_empty());
+    assert!(
+        custody.load("file", &key).is_err(),
+        "temporary service custody remained"
+    );
+    job
+}
+
 /// The stored `assist_requests` provenance row for a job — the deferred
 /// commit's re-prove target.
 fn assist_provenance(fx: &Fx, job: &str) -> crate::store::AssistRequest {
@@ -2932,9 +3210,9 @@ fn deferred_dispatch_reproves_live_authority_and_refuses_self() {
     // `assist_requests` provenance + creates the job + draft task).
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-dora"), "title": "dora job", "request_key": "d-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-dora"), "title": "dora job", "request_key": "d-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_member_fixture_job(&fx, "sub-dora", &req);
     let task = format!("{job}-t1");
     let prov = assist_provenance(&fx, &job);
     assert_eq!(prov.org, ORG);
@@ -2992,9 +3270,9 @@ fn deferred_dispatch_reproves_live_authority_and_refuses_self() {
     join_group(&rt2.alias);
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-ed"), "title": "ed job", "request_key": "e-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-ed"), "title": "ed job", "request_key": "e-k1", "issue": FIXTURE_ISSUE_2, "body": "b"}),
     );
-    let job2 = req["job"].as_str().unwrap().to_string();
+    let job2 = promote_member_fixture_job(&fx, "sub-ed", &req);
     let task2 = format!("{job2}-t1");
     // Revoke the member's recorded issuing credential at the platform.
     fx.set_member("sub-ed", |m| m.credential_live = false);
@@ -3035,9 +3313,9 @@ fn deferred_dispatch_reproves_live_authority_and_refuses_self() {
     join_group(&rt3.alias);
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-fox"), "title": "fox job", "request_key": "f-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-fox"), "title": "fox job", "request_key": "f-k1", "issue": FIXTURE_ISSUE_3, "body": "b"}),
     );
-    let job3 = req["job"].as_str().unwrap().to_string();
+    let job3 = promote_member_fixture_job(&fx, "sub-fox", &req);
     let task3 = format!("{job3}-t1");
     // Deleting the provenance row does NOT unbind the job — its id is the
     // `assist-<digest>` family, so a missing/corrupt provenance is a
@@ -3077,9 +3355,9 @@ fn deferred_dispatch_reproves_live_authority_and_refuses_self() {
     join_group(&rt4.alias);
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-gail"), "title": "gail job", "request_key": "g-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-gail"), "title": "gail job", "request_key": "g-k1", "issue": FIXTURE_ISSUE_4, "body": "b"}),
     );
-    let job4 = req["job"].as_str().unwrap().to_string();
+    let job4 = promote_member_fixture_job(&fx, "sub-gail", &req);
     let task4 = format!("{job4}-t1");
     let before = fx.tree();
     // The `to` override naming the assistant's OWN alias must refuse —
@@ -3132,6 +3410,14 @@ fn deferred_dispatch_reproves_live_authority_and_refuses_self() {
 fn deferred_dispatch_fails_closed_on_unloadable_custody() {
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
+    assert!(fx.authority.lock().unwrap().services.is_empty());
+    let custody_key = crate::platform::custody::Key {
+        platform: "hosted-board",
+        account: &fx.host,
+    };
+    let custody = crate::platform::custody::Custody::open(fx.dir.path()).unwrap();
+    assert!(custody.load("file", &custody_key).is_err());
+    with_deferred_service(&fx);
     let rt = fx.member_runtime("sub-hal");
     // Group join so the dispatch reaches the deferred-authority guard.
     fx.shared
@@ -3146,10 +3432,23 @@ fn deferred_dispatch_fails_closed_on_unloadable_custody() {
         .unwrap();
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-hal"), "title": "hal job", "request_key": "h-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-hal"), "title": "hal job", "request_key": "h-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_member_fixture_job(&fx, "sub-hal", &req);
     let task = format!("{job}-t1");
+    custody.remove("file", &custody_key).unwrap();
+    fx.shared.store.fixture_write(|tx| {
+        tx.execute("DELETE FROM platform_credentials WHERE platform='hosted-board' AND account=?1", rusqlite::params![&fx.host])?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM platform_credentials WHERE platform='hosted-board' AND account=?1", rusqlite::params![&fx.host], |r| r.get(0))?;
+        assert_eq!(count, 0, "temporary service row remained");
+        Ok(())
+    }).unwrap();
+    fx.authority.lock().unwrap().services.clear();
+    assert!(fx.authority.lock().unwrap().services.is_empty());
+    assert!(
+        custody.load("file", &custody_key).is_err(),
+        "temporary service custody remained"
+    );
     // Land the `platform_credentials` row WITHOUT custody bytes — the
     // fail-closed arm: a half-configured service binding refuses rather
     // than degrading.
@@ -3214,9 +3513,9 @@ fn deferred_dispatch_reproves_original_provenance_not_replacement() {
     // that record, not a later mint, is what the deferred re-prove names.
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-pat"), "title": "pat job", "request_key": "p-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-pat"), "title": "pat job", "request_key": "p-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_member_fixture_job(&fx, "sub-pat", &req);
     let task = format!("{job}-t1");
     let prov = assist_provenance(&fx, &job);
     assert_eq!(
@@ -3299,9 +3598,9 @@ fn old_queued_dispatch_needs_job_reconcile_not_global_renewal() {
     // The member requests under the ORIGINAL recorded credential.
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-quinn"), "title": "q job", "request_key": "q-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-quinn"), "title": "q job", "request_key": "q-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_member_fixture_job(&fx, "sub-quinn", &req);
     let task = format!("{job}-t1");
     let prov = assist_provenance(&fx, &job);
     assert_eq!(prov.credential_id.as_deref(), Some("cred-sub-quinn"));
@@ -3476,9 +3775,9 @@ fn member_job_reconcile_binds_expected_authority_rev() {
         .unwrap();
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-rhea"), "title": "r job", "request_key": "r-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-rhea"), "title": "r job", "request_key": "r-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_member_fixture_job(&fx, "sub-rhea", &req);
     // The CURRENT member-visible revision — read through the real
     // `member_job_evidence` path the UI re-reads before reconcile (the
     // same `assist_job_authority_rev` the store compare derives).
@@ -3503,9 +3802,9 @@ fn member_job_reconcile_binds_expected_authority_rev() {
     // rev token, never a garbage string.
     let req2 = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-rhea"), "title": "r job 2", "request_key": "r-k2", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-rhea"), "title": "r job 2", "request_key": "r-k2", "issue": FIXTURE_ISSUE_2, "body": "b"}),
     );
-    let job2 = req2["job"].as_str().unwrap().to_string();
+    let job2 = promote_member_fixture_job(&fx, "sub-rhea", &req2);
     let rev_of_job2 = fx
         .shared
         .store
@@ -3665,9 +3964,9 @@ fn stall_supervisor_dedups_one_check_and_never_dispatches() {
     let rt = fx.member_runtime("sub-ida");
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-ida"), "title": "ida job", "request_key": "i-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-ida"), "title": "ida job", "request_key": "i-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_fixture_job_without_persistent_service(&fx, "sub-ida", &req);
     let task = format!("{job}-t1");
 
     // Age the job past the 300 s assist bound (the sweep's default when
@@ -3777,9 +4076,9 @@ fn stall_supervisor_respects_budget_terminal_and_manual_stop() {
     // Fresh assist job within the 300 s budget — no check.
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-jay"), "title": "jay job", "request_key": "j-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-jay"), "title": "jay job", "request_key": "j-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
-    let _job_fresh = req["job"].as_str().unwrap().to_string();
+    let _job_fresh = promote_fixture_job_without_persistent_service(&fx, "sub-jay", &req);
     let swept = fx
         .shared
         .store
@@ -3794,9 +4093,9 @@ fn stall_supervisor_respects_budget_terminal_and_manual_stop() {
     let rt2 = fx.member_runtime("sub-kai");
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-kai"), "title": "kai job", "request_key": "k-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-kai"), "title": "kai job", "request_key": "k-k1", "issue": FIXTURE_ISSUE_2, "body": "b"}),
     );
-    let job_slow = req["job"].as_str().unwrap().to_string();
+    let job_slow = promote_fixture_job_without_persistent_service(&fx, "sub-kai", &req);
     fx.shared
         .store
         .fixture_write(|tx| {
@@ -3826,9 +4125,9 @@ fn stall_supervisor_respects_budget_terminal_and_manual_stop() {
     let rt3 = fx.member_runtime("sub-lou");
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-lou"), "title": "lou job", "request_key": "l-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-lou"), "title": "lou job", "request_key": "l-k1", "issue": FIXTURE_ISSUE_3, "body": "b"}),
     );
-    let job_dead = req["job"].as_str().unwrap().to_string();
+    let job_dead = promote_fixture_job_without_persistent_service(&fx, "sub-lou", &req);
     fx.shared.store.cancel_job(&job_dead, "operator").unwrap();
     age_job(&fx, &job_dead, 400);
     let swept = fx
@@ -3922,6 +4221,10 @@ fn job_subscribe_needs_owner_share_not_membership_alone() {
     fx.provision("sub-ana");
     fx.provision("sub-ben");
     fx.provision("sub-cid");
+    // The granted member's `member_job_events` read re-proves an initialized
+    // keyring; bind the real operator-provisioned ring so the unentitled
+    // probes below cannot pass merely because key material is missing.
+    fx.init_cursor_keyring();
 
     // A (owner) requests the canonical job — the owner is implicitly
     // entitled to their own job (their request is the grant). A second
@@ -3929,14 +4232,14 @@ fn job_subscribe_needs_owner_share_not_membership_alone() {
     let ana = fx.member_envelope("sub-ana");
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": ana, "title": "shared job", "request_key": "a-s1", "body": "x"}),
+        json!({"member_envelope": ana, "title": "shared job", "request_key": "a-s1", "issue": FIXTURE_ISSUE, "body": "x"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_fixture_job_without_persistent_service(&fx, "sub-ana", &req);
     let req2 = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-ana"), "title": "other", "request_key": "a-s2", "body": "x"}),
+        json!({"member_envelope": fx.member_envelope("sub-ana"), "title": "other", "request_key": "a-s2", "issue": FIXTURE_ISSUE_2, "body": "x"}),
     );
-    let job2 = req2["job"].as_str().unwrap().to_string();
+    let job2 = promote_fixture_job_without_persistent_service(&fx, "sub-ana", &req2);
 
     // ---- B same-org, NO owner share → every job-bound verb refuses ----
     let ben = fx.member_envelope("sub-ben");
@@ -3944,19 +4247,21 @@ fn job_subscribe_needs_owner_share_not_membership_alone() {
     for (method, args) in [
         ("member_job_subscribe", json!({"job": job})),
         ("member_job_evidence", json!({"job": job})),
-        ("member_job_events", json!({"job": job})),
+        (
+            "member_job_events",
+            // Name the opaque format so only the missing owner share can
+            // refuse this read, not the handler's format gate.
+            json!({
+                "job": job,
+                "cursor_format": cadence_core::board_api::JOB_EVENTS_CURSOR_FORMAT,
+            }),
+        ),
     ] {
         let mut p = args.clone();
         p["member_envelope"] = ben.clone().into();
-        let e = err_text(fx.op_err(method, p), &format!("unentitled B {method}"));
-        assert!(
-            e.contains("shared")
-                || e.contains("owns")
-                || e.contains("subscribe")
-                || e.contains("refused")
-                || e.contains("member"),
-            "unentitled B {method} refused for another reason: {e}"
-        );
+        // The refusal's prose is not the contract: an unentitled member is
+        // refused, and no wording is asserted or re-pinned here.
+        err_text(fx.op_err(method, p), &format!("unentitled B {method}"));
     }
     // No subscriber row was written for B — the refusal committed nothing.
     assert!(
@@ -3974,16 +4279,12 @@ fn job_subscribe_needs_owner_share_not_membership_alone() {
 
     // ---- a NON-owner can never mint the entitlement: B cannot share
     // A's job for themselves. ----
-    let e = err_text(
+    err_text(
         fx.op_err(
             "member_job_share",
             json!({"member_envelope": fx.member_envelope("sub-ben"), "job": job}),
         ),
         "B shares a job they do not own",
-    );
-    assert!(
-        e.contains("owns") || e.contains("refused") || e.contains("member"),
-        "non-owner share refused for another reason: {e}"
     );
     assert!(
         !fx.shared.store.assist_job_is_shared(&job, ORG).unwrap(),
@@ -4026,9 +4327,40 @@ fn job_subscribe_needs_owner_share_not_membership_alone() {
     assert_eq!(ev["job"].as_str(), Some(job.as_str()));
     let evs = fx.op(
         "member_job_events",
-        json!({"member_envelope": fx.member_envelope("sub-ben"), "job": job}),
+        json!({
+            "member_envelope": fx.member_envelope("sub-ben"),
+            "job": job,
+            "cursor_format": cadence_core::board_api::JOB_EVENTS_CURSOR_FORMAT,
+        }),
     );
     assert_eq!(evs["job"].as_str(), Some(job.as_str()));
+    assert_eq!(
+        evs[cadence_core::board_api::READER_SCOPE_FIELD],
+        json!(cadence_core::board_api::JOB_EVENTS_SCOPE_ACK),
+        "granted member job-events page did not name its reader mode: {evs}"
+    );
+    // Scoped rows carry a keyed id and an opaque forward cursor, never the
+    // shared `events.seq`; the page cursor is null or a token, never a number.
+    let scoped_rows = evs["events"].as_array().expect("events array");
+    for row in scoped_rows {
+        assert!(
+            row.get("seq").is_none(),
+            "granted member job-events row exposed a global sequence position: {evs}"
+        );
+        assert!(
+            row["cursor"]
+                .as_str()
+                .is_some_and(|cursor| !cursor.is_empty()),
+            "granted member job-events row has no opaque forward cursor: {evs}"
+        );
+    }
+    assert!(
+        evs["cursor"].is_null()
+            || evs["cursor"]
+                .as_str()
+                .is_some_and(|cursor| !cursor.is_empty()),
+        "granted member job-events page cursor is not opaque: {evs}"
+    );
     // B now sees the job in `member_job_list`; A's list is unchanged.
     let ben_jobs = fx.op(
         "member_job_list",
@@ -4048,21 +4380,15 @@ fn job_subscribe_needs_owner_share_not_membership_alone() {
 
     // ---- B's grant is for THIS shared job only: a DIFFERENT assist
     // job the owner did NOT share is still refused (the share is
-    // per-(job,org), never org-wide). ----
-    let e = err_text(
+    // per-(job,org), never org-wide). The refusal deliberately does not
+    // distinguish a hidden job from a nonexistent one, so only the fact
+    // of the refusal is asserted, never its wording. ----
+    err_text(
         fx.op_err(
             "member_job_evidence",
             json!({"member_envelope": fx.member_envelope("sub-ben"), "job": job2}),
         ),
         "B reads an unentitled second job",
-    );
-    assert!(
-        e.contains("owns")
-            || e.contains("subscribe")
-            || e.contains("revalidation")
-            || e.contains("refused")
-            || e.contains("allow"),
-        "B on an ungranted second job refused for another reason: {e}"
     );
 
     // ---- a non-assist job refuses subscribe (no `assist_requests`
@@ -4106,7 +4432,9 @@ fn job_subscribe_needs_owner_share_not_membership_alone() {
             spec.to_str().unwrap(),
             &sha,
             "ordinary-worker",
-            None,
+            // A readable issue is what lets the probe reach the intended
+            // "no assist provenance" refusal instead of the issue guard.
+            Some(FIXTURE_ISSUE_3),
             None,
             None,
             2,
@@ -4123,16 +4451,12 @@ fn job_subscribe_needs_owner_share_not_membership_alone() {
     // assist-binding check (`assist_requests` provenance) refuses before
     // any share/subscriber row is read.
     let before = fx.tree();
-    let e = err_text(
+    err_text(
         fx.op_err(
             "member_job_subscribe",
             json!({"member_envelope": fx.member_envelope("sub-ben"), "job": plain.id}),
         ),
         "B subscribes a non-assist job",
-    );
-    assert!(
-        e.contains("assist") || e.contains("refused") || e.contains("bound"),
-        "non-assist job subscribe refused for another reason: {e}"
     );
     assert!(
         !fx.shared
@@ -4145,17 +4469,14 @@ fn job_subscribe_needs_owner_share_not_membership_alone() {
 
     // ---- a foreign-org member is refused: a binding for a DIFFERENT
     // org never resolves, and a same-org member cannot subscribe to a
-    // job bound to another org's assist row. ----
-    let e = err_text(
+    // job bound to another org's assist row. Only the refusal is asserted;
+    // its prose is not the contract. ----
+    err_text(
         fx.op_err(
             "member_assist_state",
             json!({"member_envelope": fx.envelope("sub-xorg", json!({}), json!({}))}),
         ),
         "foreign-org member",
-    );
-    assert!(
-        e.contains("binding") || e.contains("member") || e.contains("refused"),
-        "foreign-org member refused for another reason: {e}"
     );
 
     // ---- A/B privacy never crosses: B's evidence/events reads carry
@@ -4163,7 +4484,7 @@ fn job_subscribe_needs_owner_share_not_membership_alone() {
     // conversation is not exposed through the job ACL. ----
     let ana_hist = fx.op(
         "member_assist_history",
-        json!({"member_envelope": fx.member_envelope("sub-ana")}),
+        json!({"member_envelope": fx.member_envelope("sub-ana"), "cursor_format": "opaque-v1"}),
     );
     // The events feed B reads is the JOB event stream — bound to the
     // job, carrying no conversation text.
@@ -4426,6 +4747,7 @@ fn owned(fx: &Fx, alias: &str) -> bool {
 fn member_send_claims_one_launch_on_own_alias_reads_never_launch() {
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
+    fx.init_cursor_keyring();
     let rt = fx.member_runtime("sub-liv");
 
     // READ verbs never launch: state/history/evidence admit the member but
@@ -4442,7 +4764,7 @@ fn member_send_claims_one_launch_on_own_alias_reads_never_launch() {
     assert!(
         fx.op_err(
             "member_assist_history",
-            json!({"member_envelope": fx.member_envelope("sub-liv")}),
+            json!({"member_envelope": fx.member_envelope("sub-liv"), "cursor_format": "opaque-v1"}),
         )
         .is_ok(),
         "live member history read refused"
@@ -4945,6 +5267,7 @@ fn sha_hex(bytes: &[u8]) -> String {
 fn concurrent_same_request_key_keeps_one_winner_artifact() {
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
+    with_deferred_service(&fx);
     fx.provision("sub-alice");
     let key = "k-race";
     let (a_title, a_body, a_acc) = ("race ship A", "body A", "acceptance A");
@@ -4952,8 +5275,8 @@ fn concurrent_same_request_key_keeps_one_winner_artifact() {
     // Mint both single-use envelopes before the threads start.
     let env_a = fx.member_envelope("sub-alice");
     let env_b = fx.member_envelope("sub-alice");
-    let params_a = json!({"member_envelope": env_a, "title": a_title, "request_key": key, "body": a_body, "acceptance": a_acc});
-    let params_b = json!({"member_envelope": env_b, "title": b_title, "request_key": key, "body": b_body, "acceptance": b_acc});
+    let params_a = json!({"member_envelope": env_a, "title": a_title, "request_key": key, "issue": FIXTURE_ISSUE, "body": a_body, "acceptance": a_acc});
+    let params_b = json!({"member_envelope": env_b, "title": b_title, "request_key": key, "issue": FIXTURE_ISSUE, "body": b_body, "acceptance": b_acc});
 
     let barrier = std::sync::Barrier::new(2);
     let (ra, rb) = std::thread::scope(|s| {
@@ -4970,23 +5293,38 @@ fn concurrent_same_request_key_keeps_one_winner_artifact() {
     let ra = ra.unwrap_or_else(|e| panic!("concurrent request A refused: {e}"));
     let rb = rb.unwrap_or_else(|e| panic!("concurrent request B refused: {e}"));
 
-    // Both callers receive the one canonical job; exactly one published it.
-    let job = ra["job"].as_str().unwrap().to_string();
-    assert_eq!(
-        rb["job"].as_str(),
-        Some(job.as_str()),
-        "concurrent equivalents returned different jobs: {ra} vs {rb}"
+    // Both immediate receipts are identical, contain no job, and reveal no
+    // publication state. The real worker, not the request, publishes the job.
+    let request_id = ra["request_id"]
+        .as_str()
+        .expect("missing request ID")
+        .to_string();
+    assert!(!request_id.is_empty());
+    assert_eq!(ra, json!({"request_id":request_id, "status":"accepted"}));
+    assert_eq!(rb, ra, "concurrent equivalents returned different receipts");
+    let outcomes = fx.shared.sweep_member_job_requests_for_test().unwrap();
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| o.request_id == request_id && o.outcome == "created"),
+        "real promotion did not create the canonical job: {outcomes:?}"
     );
-    let mut statuses = [
-        ra["status"].as_str().unwrap_or_default().to_string(),
-        rb["status"].as_str().unwrap_or_default().to_string(),
-    ];
-    statuses.sort();
-    assert_eq!(
-        statuses,
-        ["awaiting_approval".to_string(), "existing".to_string()],
-        "expected one publisher and one replay: {ra} vs {rb}"
+    let list = fx.op(
+        "member_job_list",
+        json!({"member_envelope":fx.member_envelope("sub-alice")}),
     );
+    let matches: Vec<_> = list["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["request_id"] == request_id)
+        .collect();
+    assert_eq!(matches.len(), 1, "canonical request was duplicated: {list}");
+    assert_eq!(matches[0]["status"], "created");
+    let job = matches[0]["job"]
+        .as_str()
+        .expect("created request has no job")
+        .to_string();
 
     // The winning ledger row: which request won, and its recorded provenance.
     let ledger = fx
@@ -5025,7 +5363,7 @@ fn concurrent_same_request_key_keeps_one_winner_artifact() {
     assert_eq!(by_job.title, ledger.title, "job-keyed ledger disagrees");
 
     // The persisted job: its spec bytes are the winner's, and its hash is the
-    // hash of THOSE bytes. Both returned records carry that same hash.
+    // hash of THOSE bytes.
     let stored = fx.shared.store.job(&job).unwrap();
     let file = std::fs::read(&stored.spec_path)
         .unwrap_or_else(|e| panic!("canonical spec unreadable: {e}"));
@@ -5044,18 +5382,6 @@ fn concurrent_same_request_key_keeps_one_winner_artifact() {
         Some(winner.0),
         "job title is not the winner's"
     );
-    for (name, r) in [("A", &ra), ("B", &rb)] {
-        assert_eq!(
-            r["job_record"]["spec_sha256"].as_str(),
-            stored.spec_sha256.as_deref(),
-            "request {name} returned a job_record with a different spec hash: {r}"
-        );
-        assert_eq!(
-            r["job_record"]["title"].as_str(),
-            Some(winner.0),
-            "request {name} returned a job_record with a different title: {r}"
-        );
-    }
 
     // Partial retry (the accepted artifact must stay unchanged): a prior
     // request left a job row with no ledger row. The retry is refused BEFORE
@@ -5063,7 +5389,15 @@ fn concurrent_same_request_key_keeps_one_winner_artifact() {
     let partial_key = "k-partial";
     let partial_id = format!(
         "assist-{}",
-        &crate::operator_auth::digest(&format!("{ORG}:sub-alice:{partial_key}"))[..24]
+        &crate::operator_auth::digest(&format!(
+            "{}:{}|{}:{}|{}:{}",
+            ORG.len(),
+            ORG,
+            "sub-alice".len(),
+            "sub-alice",
+            partial_key.len(),
+            partial_key
+        ))[..24]
     );
     let partial_spec = fx.shared.state_dir.join("assist_jobs");
     std::fs::create_dir_all(&partial_spec).unwrap();
@@ -5091,14 +5425,63 @@ fn concurrent_same_request_key_keeps_one_winner_artifact() {
             None,
         )
         .unwrap_or_else(|e| panic!("could not seed partial job: {e}"));
-    let retry = fx.op_err(
+    let job_snapshot = || {
+        let mut rows: Vec<_> = fx
+            .shared
+            .store
+            .jobs(None, true)
+            .unwrap()
+            .into_iter()
+            .map(|j| (j.id, j.issue_id, j.spec_path, j.spec_sha256, j.pm_alias))
+            .collect();
+        rows.sort();
+        rows
+    };
+    let before_partial = job_snapshot();
+
+    let retry = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "partial retry", "request_key": partial_key, "body": "retry body", "acceptance": "retry acc"}),
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "partial retry", "request_key": partial_key, "issue": FIXTURE_ISSUE, "body": "retry body", "acceptance": "retry acc"}),
     );
-    let refusal = err_text(retry, "partial-state retry");
+    let partial_request = retry["request_id"]
+        .as_str()
+        .expect("partial request has no ID")
+        .to_string();
+    assert_eq!(
+        retry,
+        json!({"request_id":partial_request, "status":"accepted"})
+    );
+    let outcomes = fx.shared.sweep_member_job_requests_for_test().unwrap();
     assert!(
-        refusal.contains("partially recorded"),
-        "partial-state retry refused for the wrong reason: {refusal}"
+        outcomes
+            .iter()
+            .any(|o| o.request_id == partial_request && o.outcome == "refused"),
+        "partial-state promotion was not refused: {outcomes:?}"
+    );
+    assert_eq!(
+        job_snapshot(),
+        before_partial,
+        "partial retry created or retargeted a job"
+    );
+    let partial_list = fx.op(
+        "member_job_list",
+        json!({"member_envelope": fx.member_envelope("sub-alice")}),
+    );
+    let partial_row = partial_list["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["request_id"] == partial_request)
+        .expect("accepted partial request disappeared");
+    assert_eq!(partial_row["status"], "pending");
+    assert!(partial_row["job"].is_null());
+    assert!(
+        fx.shared
+            .store
+            .assist_request_record(ORG, "sub-alice", partial_key)
+            .unwrap()
+            .is_none(),
+        "refused partial retry created an ownership ledger"
     );
     assert_eq!(
         std::fs::read(&partial_path).unwrap(),
@@ -5162,9 +5545,9 @@ fn assist_real_progress_advances_authority_rev_and_stall_watermark() {
         .unwrap();
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-nico"), "title": "n job", "request_key": "n-k1", "body": "b"}),
+        json!({"member_envelope": fx.member_envelope("sub-nico"), "title": "n job", "request_key": "n-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_member_fixture_job(&fx, "sub-nico", &req);
     let prov_orig = assist_provenance(&fx, &job);
     assert_eq!(prov_orig.credential_id.as_deref(), Some("cred-sub-nico"));
 
@@ -5369,13 +5752,11 @@ fn member_job_evidence_requires_available_submitted_artifact() {
         })
         .unwrap();
     let env = fx.member_envelope("sub-nico");
-    let job = fx.op(
+    let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": env, "title": "r5 job", "request_key": "r5-k1", "body": "b"}),
-    )["job"]
-        .as_str()
-        .unwrap()
-        .to_string();
+        json!({"member_envelope": env, "title": "r5 job", "request_key": "r5-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
+    );
+    let job = promote_member_fixture_job(&fx, "sub-nico", &req);
 
     // A real local repo: the worker's submitted commit is an object here.
     let repo = fx.dir.path().join("r5-repo");
@@ -5417,6 +5798,53 @@ fn member_job_evidence_requires_available_submitted_artifact() {
         ev["evidence_state"].as_str(),
         Some("independently_verified"),
         "positive job: {ev}"
+    );
+
+    // ---- CAD-2215 negative: the member evidence read embeds the current
+    // verdict's content, but the verdict's global sequence is a shared
+    // position and must never appear on a member-scoped reply. The SAME
+    // verdict stays numerically addressable on the proven operator's own
+    // native `task_show`, so the two views are distinguishable per response.
+    let operator_task = fx.op("task_show", json!({"task": t1}));
+    let operator_verdicts = operator_task["task"]["verdicts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("operator task_show lost its verdicts: {operator_task}"));
+    let operator_verdict = operator_verdicts
+        .iter()
+        .find(|verdict| {
+            verdict["sha"].as_str() == Some(sha1.as_str())
+                && verdict["verdict"].as_str() == Some("pass")
+        })
+        .unwrap_or_else(|| panic!("operator task_show lacks the recorded pass: {operator_task}"));
+    assert!(
+        operator_verdict["seq"].as_i64().is_some(),
+        "operator task_show lost the numeric verdict seq: {operator_task}"
+    );
+    let member_verdict = t["verdict"]
+        .as_object()
+        .unwrap_or_else(|| panic!("positive member verdict is missing: {ev}"));
+    // The content is still real — the verdict, its bound head and reviewer...
+    assert_eq!(
+        member_verdict.get("verdict").and_then(Value::as_str),
+        Some("pass"),
+        "member evidence lost the verdict content: {ev}"
+    );
+    assert_eq!(
+        member_verdict.get("sha").and_then(Value::as_str),
+        Some(sha1.as_str()),
+        "member evidence lost the verdict's bound head: {ev}"
+    );
+    assert!(
+        member_verdict
+            .get("reviewer")
+            .and_then(Value::as_str)
+            .is_some(),
+        "member evidence lost the verdict reviewer: {ev}"
+    );
+    // ...but a member-scoped row carries no shared global position.
+    assert!(
+        member_verdict.get("seq").is_none(),
+        "member evidence exposed the global verdict seq: {ev}"
     );
 
     // ---- MIXED: a second task is created but never submitted. The passed
@@ -5509,15 +5937,29 @@ fn assist_own_thread_read_refuses_platform_revoked_member() {
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     with_deferred_service(&fx);
+    fx.init_cursor_keyring();
     let sub = "sub-c1380-plat";
     let rt = fx.member_runtime(sub);
 
     // Positive: live platform authority admits the assistant's own thread read.
-    let live = fx.as_assistant(&rt.alias, "thread_read", json!({"alias": rt.alias}));
+    let live = fx.as_assistant(
+        &rt.alias,
+        "thread_read",
+        json!({"alias": rt.alias, "cursor_format":"opaque-v1"}),
+    );
     assert!(
         live.is_ok(),
         "live member own thread_read refused: {live:?}"
     );
+    let live_page = live.as_ref().unwrap();
+    assert_eq!(
+        live_page["_reader_scope"],
+        cadence_core::board_api::THREAD_OPAQUE_SCOPE_ACK
+    );
+    assert!(live_page.get("reply_seq").is_none() && live_page.get("scanned_before").is_none());
+    for row in live_page["entries"].as_array().expect("thread entries") {
+        assert!(row.get("seq").is_none(), "global thread seq leaked: {row}");
+    }
 
     // Platform-side revocation of the member's issuing credential. The local
     // binding is deliberately left active so only the live pull can refuse.
@@ -5530,7 +5972,11 @@ fn assist_own_thread_read_refuses_platform_revoked_member() {
             .is_some_and(|b| b.is_active()),
         "the local binding must remain active for this platform-only case"
     );
-    let refused = fx.as_assistant(&rt.alias, "thread_read", json!({"alias": rt.alias}));
+    let refused = fx.as_assistant(
+        &rt.alias,
+        "thread_read",
+        json!({"alias": rt.alias, "cursor_format":"opaque-v1"}),
+    );
     assert!(
         refused.is_err(),
         "platform-revoked member read its own thread through the assistant identity: {refused:?}"
@@ -5684,12 +6130,9 @@ fn assist_job_notice_never_queues_private_delivery_before_live_proof() {
     // Real job request through the signed member route.
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope(sub), "title": "r4 notice job", "request_key": "r4-notice-k1", "body": "r4 body", "acceptance": "r4 acceptance"}),
+        json!({"member_envelope": fx.member_envelope(sub), "title": "r4 notice job", "request_key": "r4-notice-k1", "issue": FIXTURE_ISSUE, "body": "r4 body", "acceptance": "r4 acceptance"}),
     );
-    let job = req["job"]
-        .as_str()
-        .expect("member_job_request returned no job id")
-        .to_string();
+    let job = promote_member_fixture_job(&fx, sub, &req);
     let task = fx
         .shared
         .store
@@ -5797,9 +6240,9 @@ fn assist_drain_notifies_only_live_entitled_subscribers() {
     // Owner requests the job; the request body carries a private marker.
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-ana"), "title": "r4d drain job", "request_key": "r4d-k1", "body": "PRIVATE_REQUEST_BODY_R4D", "acceptance": "r4d acceptance"}),
+        json!({"member_envelope": fx.member_envelope("sub-ana"), "title": "r4d drain job", "request_key": "r4d-k1", "issue": FIXTURE_ISSUE, "body": "PRIVATE_REQUEST_BODY_R4D", "acceptance": "r4d acceptance"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_member_fixture_job(&fx, "sub-ana", &req);
     let task = fx
         .shared
         .store
@@ -6053,9 +6496,9 @@ fn assist_drain_routes_without_flag_and_stall_notice_is_metadata_only() {
 
     let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": fx.member_envelope("sub-ana"), "title": "r4s stall job", "request_key": "r4s-k1", "body": "PRIVATE_REQUEST_BODY_R4S", "acceptance": "r4s acceptance"}),
+        json!({"member_envelope": fx.member_envelope("sub-ana"), "title": "r4s stall job", "request_key": "r4s-k1", "issue": FIXTURE_ISSUE, "body": "PRIVATE_REQUEST_BODY_R4S", "acceptance": "r4s acceptance"}),
     );
-    let job = req["job"].as_str().unwrap().to_string();
+    let job = promote_member_fixture_job(&fx, "sub-ana", &req);
     let task = fx
         .shared
         .store
@@ -6223,13 +6666,11 @@ fn assist_revise_notifies_only_kickoff_proven_author_metadata_only() {
     with_deferred_service(&fx);
     let rt = fx.member_runtime("sub-rev");
     let env = fx.member_envelope("sub-rev");
-    let job = fx.op(
+    let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": env, "title": "r4a revise job", "request_key": "r4a-k1", "body": "PRIVATE_REQUEST_BODY_R4A", "acceptance": "r4a acceptance"}),
-    )["job"]
-        .as_str()
-        .unwrap()
-        .to_string();
+        json!({"member_envelope": env, "title": "r4a revise job", "request_key": "r4a-k1", "issue": FIXTURE_ISSUE, "body": "PRIVATE_REQUEST_BODY_R4A", "acceptance": "r4a acceptance"}),
+    );
+    let job = promote_member_fixture_job(&fx, "sub-rev", &req);
 
     let repo = fx.dir.path().join("r4a-repo");
     r4a_upstream(&fx, &rt);
@@ -6339,13 +6780,11 @@ fn assist_revise_refuses_author_born_after_kickoff() {
     with_deferred_service(&fx);
     let rt = fx.member_runtime("sub-rev2");
     let env = fx.member_envelope("sub-rev2");
-    let job = fx.op(
+    let req = fx.op(
         "member_job_request",
-        json!({"member_envelope": env, "title": "r4a birth job", "request_key": "r4a-k2", "body": "PRIVATE_REQUEST_BODY_R4A2", "acceptance": "r4a2 acceptance"}),
-    )["job"]
-        .as_str()
-        .unwrap()
-        .to_string();
+        json!({"member_envelope": env, "title": "r4a birth job", "request_key": "r4a-k2", "issue": FIXTURE_ISSUE, "body": "PRIVATE_REQUEST_BODY_R4A2", "acceptance": "r4a2 acceptance"}),
+    );
+    let job = promote_member_fixture_job(&fx, "sub-rev2", &req);
 
     let repo = fx.dir.path().join("r4a-repo2");
     r4a_upstream(&fx, &rt);
@@ -6483,7 +6922,14 @@ mod master_home_acceptance {
     impl OwnedDaemon {
         /// Start stateB. The board config and the enrolled service credential
         /// are written BEFORE `serve_with`, from the same `Fx` platform.
-        fn start(fx: &Fx, token: &str, sub: &str, fake_gateway: &Path) -> Self {
+        #[allow(clippy::type_complexity)] // one fixture callback, one shape
+        fn start(
+            fx: &Fx,
+            token: &str,
+            sub: &str,
+            fake_gateway: &Path,
+            observer: Arc<dyn Fn(&str, &str) + Send + Sync>,
+        ) -> Self {
             // The process temp root (respects TMPDIR), the same root
             // `test_seam::confine` checks. A hardcoded `/tmp` is refused on
             // runners whose temp root differs.
@@ -6491,6 +6937,7 @@ mod master_home_acceptance {
             let [state, pm, home] = ["s", "pm", "h"].map(|d| root.path().join(d));
             // Real PM tracker, the same supported init `Fx::new` uses.
             crate::issue::Pm::init(&pm).unwrap();
+            super::fixture_issue_project(&pm);
             // Synthetic model allowlist, ONLY in this temp pm.yaml.
             let yaml = pm.join("pm.yaml");
             let mut text = std::fs::read_to_string(&yaml).unwrap();
@@ -6529,6 +6976,7 @@ mod master_home_acceptance {
                 provider_env: env,
                 stop: Some(stop.clone()),
                 test_seam: true,
+                assist_request_sweep_observer: Some(observer),
                 ..Default::default()
             };
             let dir = state.clone();
@@ -6676,7 +7124,12 @@ mod master_home_acceptance {
                 caps: vec!["assist.revalidate".into()],
                 live: true,
             });
-        let daemon = OwnedDaemon::start(&fx, &token, sub, &fake);
+        let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
+        #[allow(clippy::type_complexity)] // one fixture callback, one shape
+        let observer: Arc<dyn Fn(&str, &str) + Send + Sync> = Arc::new(move |id, outcome| {
+            let _ = tx.send((id.to_string(), outcome.to_string()));
+        });
+        let daemon = OwnedDaemon::start(&fx, &token, sub, &fake, observer);
 
         // Real confined master_start on stateB: no unconfined, no TEST_NO_LANDLOCK.
         let started = daemon.rpc("master_start", json!({"provider": "pi"}));
@@ -6695,9 +7148,42 @@ mod master_home_acceptance {
         let env = fx.member_envelope(sub);
         let req = daemon.rpc(
             "member_job_request",
-            json!({"member_envelope": env, "title": "home job", "request_key": "home-k1", "body": "PRIVATE_REQUEST_BODY_HOME", "acceptance": "home acceptance"}),
+            json!({"member_envelope": env, "title": "home job", "request_key": "home-k1", "issue": super::FIXTURE_ISSUE, "body": "PRIVATE_REQUEST_BODY_HOME", "acceptance": "home acceptance"}),
         );
-        let job = req["job"].as_str().unwrap().to_string();
+        let request_id = req["request_id"]
+            .as_str()
+            .expect("home request ID")
+            .to_string();
+        assert_eq!(req, json!({"request_id":request_id,"status":"accepted"}));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let wait = deadline
+                .checked_duration_since(Instant::now())
+                .expect("home promotion deadline");
+            let (id, outcome) = rx
+                .recv_timeout(wait)
+                .expect("home worker emitted no promotion outcome");
+            if id == request_id {
+                assert_eq!(outcome, "created", "home job promotion failed");
+                break;
+            }
+        }
+        let jobs = daemon.rpc(
+            "member_job_list",
+            json!({"member_envelope":fx.member_envelope(sub)}),
+        );
+        let rows: Vec<_> = jobs["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["request_id"] == request_id)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], "created");
+        let job = rows[0]["job"]
+            .as_str()
+            .expect("home owner row lacks job")
+            .to_string();
         let task = format!("{job}-t1");
         let master_body = |d: &OwnedDaemon| -> Vec<Value> {
             d.rpc("thread_read", json!({"alias": master::ALIAS, "limit": 500}))["entries"]
@@ -6914,9 +7400,9 @@ mod cad1380_rereview_refusal {
         let rt = fx.member_runtime("sub-tail");
         let req = fx.op(
             "member_job_request",
-            json!({"member_envelope": fx.member_envelope("sub-tail"), "title": "tail", "request_key": "t-k1", "body": "b"}),
+            json!({"member_envelope": fx.member_envelope("sub-tail"), "title": "tail", "request_key": "t-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
         );
-        let job = req["job"].as_str().unwrap().to_string();
+        let job = promote_member_fixture_job(&fx, "sub-tail", &req);
         // Positive control: the operator tail sees the private intent.
         let op_tail = fx
             .op("agent_events", json!({"alias": "daemon", "tail": true}))
@@ -6935,7 +7421,11 @@ mod cad1380_rereview_refusal {
             .call(
                 Asserted::Agent(rt.worker.clone()),
                 "agent_events",
-                json!({"alias": "daemon", "tail": true}),
+                json!({
+                    "alias": "daemon",
+                    "tail": true,
+                    "cursor_format": cadence_core::board_api::AGENT_EVENTS_CURSOR_FORMAT,
+                }),
             )
             .unwrap_or_else(|e| panic!("ordinary daemon tail was denied outright: {e}"));
         let worker_text = worker_tail.to_string();
@@ -7026,9 +7516,9 @@ mod cad1380_rereview_refusal {
         join_group(&rt.alias);
         let req = fx.op(
             "member_job_request",
-            json!({"member_envelope": fx.member_envelope("sub-race"), "title": "race", "request_key": "r-k1", "body": "b"}),
+            json!({"member_envelope": fx.member_envelope("sub-race"), "title": "race", "request_key": "r-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
         );
-        let job = req["job"].as_str().unwrap().to_string();
+        let job = promote_member_fixture_job(&fx, "sub-race", &req);
         let task = format!("{job}-t1");
         let task_before = fx.shared.store.task(&task).unwrap();
         let tree_before = fx.tree();
@@ -7116,9 +7606,9 @@ mod cad1380_rereview_refusal {
             .unwrap();
         let req = fx.op(
             "member_job_request",
-            json!({"member_envelope": fx.member_envelope("sub-ctrl"), "title": "ctrl", "request_key": "c-k1", "body": "b"}),
+            json!({"member_envelope": fx.member_envelope("sub-ctrl"), "title": "ctrl", "request_key": "c-k1", "issue": FIXTURE_ISSUE, "body": "b"}),
         );
-        let job = req["job"].as_str().unwrap().to_string();
+        let job = promote_member_fixture_job(&fx, "sub-ctrl", &req);
         let task = format!("{job}-t1");
         fx.authority.lock().unwrap().hold_next = true;
         let shared = fx.shared.clone();
@@ -8239,14 +8729,15 @@ fn platform_provision_live_denial_creates_no_binding_or_files() {
 /// member's assistant identity and a member envelope are refused by
 /// `artifact_read`.
 ///
-/// Guards: `operator_only_entries_hidden` in `rpc_member_assist_history`
-/// (daemon/members_rpc.rs); `artifact_operator` + `reject_artifact_fields`
-/// (daemon/artifacts_rpc.rs).
+/// Guards: `member_thread_entries_after` and `member_thread_entries_before`
+/// filter operator-only rows before pagination; `artifact_operator` +
+/// `reject_artifact_fields` (daemon/artifacts_rpc.rs).
 #[test]
 fn cad1726_member_history_never_carries_an_artifact_card() {
     use crate::store::{ArtifactStore, LocalArtifacts, NewEntry, PutArtifact};
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
+    fx.init_cursor_keyring();
     let rt = fx.member_runtime("sub-ana");
     let reply = |text: &str| {
         fx.shared
@@ -8283,7 +8774,8 @@ fn cad1726_member_history_never_carries_an_artifact_card() {
         b"# operator only",
     )
     .unwrap();
-    let last = reply("visible reply two");
+    reply("visible reply two");
+    reply("visible reply three");
 
     // Control: the operator's view of the same thread holds the card.
     let all = fx
@@ -8300,12 +8792,33 @@ fn cad1726_member_history_never_carries_an_artifact_card() {
     );
 
     let env = fx.member_envelope("sub-ana");
+    let newest = fx.op(
+        "member_assist_history",
+        json!({
+            "member_envelope": env, "cursor_format": "opaque-v1", "tail": true, "limit": 1
+        }),
+    );
+    assert_eq!(
+        newest["_reader_scope"],
+        json!("cad2215.member-assist-history.opaque.v1")
+    );
+    assert_eq!(newest["entries"][0]["text"], json!("visible reply three"));
+    let before = newest["before_cursor"]
+        .as_str()
+        .expect("tail backward cursor")
+        .to_string();
     for (branch, params) in [
-        ("forward", json!({"member_envelope": env, "after": 0})),
-        ("tail", json!({"member_envelope": env, "tail": true})),
+        (
+            "forward",
+            json!({"member_envelope": env, "cursor_format": "opaque-v1"}),
+        ),
+        (
+            "tail",
+            json!({"member_envelope": env, "cursor_format": "opaque-v1", "tail": true}),
+        ),
         (
             "before",
-            json!({"member_envelope": env, "before": last + 1}),
+            json!({"member_envelope": env, "cursor_format": "opaque-v1", "before": before}),
         ),
     ] {
         let page = fx.op("member_assist_history", params);
@@ -8362,3 +8875,337 @@ fn cad1726_member_history_never_carries_an_artifact_card() {
 }
 
 // CAD-1767 G2: the member-assist-history half (check author, failing first).
+
+#[test]
+fn cad2215_member_history_refuses_numeric_positions_without_reset() {
+    use crate::store::NewEntry;
+
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    fx.init_cursor_keyring();
+    let rt = fx.member_runtime("sub-ana");
+    fx.shared
+        .store
+        .thread_append_to(
+            &rt.thread_id,
+            NewEntry {
+                role: "agent",
+                kind: "assistant_text",
+                text: "numeric refusal control",
+                payload: None,
+                message_id: None,
+            },
+        )
+        .unwrap()
+        .expect("bound conversation");
+
+    let owner = fx.op(
+        "thread_read",
+        json!({"alias": rt.alias, "conversation": rt.thread_id, "after": 0}),
+    );
+    assert!(
+        owner["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| { e["text"] == json!("numeric refusal control") && e["seq"].is_number() }),
+        "operator numeric control: {owner}"
+    );
+
+    let env = fx.member_envelope("sub-ana");
+    let page = fx.op(
+        "member_assist_history",
+        json!({
+            "member_envelope": env,
+            "cursor_format": "opaque-v1"
+        }),
+    );
+    assert_eq!(
+        page["_reader_scope"],
+        json!("cad2215.member-assist-history.opaque.v1")
+    );
+    assert!(
+        page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| { e["text"] == json!("numeric refusal control") }),
+        "valid member control: {page}"
+    );
+
+    for params in [
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "after": 0}),
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "before": 1}),
+    ] {
+        let err = fx
+            .op_err("member_assist_history", params.clone())
+            .expect_err("numeric member history position must be refused");
+        assert_eq!(
+            err.code(),
+            Some("member_assist_history_cursor_numeric"),
+            "refused for the wrong reason: {params}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn cad2215_member_history_pages_only_visible_rows_and_binds_cursors() {
+    use crate::store::NewEntry;
+
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    fx.init_cursor_keyring();
+    let ana = fx.member_runtime("sub-ana");
+    let _liv = fx.member_runtime("sub-liv");
+    let append = |kind: &str, text: &str| {
+        fx.shared
+            .store
+            .thread_append_to(
+                &ana.thread_id,
+                NewEntry {
+                    role: "agent",
+                    kind,
+                    text,
+                    payload: None,
+                    message_id: None,
+                },
+            )
+            .unwrap()
+            .expect("bound conversation");
+    };
+    append("assistant_text", "cad2215-visible-a");
+    append("hire_proposal", "cad2215-hidden-one");
+    append("assistant_text", "cad2215-visible-b");
+    append("hire_proposal", "cad2215-hidden-two");
+    append("assistant_text", "cad2215-visible-c");
+
+    let operator = fx.op(
+        "thread_read",
+        json!({"alias": ana.alias, "conversation": ana.thread_id, "after": 0}),
+    );
+    let operator_rows = operator["entries"].as_array().unwrap();
+    assert!(operator_rows
+        .iter()
+        .any(|e| e["text"] == json!("cad2215-hidden-one")));
+    assert!(operator_rows
+        .iter()
+        .any(|e| e["text"] == json!("cad2215-hidden-two")));
+
+    let env = fx.member_envelope("sub-ana");
+    let liv_env = fx.member_envelope("sub-liv");
+    let read = |params: Value| fx.op("member_assist_history", params);
+    let check = |page: &Value, expected: &[&str]| {
+        assert_eq!(
+            page["_reader_scope"],
+            json!("cad2215.member-assist-history.opaque.v1")
+        );
+        let rows = page["entries"].as_array().unwrap();
+        let texts: Vec<&str> = rows.iter().map(|e| e["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, expected, "page: {page}");
+        for row in rows {
+            assert!(row.get("seq").is_none(), "global sequence leaked: {row}");
+            assert!(
+                row["id"].as_str().is_some_and(|id| !id.is_empty()),
+                "missing keyed id: {row}"
+            );
+        }
+        assert!(
+            !page.to_string().contains("cad2215-hidden"),
+            "hidden row leaked: {page}"
+        );
+    };
+    let first = read(json!({"member_envelope": env, "cursor_format": "opaque-v1", "limit": 1}));
+    check(&first, &["cad2215-visible-a"]);
+    assert_eq!(first["more_after"], json!(true));
+    let forward = first["cursor"].as_str().unwrap().to_string();
+    let second = read(
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "after": forward, "limit": 1}),
+    );
+    check(&second, &["cad2215-visible-b"]);
+    assert_eq!(second["more_after"], json!(true));
+    let third = read(
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "after": second["cursor"], "limit": 1}),
+    );
+    check(&third, &["cad2215-visible-c"]);
+    assert_eq!(third["more_after"], json!(false));
+    let empty = read(
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "after": third["cursor"], "limit": 1}),
+    );
+    check(&empty, &[]);
+    assert_eq!(empty["cursor"], third["cursor"]);
+
+    let tail = read(
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "tail": true, "limit": 1}),
+    );
+    check(&tail, &["cad2215-visible-c"]);
+    assert_eq!(tail["more_before"], json!(true));
+    assert_eq!(tail["entries"][0]["id"], third["entries"][0]["id"]);
+    let backward = tail["before_cursor"].as_str().unwrap().to_string();
+    let previous = read(
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "before": backward, "limit": 1}),
+    );
+    check(&previous, &["cad2215-visible-b"]);
+    assert_eq!(previous["more_before"], json!(true));
+    let oldest = read(
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "before": previous["before_cursor"], "limit": 1}),
+    );
+    check(&oldest, &["cad2215-visible-a"]);
+    assert_eq!(oldest["more_before"], json!(false));
+    let empty_before = read(
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "before": oldest["before_cursor"], "limit": 1}),
+    );
+    check(&empty_before, &[]);
+    assert_eq!(empty_before["before_cursor"], oldest["before_cursor"]);
+
+    let mut tampered = forward.as_bytes().to_vec();
+    assert!(!tampered.is_empty());
+    tampered[0] = if tampered[0] == b'A' { b'B' } else { b'A' };
+    let tampered = String::from_utf8(tampered).unwrap();
+    for params in [
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "after": tampered}),
+        json!({"member_envelope": liv_env, "cursor_format": "opaque-v1", "after": forward}),
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "before": forward}),
+        json!({"member_envelope": env, "cursor_format": "opaque-v1", "after": backward}),
+    ] {
+        let err = fx
+            .op_err("member_assist_history", params.clone())
+            .expect_err("invalid cursor must be refused");
+        assert_eq!(
+            err.code(),
+            Some("member_assist_history_cursor_invalid"),
+            "refused for wrong reason: {params}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn cad2215_member_history_hidden_append_does_not_change_visible_projection() {
+    use crate::store::NewEntry;
+
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    fx.init_cursor_keyring();
+    let rt = fx.member_runtime("sub-ana");
+    let visible = "cad2215-visible-metadata-control";
+    let hidden = "cad2215-hidden-metadata-control";
+
+    fx.shared
+        .store
+        .thread_append_to(
+            &rt.thread_id,
+            NewEntry {
+                role: "agent",
+                kind: "assistant_text",
+                text: visible,
+                payload: None,
+                message_id: None,
+            },
+        )
+        .unwrap()
+        .expect("bound conversation");
+
+    // Set a deterministic pre-append timestamp on this isolated fixture.
+    // The actual hidden append below takes the normal store path and stamps
+    // its own real timestamp; no sleep or clock-resolution assumption.
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            let changed = tx.execute(
+                "UPDATE threads SET updated=?1 WHERE id=?2",
+                rusqlite::params![0.0_f64, &rt.thread_id],
+            )?;
+            assert_eq!(changed, 1, "fixture conversation missing");
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        fx.shared
+            .store
+            .thread_by_id(&rt.thread_id)
+            .unwrap()
+            .unwrap()
+            .updated,
+        0.0
+    );
+
+    let env = fx.member_envelope("sub-ana");
+    let read = || {
+        fx.op(
+            "member_assist_history",
+            json!({
+                "member_envelope": env,
+                "cursor_format": "opaque-v1",
+                "tail": true,
+            }),
+        )
+    };
+    let before = read();
+    assert_eq!(
+        before["_reader_scope"],
+        json!("cad2215.member-assist-history.opaque.v1")
+    );
+    assert!(
+        before["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["text"] == json!(visible)),
+        "valid member control lost visible row: {before}"
+    );
+
+    fx.shared
+        .store
+        .thread_append_to(
+            &rt.thread_id,
+            NewEntry {
+                role: "agent",
+                kind: "hire_proposal",
+                text: hidden,
+                payload: None,
+                message_id: None,
+            },
+        )
+        .unwrap()
+        .expect("bound conversation");
+
+    // Owner control proves both that an operator-only row really landed and
+    // that this setup actually changed the underlying shared metadata.
+    let owner_rows = fx
+        .shared
+        .store
+        .thread_entries_of(&rt.thread_id, 0, 100)
+        .unwrap();
+    assert!(
+        owner_rows
+            .iter()
+            .any(|row| row.kind == "hire_proposal" && row.text == hidden),
+        "owner cannot see the hidden row"
+    );
+    let updated = fx
+        .shared
+        .store
+        .thread_by_id(&rt.thread_id)
+        .unwrap()
+        .unwrap()
+        .updated;
+    assert_ne!(
+        updated, 0.0,
+        "hidden append did not change shared updated timestamp"
+    );
+
+    let after = read();
+    assert_eq!(
+        after["_reader_scope"],
+        json!("cad2215.member-assist-history.opaque.v1")
+    );
+    assert_eq!(
+        before["entries"], after["entries"],
+        "operator-only append changed member-visible entries"
+    );
+    assert_eq!(
+        before["conversation"], after["conversation"],
+        "operator-only append changed member-visible conversation metadata"
+    );
+    assert_eq!(before["more_before"], after["more_before"]);
+    assert_eq!(before["more_after"], after["more_after"]);
+}

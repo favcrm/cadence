@@ -46,10 +46,21 @@ impl Snapshot {
     /// The project-scoped board for `policy_actor`. The owner the read
     /// answers for is a session identity passed to each projection, never
     /// a request field.
-    pub(super) fn load(state_dir: &Path, pm_dir: &Path, policy_actor: &str) -> crate::Result<Self> {
+    pub(super) fn load(
+        state_dir: &Path,
+        pm_dir: &Path,
+        policy_actor: &str,
+        proof: Option<&operator::ReadRelayProof>,
+    ) -> crate::Result<Self> {
         let pm = Pm::at(pm_dir)?;
         let readable = project_policy::readable(&pm, policy_actor);
-        let board = read_model::get(state_dir, pm_dir).board_readable(&pm, &readable);
+        let board = if policy_actor == "operator" {
+            read_model::get(state_dir, pm_dir).board(&pm, None)
+        } else {
+            let proof =
+                proof.ok_or_else(|| crate::Error::rejected("My work read scope is unavailable"))?;
+            super::serve::readable_member_board(state_dir, &pm, policy_actor, proof, None)?
+        };
         Ok(Self {
             pm,
             readable,
@@ -267,8 +278,20 @@ fn human_caller(
     }
     let policy_actor = if is_owner(&caller) {
         Cow::Borrowed("operator")
+    } else if let operator::Caller::Named(named) = &caller {
+        let actor = crate::project_policy::policy_user_actor(&named.sub);
+        if named.author != named.sub || actor == "service/unresolved-member" {
+            return Err(super::err_response(
+                403,
+                "My work identity is not unambiguously bound",
+            ));
+        }
+        Cow::Owned(actor)
     } else {
-        Cow::Owned(operator::caller_spelling(&caller))
+        return Err(super::err_response(
+            403,
+            "My work requires a human board session",
+        ));
     };
     Ok((caller, policy_actor))
 }
@@ -308,6 +331,7 @@ pub(super) fn get(
     state_dir: &Path,
     pm_dir: &Path,
     opts: &ServeOpts,
+    admission: &operator::ReadAdmission,
     raw_query: &str,
 ) -> HttpResp {
     let query = match Query::parse(raw_query) {
@@ -318,7 +342,12 @@ pub(super) fn get(
         Ok(found) => found,
         Err(response) => return response,
     };
-    let snapshot = match Snapshot::load(state_dir, pm_dir, &policy_actor) {
+    let snapshot = match Snapshot::load(
+        state_dir,
+        pm_dir,
+        &policy_actor,
+        Some(&admission.relay_proof()),
+    ) {
         Ok(snapshot) => snapshot,
         Err(error) => return super::err_response(503, &error.to_string()),
     };
@@ -339,6 +368,7 @@ pub(super) fn get_issue(
     state_dir: &Path,
     pm_dir: &Path,
     opts: &ServeOpts,
+    admission: &operator::ReadAdmission,
     raw_id: &str,
     raw_query: &str,
 ) -> HttpResp {
@@ -352,7 +382,12 @@ pub(super) fn get_issue(
         Ok(found) => found,
         Err(response) => return response,
     };
-    let snapshot = match Snapshot::load(state_dir, pm_dir, &policy_actor) {
+    let snapshot = match Snapshot::load(
+        state_dir,
+        pm_dir,
+        &policy_actor,
+        Some(&admission.relay_proof()),
+    ) {
         Ok(snapshot) => snapshot,
         Err(error) => return super::err_response(503, &error.to_string()),
     };
@@ -492,7 +527,7 @@ mod tests {
         let theirs = new("alpha", "Someone else's SMTP work", "noor");
 
         let page = |raw: &str| {
-            let snapshot = Snapshot::load(&state, &pm.dir, "operator").unwrap();
+            let snapshot = Snapshot::load(&state, &pm.dir, "operator", None).unwrap();
             let times = LineTimes::load(&pm.dir, LINE_TIMES_BUDGET).ok();
             snapshot
                 .page(

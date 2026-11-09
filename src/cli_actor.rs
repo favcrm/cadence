@@ -249,18 +249,8 @@ pub struct CliActor {
 }
 
 impl CliActor {
-    /// The project-policy spelling this actor is keyed by: the actor's
-    /// kind with its subject in the sanitized handle form the board
-    /// stores (`board_identity::handle_of`), which is also the only form
-    /// the store accepts — `Grant::parse` refuses a handle outside
-    /// `[A-Za-z0-9_-]{1,200}`.
-    ///
-    /// Deriving it here is what makes a grant recorded on either surface
-    /// match the caller arriving through the other. Keying on `actor`
-    /// verbatim would refuse a member whose subject needs sanitizing a
-    /// project the board admits it to: the envelope's
-    /// `users/auth0|usr:9/x` can never equal the store's
-    /// `users/auth0_usr_9_x`.
+    /// Legacy attribution spelling. Subject sanitization is lossy, so this
+    /// must not be used to authorize user access; use the verified subject.
     pub fn policy_spelling(&self) -> String {
         match self.actor.split_once('/') {
             Some((kind, _)) => format!("{kind}/{}", self.handle),

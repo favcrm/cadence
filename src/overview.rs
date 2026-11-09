@@ -41,7 +41,7 @@ mod commands;
 mod github;
 mod github_cache;
 mod main_ci;
-mod monitoring;
+pub mod monitoring;
 mod needs_merge;
 mod sources;
 
@@ -63,6 +63,7 @@ use main_ci::main_ci_view;
 #[cfg(test)]
 use main_ci::{classify_main_ci, main_ci_alerts, CiState, ShaCi};
 pub use monitoring::monitoring;
+pub(crate) use monitoring::{monitoring_for_tasks, monitoring_unavailable};
 use needs_merge::{merge_by_subject, sort_needs};
 #[cfg(test)]
 use sources::probe_agent;
@@ -558,7 +559,13 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
             return out;
         }
     };
-    for rec in records.into_values() {
+    // CAD-2215: shared Needs-you rows come only from records standing on
+    // an exact native dispatch receipt. A legacy candidate is operator
+    // recovery evidence (`cadence delivery ls`), never a shared row.
+    for rec in crate::delivery::ordinary_in_order(&records)
+        .into_iter()
+        .cloned()
+    {
         let id = rec.issue.as_str();
         let age = now - rec.since;
         let pr = rec.pr.as_deref();
@@ -1554,7 +1561,7 @@ mod tests {
     fn merge_ready_decision_survives_an_older_no_safe_next_step_alert() {
         let state = tempfile::TempDir::new().unwrap();
         let sha = "a".repeat(40);
-        let mut rec = crate::delivery::Record::new("DEM-2", "demo", "w1", 0);
+        let mut rec = crate::delivery::Record::new_ordinary("DEM-2", "demo", "w1", 0, "m-demo");
         rec.state = crate::delivery::State::Passed;
         rec.pr = Some("https://github.com/acme/demo/pull/1".into());
         rec.verdict = Some(crate::delivery::VerdictRec {

@@ -1448,8 +1448,10 @@ impl Store {
     /// `running` moves its task `dispatched → running`. Only
     /// `job_dispatch` messages are kickoffs — `--task` follow-ups and
     /// `job_event` notifications attach `task_id` for indexing but
-    /// never drive state. Guarded on the stored state so a cancelled
-    /// or already-advanced task is untouched.
+    /// never drive state. Guarded on the stored state and on the
+    /// `dispatch_message` pointer so a cancelled, already-advanced or
+    /// superseded kickoff is untouched: an older message can still be
+    /// claimed after `fail` → `reopen` → `dispatch` moved the task on.
     pub(super) fn task_on_running(
         &self,
         tx: &impl super::StoreConn,
@@ -1470,12 +1472,13 @@ impl Store {
         let Ok(task) = self.task_in(tx, &task_id) else {
             return Ok(());
         };
-        if task.state != "dispatched" {
+        if task.state != "dispatched" || task.dispatch_message.as_deref() != Some(message_id) {
             return Ok(());
         }
         tx.execute(
-            "UPDATE tasks SET state='running',updated=? WHERE id=? AND state='dispatched'",
-            params![now(), task.id],
+            "UPDATE tasks SET state='running',updated=? WHERE id=? AND state='dispatched' \
+             AND dispatch_message=?",
+            params![now(), task.id, message_id],
         )?;
         Self::event_scoped(
             tx,
@@ -1497,6 +1500,18 @@ impl Store {
     /// reaches `review` with NULL; `job task sha` repairs it. Any
     /// non-completion terminal leaves the task where it is — `job show`
     /// reports the drift and `job dispatch` starts the next revision.
+    ///
+    /// The report belongs to the kickoff that actually finished, never
+    /// to the revision the task carries now. `jobs task fail` lets an
+    /// in-flight kickoff run on, `reopen` resets the revision to 0, and
+    /// a fresh `dispatch` can reach the same revision number again — so
+    /// `task.revision` is not an attempt identity. Two durable rows are:
+    /// `tasks.dispatch_message` (the live kickoff this task points at)
+    /// and the `task_dispatched` event naming this exact message and its
+    /// revision. Only a completion whose message is the live pointer may
+    /// advance the task; a late completion of a superseded kickoff keeps
+    /// its own `task_reported` evidence — the row historical private
+    /// recovery binds a delivery to — and changes no newer task state.
     fn task_on_completed(
         &self,
         tx: &impl super::StoreConn,
@@ -1515,9 +1530,34 @@ impl Store {
         let Ok(task) = self.task_in(tx, task_id) else {
             return Ok(());
         };
-        if !matches!(task.state.as_str(), "dispatched" | "running") {
+        // The revision of THIS kickoff, from the dispatch row that wrote
+        // it. `task.revision` is only a fallback for a live pointer with
+        // no dispatch event (a row older than the event stream) — a
+        // superseded kickoff with no durable revision has nothing
+        // truthful to bind and records no report. Payloads are parsed
+        // exactly like `task_history_events`: an unreadable row or
+        // revision is missing, never a guess.
+        let dispatched_revision: Option<i64> = tx
+            .query_vec(
+                "SELECT payload FROM events
+                 WHERE job_id=?1 AND task_id=?2 AND kind='task_dispatched'
+                 ORDER BY seq DESC",
+                params![task.job_id, task.id],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .into_iter()
+            .flatten()
+            .filter_map(|payload| serde_json::from_str::<Value>(&payload).ok())
+            .find(|payload| {
+                payload.get("message").and_then(Value::as_str) == Some(message.id.as_str())
+            })
+            .and_then(|payload| payload.get("revision").and_then(Value::as_i64));
+        let live = matches!(task.state.as_str(), "dispatched" | "running")
+            && task.dispatch_message.as_deref() == Some(message.id.as_str());
+        let revision = dispatched_revision.or_else(|| live.then_some(task.revision));
+        let Some(revision) = revision else {
             return Ok(());
-        }
+        };
         let sha = result
             .get("sha")
             .and_then(Value::as_str)
@@ -1530,17 +1570,38 @@ impl Store {
                         .and_then(last_sha_line)
                 })
             });
-        tx.execute(
-            "UPDATE tasks SET state='review',head_sha=?,updated=?
-             WHERE id=? AND state IN ('dispatched','running')",
-            params![sha, now(), task_id],
-        )?;
+        if live && revision == task.revision {
+            // The pointer guard makes the stale check and the transition
+            // one atomic decision: a completion that raced a later
+            // dispatch loses here instead of moving the new attempt.
+            tx.execute(
+                "UPDATE tasks SET state='review',head_sha=?,updated=?
+                 WHERE id=? AND state IN ('dispatched','running')
+                   AND dispatch_message=?",
+                params![sha, now(), task_id, message.id],
+            )?;
+        } else {
+            // Superseded kickoff: keep its own report as evidence for the
+            // attempt it finished, once. Private historical recovery requires
+            // exactly one `task_reported` per dispatch message, so a replayed
+            // finish of the same message never writes a second row.
+            let reported: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE job_id=?1 AND task_id=?2 AND kind='task_reported'
+                   AND json_extract(payload,'$.message')=?3",
+                params![task.job_id, task.id, message.id],
+                |row| row.get(0),
+            )?;
+            if reported > 0 {
+                return Ok(());
+            }
+        }
         Self::event_scoped(
             tx,
             &message.alias,
             "task_reported",
             json!({"task": task_id, "job": task.job_id,
-                   "revision": task.revision, "message": message.id,
+                   "revision": revision, "message": message.id,
                    "sha": sha}),
             Some(&task.job_id),
             Some(task_id),

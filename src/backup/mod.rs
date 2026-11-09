@@ -114,6 +114,9 @@ mod portable_selftest;
 #[cfg(test)]
 mod portable_activate_selftest;
 
+#[cfg(all(test, feature = "test-seam"))]
+mod cad2215_portable_cursor_acceptance;
+
 mod namespace;
 use namespace::ArtifactDir;
 #[cfg(test)]

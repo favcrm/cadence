@@ -18,6 +18,9 @@ pub mod custody;
 pub mod deployments;
 pub(crate) mod encrypted_config;
 mod encrypted_fs;
+/// CAD-2215: the fixed owner-selected path-only scoped-cursor keyring
+/// record. `pub(crate)` — no platform/custody surface re-exports it.
+pub(crate) mod scoped_cursor_config;
 pub(crate) use encrypted_fs::Directories as ControlledDirectories;
 /// CAD-1128: the encrypted-SQLite custody vault. `pub(crate)` — the
 /// manager and its key material are daemon-internal; no public

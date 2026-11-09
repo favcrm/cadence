@@ -13,6 +13,7 @@
 //! daemon re-checks against the session, exactly like `wiki_as` — a
 //! relayed claim can only ever shrink a caller.
 
+use cadence_core::board_api::AppOrigin;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -22,6 +23,59 @@ use super::*;
 use crate::error::{Error, Result};
 use crate::issue::app_access;
 use crate::issue::app_catalog::{self, workspace};
+
+/// CAD-2215: one exact app conversation a verified member may read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct GrantedConversation {
+    pub install_id: String,
+    /// The conversation's exact context captured when the grant was written;
+    /// `None` is the installation's canonical contextless General
+    /// conversation. This is a fact, never a selector.
+    pub context_id: Option<String>,
+    /// Fences a later grant to the same conversation from this snapshot.
+    pub authorization_epoch: String,
+}
+
+/// CAD-2215: the exact conversations a live member may read, re-proved from
+/// active grants at the moment of the read. Local agents, `read_as` relays
+/// and CLI-envelope principals never construct a non-empty value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct MemberAppAccess {
+    admitted: BTreeMap<String, GrantedConversation>,
+}
+
+impl MemberAppAccess {
+    /// The exact conversation ids for the scoped SQL. Deterministic order.
+    pub(super) fn conversations(&self) -> Vec<String> {
+        self.admitted.keys().cloned().collect()
+    }
+
+    pub(super) fn conversation(&self, id: &str) -> bool {
+        self.admitted.contains_key(id)
+    }
+
+    /// Is this derived app origin exactly one the grant covers? Compares the
+    /// conversation, its installation and its context; nothing is inferred.
+    pub(super) fn allows_origin(&self, origin: &AppOrigin) -> bool {
+        self.admits(
+            &origin.conversation_id,
+            &origin.install_id,
+            origin.context_id.as_str(),
+        )
+    }
+
+    /// CAD-2215: the same exact admission as [`Self::allows_origin`] from
+    /// borrowed parts, so a read path that already holds a thread row never
+    /// builds an [`AppOrigin`] (or copies its strings) to prove the grant.
+    /// `context_id` is the installation's empty string when the conversation
+    /// is contextless, exactly as `AppOrigin` spells it.
+    pub(super) fn admits(&self, conversation_id: &str, install_id: &str, context_id: &str) -> bool {
+        self.admitted.get(conversation_id).is_some_and(|admitted| {
+            admitted.install_id.as_str() == install_id
+                && admitted.context_id.as_deref().unwrap_or("") == context_id
+        })
+    }
+}
 
 /// One workspace install of a catalog app, as the Explorer sees it.
 struct Installed {
@@ -614,6 +668,20 @@ impl Shared {
                 "request_id",
                 "public_session",
             ],
+            "app_member_access_list" => &["install_id", "public_session"],
+            "app_member_access_grant" => &[
+                "install_id",
+                "member_sub",
+                "conversation_id",
+                "expected_digest",
+                "public_session",
+            ],
+            "app_member_access_revoke" => &[
+                "install_id",
+                "member_sub",
+                "conversation_id",
+                "public_session",
+            ],
             _ => return Err(Error::rejected("unknown app explorer method")),
         };
         let object = params
@@ -814,6 +882,9 @@ impl Shared {
                     |guard| self.rpc_app_workspace_restore(install_id, guard),
                 )
             }
+            "app_member_access_list" => self.rpc_app_member_access_list(params, peer_pid),
+            "app_member_access_grant" => self.rpc_app_member_access_grant(params, peer_pid),
+            "app_member_access_revoke" => self.rpc_app_member_access_revoke(params),
             _ => Err(Error::rejected("unknown app explorer method")),
         }
     }
@@ -984,6 +1055,581 @@ impl Shared {
             "role": role.as_str(),
         })))
     }
+
+    /// CAD-2215: the exact conversations this live member may read, resolved
+    /// from active grants and re-proved against live state. Fail closed: any
+    /// grant whose installation, digest, approval, exact conversation or
+    /// pinned context cannot be proved NOW is skipped, never widened.
+    pub(super) fn member_app_access(
+        &self,
+        principal: &super::identity::PublicReadPrincipal,
+    ) -> Result<MemberAppAccess> {
+        let mut access = MemberAppAccess::default();
+        // An operator-role session reads the unscoped document; a grant is
+        // only ever a narrowing for a member. A local agent, `read_as` relay
+        // or CLI principal never reaches here with a principal.
+        if principal.operator {
+            return Ok(access);
+        }
+        let grants = self
+            .store
+            .app_member_grants_active(&principal.company, &principal.subject)?;
+        if grants.is_empty() {
+            return Ok(access);
+        }
+        let pm_dir = self.pm_dir()?;
+        let pm = self.pm_at(&pm_dir)?;
+        let catalog = app_catalog::Catalog::load(&pm.dir).unwrap_or_default();
+        for grant in grants {
+            if !grant.has_valid_authorization_epoch() {
+                return Err(Error::rejected("app access grant identity is unavailable"));
+            }
+            let Ok(id) = app_catalog::InstallationId::parse(&grant.install_id) else {
+                continue;
+            };
+            let Some(entry) = catalog.entries().get(&id) else {
+                continue;
+            };
+            if entry.storage != app_catalog::Storage::Workspace {
+                continue;
+            }
+            let Ok(description) = workspace::describe_id(&pm, &catalog, &id) else {
+                continue;
+            };
+            if description["removed"].as_i64().is_some()
+                || description["digest"].as_str() != Some(grant.install_digest.as_str())
+            {
+                continue;
+            }
+            if self
+                .store
+                .app_capability_status(&grant.install_id, &grant.install_digest)?
+                .get("state")
+                .and_then(Value::as_str)
+                != Some("approved")
+            {
+                continue;
+            }
+            if crate::proto::identifier(&grant.conversation_id, "conversation ID").is_err() {
+                continue;
+            }
+            let Some(thread) = self.store.thread_by_id(&grant.conversation_id)? else {
+                continue;
+            };
+            if thread.id != grant.conversation_id
+                || thread.alias != crate::master::ALIAS
+                || thread.archived
+                || thread.runs_as_home()
+                || thread.subject.is_some()
+                || thread.install_id.as_deref() != Some(grant.install_id.as_str())
+            {
+                continue;
+            }
+            match (grant.context_id.as_deref(), thread.context_id.as_deref()) {
+                (Some(pinned), Some(current)) if pinned == current => {
+                    if self
+                        .store
+                        .app_context_proof(&grant.install_id, pinned)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                }
+                // The only contextless admission is the installation's
+                // canonical General conversation, bound by its exact id.
+                (None, None) if thread.is_general => {}
+                _ => continue,
+            }
+            access.admitted.insert(
+                thread.id,
+                GrantedConversation {
+                    install_id: grant.install_id,
+                    context_id: thread.context_id,
+                    authorization_epoch: grant.authorization_epoch,
+                },
+            );
+        }
+        Ok(access)
+    }
+
+    /// This board's configured company. The grant key's `org` is always this
+    /// value, never a request field.
+    fn member_grant_company(&self) -> Result<String> {
+        crate::board_identity::read_config(&self.state_dir)
+            .map(|config| config.company)
+            .map_err(|_| {
+                Error::invalid(
+                    "capability_unavailable",
+                    "member app access needs this board's configured identity",
+                )
+            })
+    }
+
+    /// CAD-2215: prove the target subject is a CURRENT member of this exact
+    /// organization before writing any grant. The authoritative source is the
+    /// live platform roster read with the operator's verified board session
+    /// (`human_current_actor`), which checks the roster's issuer and
+    /// organization against the server config. No roster means no grant: a
+    /// later session check cannot undo a latent grant to a future member.
+    fn verified_grant_member(&self, params: &Value, peer_pid: u32, member_sub: &str) -> Result<()> {
+        let token = match params.get("public_session") {
+            Some(Value::String(token)) if !token.is_empty() => token.as_str(),
+            _ => {
+                return Err(Error::invalid(
+                    "capability_unavailable",
+                    "a member app access grant needs a verified operator board session so the live roster can prove the target member",
+                ))
+            }
+        };
+        let current = self.human_current_actor(token, params, peer_pid)?;
+        let config = crate::board_identity::read_config(&self.state_dir)?;
+        if current.scope.organization_id != config.company
+            || current.roster.organization_id != config.company
+        {
+            return Err(Error::invalid(
+                "tenancy_mismatch",
+                "the live roster names a different organization",
+            ));
+        }
+        if current.self_role != "owner" {
+            return Err(Error::invalid(
+                "not_an_owner",
+                "the live roster does not name this operator as an owner",
+            ));
+        }
+        match current
+            .roster
+            .members
+            .iter()
+            .find(|member| member.subject_id == member_sub)
+        {
+            Some(member) if matches!(member.role.as_str(), "owner" | "member") => Ok(()),
+            _ => Err(Error::invalid(
+                "not_a_member",
+                "the named subject is not a current member of this organization",
+            )),
+        }
+    }
+
+    /// Why an operator-visible grant is or is not usable right now. Every
+    /// reason is one the operator can act on; a row is never silently omitted.
+    fn app_member_grant_state(
+        &self,
+        pm: &crate::issue::Pm,
+        catalog: &app_catalog::Catalog,
+        grant: &store::app_member_grants::MemberGrant,
+    ) -> (bool, &'static str) {
+        if !grant.active() {
+            return (false, "revoked");
+        }
+        if !grant.has_valid_authorization_epoch() {
+            return (false, "grant_identity_unavailable");
+        }
+        let Ok(id) = app_catalog::InstallationId::parse(&grant.install_id) else {
+            return (false, "install_mismatch");
+        };
+        let Ok(description) = workspace::describe_id(pm, catalog, &id) else {
+            return (false, "install_unavailable");
+        };
+        if description["removed"].as_i64().is_some() {
+            return (false, "install_removed");
+        }
+        if description["digest"].as_str() != Some(grant.install_digest.as_str()) {
+            return (false, "digest_changed");
+        }
+        let Ok(status) = self
+            .store
+            .app_capability_status(&grant.install_id, &grant.install_digest)
+        else {
+            return (false, "capability_unavailable");
+        };
+        if status.get("state").and_then(Value::as_str) != Some("approved") {
+            return (false, "capability_revoked");
+        }
+        let Ok(Some(thread)) = self.store.thread_by_id(&grant.conversation_id) else {
+            return (false, "conversation_unavailable");
+        };
+        if thread.alias != crate::master::ALIAS
+            || thread.archived
+            || thread.runs_as_home()
+            || thread.subject.is_some()
+            || thread.install_id.as_deref() != Some(grant.install_id.as_str())
+        {
+            return (false, "conversation_unavailable");
+        }
+        match (grant.context_id.as_deref(), thread.context_id.as_deref()) {
+            (Some(pinned), Some(current)) if pinned == current => {
+                if self
+                    .store
+                    .app_context_proof(&grant.install_id, pinned)
+                    .is_err()
+                {
+                    return (false, "context_archived");
+                }
+            }
+            (None, None) if thread.is_general => {}
+            _ => return (false, "conversation_changed"),
+        }
+        (true, "")
+    }
+
+    /// CAD-2215: one grant row as every response carries it — the exact
+    /// binding plus the daemon's CURRENT verdict. The list and the grant
+    /// receipt both use this shape, so a reader never has to guess whether
+    /// `usable`/`reason` are present.
+    fn app_member_grant_row(
+        &self,
+        pm: &crate::issue::Pm,
+        catalog: &app_catalog::Catalog,
+        grant: &store::app_member_grants::MemberGrant,
+    ) -> Value {
+        let (usable, reason) = self.app_member_grant_state(pm, catalog, grant);
+        let mut row = grant.to_json();
+        row["usable"] = json!(usable);
+        row["reason"] = json!(reason);
+        row
+    }
+
+    /// The row a revoke just wrote. Every row a revoke answers with is the
+    /// tombstone the store read back after its UPDATE, and a non-active row is
+    /// never usable — `app_member_grant_state`'s own first rule — so the
+    /// verdict needs no installation read and a revoke still answers when the
+    /// installation, its tracker or the member's session is gone.
+    fn revoked_grant_row(grant: &store::app_member_grants::MemberGrant) -> Value {
+        let mut row = grant.to_json();
+        row["usable"] = json!(false);
+        row["reason"] = json!("revoked");
+        row
+    }
+
+    /// `app_member_access_list` — operator-only. Lists every grant (active and
+    /// revoked), the installation's live conversations, and the live roster a
+    /// grant may name, so the operator can choose an exact conversation and an
+    /// exact member for the next grant.
+    fn rpc_app_member_access_list(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let human = self.explorer_human(params, None)?;
+        let install_id = required_str(params, "install_id")?;
+        let id = app_catalog::InstallationId::parse(install_id)?;
+        let org = self.member_grant_company()?;
+        let pm_dir = self.pm_dir()?;
+        let pm = self.pm_at(&pm_dir)?;
+        let catalog = app_catalog::Catalog::load(&pm.dir).unwrap_or_default();
+        let (digest, install_reason) = match workspace::describe_id(&pm, &catalog, &id) {
+            Ok(description) if description["removed"].as_i64().is_some() => (
+                description["digest"].as_str().map(str::to_string),
+                "install_removed",
+            ),
+            Ok(description) => (description["digest"].as_str().map(str::to_string), ""),
+            Err(_) => (None, "install_unavailable"),
+        };
+        let conversations = self
+            .store
+            .conversation_list(crate::master::ALIAS, install_id)?
+            .into_iter()
+            .filter(|thread| {
+                thread.install_id.as_deref() == Some(install_id)
+                    && !thread.archived
+                    && !thread.runs_as_home()
+                    && thread.subject.is_none()
+            })
+            .map(|thread| {
+                json!({
+                    "id": thread.id,
+                    "context_id": thread.context_id,
+                    "general": thread.is_general,
+                    "title": thread.title,
+                })
+            })
+            .collect::<Vec<_>>();
+        let grants = self
+            .store
+            .app_member_grants_list(&org, install_id)?
+            .into_iter()
+            .map(|grant| self.app_member_grant_row(&pm, &catalog, &grant))
+            .collect::<Vec<_>>();
+        // CAD-2215: the members a grant can name are the live roster the grant
+        // guard itself reads (`human_current_actor`), re-proved against this
+        // board's organization and the caller's current owner role. A public
+        // session whose live authority or roster cannot be re-proven fails the
+        // read; it never becomes an empty "nobody to add". A local operator
+        // has no public session at all, so it gets `null` and cannot grant.
+        let members = match &human {
+            Some(_) => {
+                let token = params
+                    .get("public_session")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let current = self.human_current_actor(token, params, peer_pid)?;
+                if current.scope.organization_id != org || current.roster.organization_id != org {
+                    return Err(Error::invalid(
+                        "tenancy_mismatch",
+                        "the live roster names a different organization",
+                    ));
+                }
+                if current.self_role != "owner" {
+                    return Err(Error::invalid(
+                        "not_an_owner",
+                        "the live roster does not name this operator as an owner",
+                    ));
+                }
+                Some(
+                    current
+                        .roster
+                        .members
+                        .iter()
+                        .map(|member| {
+                            json!({
+                                "subject_id": member.subject_id,
+                                "name": member.name,
+                                "role": member.role,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            None => None,
+        };
+        let grant_reason = self.app_member_grant_readiness(
+            install_id,
+            digest.as_deref(),
+            install_reason,
+            conversations.len(),
+            members.is_some(),
+        );
+        Ok(json!({
+            "install_id": install_id,
+            "digest": digest,
+            "install_reason": install_reason,
+            "conversations": conversations,
+            "grants": grants,
+            "members": members,
+            "grant_reason": grant_reason,
+        }))
+    }
+
+    /// CAD-2215: the one machine reason a grant cannot be written right now,
+    /// or `""` when one could. The order is the grant guard's own — install,
+    /// digest, approval, a live conversation, then the live roster — so the
+    /// panel never offers a grant the daemon would refuse. An unreadable
+    /// approval is a reason, never a reason to lose the whole list.
+    fn app_member_grant_readiness(
+        &self,
+        install_id: &str,
+        digest: Option<&str>,
+        install_reason: &'static str,
+        conversations: usize,
+        roster: bool,
+    ) -> &'static str {
+        if !install_reason.is_empty() {
+            return install_reason;
+        }
+        let Some(digest) = digest else {
+            return "digest_unavailable";
+        };
+        match self.store.app_capability_status(install_id, digest) {
+            Ok(status) if status.get("state").and_then(Value::as_str) == Some("approved") => {}
+            Ok(_) => return "not_approved",
+            Err(_) => return "capability_unavailable",
+        }
+        if conversations == 0 {
+            return "no_conversations";
+        }
+        if !roster {
+            return "roster_unavailable";
+        }
+        ""
+    }
+
+    /// `app_member_access_grant` — operator-only. Binds one exact conversation
+    /// of one live, approved installation to one `member_sub` that the live
+    /// roster proves is currently in this organization.
+    fn rpc_app_member_access_grant(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let human = self.explorer_human(params, None)?;
+        let install_id = required_str(params, "install_id")?;
+        let id = app_catalog::InstallationId::parse(install_id)?;
+        let member_sub = member_grant_subject(params)?;
+        let conversation_id = required_str(params, "conversation_id")?;
+        crate::proto::identifier(conversation_id, "conversation ID")?;
+        let expected = required_str(params, "expected_digest")?;
+        if !is_sha256_digest(expected) {
+            return Err(Error::rejected(
+                "expected_digest must be the installation's bundle digest",
+            ));
+        }
+        let org = self.member_grant_company()?;
+        if let Some(human) = &human {
+            if human.get("company").and_then(Value::as_str) != Some(org.as_str()) {
+                return Err(Error::invalid(
+                    "tenancy_mismatch",
+                    "the operator session belongs to a different board",
+                ));
+            }
+        }
+        let pm_dir = self.pm_dir()?;
+        let pm = self.pm_at(&pm_dir)?;
+        let catalog = app_catalog::Catalog::load(&pm.dir).unwrap_or_default();
+        let description = workspace::describe_id(&pm, &catalog, &id)
+            .map_err(|_| Error::rejected("unknown installation ID"))?;
+        if description["removed"].as_i64().is_some() {
+            return Err(Error::rejected(
+                "this installation is removed - restore it before granting access",
+            ));
+        }
+        let digest = description["digest"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("the installation has no bundle digest"))?;
+        if digest != expected {
+            return Err(Error::rejected(
+                "the installation changed - review the current version before granting access",
+            ));
+        }
+        if self
+            .store
+            .app_capability_status(install_id, digest)?
+            .get("state")
+            .and_then(Value::as_str)
+            != Some("approved")
+        {
+            return Err(Error::rejected(
+                "the current version is not approved - approve it before granting access",
+            ));
+        }
+        let thread = self
+            .store
+            .thread_by_id(conversation_id)?
+            .filter(|thread| {
+                thread.alias == crate::master::ALIAS
+                    && thread.install_id.as_deref() == Some(install_id)
+                    && !thread.archived
+                    && !thread.runs_as_home()
+                    && thread.subject.is_none()
+                    && thread.id == conversation_id
+            })
+            .ok_or_else(|| Error::rejected("conversation is unavailable for this installation"))?;
+        // Pin the conversation's exact existing context as a fact. A
+        // contextless conversation is admitted only as the installation's
+        // canonical General conversation.
+        if let Some(context) = thread.context_id.as_deref() {
+            self.store.app_context_proof(install_id, context)?;
+        } else if !thread.is_general {
+            return Err(Error::rejected(
+                "conversation has no context and is not the installation's General conversation",
+            ));
+        }
+        let by = human
+            .as_ref()
+            .and_then(|human| human.get("sub"))
+            .and_then(Value::as_str)
+            .unwrap_or("operator")
+            .to_string();
+        // The live owner/target roster proof runs HERE, after the
+        // installation, digest, approval, conversation and context reads and
+        // immediately before the write, so an owner demotion or target
+        // removal in flight fails closed. The steps are sequential, not one
+        // atomic transaction.
+        self.verified_grant_member(params, peer_pid, &member_sub)?;
+        let grant = self.store.app_member_grant_set(
+            &org,
+            &member_sub,
+            install_id,
+            conversation_id,
+            thread.context_id.as_deref(),
+            digest,
+            &by,
+        )?;
+        self.store.event_public(
+            DAEMON_ALIAS,
+            "app_member_access_granted",
+            json!({
+                "install_id": install_id,
+                "member_sub": member_sub,
+                "conversation_id": conversation_id,
+                "context_id": thread.context_id,
+                "install_digest": digest,
+                "company": org,
+                "by": by,
+                "by_kind": if human.is_some() { "board_operator" } else { "operator" },
+            }),
+        )?;
+        Ok(json!({
+            "install_id": install_id,
+            "grant": self.app_member_grant_row(&pm, &catalog, &grant),
+        }))
+    }
+
+    /// `app_member_access_revoke` — operator-only and idempotent. With a
+    /// `conversation_id` it revokes that exact row; without one it tombstones
+    /// every exact row this member holds for the installation. It needs no
+    /// live member session and no assistant binding.
+    fn rpc_app_member_access_revoke(&self, params: &Value) -> Result<Value> {
+        let human = self.explorer_human(params, None)?;
+        let install_id = required_str(params, "install_id")?;
+        app_catalog::InstallationId::parse(install_id)?;
+        let member_sub = member_grant_subject(params)?;
+        let org = self.member_grant_company()?;
+        if let Some(human) = &human {
+            if human.get("company").and_then(Value::as_str) != Some(org.as_str()) {
+                return Err(Error::invalid(
+                    "tenancy_mismatch",
+                    "the operator session belongs to a different board",
+                ));
+            }
+        }
+        let by = human
+            .as_ref()
+            .and_then(|human| human.get("sub"))
+            .and_then(Value::as_str)
+            .unwrap_or("operator")
+            .to_string();
+        let (grants, revoked, conversation_id) = match params.get("conversation_id") {
+            Some(_) => {
+                let conversation_id = required_str(params, "conversation_id")?;
+                crate::proto::identifier(conversation_id, "conversation ID")?;
+                let grant = self.store.app_member_grant_revoke(
+                    &org,
+                    &member_sub,
+                    install_id,
+                    conversation_id,
+                    &by,
+                )?;
+                let revoked = grant.is_some();
+                (
+                    grant.into_iter().collect::<Vec<_>>(),
+                    revoked,
+                    json!(conversation_id),
+                )
+            }
+            None => {
+                let grants = self.store.app_member_grants_revoke_member_install(
+                    &org,
+                    &member_sub,
+                    install_id,
+                    &by,
+                )?;
+                let revoked = !grants.is_empty();
+                (grants, revoked, Value::Null)
+            }
+        };
+        self.store.event_public(
+            DAEMON_ALIAS,
+            "app_member_access_revoked",
+            json!({
+                "install_id": install_id,
+                "member_sub": member_sub,
+                "conversation_id": conversation_id,
+                "company": org,
+                "grants": grants.len(),
+                "by": by,
+                "by_kind": if human.is_some() { "board_operator" } else { "operator" },
+            }),
+        )?;
+        Ok(json!({
+            "install_id": install_id,
+            "member_sub": member_sub,
+            "revoked": revoked,
+            "grants": grants.iter().map(Self::revoked_grant_row).collect::<Vec<_>>(),
+        }))
+    }
 }
 
 /// CAD-1374: one canonical workspace-effect frame. `human` is the verified
@@ -1060,6 +1706,19 @@ fn data_flags(manifest: &crate::issue::app::Manifest) -> (bool, bool) {
         .is_some_and(|s| !s.is_empty());
     let personal = data.and_then(|d| d["personal"].as_bool()).unwrap_or(false);
     (holds_records, personal)
+}
+
+/// CAD-2215: `member_sub` names the platform's exact member subject. It is
+/// never a handle and never normalized: padding, control characters and
+/// overlong values are refused rather than lossily matched.
+fn member_grant_subject(params: &Value) -> Result<String> {
+    let sub = required_str(params, "member_sub")?;
+    if sub.is_empty() || sub.len() > 256 || sub.trim() != sub || sub.chars().any(char::is_control) {
+        return Err(Error::rejected(
+            "member_sub must be the platform's exact member subject",
+        ));
+    }
+    Ok(sub.to_string())
 }
 
 /// `member_as` param → `Some(handle)` when present and tag-shaped.

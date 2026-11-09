@@ -505,7 +505,7 @@ impl Store {
         }
     }
 
-    pub(super) fn agent_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<Agent> {
+    pub(crate) fn agent_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<Agent> {
         conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent)
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Error::rejected("Unknown managed agent"),

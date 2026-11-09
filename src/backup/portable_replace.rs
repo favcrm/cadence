@@ -45,7 +45,6 @@ const ROLLBACK_PREFIX: &str = ".portable-rollback-";
 const LOCK_FILE: &str = "cadence.lock";
 const DB_FILE: &str = "cadence.sqlite3";
 const TRACKER_DIR: &str = "portable-tracker";
-const MANIFEST: &str = "manifest.json";
 
 /// Native operator proof. Opaque: its only field is private, and it is minted
 /// by [`NativeOperatorProof::mint`], which is `pub(crate)`. Call sites are
@@ -122,8 +121,8 @@ pub enum Entry {
 /// carries no authority and changes nothing, and it uses the same inventory
 /// the mutating path binds.
 pub fn preflight(source: &Path, destination: &Path, controller_state: &Path) -> Result<Value> {
-    let manifest_digest = package_digest(source)?;
-    verify_package_for_replace(source)?;
+    let verified = verify_package_for_replace(source)?;
+    let manifest_digest = &verified.manifest_sha256;
     let (_, target) = boundaries(controller_state, destination, source)?;
     let snap = snapshot_target(&target)?;
     Ok(json!({
@@ -135,25 +134,9 @@ pub fn preflight(source: &Path, destination: &Path, controller_state: &Path) -> 
     }))
 }
 
-/// sha256 of the exact `manifest.json` bytes: the package identity.
+/// sha256 of the exact manifest bytes; this does not verify the package.
 pub fn package_digest(source: &Path) -> Result<String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(&read_manifest_bytes(source)?)
-    ))
-}
-
-fn read_manifest_bytes(source: &Path) -> Result<Vec<u8>> {
-    let path = source.join(MANIFEST);
-    let meta = path
-        .symlink_metadata()
-        .map_err(|e| Error::rejected(format!("cannot read package manifest: {e}")))?;
-    if !meta.is_file() || meta.nlink() != 1 {
-        return Err(Error::rejected(
-            "package manifest is not a plain single-link file",
-        ));
-    }
-    fs::read(&path).map_err(|e| Error::rejected(format!("cannot read package manifest: {e}")))
+    super::portable::package_manifest_digest(source)
 }
 
 /// Replacement. The proof must bind exactly `req`; any mismatch refuses
@@ -175,16 +158,15 @@ pub fn replace_authorized(proof: &NativeOperatorProof, req: &ReplaceRequest) -> 
             "operator proof does not bind this request; nothing was written",
         ));
     }
-    // Bind the package to the exact manifest bytes read here, and parse the
-    // verified manifest from those same bytes. A source change between the
-    // digest and verify steps cannot swap in an unapproved package.
-    let manifest_bytes = read_manifest_bytes(&req.source)?;
-    if format!("{:x}", Sha256::digest(&manifest_bytes)) != req.expected_package_digest {
+    // Bind the request to one verified private snapshot. Only `boundaries`
+    // keeps the original source spelling, for its overlap checks.
+    let verified = verify_package_for_replace(&req.source)?;
+    if verified.manifest_sha256 != req.expected_package_digest {
         return Err(Error::rejected(
             "package digest does not match expected_package_digest; nothing was written",
         ));
     }
-    let manifest = verify_package_for_replace(&req.source)?;
+    let manifest = verified.manifest.clone();
     let (_controller, target) = boundaries(&req.controller_state, &req.destination, &req.source)?;
     let parent = target
         .parent()
@@ -207,7 +189,7 @@ pub fn replace_authorized(proof: &NativeOperatorProof, req: &ReplaceRequest) -> 
     let stage = parent.join(format!(".portable-replace-stage-{nonce}"));
     let rollback = parent.join(format!("{ROLLBACK_PREFIX}{nonce}"));
     fs::DirBuilder::new().mode(0o700).create(&stage)?;
-    if let Err(error) = stage_inactive_members(&req.source, &stage, &manifest) {
+    if let Err(error) = stage_inactive_members(verified.snapshot_root(), &stage, &manifest) {
         let _ = fs::remove_dir_all(&stage);
         return Err(error);
     }

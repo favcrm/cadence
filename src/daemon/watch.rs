@@ -19,6 +19,10 @@ const WAL_TICK: Duration = Duration::from_secs(60);
 /// starts after its deadline.
 const MONITOR_TICK: Duration = Duration::from_secs(1);
 
+/// A request also wakes the worker immediately; this bounds retries after
+/// issue release or a temporarily unavailable authority.
+const ASSIST_REQUEST_TICK: Duration = Duration::from_secs(10);
+
 /// CAD-250 N3: how long a nudge may wait in the queue (a busy or
 /// menu-blocked pane) before it is cancelled as stale steering.
 const NUDGE_TTL_SECS: u64 = 900;
@@ -305,6 +309,48 @@ impl StallView {
 }
 
 impl Shared {
+    /// Promote accepted requests independently of the requester's connection.
+    /// The joined worker is the only autonomous writer and exits before the
+    /// daemon releases its lease.
+    pub(super) fn run_assist_request_watch(&self) {
+        struct Running<'a>(&'a AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+
+        if self
+            .assist_request_worker_running
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let _running = Running(&self.assist_request_worker_running);
+        loop {
+            let ticket = self.assist_requests_changed.ticket();
+            if self.closing.load(Ordering::SeqCst) {
+                break;
+            }
+            match self.route_member_job_requests() {
+                Ok(outcomes) => {
+                    #[cfg(test)]
+                    if let Some(observer) = &self.assist_request_sweep_observer {
+                        for outcome in &outcomes {
+                            observer(&outcome.request_id, outcome.outcome);
+                        }
+                    }
+                    if outcomes.iter().any(|outcome| outcome.outcome == "created") {
+                        self.wake();
+                    }
+                }
+                Err(error) => eprintln!("cadence: member request sweep failed: {error}"),
+            }
+            self.assist_requests_changed
+                .wait_if_unchanged(ticket, Instant::now() + ASSIST_REQUEST_TICK);
+        }
+    }
+
     // ---- Stall watch: report silent turns, never touch them (CAD-52) ----
 
     /// Stall-watch logic now: wall clock plus the test offset (`0` in

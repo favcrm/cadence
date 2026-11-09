@@ -5,6 +5,7 @@
 
 use super::*;
 
+#[allow(clippy::too_many_arguments)] // mirrors the command's flags one-for-one
 pub(super) fn run(
     state_dir: PathBuf,
     out: PathBuf,
@@ -13,6 +14,7 @@ pub(super) fn run(
     apps: Vec<String>,
     snapshot_working_tree: bool,
     redact_history_secrets: bool,
+    attest_chat_custody_absent: bool,
 ) -> Result<i32> {
     if !portable {
         print_json(&cadence_agent::backup::export(&state_dir, &out)?);
@@ -23,6 +25,7 @@ pub(super) fn run(
         scope: cadence_agent::backup::portable::Scope::Coordination,
         tracker,
         redact_history_secrets,
+        attest_chat_custody_absent,
     };
     let report = if snapshot_working_tree {
         cadence_agent::backup::portable::export_portable_snapshot_selected(

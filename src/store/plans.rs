@@ -14,6 +14,9 @@ use super::messages::{row_message, Message, Priority};
 use super::StoreConn;
 use super::{is_task_terminal, is_terminal, now, take_bytes, Sender, Store};
 
+const OPEN_JOB_FOR_ISSUE: &str =
+    "SELECT id FROM jobs WHERE issue_id=? AND state NOT IN ('done','cancelled','failed')";
+
 /// CAD-1239: an archived worker cannot be assigned new work or have a
 /// terminal task reopened onto it. Runs inside the assignment transaction.
 fn refuse_archived_assignee(worker: &Agent) -> Result<()> {
@@ -95,6 +98,27 @@ pub struct Task {
     pub error: Option<String>,
     pub created: f64,
     pub updated: f64,
+}
+
+/// One durable dispatch/report event for a task. `None` means the field
+/// was missing or the payload was unreadable — never a value to guess at.
+#[derive(Clone, Debug)]
+pub(crate) struct TaskHistoryEvent {
+    pub kind: String,
+    pub alias: String,
+    pub task: Option<String>,
+    pub job: Option<String>,
+    pub revision: Option<i64>,
+    pub message: Option<String>,
+    pub assignee: Option<String>,
+    /// `Some(None)` is an explicitly recorded null (a legitimate SHA-less
+    /// completion); `None` means the field was absent. `sha_bad` marks a
+    /// field present with a non-string, non-null type.
+    pub sha: Option<Option<String>>,
+    pub sha_bad: bool,
+    /// The project bound at dispatch. `None` on a pre-cutover or corrupt
+    /// event — historical recovery refuses rather than rebinding.
+    pub project: Option<String>,
 }
 
 /// A verdict: the QA record bound to one exact `(task, revision, sha)`.
@@ -279,6 +303,10 @@ pub(super) struct DispatchPreparation<'a> {
     pub(super) plan: &'a DispatchPlan,
     /// Absent only when the captured plan already names an accepted kickoff.
     pub(super) delivery: Option<(String, super::messages::IssueSelection)>,
+    /// The ticket's project at this dispatch, recorded in the durable
+    /// `task_dispatched` event so a later recovery never re-derives it from
+    /// the ticket's current location.
+    pub(super) project: Option<&'a str>,
 }
 
 impl Store {
@@ -339,6 +367,18 @@ impl Store {
                 }
                 other => other.into(),
             })
+    }
+
+    /// Optional job read: `Ok(None)` only when no row exists. Any other
+    /// store failure propagates, so a caller can never mistake a failed
+    /// read for an absent job.
+    pub(crate) fn job_opt(&self, id: &str) -> Result<Option<Job>> {
+        let conn = self.conn();
+        match conn.query_row("SELECT * FROM jobs WHERE id=?", [id], row_job) {
+            Ok(job) => Ok(Some(job)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn job(&self, id: &str) -> Result<Job> {
@@ -455,6 +495,13 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub(crate) fn has_open_job_for_issue(&self, issue: &str) -> Result<bool> {
+        Ok(self
+            .conn()
+            .query_opt(OPEN_JOB_FOR_ISSUE, [issue], |_| Ok(()))?
+            .is_some())
+    }
+
     pub fn tasks_for_job(&self, job_id: &str) -> Result<Vec<Task>> {
         self.read_tx(|conn| {
             let stmt_sql = "SELECT * FROM tasks WHERE job_id=? ORDER BY created";
@@ -462,6 +509,39 @@ impl Store {
                 .query_vec(stmt_sql, [job_id], row_task)
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    /// Resolve task ids to their jobs' issue bindings in bounded batches.
+    pub(crate) fn task_issue_bindings<S: AsRef<str>>(
+        &self,
+        ids: &[S],
+    ) -> Result<std::collections::HashMap<String, Option<String>>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        self.read_tx(|conn| {
+            let mut bindings = std::collections::HashMap::with_capacity(ids.len());
+            for chunk in ids.chunks(500) {
+                let mut placeholders = String::with_capacity(chunk.len() * 2 - 1);
+                for index in 0..chunk.len() {
+                    if index > 0 {
+                        placeholders.push(',');
+                    }
+                    placeholders.push('?');
+                }
+                let sql = format!(
+                    "SELECT t.id, NULLIF(j.issue_id, '') FROM tasks t
+                     LEFT JOIN jobs j ON j.id = t.job_id WHERE t.id IN ({placeholders})"
+                );
+                let rows = conn.query_vec(
+                    &sql,
+                    rusqlite::params_from_iter(chunk.iter().map(|id| id.as_ref())),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )?;
+                bindings.extend(rows);
+            }
+            Ok(bindings)
         })
     }
 
@@ -507,6 +587,77 @@ impl Store {
         })
     }
 
+    /// Native history for exactly one job/task: the durable
+    /// `task_dispatched` and `task_reported` rows, oldest first. Scoped by
+    /// the stored job/task columns. A payload field that is missing or
+    /// unreadable stays `None` so the caller refuses rather than guesses.
+    pub(crate) fn task_history_events(
+        &self,
+        job: &str,
+        task: &str,
+    ) -> Result<Vec<TaskHistoryEvent>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "SELECT kind,alias,payload FROM events
+                 WHERE job_id=? AND task_id=?
+                   AND kind IN ('task_dispatched','task_reported')
+                 ORDER BY seq",
+                params![job, task],
+                |row| {
+                    let payload: String = row.get(2)?;
+                    let value: Option<Value> = serde_json::from_str(&payload).ok();
+                    let text = |key: &str| {
+                        value
+                            .as_ref()
+                            .and_then(|value| value.get(key))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    };
+                    Ok(TaskHistoryEvent {
+                        kind: row.get(0)?,
+                        alias: row.get(1)?,
+                        task: text("task"),
+                        job: text("job"),
+                        revision: value
+                            .as_ref()
+                            .and_then(|value| value.get("revision"))
+                            .and_then(Value::as_i64),
+                        message: text("message"),
+                        assignee: text("assignee"),
+                        sha: match value.as_ref().and_then(|value| value.get("sha")) {
+                            None => None,
+                            Some(Value::Null) => Some(None),
+                            Some(Value::String(sha)) => Some(Some(sha.clone())),
+                            Some(_) => None,
+                        },
+                        sha_bad: matches!(
+                            value.as_ref().and_then(|value| value.get("sha")),
+                            Some(Value::Bool(_))
+                                | Some(Value::Number(_))
+                                | Some(Value::Array(_))
+                                | Some(Value::Object(_))
+                        ),
+                        project: text("project"),
+                    })
+                },
+            )?)
+        })
+    }
+
+    /// Every durable dispatch message the store wrote for this task,
+    /// oldest first. Native rows only; nothing is parsed from prose.
+    pub(crate) fn task_dispatch_messages(&self, task: &str) -> Result<Vec<Message>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "SELECT * FROM messages
+                 WHERE task_id=? AND source='job_dispatch'
+                 ORDER BY created, rowid",
+                params![task],
+                row_message,
+            )?)
+        })
+    }
+
     /// An alias's non-terminal task assignments — derived, never stored.
     pub fn tasks_for_assignee(&self, alias: &str) -> Result<Vec<Task>> {
         self.read_tx(|conn| {
@@ -544,26 +695,20 @@ impl Store {
         })
     }
 
-    /// CAD-1752: the issue ids of each assignee's non-terminal tasks (a
-    /// task's job binds the issue), for `agent list --project`.
-    pub fn open_task_issues_by_assignee(
+    /// The issue binding of each assigned, non-terminal task in the fleet.
+    pub(crate) fn open_task_issue_bindings(
         &self,
-    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    ) -> Result<std::collections::HashMap<String, Option<String>>> {
         self.read_tx(|conn| {
             let rows = conn.query_vec(
-                "SELECT t.assignee, j.issue_id FROM tasks t JOIN jobs j ON j.id = t.job_id
-                 WHERE t.assignee IS NOT NULL AND COALESCE(j.issue_id,'') != ''
-                 AND t.state NOT IN ('verified','done','cancelled','failed')
-                 ORDER BY t.updated",
+                "SELECT t.id, NULLIF(j.issue_id, '') FROM tasks t
+                 LEFT JOIN jobs j ON j.id = t.job_id
+                 WHERE t.assignee IS NOT NULL
+                 AND t.state NOT IN ('verified','done','cancelled','failed')",
                 [],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )?;
-            let mut by_assignee: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            for (assignee, issue) in rows {
-                by_assignee.entry(assignee).or_default().push(issue);
-            }
-            Ok(by_assignee)
+            Ok(rows.into_iter().collect())
         })
     }
 
@@ -666,14 +811,8 @@ impl Store {
                 return Ok((true, existing));
             }
             if let Some(issue) = issue_id {
-                let holder: Option<String> = tx
-                    .query_row(
-                        "SELECT id FROM jobs WHERE issue_id=?
-                                 AND state NOT IN ('done','cancelled','failed')",
-                        [issue],
-                        |r| r.get(0),
-                    )
-                    .ok();
+                let holder: Option<String> =
+                    tx.query_opt(OPEN_JOB_FOR_ISSUE, [issue], |r| r.get(0))?;
                 if let Some(holder) = holder {
                     return Err(Error::rejected(format!(
                         "Issue {issue} already maps to job '{holder}' — \
@@ -1003,6 +1142,7 @@ impl Store {
         by: &str,
         expect: Option<&AssistDispatchExpect>,
         stall_secs: Option<i64>,
+        project: Option<&str>,
     ) -> Result<(Task, String, bool, bool)> {
         self.dispatch_task_inner(
             &plan.task.id,
@@ -1012,7 +1152,11 @@ impl Store {
             Some(&plan.worker),
             expect,
             stall_secs,
-            Some(DispatchPreparation { plan, delivery }),
+            Some(DispatchPreparation {
+                plan,
+                delivery,
+                project,
+            }),
         )
     }
 
@@ -1094,6 +1238,21 @@ impl Store {
             Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
             let job = self.job_in(&tx, &task.job_id)?;
+            let private = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assist_requests WHERE job=?)",
+                [job.id.as_str()],
+                |r| r.get::<_, bool>(0),
+            )?;
+            if private {
+                let project = prepared.as_ref().and_then(|prepared| prepared.project);
+                if project.is_none_or(|project| project.trim().is_empty()) {
+                    return Err(Error::rejected(format!(
+                        "task dispatch refused: private job '{}' has no proven \
+                         dispatch-time project",
+                        job.id
+                    )));
+                }
+            }
             self.task_dispatch_authority_in(&tx, &task, expect)?;
             if job.state != "open" {
                 return Err(Error::rejected(format!(
@@ -1198,6 +1357,7 @@ impl Store {
                 .simple()
                 .to_string()
             });
+            let project = prepared.as_ref().and_then(|prepared| prepared.project);
             if let Some(prepared) = prepared.as_ref() {
                 prepared
                     .plan
@@ -1271,7 +1431,8 @@ impl Store {
                 &job.pm_alias,
                 "task_dispatched",
                 json!({"task": task_id, "job": job.id, "assignee": assignee,
-                               "revision": revision, "message": kickoff, "by": by}),
+                               "revision": revision, "message": kickoff, "by": by,
+                               "project": project}),
                 Some(&job.id),
                 Some(task_id),
             )?;

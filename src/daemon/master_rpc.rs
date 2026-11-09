@@ -55,10 +55,10 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "task_show",
     "model_defaults_get",
     // CAD-552: the reads behind the completed verb allowlist — `issue
-    // ls --json`'s work block (`project_work_approvals`) and the
-    // `overview`/`status` sections (`monitor_*`, `agent_probe`) — all
-    // Rule::Read. Self-scoped reads like `agent_requests` stay refused:
-    // empty would pass for "nothing pending".
+    // ls --json`'s work block and the `overview`/`status` sections.
+    // Project-scoped handlers apply their own caller and policy checks.
+    // Self-scoped reads like `agent_requests` stay refused: empty would
+    // pass for "nothing pending".
     "project_work_approvals",
     "monitor_list",
     "monitor_alerts",
@@ -586,9 +586,18 @@ impl Shared {
         // it (CAD-323).
         if out["dispatched"] != json!(false) {
             // CAD-431: the ticket enters the review loop; its worker's
-            // done report is what moves it on.
-            if let Err(e) = self.delivery_start(id, &ticket.project, &to) {
-                tracing::warn!("delivery record for {id}: {e}");
+            // done report is what moves it on. CAD-2215: the accepted
+            // kickoff id is the record's exact native receipt — without
+            // one there is no ordinary record to open.
+            match out["message"].as_str().filter(|m| !m.is_empty()) {
+                Some(message) => {
+                    if let Err(e) = self.delivery_start(id, &ticket.project, &to, message) {
+                        tracing::warn!("delivery record for {id}: {e}");
+                    }
+                }
+                None => tracing::warn!(
+                    "delivery record for {id}: the dispatch answered no accepted message id"
+                ),
             }
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
