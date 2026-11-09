@@ -114,6 +114,50 @@ token or terminate remote sessions. Device credentials currently expire after
 30 days; the protocol has no refresh token or token expiry introspection field.
 For imported tokens, expiry is unknown locally and checked by the issuer.
 
+## Managed agents and saved hosted logins (CAD-2148)
+
+**A managed agent credential is not a boundary around the member's saved
+login.** File mode `0600` restricts access by ordinary users with other UIDs,
+not by privileged processes or an unconfined process running as the same user.
+`CADENCE_ALIAS` is an accidental-change guard, not caller authentication. A
+managed CLI currently reads the member's login to mint its claim-bound agent
+credential; some operations and compatibility fallbacks still use the login.
+See the [hosted-workspace guide](guides/hosted-workspace.md) for those paths
+and their attribution.
+
+For a local endpoint, assume a same-user agent can read the member's login
+unless the actual launch and every route to that credential have been
+independently isolated. Cadence does not currently establish that boundary
+for these local endpoints:
+
+- **Codex managed stdio and managed-WS:** no hosted-login isolation is
+  established. The managed-WS loopback endpoint is unauthenticated;
+  loopback is not same-user isolation.
+- **Claude managed worker:** Cadence's Landlock wrapper is for the master;
+  it does not wrap an ordinary managed worker.
+- **Pi or OMP managed worker:** Landlock is opt-in and limits filesystem
+  paths. Explicit extra grants or another allowed path can include the login.
+- **Claude, Devin or Cursor PTY:** a normal same-user launch has no
+  separate-user credential boundary. Real profiles refuse the split-UID path
+  until native session preparation is supported.
+
+The remote Devin and cloud sandbox adapters launch no local actor. That does
+not establish what credentials or access the remote runtime receives.
+
+Pi/OMP Landlock does not gate network access or path-named Unix-socket
+connections and is not a capability sandbox against arbitrary execution.
+The protected split-UID managed-Pi path unconditionally refuses to launch in
+the current implementation. Enabling it needs future implementation and
+external sealed-helper, namespace-policy and restore-lineage pins; supplying
+those pins alone is not enough. Do not treat either an agent credential or a
+`confined` label as proof that a human login is unreachable.
+
+If that login must remain private from an agent, do not rely on same-user
+confinement to protect it. Use a separately controlled account or host, with
+its own authorized identity, only after verifying its filesystem, process and
+socket access. Do not copy the member's login into an agent environment to
+make a hosted command work.
+
 ## Hosted login and remote org transport (CAD-1019, CAD-1329)
 
 For a first login, run `cadence login`. The CLI opens the trusted hosted
