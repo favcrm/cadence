@@ -634,8 +634,8 @@ fn assignment_custody_failed(
     if let Some(claim) = assignment.claim_id.as_deref() {
         write!(&mut message, "; claim_id={claim}").expect("writing to a String cannot fail");
     }
-    // Claim, report and reassign carry `operation_id`; queue's key is
-    // `idempotency_key`. Name whichever the body holds.
+    // Per path: queue sends `idempotency_key`, reassignment `operation_id`; claim and
+    // report send neither (they name `claim_id` above and `expected_generation` below).
     for key in ["operation_id", "idempotency_key"] {
         if let Some(value) = body
             .get(key)
@@ -653,6 +653,9 @@ fn assignment_custody_failed(
         "; inspect `cadence agent assignments` in the same selected workspace and reconcile \
          the original assignment before deciding whether to retry; do not replay blindly",
     );
+    if body.get("idempotency_key").is_some() {
+        message.push_str("; repeating the same queue command reuses this idempotency_key");
+    }
     Error::internal(message)
 }
 

@@ -1095,6 +1095,25 @@ fn lowercase_chars(text: &str) -> impl Iterator<Item = char> + '_ {
     text.chars().flat_map(char::to_lowercase)
 }
 
+// Seam note (CAD-2096): mirrors of native settings rules.
+// The receipt validators in this file re-state, read-only, what the native settings
+// path normalizes or projects. Owner: the native side. Families and counterparts:
+//   settings_snapshot_document          <- agent_settings::build_snapshot (shape)
+//   normalized_pin_pair / provider_pin_matches <- normalize_pin / parse_pin_text
+//   canonical_model_id                  <- model_defaults::validate_model_id
+//   settings_field/tri/trimmed matchers, opt_bool semantics <- settings_rpc::opt_bool
+//   settings_apply_scope                <- agent_settings::parse_overlay
+//   settings_apply_exact, settings_apply_pins_exact <- pi_pins and project_pi
+//   settings_pin_removed                <- the Pi-extension pin retention rule
+//   settings_same_id_set                <- post-apply id sets
+//   settings_rename_applied             <- the native same-id refusal
+//   settings_sync_files_exact           <- export_status
+// They are not shared code because the native functions return `Result` and write
+// state, while this side is a read-only, fail-closed check of what a hosted tenant
+// says it committed. Update rule: a change to native normalization OR projection
+// changes the matching validator here in the same PR, with receipt tests for the old
+// and new spelling, since a hosted tenant may lag the client.
+
 /// A native settings save answers the committed snapshot document: a
 /// nonempty revision token plus the `config` document it wrote. The native
 /// `build_snapshot` always carries the five row tables and the two maps, so a
@@ -1971,16 +1990,6 @@ fn settings_sync_files_exact(
         }
 }
 
-/// Seam note (CAD-2096): the receipt validators in this file (`normalized_pin_pair`,
-/// `provider_pin_matches`, `canonical_model_id`, the trim/tri-state field matchers and
-/// `settings_snapshot_document`) deliberately mirror native normalization in
-/// `agent_settings.rs` (`normalize_pin`/`parse_pin_text`, `build_snapshot`) and
-/// `model_defaults::validate_model_id`. The native module owns the rules; this side is
-/// a read-only check of what a hosted tenant says it committed, kept separate so a
-/// malformed or foreign receipt is refused without the hosted wire taking a native
-/// dependency. Update rule: any change to native settings normalization must change
-/// the matching validator here in the same PR, with a receipt test for the old and new
-/// spelling, since a hosted tenant may lag the client.
 /// A settings write answers its operation's own receipt family. The snapshot
 /// document covers the config writes; the nested shapes, the catalogue and
 /// the grant decisions answer their own bounded records. `fleet.check` is a
