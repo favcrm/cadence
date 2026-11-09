@@ -384,27 +384,21 @@ function entryText(model: unknown): string | null {
 }
 
 /**
- * The newest failed blocking compaction that no later record supersedes, or
- * `null`.
+ * Whether a blocking compaction the run itself waited on ended in a terminal
+ * failure.
  *
- * Only a compaction the run itself waited on counts: the engine creates a
- * blocking threshold compaction as a child of the generation that needs it,
- * while a background one is conversation-owned and may fail while its
- * concurrent generation still succeeds. A failed blocking compaction settles
- * its run without an assistant entry, so the board has no other durable trace
- * to name.
+ * Only a compaction the run waited on counts: the engine creates a blocking
+ * threshold compaction as a child of the generation that needs it, while a
+ * background one is conversation-owned and may fail while its concurrent
+ * generation still succeeds. The owning generation must also have settled —
+ * the child commits its outcome before the generation reads it and ends the
+ * run — so a read between those commits reports nothing yet.
  *
- * Record ids come from one monotonic counter, so the newest entry's id orders
- * this failure against everything the transcript already shows, and the task's
- * own id can stand in for a position: it is greater than every earlier record
- * and less than every later one, so no later entry can ever reuse it.
+ * The message is the caller's own sentence: a failed compaction's stored error
+ * may carry provider prose, and this adapter never hands that out.
  */
-export function readCompactionFailure(
-  sql: TaskSql,
-  conversationId: number,
-  afterEntryId: number,
-): { readonly id: number; readonly message: string } | null {
-  if (!Number.isSafeInteger(conversationId) || conversationId <= 0) return null;
+export function readCompactionFailure(sql: TaskSql, conversationId: number): boolean {
+  if (!Number.isSafeInteger(conversationId) || conversationId <= 0) return false;
   try {
     const rows = sql
       .exec(
@@ -415,26 +409,24 @@ export function readCompactionFailure(
       )
       .toArray();
     const row = rows[0];
-    if (row === undefined || !Number.isSafeInteger(row.id)) return null;
-    const id = Number(row.id);
-    if (Number.isSafeInteger(afterEntryId) && id <= afterEntryId) return null;
+    if (row === undefined || !Number.isSafeInteger(row.id)) return false;
     const record = parseRecord(row.record);
-    if (!Number.isSafeInteger(record?.owner)) return null;
+    const owner = record?.owner;
+    if (!Number.isSafeInteger(owner)) return false;
     const state = record?.state;
-    if (typeof state !== "object" || state === null || Array.isArray(state)) return null;
+    if (typeof state !== "object" || state === null || Array.isArray(state)) return false;
     const terminal = state as Record<string, unknown>;
-    if (terminal.status !== "terminal") return null;
+    if (terminal.status !== "terminal") return false;
     const outcome = terminal.outcome;
-    if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome))
-      return null;
-    const failed = outcome as Record<string, unknown>;
-    if (failed.status !== "failed") return null;
-    const error = failed.error;
-    if (typeof error !== "object" || error === null || Array.isArray(error)) return null;
-    const message = (error as Record<string, unknown>).message;
-    return typeof message === "string" && message.length > 0 ? { id, message } : null;
+    if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome)) return false;
+    const status = (outcome as Record<string, unknown>).status;
+    if (status !== "failed" && status !== "faulted") return false;
+    const parent = sql
+      .exec(`SELECT status FROM pi_tasks WHERE id = ?`, owner as number)
+      .toArray()[0];
+    return parent === undefined || parent.status === "terminal";
   } catch {
-    return null;
+    return false;
   }
 }
 

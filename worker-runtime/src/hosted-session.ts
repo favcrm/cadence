@@ -26,6 +26,7 @@ import type {
   ThreadContext,
   ThreadEntry,
 } from "./contract.ts";
+import { COMPACTION_FAILURE_TEXT } from "./contract.ts";
 import { assistantIdentityText } from "./assistant-identity.ts";
 import { ContextBudgetProofs } from "./context-budget-proofs.ts";
 import {
@@ -595,25 +596,19 @@ export class HostedSession<
     const conversation = await this.harness.conversation(
       this.harness.session().id,
     );
-    const records = await readAllRecords<Cursor>((cursor, limit) =>
-      conversation.entries(
-        { order: "ascending" },
-        limit,
-        cursor,
-        BACKGROUND_CONTEXT,
-      ),
-    );
     return projectedThreadEntries(
-      records,
+      await readAllRecords<Cursor>((cursor, limit) =>
+        conversation.entries(
+          { order: "ascending" },
+          limit,
+          cursor,
+          BACKGROUND_CONTEXT,
+        ),
+      ),
       includeThinking,
       this.options.projectThread,
       (entry, message) => this.contextBudgetProofs.matches(entry, message),
       (entry, message) => this.contextBudgetProofs.settled(entry, message),
-      readCompactionFailure(
-        this.ctx.storage.sql as unknown as TaskSql,
-        conversation.id,
-        records.at(-1)?.id ?? 0,
-      ),
     );
   }
 
@@ -982,7 +977,16 @@ export class HostedSession<
       this.pendingOperations(),
       this.modelLabel(),
     ]);
-    return { ...operationStatus(pending), model };
+    return {
+      ...operationStatus(pending),
+      model,
+      compactionFailure: readCompactionFailure(
+        this.ctx.storage.sql as unknown as TaskSql,
+        Number(this.harness.session().id),
+      )
+        ? COMPACTION_FAILURE_TEXT
+        : null,
+    };
   }
 
   /**

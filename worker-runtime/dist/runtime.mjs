@@ -55706,6 +55706,11 @@ function createAI(settings) {
   });
 }
 
+// src/contract.ts
+var COMPACTION_FAILURE_TEXT = "The conversation could not be compacted. Start a fresh conversation or split the task and retry.";
+var BOARD_MESSAGE_KIND = "tenant.board.message";
+var OPERATIONAL_SKILL_VERSION = "tenant-operations-1";
+
 // src/assistant-identity.ts
 var IDENTITY_CONTEXT_MAX = 64 * 1024;
 var BOOTSTRAP_STATES = [
@@ -56175,41 +56180,36 @@ function entryText(model) {
     return null;
   return message.content;
 }
-function readCompactionFailure(sql, conversationId, afterEntryId) {
+function readCompactionFailure(sql, conversationId) {
   if (!Number.isSafeInteger(conversationId) || conversationId <= 0)
-    return null;
+    return false;
   try {
     const rows = sql.exec(`SELECT id, record FROM pi_tasks
           WHERE conversation_id = ? AND kind = '"pi.compaction"' AND status = 'terminal'
           ORDER BY id DESC LIMIT 1`, conversationId).toArray();
     const row = rows[0];
     if (row === undefined || !Number.isSafeInteger(row.id))
-      return null;
-    const id = Number(row.id);
-    if (Number.isSafeInteger(afterEntryId) && id <= afterEntryId)
-      return null;
+      return false;
     const record = parseRecord(row.record);
-    if (!Number.isSafeInteger(record?.owner))
-      return null;
+    const owner = record?.owner;
+    if (!Number.isSafeInteger(owner))
+      return false;
     const state = record?.state;
     if (typeof state !== "object" || state === null || Array.isArray(state))
-      return null;
+      return false;
     const terminal = state;
     if (terminal.status !== "terminal")
-      return null;
+      return false;
     const outcome = terminal.outcome;
     if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome))
-      return null;
-    const failed = outcome;
-    if (failed.status !== "failed")
-      return null;
-    const error = failed.error;
-    if (typeof error !== "object" || error === null || Array.isArray(error))
-      return null;
-    const message = error.message;
-    return typeof message === "string" && message.length > 0 ? { id, message } : null;
+      return false;
+    const status = outcome.status;
+    if (status !== "failed" && status !== "faulted")
+      return false;
+    const parent = sql.exec(`SELECT status FROM pi_tasks WHERE id = ?`, owner).toArray()[0];
+    return parent === undefined || parent.status === "terminal";
   } catch {
-    return null;
+    return false;
   }
 }
 function parseRecord(stored) {
@@ -56740,12 +56740,6 @@ class ModelTaskContext {
 
 // src/operation-scope.ts
 import { createHash } from "node:crypto";
-
-// src/contract.ts
-var BOARD_MESSAGE_KIND = "tenant.board.message";
-var OPERATIONAL_SKILL_VERSION = "tenant-operations-1";
-
-// src/operation-scope.ts
 var CREATE_TABLE2 = `CREATE TABLE IF NOT EXISTS tenant_operation_scopes (
     operation_id TEXT PRIMARY KEY,
     install_id TEXT,
@@ -57787,30 +57781,9 @@ function toolCallText(name, args) {
 function createdAt(timestamp) {
   return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0 ? { created: new Date(timestamp).toISOString() } : {};
 }
-function projectedThreadEntries(records, includeThinking, project, budgetProof, settledBudgetProof, unansweredCompactionFailure) {
+function projectedThreadEntries(records, includeThinking, project, budgetProof, settledBudgetProof) {
   const entries = threadEntries(records, includeThinking, budgetProof, settledBudgetProof);
-  const projected = project ? [...project(entries)] : entries;
-  const failure = unansweredCompactionFailure ?? null;
-  if (failure !== null) {
-    let lastOperator = -1;
-    for (let index = projected.length - 1;index >= 0; index--)
-      if (projected[index].role === "operator") {
-        lastOperator = index;
-        break;
-      }
-    if (lastOperator !== -1 && !projected.slice(lastOperator + 1).some((entry) => entry.role === "agent" && entry.kind === "turn_result"))
-      projected.push({
-        seq: failure.id,
-        role: "agent",
-        kind: "turn_result",
-        text: "",
-        payload: {
-          status: "failed",
-          error: failure.message.includes(CONTEXT_BUDGET_EXCEEDED_TEXT) ? CONTEXT_BUDGET_EXCEEDED_TEXT : failedTurnReason(failure.message)
-        }
-      });
-  }
-  return projected;
+  return project ? [...project(entries)] : entries;
 }
 var RESET_KIND = "pi.reset";
 var COMPACTION_KIND = "pi.compaction";
@@ -58220,8 +58193,7 @@ data: ${JSON.stringify(entry)}
   }
   async transcript(includeThinking) {
     const conversation = await this.harness.conversation(this.harness.session().id);
-    const records = await readAllRecords((cursor, limit) => conversation.entries({ order: "ascending" }, limit, cursor, BACKGROUND_CONTEXT));
-    return projectedThreadEntries(records, includeThinking, this.options.projectThread, (entry, message) => this.contextBudgetProofs.matches(entry, message), (entry, message) => this.contextBudgetProofs.settled(entry, message), readCompactionFailure(this.ctx.storage.sql, conversation.id, records.at(-1)?.id ?? 0));
+    return projectedThreadEntries(await readAllRecords((cursor, limit) => conversation.entries({ order: "ascending" }, limit, cursor, BACKGROUND_CONTEXT)), includeThinking, this.options.projectThread, (entry, message) => this.contextBudgetProofs.matches(entry, message), (entry, message) => this.contextBudgetProofs.settled(entry, message));
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;
@@ -58379,7 +58351,11 @@ data: ${JSON.stringify(masterState(status.model, status, context?.conversationId
       this.pendingOperations(),
       this.modelLabel()
     ]);
-    return { ...operationStatus(pending), model };
+    return {
+      ...operationStatus(pending),
+      model,
+      compactionFailure: readCompactionFailure(this.ctx.storage.sql, Number(this.harness.session().id)) ? COMPACTION_FAILURE_TEXT : null
+    };
   }
   async stopOperation(operationId) {
     if (!operationId)

@@ -345,7 +345,16 @@ export interface HostedState {
   /** The queued operations' ids: stopping the running turn withdraws them. */
   readonly queuedMessages: readonly string[];
   readonly model: string;
+  /**
+   * The runtime's own sentence for a blocking compaction that failed and ended
+   * its run without an answer, or `null`. Never provider text.
+   */
+  readonly compactionFailure: string | null;
 }
+
+/** Shown when a blocking compaction failed and its run ended without an answer. */
+export const COMPACTION_FAILURE_TEXT =
+  "The conversation could not be compacted. Start a fresh conversation or split the task and retry.";
 
 /**
  * The entry kind this runtime stores an operator submission as, and the

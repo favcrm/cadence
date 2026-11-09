@@ -128,42 +128,34 @@ describe("failed compaction adapter", () => {
       state: { status: "terminal", outcome },
     }),
   });
-  const failed = (id: number, conversationId: number, message: string) =>
-    task(id, conversationId, { status: "failed", error: { message } });
+  /** The compaction rows, and the owning generation's own status. */
+  const tasks = (rows: Record<string, unknown>[], ownerStatus = "terminal"): TaskSql => ({
+    exec(query) {
+      return {
+        toArray: () =>
+          query.startsWith("SELECT status") ? [{ status: ownerStatus }] : rows,
+      };
+    },
+  });
+  const failed = (id: number, conversationId: number, outcome: unknown = { status: "failed" }) =>
+    task(id, conversationId, outcome);
 
-  it("names the newest blocking failure that no later entry supersedes", () => {
-    expect(readCompactionFailure(sql([failed(30, 1, "Compaction failed.")]), 1, 20))
-      .toEqual({ id: 30, message: "Compaction failed." });
-    expect(readCompactionFailure(sql([failed(30, 1, "Compaction failed.")]), 1, 30))
-      .toBeNull();
+  it("reports a blocking failure once its owning generation settled", () => {
+    expect(readCompactionFailure(tasks([failed(30, 1)]), 1)).toBe(true);
+    expect(readCompactionFailure(tasks([failed(30, 1)], "running"), 1)).toBe(false);
+    expect(readCompactionFailure(tasks([failed(30, 1, { status: "faulted" })]), 1)).toBe(true);
   });
 
   it("ignores a conversation-owned background failure", () => {
-    expect(
-      readCompactionFailure(
-        sql([task(30, 1, { status: "failed", error: { message: "Compaction failed." } }, null)]),
-        1,
-        0,
-      ),
-    ).toBeNull();
+    expect(readCompactionFailure(tasks([task(30, 1, { status: "failed" }, null)]), 1))
+      .toBe(false);
   });
 
   it("fails closed on a succeeded, malformed or unreadable task", () => {
-    expect(
-      readCompactionFailure(
-        sql([task(30, 1, { status: "completed" })]),
-        1,
-        0,
-      ),
-    ).toBeNull();
-    expect(readCompactionFailure(sql([{ id: 30, record: "{" }]), 1, 0)).toBeNull();
-    expect(
-      readCompactionFailure(
-        sql([task(30, 1, { status: "failed", error: {} })]),
-        1,
-        0,
-      ),
-    ).toBeNull();
+    expect(readCompactionFailure(tasks([failed(30, 1, { status: "completed" })]), 1))
+      .toBe(false);
+    expect(readCompactionFailure(tasks([{ id: 30, record: "{" }]), 1)).toBe(false);
+    expect(readCompactionFailure(tasks([]), 1)).toBe(false);
     expect(
       readCompactionFailure(
         {
@@ -172,9 +164,8 @@ describe("failed compaction adapter", () => {
           },
         },
         1,
-        0,
       ),
-    ).toBeNull();
+    ).toBe(false);
   });
 });
 

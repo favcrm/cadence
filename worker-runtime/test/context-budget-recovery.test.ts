@@ -4,7 +4,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "@earendil-works/chord/sqlite";
 import { Harness, watchEvents } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
-import { BOARD_MESSAGE_KIND, type GenerationIdentity, type ThreadEntry } from "../src/contract.ts";
+import { BOARD_MESSAGE_KIND, COMPACTION_FAILURE_TEXT, type GenerationIdentity, type ThreadEntry } from "../src/contract.ts";
 import { CONTEXT_BUDGET_EXCEEDED_TEXT, defaultModel } from "../src/model.ts";
 import type { ModelTaskContext } from "../src/model-task-context.ts";
 
@@ -314,8 +314,10 @@ describe("gateway byte-budget recovery", () => {
     // The threshold compacts before the second generation, so the failed
     // summary is the last request and no answer follows it.
     expect(run.requests).toHaveLength(2);
+    expect((await run.hosted.state()).compactionFailure).toBe(COMPACTION_FAILURE_TEXT);
+    // The transcript keeps only what the engine recorded: no invented row.
     const thread = await run.hosted.transcript(false);
-    expect(failed(thread).at(-1)?.payload?.error).toBe("The model request failed.");
+    expect(failed(thread)).toHaveLength(0);
     expect(JSON.stringify(thread)).not.toContain("private summary failure");
   });
 
