@@ -94,8 +94,9 @@ export function projectedThreadEntries(
   includeThinking: boolean,
   project?: ThreadProjection,
   budgetProof?: BudgetProof,
+  settledBudgetProof?: BudgetProof,
 ): ThreadEntry[] {
-  const entries = threadEntries(records, includeThinking, budgetProof);
+  const entries = threadEntries(records, includeThinking, budgetProof, settledBudgetProof);
   return project ? [...project(entries)] : entries;
 }
 
@@ -150,6 +151,7 @@ export function threadEntries(
   records: readonly EntryRecord[],
   includeThinking: boolean,
   budgetProof?: BudgetProof,
+  settledBudgetProof?: BudgetProof,
 ): ThreadEntry[] {
   const entries: ThreadEntry[] = [];
   const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
@@ -283,7 +285,13 @@ export function threadEntries(
           ...(operator && payload !== undefined ? { payload } : {}),
         });
       }
-      if (message.role === "assistant" && terminalError(all, position)) {
+      if (
+        message.role === "assistant" &&
+        (terminalError(all, position) ||
+          (message.stopReason === "error" &&
+            all[position + 1] === undefined &&
+            settledBudgetProof?.(record, message.errorMessage) === true))
+      ) {
         entries.push({
           seq: entries.length + 1,
           role: "agent",

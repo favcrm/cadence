@@ -4,8 +4,10 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
   type AgentEvent,
   type Cursor,
+  CompactionTask,
   createRegistry,
   Harness,
+  hook,
   InboxDoc,
   LiveDoc,
   ROOT_CONVERSATION_ID,
@@ -24,6 +26,7 @@ import type {
   ThreadContext,
   ThreadEntry,
 } from "./contract.ts";
+import { COMPACTION_FAILURE_TEXT } from "./contract.ts";
 import { assistantIdentityText } from "./assistant-identity.ts";
 import { ContextBudgetProofs } from "./context-budget-proofs.ts";
 import {
@@ -33,6 +36,8 @@ import {
   type AppScopeResolver,
 } from "./engine.ts";
 import {
+  readCompactionFailure,
+  readCompactionIdentity,
   readGenerationIdentity,
   readHeldSubmission,
   readSubmissionEntry,
@@ -50,6 +55,7 @@ import {
 } from "./identity-snapshots.ts";
 import { masterState, operationStatus } from "./master.ts";
 import { defaultModel, meteredBinding, withDefaultModel } from "./model.ts";
+import { ModelTaskContext } from "./model-task-context.ts";
 import {
   guardOperationRequests,
   operationContextExtension,
@@ -136,7 +142,10 @@ function engineBatchChanges(events: readonly AgentEvent[]): {
         if (event.entry !== undefined) entries = true;
         break;
       case "task_failed":
-        if (event.kind === "pi.generation") master = true;
+        if (event.kind === "pi.generation") {
+          master = true;
+          entries = true;
+        }
         break;
       default:
         break;
@@ -174,6 +183,7 @@ export class HostedSession<
    */
   private readonly operationScopes: OperationScopes;
   private readonly contextBudgetProofs: ContextBudgetProofs;
+  private readonly modelTaskContext = new ModelTaskContext();
   /** The app scope of the operation that owns one tool call, read from the engine. */
   private readonly toolAppScope: AppScopeResolver = async (api, context) => {
     const live = await api.snapshot(LiveDoc, api.conversationId, context);
@@ -216,15 +226,56 @@ export class HostedSession<
     const ai = createAI({
       binding: meteredBinding(
         options,
-        () => this.generationIdentity(),
+        (signal) => this.modelIdentity(signal),
         (served) => this.recordResolvedModel(served),
         options.maxImagesPerRequest,
         this.contextBudgetProofs,
+        (signal) => this.modelTaskContext.read(signal)?.kind === "compaction",
       ) as unknown as Ai,
     });
     this.models.setProvider(withDefaultModel(ai.provider, model));
     this.registry.install(intentGuard(options.toolRefusal));
     this.registry.install(runtimeProfile);
+    // Pi's token-based cut may fall inside the current operation, including
+    // an artifact read. Decline rather than silently summarize that input.
+    this.registry.install({
+      name: "hosted-preserve-active-operation",
+      hooks: [
+        hook(CompactionTask, {
+          beforeCompact: async (candidate, api, context) => {
+            try {
+              const conversation = await this.harness.conversation(this.harness.session().id);
+              if (conversation.id !== api.conversationId) return { decline: true };
+              const view = await conversation.context(context);
+              const firstKept = view.entries.findIndex((entry) => entry.id === candidate.firstKept);
+              if (firstKept < 0) return { decline: true };
+              let completed = -1;
+              for (let index = view.contributions.length - 1; index >= 0; index--) {
+                if (view.contributions[index]!.some((message) =>
+                  message.role === "assistant" &&
+                  (message.stopReason === "stop" || message.stopReason === "length") &&
+                  !message.content.some((part) => part.type === "toolCall"),
+                )) {
+                  completed = index;
+                  break;
+                }
+              }
+              for (let index = completed + 1; index < firstKept; index++) {
+                if (view.contributions[index]!.some((message) =>
+                  message.role === "user" ||
+                  message.role === "toolResult" ||
+                  (message.role === "assistant" &&
+                    message.content.some((part) => part.type === "toolCall")),
+                )) return { decline: true };
+              }
+              return undefined;
+            } catch {
+              return { decline: true };
+            }
+          },
+        }),
+      ],
+    });
     if (options.identity) {
       const identityMessages = new WeakSet<object>();
       const identitySnapshots = new IdentitySnapshots(
@@ -266,6 +317,7 @@ export class HostedSession<
       ),
     );
     guardOperationRequests(this.models, operationMessages);
+    this.modelTaskContext.install(this.models);
     for (const group of options.tools) {
       this.registry.install(
         runtimeExtension(group, authority, this.toolAppScope, acceptsImages),
@@ -283,7 +335,12 @@ export class HostedSession<
         );
         return Harness.open(
           storage,
-          { models: this.models, registry: this.registry, onWake },
+          {
+            models: this.models,
+            registry: this.registry,
+            onWake,
+            telemetry: this.modelTaskContext.telemetry,
+          },
           context,
         );
       },
@@ -551,6 +608,7 @@ export class HostedSession<
       includeThinking,
       this.options.projectThread,
       (entry, message) => this.contextBudgetProofs.matches(entry, message),
+      (entry, message) => this.contextBudgetProofs.settled(entry, message),
     );
   }
 
@@ -888,16 +946,17 @@ export class HostedSession<
   }
 
   /**
-   * The operation-scoped identity of the model request running right now. It
-   * comes from the engine's own running generation checkpoint (task id +
-   * transcript cutoff), so provider retries and a crash recovery reuse the
-   * same funding key while a tool round gets a new one. No running generation,
-   * or more than one, is a refusal — never a guessed key.
+   * Resolve the engine invocation that made this exact model call. Generation
+   * retains its existing fail-closed uniqueness check; compaction must present
+   * the task id attested by its own phase before its checkpoint can fund a call.
    */
-  private generationIdentity(): GenerationIdentity | null {
-    // The Workers SQL storage exposes the same `exec(...).toArray()` surface;
-    // the adapter's narrower type keeps its own casts out of the session.
-    return readGenerationIdentity(this.ctx.storage.sql as unknown as TaskSql);
+  private modelIdentity(signal: AbortSignal | undefined): GenerationIdentity | null {
+    const call = this.modelTaskContext.read(signal);
+    if (!call) return null;
+    const sql = this.ctx.storage.sql as unknown as TaskSql;
+    if (call.kind === "compaction") return readCompactionIdentity(sql, call.task);
+    const identity = readGenerationIdentity(sql);
+    return call.task === undefined || identity?.task === String(call.task) ? identity : null;
   }
 
   /** Whether a run is in flight. */
@@ -918,7 +977,16 @@ export class HostedSession<
       this.pendingOperations(),
       this.modelLabel(),
     ]);
-    return { ...operationStatus(pending), model };
+    return {
+      ...operationStatus(pending),
+      model,
+      compactionFailure: readCompactionFailure(
+        this.ctx.storage.sql as unknown as TaskSql,
+        Number(this.harness.session().id),
+      )
+        ? COMPACTION_FAILURE_TEXT
+        : null,
+    };
   }
 
   /**

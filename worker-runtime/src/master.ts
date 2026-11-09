@@ -74,6 +74,9 @@ export function masterState(
       : null,
     queue: [],
     queued: status.queued,
+    // The engine records a failed blocking compaction nowhere in the
+    // transcript, so this is the only field that names it.
+    compaction_failure: status.compactionFailure ?? null,
   };
   // A callable root hook could replace the whole authoritative frame.
   if (typeof state.toJSON === "function")

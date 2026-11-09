@@ -557,6 +557,17 @@ pre {
 .turnbar[data-state="queued"],
 .turnbar[data-state="needs_approval"] { --tb: var(--color-warn); }
 .turnbar[data-state="failed"] { --tb: var(--color-fail); }
+/* A failure's detail is the operator's next step, not a label: wrap it on a
+   narrow board instead of cutting the instruction off, inside a bounded
+   scroll area so a long provider message cannot push the composer away. */
+.turnbar[data-state="failed"] .tb-detail {
+  max-height: 4.5em;
+  overflow-x: hidden;
+  overflow-y: auto;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .turnbar[data-stale] { opacity: .7; }
 .tb-dot {
   flex: none;

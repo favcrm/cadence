@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { readGenerationIdentity, type TaskSql } from "../src/identity.ts";
+import { readCompactionFailure, readCompactionIdentity, readGenerationIdentity, type TaskSql } from "../src/identity.ts";
 
 const sql = (rows: Record<string, unknown>[]): TaskSql => ({
   exec: () => ({ toArray: () => rows }),
@@ -110,5 +110,102 @@ describe("generation identity adapter", () => {
         ]),
       ),
     ).toBeNull();
+  });
+});
+
+describe("failed compaction adapter", () => {
+  const task = (
+    id: number,
+    conversationId: number,
+    outcome: unknown,
+    owner: unknown = 5,
+  ) => ({
+    id,
+    record: JSON.stringify({
+      conversationId,
+      kind: "pi.compaction",
+      ...(owner === null ? {} : { owner }),
+      state: { status: "terminal", outcome },
+    }),
+  });
+  /** The compaction rows, the owning generation's status, and the newest entry. */
+  const tasks = (
+    rows: Record<string, unknown>[],
+    ownerStatus = "terminal",
+    latestEntryId = 0,
+  ): TaskSql => ({
+    exec(query) {
+      return {
+        toArray: () =>
+          query.startsWith("SELECT status")
+            ? [{ status: ownerStatus }]
+            : query.startsWith("SELECT MAX")
+              ? [{ latest: latestEntryId }]
+              : rows,
+      };
+    },
+  });
+  const failed = (id: number, conversationId: number, outcome: unknown = { status: "failed" }) =>
+    task(id, conversationId, outcome);
+
+  it("reports a blocking failure once its owning generation settled", () => {
+    expect(readCompactionFailure(tasks([failed(30, 1)]), 1)).toBe(true);
+    expect(readCompactionFailure(tasks([failed(30, 1)], "running"), 1)).toBe(false);
+    expect(readCompactionFailure(tasks([failed(30, 1, { status: "faulted" })]), 1)).toBe(true);
+    expect(readCompactionFailure(tasks([failed(30, 1, { status: "orphaned" })]), 1)).toBe(true);
+  });
+
+  it("stops reporting once a later record owns the transcript", () => {
+    expect(readCompactionFailure(tasks([failed(30, 1)], "terminal", 30), 1)).toBe(false);
+    expect(readCompactionFailure(tasks([failed(30, 1)], "terminal", 12), 1)).toBe(true);
+  });
+
+  it("ignores a conversation-owned background failure", () => {
+    expect(readCompactionFailure(tasks([task(30, 1, { status: "failed" }, null)]), 1))
+      .toBe(false);
+  });
+
+  it("fails closed on a succeeded, malformed or unreadable task", () => {
+    expect(readCompactionFailure(tasks([failed(30, 1, { status: "completed" })]), 1))
+      .toBe(false);
+    expect(readCompactionFailure(tasks([{ id: 30, record: "{" }]), 1)).toBe(false);
+    expect(readCompactionFailure(tasks([]), 1)).toBe(false);
+    expect(
+      readCompactionFailure(
+        {
+          exec() {
+            throw new Error("no such table: pi_tasks");
+          },
+        },
+        1,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("compaction identity adapter", () => {
+  const row = (conversationId: unknown, tail: unknown, id: unknown = 9, owner: unknown = 1) => ({
+    id: 9,
+    conversation_id: owner,
+    record: JSON.stringify({
+      id,
+      conversationId,
+      kind: "pi.compaction",
+      state: { status: "running", checkpoint: { phase: "summarize", tail } },
+    }),
+  });
+
+  it("uses the durable task's numeric conversation and checkpoint tail", () => {
+    expect(readCompactionIdentity(sql([row(1, 12)]), 9))
+      .toEqual({ conversation: "1", task: "9", cutoff: "12" });
+  });
+
+  it("refuses malformed or inconsistent durable task identities", () => {
+    for (const invalid of ["not-a-tail", "12", 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, null]) {
+      expect(readCompactionIdentity(sql([row(1, invalid)]), 9)).toBeNull();
+      expect(readCompactionIdentity(sql([row(invalid, 12)]), 9)).toBeNull();
+    }
+    expect(readCompactionIdentity(sql([row(1, 12, 10)]), 9)).toBeNull();
+    expect(readCompactionIdentity(sql([row(1, 12, 9, 2)]), 9)).toBeNull();
   });
 });

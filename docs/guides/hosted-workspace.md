@@ -138,17 +138,30 @@ the attempt if the callback fails. Attachment bytes are not written to the
 transcript. This callback does not enable image-returning tools; those retain
 their separate `acceptsToolImages` opt-in.
 
-**Context budget.** The gateway refuses a request that exceeds a trusted hosted
-size budget — the serialized context or the fully translated request including
-images — with a JSON 400 whose `error.type` is `invalid_request_error` and
-whose `error.code` is `context_budget_exceeded`. The runtime records a fresh
-task-bound refusal marker before the engine commits the failure. On transcript
-reads it presents `The context limit was reached. Start a fresh conversation
-or split the task and retry.` only when the marker and the entry's authoring
-task agree. The marker survives a restart and is invalidated before a repeated
-generation request, so unrelated HTTP or streamed error text cannot claim this
-reason. The marker triggers neither compaction nor retry. The raw gateway
-text stays private, the limit is unchanged and the task is not narrowed.
+**Context budget.** The runtime shortens long tool results from completed
+earlier turns in model requests, with an explicit incomplete-content notice.
+This shaping leaves the stored transcript and current operation's tool results
+unchanged. Artifact reads may be paged; use the returned continuation rather
+than assuming an earlier excerpt is complete.
+
+When the gateway refuses its byte budget with a JSON 400 whose `error.type` is
+`invalid_request_error` and `error.code` is `context_budget_exceeded`, the
+runtime records a task-bound marker and lets the engine attempt at most one
+overflow-triggered compaction per generation. The selected summary must not
+consume the current operation; if a safe cut is unavailable, it is declined.
+A long summary source is split into complete messages for the gateway's
+per-message limit, without discarding its content.
+
+The summary is a separately funded model request, identified by the actual
+durable compaction task and its pinned checkpoint tail, not by a concurrent
+generation. Missing or ambiguous task provenance refuses the request before
+dispatch. If compaction fails, finds no safe cut, or the retry still exceeds the
+budget, the transcript reports `The context limit was reached. Start a fresh
+conversation or split the task and retry.` only when the marker and the
+entry's authoring task agree. It remains hidden while recovery is in progress.
+The marker survives a restart and is invalidated before a repeated generation
+request; unrelated HTTP or streamed error text cannot claim this reason. Raw
+gateway text stays private and the gateway's limits are unchanged.
 
 **Hosted identity.** A host that has a committed assistant identity may supply
 two optional domain-data callbacks on `HostedSessionOptions`: `identity()`
@@ -256,9 +269,9 @@ which settles the turn unanswered. A skipped hook, or a hook that cannot
 establish the scope — an unattributable run, a mixed run, a malformed stored
 scope — authors nothing and is therefore refused rather than sent unscoped. A
 fresh object per attempt is what makes an attestation un-reusable by any later
-request. Compaction's summarizer keeps the original unguarded path, and the
-operation guard composes with the identity guard on the same `Models`: both
-checks run, in install order.
+request. These generation guards compose on the same `Models` in install
+order. The compaction summarizer does not receive those generation context
+messages; its separate task-bound funding check fails closed instead.
 
 Each tool call receives `ToolInvocation.app`, the same resolved scope, after
 the refusal and live-authorization checks, so structured admission stays the
