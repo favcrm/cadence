@@ -387,9 +387,263 @@ projects default to `workspace_visible`.
 acceptance checks are incomplete. Do not rely on project policy as a
 completed isolation boundary.
 
-The tracker is stored in ordinary files. A process with filesystem access
-to those files is not isolated merely by board or daemon permission checks.
-The local CLI and MCP trust boundary remains a decision tracked by CAD-2216.
+`POST /api/assist/job_request` requires a JSON `issue` field (the hosted
+platform call uses `arguments.issue`): an existing issue in a project the
+member can read. Every valid request is accepted durably, whether the issue
+is free or already held by another nonterminal job. The immediate response
+is exactly `{request_id, status:"accepted"}` and is identical for a replay;
+it names no job and no occupancy state. A request whose issue is held waits
+as a pending accepted request and is promoted autonomously by the daemon
+watch to at most one draft job when the issue becomes free. Every promotion,
+including the first, re-proves the request's ORIGINAL issuing credential
+(never the member's latest) and the member's current project/issue grant
+before its effects. It needs the operator-enrolled `hosted-board`
+`assist.revalidate` service credential; a revoked credential, removed member,
+inaccessible issue or unavailable service fails closed. The request does not
+approve or dispatch work. One issue can have only one nonterminal job.
+Replaying a request key cannot retarget it to a different issue.
+
+`member_job_list` adds owner-only `requests` rows
+`{request_id, issue, status, job, reason}`, filtered by the issues the member
+can read now. `pending` never exposes a job id, even if a crash left an
+internal job or ownership binding; `created` exposes the canonical job only
+after its ledger, subscription and notice are durable and its provenance is
+unambiguous. The list reports `promotion_worker` (`running` or `unavailable`).
+A pending row's `reason` is `null` while waiting,
+`promotion_worker_unavailable` when no joined worker runs,
+`promotion_unavailable` when the original credential or service cannot be
+re-proven, or `promotion_attempt_failed` when an effect or recorded binding
+cannot be proven. No reason names another job or its occupancy. An unprovable
+completed binding needs operator recovery; it is not silently rebound.
+
+Member-assistant job lists, evidence, events, sharing, subscription and
+reconciliation require a readable issue binding. A subscriber can read only
+while the owner shares the job; disabling sharing retains the subscription
+record but withholds its reads until sharing resumes.
+
+Member-private job deliveries are recorded separately from the shared delivery
+loop. Each result binds the exact job, task, revision, dispatch message,
+recorded report SHA (including an explicit null) and result bytes. Only the
+current owner with the required project access can receive them in
+`member_job_list.private_deliveries`; a subscriber cannot. A proven operator
+can inspect them with `cadence delivery private-ls`. The projection's
+`private_deliveries_state` is `unavailable` when a native completion cannot be
+matched to the ledger; stale running entries are withheld. This is a
+point-in-time consistency check, not a claim about the cause of the mismatch.
+`cadence delivery private-reconcile` replays provable native evidence without
+rerunning work or publishing it.
+
+For this delivery ledger, sharing requires an explicit, proven local operator
+action: `cadence delivery publish` names the delivery, its bound issue and
+project, and the selected result messages. It writes an issue comment, not a
+PR; there is no member publication operation or PR publication target. A
+pending attempt can be resolved with `cadence delivery publish-reconcile`.
+Ambiguous legacy records remain available only for operator inspection and
+recovery. Other tracker report writers are not yet covered by this gate; do
+not rely on it as a publication boundary for all private work.
+
+The cloud-sandbox dispatch preflight refuses jobs whose ownership is private
+or ambiguous before its entitlement probe and dispatch effects. That runner
+records shared issue references and pushes a Git ref; the preflight is not yet
+fenced against a later provenance change, so it is not a complete privacy
+boundary. A previously attempted remote create has an unknown outcome and is
+left for operator inspection; the refusal does not assert that the remote job
+stopped.
+
+An issue-only message is withheld from a reader who cannot access a private
+job on that issue: without task provenance it cannot be distinguished from the
+job's work. This may also hide unrelated issue activity. Scoped message pages
+withhold cloud-origin and cloud-derived rows rather than borrowing the board's
+operator cloud proof; other cloud paths are not yet qualified.
+For a scoped `cadence message ls`, rows omit the table-global message sequence;
+use a returned message ID with `--since` to continue terminal history. Live
+messages remain in the list regardless of that anchor. A proven operator keeps
+the numeric sequence in the management view.
+Scoped agent and task details also omit message sequence positions; scoped task
+verdicts and member job evidence omit verdict sequence positions. Authorized
+content remains available, and the operator retains numeric management views.
+
+Scoped agent status is `busy` only when the reader can see running work for
+that agent; otherwise it is unavailable, not an idle or live verdict. Scoped
+fleet `live` is `null`, and a state filter other than `busy` is refused.
+Operators retain the runtime state, liveness count and full state filters.
+
+Scoped `cadence job events <job>` and `cadence events --job <job>` use
+encrypted continuation cursors and stable keyed event IDs instead of global
+event positions. Continue with an event's returned `cursor` via `--after`;
+an empty continuation returns the same cursor. Scoped readers cannot use legacy
+numeric event checkpoints, and missing key material refuses the read rather
+than resetting it or returning numeric positions. A proven operator retains
+the numeric view. Relayed member job-event pages must acknowledge the opaque
+format on every response; an older daemon cannot serve that scoped feed.
+
+Scoped `cadence events <agent>` uses the same opaque format. Its tail contains
+only visible rows; continue with the returned cursor via `--after`. A cursor
+is bound to the reader, agent registration, workspace and readable project
+set, so a change of access refuses an old cursor instead of resetting it.
+The board requires the daemon to acknowledge the scoped format before it
+shows member event history. Agent event watermarks remain operator-only.
+
+Scoped `cadence topic read <topic>` returns post IDs without global positions.
+Use the page's opaque `before` value with `--before` to read older posts. A
+native topic reader must request the opaque format; missing keys, numeric
+checkpoints and older daemons refuse rather than silently restarting. Private
+room cursors are also bound to the member's current join cutoff.
+For project topics, a subscription alone does not grant project read access;
+job and peer topics also require access to the associated job. Fleet topics
+remain explicitly subscriber-shared. Topic fan-out and retained mailbox
+copies are not yet covered by this read guard and must not be treated as a
+private-data boundary.
+
+Scoped `cadence monitor alerts <monitor>` returns stable alert IDs, opaque
+continuation cursors and per-alert acknowledgement tokens. Continue with
+`--after <cursor>` and acknowledge an authorized native-agent alert with
+`cadence monitor ack <monitor> --ack <token>`; numeric positions remain
+operator-only. The board's numeric acknowledgement route is operator-only,
+and member alert rows are read-only. The CLI requires the daemon to confirm
+either a scoped page or a proven operator's numeric page; an older daemon that
+does neither is refused. Native scoped acknowledgement holds the tracker and
+slot guards while rechecking identity, project access, monitor
+coverage and private-job denials in the same transaction as the alert write.
+This serializes supported authority changes; it does not isolate an agent that
+can modify the same user's files or database directly.
+
+Native inbox reads and acknowledgements require a proven operator or a
+connection attributed to the named inbox alias. A passive inbox has no actor
+of its own, so the latter is not a usable native consumer identity. Explicit
+agent and service consumer grants are not yet implemented. Scoped inbox
+cursors and topic-notice filtering are also not yet migrated; this does not
+establish project isolation for a non-operator mailbox.
+
+The synthetic unread-recovery preview at
+`/20261108-004316/cad2215-unread-recovery/` was owner-accepted on 2026-11-08;
+its source is `design-plans/cad2215-unread-recovery/`. It demonstrates an
+explicit per-conversation start without deleting older markers. The product
+flow and server-side watermark are not implemented yet.
+
+Signed `member_assist_history` reads require `cursor_format: "opaque-v1"`.
+They return stable keyed entry IDs and randomized, direction-bound continuation
+tokens instead of global thread positions. Tokens are bound to the verified
+member, assistant conversation and workspace; numeric, foreign or invalid
+tokens refuse rather than restarting. Operator-only entries are filtered before
+the page limit, and conversation metadata excludes the shared update timestamp.
+The board requires the per-page opaque acknowledgement and refuses an older
+daemon's numeric or unexpected metadata.
+
+Human-room history and post/Ask receipts omit global topic positions. History
+returns opaque backward cursors, a stable keyed identity for the current
+human/room/join scope, and a separate opaque read token for each visible post.
+Read markers remain numeric inside the store and are not reset by the cutover.
+The board checks capability and executes each scoped call on the same daemon
+connection, then requires that response's opaque-format acknowledgement.
+Invalid, stale or foreign cursors are refused; the UI blocks automatic
+continuation and offers an explicit room reload without resetting its marker.
+An unavailable write receipt can mean the post already committed; retries use
+the same client ID.
+
+Direct-agent `thread_read` requires `cursor_format: "opaque-v1"` and returns
+stable keyed row IDs and randomized, principal-, direction-, thread- and
+workspace-bound cursors instead of global positions. Project/private and cloud
+source filtering precede pagination. A proven operator retains numeric thread
+positions. `cadence thread show` requires the corresponding per-response
+acknowledgement and refuses an older or malformed daemon page.
+
+This is not yet a complete private-activity boundary. Relayed member and
+`read_as` thread pages still expose global positions. On an ordinary thread,
+cloud admission can also fail because a same-agent row belongs to an
+unverifiable foreign owner on another credential target; that failure can
+reveal the row's existence. The owner identity must be proved independently
+of the hidden row to close that remaining oracle.
+
+For scoped job-event, agent-event, topic, monitor-alert, human-room,
+member-assistant history and direct-agent thread reads, an operator provisions
+the fixed
+`<state-dir>/scoped-cursors.json` record and raw key files, then runs
+`cadence daemon cursor-key-init` from a proven operator connection:
+
+```json
+{
+  "version": 1,
+  "identity_key_file": "/secure/cadence-cursors/identity.key",
+  "active_key_id": "0123456789abcdef0123456789abcdef",
+  "keys": [{
+    "id": "0123456789abcdef0123456789abcdef",
+    "key_file": "/secure/cadence-cursors/cursor.key"
+  }]
+}
+```
+
+Replace these example paths with owner-controlled absolute paths. Each
+distinct key file contains exactly 32 raw bytes, is a single-link regular file
+with mode `0600` under a `0700` owner-only directory, and is outside the state,
+tracker and backup trees. The state directory is `0700`; the record is `0600`.
+Symlinked or unsafe paths are refused. Initialization is idempotent for the
+same key set; changing that set or its bytes fails closed. The active ID may
+switch among keys already in the bound set. Retain the key set for restarts.
+A portable import creates a new workspace namespace, so source-workspace
+cursors do not resume there.
+
+The board projects live updates per signed member, including after project
+access changes. This is not yet a completed privacy boundary: global sequence
+numbers can reveal intervening activity, and same-UID processes and files are
+not isolated.
+
+Relayed member job-list, agent-list/detail/event, thread and master-state reads
+require the daemon's matching per-response scope acknowledgement. A daemon
+that does not confirm the projection is unavailable to that reader; the board
+must not use its global response. In particular, a missing or older member-job
+ack makes the whole list unavailable, not just its private-delivery rows. An
+older board does not enforce this boundary, even against a newer daemon. Keep
+private projects unavailable until both components are upgraded, old board
+processes are gone, and the remaining checks pass.
+
+Member agent detail rechecks the current agent and job scopes before returning
+the row. If the scoped event read fails or either scope changes, it returns an
+unavailable response instead of an earlier row or a raw daemon error. Concurrent
+visible job or agent changes can require a retry. Operator detail rechecks the
+live role before returning and retains event-error reporting for recovery.
+
+For a relayed member, master-state turn and queue metadata are withheld. A
+non-Home master app conversation requires an explicit grant for that exact
+member, installation and conversation, pinned to its approved bundle and
+context. A later read rechecks revocation, installation drift and membership;
+project and private-job checks still apply to its bound messages. Anonymous
+and other relays without a member grant cannot read it. The owner manages those
+grants on one exact installation: `GET /api/app-installations/{id}/member-access`
+lists the installation's conversations, its grants (active and revoked) and the
+live roster a grant may name; `POST` on the same path grants one conversation to
+one `member_sub` with the approved `expected_digest`; `POST
+/api/app-installations/{id}/member-access/revoke` withdraws that one exact pair.
+All three are operator-only, take the installation from the path, ignore any
+body field that claims the caller's identity or tenancy, and relay the board's
+verified public session so the daemon re-reads the live roster itself. A local
+operator with no public session may list and revoke but cannot grant, because
+no live roster can prove the member; an unprovable roster fails the read
+rather than returning an empty one. There is no installation-wide or
+conversation-less revoke on this surface.
+
+Each explicit app-conversation grant has an authorization epoch, and an
+in-flight member thread or master-state read rechecks it. Schema 66 assigns
+epochs to existing grants without changing their access or recreating history.
+The final recheck can still race a revocation, and daemon and board socket
+writes are not fenced across revocation. Do not rely on the epoch as a strict
+in-flight revocation boundary. Opaque thread watermarks and the accepted
+unread-recovery flow are also not implemented.
+
+Project authorization uses the exact verified user subject, not its lossy
+display handle. Subjects that do not fit the existing 64-character handle
+grammar have no private-project or personal-wiki identity; public wiki reads
+remain subject to their ordinary public policy. This does not establish the
+remaining project or local-process isolation boundary.
+
+Agent-memory wiki paths are scoped to the lesson's project; personal wiki
+search uses separate per-user corpora so another user's private pages do not
+change a member's search ranking.
+
+The intended boundary includes local agents and MCP. The tracker is stored in
+ordinary files: board and daemon checks do not isolate a process that can read
+them. Existing same-UID agent and local CLI/MCP paths are not yet isolated;
+CAD-2216 tracks the implementation and independent verification.
 
 ## `cadence issue` — the only writer
 

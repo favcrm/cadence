@@ -813,9 +813,80 @@ recovery-hook worktrees request owner-only `0700` at creation, before tracker
 content is written; a more restrictive umask can narrow it.
 A source-change refusal is not an automatic retry.
 
-The coordination projection removes related private rows in one transaction
-on the private database copy. Foreign keys remain enabled; their checks are
-deferred until commit so removing human-room topics and metadata does not
+A coordination export refuses a source that holds private or private-capable
+state: queued but unpromoted member requests, member-private job ownership,
+shares, stall checks and job subscriptions, member assistants, app member
+grants in any state (revoked tombstones included), app contexts, app team
+defaults (`app-teams.json`), per-installation app record files under
+`app-records/`, app conversations, chat attachments (`chat_files`, the legacy
+workspace custody `.cadence/chat-files`, and the state `chat-files/`), chat
+upload accounts (`chat_upload_accounts`), issue artifacts (`artifacts`,
+`artifacts/`), member-private job specs (`assist_jobs/`), upload staging under
+`wiki-uploads/`, human-room transcripts and membership, cloud-agent state (its
+tables, a `provider=agenticos-cloud` alias or a `source=cloud_agent` message),
+a recorded private delivery or publication, a publication comment in the
+tracker, or a project whose `project.yaml` records `visibility: private`.
+These are all data the coordination profile never carries, and each can hold
+private work with no remaining grant, conversation or marker to classify it, so
+presence refuses rather than omitting it behind the coordination label. Empty
+or absent custody roots (`app-records/`, `chat-files/`, `artifacts/`,
+`assist_jobs/`, `wiki-uploads/`, an empty `app-teams.json` object) stay clean;
+an unreadable or unparseable one refuses.
+
+Chat attachment custody has no single establishable root. The legacy PM-rooted
+custody is `<pm dir>/.cadence/chat-files` (both the root and nested `pm/`
+layouts are inspected). The operational custody is a per-user tree under the
+workspace the daemon resolved from its captured provider environment; the
+daemon persists no binding for it, and this process's `HOME`/`CADENCE_HOME`
+would name a different root, so it is never guessed. A store restore can
+replace the database with an older copy while that root keeps attachment bytes
+no surviving row names, so an empty `chat_files` or `chat_upload_accounts`
+table does not prove it empty. Proving absence needs a complete,
+restore-surviving record of every operational workspace this store has ever
+used, and no such record exists: a forward-only sidecar or the current
+environment cannot establish history. An otherwise-clean source therefore
+refuses unless the operator states the fact for that source with
+`--attest-chat-custody-absent`. The flag records the assertion in the
+manifest's `package_exclusions`; it never overrides a classifiable private
+record, which still refuses. Without it, a source that holds no private row
+still refuses, because an unknown root cannot be proved empty.
+
+The profile carries no ownership, grants, conversations or receipts for that
+work, so packaging it would expose the work without its provenance.
+Classification runs on the live store before any snapshot copy is written — a
+refusal creates nothing at all — and again on the private snapshot after the
+catalog check, before the projection or any tracker blob is copied. Because the
+store snapshot, the pinned tracker tree and the private ledger are not one
+atomic snapshot, the source is classified once more after the package is
+complete, and the ordinary export also re-proves the tracker is still the clean
+pinned revision; private work or a moved tracker observed during packaging
+refuses publication. Private content that appears after that re-check is not in
+the package. A refusal names the classes found — never a member, request, job,
+conversation, project or file — publishes no package, and leaves the source
+store, tracker and state directory unchanged. The check covers the classes that
+leave evidence in the store, the tracker tree or the state directory; it does
+not claim to detect arbitrary private text that left no row, ledger record or
+marker. Keep the source workspace as the record of that private work and export
+a workspace that holds none of it. A record that cannot be read or decoded
+refuses too: an unreadable policy is not a public one.
+
+`inspect-portable` and every restore apply the same rule to the package. The
+package's PM root is derived from its verified member inventory, not from the
+manifest field, and a mismatch refuses; a project-shaped record the carried
+root cannot authorize refuses even when no `pm.yaml` is present; a staged store
+that carries an app conversation, a human-room topic or a cloud-agent marker,
+and a tracker that carries a publication comment or a private or undecodable
+project record, refuse instead of being imported with their grants and
+receipts left behind. Each tracker member is read once and that same buffer is
+hashed and classified — on export into the package, on inspection, and on the
+staged restore before publication — so a concurrent replacement cannot show a
+public blob to the classifier and a private one to the hash.
+
+The coordination projection still removes any residual cloud-agent or
+human-room rows in one transaction
+on the private database copy, as defence in depth behind that classification.
+Foreign keys remain enabled; their checks are
+deferred until commit so that removal does not
 fail on an intermediate state. A foreign-key failure at commit refuses the
 export without publishing a package. The source database is unchanged.
 
@@ -880,7 +951,10 @@ Destination compatibility and owner authorization remain separate checks.
 This is a **coordination package, not a full workspace backup**:
 `full_workspace=false`. App/business data, credentials/grants, local
 checkouts and runtime files are excluded; execution authority is removed
-and imported actors/dispatch disabled. Manifest SHA-256 detects changed
+and imported actors/dispatch disabled. Private member work is not excluded
+from a package that also carries the work itself: its presence refuses the
+export, so a published package never publishes a private job, conversation or
+grant without its provenance. Manifest SHA-256 detects changed
 bytes, not a producer who rewrites both the package and its manifest.
 Neither command grants an agent new source access or production privileges,
 uploads data, imports a tenant, reconnects executors or activates a root.
