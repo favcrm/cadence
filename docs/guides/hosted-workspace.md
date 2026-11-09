@@ -827,8 +827,15 @@ renewal is another mint, and the file goes when the assignment ends.
 Stays on the member's login: claim, daemon reports and `agent report`; every
 wiki action; `artifact put`; and the audit verdicts (`audit_verdict`,
 `audit_verdict_project`). Not available to a managed agent session at all:
-`settings agents` and `master status`. They always refuse, and their message
-talks about a login grant; read it as "a managed agent session can't use this".
+`settings agents`, `master status` and `master resume`. They always refuse —
+owner-class settings authority is never delegated — and the refusal names the
+operator's plain shell and the grant-bound local path.
+
+An artifact review rides the agent credential, so it is recorded as the agent;
+on a login fallback it is recorded as the member. A member's agent can
+therefore review an artifact that member attached. That is attribution, not
+independent review: the merge gate, not artifact review, is what judges
+independence, and it still refuses the author's principal.
 
 **This is attribution and server-side refusal, not a security boundary.** The
 session runs as the same OS user and can still read the member's login file
@@ -841,7 +848,8 @@ What the client does when the credential is not available:
 | mint `404`, or `409 renewable_login_required` | keeps the login, one line on stderr |
 | authorize or call `403 human_session_required` (a workspace not yet updated to accept it) | keeps the login for the rest of the command, one line on stderr |
 | any other mint answer, or an unusable `200` | refuses; nothing is sent and the login is not used in its place |
-| the agent's own refusals: `401`, `403 forbidden`, and the rest | final, never retried on the login |
+| the agent's own refusals: `403 forbidden` and the rest | final, never retried on the login |
+| a `401` to a **cached** agent credential | drop the cache and re-mint once; a `401` to one just minted is final |
 
 ### Leaving a message for a role on a ticket
 
