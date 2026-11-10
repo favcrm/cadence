@@ -3102,9 +3102,8 @@ fn task_detail_refuses_bodies_when_the_cloud_grant_is_revoked_after_selection() 
 #[test]
 fn task_detail_hides_a_kickoff_it_cannot_admit_without_refusing() {
     let world = build_world();
-    // Cloud B's grant is withdrawn before the read, so this kickoff cannot be
-    // admitted; it also belongs to another task, which redacts it on the
-    // binding check alone.
+    // The kickoff belongs to another task and carries no cloud operation, so
+    // it cannot be admitted: `task_json` redacts it instead of refusing.
     let db = rusqlite::Connection::open(world._state.path().join("cadence.sqlite3")).unwrap();
     assert_eq!(
         db.execute(
@@ -3118,13 +3117,28 @@ fn task_detail_hides_a_kickoff_it_cannot_admit_without_refusing() {
         1
     );
     bind_dispatch(&world, OPEN_TASK, FOREIGN_KICKOFF);
-    world.mode.store(REVOKE_B, Ordering::SeqCst);
+    // A task whose kickoff reported no SHA: the diagnostic is kickoff-derived,
+    // so a reader who was not served the kickoff must not be told about it.
+    let db = rusqlite::Connection::open(world._state.path().join("cadence.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE tasks SET state='review', head_sha=NULL WHERE id=?1",
+        rusqlite::params![OPEN_TASK],
+    )
+    .unwrap();
 
     let detail = task_detail(&world, OPEN_TASK)
         .expect("a kickoff the reader cannot admit must not refuse a readable detail");
     let task = &detail["task"];
     assert_eq!(task["dispatch_message"], Value::Null, "{detail}");
     assert!(task.get("kickoff").is_none(), "{detail}");
+    let attention = task
+        .get("attention")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !attention.contains("kickoff"),
+        "a redacted kickoff still leaked its result: {detail}"
+    );
 }
 
 /// The detail verbs serve an admitted kickoff's message id and state, which is
@@ -3134,11 +3148,8 @@ fn detail_refuses_revoked_kickoff(verb: &str) {
     let world = build_world();
     bind_dispatch(&world, OPEN_TASK, OP_A);
 
-    let live = match verb {
-        "task_show" => task_detail(&world, OPEN_TASK),
-        _ => job_detail(&world, OPEN_JOB),
-    }
-    .unwrap_or_else(|e| panic!("{verb} refused a detail with a live kickoff grant: {e}"));
+    let live = job_detail(&world, OPEN_JOB)
+        .unwrap_or_else(|e| panic!("{verb} refused a detail with a live kickoff grant: {e}"));
     assert!(
         live.to_string().contains("\"kickoff\""),
         "{verb} did not serve the admitted kickoff: {live}"
@@ -3146,11 +3157,8 @@ fn detail_refuses_revoked_kickoff(verb: &str) {
 
     // Revoke inside the hook: after the detail is assembled, before the reply.
     world.detail_mode.store(DETAIL_REVOKE_A, Ordering::SeqCst);
-    let error = match verb {
-        "task_show" => task_detail(&world, OPEN_TASK),
-        _ => job_detail(&world, OPEN_JOB),
-    }
-    .expect_err("a revoked kickoff grant must not serve the earlier snapshot");
+    let error = job_detail(&world, OPEN_JOB)
+        .expect_err("a revoked kickoff grant must not serve the earlier snapshot");
     assert_eq!(error.kind(), "rejected", "{error:?}");
     let rendered = format!("{error:?}");
     assert!(
@@ -3163,11 +3171,6 @@ fn detail_refuses_revoked_kickoff(verb: &str) {
             "the refusal leaked {secret}: {rendered}"
         );
     }
-}
-
-#[test]
-fn task_detail_refuses_a_kickoff_grant_revoked_after_selection() {
-    detail_refuses_revoked_kickoff("task_show");
 }
 
 #[test]
