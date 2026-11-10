@@ -4,16 +4,10 @@ use super::*;
 
 use crate::peer::PeerTies;
 
-/// The readable projects, and for each issue id every project that holds it.
-///
-/// An id is only unique inside one project (legacy trackers can share a
-/// prefix), so the map keeps them all: a row is admitted when ANY of its
-/// projects is readable. Collapsing duplicates to "ambiguous" would deny a
-/// visible issue because an unrelated project happens to reuse its id, and a
-/// reader could then observe that hidden copy through the refusal.
+/// The readable projects and the issue→project map a row filter needs.
 pub(super) type ProjectScope = (
     std::collections::BTreeSet<String>,
-    std::collections::HashMap<String, Vec<String>>,
+    std::collections::HashMap<String, String>,
 );
 
 /// A public board reader whose live session was re-verified by the daemon.
@@ -30,7 +24,25 @@ pub(super) fn scope_allows_issue(scope: &Option<ProjectScope>, issue: Option<&st
         None => true,
         Some((readable, projects)) => issue
             .and_then(|id| projects.get(id))
-            .is_some_and(|holders| holders.iter().any(|project| readable.contains(project))),
+            .is_some_and(|project| readable.contains(project)),
+    }
+}
+
+/// Whether a record that names its own project may be read.
+///
+/// `scope_allows_issue` answers for an issue id, which a row may carry alone;
+/// a record that ALSO names a project must bind to that project, or a project
+/// reusing the id would authorize a row belonging to another one.
+pub(super) fn scope_allows_delivery(
+    scope: &Option<ProjectScope>,
+    issue: &str,
+    project: &str,
+) -> bool {
+    match scope {
+        None => true,
+        Some((readable, projects)) => {
+            projects.get(issue).is_some_and(|bound| bound == project) && readable.contains(project)
+        }
     }
 }
 
@@ -639,10 +651,11 @@ impl Shared {
                 };
             }
         };
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
 
         let mut readable = BTreeSet::new();
-        let mut issues: HashMap<String, Vec<String>> = HashMap::new();
+        let mut issues = HashMap::new();
+        let mut ambiguous = HashSet::new();
         for (project, project_dir) in crate::issue::write::checked_project_dirs(&pm)? {
             if project.allows(caller) {
                 readable.insert(project.key.clone());
@@ -661,12 +674,17 @@ impl Shared {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
                 };
-                if !meta.is_file() || meta.file_type().is_symlink() {
+                if !meta.is_file() || meta.file_type().is_symlink() || ambiguous.contains(&id) {
                     continue;
                 }
-                let holders = issues.entry(id).or_default();
-                if !holders.contains(&project.key) {
-                    holders.push(project.key.clone());
+                match issues.entry(id) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(project.key.clone());
+                    }
+                    Entry::Occupied(entry) => {
+                        let (id, _) = entry.remove_entry();
+                        ambiguous.insert(id);
+                    }
                 }
             }
         }

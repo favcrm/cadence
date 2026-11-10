@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::delivery_requirements_rpc::{self, RoutineReadiness};
-use super::identity::scope_allows_issue;
+use super::identity::scope_allows_delivery;
 use super::{
     check_values, optional_str, optional_strs, request_actor, required_str, Shared,
     APPROVAL_RECORDED_VIA, DAEMON_ALIAS,
@@ -1720,7 +1720,10 @@ impl Shared {
         let mut rows: Vec<Record> = delivery::load(&self.state_dir)?
             .into_values()
             .filter(|r| include_legacy || r.origin.is_verified_ordinary())
-            .filter(|r| scope_allows_issue(scope, Some(&r.issue)))
+            // A record names the project it belongs to, so that exact
+            // project must be readable: an issue id alone is not enough when
+            // the tracker holds the id in more than one project.
+            .filter(|r| scope_allows_delivery(scope, &r.issue, &r.project))
             .filter(|r| denials.is_none_or(|denied| !denied.issues.contains(&r.issue)))
             .filter(|r| issues.is_empty() || issues.contains(&r.issue))
             .collect();

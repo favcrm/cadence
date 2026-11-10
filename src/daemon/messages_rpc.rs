@@ -1148,7 +1148,7 @@ impl Shared {
         let allowed_issues = scope.as_ref().map(|(readable, issues)| {
             issues
                 .iter()
-                .filter(|(_, holders)| holders.iter().any(|project| readable.contains(project)))
+                .filter(|(_, project)| readable.contains(*project))
                 .map(|(issue, _)| issue.as_str())
                 .collect::<Vec<_>>()
         });

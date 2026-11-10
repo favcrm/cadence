@@ -581,7 +581,7 @@ impl Shared {
         let allowed_issues = reader.scope.as_ref().map(|(readable, issues)| {
             issues
                 .iter()
-                .filter(|(_, holders)| holders.iter().any(|project| readable.contains(project)))
+                .filter(|(_, project)| readable.contains(*project))
                 .map(|(issue, _)| issue.as_str())
                 .collect::<Vec<_>>()
         });
@@ -1001,7 +1001,7 @@ impl Shared {
         let changed = || Error::rejected("agent events refused: reader access changed");
         let allowed = issues
             .iter()
-            .filter(|(_, holders)| holders.iter().any(|project| readable.contains(project)))
+            .filter(|(_, project)| readable.contains(*project))
             .map(|(issue, _)| issue.as_str())
             .collect::<Vec<_>>();
         let denied = self

@@ -617,11 +617,16 @@ impl Shared {
                 }
             }
         }
-        // No kickoff reproof here: every kickoff this reply can carry is a
-        // message bound to this task, so the body loop above already re-proved
-        // its admission. `job_show` needs the separate proof because its task
-        // list serves the kickoff reference without the bodies.
-        let _ = kickoff;
+        // The kickoff is re-proved on its own even though the body loop above
+        // re-proves the same message: `task_json` admits it first, and a grant
+        // withdrawn between that admission and the loop drops the message from
+        // `selected` without taking back the `kickoff` block already built.
+        self.reprove_task_kickoffs(
+            "task show",
+            &kickoff.into_iter().collect::<Vec<_>>(),
+            &scope,
+            peer_pid,
+        )?;
         Ok(json!({"task": out}))
     }
 

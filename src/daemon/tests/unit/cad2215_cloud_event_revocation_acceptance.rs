@@ -1887,11 +1887,9 @@ fn scoped_ordinary_thread_warns_only_for_eligible_cloud_history() {
             !scope.0.contains(RESTRICTED_PROJECT),
             "restricted fixture project is readable by READER"
         );
-        assert!(
-            scope
-                .1
-                .get(RESTRICTED_ISSUE)
-                .is_some_and(|holders| holders.iter().any(|p| p == RESTRICTED_PROJECT)),
+        assert_eq!(
+            scope.1.get(RESTRICTED_ISSUE).map(String::as_str),
+            Some(RESTRICTED_PROJECT),
             "restricted issue is not bound to its private project"
         );
     }

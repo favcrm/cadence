@@ -540,12 +540,12 @@ fn a_carried_issue_moved_out_of_reach_refuses_the_selected_page() {
     );
 }
 
-/// The mirror of the moved-issue case: the SAME id appearing in a project the
-/// reader cannot see must leave the page served. The scope map drops ambiguous
-/// ids, so a naive re-admission would refuse here and tell the reader that a
-/// hidden copy exists.
+/// A symlink is not a readable binding. If the issue leaves the readable
+/// project and a link to the hidden copy is left behind, the scope scan
+/// refuses the link, so the page must refuse too rather than treat it as a
+/// surviving binding.
 #[test]
-fn a_hidden_duplicate_of_a_carried_issue_does_not_refuse_the_selected_page() {
+fn a_carried_issue_left_behind_as_a_symlink_refuses_the_selected_page() {
     let temp = tempfile::tempdir().unwrap();
     private_dir(temp.path());
     let pm = temp.path().join("tracker");
@@ -560,9 +560,8 @@ fn a_hidden_duplicate_of_a_carried_issue_does_not_refuse_the_selected_page() {
          created: '2026-01-01T00:00:00Z'\n---\n",
     )
     .unwrap();
-    // A project this reader cannot see, empty at selection.
     let secret = pm.join("secret");
-    std::fs::create_dir_all(&secret).unwrap();
+    std::fs::create_dir_all(secret.join("RACE-1")).unwrap();
     std::fs::write(
         secret.join("project.yaml"),
         "key: secret\nprefix: SEC\npolicy:\n  version: 1\n  visibility: private\n",
@@ -578,16 +577,15 @@ fn a_hidden_duplicate_of_a_carried_issue_does_not_refuse_the_selected_page() {
             if kind != "job_list" || fired.swap(true, Ordering::SeqCst) {
                 return;
             }
-            // The same id appears in the project the reader cannot see: no
-            // change to what this reader may read, and none of its business.
             let hidden = pm.join("secret").join("RACE-1");
-            std::fs::create_dir_all(&hidden).unwrap();
             std::fs::write(
                 hidden.join("issue.md"),
-                "---\nid: RACE-1\ntitle: Hidden copy\nstatus: backlog\npriority: P2\n\
+                "---\nid: RACE-1\ntitle: Race fixture\nstatus: backlog\npriority: P2\n\
                  created: '2026-01-01T00:00:00Z'\n---\n",
             )
             .unwrap();
+            std::fs::remove_dir_all(pm.join("race").join("RACE-1")).unwrap();
+            std::os::unix::fs::symlink(&hidden, pm.join("race").join("RACE-1")).unwrap();
         })
     };
     let mut opts = ServeOptions::default();
@@ -604,17 +602,13 @@ fn a_hidden_duplicate_of_a_carried_issue_does_not_refuse_the_selected_page() {
     .unwrap();
 
     let pid = std::process::id();
-    let page = scoped(Asserted::Agent("reader".to_string()), || {
+    let result = scoped(Asserted::Agent("reader".to_string()), || {
         shared.dispatch("job_list", &json!({}), pid)
-    })
-    .expect("a hidden duplicate must not refuse a selected job list");
+    });
     assert!(
         fired.load(Ordering::SeqCst),
         "the fixture interleaving never fired"
     );
-    assert_eq!(
-        page["jobs"].as_array().map(Vec::len),
-        Some(1),
-        "job list changed: {page}"
-    );
+    let error = result.expect_err("a symlink to the hidden copy must not keep the page served");
+    assert_eq!(error.kind(), "rejected", "{error:?}");
 }
