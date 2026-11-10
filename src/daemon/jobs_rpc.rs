@@ -296,9 +296,9 @@ impl Shared {
             };
             // A carried row's issue must still be readable NOW: `current_scope`
             // was read fresh above, so this is the current issue-to-project
-            // mapping, not the entry snapshot. The map keeps every holder of
-            // an id, so a hidden project reusing it neither denies nor
-            // discloses anything here.
+            // mapping, not the entry snapshot. An issue id that no longer
+            // resolves — moved away, deleted, or now present in more than one
+            // project — is withheld, which is what a direct read does too.
             let carried_unreadable = returned_issues
                 .iter()
                 .any(|issue| !super::identity::scope_allows_issue(&current_scope, Some(issue)));

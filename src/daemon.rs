@@ -578,7 +578,10 @@ pub(crate) type MonitorReadSnapshotHook = Arc<dyn Fn(&str) + Send + Sync>;
 #[cfg(test)]
 pub(crate) type MonitorAckWriterHook = Arc<dyn Fn() + Send + Sync>;
 
-/// Test-only witness after a job or task detail is selected.
+/// Test-only witness at a job or task detail's selected snapshot. `job_show`
+/// and `task_show` pass their own id after assembly; `task_show` also reports
+/// `task_show_kickoff` between admitting a kickoff and reading that task's
+/// messages, which is the only window where the kickoff is in hand alone.
 #[cfg(test)]
 pub(crate) type JobDetailSnapshotHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
