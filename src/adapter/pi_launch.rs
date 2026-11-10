@@ -497,50 +497,18 @@ pub(super) fn pi_cache_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
     }
 }
 
-/// A reviewer agent's `gh` environment (CAD-844).
-///
-/// A worker keeps `HOME`, so `gh` would otherwise read the operator's saved
-/// login under `~/.config/gh` and could post a PR comment or a status with the
-/// operator's account. A reviewer gets a private, empty `GH_CONFIG_DIR`
-/// instead, plus `CADENCE_REVIEWER_GH_TOKEN` as `GH_TOKEN` when the operator
-/// has provisioned one. With no token `gh` is simply unauthenticated: the
-/// fail-closed direction, never the operator's account. The token must be a
-/// read-only credential; nothing here can verify its scope, and nothing copies
-/// the operator's own login.
+/// Pi's reviewer `gh` environment: the shared pin, under this worker's own
+/// directory (`super::reviewer_gh_env`, CAD-844).
 pub(super) fn reviewer_gh_env(
     env: &ProviderEnv,
     role: &str,
-    state_dir: &Path,
+    state_dir: &std::path::Path,
     alias: &str,
 ) -> Result<Vec<(String, String)>> {
-    if role != "reviewer" {
-        return Ok(Vec::new());
-    }
-    let dir = pi_worker_dir(state_dir, alias)?.join("gh-review");
-    ensure_private_dir(&dir)?;
-    let mut pairs = vec![(
-        "GH_CONFIG_DIR".to_string(),
-        dir.to_string_lossy().to_string(),
-    )];
-    if let Some(token) = env
-        .var("CADENCE_REVIEWER_GH_TOKEN")
-        .filter(|value| !value.trim().is_empty())
-    {
-        pairs.push(("GH_TOKEN".to_string(), token));
-    }
-    Ok(pairs)
+    crate::adapter::reviewer_gh_env(env, role, &pi_worker_dir(state_dir, alias)?)
 }
 
-/// Create `dir` (recursive) at mode 0700, tightening an existing one.
-pub(super) fn ensure_private_dir(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
+pub(super) use crate::adapter::ensure_private_dir;
 
 /// Copy the operator's `auth.json` into `dir` (0600, atomic via
 /// `auth.json.tmp` rename) when the dir has no non-empty login of its
@@ -942,60 +910,6 @@ mod cad1752_session_argv_tests {
                 "--session".to_string(),
                 forked.to_string_lossy().to_string()
             ]
-        );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    // CAD-844: a reviewer's `gh` must not read the operator's saved login. It
-    // gets a private empty config plus, only when the operator provisioned one,
-    // a token under its own name. Other roles are unchanged.
-    #[test]
-    fn a_reviewer_gets_a_private_empty_gh_config() {
-        let state = tempfile::tempdir().unwrap();
-        let directory = state.path().join("state");
-        let env = ProviderEnv::default();
-        let pairs = reviewer_gh_env(&env, "reviewer", &directory, "rev-1").unwrap();
-        let config = pairs
-            .iter()
-            .find(|(name, _)| name == "GH_CONFIG_DIR")
-            .expect("a reviewer is pinned");
-        let path = PathBuf::from(&config.1);
-        assert!(path.starts_with(&directory), "{path:?}");
-        assert!(
-            std::fs::read_dir(&path).unwrap().next().is_none(),
-            "the reviewer gh config must start empty"
-        );
-        assert_eq!(
-            std::fs::symlink_metadata(&path)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        assert!(
-            !pairs.iter().any(|(name, _)| name == "GH_TOKEN"),
-            "no token is invented when none is provisioned"
-        );
-        assert!(reviewer_gh_env(&env, "developer", &directory, "dev-1")
-            .unwrap()
-            .is_empty());
-        assert!(reviewer_gh_env(&env, "pm", &directory, "pm-1")
-            .unwrap()
-            .is_empty());
-
-        env.set("CADENCE_REVIEWER_GH_TOKEN", "ghp_read_only_synthetic");
-        let pairs = reviewer_gh_env(&env, "reviewer", &directory, "rev-2").unwrap();
-        assert!(
-            pairs
-                .iter()
-                .any(|(name, value)| name == "GH_TOKEN" && value == "ghp_read_only_synthetic"),
-            "the provisioned reviewer token is the only credential passed"
         );
     }
 }
