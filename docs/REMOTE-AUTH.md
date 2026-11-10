@@ -156,10 +156,10 @@ pins a private, empty `GH_CONFIG_DIR` under the worker's state directory and
 passes `CADENCE_REVIEWER_GH_TOKEN` as `GH_TOKEN` when the operator has
 provisioned a read-only token. With no such token `gh` is unauthenticated — the
 fail-closed direction, never the operator's account. The token's scope is the
-operator's responsibility; nothing here can verify it. The pin covers the
-**Pi and Claude** adapters. The Codex adapter (its launch path does not carry
-the daemon env or state dir) and the PTY/tmux adapter still inherit `HOME`'s
-`gh` config and remain uncovered until CAD-844's remaining slices land.
+operator's responsibility; nothing here can verify it. The pin covers all four
+managed adapters — **Pi, Claude, Codex and PTY**: the stdio adapters hand the
+pairs to their child launch, and the PTY adapter adds them to the pane through
+tmux `-e` (or the split-launch helper's environment).
 
 The remote Devin and cloud sandbox adapters launch no local actor. That does
 not establish what credentials or access the remote runtime receives.
