@@ -628,7 +628,7 @@ rather than returning an empty one. There is no installation-wide or
 conversation-less revoke on this surface.
 
 Each explicit app-conversation grant has an authorization epoch, and an
-in-flight member thread or master-state read rechecks it. Schema 66 assigns
+in-flight member thread or master-state read rechecks it. Schema v67 assigns
 epochs to existing grants without changing their access or recreating history.
 The final recheck can still race a revocation, and daemon and board socket
 writes are not fenced across revocation. Do not rely on the epoch as a strict

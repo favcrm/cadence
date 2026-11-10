@@ -2401,6 +2401,39 @@ impl Store {
             .collect())
     }
 
+    /// The registered pty panes on an already-open connection or write
+    /// transaction — the same rows [`Self::pty_pane_pids`] reads — so a scoped
+    /// acknowledgement's identity re-proof reads the same registration rows as
+    /// the transaction that mutates the alert.
+    pub(crate) fn pty_pane_pids_in(
+        &self,
+        conn: &impl StoreConn,
+    ) -> Result<Vec<(String, u32, Option<u64>)>> {
+        let rows = conn.query_vec(
+            "SELECT alias, pid, pid_start FROM agents
+             WHERE endpoint_kind='pty'
+               AND generation IS NOT NULL AND pid IS NOT NULL",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(alias, pid, start)| {
+                Some((
+                    alias,
+                    u32::try_from(pid).ok()?,
+                    start.and_then(|s| u64::try_from(s).ok()),
+                ))
+            })
+            .collect())
+    }
+
     /// The shutdown marker's payload: every in-flight pty message
     /// joined against the endpoint facts captured while the pane was
     /// still live (`pty_endpoint_facts`). `submitting` rows ride along
