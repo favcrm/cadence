@@ -540,10 +540,12 @@ pub struct Launched {
 }
 
 impl Transport {
-    fn launch(&self, cwd: &str, log: &Path) -> Result<Launched> {
+    /// `env` reaches a local stdio child only; a managed-WS endpoint is
+    /// remote and receives no local environment.
+    fn launch(&self, cwd: &str, log: &Path, env: &[(String, String)]) -> Result<Launched> {
         match self {
             Transport::Stdio(adapter) => Ok(Launched {
-                pid: adapter.launch(cwd, log, &[])?,
+                pid: adapter.launch(cwd, log, env)?,
                 endpoint: None,
             }),
             Transport::Ws(adapter) => {
@@ -619,6 +621,19 @@ pub struct CodexAdapter {
     shared: Arc<Shared>,
     log_path: PathBuf,
     sandbox_command: Vec<String>,
+    env: ProviderEnv,
+    /// The daemon state dir, derived from the provider log path the same way
+    /// the Claude adapter does (`<state>/logs/<agent>.log`).
+    state_dir: PathBuf,
+}
+
+/// The state dir a provider log path belongs to: `<state>/logs/<agent>.log`.
+fn adapter_state_dir(log_path: &Path) -> PathBuf {
+    log_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// `turnId → itemId → agentMessage item`, collected while a turn runs.
@@ -743,6 +758,8 @@ impl CodexAdapter {
             shared,
             log_path: log_path.to_path_buf(),
             sandbox_command: codex_sandbox_command(env),
+            env: env.clone(),
+            state_dir: adapter_state_dir(log_path),
         }
     }
 
@@ -755,6 +772,8 @@ impl CodexAdapter {
             shared,
             log_path: log_path.to_path_buf(),
             sandbox_command: codex_sandbox_command(env),
+            env: env.clone(),
+            state_dir: adapter_state_dir(log_path),
         }
     }
 
@@ -1048,7 +1067,15 @@ impl ProviderAdapter for CodexAdapter {
         // doing it before launch means a bad row spawns nothing.
         registry::codex_sandbox(&agent.sandbox)?;
         sandbox_probe(&self.sandbox_command, &agent.cwd, &agent.sandbox)?;
-        let launched = self.transport.launch(&agent.cwd, &self.log_path)?;
+        // CAD-844: a reviewer must not use the operator's saved `gh` login.
+        let reviewer_env = super::reviewer_gh_env(
+            &self.env,
+            &agent.role,
+            &self.state_dir.join("agents").join(&agent.alias),
+        )?;
+        let launched = self
+            .transport
+            .launch(&agent.cwd, &self.log_path, &reviewer_env)?;
         // Everything after launch is guarded: any failure closes the
         // transport so no owned provider process is left behind.
         let opened = (|| -> Result<Identity> {
@@ -1514,8 +1541,10 @@ mod tests {
                 Box::new(|| {}),
             )),
             shared,
-            log_path: log,
+            log_path: log.clone(),
             sandbox_command: vec![],
+            env: ProviderEnv::default(),
+            state_dir: adapter_state_dir(&log),
         };
         // Launch the peer by hand — `open` is a full provider
         // handshake; the steer seam needs only the transport.

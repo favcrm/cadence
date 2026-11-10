@@ -497,16 +497,18 @@ pub(super) fn pi_cache_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
     }
 }
 
-/// Create `dir` (recursive) at mode 0700, tightening an existing one.
-pub(super) fn ensure_private_dir(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
+/// Pi's reviewer `gh` environment: the shared pin, under this worker's own
+/// directory (`super::reviewer_gh_env`, CAD-844).
+pub(super) fn reviewer_gh_env(
+    env: &ProviderEnv,
+    role: &str,
+    state_dir: &std::path::Path,
+    alias: &str,
+) -> Result<Vec<(String, String)>> {
+    crate::adapter::reviewer_gh_env(env, role, &pi_worker_dir(state_dir, alias)?)
 }
+
+pub(super) use crate::adapter::ensure_private_dir;
 
 /// Copy the operator's `auth.json` into `dir` (0600, atomic via
 /// `auth.json.tmp` rename) when the dir has no non-empty login of its

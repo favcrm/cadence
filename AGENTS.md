@@ -9,6 +9,26 @@ path `cadence agent show` prints, report with
 and discover peers with `cadence agent list`.
 <!-- cadence:end -->
 
+## Reviewer agents are read-only
+
+A reviewer's credentials and environment are read-only by construction, not by
+brief. The mechanisms, in the order they apply:
+
+- `gh` runs with a private empty `GH_CONFIG_DIR` under the reviewer's state dir
+  (`adapter::reviewer_gh_env`, CAD-844); `GH_TOKEN` is set only from the
+  operator's `CADENCE_REVIEWER_GH_TOKEN`, which must carry read-only scopes
+  (`contents:read`, `pull_requests:read`, `metadata:read`). With no token, `gh`
+  is unauthenticated and fails closed.
+- The hosted gate refuses every tracker-mutation verb from a live
+  `role='reviewer'` agent credential (`checkCliCall`, code `reviewer_read_only`,
+  HTTP 403). It keeps the reads, the reviewer's own verdict (`issue_review`,
+  `audit_verdict`, `audit_verdict_project`) and `artifact_put`.
+- A reviewer's output is a verdict file in its scratch directory; the operator
+  or the PM posts it to the ticket.
+- Never run a reviewer under the operator's login or under a bridge grant that
+  carries `cli.write`. A brief is a denylist; this section names the credential
+  and the gate instead.
+
 ## Where the rules live
 
 This file holds the principles and the commands, not the policy. Where

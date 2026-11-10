@@ -30,6 +30,56 @@ pub fn cloud_secret_env_prefix() -> String {
         .join(" ")
 }
 
+/// Create `dir` (recursive) at mode 0700, tightening an existing one.
+pub(super) fn ensure_private_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// A reviewer agent's `gh` environment (CAD-844).
+///
+/// A managed worker keeps `HOME`, so `gh` would otherwise read the operator's
+/// saved login under `~/.config/gh` and could post a PR comment or a status
+/// with the operator's account. A reviewer gets a private, empty
+/// `GH_CONFIG_DIR` under its own agent directory instead, plus
+/// `CADENCE_REVIEWER_GH_TOKEN` as `GH_TOKEN` when the operator has provisioned
+/// a read-only token. With no token `gh` is unauthenticated — the fail-closed
+/// direction, never the operator's account. The token's scope is the
+/// operator's responsibility and nothing here copies their login.
+pub(super) fn reviewer_gh_env(
+    env: &ProviderEnv,
+    role: &str,
+    agent_dir: &std::path::Path,
+) -> Result<Vec<(String, String)>> {
+    // Fail closed on spelling: any role that reads as a review gets the pin,
+    // and a variant like `Reviewer` never falls through to the operator's
+    // saved login. Pinning a role that turns out not to review is harmless —
+    // it costs an empty, unauthenticated `gh`.
+    if !role.to_ascii_lowercase().contains("review") {
+        return Ok(Vec::new());
+    }
+    let dir = agent_dir.join("gh-review");
+    ensure_private_dir(&dir)?;
+    let mut pairs = vec![(
+        "GH_CONFIG_DIR".to_string(),
+        dir.to_string_lossy().to_string(),
+    )];
+    // `gh` prefers these over the config file, so an inherited value would
+    // defeat the config pin. Always override both: the provisioned read-only
+    // token when present, an empty value (unset to `gh`) when not.
+    let token = env
+        .var("CADENCE_REVIEWER_GH_TOKEN")
+        .filter(|value| !value.trim().is_empty());
+    pairs.push(("GH_TOKEN".to_string(), token.unwrap_or_default()));
+    pairs.push(("GITHUB_TOKEN".to_string(), String::new()));
+    Ok(pairs)
+}
+
 /// The daemon's own tracker and profile. Every agent it launches must
 /// share them, so a sandbox worker's `cadence issue …` reaches the
 /// sandbox's tracker, gated (CAD-310). Provider scrubs that drop
@@ -1569,6 +1619,76 @@ mod tests {
         eprintln!(
             "scratch agents/ 4 logs: before={before} bytes, after={after} bytes, cap={}",
             PROVIDER_LOG_MAX_BYTES
+        );
+    }
+}
+
+#[cfg(test)]
+mod reviewer_env_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // CAD-844: a reviewer's `gh` must not read the operator's saved login. It
+    // gets a private empty config plus, only when provisioned, a token under
+    // its own name; other roles are unchanged.
+    #[test]
+    fn a_reviewer_gets_a_private_empty_gh_config() {
+        let state = tempfile::tempdir().unwrap();
+        let agent_dir = state.path().join("agents/rev-1");
+        let env = ProviderEnv::default();
+        let pairs = reviewer_gh_env(&env, "reviewer", &agent_dir).unwrap();
+        let config = pairs
+            .iter()
+            .find(|(name, _)| name == "GH_CONFIG_DIR")
+            .expect("a reviewer is pinned");
+        let path = std::path::PathBuf::from(&config.1);
+        assert!(path.starts_with(&agent_dir), "{path:?}");
+        assert!(
+            std::fs::read_dir(&path).unwrap().next().is_none(),
+            "the reviewer gh config must start empty"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        // Both token names are pinned empty: an inherited value would
+        // otherwise override the config pin and authenticate as the operator.
+        for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(key, value)| key == name && value.is_empty()),
+                "{name} is pinned empty when the operator provisioned nothing"
+            );
+        }
+        assert!(reviewer_gh_env(&env, "developer", &agent_dir)
+            .unwrap()
+            .is_empty());
+        assert!(reviewer_gh_env(&env, "pm", &agent_dir).unwrap().is_empty());
+        for role in ["Reviewer", "review", "code-reviewer"] {
+            assert!(
+                !reviewer_gh_env(&env, role, &agent_dir).unwrap().is_empty(),
+                "a role that reads as a review is pinned whatever its spelling: {role}"
+            );
+        }
+
+        env.set("CADENCE_REVIEWER_GH_TOKEN", "ghp_read_only_synthetic");
+        let pairs = reviewer_gh_env(&env, "reviewer", &agent_dir).unwrap();
+        assert!(
+            pairs
+                .iter()
+                .any(|(name, value)| name == "GH_TOKEN" && value == "ghp_read_only_synthetic"),
+            "the provisioned reviewer token is the only credential passed"
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(name, value)| name == "GITHUB_TOKEN" && value.is_empty()),
+            "the generic token stays empty even when the reviewer token is set"
         );
     }
 }

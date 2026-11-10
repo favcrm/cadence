@@ -1329,6 +1329,16 @@ impl ProviderAdapter for PiAdapter {
                     config.to_string_lossy().to_string(),
                 ));
                 env.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
+                // CAD-844: a reviewer keeps HOME, so without this `gh` would
+                // read the operator's saved login and could post with their
+                // account. Pin a private, empty gh config instead; a read-only
+                // token, when the operator provisions one, is a separate input.
+                env.extend(pi_launch::reviewer_gh_env(
+                    &self.env,
+                    &agent.role,
+                    &self.state_dir,
+                    &agent.alias,
+                )?);
                 if confinement.is_some() {
                     // CAD-556: under Landlock the daemon's TMPDIR may be a
                     // shared root — the worker gets its own so `mktemp`
