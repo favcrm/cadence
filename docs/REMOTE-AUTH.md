@@ -156,10 +156,14 @@ pins a private, empty `GH_CONFIG_DIR` under the worker's state directory and
 passes `CADENCE_REVIEWER_GH_TOKEN` as `GH_TOKEN` when the operator has
 provisioned a read-only token. With no such token `gh` is unauthenticated — the
 fail-closed direction, never the operator's account. The token's scope is the
-operator's responsibility; nothing here can verify it. The pin covers all four
-managed adapters — **Pi, Claude, Codex and PTY**: the stdio adapters hand the
-pairs to their child launch, and the PTY adapter adds them to the pane through
-tmux `-e` (or the split-launch helper's environment).
+operator's responsibility; nothing here can verify it. `GH_TOKEN` and
+`GITHUB_TOKEN` are always overridden too — empty when nothing is provisioned —
+because `gh` prefers them over the config file and an inherited value would
+defeat the config pin. A role that reads as a review (`reviewer`, `Reviewer`,
+`code-reviewer`, `review`) gets the pin; other roles are unchanged. The pin
+covers all four managed adapters — **Pi, Claude, Codex and PTY**: the stdio
+adapters hand the pairs to their child launch, and the PTY adapter adds them to
+the pane through tmux `-e` (or the split-launch helper's environment).
 
 The remote Devin and cloud sandbox adapters launch no local actor. That does
 not establish what credentials or access the remote runtime receives.

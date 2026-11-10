@@ -56,7 +56,11 @@ pub(super) fn reviewer_gh_env(
     role: &str,
     agent_dir: &std::path::Path,
 ) -> Result<Vec<(String, String)>> {
-    if role != "reviewer" {
+    // Fail closed on spelling: any role that reads as a review gets the pin,
+    // and a variant like `Reviewer` never falls through to the operator's
+    // saved login. Pinning a role that turns out not to review is harmless —
+    // it costs an empty, unauthenticated `gh`.
+    if !role.to_ascii_lowercase().contains("review") {
         return Ok(Vec::new());
     }
     let dir = agent_dir.join("gh-review");
@@ -65,12 +69,14 @@ pub(super) fn reviewer_gh_env(
         "GH_CONFIG_DIR".to_string(),
         dir.to_string_lossy().to_string(),
     )];
-    if let Some(token) = env
+    // `gh` prefers these over the config file, so an inherited value would
+    // defeat the config pin. Always override both: the provisioned read-only
+    // token when present, an empty value (unset to `gh`) when not.
+    let token = env
         .var("CADENCE_REVIEWER_GH_TOKEN")
-        .filter(|value| !value.trim().is_empty())
-    {
-        pairs.push(("GH_TOKEN".to_string(), token));
-    }
+        .filter(|value| !value.trim().is_empty());
+    pairs.push(("GH_TOKEN".to_string(), token.unwrap_or_default()));
+    pairs.push(("GITHUB_TOKEN".to_string(), String::new()));
     Ok(pairs)
 }
 
@@ -1649,14 +1655,26 @@ mod reviewer_env_tests {
                 & 0o777,
             0o700
         );
-        assert!(
-            !pairs.iter().any(|(name, _)| name == "GH_TOKEN"),
-            "no token is invented when none is provisioned"
-        );
+        // Both token names are pinned empty: an inherited value would
+        // otherwise override the config pin and authenticate as the operator.
+        for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(key, value)| key == name && value.is_empty()),
+                "{name} is pinned empty when the operator provisioned nothing"
+            );
+        }
         assert!(reviewer_gh_env(&env, "developer", &agent_dir)
             .unwrap()
             .is_empty());
         assert!(reviewer_gh_env(&env, "pm", &agent_dir).unwrap().is_empty());
+        for role in ["Reviewer", "review", "code-reviewer"] {
+            assert!(
+                !reviewer_gh_env(&env, role, &agent_dir).unwrap().is_empty(),
+                "a role that reads as a review is pinned whatever its spelling: {role}"
+            );
+        }
 
         env.set("CADENCE_REVIEWER_GH_TOKEN", "ghp_read_only_synthetic");
         let pairs = reviewer_gh_env(&env, "reviewer", &agent_dir).unwrap();
@@ -1665,6 +1683,12 @@ mod reviewer_env_tests {
                 .iter()
                 .any(|(name, value)| name == "GH_TOKEN" && value == "ghp_read_only_synthetic"),
             "the provisioned reviewer token is the only credential passed"
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(name, value)| name == "GITHUB_TOKEN" && value.is_empty()),
+            "the generic token stays empty even when the reviewer token is set"
         );
     }
 }
