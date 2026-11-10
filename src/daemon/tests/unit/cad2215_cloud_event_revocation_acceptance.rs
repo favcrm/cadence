@@ -67,6 +67,9 @@ const SHOW_NONE: u8 = 0;
 const SHOW_REVOKE_A: u8 = 1;
 const SHOW_INSERT_HIDDEN: u8 = 2;
 
+const DETAIL_NONE: u8 = 0;
+const DETAIL_REVOKE_A: u8 = 1;
+
 const RESULT_MARKER: &str = "CAD2215_CLOUD_RESULT";
 const ERROR_MARKER: &str = "CAD2215_CLOUD_ERROR";
 const HIDDEN_NOISE: &str = "cad2215-cloud-hidden-noise";
@@ -203,6 +206,7 @@ struct World {
     mode: Arc<AtomicU8>,
     show_mode: Arc<AtomicU8>,
     show_calls: Arc<Mutex<Vec<String>>>,
+    detail_mode: Arc<AtomicU8>,
     hook_calls: Arc<Mutex<Vec<HookCall>>>,
 }
 
@@ -447,6 +451,37 @@ fn build_world_with_thread_observers(
         }))
     };
 
+    // `task_show`'s witness: the detail (task row plus every admitted
+    // message body) is assembled; commit a real grant revocation before the
+    // reproof runs.
+    let detail_mode = Arc::new(AtomicU8::new(DETAIL_NONE));
+    let detail_hook: Option<crate::daemon::JobDetailSnapshotHook> = {
+        let slot = Arc::clone(&hook_slot);
+        let grants = Arc::clone(&grants);
+        let mode = Arc::clone(&detail_mode);
+        Some(Arc::new(move |kind: &str, id: &str| {
+            if kind != "task_show"
+                || id != OPEN_TASK
+                || mode.load(Ordering::SeqCst) != DETAIL_REVOKE_A
+            {
+                return;
+            }
+            let Some(shared) = slot.lock().unwrap().clone() else {
+                return;
+            };
+            let Some((a, _)) = grants.lock().unwrap().clone() else {
+                return;
+            };
+            let _ = shared.store.cloud_agent_source_revoke(
+                &a.cloud_agent_id,
+                SOURCE_PEER,
+                &a.uid,
+                a.epoch,
+                &a.owner,
+            );
+        }))
+    };
+
     let hook: Option<crate::daemon::AgentEventsSelectedHook> = {
         let log = Arc::clone(&hook_calls);
         let slot = Arc::clone(&hook_slot);
@@ -500,6 +535,7 @@ fn build_world_with_thread_observers(
         agent_uid: Some(uid),
         agent_events_selected_hook: hook,
         agent_show_selected_hook: show_hook,
+        job_detail_snapshot_hook: detail_hook,
         cloud_projection_observer: projection_observer,
         agent_thread_batch_observer: batch_observer,
         ..ServeOptions::default()
@@ -647,6 +683,7 @@ fn build_world_with_thread_observers(
         mode,
         show_mode,
         show_calls,
+        detail_mode,
         hook_calls,
     }
 }
@@ -661,6 +698,14 @@ fn events(world: &World, params: &Value) -> Result<Value> {
 
 fn tail(alias: &str) -> Value {
     json!({"alias": alias, "tail": true, "cursor_format": "opaque-v1"})
+}
+
+fn task_detail(world: &World, task: &str) -> Result<Value> {
+    let shared = Arc::clone(&world.shared);
+    let _uid = crate::daemon::serve::test_peer_uid_scope(world.agent_uid);
+    scoped(Asserted::Agent(READER.to_string()), || {
+        shared.dispatch("task_show", &json!({"task": task}), std::process::id())
+    })
 }
 
 fn show(world: &World, params: &Value) -> Result<Value> {
@@ -2988,5 +3033,39 @@ fn scoped_thread_ignores_prior_owner_origin_without_current_target_credential() 
     assert_eq!(
         after_foreign, baseline,
         "prior-owner foreign target changed the exhausted page, token, or warning"
+    );
+}
+
+/// A cloud grant withdrawn between a task detail's selection and its response
+/// must not serve the message bodies the earlier snapshot admitted. The event
+/// reader re-proves after selection for exactly this reason; the detail path
+/// carries bodies too.
+#[test]
+fn task_detail_refuses_bodies_when_the_cloud_grant_is_revoked_after_selection() {
+    let world = build_world();
+
+    // Positive control: the admitted cloud message body is served while the
+    // grant is live, so the refusal below is a revocation, not a broken
+    // fixture.
+    let live = task_detail(&world, OPEN_TASK).expect("the admitted task detail must be served");
+    assert!(
+        live.to_string().contains(CLOUD_BODY),
+        "the admitted cloud body is missing: {live}"
+    );
+
+    // Revoke inside the hook: after the bodies are selected, before the
+    // response leaves.
+    world.detail_mode.store(DETAIL_REVOKE_A, Ordering::SeqCst);
+    let error = task_detail(&world, OPEN_TASK)
+        .expect_err("a grant revoked after selection must not serve the body");
+    assert_eq!(error.kind(), "rejected", "{error:?}");
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains("task show refused"),
+        "the refusal did not name the reproof: {rendered}"
+    );
+    assert!(
+        !rendered.contains(CLOUD_BODY),
+        "the refusal leaked the revoked body: {rendered}"
     );
 }

@@ -379,3 +379,83 @@ fn job_and_task_details_reprove_project_access_after_assembly() {
         "TASK_DETAIL_SECRET_2215",
     );
 }
+
+/// A new issue arriving in a READABLE project between selection and reproof
+/// must not refuse the selected `job_list`: the reader's readable project set
+/// did not change, and the new issue is not in the reply. Comparing the whole
+/// issue map would turn an unrelated arrival into an error signal — the same
+/// oracle the scoped event reader already avoids.
+#[test]
+fn unrelated_issue_during_job_list_does_not_refuse_the_selected_page() {
+    let temp = tempfile::tempdir().unwrap();
+    private_dir(temp.path());
+    let pm = temp.path().join("tracker");
+    crate::issue::Pm::init(&pm).unwrap();
+    let project = pm.join("race");
+    let issue = project.join("RACE-1");
+    std::fs::create_dir_all(&issue).unwrap();
+    std::fs::write(project.join("project.yaml"), "key: race\nprefix: RACE\n").unwrap();
+    std::fs::write(
+        issue.join("issue.md"),
+        "---\nid: RACE-1\ntitle: Race fixture\nstatus: backlog\npriority: P2\n\
+         created: '2026-01-01T00:00:00Z'\n---\n",
+    )
+    .unwrap();
+
+    let fired = Arc::new(AtomicBool::new(false));
+    #[allow(clippy::type_complexity)] // one fixture callback, one shape
+    let hook: Arc<dyn Fn(&str, &str) + Send + Sync> = {
+        let fired = fired.clone();
+        let pm = pm.clone();
+        Arc::new(move |kind, _| {
+            if kind != "job_list" || fired.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            // A real tracker change in the same readable project, committed
+            // while the reply is assembled.
+            let late = pm.join("race").join("RACE-9");
+            std::fs::create_dir_all(&late).unwrap();
+            std::fs::write(
+                late.join("issue.md"),
+                "---\nid: RACE-9\ntitle: Later issue\nstatus: backlog\npriority: P2\n\
+                 created: '2026-01-01T00:00:00Z'\n---\n",
+            )
+            .unwrap();
+        })
+    };
+    let mut opts = ServeOptions::default();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    opts.job_list_snapshot_hook = Some(hook);
+    let shared = Shared::new(temp.path(), &opts).unwrap();
+    register(&shared, temp.path(), "reader");
+    let db = rusqlite::Connection::open(temp.path().join("cadence.sqlite3")).unwrap();
+    db.execute_batch(
+        "INSERT INTO jobs(id,title,spec_path,pm_alias,issue_id,state,created,updated) \
+         VALUES ('snapshot-job','LIST_SECRET_2215','spec.md','reader','RACE-1','open',1,1);
+         INSERT INTO tasks(id,job_id,title,assignee,state,created,updated) \
+         VALUES ('snapshot-task','snapshot-job','LIST_TASK_2215','reader','running',1,1);",
+    )
+    .unwrap();
+
+    let pid = std::process::id();
+    let page = scoped(Asserted::Agent("reader".to_string()), || {
+        shared.dispatch("job_list", &json!({}), pid)
+    })
+    .expect("an unrelated readable issue refused a selected job list");
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "the fixture interleaving never fired"
+    );
+    let ids = page["jobs"]
+        .as_array()
+        .expect("job list has no jobs array")
+        .iter()
+        .filter_map(|job| job["id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["snapshot-job"], "job list changed: {page}");
+    assert!(
+        pm.join("race/RACE-9/issue.md").is_file(),
+        "the fixture did not commit the interleaved issue"
+    );
+}

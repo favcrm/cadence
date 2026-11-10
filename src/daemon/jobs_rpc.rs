@@ -211,6 +211,12 @@ impl Shared {
         let open_only = params.get("open_tasks_only").and_then(Value::as_bool) == Some(true);
         let mut summary = self.store.job_task_summary(detail.then_some(open_only))?;
         let mut out = Vec::new();
+        // The rows this reply actually carries, so the reproof below judges
+        // them rather than the reader's whole hidden set.
+        let mut returned_jobs: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut returned_tasks: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         for job in jobs {
             if !scope_allows_issue(&scope, job.issue_id.as_deref()) {
                 continue;
@@ -224,13 +230,15 @@ impl Shared {
             {
                 continue;
             }
+            returned_jobs.insert(job.id.clone());
             let mut j = job.to_json();
             j["tasks"] = json!(summary.counts.remove(&job.id).unwrap_or_default());
             if detail {
-                j["task_list"] = json!(summary
-                    .lists
-                    .remove(&job.id)
-                    .unwrap_or_default()
+                let rows = summary.lists.remove(&job.id).unwrap_or_default();
+                for task in &rows {
+                    returned_tasks.insert(task.id.clone());
+                }
+                j["task_list"] = json!(rows
                     .iter()
                     .map(|t| json!({"id": t.id, "state": t.state, "title": t.title}))
                     .collect::<Vec<_>>());
@@ -238,22 +246,48 @@ impl Shared {
             out.push(j);
         }
         if private_denials.is_some() || public_principal.is_some() {
+            #[cfg(test)]
+            if let Some(hook) = &self.job_list_snapshot_hook {
+                hook("job_list", "");
+            }
             let (current_scope, current_cli, current_public) =
                 self.agent_read_scope(params, peer_pid, "job list")?;
-            if current_scope != scope
-                || current_public != public_principal
-                || match &private_denials {
-                    Some(previous) => {
-                        self.private_job_denials_for_read(
-                            params,
-                            current_cli.as_ref(),
-                            current_public.as_ref(),
-                            peer_pid,
-                        )? != *previous
-                    }
-                    None => false,
+            // Only the reader's READABLE PROJECT SET can invalidate a row that
+            // was already selected: an unrelated issue appearing in the map
+            // does not change what this reader may see. Refusing on the whole
+            // map would turn a hidden arrival into an error signal.
+            let readable_changed = match (&current_scope, &scope) {
+                (Some(now), Some(before)) => now.0 != before.0,
+                (None, None) => false,
+                _ => true,
+            };
+            // Re-admit exactly the returned rows. A job, task or issue that
+            // became private is selected and refuses the page; an unrelated
+            // hidden row is not selected and cannot.
+            let selected_changed = match &private_denials {
+                Some(before) => {
+                    let now = self.private_job_denials_for_read(
+                        params,
+                        current_cli.as_ref(),
+                        current_public.as_ref(),
+                        peer_pid,
+                    )?;
+                    // Only the jobs and tasks this reply carries are judged.
+                    // The denial set's ISSUES exist so an issue-only message
+                    // cannot be attributed to a hidden job; this reply carries
+                    // no messages, and a returned job can share an issue with
+                    // a hidden sibling without becoming unreadable itself.
+                    now.jobs
+                        .difference(&before.jobs)
+                        .any(|job| returned_jobs.contains(job))
+                        || now
+                            .tasks
+                            .difference(&before.tasks)
+                            .any(|task| returned_tasks.contains(task))
                 }
-            {
+                None => false,
+            };
+            if readable_changed || selected_changed || current_public != public_principal {
                 return Err(Error::rejected("job list refused: reader access changed"));
             }
         }
@@ -347,7 +381,46 @@ impl Shared {
         {
             return Err(Error::rejected("job show refused: reader access changed"));
         }
+        self.reprove_task_kickoffs("job show", &job_tasks, &scope, peer_pid)?;
         Ok(json!({"job": jj}))
+    }
+
+    /// Re-prove the cloud admission of each task's dispatch (kickoff) message.
+    ///
+    /// The kickoff reference carries the message id and state, which is
+    /// member-visible metadata: a cloud grant withdrawn between selection and
+    /// the response must not be served from the earlier snapshot. The operator
+    /// keeps the unscoped view, as it does for every other read here.
+    fn reprove_task_kickoffs(
+        &self,
+        verb: &str,
+        tasks: &[store::Task],
+        scope: &Option<super::identity::ProjectScope>,
+        peer_pid: u32,
+    ) -> Result<()> {
+        if scope.is_none() {
+            return Ok(());
+        }
+        for task in tasks {
+            let Some(mid) = task.dispatch_message.as_deref() else {
+                continue;
+            };
+            let Some(message) = self.store.message(mid)? else {
+                continue;
+            };
+            if !self.may_read_cloud_row(
+                peer_pid,
+                &message.alias,
+                &message.id,
+                message.sender_uid.as_deref(),
+                message.recipient_uid.as_deref(),
+            )? {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: reader access changed"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// One task rendered for show/list: the row plus live kickoff
@@ -454,6 +527,7 @@ impl Shared {
         let mut out = self.task_json(&task, &scope, &task_issues, peer_pid)?;
         let messages = self.store.messages_for_task(&task.id)?;
         let mut visible = Vec::with_capacity(messages.len());
+        let mut selected: Vec<&store::Message> = Vec::new();
         for message in &messages {
             if scope.is_some()
                 && (!super::identity::scope_allows_message(&scope, message, &task_issues)
@@ -467,6 +541,7 @@ impl Shared {
             {
                 continue;
             }
+            selected.push(message);
             visible.push(super::identity::message_json_for_scope(message, &scope));
         }
         out["messages"] = json!(visible);
@@ -491,6 +566,23 @@ impl Shared {
         {
             return Err(Error::rejected("task show refused: reader access changed"));
         }
+        // The reply carries the bodies of every admitted message, so re-prove
+        // that each one is still admitted now: a cloud grant withdrawn between
+        // selection and this response must not serve the earlier snapshot.
+        if scope.is_some() {
+            for message in &selected {
+                if !self.may_read_cloud_row(
+                    peer_pid,
+                    &message.alias,
+                    &message.id,
+                    message.sender_uid.as_deref(),
+                    message.recipient_uid.as_deref(),
+                )? {
+                    return Err(Error::rejected("task show refused: reader access changed"));
+                }
+            }
+        }
+        self.reprove_task_kickoffs("task show", std::slice::from_ref(&task), &scope, peer_pid)?;
         Ok(json!({"task": out}))
     }
 

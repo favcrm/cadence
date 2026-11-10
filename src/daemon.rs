@@ -637,6 +637,8 @@ pub struct Shared {
     #[cfg(test)]
     job_detail_snapshot_hook: Option<JobDetailSnapshotHook>,
     #[cfg(test)]
+    job_list_snapshot_hook: Option<JobDetailSnapshotHook>,
+    #[cfg(test)]
     agent_list_selected_hook: Option<AgentListSelectedHook>,
     #[cfg(test)]
     agent_show_selected_hook: Option<AgentShowSelectedHook>,
@@ -1325,6 +1327,8 @@ impl Shared {
             monitor_ack_writer_hook: opts.monitor_ack_writer_hook.clone(),
             #[cfg(test)]
             job_detail_snapshot_hook: opts.job_detail_snapshot_hook.clone(),
+            #[cfg(test)]
+            job_list_snapshot_hook: opts.job_list_snapshot_hook.clone(),
             #[cfg(test)]
             agent_list_selected_hook: opts.agent_list_selected_hook.clone(),
             #[cfg(test)]
@@ -6712,6 +6716,10 @@ pub struct ServeOptions {
     /// Observes a job/task detail before reproof; never supplied by RPC.
     #[cfg(test)]
     pub(crate) job_detail_snapshot_hook: Option<JobDetailSnapshotHook>,
+    /// Observes a scoped `job_list` after selection and before its reproof, so
+    /// a test can commit a real interleaving; never supplied by RPC.
+    #[cfg(test)]
+    pub(crate) job_list_snapshot_hook: Option<JobDetailSnapshotHook>,
     /// Observes the selected scoped `agent_list` rows before reproof; never
     /// supplied by RPC.
     #[cfg(test)]
