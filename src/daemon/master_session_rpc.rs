@@ -220,7 +220,7 @@ impl Shared {
         // a separate, exact set, never an issue/project substitute.
         let allowed = projects
             .iter()
-            .filter(|(_, project)| readable.contains(*project))
+            .filter(|(_, holders)| holders.iter().any(|project| readable.contains(project)))
             .map(|(issue, _)| issue.as_str())
             .collect::<Vec<_>>();
         let conversations = access.conversations();

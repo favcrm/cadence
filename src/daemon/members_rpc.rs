@@ -2743,7 +2743,7 @@ impl Shared {
         &self,
         member: &MemberCaller,
         readable: &std::collections::BTreeSet<String>,
-        projects: &std::collections::HashMap<String, String>,
+        projects: &std::collections::HashMap<String, Vec<String>>,
         jobs: &[String],
         worker_running: bool,
     ) -> Result<Vec<Value>> {
@@ -2754,7 +2754,7 @@ impl Shared {
             .filter(|request| {
                 projects
                     .get(&request.issue)
-                    .is_some_and(|project| readable.contains(project))
+                    .is_some_and(|holders| holders.iter().any(|project| readable.contains(project)))
             })
             .map(|request| {
                 // A bound job is only owner-visible once every required
@@ -2809,7 +2809,7 @@ impl Shared {
         &self,
         member: &MemberCaller,
         readable: &std::collections::BTreeSet<String>,
-        projects: &std::collections::HashMap<String, String>,
+        projects: &std::collections::HashMap<String, Vec<String>>,
         jobs: &[String],
     ) -> Result<(Vec<Value>, bool)> {
         let all = crate::delivery::private::load(&self.state_dir)?;
@@ -2832,10 +2832,15 @@ impl Shared {
                 sub: &member.sub,
             },
         ) {
-            let Some(project) = projects.get(&delivery.origin.issue) else {
-                continue;
-            };
-            if !readable.contains(project) || project.as_str() != delivery.origin.project {
+            // The delivery names its own project, so that binding must be one
+            // of the holders AND readable: another project reusing the issue
+            // id must not authorize this row.
+            let bound = projects.get(&delivery.origin.issue).is_some_and(|holders| {
+                holders.iter().any(|project| {
+                    project == &delivery.origin.project && readable.contains(project)
+                })
+            });
+            if !bound {
                 continue;
             }
             if unavailable.contains(&delivery.origin.dispatch) {
@@ -2882,7 +2887,7 @@ impl Shared {
             return Err(Error::rejected(MEMBER_JOB_ISSUE_UNAVAILABLE));
         };
         match projects.get(issue) {
-            Some(project) if readable.contains(project) => Ok(()),
+            Some(holders) if holders.iter().any(|project| readable.contains(project)) => Ok(()),
             _ => Err(Error::rejected(MEMBER_JOB_ISSUE_UNAVAILABLE)),
         }
     }
@@ -2974,7 +2979,7 @@ impl Shared {
         };
         let issues = projects
             .iter()
-            .filter(|(_, project)| readable.contains(*project))
+            .filter(|(_, holders)| holders.iter().any(|project| readable.contains(project)))
             .map(|(issue, _)| issue.as_str())
             .collect::<Vec<_>>();
         let jobs = self

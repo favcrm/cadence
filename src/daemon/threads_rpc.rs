@@ -224,7 +224,7 @@ impl Shared {
         let allowed_issues = scope.as_ref().map(|(readable, issues)| {
             issues
                 .iter()
-                .filter(|(_, project)| readable.contains(*project))
+                .filter(|(_, holders)| holders.iter().any(|project| readable.contains(project)))
                 .map(|(issue, _)| issue.as_str())
                 .collect::<Vec<_>>()
         });
@@ -926,7 +926,11 @@ impl Shared {
             let current_issues: Vec<&str> = current_scope
                 .1
                 .iter()
-                .filter(|(_, project)| current_scope.0.contains(*project))
+                .filter(|(_, holders)| {
+                    holders
+                        .iter()
+                        .any(|project| current_scope.0.contains(project))
+                })
                 .map(|(issue, _)| issue.as_str())
                 .collect();
             let mut final_projection =
@@ -971,7 +975,9 @@ impl Shared {
                 let last_issues: Vec<&str> = last_scope
                     .1
                     .iter()
-                    .filter(|(_, project)| last_scope.0.contains(*project))
+                    .filter(|(_, holders)| {
+                        holders.iter().any(|project| last_scope.0.contains(project))
+                    })
                     .map(|(issue, _)| issue.as_str())
                     .collect();
                 let (rechecked, rechecked_denied) = scan(

@@ -3507,7 +3507,9 @@ impl Shared {
                     (Some((readable, issues)), Some(denied)) => {
                         let allowed = issues
                             .iter()
-                            .filter(|(_, project)| readable.contains(*project))
+                            .filter(|(_, holders)| {
+                                holders.iter().any(|project| readable.contains(project))
+                            })
                             .map(|(issue, _)| issue.as_str())
                             .collect::<Vec<_>>();
                         Some(if app_conversations.is_empty() {
@@ -3800,7 +3802,9 @@ impl Shared {
                     {
                         let allowed = issues
                             .iter()
-                            .filter(|(_, project)| readable.contains(*project))
+                            .filter(|(_, holders)| {
+                                holders.iter().any(|project| readable.contains(project))
+                            })
                             .map(|(issue, _)| issue.as_str())
                             .collect::<Vec<_>>();
                         let current_running = if app_conversations.is_empty() {
@@ -4030,7 +4034,9 @@ impl Shared {
                     let allowed_issues = scope.as_ref().map(|(readable, issues)| {
                         issues
                             .iter()
-                            .filter(|(_, project)| readable.contains(*project))
+                            .filter(|(_, holders)| {
+                                holders.iter().any(|project| readable.contains(project))
+                            })
                             .map(|(issue, _)| issue.as_str())
                             .collect::<Vec<_>>()
                     });

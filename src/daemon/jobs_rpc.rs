@@ -296,23 +296,12 @@ impl Shared {
             };
             // A carried row's issue must still be readable NOW: `current_scope`
             // was read fresh above, so this is the current issue-to-project
-            // mapping, not the entry snapshot. A duplicate of the id in a
-            // project the reader cannot see is NOT an access change here — the
-            // map drops ambiguous ids, and refusing would disclose that a
-            // hidden copy exists — so an id that still lives in a readable
-            // project stays admitted.
-            let mut carried_unreadable = false;
-            if let Some(now) = &current_scope {
-                for issue in &returned_issues {
-                    if super::identity::scope_allows_issue(&current_scope, Some(issue)) {
-                        continue;
-                    }
-                    if !self.issue_survives_in_readable_project(&now.0, issue)? {
-                        carried_unreadable = true;
-                        break;
-                    }
-                }
-            }
+            // mapping, not the entry snapshot. The map keeps every holder of
+            // an id, so a hidden project reusing it neither denies nor
+            // discloses anything here.
+            let carried_unreadable = returned_issues
+                .iter()
+                .any(|issue| !super::identity::scope_allows_issue(&current_scope, Some(issue)));
             if readable_changed
                 || carried_unreadable
                 || selected_changed
@@ -416,29 +405,6 @@ impl Shared {
         }
         self.reprove_task_kickoffs("job show", &kickoffs, &scope, peer_pid)?;
         Ok(json!({"job": jj}))
-    }
-
-    /// Whether any project this reader can see still holds `issue`.
-    ///
-    /// [`super::identity::scope_allows_issue`] answers false for two different
-    /// situations: the issue moved into a project the reader cannot see, and an
-    /// id that now exists in more than one project (the map drops ambiguous
-    /// ids). Only the first is a change to this reader's access; the second is
-    /// another project's business and must stay invisible.
-    fn issue_survives_in_readable_project(
-        &self,
-        readable: &std::collections::BTreeSet<String>,
-        issue: &str,
-    ) -> Result<bool> {
-        for (project, dir) in crate::issue::write::checked_project_dirs(&self.pm()?)? {
-            if !readable.contains(&project.key) {
-                continue;
-            }
-            if std::fs::symlink_metadata(dir.join(issue).join("issue.md")).is_ok() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     /// Re-prove the cloud admission of the kickoff messages the reply served.
