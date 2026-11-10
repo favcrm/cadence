@@ -459,3 +459,83 @@ fn unrelated_issue_during_job_list_does_not_refuse_the_selected_page() {
         "the fixture did not commit the interleaved issue"
     );
 }
+
+/// The mirror case: a returned job whose ISSUE leaves the reader's project set
+/// between selection and reproof must refuse the page. The readable project
+/// SET is unchanged by such a move, so only a re-admission of the issues the
+/// reply names can catch it.
+#[test]
+fn a_carried_issue_moved_out_of_reach_refuses_the_selected_page() {
+    let temp = tempfile::tempdir().unwrap();
+    private_dir(temp.path());
+    let pm = temp.path().join("tracker");
+    crate::issue::Pm::init(&pm).unwrap();
+    let race = pm.join("race");
+    let issue = race.join("RACE-1");
+    std::fs::create_dir_all(&issue).unwrap();
+    std::fs::write(race.join("project.yaml"), "key: race\nprefix: RACE\n").unwrap();
+    std::fs::write(
+        issue.join("issue.md"),
+        "---\nid: RACE-1\ntitle: Race fixture\nstatus: backlog\npriority: P2\n\
+         created: '2026-01-01T00:00:00Z'\n---\n",
+    )
+    .unwrap();
+    // A project this reader cannot see, ready to receive the issue.
+    let secret = pm.join("secret");
+    std::fs::create_dir_all(secret.join("RACE-1")).unwrap();
+    // `visibility: private` is what makes a project unreadable to this reader.
+    std::fs::write(
+        secret.join("project.yaml"),
+        "key: secret\nprefix: SEC\npolicy:\n  version: 1\n  visibility: private\n",
+    )
+    .unwrap();
+
+    let fired = Arc::new(AtomicBool::new(false));
+    #[allow(clippy::type_complexity)] // one fixture callback, one shape
+    let hook: Arc<dyn Fn(&str, &str) + Send + Sync> = {
+        let fired = fired.clone();
+        let pm = pm.clone();
+        Arc::new(move |kind, _| {
+            if kind != "job_list" || fired.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            // Move the issue the reply names into the unreadable project while
+            // the reply is assembled: same id, different project.
+            let hidden = pm.join("secret").join("RACE-1");
+            std::fs::write(
+                hidden.join("issue.md"),
+                "---\nid: RACE-1\ntitle: Race fixture\nstatus: backlog\npriority: P2\n\
+                 created: '2026-01-01T00:00:00Z'\n---\n",
+            )
+            .unwrap();
+            std::fs::remove_dir_all(pm.join("race").join("RACE-1")).unwrap();
+        })
+    };
+    let mut opts = ServeOptions::default();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    opts.job_list_snapshot_hook = Some(hook);
+    let shared = Shared::new(temp.path(), &opts).unwrap();
+    register(&shared, temp.path(), "reader");
+    let db = rusqlite::Connection::open(temp.path().join("cadence.sqlite3")).unwrap();
+    db.execute_batch(
+        "INSERT INTO jobs(id,title,spec_path,pm_alias,issue_id,state,created,updated) \
+         VALUES ('snapshot-job','LIST_SECRET_2215','spec.md','reader','RACE-1','open',1,1);",
+    )
+    .unwrap();
+
+    let pid = std::process::id();
+    let result = scoped(Asserted::Agent("reader".to_string()), || {
+        shared.dispatch("job_list", &json!({}), pid)
+    });
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "the fixture interleaving never fired"
+    );
+    let error = result.expect_err("a carried issue moved out of reach must refuse the page");
+    assert_eq!(error.kind(), "rejected", "{error:?}");
+    assert!(
+        format!("{error:?}").contains("job list refused"),
+        "the refusal did not name the reproof: {error:?}"
+    );
+}

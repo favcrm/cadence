@@ -217,6 +217,10 @@ impl Shared {
             std::collections::BTreeSet::new();
         let mut returned_tasks: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
+        // Every issue this reply names, re-admitted under the scope read at
+        // reproof: an issue can move to a project the reader cannot see
+        // without changing which projects that reader can see.
+        let mut returned_issues: Vec<String> = Vec::new();
         for job in jobs {
             if !scope_allows_issue(&scope, job.issue_id.as_deref()) {
                 continue;
@@ -231,6 +235,9 @@ impl Shared {
                 continue;
             }
             returned_jobs.insert(job.id.clone());
+            if let Some(issue) = job.issue_id.as_deref() {
+                returned_issues.push(issue.to_owned());
+            }
             let mut j = job.to_json();
             j["tasks"] = json!(summary.counts.remove(&job.id).unwrap_or_default());
             if detail {
@@ -287,7 +294,17 @@ impl Shared {
                 }
                 None => false,
             };
-            if readable_changed || selected_changed || current_public != public_principal {
+            // A carried row's issue must still resolve into the reader's
+            // readable set NOW: `current_scope` was read fresh above, so this
+            // is the current issue-to-project mapping, not the entry snapshot.
+            let carried_unreadable = returned_issues
+                .iter()
+                .any(|issue| !super::identity::scope_allows_issue(&current_scope, Some(issue)));
+            if readable_changed
+                || carried_unreadable
+                || selected_changed
+                || current_public != public_principal
+            {
                 return Err(Error::rejected("job list refused: reader access changed"));
             }
         }
@@ -362,8 +379,11 @@ impl Shared {
             None => Default::default(),
         };
         let mut tasks = Vec::with_capacity(job_tasks.len());
+        let mut kickoffs: Vec<String> = Vec::new();
         for task in &job_tasks {
-            tasks.push(self.task_json(task, &scope, &task_issues, peer_pid)?);
+            let (rendered, kickoff) = self.task_json(task, &scope, &task_issues, peer_pid)?;
+            tasks.push(rendered);
+            kickoffs.extend(kickoff);
         }
         jj["tasks"] = json!(tasks);
         #[cfg(test)]
@@ -381,30 +401,31 @@ impl Shared {
         {
             return Err(Error::rejected("job show refused: reader access changed"));
         }
-        self.reprove_task_kickoffs("job show", &job_tasks, &scope, peer_pid)?;
+        self.reprove_task_kickoffs("job show", &kickoffs, &scope, peer_pid)?;
         Ok(json!({"job": jj}))
     }
 
-    /// Re-prove the cloud admission of each task's dispatch (kickoff) message.
+    /// Re-prove the cloud admission of the kickoff messages the reply served.
     ///
-    /// The kickoff reference carries the message id and state, which is
-    /// member-visible metadata: a cloud grant withdrawn between selection and
-    /// the response must not be served from the earlier snapshot. The operator
-    /// keeps the unscoped view, as it does for every other read here.
+    /// `kickoffs` is what [`Self::task_json`] actually admitted, never the
+    /// task rows' dispatch pointers: a kickoff the reader cannot see was
+    /// redacted out of the reply, and refusing it here would both break a
+    /// readable detail and disclose the hidden kickoff's existence. The
+    /// admitted reference carries the message id and state, which is
+    /// member-visible metadata, so a cloud grant withdrawn between selection
+    /// and the response must not be served from the earlier snapshot. The
+    /// operator keeps the unscoped view, as it does for every other read here.
     fn reprove_task_kickoffs(
         &self,
         verb: &str,
-        tasks: &[store::Task],
+        kickoffs: &[String],
         scope: &Option<super::identity::ProjectScope>,
         peer_pid: u32,
     ) -> Result<()> {
         if scope.is_none() {
             return Ok(());
         }
-        for task in tasks {
-            let Some(mid) = task.dispatch_message.as_deref() else {
-                continue;
-            };
+        for mid in kickoffs {
             let Some(message) = self.store.message(mid)? else {
                 continue;
             };
@@ -423,16 +444,21 @@ impl Shared {
         Ok(())
     }
 
-    /// One task rendered for show/list: the row plus live kickoff
-    /// state, drift flags and the latest verdict.
+    /// One task rendered for show/list: the row plus live kickoff state,
+    /// drift flags and the latest verdict. The second value is the kickoff
+    /// message this reply ADMITTED (its `kickoff` block is present), so the
+    /// caller re-proves exactly what it served: a kickoff the reader cannot
+    /// see is redacted here and must not turn the reply into a refusal that
+    /// would disclose it.
     fn task_json(
         self: &Arc<Self>,
         task: &store::Task,
         scope: &Option<super::identity::ProjectScope>,
         task_issues: &std::collections::HashMap<String, Option<String>>,
         peer_pid: u32,
-    ) -> Result<Value> {
+    ) -> Result<(Value, Option<String>)> {
         let mut j = task.to_json();
+        let mut admitted_kickoff: Option<String> = None;
         if let Some(mid) = &task.dispatch_message {
             match self.store.message(mid)? {
                 Some(m) => {
@@ -449,6 +475,7 @@ impl Shared {
                     if !admitted {
                         j["dispatch_message"] = Value::Null;
                     } else {
+                        admitted_kickoff = Some(m.id.clone());
                         j["kickoff"] = json!({"id": m.id, "state": m.state});
                         if scope.is_none() {
                             j["kickoff"]["turn_id"] = json!(m.turn_id);
@@ -511,7 +538,7 @@ impl Shared {
         if let Some(v) = store::current_verdict(task.revision, &verdicts) {
             j["latest_verdict"] = super::identity::verdict_json_for_scope(v, scope.is_some());
         }
-        Ok(j)
+        Ok((j, admitted_kickoff))
     }
 
     pub(super) fn rpc_task_show(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
@@ -524,7 +551,7 @@ impl Shared {
         } else {
             Default::default()
         };
-        let mut out = self.task_json(&task, &scope, &task_issues, peer_pid)?;
+        let (mut out, kickoff) = self.task_json(&task, &scope, &task_issues, peer_pid)?;
         let messages = self.store.messages_for_task(&task.id)?;
         let mut visible = Vec::with_capacity(messages.len());
         let mut selected: Vec<&store::Message> = Vec::new();
@@ -582,7 +609,12 @@ impl Shared {
                 }
             }
         }
-        self.reprove_task_kickoffs("task show", std::slice::from_ref(&task), &scope, peer_pid)?;
+        self.reprove_task_kickoffs(
+            "task show",
+            &kickoff.into_iter().collect::<Vec<_>>(),
+            &scope,
+            peer_pid,
+        )?;
         Ok(json!({"task": out}))
     }
 

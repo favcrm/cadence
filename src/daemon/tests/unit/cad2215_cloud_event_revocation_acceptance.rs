@@ -58,6 +58,7 @@ const OP_A: &str = "cad2215-cloud-op-a";
 const OP_B: &str = "cad2215-cloud-op-b";
 const REPLY: &str = "cad2215 cloud reply";
 const CLOUD_BODY: &str = "cloud reply a";
+const FOREIGN_KICKOFF: &str = "cad2215-cloud-foreign-kickoff";
 
 const REVOKE_NONE: u8 = 0;
 const REVOKE_A: u8 = 1;
@@ -460,10 +461,12 @@ fn build_world_with_thread_observers(
         let grants = Arc::clone(&grants);
         let mode = Arc::clone(&detail_mode);
         Some(Arc::new(move |kind: &str, id: &str| {
-            if kind != "task_show"
-                || id != OPEN_TASK
-                || mode.load(Ordering::SeqCst) != DETAIL_REVOKE_A
-            {
+            let target = match kind {
+                "task_show" => OPEN_TASK,
+                "job_show" => OPEN_JOB,
+                _ => return,
+            };
+            if id != target || mode.load(Ordering::SeqCst) != DETAIL_REVOKE_A {
                 return;
             }
             let Some(shared) = slot.lock().unwrap().clone() else {
@@ -698,6 +701,28 @@ fn events(world: &World, params: &Value) -> Result<Value> {
 
 fn tail(alias: &str) -> Value {
     json!({"alias": alias, "tail": true, "cursor_format": "opaque-v1"})
+}
+
+fn job_detail(world: &World, job: &str) -> Result<Value> {
+    let shared = Arc::clone(&world.shared);
+    let _uid = crate::daemon::serve::test_peer_uid_scope(world.agent_uid);
+    scoped(Asserted::Agent(READER.to_string()), || {
+        shared.dispatch("job_show", &json!({"job": job}), std::process::id())
+    })
+}
+
+/// Point the fixture task's dispatch at one message, the way `job dispatch`
+/// records a kickoff.
+fn bind_dispatch(world: &World, task: &str, message: &str) {
+    let db = rusqlite::Connection::open(world._state.path().join("cadence.sqlite3")).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE tasks SET dispatch_message=?1 WHERE id=?2",
+            rusqlite::params![message, task],
+        )
+        .unwrap(),
+        1
+    );
 }
 
 fn task_detail(world: &World, task: &str) -> Result<Value> {
@@ -3068,4 +3093,84 @@ fn task_detail_refuses_bodies_when_the_cloud_grant_is_revoked_after_selection() 
         !rendered.contains(CLOUD_BODY),
         "the refusal leaked the revoked body: {rendered}"
     );
+}
+
+/// A kickoff the reader cannot admit is redacted out of the detail, not
+/// turned into a refusal: the denial is already visible in the reply, so
+/// refusing the whole row would break a readable detail and disclose that a
+/// kickoff it never saw exists.
+#[test]
+fn task_detail_hides_a_kickoff_it_cannot_admit_without_refusing() {
+    let world = build_world();
+    // Cloud B's grant is withdrawn before the read, so this kickoff cannot be
+    // admitted; it also belongs to another task, which redacts it on the
+    // binding check alone.
+    let db = rusqlite::Connection::open(world._state.path().join("cadence.sqlite3")).unwrap();
+    assert_eq!(
+        db.execute(
+            "INSERT OR IGNORE INTO messages(id, alias, body, sender, source, state, created, \
+             completed, issue, task_id) SELECT ?1, ?2, 'foreign kickoff', 'cloud-agent', \
+             'cloud_agent', 'running', created, created, ?3, 'cad2215-other-task' FROM agents \
+             WHERE alias=?2",
+            rusqlite::params![FOREIGN_KICKOFF, CLOUD_B, OPEN_ISSUE],
+        )
+        .unwrap(),
+        1
+    );
+    bind_dispatch(&world, OPEN_TASK, FOREIGN_KICKOFF);
+    world.mode.store(REVOKE_B, Ordering::SeqCst);
+
+    let detail = task_detail(&world, OPEN_TASK)
+        .expect("a kickoff the reader cannot admit must not refuse a readable detail");
+    let task = &detail["task"];
+    assert_eq!(task["dispatch_message"], Value::Null, "{detail}");
+    assert!(task.get("kickoff").is_none(), "{detail}");
+}
+
+/// The detail verbs serve an admitted kickoff's message id and state, which is
+/// member-visible metadata: a grant withdrawn between selection and the
+/// response must refuse the page rather than serve the earlier snapshot.
+fn detail_refuses_revoked_kickoff(verb: &str) {
+    let world = build_world();
+    bind_dispatch(&world, OPEN_TASK, OP_A);
+
+    let live = match verb {
+        "task_show" => task_detail(&world, OPEN_TASK),
+        _ => job_detail(&world, OPEN_JOB),
+    }
+    .unwrap_or_else(|e| panic!("{verb} refused a detail with a live kickoff grant: {e}"));
+    assert!(
+        live.to_string().contains("\"kickoff\""),
+        "{verb} did not serve the admitted kickoff: {live}"
+    );
+
+    // Revoke inside the hook: after the detail is assembled, before the reply.
+    world.detail_mode.store(DETAIL_REVOKE_A, Ordering::SeqCst);
+    let error = match verb {
+        "task_show" => task_detail(&world, OPEN_TASK),
+        _ => job_detail(&world, OPEN_JOB),
+    }
+    .expect_err("a revoked kickoff grant must not serve the earlier snapshot");
+    assert_eq!(error.kind(), "rejected", "{error:?}");
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains(&format!("{} refused", verb.replace('_', " "))),
+        "the refusal did not name the reproof: {rendered}"
+    );
+    for secret in [OP_A, CLOUD_BODY] {
+        assert!(
+            !rendered.contains(secret),
+            "the refusal leaked {secret}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn task_detail_refuses_a_kickoff_grant_revoked_after_selection() {
+    detail_refuses_revoked_kickoff("task_show");
+}
+
+#[test]
+fn job_detail_refuses_a_kickoff_grant_revoked_after_selection() {
+    detail_refuses_revoked_kickoff("job_show");
 }
