@@ -560,6 +560,13 @@ impl Shared {
             Default::default()
         };
         let (mut out, kickoff) = self.task_json(&task, &scope, &task_issues, peer_pid)?;
+        // From here to the body loop below, the kickoff admitted above is the
+        // only kickoff-derived content in hand: a witness that this reply must
+        // re-prove even when the later selection drops the message.
+        #[cfg(test)]
+        if let Some(hook) = &self.job_detail_snapshot_hook {
+            hook("task_show_kickoff", &task.id);
+        }
         let messages = self.store.messages_for_task(&task.id)?;
         let mut visible = Vec::with_capacity(messages.len());
         let mut selected: Vec<&store::Message> = Vec::new();

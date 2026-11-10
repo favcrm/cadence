@@ -560,11 +560,16 @@ fn a_carried_issue_left_behind_as_a_symlink_refuses_the_selected_page() {
          created: '2026-01-01T00:00:00Z'\n---\n",
     )
     .unwrap();
-    let secret = pm.join("secret");
-    std::fs::create_dir_all(secret.join("RACE-1")).unwrap();
+    // The link target lives OUTSIDE every project directory, so the only
+    // scanner-visible binding after the move is the link itself: a scan that
+    // followed links would keep the id readable and this page served, while
+    // the real scan refuses it.
+    let outside = temp.path().join("outside").join("RACE-1");
+    std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(
-        secret.join("project.yaml"),
-        "key: secret\nprefix: SEC\npolicy:\n  version: 1\n  visibility: private\n",
+        outside.join("issue.md"),
+        "---\nid: RACE-1\ntitle: Race fixture\nstatus: backlog\npriority: P2\n\
+         created: '2026-01-01T00:00:00Z'\n---\n",
     )
     .unwrap();
 
@@ -577,13 +582,7 @@ fn a_carried_issue_left_behind_as_a_symlink_refuses_the_selected_page() {
             if kind != "job_list" || fired.swap(true, Ordering::SeqCst) {
                 return;
             }
-            let hidden = pm.join("secret").join("RACE-1");
-            std::fs::write(
-                hidden.join("issue.md"),
-                "---\nid: RACE-1\ntitle: Race fixture\nstatus: backlog\npriority: P2\n\
-                 created: '2026-01-01T00:00:00Z'\n---\n",
-            )
-            .unwrap();
+            let hidden = outside.clone();
             std::fs::remove_dir_all(pm.join("race").join("RACE-1")).unwrap();
             std::os::unix::fs::symlink(&hidden, pm.join("race").join("RACE-1")).unwrap();
         })

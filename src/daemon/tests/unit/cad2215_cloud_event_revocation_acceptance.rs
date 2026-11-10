@@ -70,6 +70,8 @@ const SHOW_INSERT_HIDDEN: u8 = 2;
 
 const DETAIL_NONE: u8 = 0;
 const DETAIL_REVOKE_A: u8 = 1;
+const DETAIL_REVOKE_KICKOFF: u8 = 2;
+const DETAIL_REVOKE_BODIES: u8 = 3;
 
 const RESULT_MARKER: &str = "CAD2215_CLOUD_RESULT";
 const ERROR_MARKER: &str = "CAD2215_CLOUD_ERROR";
@@ -461,12 +463,16 @@ fn build_world_with_thread_observers(
         let grants = Arc::clone(&grants);
         let mode = Arc::clone(&detail_mode);
         Some(Arc::new(move |kind: &str, id: &str| {
-            let target = match kind {
-                "task_show" => OPEN_TASK,
-                "job_show" => OPEN_JOB,
+            // Two armed points: `job_show` after its detail is assembled, and
+            // `task_show_kickoff` — after the kickoff was admitted and before
+            // the message loop reads the same message.
+            let armed = match kind {
+                "task_show_kickoff" => (OPEN_TASK, DETAIL_REVOKE_KICKOFF),
+                "task_show" => (OPEN_TASK, DETAIL_REVOKE_BODIES),
+                "job_show" => (OPEN_JOB, DETAIL_REVOKE_A),
                 _ => return,
             };
-            if id != target || mode.load(Ordering::SeqCst) != DETAIL_REVOKE_A {
+            if id != armed.0 || mode.load(Ordering::SeqCst) != armed.1 {
                 return;
             }
             let Some(shared) = slot.lock().unwrap().clone() else {
@@ -3080,7 +3086,9 @@ fn task_detail_refuses_bodies_when_the_cloud_grant_is_revoked_after_selection() 
 
     // Revoke inside the hook: after the bodies are selected, before the
     // response leaves.
-    world.detail_mode.store(DETAIL_REVOKE_A, Ordering::SeqCst);
+    world
+        .detail_mode
+        .store(DETAIL_REVOKE_BODIES, Ordering::SeqCst);
     let error = task_detail(&world, OPEN_TASK)
         .expect_err("a grant revoked after selection must not serve the body");
     assert_eq!(error.kind(), "rejected", "{error:?}");
@@ -3148,17 +3156,30 @@ fn detail_refuses_revoked_kickoff(verb: &str) {
     let world = build_world();
     bind_dispatch(&world, OPEN_TASK, OP_A);
 
-    let live = job_detail(&world, OPEN_JOB)
+    let call = |world: &World| match verb {
+        "task_show" => task_detail(world, OPEN_TASK),
+        _ => job_detail(world, OPEN_JOB),
+    };
+    let live = call(&world)
         .unwrap_or_else(|e| panic!("{verb} refused a detail with a live kickoff grant: {e}"));
     assert!(
         live.to_string().contains("\"kickoff\""),
         "{verb} did not serve the admitted kickoff: {live}"
     );
 
-    // Revoke inside the hook: after the detail is assembled, before the reply.
-    world.detail_mode.store(DETAIL_REVOKE_A, Ordering::SeqCst);
-    let error = job_detail(&world, OPEN_JOB)
-        .expect_err("a revoked kickoff grant must not serve the earlier snapshot");
+    // Revoke inside the hook, at the point that verb's reply can still carry
+    // the kickoff: between admission and the message loop for the task, after
+    // the detail is assembled for the job.
+    world.detail_mode.store(
+        if verb == "task_show" {
+            DETAIL_REVOKE_KICKOFF
+        } else {
+            DETAIL_REVOKE_A
+        },
+        Ordering::SeqCst,
+    );
+    let error =
+        call(&world).expect_err("a revoked kickoff grant must not serve the earlier snapshot");
     assert_eq!(error.kind(), "rejected", "{error:?}");
     let rendered = format!("{error:?}");
     assert!(
@@ -3176,4 +3197,9 @@ fn detail_refuses_revoked_kickoff(verb: &str) {
 #[test]
 fn job_detail_refuses_a_kickoff_grant_revoked_after_selection() {
     detail_refuses_revoked_kickoff("job_show");
+}
+
+#[test]
+fn task_detail_refuses_a_kickoff_grant_revoked_after_selection() {
+    detail_refuses_revoked_kickoff("task_show");
 }
