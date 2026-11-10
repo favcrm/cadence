@@ -2443,7 +2443,7 @@ fn package_paths(root: &PackageRoot) -> Result<Vec<String>> {
                 )
             };
             let rel = format!("{prefix}{}", String::from_utf8_lossy(name));
-            let child = match rc {
+            match rc {
                 0 => match stat.st_mode & libc::S_IFMT {
                     libc::S_IFLNK => {
                         return Err(Error::rejected("package contains a symlink"));
@@ -2462,12 +2462,14 @@ fn package_paths(root: &PackageRoot) -> Result<Vec<String>> {
                         if raw < 0 {
                             return Err(Error::rejected("package directory is not reachable"));
                         }
-                        Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+                        let child = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+                        // Recurse here, as the Linux enumeration does: `rel`
+                        // is only consumed by the regular-file arm, so a
+                        // deferred `walk` after the match would use it after a
+                        // move.
+                        walk(&child, &format!("{rel}/"), out)?;
                     }
-                    libc::S_IFREG => {
-                        out.push(rel);
-                        None
-                    }
+                    libc::S_IFREG => out.push(rel),
                     _ => {
                         return Err(Error::rejected("package contains a non-regular file"));
                     }
@@ -2475,9 +2477,6 @@ fn package_paths(root: &PackageRoot) -> Result<Vec<String>> {
                 _ => {
                     return Err(Error::rejected("package entry cannot be classified"));
                 }
-            };
-            if let Some(child) = child {
-                walk(&child, &format!("{rel}/"), out)?;
             }
         }
         Ok(())
