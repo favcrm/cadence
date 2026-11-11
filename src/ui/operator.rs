@@ -411,7 +411,7 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route(
         "POST",
         "/api/monitors/*/alerts/*/ack",
-        RouteClass::AgentAllowed,
+        RouteClass::OperatorOnly,
     ),
     route("POST", "/api/issues/*/answers", RouteClass::OperatorOnly),
     // CAD-606: board Kick off — operator-only, same gate as `issue_kickoff`.
@@ -1383,47 +1383,72 @@ enum SessionScope {
 pub(super) struct ReadAdmission {
     proof: Option<(String, String, SessionScope)>,
     checked_at: std::time::Instant,
+    held: Option<Held>,
 }
 
-impl ReadAdmission {
-    /// True when `admit_read` admitted the request without a session — the
-    /// local bootstrap case, where the caller is the operator.
-    pub(super) fn is_anonymous(&self) -> bool {
-        self.proof.is_none()
+/// Reader proof sent only over the board-to-daemon connection.
+pub(super) enum ReadRelayProof {
+    Operator,
+    Public(String),
+    Cli(String),
+    Anonymous,
+}
+
+impl ReadRelayProof {
+    pub(super) fn attach(&self, params: &mut Value) {
+        match self {
+            Self::Operator => {}
+            Self::Public(token) => params["public_session"] = json!(token),
+            Self::Cli(envelope) => params["cli_envelope"] = json!(envelope),
+            Self::Anonymous => params["read_as"] = json!("service/anonymous"),
+        }
     }
 }
 
 /// The caller spelling for a read `admit_read` already admitted.
 ///
-/// `operator` for an anonymous local read; otherwise the public session's
-/// `users/<handle>` via [`board_caller`]. A failure to resolve refuses —
-/// a project-scoped read is never served unfiltered.
+/// A verified owner is `operator`. A member uses its exact verified subject
+/// only when it fits the grant grammar; anonymous reads are not operator proof.
 pub(super) fn read_actor(
-    admission: &ReadAdmission,
+    _admission: &ReadAdmission,
     request: &Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> Result<String, HttpResp> {
-    if admission.is_anonymous() {
-        return Ok("operator".to_string());
+    board_caller(request, state_dir, opts, false, None).map(|caller| policy_caller(&caller))
+}
+
+/// A project policy must use the verified subject, not a lossy display handle.
+pub(super) fn policy_caller(caller: &Caller) -> String {
+    match caller {
+        Caller::Named(named) if !named.operator => {
+            crate::project_policy::policy_user_actor(&named.sub)
+        }
+        _ => caller_spelling(caller),
     }
-    // `Caller::actor()` is display text (it can read "<name> via board"),
-    // so the policy spelling is built from the variant: the public
-    // session's attribution handle is the platform subject, which is what
-    // `users/<handle>` keys on everywhere else.
-    board_caller(request, state_dir, opts, false, None).map(|caller| caller_spelling(&caller))
 }
 
 /// The project-policy spelling for a resolved board caller.
 pub(super) fn caller_spelling(caller: &Caller) -> String {
     match caller {
         Caller::Operator(_) => "operator".to_string(),
+        Caller::Named(named) if named.operator => "operator".to_string(),
         Caller::Named(named) => format!("users/{}", named.author),
         Caller::Agent(alias) => format!("agents/{alias}"),
     }
 }
 
 impl ReadAdmission {
+    pub(super) fn relay_proof(&self) -> ReadRelayProof {
+        match &self.proof {
+            Some((token, _, SessionScope::Origin(Origin::Public))) => {
+                ReadRelayProof::Public(token.clone())
+            }
+            Some(_) => ReadRelayProof::Operator,
+            None => ReadRelayProof::Anonymous,
+        }
+    }
+
     pub(super) const RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub(super) fn wait_timeout(&self) -> std::time::Duration {
@@ -1434,17 +1459,22 @@ impl ReadAdmission {
         }
     }
 
-    /// Revalidate before new frames once the five-second window ends.
-    /// Idle board streams wait only until that deadline; thread streams
-    /// can additionally spend at most two seconds in their bounded poll.
-    /// Validation itself has a two-second absolute deadline. Unknown or
-    /// invalid closes the stream without revoking or clearing credentials.
-    /// Bytes already handed to the blocking HTTP writer are not retractable.
+    /// Revalidate a stream's session and the identity/role it admitted.
+    /// Bytes already handed to the blocking writer are not retractable.
     pub(super) fn still_live(&mut self, state_dir: &std::path::Path) -> bool {
+        self.revalidate(state_dir, false)
+    }
+
+    /// Check again immediately before forwarding a data frame.
+    pub(super) fn still_live_before_frame(&mut self, state_dir: &std::path::Path) -> bool {
+        self.revalidate(state_dir, true)
+    }
+
+    fn revalidate(&mut self, state_dir: &std::path::Path, force: bool) -> bool {
         let Some((token, key, origin)) = &self.proof else {
             return true;
         };
-        if self.checked_at.elapsed() < Self::RECHECK {
+        if !force && self.checked_at.elapsed() < Self::RECHECK {
             return true;
         }
         let checked_at = std::time::Instant::now();
@@ -1458,7 +1488,14 @@ impl ReadAdmission {
             }
         };
         match live {
-            Ok(Some(_)) => {
+            Ok(Some(session)) => {
+                let held = match origin {
+                    SessionScope::Origin(origin) => held_of(*origin, &session),
+                    SessionScope::Entry(_) => Some(Held::Operator),
+                };
+                if held.is_none() || held != self.held {
+                    return false;
+                }
                 self.checked_at = checked_at;
                 true
             }
@@ -1484,27 +1521,30 @@ pub(super) fn admit_read(
     opts: &ServeOpts,
 ) -> Result<ReadAdmission, HttpResp> {
     let checked_at = std::time::Instant::now();
-    let admission = |proof| ReadAdmission { proof, checked_at };
+    let admission = |proof, held| ReadAdmission {
+        proof,
+        checked_at,
+        held,
+    };
     let scope = match request_origin(request, opts) {
         ReqOrigin::Known(origin) => Some(SessionScope::Origin(origin)),
         ReqOrigin::Entry(entry) => Some(SessionScope::Entry(entry)),
         ReqOrigin::NoSession(_) => None,
     };
-    // Only the loopback origin can use the local bootstrap allowance; a
-    // tailnet proxy, the entry origin or any other Host still needs a
-    // session.
-    if let Some(SessionScope::Origin(origin)) = &scope {
-        if anonymous_reads_on(opts, Some(*origin)) {
-            return Ok(admission(None));
-        }
-    }
     match &scope {
         Some(SessionScope::Origin(origin)) => {
             if let Some(token) = session_cookie(request, opts, *origin) {
                 let key = session_key(request);
                 let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
-                if check_session(state_dir, &token, &key, *origin, Some(&budget))?.is_some() {
-                    return Ok(admission(Some((token, key, SessionScope::Origin(*origin)))));
+                if let Some(session) =
+                    check_session(state_dir, &token, &key, *origin, Some(&budget))?
+                {
+                    if let Some(held) = held_of(*origin, &session) {
+                        return Ok(admission(
+                            Some((token, key, SessionScope::Origin(*origin))),
+                            Some(held),
+                        ));
+                    }
                 }
             }
         }
@@ -1515,15 +1555,21 @@ pub(super) fn admit_read(
                 if check_entry_session(state_dir, &token, &key, entry.origin(), Some(&budget))?
                     .is_some()
                 {
-                    return Ok(admission(Some((
-                        token,
-                        key,
-                        SessionScope::Entry(entry.clone()),
-                    ))));
+                    return Ok(admission(
+                        Some((token, key, SessionScope::Entry(entry.clone()))),
+                        Some(Held::Operator),
+                    ));
                 }
             }
         }
         None => {}
+    }
+    // A session, when presented, is checked before the loopback bootstrap
+    // fallback so a stream retains its real identity and role.
+    if let Some(SessionScope::Origin(origin)) = &scope {
+        if anonymous_reads_on(opts, Some(*origin)) {
+            return Ok(admission(None, None));
+        }
     }
     let (code, message) = match &scope {
         Some(SessionScope::Origin(Origin::Public)) => (

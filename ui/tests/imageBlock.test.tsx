@@ -110,10 +110,10 @@ globalThis.fetch = (async (input: unknown) => {
   }
   if (url.pathname === "/api/member-assistant/history") {
     return new Response(JSON.stringify({ conversation: { id: "cm1", alias: "assistant" }, entries: [
-      { seq: 1, role: "member", kind: "message", text: "make an apple", message: "m1" },
-      { seq: 2, role: "agent", kind: "image_job", text: "", message: "m1", created: new Date(now - 5000).toISOString(), payload },
-      { seq: 3, role: "agent", kind: "turn_result", text: "Started.", message: "m1" },
-    ], more_before: false }), { status: 200 });
+      { id: "csrid_fixture_1", role: "member", kind: "message", text: "make an apple", message: "m1" },
+      { id: "csrid_fixture_2", role: "agent", kind: "image_job", text: "", message: "m1", created: new Date(now - 5000).toISOString(), payload },
+      { id: "csrid_fixture_3", role: "agent", kind: "turn_result", text: "Started.", message: "m1" },
+    ], cursor: "csc1_fixture_forward", before_cursor: "csc1_fixture_before", more_before: false, more_after: false }), { status: 200 });
   }
   if (url.pathname.startsWith("/api/artifacts/")) {
     host.byteReads++;

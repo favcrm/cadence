@@ -174,10 +174,42 @@ fn decide(until: WaitUntil, snap: &WaitSnapshot) -> Option<WaitHit> {
 }
 
 impl Shared {
+    fn wait_message_readable(
+        &self,
+        message: &store::Message,
+        scope: &Option<super::identity::ProjectScope>,
+        denied: &store::PrivateJobDenials,
+        peer_pid: u32,
+    ) -> Result<bool> {
+        if scope.is_none() {
+            return Ok(true);
+        }
+        let task_issues = match message.task_id.as_deref() {
+            Some(task) => self.store.task_issue_bindings(&[task])?,
+            None => Default::default(),
+        };
+        Ok(message.source != "app_run_dispatch"
+            && super::identity::scope_allows_message(scope, message, &task_issues)
+            && !denied.hides_message(message)
+            && self.may_read_cloud_row(
+                peer_pid,
+                &message.alias,
+                &message.id,
+                message.sender_uid.as_deref(),
+                message.recipient_uid.as_deref(),
+            )?)
+    }
+
     /// `agent_wait`: block (daemon-side) until the condition holds.
     /// Read-only: no store write on any path.
     pub(super) fn rpc_wait(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let scope = self.project_scope(peer_pid, "agent wait")?;
+        let private_denials = if scope.is_some() {
+            self.private_job_denials_for_read(params, None, None, peer_pid)?
+        } else {
+            Default::default()
+        };
         let until = WaitUntil::parse(optional_str(params, "until").unwrap_or("any"))?;
         let message = match optional_str(params, "message") {
             Some(id) => {
@@ -191,6 +223,9 @@ impl Shared {
                     .store
                     .message(id)?
                     .ok_or_else(|| Error::rejected(format!("Unknown message '{id}'")))?;
+                if !self.wait_message_readable(&row, &scope, &private_denials, peer_pid)? {
+                    return Err(Error::rejected(format!("Unknown message '{id}'")));
+                }
                 if row.alias != alias {
                     return Err(Error::rejected(format!(
                         "Message '{id}' belongs to '{}', not '{alias}'",
@@ -202,14 +237,55 @@ impl Shared {
             None => None,
         };
         let bound = clamp_wait_secs(optional_u64(params, "timeout").unwrap_or(600));
-        let cursor = self.store.event_cursor(&alias)?;
+        let mut cursor = self.store.event_cursor(&alias)?;
+        #[cfg(feature = "test-seam")]
+        if let Some(observer) = &self.wait_baseline_observer {
+            observer(&alias, cursor);
+        }
+        let allowed_issues = scope.as_ref().map(|(readable, issues)| {
+            issues
+                .iter()
+                .filter(|(_, project)| readable.contains(*project))
+                .map(|(issue, _)| issue.as_str())
+                .collect::<Vec<_>>()
+        });
         let t0 = Instant::now();
         let deadline = t0 + Duration::from_secs(bound);
         loop {
-            if let Some(out) = self.wait_check(&alias, until, &message, cursor, peer_pid)? {
+            if let Some(out) = self.wait_check(
+                &alias,
+                until,
+                &message,
+                &mut cursor,
+                &scope,
+                allowed_issues.as_deref(),
+                &private_denials,
+                peer_pid,
+            )? {
+                let current_scope = self.project_scope(peer_pid, "agent wait")?;
+                if current_scope != scope
+                    || (scope.is_some()
+                        && self.private_job_denials_for_read(params, None, None, peer_pid)?
+                            != private_denials)
+                {
+                    return Err(Error::rejected(
+                        "agent wait refused: project access changed",
+                    ));
+                }
+                if let Some(id) = &message {
+                    let row = self
+                        .store
+                        .message(id)?
+                        .ok_or_else(|| Error::rejected(format!("Unknown message '{id}'")))?;
+                    if !self.wait_message_readable(&row, &scope, &private_denials, peer_pid)? {
+                        return Err(Error::rejected(format!("Unknown message '{id}'")));
+                    }
+                }
                 let mut obj = serde_json::Map::new();
                 obj.insert("alias".to_string(), json!(alias));
-                obj.insert("state".to_string(), json!(self.store.agent(&alias)?.state));
+                if scope.is_none() {
+                    obj.insert("state".to_string(), json!(self.store.agent(&alias)?.state));
+                }
                 let (reason, mid) = match &out {
                     WaitHit::Attention { reason, message } => (reason.to_string(), message.clone()),
                     WaitHit::Reported { message } => {
@@ -219,15 +295,16 @@ impl Shared {
                     WaitHit::Idle => ("idle".to_string(), None),
                 };
                 obj.insert("reason".to_string(), json!(reason));
-                // The turn token rides the answer as text so the central
-                // CAD-375 withhold redacts it for non-owners (I2); dead
-                // tokens stay visible like `agent_show` rows.
+                // Turn credentials are emitted only to the operator.
                 if let Some(id) = mid {
                     // CAD-1853: a routed cloud reply is a message this caller
                     // may not read. The wait still reports that something
                     // settled, but it does not name a row the body reader
                     // would refuse.
                     let readable = match self.store.message(&id)? {
+                        Some(m) if scope.is_some() => {
+                            self.wait_message_readable(&m, &scope, &private_denials, peer_pid)?
+                        }
                         Some(m) => self.may_read_cloud_row(
                             peer_pid,
                             &m.alias,
@@ -235,17 +312,35 @@ impl Shared {
                             m.sender_uid.as_deref(),
                             m.recipient_uid.as_deref(),
                         )?,
-                        None => true,
+                        None => scope.is_none(),
                     };
+                    if !readable && scope.is_some() {
+                        if Instant::now() >= deadline {
+                            return Err(Error::busy(format!(
+                                "agent wait timed out after {bound}s: no {} for '{alias}'",
+                                optional_str(params, "until").unwrap_or("any"),
+                            )));
+                        }
+                        let ticket = self.changed.ticket();
+                        self.changed
+                            .wait_if_unchanged(ticket, deadline.min(Instant::now() + QUANTUM));
+                        continue;
+                    }
                     if readable {
                         obj.insert("message".to_string(), json!(id.clone()));
-                        if let Some(token) = self.store.message(&id)?.and_then(|m| m.turn_id) {
-                            obj.insert("turn".to_string(), json!(token));
+                        if scope.is_none() {
+                            if let Some(token) = self.store.message(&id)?.and_then(|m| m.turn_id) {
+                                obj.insert("turn".to_string(), json!(token));
+                            }
                         }
                     }
                 }
                 obj.insert("waited_secs".to_string(), json!(t0.elapsed().as_secs_f64()));
                 return Ok(Value::Object(obj));
+            }
+            #[cfg(feature = "test-seam")]
+            if let Some(observer) = &self.wait_scan_observer {
+                observer(&alias, cursor);
             }
             if Instant::now() >= deadline {
                 return Err(Error::busy(format!(
@@ -272,22 +367,60 @@ impl Shared {
     }
 
     /// One evaluation: read the snapshot, run the predicate. No writes.
+    #[allow(clippy::too_many_arguments)]
     fn wait_check(
         &self,
         alias: &str,
         until: WaitUntil,
         message: &Option<String>,
-        cursor: i64,
+        cursor: &mut i64,
+        scope: &Option<super::identity::ProjectScope>,
+        allowed_issues: Option<&[&str]>,
+        denied: &store::PrivateJobDenials,
         peer_pid: u32,
     ) -> Result<Option<WaitHit>> {
         let agent = self.store.agent(alias)?;
-        let unknown = self.store.unknown_messages(alias)?;
-        let menu = self.stall_view(alias).and_then(|view| view.menu.clone());
+        let mut unknown = if until.watches_attention() {
+            self.store.unknown_messages(alias)?
+        } else {
+            Vec::new()
+        };
+        if scope.is_some() {
+            let mut visible = Vec::with_capacity(unknown.len());
+            for id in unknown {
+                if let Some(row) = self.store.message(&id)? {
+                    if self.wait_message_readable(&row, scope, denied, peer_pid)? {
+                        visible.push(id);
+                    }
+                }
+            }
+            unknown = visible;
+        }
+        let running = if until.watches_attention() {
+            match self.store.running_message(alias)? {
+                Some(message)
+                    if self.wait_message_readable(&message, scope, denied, peer_pid)? =>
+                {
+                    Some((message.id, message.turn_id))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let can_view_activity = scope.is_none() || running.is_some() || !unknown.is_empty();
+        let menu = if until.watches_attention() && can_view_activity {
+            self.stall_view(alias).and_then(|view| view.menu.clone())
+        } else {
+            None
+        };
         // Brokered-request existence is CAD-506-gated: callers
         // `agent_requests` would refuse never see this cause (fail
         // closed). The pane-menu line above is already public via
         // `agent_show`, so it needs no gate.
-        let open_requests = self.may_see_requests(alias, peer_pid)
+        let open_requests = until.watches_attention()
+            && can_view_activity
+            && self.may_see_requests(alias, peer_pid)
             && (self
                 .pending
                 .lock()
@@ -299,10 +432,6 @@ impl Shared {
                     .platform_effects(Some(alias))?
                     .iter()
                     .any(|row| row.state == "waiting"));
-        let running = self
-            .store
-            .running_message(alias)?
-            .map(|m| (m.id, m.turn_id));
         // A `--message` wait keys off the named row's terminal state
         // (covers `cancelled`, which emits no `turn_finished`); without
         // `--message`, the first `turn_finished` after the baseline
@@ -316,18 +445,35 @@ impl Shared {
                     .ok_or_else(|| Error::internal(format!("Message '{id}' vanished mid-wait")))?;
                 is_terminal(&current.state).then(|| (id.clone(), current.state))
             }
+            None if !until.watches_reported() => None,
             None => {
                 let mut found = None;
-                for event in self.store.events(alias, cursor, 100)? {
-                    if event.kind == "turn_finished" {
-                        if let Some(id) = event.payload.get("message").and_then(Value::as_str) {
-                            if let Some(row) = self.store.message(id)? {
-                                if is_terminal(&row.state) {
-                                    found = Some((id.to_string(), row.state));
-                                    break;
+                loop {
+                    let events = match allowed_issues {
+                        Some(issues) => self
+                            .store
+                            .events_scoped(alias, *cursor, 100, issues, denied, false)?,
+                        None => self.store.events(alias, *cursor, 100)?,
+                    };
+                    let more = events.len() == 100;
+                    for event in events {
+                        *cursor = event.seq;
+                        if event.kind == "turn_finished" {
+                            if let Some(id) = event.payload.get("message").and_then(Value::as_str) {
+                                if let Some(row) = self.store.message(id)? {
+                                    if is_terminal(&row.state)
+                                        && self
+                                            .wait_message_readable(&row, scope, denied, peer_pid)?
+                                    {
+                                        found = Some((id.to_string(), row.state));
+                                        break;
+                                    }
                                 }
                             }
                         }
+                    }
+                    if found.is_some() || !more {
+                        break;
                     }
                 }
                 found
@@ -336,8 +482,16 @@ impl Shared {
         Ok(decide(
             until,
             &WaitSnapshot {
-                state: agent.state,
-                error: agent.error.unwrap_or_default(),
+                state: if !can_view_activity && agent.state == "attention" {
+                    String::new()
+                } else {
+                    agent.state
+                },
+                error: if can_view_activity {
+                    agent.error.unwrap_or_default()
+                } else {
+                    String::new()
+                },
                 unknown,
                 menu,
                 open_requests,

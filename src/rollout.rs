@@ -136,7 +136,25 @@ pub use migration::{
 /// source-read marker onto capability receipts, with a partial scoped index,
 /// so the retained-source page is an ordered range instead of a join+sort.
 /// v63 (CAD-1857) adds `agent_endpoints`, the agent ingress endpoint registry.
-pub const SCHEMA_VERSION: i64 = 63;
+///
+/// v64 (CAD-2215) adds `assist_request_queue`, the durable acceptance of a
+/// member job request before its canonical job exists. One row per
+/// `(org, sub, request_key)` keeps a request pending behind an occupied
+/// issue instead of refusing it; the joined autonomous promotion worker
+/// turns it into the ordinary one-nonterminal-job-per-issue draft.
+///
+/// v65 (CAD-2215) adds `app_member_grants`, the explicit per-member grant for
+/// one exact app conversation, retained as a revocable tombstone.
+///
+/// v66 (CAD-2215) adds the nullable
+/// `connection_metadata.cursor_keyring_fingerprint`. `NULL` means the
+/// operator never explicitly initialized the scoped-cursor keyring; the
+/// migration never writes a value, so only the operator RPC can bind one.
+///
+/// v67 (CAD-2215) gives each app-conversation grant an authorization epoch.
+/// Existing grants keep their authority; an explicit re-grant changes the
+/// epoch, fencing readers that selected data under the previous grant.
+pub const SCHEMA_VERSION: i64 = 67;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

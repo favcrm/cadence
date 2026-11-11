@@ -199,6 +199,10 @@ impl Shared {
     /// who queued it, derived from the connection (CAD-319); a steering
     /// send's caller is derived the same way (CAD-158).
     pub(super) fn rpc_send_from(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        if let Some(task) = optional_str(params, "task") {
+            let caller = self.agent_caller(peer_pid, "send --task")?;
+            self.read_task_for(&caller, task)?;
+        }
         // CAD-1853: a cloud target is not a local queue. The normal send
         // path reaches the same canonical Thread through the cloud transport.
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
@@ -1018,17 +1022,34 @@ impl Shared {
     ) -> Result<Value> {
         reject_identity_fields(params, "message_read")?;
         let id = required_str(params, "message")?;
+        let scope = self.project_scope(peer_pid, "message read")?;
+        let private_denials = if scope.is_some() {
+            Some(self.private_job_denials_for_read(params, None, None, peer_pid)?)
+        } else {
+            None
+        };
         let message = self
             .store
             .message(id)?
             .ok_or_else(|| Error::rejected(format!("No such message '{id}'")))?;
+        if scope.is_some() {
+            let task_issues = match message.task_id.as_deref() {
+                Some(task) => self.store.task_issue_bindings(&[task])?,
+                None => Default::default(),
+            };
+            if !super::identity::scope_allows_message(&scope, &message, &task_issues)
+                || private_denials
+                    .as_ref()
+                    .is_some_and(|denied| denied.hides_message(&message))
+            {
+                return Err(Error::rejected(format!("No such message '{id}'")));
+            }
+        }
         if message.source == "app_run_dispatch" {
             match self.connection_caller(peer_pid)? {
                 caller_rule::Who::Operator => {}
                 _ => {
-                    return Err(Error::rejected(
-                        "app mail inspection requires operator proof",
-                    ));
+                    return Err(Error::rejected(format!("No such message '{id}'")));
                 }
             }
         }
@@ -1043,6 +1064,9 @@ impl Shared {
             message.sender_uid.as_deref(),
             message.recipient_uid.as_deref(),
         )? {
+            if scope.is_some() {
+                return Err(Error::rejected(format!("No such message '{id}'")));
+            }
             return Err(Error::rejected(
                 "message_read refused: this message carries another source's cloud \
                  result and is readable only by its sender, its recipient or the \
@@ -1051,10 +1075,7 @@ impl Shared {
         }
         if let caller_rule::Who::Agent(caller) = self.connection_caller(peer_pid)? {
             if !self.store.agent_reads_message(&message, &caller)? {
-                return Err(Error::rejected(format!(
-                    "message_read refused: agent '{caller}' cannot read another \
-                     agent's mail (caller rule, CAD-480)"
-                )));
+                return Err(Error::rejected(format!("No such message '{id}'")));
             }
         }
         // CAD-1380 target-side privacy: a member assistant's stored message is
@@ -1065,10 +1086,7 @@ impl Shared {
                 caller_rule::Who::Operator => {}
                 caller_rule::Who::Agent(caller) if caller == message.alias => {}
                 _ => {
-                    return Err(Error::rejected(
-                        "message_read refused: a member assistant's message is private \
-                         to its assistant (CAD-1380 target-side privacy)",
-                    ))
+                    return Err(Error::rejected(format!("No such message '{id}'")));
                 }
             }
         }
@@ -1087,6 +1105,15 @@ impl Shared {
             .ok()
             .flatten()
             .unwrap_or(Value::Null);
+        if let Some(previous) = &private_denials {
+            if self.project_scope(peer_pid, "message read")? != scope
+                || self.private_job_denials_for_read(params, None, None, peer_pid)? != *previous
+            {
+                return Err(Error::rejected(
+                    "message read refused: reader access changed",
+                ));
+            }
+        }
         Ok(json!({
             "message": message.id,
             "text": text,
@@ -1112,6 +1139,19 @@ impl Shared {
         let alias = self.resolve_alias(to)?;
         let who = self.connection_caller(peer_pid)?;
         admit_message_list(&who, &alias)?;
+        let scope = self.project_scope(peer_pid, "message list")?;
+        let private_denials = if scope.is_some() {
+            Some(self.private_job_denials_for_read(params, None, None, peer_pid)?)
+        } else {
+            None
+        };
+        let allowed_issues = scope.as_ref().map(|(readable, issues)| {
+            issues
+                .iter()
+                .filter(|(_, project)| readable.contains(*project))
+                .map(|(issue, _)| issue.as_str())
+                .collect::<Vec<_>>()
+        });
         let states = match params.get("state") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(items)) => items
@@ -1159,11 +1199,41 @@ impl Shared {
                 since: since.as_deref(),
                 limit,
                 include_app,
+                allowed_issues: allowed_issues.as_deref(),
+                denied_tasks: private_denials.as_ref().map(|denied| &denied.tasks),
+                denied_issues: private_denials.as_ref().map(|denied| &denied.issues),
+                exclude_cloud: private_denials
+                    .as_ref()
+                    .is_some_and(|denied| denied.exclude_cloud),
             },
         )?;
+        let messages = page
+            .rows
+            .iter()
+            .map(|row| {
+                let mut value = row.to_json();
+                if scope.is_some() {
+                    let fields = value.as_object_mut().expect("message index is an object");
+                    // `id` is the continuation handle. The table-global sequence
+                    // exposes activity in unrelated mailboxes and is not needed.
+                    fields.remove("seq");
+                    fields.remove("reply_to");
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        if let Some(previous) = &private_denials {
+            if self.project_scope(peer_pid, "message list")? != scope
+                || self.private_job_denials_for_read(params, None, None, peer_pid)? != *previous
+            {
+                return Err(Error::rejected(
+                    "message list refused: reader access changed",
+                ));
+            }
+        }
         Ok(json!({
             "alias": alias,
-            "messages": page.rows.iter().map(store::MessageIndex::to_json).collect::<Vec<_>>(),
+            "messages": messages,
             "limit": limit,
             "omitted": page.omitted,
             "truncated": page.omitted > 0,
@@ -1955,12 +2025,22 @@ impl Shared {
                     match completion {
                         Ok(finished) => {
                             self.notify_routed_target(&finished, &stored);
+                            // CAD-2215: the durable completion is the
+                            // private ledger's trigger — a member-owned
+                            // kickoff's result is recorded now, not on a
+                            // later verdict or manual reconcile.
+                            let private_delivery = if finished.source == "job_dispatch" {
+                                self.settle_private_completion(&finished.id)
+                            } else {
+                                json!({"state": "not_private"})
+                            };
                             // The report frees the actor's one turn — wake
                             // it so the next queued delivery is claimed
                             // now, not on the idle poll.
                             self.notify_agent(&finished.alias);
                             self.wake();
-                            return Ok(json!({"state": "reported", "kind": kind}));
+                            return Ok(json!({"state": "reported", "kind": kind,
+                                             "private_delivery": private_delivery}));
                         }
                         Err(current) => {
                             current.ok_or_else(|| Error::rejected("Unknown message"))?
@@ -1982,7 +2062,17 @@ impl Shared {
                             "Message already completed with a different result",
                         ));
                     }
-                    return Ok(json!({"state": "completed", "duplicate": true}));
+                    // The completion is already durable (another writer
+                    // or a retried report): settle its private delivery
+                    // here too, idempotently, so the owner is not left
+                    // waiting for a verdict.
+                    let private_delivery = if message.source == "job_dispatch" {
+                        self.settle_private_completion(&message.id)
+                    } else {
+                        json!({"state": "not_private"})
+                    };
+                    return Ok(json!({"state": "completed", "duplicate": true,
+                                     "private_delivery": private_delivery}));
                 } else {
                     return Err(Error::rejected(format!(
                         "Message is not awaiting a report (state {})",
@@ -2113,10 +2203,19 @@ impl Shared {
         if let Some(result) = message.result.clone() {
             self.notify_routed_target(&message, &result);
         }
+        // CAD-2215: an operator reconcile to `completed` is a real
+        // completion of the kickoff, so the private ledger settles here
+        // through the same canonical evidence — still no shared effect.
+        let private_delivery = if message.source == "job_dispatch" {
+            self.settle_private_completion(&message.id)
+        } else {
+            json!({"state": "not_private"})
+        };
         // A live actor holding this cloud turn stops polling it now.
         self.notify_agent(&message.alias);
         self.wake();
-        Ok(json!({"state": "reconciled", "message": message.to_json()}))
+        Ok(json!({"state": "reconciled", "message": message.to_json(),
+                  "private_delivery": private_delivery}))
     }
 
     /// Cancel a still-`queued` message — never delivered. The store's

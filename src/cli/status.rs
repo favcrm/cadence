@@ -179,12 +179,14 @@ pub(super) fn status_view(
             "alias": alias,
             "provider": provider,
             "endpoint_kind": kind,
-            "state": a["state"].as_str().unwrap_or_default(),
+            // CAD-2215: a scoped row reports no stored state; `null` is
+            // unavailable, never an empty-string state.
+            "state": a["state"].clone(),
             // CAD-96: `stopped (auto, idle 72m)` for an idle auto-stop.
             "state_label": a["state_label"],
             "auto_stopped": a["auto_stopped"],
-            "dead": a["dead"].as_bool().unwrap_or(false),
-            "resumable": a["resumable"].as_bool().unwrap_or(false),
+            "dead": a["dead"].clone(),
+            "resumable": a["resumable"].clone(),
             "running": running,
             // CAD-250: the daemon's `awaiting_report` view (wait, bound,
             // queued behind it) — null when no turn awaits a report.
@@ -231,16 +233,24 @@ pub(super) fn status_view(
             // not in a terminal/fenced state. Summing `states` minus
             // `stopped` overcounts (attention rows are fenced, dead
             // rows can sit in any state).
-            "live": rows
-                .iter()
-                .filter(|r| {
-                    !r["dead"].as_bool().unwrap_or(false)
-                        && !matches!(
-                            r["state"].as_str().unwrap_or_default(),
-                            "stopping" | "stopped" | "attention" | "offline"
-                        )
-                })
-                .count(),
+            //
+            // CAD-2215: the daemon reports capacity as unavailable to a
+            // scoped reader; a footer must not invent one from the rows it
+            // can see.
+            "live": if list["live"].is_number() {
+                json!(rows
+                    .iter()
+                    .filter(|r| {
+                        !r["dead"].as_bool().unwrap_or(false)
+                            && !matches!(
+                                r["state"].as_str().unwrap_or_default(),
+                                "stopping" | "stopped" | "attention" | "offline"
+                            )
+                    })
+                    .count())
+            } else {
+                Value::Null
+            },
             "unread_inboxes": unread_inboxes,
             "stale_inboxes": stale_inboxes,
             "slots": slots,
@@ -311,7 +321,7 @@ pub(super) fn print_status_table(view: &Value) {
                 a["state_label"]
                     .as_str()
                     .or(a["state"].as_str())
-                    .unwrap_or_default()
+                    .unwrap_or("-")
                     .to_string(),
                 running,
                 a["queued"].as_i64().unwrap_or(0).to_string(),

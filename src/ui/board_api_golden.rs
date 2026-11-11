@@ -1,7 +1,7 @@
 //! CAD-1792: the typed board-API bodies serialize to the same bytes the
 //! `json!` builders did. Each golden is the pretty body captured from the
 //! pre-typing code; `CADENCE_WRITE_GOLDEN=1` rewrites them.
-use super::member_view::{member_view, redact_agents_payload, redact_master_state};
+use super::member_view::{member_view, redact_master_state};
 use super::serve::agents_payload_from;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -81,9 +81,6 @@ fn agents_payload_bytes_are_unchanged() {
     let dir = tempfile::TempDir::new().unwrap();
     let full = agents_payload_from(dir.path(), Some(roster()), Some(&jobs()));
     golden("agents_operator.json", &full);
-    let mut member = full.clone();
-    redact_agents_payload(&mut member);
-    golden("agents_member.json", &member);
     golden(
         "agents_unreachable.json",
         &agents_payload_from(dir.path(), None, None),

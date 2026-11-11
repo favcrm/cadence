@@ -16,6 +16,8 @@ use super::quota::automatic_quota_error;
 use super::StoreConn;
 use super::{is_terminal, now, Sender, Store};
 
+pub(crate) const MAX_MONITOR_TASKS: usize = 256;
+
 /// A daemon-owned supervision registration. `state` is the monitor
 /// lifecycle (`degraded` until the first successful check, then `active`,
 /// or `off` after an explicit stop); it never describes worker health.
@@ -41,6 +43,13 @@ pub struct Monitor {
     pub error: Option<String>,
     pub created: f64,
     pub updated: f64,
+}
+
+pub(crate) struct ProjectMonitorView {
+    pub monitor: Monitor,
+    pub coverage: Vec<(String, Option<String>)>,
+    pub open_alerts: i64,
+    pub total_alerts: i64,
 }
 
 /// A durable local alert produced by an observed, task-scoped event.
@@ -168,7 +177,11 @@ impl Store {
             })
     }
 
-    fn monitor_alert_in(&self, conn: &impl super::StoreConn, seq: i64) -> Result<MonitorAlert> {
+    pub(crate) fn monitor_alert_in(
+        &self,
+        conn: &impl super::StoreConn,
+        seq: i64,
+    ) -> Result<MonitorAlert> {
         conn.query_row(
             "SELECT * FROM monitor_alerts WHERE seq=?",
             [seq],
@@ -214,6 +227,38 @@ impl Store {
         })
     }
 
+    /// The monitor and its covered tasks' issue bindings from one read.
+    pub(crate) fn project_monitor_view(&self, id: &str) -> Result<ProjectMonitorView> {
+        self.read_tx(|conn| self.project_monitor_view_in(&*conn, id))
+    }
+
+    /// [`Self::project_monitor_view`] on an already-open connection or write
+    /// transaction, so an acknowledgement can re-read the exact coverage in
+    /// the same transaction that mutates the alert.
+    pub(crate) fn project_monitor_view_in(
+        &self,
+        conn: &impl StoreConn,
+        id: &str,
+    ) -> Result<ProjectMonitorView> {
+        let monitor = self.monitor_in(conn, id)?;
+        let coverage = conn.query_vec(
+            "SELECT mt.task_id, NULLIF(j.issue_id, '')
+             FROM monitor_tasks mt
+             LEFT JOIN tasks t ON t.id = mt.task_id
+             LEFT JOIN jobs j ON j.id = t.job_id
+             WHERE mt.monitor_id = ? ORDER BY mt.task_id",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (open_alerts, total_alerts) = self.monitor_counts_in(conn, id)?;
+        Ok(ProjectMonitorView {
+            monitor,
+            coverage,
+            open_alerts,
+            total_alerts,
+        })
+    }
+
     pub fn monitors(&self) -> Result<Vec<Monitor>> {
         self.read_tx(|conn| {
             let stmt_sql = "SELECT * FROM monitors ORDER BY id";
@@ -254,7 +299,7 @@ impl Store {
                 "Automatic monitor dispatch requires the separate manual dispatch permission",
             ));
         }
-        if task_ids.is_empty() || task_ids.len() > 256 {
+        if task_ids.is_empty() || task_ids.len() > MAX_MONITOR_TASKS {
             return Err(Error::rejected(
                 "Monitor coverage must contain 1-256 task ids",
             ));
@@ -444,7 +489,11 @@ impl Store {
             &plan.task.id,
             pending_aliases,
             by,
-            Some(DispatchPreparation { plan, delivery }),
+            Some(DispatchPreparation {
+                plan,
+                delivery,
+                project: None,
+            }),
             expect,
         )
     }
@@ -1072,29 +1121,40 @@ impl Store {
     }
 
     pub fn ack_monitor_alert(&self, id: &str, seq: i64, by: &str) -> Result<MonitorAlert> {
+        self.write_tx(|tx| self.ack_monitor_alert_in(&*tx, id, seq, by))
+    }
+
+    /// [`Self::ack_monitor_alert`] on an already-open write transaction, so
+    /// the scoped acknowledgement can re-authorize and mutate under the same
+    /// database snapshot. Callers must hold the tracker and enrollment guards
+    /// that serialize the other authority sources.
+    pub(crate) fn ack_monitor_alert_in(
+        &self,
+        conn: &impl StoreConn,
+        id: &str,
+        seq: i64,
+        by: &str,
+    ) -> Result<MonitorAlert> {
         identifier(by, "Alert acknowledger")?;
-        self.write_tx(|conn| {
-            let tx = &mut *conn;
-            let alert = self.monitor_alert_in(&tx, seq)?;
-            if alert.monitor_id != id {
-                return Err(Error::rejected(format!(
-                    "Alert '{seq}' does not belong to monitor '{id}'"
-                )));
-            }
-            if alert.state == "open" {
-                tx.execute(
-                    "UPDATE monitor_alerts SET state='acknowledged',updated=? WHERE seq=?",
-                    params![now(), seq],
-                )?;
-                Self::event(
-                    &tx,
-                    Self::DAEMON_STREAM,
-                    "monitor_alert_ack",
-                    json!({"monitor": id, "alert": seq, "by": by}),
-                )?;
-            }
-            self.monitor_alert_in(&conn, seq)
-        })
+        let alert = self.monitor_alert_in(conn, seq)?;
+        if alert.monitor_id != id {
+            return Err(Error::rejected(format!(
+                "Alert '{seq}' does not belong to monitor '{id}'"
+            )));
+        }
+        if alert.state == "open" {
+            conn.execute(
+                "UPDATE monitor_alerts SET state='acknowledged',updated=? WHERE seq=?",
+                params![now(), seq],
+            )?;
+            Self::event(
+                conn,
+                Self::DAEMON_STREAM,
+                "monitor_alert_ack",
+                json!({"monitor": id, "alert": seq, "by": by}),
+            )?;
+        }
+        self.monitor_alert_in(conn, seq)
     }
 
     // ---- Jobs, tasks, verdicts (the work axis) ----

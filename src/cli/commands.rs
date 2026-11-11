@@ -320,6 +320,13 @@ pub(crate) enum Commands {
         /// all other fields and the sanitized copy still face normal scanning.
         #[arg(long, requires = "portable")]
         redact_history_secrets: bool,
+        /// With `--portable`: state for this source that no unidentified
+        /// chat-attachment custody root holds private bytes. The exporter
+        /// cannot prove that from the store, so an otherwise-clean source
+        /// refuses without it. A source holding a classifiable private record
+        /// still refuses, and the package records the assertion.
+        #[arg(long, requires = "portable")]
+        attest_chat_custody_absent: bool,
         /// Repeatable, with `--portable`: an app whose data to include. No
         /// app schema is supported yet, so any selection is refused before
         /// the store or tracker is read or the output is created.
@@ -1244,9 +1251,11 @@ pub(crate) enum Commands {
         job: Option<String>,
         /// Return events after this cursor. Omit for the newest page —
         /// the default shows the latest 50 events, oldest first, with
-        /// the cursor to continue forward from.
+        /// the cursor to continue forward from. Continue with the
+        /// opaque `cursor` a previous page returned; a numeric sequence
+        /// is accepted only for a proven operator's agent log.
         #[arg(long)]
-        after: Option<i64>,
+        after: Option<String>,
         /// Seconds to wait for new events per request (0-30).
         #[arg(long, default_value_t = 0)]
         wait: u64,

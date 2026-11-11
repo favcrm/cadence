@@ -35,6 +35,8 @@
 
 use std::io::Read as _;
 
+use super::job_events_opaque;
+use super::scoped_cursor::{CursorBinding, CursorDirection};
 use super::*;
 
 use crate::board_identity;
@@ -78,6 +80,11 @@ pub(crate) struct MemberCaller {
 /// CAD-1380 R4: pending assist intents drained per tick (oldest first).
 pub(super) const ASSIST_NOTICE_BATCH: usize = 20;
 
+/// Missing, unreadable, ambiguous and already-claimed issues share a refusal
+/// that names neither the issue nor any existing job.
+const MEMBER_JOB_ISSUE_UNAVAILABLE: &str =
+    "member job request refused: the requested issue is unavailable";
+
 /// A bounded, single-line diagnostic for an unresolved intent (no secrets:
 /// the reason is a refusal message, never a credential).
 fn bounded_reason(text: &str) -> String {
@@ -103,6 +110,23 @@ pub(super) struct MemberReprove<'a> {
     /// `job_dispatch`, absent for every other op. The platform re-proves
     /// THIS credential live, never the binding's latest pin.
     pub op_credential_id: Option<&'a str>,
+}
+
+/// CAD-2215: pending accepted requests visited per autonomous promotion
+/// sweep. Bounded so one tick never holds the publication lock or a store
+/// connection over an unbounded scan.
+pub(super) const ASSIST_REQUEST_BATCH: usize = 20;
+
+/// One autonomous promotion outcome, keyed by the owner-facing request id.
+/// The sweep returns these so the watch log and an independent test can
+/// witness every attempt (`created`/`pending`/`refused`/`failed`) without
+/// elapsed-time assumptions. This is the production trigger's return
+/// value, not a test-only side channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AssistPromotion {
+    pub request_id: String,
+    /// `created`, `pending`, `refused` or `failed`.
+    pub outcome: &'static str,
 }
 
 /// Daemon-side JWKS cache for the assist family — independent of the HTTP
@@ -406,13 +430,7 @@ impl Shared {
             let Some(binding) = self.store.assistant_for_alias(&canonical)? else {
                 return Ok(());
             };
-            return self.member_owner_or_operator(
-                method,
-                peer_pid,
-                Some(&binding),
-                &binding.org,
-                None,
-            );
+            return self.member_owner_or_operator(peer_pid, Some(&binding), &binding.org, None);
         }
         // A job or task read names its job through the real store. An
         // unknown id is not member-private (the handler errors for it); any
@@ -426,19 +444,26 @@ impl Shared {
             },
             (None, None) => return Ok(()),
         };
-        let owner = match self.store.assist_request_for_job(&job) {
-            Ok(Some(owner)) => owner,
-            Ok(None) => return Ok(()),
-            Err(e) => return Err(e),
+        if !self.store.assist_job_has_request(&job)? {
+            return Ok(());
+        }
+        // Queue-only, incomplete or ambiguous provenance is still private,
+        // but it has no owner we can safely authorize. The operator retains
+        // recovery access; no agent may treat it as an ordinary project job.
+        let Some((owner_org, owner_sub)) = self.store.assist_job_owner(&job)? else {
+            return match self.connection_caller(peer_pid)? {
+                caller_rule::Who::Operator => Ok(()),
+                _ => match task.as_deref() {
+                    Some(task) => Err(Error::rejected(format!("No such task '{task}'"))),
+                    None => Err(Error::rejected(format!("No such job '{job}'"))),
+                },
+            };
         };
-        // The job has a member-owned ledger row, so it is member-private. A
-        // missing owner binding can never drop it to ordinary rules.
-        let binding = self.store.assistant_binding(&owner.org, &owner.sub)?;
+        let binding = self.store.assistant_binding(&owner_org, &owner_sub)?;
         self.member_owner_or_operator(
-            method,
             peer_pid,
             binding.as_ref(),
-            &owner.org,
+            &owner_org,
             Some((&job, task.as_deref())),
         )
     }
@@ -452,17 +477,15 @@ impl Shared {
     /// `job` is `Some((job_id, requested_task))` for a job or task read.
     fn member_owner_or_operator(
         &self,
-        method: &str,
         peer_pid: u32,
         binding: Option<&crate::store::AssistantBinding>,
         org: &str,
         job: Option<(&str, Option<&str>)>,
     ) -> Result<()> {
-        let refuse = |who: &str| {
-            Err(Error::rejected(format!(
-                "{method} refused: '{who}' cannot read a member-private target \
-                 (CAD-1380 target-side privacy)"
-            )))
+        let refuse = || match job {
+            Some((_, Some(task))) => Err(Error::rejected(format!("No such task '{task}'"))),
+            Some((id, None)) => Err(Error::rejected(format!("No such job '{id}'"))),
+            None => Err(Error::rejected("Unknown managed agent")),
         };
         match self.connection_caller(peer_pid)? {
             caller_rule::Who::Operator => Ok(()),
@@ -482,12 +505,9 @@ impl Shared {
                         return Ok(());
                     }
                 }
-                refuse(&caller)
+                refuse()
             }
-            caller_rule::Who::Unproven(why) => Err(Error::rejected(format!(
-                "{method} refused: an unproven caller cannot read a member-private target \
-                 ({why}) (CAD-1380 target-side privacy)"
-            ))),
+            caller_rule::Who::Unproven(_) => refuse(),
         }
     }
 
@@ -518,28 +538,104 @@ impl Shared {
         })
     }
 
-    /// CAD-1380 list filter for `job_list`. Returns `true` when the job must be
-    /// withheld: it is bound to a member's assistant and the caller is neither
-    /// the operator nor an authorized job actor (canonical PM or the assignee
-    /// of a task of this job). Nonmember jobs are never withheld.
-    pub(super) fn member_job_row_withheld(&self, job: &str, peer_pid: u32) -> Result<bool> {
-        let Some(owner) = self.store.assist_request_for_job(job)? else {
+    /// A board relay is not the member-private owner merely because its
+    /// connection is operator-proven. A CLI envelope carries the verified
+    /// workspace and subject; a plain read_as claim can name only an agent's
+    /// own alias, never a human member's private assistant.
+    pub(super) fn member_agent_row_withheld_for_relay(
+        &self,
+        alias: &str,
+        params: &Value,
+        principal: Option<&super::cli_rpc::CliPrincipal>,
+        public: Option<&super::identity::PublicReadPrincipal>,
+        peer_pid: u32,
+    ) -> Result<bool> {
+        if principal.is_none() && public.is_none() && params.get("read_as").is_none() {
+            return self.member_agent_row_withheld(alias, peer_pid);
+        }
+        let Some(binding) = self.store.assistant_for_alias(alias)? else {
             return Ok(false);
         };
-        let binding = self.store.assistant_binding(&owner.org, &owner.sub)?;
-        match self.connection_caller(peer_pid)? {
-            caller_rule::Who::Operator => Ok(false),
-            caller_rule::Who::Agent(caller) => {
-                if binding.as_ref().is_some_and(|b| caller == b.alias) {
-                    return Ok(false);
-                }
-                if self.caller_holds_job_authority(&caller, job, None)? {
-                    return Ok(false);
-                }
-                Ok(!self.caller_is_active_subscriber(&caller, job, &owner.org)?)
-            }
-            caller_rule::Who::Unproven(_) => Ok(true),
+        if let Some(reader) = public {
+            return Ok(!reader.operator
+                && (!binding.is_active()
+                    || reader.company != binding.org
+                    || reader.subject != binding.sub));
         }
+        if let Some(principal) = principal {
+            let actor = &principal.actor;
+            return Ok(actor.actor != "operator"
+                && (actor.principal_kind != "user"
+                    || !binding.is_active()
+                    || principal.config.company != binding.org
+                    || actor.sub != binding.sub));
+        }
+        if let Some(claim) = params.get("read_as").and_then(Value::as_str) {
+            return Ok(claim != "operator"
+                && claim.strip_prefix("agents/") != Some(binding.alias.as_str()));
+        }
+        Ok(true)
+    }
+
+    /// Resolve private job exclusions from verified reader identity, never
+    /// from a member string asserted by an operator-connected relay.
+    pub(super) fn private_job_denials_for_read(
+        &self,
+        params: &Value,
+        cli: Option<&super::cli_rpc::CliPrincipal>,
+        public: Option<&super::identity::PublicReadPrincipal>,
+        peer_pid: u32,
+    ) -> Result<store::PrivateJobDenials> {
+        let (mut denied, exclude_cloud) = if let Some(reader) = public {
+            if reader.operator {
+                (Default::default(), false)
+            } else {
+                (
+                    self.store
+                        .private_job_denials(store::PrivateJobReader::User {
+                            org: &reader.company,
+                            sub: &reader.subject,
+                        })?,
+                    true,
+                )
+            }
+        } else if let Some(reader) = cli {
+            if reader.actor.actor == "operator" {
+                (Default::default(), false)
+            } else {
+                let principal = if reader.actor.principal_kind == "user" {
+                    store::PrivateJobReader::User {
+                        org: &reader.config.company,
+                        sub: &reader.actor.sub,
+                    }
+                } else {
+                    store::PrivateJobReader::Unproven
+                };
+                (self.store.private_job_denials(principal)?, true)
+            }
+        } else if params.get("read_as").is_some() {
+            (
+                self.store
+                    .private_job_denials(store::PrivateJobReader::Unproven)?,
+                true,
+            )
+        } else {
+            match self.connection_caller(peer_pid)? {
+                caller_rule::Who::Operator => (Default::default(), false),
+                caller_rule::Who::Agent(alias) => (
+                    self.store
+                        .private_job_denials(store::PrivateJobReader::Agent(&alias))?,
+                    false,
+                ),
+                caller_rule::Who::Unproven(_) => (
+                    self.store
+                        .private_job_denials(store::PrivateJobReader::Unproven)?,
+                    true,
+                ),
+            }
+        };
+        denied.exclude_cloud = exclude_cloud;
+        Ok(denied)
     }
 
     /// Job-level authority: the canonical job PM (the whole job context), or
@@ -1703,16 +1799,24 @@ impl Shared {
         }))
     }
 
-    /// `member_assist_history` — a PAGED read of the member's own
-    /// assistant conversation: the stored binding's thread id (never a
-    /// request field) → the thread's entries after `after` (or the newest
-    /// `tail` page), bounded by `limit`. A member sees ONLY their bound
-    /// conversation's entries — no other principal's chat, never a forged
-    /// or caller-named thread.
+    /// Read only the member's bound assistant conversation. Positions are
+    /// opaque and member-bound; operator-only rows are excluded before paging.
     pub(super) fn rpc_member_assist_history(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        use cadence_core::board_api::{
+            MEMBER_ASSIST_HISTORY_CURSOR_FORMAT, MEMBER_ASSIST_HISTORY_SCOPE_ACK,
+            READER_SCOPE_FIELD,
+        };
+
         reject_unknown_fields(
             params,
-            &["member_envelope", "after", "before", "tail", "limit"],
+            &[
+                "member_envelope",
+                "cursor_format",
+                "after",
+                "before",
+                "tail",
+                "limit",
+            ],
             "member assist history",
         )?;
         let member = self.member_caller(
@@ -1723,48 +1827,155 @@ impl Shared {
             crate::assistant_actor::AssistScope::Read,
             None,
         )?;
-        let conv = member.conversation_id.clone().ok_or_else(|| {
+        if params.get("cursor_format").and_then(Value::as_str)
+            != Some(MEMBER_ASSIST_HISTORY_CURSOR_FORMAT)
+        {
+            return Err(Error::invalid(
+                "member_assist_history_cursor_format",
+                "member assist history requires opaque-v1 cursors",
+            ));
+        }
+        let cursor = |field: &str| -> Result<Option<&str>> {
+            match params.get(field) {
+                None => Ok(None),
+                Some(Value::String(token)) => Ok(Some(token)),
+                Some(Value::Number(_)) => Err(Error::invalid(
+                    "member_assist_history_cursor_numeric",
+                    "member assist history requires an opaque cursor",
+                )),
+                Some(_) => Err(Error::invalid(
+                    "member_assist_history_cursor_invalid",
+                    "member assist history cursor is invalid",
+                )),
+            }
+        };
+        let after = cursor("after")?;
+        let before = cursor("before")?;
+        let tail = match params.get("tail") {
+            None => false,
+            Some(Value::Bool(tail)) => *tail,
+            Some(_) => {
+                return Err(Error::invalid(
+                    "member_assist_history_cursor_invalid",
+                    "member assist history direction is invalid",
+                ));
+            }
+        };
+        if (after.is_some() && before.is_some()) || (tail && (after.is_some() || before.is_some()))
+        {
+            return Err(Error::invalid(
+                "member_assist_history_cursor_invalid",
+                "member assist history takes one paging direction",
+            ));
+        }
+        let conv = member.conversation_id.as_deref().ok_or_else(|| {
             Error::rejected("the member's assistant has no bound conversation yet")
         })?;
-        // The bound thread must still be this assistant alias's and
-        // unarchived — a foreign or archived thread is never read.
         let thread = self
             .store
-            .thread_by_id(&conv)?
-            .filter(|t| t.alias == member.alias && !t.archived)
+            .thread_by_id(conv)?
+            .filter(|thread| thread.alias == member.alias && !thread.archived)
             .ok_or_else(|| Error::rejected("the bound conversation is not this assistant's"))?;
+        let codec = self.scoped_cursor_codec()?;
+        let principal = job_events_opaque::member_principal(&member.org, &member.sub);
+        let created = format!("{:016x}", thread.created.to_bits());
+        let resource = job_events_opaque::framed(&[
+            "member-assist-history",
+            &member.assistant_id,
+            &thread.id,
+            &created,
+        ]);
+        let binding = |direction| CursorBinding {
+            domain: "member-assist-history",
+            direction,
+            principal: &principal,
+            resource: &resource,
+            filters: "",
+        };
+        let open = |token: &str, direction| {
+            codec.open(token, &binding(direction)).map_err(|_| {
+                Error::invalid(
+                    "member_assist_history_cursor_invalid",
+                    "member assist history cursor is invalid",
+                )
+            })
+        };
+        let seal = |position: i64, direction| {
+            codec
+                .seal(position, &binding(direction))
+                .map_err(|_| super::scoped_cursor_config::unavailable())
+        };
         let limit = optional_i64(params, "limit")
             .unwrap_or(100)
             .clamp(1, store::THREAD_PAGE_MAX);
-        let tail = params.get("tail").and_then(Value::as_bool).unwrap_or(false);
-        let before = optional_i64(params, "before");
-        if tail || before.is_some() {
-            let (entries, more) = self
-                .store
-                .thread_entries_before_of(&thread.id, before, limit)?;
-            let cursor = entries.last().map(|e| e.seq).unwrap_or(0);
-            let entries = operator_only_entries_hidden(entries);
-            return Ok(json!({
-                "conversation": thread.to_json(),
-                "entries": entries.iter().map(store::ThreadEntry::to_json).collect::<Vec<_>>(),
-                "cursor": cursor,
-                "more_before": more,
-            }));
+        let backwards = tail || before.is_some();
+        let (entries, more) = if backwards {
+            let position = before
+                .map(|token| open(token, CursorDirection::Backward))
+                .transpose()?;
+            self.store
+                .member_thread_entries_before(&thread.id, position, limit)?
+        } else {
+            let position = after
+                .map(|token| open(token, CursorDirection::Forward))
+                .transpose()?
+                .unwrap_or(0);
+            self.store
+                .member_thread_entries_after(&thread.id, position, limit)?
+        };
+        let forward = entries
+            .last()
+            .map(|entry| seal(entry.seq, CursorDirection::Forward))
+            .transpose()?
+            .or_else(|| (!backwards).then(|| after.map(str::to_owned)).flatten());
+        let backward = entries
+            .first()
+            .map(|entry| seal(entry.seq, CursorDirection::Backward))
+            .transpose()?
+            .or_else(|| backwards.then(|| before.map(str::to_owned)).flatten());
+        let rows = entries
+            .iter()
+            .map(|entry| {
+                let id = codec
+                    .stable_row_id(
+                        "member-assist-history-entry",
+                        &resource,
+                        &entry.seq.to_be_bytes(),
+                    )
+                    .map_err(|_| super::scoped_cursor_config::unavailable())?;
+                let mut row = entry.to_json();
+                let fields = row
+                    .as_object_mut()
+                    .expect("thread entry serializes as an object");
+                fields.remove("seq");
+                fields.insert("id".to_string(), json!(id));
+                Ok(row)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut page = json!({
+            "conversation": {"id": thread.id, "alias": thread.alias},
+            "entries": rows,
+            "cursor": forward,
+            "before_cursor": backward,
+            "more_before": backwards.then_some(more),
+            "more_after": (!backwards).then_some(more),
+        });
+        page[READER_SCOPE_FIELD] = json!(MEMBER_ASSIST_HISTORY_SCOPE_ACK);
+        #[cfg(test)]
+        if let Some(fault) = &self.member_history_page_fault {
+            match fault.load(std::sync::atomic::Ordering::Acquire) {
+                1 => {
+                    page.as_object_mut()
+                        .expect("page object")
+                        .remove(READER_SCOPE_FIELD);
+                }
+                2 => page["cursor"] = json!(1),
+                3 => page[READER_SCOPE_FIELD] = json!("wrong-scope"),
+                4 => page["conversation"]["updated"] = json!(123.0),
+                _ => {}
+            }
         }
-        let after = optional_i64(params, "after").unwrap_or(0);
-        if after < 0 {
-            return Err(Error::rejected("history cursor must be nonnegative"));
-        }
-        let entries = self.store.thread_entries_of(&thread.id, after, limit)?;
-        // The cursor advances past hidden entries too, so a page that is
-        // all artifact cards never stalls the member's poll.
-        let cursor = entries.last().map(|e| e.seq).unwrap_or(after);
-        let entries = operator_only_entries_hidden(entries);
-        Ok(json!({
-            "conversation": thread.to_json(),
-            "entries": entries.iter().map(store::ThreadEntry::to_json).collect::<Vec<_>>(),
-            "cursor": cursor,
-        }))
+        Ok(page)
     }
 
     /// `member_assist_send` — the member sends to their own assistant's
@@ -1928,23 +2139,30 @@ impl Shared {
         self.try_resume_assistant(alias)
     }
 
-    /// `member_job_request` — bounded shared-job request, idempotent on
-    /// `(org, sub, request_key)`. The canonical job id is derived from
-    /// `request_key` — NOT the wall clock — so two DISTINCT request_keys
-    /// (even in the same second) mint two distinct jobs, while a replayed
-    /// or concurrent equivalent on the SAME request_key returns the one
-    /// canonical job (acceptance: idempotency is same-request-key, not
-    /// same-second).
+    /// `member_job_request` — durable, idempotent member job request on
+    /// `(org, sub, request_key)`.
     ///
-    /// A real `plans::Job` is created: `pm_alias` is the member's own
-    /// bound assistant alias (the assistant REQUESTS and follows the
-    /// job — it is NOT an authorized approver/dispatcher), `state`
-    /// `open`, and a draft task carries the member's title/acceptance.
-    /// The request persists its title/body/acceptance + authorization
-    /// provenance so the deferred commit can re-prove the member's
-    /// authority before any dispatch lands (SEC-002 / RISK-001). Nothing
-    /// auto-dispatches: `plan_gate_task` and the operator/PM dispatch
-    /// rules still gate the kickoff — a member cannot self-approve.
+    /// Every valid request is ACCEPTED before any job publication: the
+    /// `assist_request_queue` row is the single durable record, so an
+    /// issue already held by another nonterminal job yields a pending
+    /// request (promoted autonomously once the issue is free) rather than
+    /// an occupancy-dependent refusal or a second job.
+    ///
+    /// The immediate receipt is occupancy-independent and identical on a
+    /// replay: exactly `{request_id, status:"accepted"}`. It names no job,
+    /// no holder and no pending/created state. Owner-scoped detail (the
+    /// eventual authorized job id and whether it is pending/created) is
+    /// read through `member_job_list.requests`.
+    ///
+    /// CAD-2215: a request names a tracker `issue` and must resolve —
+    /// uniquely — to a project THIS member may read NOW. An unreadable,
+    /// ambiguous or withdrawn issue refuses opaquely before any durable
+    /// write. The canonical job, once promoted, is `open` with the
+    /// member's bound assistant as `pm_alias` (it REQUESTS and follows,
+    /// never approves/dispatches) and a draft task carrying the request's
+    /// title/acceptance. Nothing auto-dispatches: operator/PM approval
+    /// still gates the kickoff. One leaf issue still maps to one
+    /// non-terminal job.
     pub(super) fn rpc_member_job_request(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         reject_unknown_fields(
             params,
@@ -1952,6 +2170,7 @@ impl Shared {
                 "member_envelope",
                 "title",
                 "request_key",
+                "issue",
                 "body",
                 "acceptance",
             ],
@@ -1962,7 +2181,7 @@ impl Shared {
         // the committed winner. Poison fails closed.
         let _publication = self
             .member_job_lock
-            .lock()
+            .write()
             .map_err(|_| Error::internal("member job publication lock poisoned"))?;
         let member = self.member_caller(
             params,
@@ -1988,112 +2207,502 @@ impl Shared {
                 "request_key must be <= 200 chars of the id grammar",
             ));
         }
+        // CAD-2215: the tracker issue is the request's project scope. It is
+        // required, and it must resolve to a project this member may read
+        // NOW — before the acceptance row is written. An unreadable,
+        // ambiguous or withdrawn issue refuses opaquely with no durable
+        // effect.
+        let issue = required_str(params, "issue")?;
+        if issue.trim().is_empty() {
+            return Err(Error::rejected("member job request needs a nonempty issue"));
+        }
         let body = optional_str(params, "body").unwrap_or_default();
         let acceptance = optional_str(params, "acceptance").unwrap_or_default();
-        // Idempotent: the stored (org,sub,request_key) → job mapping wins.
-        if let Some(job) = self
+        // The member's own project scope: readable projects and the
+        // issue→project map, read from the tracker + project policy. A
+        // member never has the operator's unrestricted (`None`) scope.
+        let scope = self.member_project_scope(&member)?;
+        self.member_issue_readable(&scope, issue)?;
+        // The one occupancy-independent receipt: a fresh request and a
+        // replay answer identically, naming neither a job nor the issue's
+        // current availability. Owner-scoped detail (`pending`/`created`,
+        // the eventual authorized job id) is read through `job_list`.
+        let receipt = json!({
+            "request_id": store::assist_request_id(&member.org, &member.sub, request_key),
+            "status": "accepted",
+        });
+        // A queued request owns its receipt even if a crash left a bound job
+        // before all promotion effects completed. Do not expose or require
+        // access to that internal job to replay the acceptance.
+        let queued = self
             .store
-            .assist_request_job(&member.org, &member.sub, request_key)?
-        {
-            let existing = self.store.job(&job).ok().map(|j| j.to_json());
-            return Ok(json!({
-                "job": job,
-                "canonical": true,
-                "requested_by": member.sub,
-                "status": "existing",
-                "job_record": existing,
-            }));
+            .assist_request_queued(&member.org, &member.sub, request_key)?;
+        if queued.is_none() {
+            // Legacy requests have no queue row. Their existing job still
+            // must be readable and bound to the requested issue.
+            if let Some(job) =
+                self.store
+                    .assist_request_job(&member.org, &member.sub, request_key)?
+            {
+                self.member_job_for_read(&member, &scope, &job)?;
+                self.revalidate_member_job_read(params, &member, &scope, "job_request", None)?;
+                let existing = self.member_job_for_read(&member, &scope, &job)?;
+                if existing.issue_id.as_deref() != Some(issue) {
+                    return Err(Error::rejected(
+                        "member job request replay refused: this request_key is already \
+                         recorded against a different issue",
+                    ));
+                }
+                return Ok(receipt);
+            }
         }
-        // The canonical job id is unique per (org,sub,request_key):
-        // derived from the request_key digest so distinct request_keys in
-        // the same second are distinct jobs. `assist_request_bind`'s
-        // INSERT-OR-IGNORE + read-back makes the concurrent equivalent
-        // resolve to the committed winner — one lane per request_key.
-        let key_digest =
-            crate::operator_auth::digest(&format!("{}:{}:{}", member.org, member.sub, request_key));
-        let job_id = format!("assist-{}", &key_digest[..key_digest.len().min(24)]);
-        // Persist the request's authorization provenance BEFORE creating
-        // the job — the deferred commit re-proves exactly this.
-        // A job row with no ledger row is a prior partial request. Refuse
-        // before any shared-file write so its committed spec is untouched.
-        if self.store.job(&job_id).is_ok() {
+        // A queued replay revalidates its recorded issue. Promotion belongs
+        // to the joined worker, never to request-time work.
+        let _record = match queued {
+            Some(record) => {
+                if record.issue != issue {
+                    return Err(Error::rejected(
+                        "member job request replay refused: this request_key is already \
+                         recorded against a different issue",
+                    ));
+                }
+                // CAD-2215: a replay must not confirm a request whose job the
+                // member can no longer reach. The job's OWN issue is what a
+                // later read is admitted against, so re-prove it here. This
+                // deliberately does not consult the ownership ledger: the
+                // receipt never depended on the internal job, and the crash
+                // window (queue row not yet completed, issue unchanged) still
+                // replays. Only a job whose issue has become unreadable — the
+                // reachable form of losing access — refuses.
+                if let Ok(job) = self.store.job(&record.planned_job_id) {
+                    if let Some(bound) = job.issue_id.as_deref() {
+                        if self.member_issue_readable(&scope, bound).is_err() {
+                            return Err(Error::rejected(
+                                "member job request replay refused: the job recorded for this \
+                                 request_key is no longer readable",
+                            ));
+                        }
+                    }
+                }
+                record
+            }
+            None => {
+                // Fresh acceptance: the durable row lands BEFORE any job
+                // publication, so an occupied issue cannot turn a valid
+                // request into a refusal. The enqueue transaction owns the
+                // no-retarget rule for a concurrent second caller.
+                self.store.assist_request_enqueue(
+                    &member.org,
+                    &member.sub,
+                    request_key,
+                    issue,
+                    title,
+                    body,
+                    acceptance,
+                    &member.credential_id,
+                )?
+            }
+        };
+        // The durable row already exists (fresh or an earlier acceptance).
+        // No promotion is attempted here: the immediate receipt must not
+        // depend on hidden occupancy, timing or the tracker. Wake the joined
+        // worker so the accepted work is event-driven; this call is the
+        // same admission path whether the issue is free or held.
+        self.assist_requests_changed.notify_all();
+        Ok(receipt)
+    }
+
+    /// CAD-2215: attempt to turn one accepted request into its canonical
+    /// draft job. `Ok(Some(job))` means the job now exists (created by this
+    /// attempt or adopted after a crash); `Ok(None)` means the issue is
+    /// still held or the tracker is busy, so the request stays pending.
+    ///
+    /// Only the joined autonomous worker calls this. The request's ORIGINAL
+    /// recorded credential is re-proven live before any publication — never
+    /// the member's latest — through the daemon's enrolled `hosted-board`
+    /// `assist.revalidate` service bearer. A missing original credential or
+    /// a missing service binding fails closed. Current project/issue
+    /// authority is re-read under the tracker lock immediately before the
+    /// job row is written.
+    fn assist_request_promote(
+        &self,
+        member: &MemberCaller,
+        record: &store::AssistRequestQueued,
+        scope: &Option<super::identity::ProjectScope>,
+    ) -> Result<Option<String>> {
+        if record.credential_id.trim().is_empty() {
             return Err(Error::rejected(
-                "member job request is partially recorded; no artifact was changed",
+                "member job request promotion refused: the request has no recorded \
+                 original credential",
             ));
         }
-        let spec_path = self.assist_job_spec(&job_id, title, body, acceptance)?;
-        let spec_sha = sha256_file(std::path::Path::new(&spec_path))
-            .ok_or_else(|| Error::internal("assist job spec could not be hashed"))?;
-        // Create the real job bound to the assistant alias as its PM
-        // (the assistant tracks, never auto-dispatches). No issue_id —
-        // the member cannot mint a tracker lane; an approved promotion
-        // binds one through the normal PM/operator path.
-        let (_dup, _job) = self.store.create_job(
-            &job_id,
-            Some(title),
-            &spec_path,
-            &spec_sha,
-            &member.alias,
-            None,
-            None,
-            None,
-            2,
-            None,
-            Some(title),
-            None,
-            None,
-            None,
-            None, // no assignee: a draft task awaits the operator's dispatch
-            if acceptance.is_empty() {
-                None
-            } else {
-                Some(acceptance)
+        // Use the id persisted at acceptance — never a fresh derivation —
+        // so a replay/crash-adoption targets exactly the queued request's
+        // own canonical job and delivery provenance matches before the
+        // ledger exists.
+        let job_id = record.planned_job_id.clone();
+        // Re-prove the request's ORIGINAL credential and current issue
+        // binding BEFORE any branch decision, including the occupancy check.
+        // An unavailable authority/service therefore reports the same
+        // truthful outcome whether the issue is free or held; it can never
+        // become a side channel for a hidden occupant. Each effect path then
+        // rechecks the current issue scope again immediately before writing.
+        self.reprove_member_job_promotion(member, record, scope)?;
+        if !self.store.assist_queue_promotion_unambiguous(record)? {
+            return Err(Error::rejected(
+                "member job request promotion refused: provenance unavailable",
+            ));
+        }
+        // An already-bound ledger is authoritative: never mint a second job.
+        // The idempotent recovery (subscription + notice) is still an
+        // effect, and the top reproof above covers it.
+        if let Some(job) =
+            self.store
+                .assist_request_job(&member.org, &member.sub, &record.request_key)?
+        {
+            let Some(row) = self.store.job_opt(&job)? else {
+                return Err(Error::rejected(MEMBER_JOB_ISSUE_UNAVAILABLE));
+            };
+            if row.issue_id.as_deref() != Some(record.issue.as_str()) {
+                return Err(Error::rejected(MEMBER_JOB_ISSUE_UNAVAILABLE));
+            }
+            self.member_issue_readable(&self.member_project_scope(member)?, &record.issue)?;
+            self.finish_assist_promotion(member, record, &job)?;
+            return Ok(Some(job));
+        }
+        let spec_path = self.assist_job_spec_path(&job_id);
+        // A job row without its ledger is a partial publication from a
+        // crashed attempt. Distinguish "absent" from a store failure — a
+        // failed read is never treated as an absent job — then adopt only
+        // when every immutable field and artifact byte matches this request.
+        match self.store.job_opt(&job_id)? {
+            Some(existing) => {
+                let expected =
+                    Self::assist_job_spec_text(&record.title, &record.body, &record.acceptance);
+                let artifact_matches = std::fs::read(&spec_path)
+                    .ok()
+                    .is_some_and(|bytes| bytes == expected.as_bytes());
+                if existing.pm_alias != member.alias
+                    || existing.issue_id.as_deref() != Some(record.issue.as_str())
+                    || existing.spec_path != spec_path.to_string_lossy().as_ref()
+                    || !artifact_matches
+                {
+                    return Err(Error::rejected(MEMBER_JOB_ISSUE_UNAVAILABLE));
+                }
+                // Adoption binds the ownership ledger and completes the
+                // idempotent effects; the top reproof covers the original
+                // credential, and the current issue scope is rechecked here
+                // immediately before the write.
+                self.member_issue_readable(&self.member_project_scope(member)?, &record.issue)?;
+                let bound = self.store.assist_request_bind(
+                    &member.org,
+                    &member.sub,
+                    &record.request_key,
+                    &existing.id,
+                    &record.title,
+                    &record.body,
+                    &record.acceptance,
+                    &record.credential_id,
+                )?;
+                self.finish_assist_promotion(member, record, &bound)?;
+                Ok(Some(bound))
+            }
+            None => {
+                // An ordinary nonterminal job holds the issue: nothing to
+                // prove or publish yet. `create_job` re-checks inside its
+                // own transaction.
+                if self.store.has_open_job_for_issue(&record.issue)? {
+                    return Ok(None);
+                }
+                // The top reproof already proved the original credential;
+                // nothing to repeat before the occupancy check.
+                // Serialize the final scope proof with supported tracker
+                // writes. The caller may already hold `member_job_lock`;
+                // never wait for the tracker writer and risk a lock-order
+                // deadlock.
+                let pm = self.pm()?;
+                let Some(_tracker_guard) = pm.try_lock()? else {
+                    return Ok(None); // tracker busy: the next sweep retries
+                };
+                // Re-read the issue binding immediately before publishing. A
+                // revoked grant or a withdrawn issue fails closed; nothing is
+                // created.
+                self.member_issue_readable(&self.member_project_scope(member)?, &record.issue)?;
+                if self.store.has_open_job_for_issue(&record.issue)? {
+                    return Ok(None);
+                }
+                let (spec_path, spec_created) =
+                    self.assist_job_spec(&job_id, &record.title, &record.body, &record.acceptance)?;
+                let spec_sha = match sha256_file(std::path::Path::new(&spec_path)) {
+                    Some(sha) => sha,
+                    None => {
+                        if spec_created {
+                            std::fs::remove_file(&spec_path)?;
+                        }
+                        return Err(Error::internal("assist job spec could not be hashed"));
+                    }
+                };
+                // Create the real job bound to the assistant alias as its PM
+                // (the assistant tracks, never auto-dispatches) and to the
+                // requested tracker issue. Nothing here approves, promotes or
+                // dispatches.
+                let created = self.store.create_job(
+                    &job_id,
+                    Some(&record.title),
+                    &spec_path,
+                    &spec_sha,
+                    &member.alias,
+                    Some(&record.issue),
+                    None,
+                    None,
+                    2,
+                    None,
+                    Some(&record.title),
+                    None,
+                    None,
+                    None,
+                    None, // no assignee: a draft task awaits the operator's dispatch
+                    if record.acceptance.is_empty() {
+                        None
+                    } else {
+                        Some(record.acceptance.as_str())
+                    },
+                );
+                let (_dup, job) = match created {
+                    Ok(created) => created,
+                    Err(error) => {
+                        if spec_created {
+                            // The no-clobber spec belongs to this attempt.
+                            std::fs::remove_file(&spec_path)?;
+                        }
+                        return match error {
+                            // A lane that claimed the issue in the race is a
+                            // contention outcome, not a request failure: the
+                            // accepted request stays pending. Every rejection
+                            // is answered without naming a holder.
+                            Error::Rejected(_) => Ok(None),
+                            other => Err(other),
+                        };
+                    }
+                };
+                let bound = self.store.assist_request_bind(
+                    &member.org,
+                    &member.sub,
+                    &record.request_key,
+                    &job.id,
+                    &record.title,
+                    &record.body,
+                    &record.acceptance,
+                    &record.credential_id,
+                )?;
+                self.finish_assist_promotion(member, record, &bound)?;
+                Ok(Some(bound))
+            }
+        }
+    }
+
+    /// Re-prove the request's ORIGINAL recorded credential (never the
+    /// member's latest) and the member's CURRENT issue binding before every
+    /// promotion or crash-recovery effect. An empty envelope selects the
+    /// daemon's enrolled `hosted-board` `assist.revalidate` service bearer;
+    /// a missing service binding fails closed.
+    fn reprove_member_job_promotion(
+        &self,
+        member: &MemberCaller,
+        record: &store::AssistRequestQueued,
+        scope: &Option<super::identity::ProjectScope>,
+    ) -> Result<()> {
+        self.member_authority_live(
+            "",
+            member,
+            MemberReprove {
+                operation: "job_request",
+                scope: "assist.jobs",
+                job_id: None,
+                op_credential_id: Some(&record.credential_id),
             },
+            "member job request promotion",
         )?;
-        let bound = self.store.assist_request_bind(
-            &member.org,
-            &member.sub,
-            request_key,
-            &job_id,
-            title,
-            body,
-            acceptance,
-            &member.credential_id,
-        )?;
-        // The requester auto-subscribes to their own canonical job —
-        // the subscriber ACL covers the requester too.
+        self.member_issue_readable(scope, &record.issue)
+    }
+
+    /// Finish the exact queued request only while its queue and ledger
+    /// provenance remain unique. The subscription and notice are idempotent;
+    /// a crash before completion can safely retry them.
+    fn finish_assist_promotion(
+        &self,
+        member: &MemberCaller,
+        record: &store::AssistRequestQueued,
+        job: &str,
+    ) -> Result<()> {
+        if job != record.planned_job_id || !self.store.assist_queue_promotion_unambiguous(record)? {
+            return Err(Error::rejected(
+                "member job request promotion refused: provenance unavailable",
+            ));
+        }
         self.store
-            .job_subscribe(&bound, &member.org, &member.sub, &member.assistant_id)?;
-        // CAD-1380 R4: the inert awaiting-approval notice, after bind and the
-        // subscription. Idempotent on a retry; never approves or dispatches.
-        self.store.assist_request_notice(&bound)?;
-        let record = self.store.job(&bound).ok().map(|j| j.to_json());
-        Ok(json!({
-            "job": bound,
-            "canonical": bound == job_id,
-            "requested_by": member.sub,
-            "assistant": member.assistant_id,
-            "status": "awaiting_approval",
-            "job_record": record,
-            "note": "the request is recorded for operator/PM approval — \
-                     it dispatches no work itself",
-        }))
+            .job_subscribe(job, &member.org, &member.sub, &member.assistant_id)?;
+        self.store.assist_request_notice(job)?;
+        if !self.store.assist_queue_promotion_unambiguous(record)? {
+            return Err(Error::rejected(
+                "member job request promotion refused: provenance unavailable",
+            ));
+        }
+        self.store
+            .assist_request_complete(&member.org, &member.sub, &record.request_key)
+    }
+
+    /// CAD-2215: autonomous promotion sweep — the daemon watch calls this
+    /// on its own cadence. Pending accepted requests progress without the
+    /// requester being connected: each is re-proven with its ORIGINAL
+    /// recorded credential through the daemon's enrolled `hosted-board`
+    /// `assist.revalidate` service bearer, its current project/issue
+    /// binding is re-read, and it is promoted only while the issue is
+    /// free. A revoked member, a withdrawn grant or an inaccessible issue
+    /// is refused (no job), never bypassed.
+    ///
+    /// Returns one outcome per visited request so the watch log and an
+    /// independent test can witness each attempt without elapsed-time
+    /// assumptions: `created`, `pending` (issue held / tracker busy),
+    /// `refused` (authority, binding or issue no longer admits), `failed`
+    /// (an unexpected store/effect error).
+    pub(crate) fn route_member_job_requests(&self) -> Result<Vec<AssistPromotion>> {
+        // Never publish durable job/spec state while the daemon is closing
+        // for shutdown or sits in the operator's manual execution fence.
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) || self.execution_mode.fenced() {
+            return Ok(Vec::new());
+        }
+        let pending = self.store.assist_requests_pending(ASSIST_REQUEST_BATCH)?;
+        let mut outcomes = Vec::with_capacity(pending.len());
+        for record in pending {
+            // Bounded and shutdown-responsive: never start another store or
+            // external revalidation step once the daemon is closing. An
+            // in-flight request finishes within its single bounded pull.
+            if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            let outcome = match self.member_job_lock.write() {
+                Ok(_publication) => self.promote_autonomous(&record),
+                Err(_) => "failed",
+            };
+            if outcome != "created" {
+                // Persist the truthful reason and rotate this row to the
+                // back so a permanently blocked request cannot starve the
+                // bound's tail.
+                self.store.assist_request_attempted(
+                    &record.org,
+                    &record.sub,
+                    &record.request_key,
+                    outcome,
+                )?;
+            }
+            outcomes.push(AssistPromotion {
+                request_id: record.request_id.clone(),
+                outcome,
+            });
+        }
+        Ok(outcomes)
+    }
+
+    /// Test-only driver: invoke the SAME promotion sweep the daemon watch
+    /// runs, so a fixture that never starts the watch can still exercise
+    /// the real guard and receive the per-request `(request_id, outcome)`
+    /// witness. It fabricates no job, skips no re-proof and changes no
+    /// authority — it is a call into the production sweep.
+    #[cfg(all(test, feature = "test-seam"))]
+    pub(crate) fn sweep_member_job_requests_for_test(&self) -> Result<Vec<AssistPromotion>> {
+        self.route_member_job_requests()
+    }
+
+    /// One pending request's autonomous attempt. A missing/revoked binding
+    /// and an inaccessible issue refuse before any effect; the promotion
+    /// itself re-proves the recorded original credential.
+    fn promote_autonomous(&self, record: &store::AssistRequestQueued) -> &'static str {
+        let binding = match self.store.assistant_binding(&record.org, &record.sub) {
+            Ok(Some(binding)) if binding.is_active() => binding,
+            Ok(_) => return "refused",
+            Err(_) => return "failed",
+        };
+        let member = MemberCaller {
+            org: record.org.clone(),
+            sub: record.sub.clone(),
+            assistant_id: binding.assistant_id.clone(),
+            alias: binding.alias.clone(),
+            conversation_id: binding.conversation_id.clone(),
+            state: binding.state.clone(),
+            credential_id: record.credential_id.clone(),
+        };
+        let scope = match self.member_project_scope(&member) {
+            Ok(scope) => scope,
+            Err(_) => return "failed",
+        };
+        if self.member_issue_readable(&scope, &record.issue).is_err() {
+            return "refused";
+        }
+        match self.assist_request_promote(&member, record, &scope) {
+            Ok(Some(_)) => "created",
+            Ok(None) => "pending",
+            Err(Error::Rejected(_)) => "refused",
+            Err(_) => "failed",
+        }
     }
 
     /// Write the member's job request to a bounded spec file the job
     /// records — daemon-owned storage, never a caller path. The spec
     /// carries the title/body/acceptance verbatim so the kickoff reads
     /// exactly what the member asked for.
+    ///
+    /// The text lands through a private temp file and is published without
+    /// replacing a prior artifact. `Ok((path, true))` means this call
+    /// published it; `Ok((path, false))` means an identical spec from an
+    /// earlier crashed attempt is reused — a differing artifact fails
+    /// closed and is never overwritten.
     fn assist_job_spec(
         &self,
         job_id: &str,
         title: &str,
         body: &str,
         acceptance: &str,
-    ) -> Result<String> {
-        let dir = self.state_dir.join("assist_jobs");
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{job_id}.md"));
+    ) -> Result<(String, bool)> {
+        let path = self.assist_job_spec_path(job_id);
+        let dir = path
+            .parent()
+            .ok_or_else(|| Error::internal("assist job spec path has no directory"))?;
+        std::fs::create_dir_all(dir)?;
+        let bounded = Self::assist_job_spec_text(title, body, acceptance);
+        use std::io::Write;
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        if let Err(error) = temp.write_all(bounded.as_bytes()) {
+            temp.close()?;
+            return Err(error.into());
+        }
+        match temp.persist_noclobber(&path) {
+            Ok(_) => Ok((path.to_string_lossy().to_string(), true)),
+            Err(error) => {
+                let tempfile::PersistError { error, file } = error;
+                file.close()?;
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error.into());
+                }
+                // A crash after publishing the spec but before the job row
+                // leaves this request's own bytes; reuse only an exact
+                // match, never overwrite.
+                let existing = std::fs::read(&path)?;
+                if existing == bounded.as_bytes() {
+                    Ok((path.to_string_lossy().to_string(), false))
+                } else {
+                    Err(Error::rejected(
+                        "member job request is partially recorded; no artifact was changed",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// The exact redacted/bounded spec bytes a request publishes — shared by
+    /// publication and by crash-adoption verification, so the two can never
+    /// disagree.
+    fn assist_job_spec_text(title: &str, body: &str, acceptance: &str) -> String {
         let text = format!("# {title}\n\n{body}\n\n## Acceptance\n\n{acceptance}\n");
         // Same redaction a stored chat body gets — a member's free text is
         // scanned before it becomes a job spec.
@@ -2109,11 +2718,246 @@ impl Shared {
             }
             bounded.truncate(cut);
         }
-        std::fs::write(&path, bounded)?;
-        Ok(path.to_string_lossy().to_string())
+        bounded
     }
 
-    /// `member_job_list` — the jobs this member owns or is subscribed to.
+    /// The daemon-owned spec path a canonical job records. Deterministic so
+    /// a crashed request can verify and adopt its own artifact.
+    fn assist_job_spec_path(&self, job_id: &str) -> std::path::PathBuf {
+        self.state_dir
+            .join("assist_jobs")
+            .join(format!("{job_id}.md"))
+    }
+
+    fn member_project_scope(
+        &self,
+        member: &MemberCaller,
+    ) -> Result<Option<super::identity::ProjectScope>> {
+        self.project_scope_for_actor(&crate::project_policy::policy_user_actor(&member.sub))
+    }
+
+    /// The owner's accepted request rows. Recomputed for the final
+    /// reproof so a status advance between projections refuses/retries
+    /// instead of mixing snapshots.
+    fn member_request_rows(
+        &self,
+        member: &MemberCaller,
+        readable: &std::collections::BTreeSet<String>,
+        projects: &std::collections::HashMap<String, String>,
+        jobs: &[String],
+        worker_running: bool,
+    ) -> Result<Vec<Value>> {
+        Ok(self
+            .store
+            .assist_requests_queued(&member.org, &member.sub)?
+            .into_iter()
+            .filter(|request| {
+                projects
+                    .get(&request.issue)
+                    .is_some_and(|project| readable.contains(project))
+            })
+            .map(|request| {
+                // A bound job is only owner-visible once every required
+                // effect (ledger, subscription, inert notice) is durable.
+                // Until then the row reads `pending` with no job id, so a
+                // crash-interrupted bind can never masquerade as complete.
+                // `jobs` is sorted by the scoped store query. A completed
+                // flag alone cannot prove that a corrupted queue/ledger
+                // binding still names this owner's readable planned job.
+                let complete = request.completed
+                    && request.job.as_ref().is_some_and(|job| {
+                        job == &request.planned_job_id && jobs.binary_search(job).is_ok()
+                    });
+                let reason = if complete {
+                    None
+                } else if request.completed {
+                    // A completed but unprovable binding cannot be retried by
+                    // the worker as a pending request.
+                    Some("promotion_attempt_failed")
+                } else if !worker_running {
+                    // No joined autonomous worker is running: this accepted
+                    // request cannot progress and must not read as merely
+                    // waiting on a free issue.
+                    Some("promotion_worker_unavailable")
+                } else {
+                    match request.last_outcome.as_deref() {
+                        // The sweep could not re-prove the request's original
+                        // credential (or the daemon's service bearer is
+                        // absent/unauthorized). No occupancy is disclosed.
+                        Some("refused") => Some("promotion_unavailable"),
+                        Some("failed") => Some("promotion_attempt_failed"),
+                        _ => None,
+                    }
+                };
+                json!({
+                    "request_id": request.request_id,
+                    "issue": request.issue,
+                    "status": if complete { "created" } else { "pending" },
+                    "job": if complete { request.job } else { None },
+                    "reason": reason,
+                })
+            })
+            .collect())
+    }
+
+    /// The owner's own private delivery rows, filtered by the current
+    /// readable project and re-proved against the unique original assist
+    /// request, its job and the job's issue. Subscribers and other members
+    /// never match; storage errors fail closed; anything unproved is
+    /// omitted.
+    fn member_private_deliveries(
+        &self,
+        member: &MemberCaller,
+        readable: &std::collections::BTreeSet<String>,
+        projects: &std::collections::HashMap<String, String>,
+        jobs: &[String],
+    ) -> Result<(Vec<Value>, bool)> {
+        let all = crate::delivery::private::load(&self.state_dir)?;
+        let mut owner_jobs = Vec::new();
+        for job in jobs {
+            if self
+                .store
+                .assist_job_owner(job)?
+                .is_some_and(|owner| owner.0 == member.org && owner.1 == member.sub)
+            {
+                owner_jobs.push(job.as_str());
+            }
+        }
+        let mut unavailable = self.unavailable_private_completions(owner_jobs, &all)?;
+        let mut rows = Vec::new();
+        for delivery in crate::delivery::private::readable(
+            &all,
+            crate::delivery::private::Reader::Owner {
+                org: &member.org,
+                sub: &member.sub,
+            },
+        ) {
+            let Some(project) = projects.get(&delivery.origin.issue) else {
+                continue;
+            };
+            if !readable.contains(project) || project.as_str() != delivery.origin.project {
+                continue;
+            }
+            if unavailable.contains(&delivery.origin.dispatch) {
+                continue;
+            }
+            // Use the same global settled-provenance rule as job reads. An
+            // owner-only queue scan misses another principal claiming this
+            // job, and must not authorize an ambiguous delivery.
+            let Some((owner_org, owner_sub)) = self.store.assist_job_owner(&delivery.origin.job)?
+            else {
+                continue;
+            };
+            if owner_org != member.org || owner_sub != member.sub {
+                continue;
+            }
+            let job = self.store.job(&delivery.origin.job)?;
+            if job.issue_id.as_deref() != Some(delivery.origin.issue.as_str()) {
+                continue;
+            }
+            if (delivery.state == crate::delivery::private::PrivateState::Completed
+                && self.verify_private_delivery_origin(delivery).is_err())
+                || (delivery.state == crate::delivery::private::PrivateState::Running
+                    && self.verify_private_running_origin(delivery).is_err())
+            {
+                unavailable.insert(delivery.origin.dispatch.clone());
+                continue;
+            }
+            rows.push(delivery.to_json());
+        }
+        Ok((rows, unavailable.is_empty()))
+    }
+
+    /// The requested tracker issue must resolve — UNIQUELY — to exactly one
+    /// project the member may read right now. A missing issue, an id present
+    /// in several projects, a project without a member grant and an absent
+    /// member project scope all answer the same opaque text: the caller
+    /// cannot tell them apart, and no tracker id is echoed back.
+    fn member_issue_readable(
+        &self,
+        scope: &Option<super::identity::ProjectScope>,
+        issue: &str,
+    ) -> Result<()> {
+        let Some((readable, projects)) = scope.as_ref() else {
+            return Err(Error::rejected(MEMBER_JOB_ISSUE_UNAVAILABLE));
+        };
+        match projects.get(issue) {
+            Some(project) if readable.contains(project) => Ok(()),
+            _ => Err(Error::rejected(MEMBER_JOB_ISSUE_UNAVAILABLE)),
+        }
+    }
+
+    /// An owning or subscribed member still needs a resolvable, readable
+    /// project binding. A withdrawn share does not authorize a subscriber.
+    fn member_job_for_read(
+        &self,
+        member: &MemberCaller,
+        scope: &Option<super::identity::ProjectScope>,
+        job: &str,
+    ) -> Result<store::Job> {
+        let unavailable = || Error::rejected("Unknown member job");
+        let row = self.store.job(job).map_err(|_| unavailable())?;
+        if !super::identity::scope_allows_issue(scope, row.issue_id.as_deref()) {
+            return Err(unavailable());
+        }
+        let Some((owner_org, owner_sub)) = self.store.assist_job_owner(job)? else {
+            return Err(unavailable());
+        };
+        if owner_org != member.org {
+            return Err(unavailable());
+        }
+        let owns = owner_sub == member.sub;
+        let subscribed = !owns
+            && self
+                .store
+                .job_is_subscriber(job, &member.org, &member.sub)?
+            && self.store.assist_job_is_shared(job, &member.org)?;
+        if !owns && !subscribed {
+            return Err(unavailable());
+        }
+        Ok(row)
+    }
+
+    fn revalidate_member_job_read(
+        &self,
+        params: &Value,
+        member: &MemberCaller,
+        scope: &Option<super::identity::ProjectScope>,
+        operation: &str,
+        job: Option<&str>,
+    ) -> Result<()> {
+        self.member_authority_live(
+            required_str(params, "member_envelope")?,
+            member,
+            MemberReprove {
+                operation,
+                scope: "assist.jobs",
+                job_id: job,
+                op_credential_id: Some(&member.credential_id),
+            },
+            "member job read",
+        )?;
+        if self.member_project_scope(member)? != *scope {
+            return Err(Error::rejected(
+                "member job read refused: project access changed",
+            ));
+        }
+        if let Some(job) = job {
+            self.member_job_for_read(member, scope, job)?;
+        }
+        Ok(())
+    }
+
+    /// `member_job_list` — the jobs this member owns or is subscribed to,
+    /// plus this owner's accepted request records. `requests` is additive
+    /// and owner-only: each row carries `request_id`, its readable
+    /// `issue`, `status` (`pending` while the issue is held,
+    /// `created` once the canonical job exists), `job` (`null` until
+    /// created) and a truthful pending `reason` (`null` while waiting,
+    /// `promotion_unavailable` when the original credential or service
+    /// bearer cannot be re-proven, `promotion_attempt_failed` for an
+    /// unexpected failure). It is the observation surface — promotion
+    /// itself is the joined autonomous worker, never this read.
     pub(super) fn rpc_member_job_list(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         reject_unknown_fields(params, &["member_envelope"], "member job list")?;
         let member = self.member_caller(
@@ -2124,8 +2968,68 @@ impl Shared {
             crate::assistant_actor::AssistScope::Jobs,
             None,
         )?;
-        let jobs = self.store.assist_member_jobs(&member.org, &member.sub)?;
-        Ok(json!({ "jobs": jobs }))
+        let scope = self.member_project_scope(&member)?;
+        let Some((readable, projects)) = scope.as_ref() else {
+            return Err(Error::rejected("member job list requires a project scope"));
+        };
+        let issues = projects
+            .iter()
+            .filter(|(_, project)| readable.contains(*project))
+            .map(|(issue, _)| issue.as_str())
+            .collect::<Vec<_>>();
+        let jobs = self
+            .store
+            .assist_member_jobs_scoped(&member.org, &member.sub, &issues)?;
+        // The owner's accepted requests, filtered by the CURRENT readable
+        // issue binding. An inaccessible or revoked issue contributes no
+        // row and no job detail.
+        let worker_running = self
+            .assist_request_worker_running
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let requests =
+            self.member_request_rows(&member, readable, projects, &jobs, worker_running)?;
+        // CAD-2215: the owner's own private job deliveries. Only the exact
+        // verified owner, a current readable project, the unique original
+        // assist request and the exact job/issue binding admit a row;
+        // subscribers and other members never see this ledger.
+        let private_deliveries =
+            self.member_private_deliveries(&member, readable, projects, &jobs)?;
+        // Test-only observation point: rows projected, no lock held, final
+        // authority/project reproof not yet run.
+        #[cfg(all(test, feature = "test-seam"))]
+        crate::delivery::publication::member_delivery_seam_fire(&self.state_dir);
+        // Re-prove the current caller credential, project and ownership
+        // after projection: a revocation between the two reads
+        // refuses instead of leaking stale results.
+        self.revalidate_member_job_read(params, &member, &scope, "job_list", None)?;
+        if self
+            .store
+            .assist_member_jobs_scoped(&member.org, &member.sub, &issues)?
+            != jobs
+            || self.member_request_rows(&member, readable, projects, &jobs, worker_running)?
+                != requests
+            || self.member_private_deliveries(&member, readable, projects, &jobs)?
+                != private_deliveries
+            || self
+                .assist_request_worker_running
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != worker_running
+        {
+            return Err(Error::rejected("member job list refused: access changed"));
+        }
+        let mut out = json!({
+            "jobs": jobs,
+            "requests": requests,
+            "private_deliveries": private_deliveries.0,
+            "private_deliveries_state": if private_deliveries.1 { "available" } else { "unavailable" },
+            "promotion_worker": if worker_running { "running" } else { "unavailable" },
+        });
+        out[cadence_core::board_api::READER_SCOPE_FIELD] =
+            json!(cadence_core::board_api::MEMBER_JOB_SCOPE_ACK);
+        // Test-only: observe/mutate the real response after the handler ran.
+        #[cfg(all(test, feature = "test-seam"))]
+        crate::delivery::publication::member_job_list_seam_fire(&self.state_dir, &mut out);
+        Ok(out)
     }
 
     /// `member_job_evidence` — revision-bound evidence for a bound job,
@@ -2144,18 +3048,8 @@ impl Shared {
             params.get("job").and_then(Value::as_str),
         )?;
         let job = required_str(params, "job")?;
-        let owns = self
-            .store
-            .assist_request_owns(&member.org, &member.sub, job)?;
-        let sub = self
-            .store
-            .job_is_subscriber(job, &member.org, &member.sub)?;
-        if !(owns || sub) {
-            return Err(Error::rejected(format!(
-                "member job evidence refused: '{job}' is not a job this member \
-                 owns or subscribes to"
-            )));
-        }
+        let scope = self.member_project_scope(&member)?;
+        let job_row = self.member_job_for_read(&member, &scope, job)?;
         // REAL evidence, revision-bound. A task's state derives only from its
         // server-recorded `head_sha` and the verdict current for its revision;
         // a verdict counts only when it names that exact head. `reported` =
@@ -2165,17 +3059,6 @@ impl Shared {
         // audit data only). `inspected` = a revise/blocked verdict on a present
         // artifact; `independently_verified` = a pass on a present artifact.
         // Nothing here fabricates a pass.
-        let job_row = match self.store.job(job) {
-            Ok(j) => j,
-            Err(_) => {
-                return Ok(json!({
-                    "job": job,
-                    "evidence_state": "unavailable",
-                    "revision": Value::Null,
-                    "note": "the job record is not resolvable",
-                }))
-            }
-        };
         // Artifact custody: the submitted commit must be an object in the
         // task's server-recorded worktree (objects are shared with the repo).
         // Fixed argv, no shell; the sha is re-validated, and a relative
@@ -2259,7 +3142,7 @@ impl Shared {
                 "head_sha": task.head_sha,
                 "evidence_state": state,
                 "artifact_available": artifact,
-                "verdict": current.map(|v| v.to_json()),
+                "verdict": current.map(|v| super::identity::verdict_json_for_scope(v, true)),
                 "reviewer": reviewer,
                 "sha": sha,
             }));
@@ -2275,6 +3158,7 @@ impl Shared {
             .store
             .assist_job_authority_rev(job)?
             .unwrap_or_default();
+        self.revalidate_member_job_read(params, &member, &scope, "job_evidence", Some(job))?;
         Ok(json!({
             "job": job,
             "job_state": job_row.state,
@@ -2291,12 +3175,35 @@ impl Shared {
     /// `member_job_events` — the subscriber-visible event feed for a bound
     /// job: the job's own event stream (plan/task/dispatch/verdict events),
     /// never private chat text. Same ACL as `member_job_evidence`.
+    ///
+    /// CAD-2215: a signed member read is ALWAYS scoped — the owner's own
+    /// session included, because a member principal is never a proven
+    /// operator. Each visible event carries a stable keyed `id` and a
+    /// purpose-bound forward `cursor` instead of the global `seq`, and the
+    /// page continues from its last visible row's token.
     pub(super) fn rpc_member_job_events(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         reject_unknown_fields(
             params,
-            &["member_envelope", "job", "after", "tail"],
+            &["member_envelope", "job", "after", "tail", "cursor_format"],
             "member job events",
         )?;
+        // The opaque format is the ONLY format this read speaks: a missing,
+        // unknown or numeric continuation is refused, never coerced.
+        if job_events_opaque::requested_format(params, "member job events")?
+            != Some(job_events_opaque::FORMAT)
+        {
+            return Err(job_events_opaque::format_required("member job events"));
+        }
+        let supplied = match job_events_opaque::supplied_after(params) {
+            job_events_opaque::SuppliedAfter::Absent => None,
+            job_events_opaque::SuppliedAfter::Text(token) => Some(token),
+            job_events_opaque::SuppliedAfter::Number => {
+                return Err(job_events_opaque::numeric_cursor("member job events"))
+            }
+            job_events_opaque::SuppliedAfter::Unsupported => {
+                return Err(job_events_opaque::invalid_after("member job events"))
+            }
+        };
         let member = self.member_caller(
             params,
             peer_pid,
@@ -2306,43 +3213,61 @@ impl Shared {
             params.get("job").and_then(Value::as_str),
         )?;
         let job = required_str(params, "job")?;
-        let sub = self
-            .store
-            .job_is_subscriber(job, &member.org, &member.sub)?;
-        let owns = self
-            .store
-            .assist_request_owns(&member.org, &member.sub, job)?;
-        if !(sub || owns) {
-            return Err(Error::rejected(format!(
-                "member job events refused: '{job}' is not a job this member \
-                 owns or subscribes to"
-            )));
+        let scope = self.member_project_scope(&member)?;
+        // The member's current project binding, the stored job and the
+        // owner/subscriber policy, from the store, before any event is read.
+        let row = self.member_job_for_read(&member, &scope, job)?;
+        // Missing key material refuses before any content; it never
+        // downgrades to numeric positions.
+        let codec = self.scoped_cursor_codec()?;
+        let principal = job_events_opaque::member_principal(&member.org, &member.sub);
+        let position = match supplied {
+            Some(token) => Some(job_events_opaque::open(
+                &codec,
+                &principal,
+                &row,
+                token,
+                "member job events",
+            )?),
+            None => None,
+        };
+        let tail = params.get("tail").and_then(Value::as_bool).unwrap_or(false);
+        let events = if tail {
+            self.store.job_events_tail(job, 51)?
+        } else {
+            self.store.job_events(job, position.unwrap_or(0), 200)?
+        };
+        let has_older = tail.then_some(events.len() > 50);
+        let events = &events[usize::from(has_older == Some(true))..];
+        // Re-prove the live credential, the project scope, the owner or
+        // subscriber grant and the exact stored job AFTER selection: a
+        // revocation or a job-identity change refuses instead of returning a
+        // stale page.
+        self.revalidate_member_job_read(params, &member, &scope, "job_events", Some(job))?;
+        let current = self.store.job(job)?;
+        if current.issue_id != row.issue_id
+            || job_events_opaque::job_resource(&current) != job_events_opaque::job_resource(&row)
+        {
+            return Err(Error::rejected(
+                "member job events refused: reader access changed",
+            ));
         }
-        // The job's own event stream — work metadata only (kind, revision,
-        // task, verdict), never a member's private conversation.
-        let after = optional_i64(params, "after").unwrap_or(0);
-        if after < 0 {
-            return Err(Error::rejected("event cursor must be nonnegative"));
-        }
-        if params.get("tail").and_then(Value::as_bool).unwrap_or(false) {
-            let mut events = self.store.job_events_tail(job, 51)?;
-            let has_older = events.len() > 50;
-            if has_older {
-                events.remove(0);
-            }
-            return Ok(json!({
-                "job": job,
-                "events": events.iter().map(store::Event::to_json).collect::<Vec<_>>(),
-                "cursor": events.last().map(|e| e.seq).unwrap_or(0),
-                "has_older": has_older,
-            }));
-        }
-        let events = self.store.job_events(job, after, 200)?;
-        Ok(json!({
-            "job": job,
-            "events": events.iter().map(store::Event::to_json).collect::<Vec<_>>(),
-            "cursor": events.last().map(|e| e.seq).unwrap_or(after),
-        }))
+        let mut page = job_events_opaque::scoped_page(
+            &codec,
+            &principal,
+            &row,
+            events,
+            // A tail page ignores `after`; its cursor is the last visible row
+            // or null, never a re-echoed token. A forward page echoes the
+            // exact supplied token when it has no rows.
+            if tail { None } else { supplied },
+            has_older,
+            "member job events",
+        )?;
+        page["job"] = json!(job);
+        page[cadence_core::board_api::READER_SCOPE_FIELD] =
+            json!(cadence_core::board_api::JOB_EVENTS_SCOPE_ACK);
+        Ok(page)
     }
 
     /// `member_job_share` — the OWNING member enables or disables
@@ -2373,6 +3298,8 @@ impl Shared {
             crate::assistant_actor::AssistScope::Jobs,
             Some(job),
         )?;
+        let scope = self.member_project_scope(&member)?;
+        self.member_job_for_read(&member, &scope, job)?;
         if !self
             .store
             .assist_request_owns(&member.org, &member.sub, job)?
@@ -2391,8 +3318,7 @@ impl Shared {
                 "the job is now shareable inside the member's organization — \
                  a second member may subscribe"
             } else {
-                "sharing is off — no NEW subscription is admitted (existing \
-                 subscribers are not retro-removed)"
+                "sharing is off — subscribers cannot read the job until sharing resumes"
             },
         }))
     }
@@ -2436,6 +3362,8 @@ impl Shared {
             crate::assistant_actor::AssistScope::Jobs,
             Some(job),
         )?;
+        let scope = self.member_project_scope(&member)?;
+        self.member_job_for_read(&member, &scope, job)?;
         if !self
             .store
             .assist_request_owns(&member.org, &member.sub, job)?
@@ -2518,6 +3446,16 @@ impl Shared {
             crate::assistant_actor::AssistScope::Jobs,
             Some(job),
         )?;
+        // Sharing is not a project grant. The selected job must already
+        // resolve to a project this member may read before subscribing.
+        let scope = self.member_project_scope(&member)?;
+        let record = self
+            .store
+            .job(job)
+            .map_err(|_| Error::rejected("Unknown member job"))?;
+        if !super::identity::scope_allows_issue(&scope, record.issue_id.as_deref()) {
+            return Err(Error::rejected("Unknown member job"));
+        }
         // The job must be an assist-bound job in THIS member's org. A
         // missing `assist_requests` row (not assist-bound) refuses; a row
         // naming a different org refuses — a member can only subscribe
@@ -2530,14 +3468,6 @@ impl Shared {
         if assist.org != member.org {
             return Err(Error::rejected(format!(
                 "member job subscribe refused: '{job}' is bound to another organization"
-            )));
-        }
-        // The job record must exist — a subscribe never names a
-        // non-existent or stale id.
-        let record = self.store.job(job).ok().map(|j| j.to_json());
-        if record.is_none() {
-            return Err(Error::rejected(format!(
-                "member job subscribe refused: '{job}' has no job record"
             )));
         }
         // The entitlement: the job's owner must have explicitly shared
@@ -2554,7 +3484,7 @@ impl Shared {
             "job": job,
             "subscribed": member.sub,
             "assistant": member.assistant_id,
-            "job_record": record,
+            "job_record": record.to_json(),
             "note": "the member now follows this shared job — evidence and \
                      events bind to it; no private conversation is shared",
         }))
@@ -2657,14 +3587,4 @@ impl Shared {
         }
         Ok(Some(out))
     }
-}
-
-/// CAD-1726 / CAD-1767: artifact cards and hire proposals are the
-/// operator's; a member reader never sees one (`store::operator_only_kind`
-/// is the one list, shared with the board's member thread reads).
-fn operator_only_entries_hidden(entries: Vec<store::ThreadEntry>) -> Vec<store::ThreadEntry> {
-    entries
-        .into_iter()
-        .filter(|e| !store::operator_only_kind(&e.kind))
-        .collect()
 }

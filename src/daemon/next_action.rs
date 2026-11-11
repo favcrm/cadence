@@ -150,6 +150,18 @@ impl Shared {
                 // A `done` issue's unrecorded PR is the operator's to
                 // wonder at, not a lane to staff.
                 None if rep.pr.is_some() && rep.sha.is_some() && rep.status != "done" => {
+                    // CAD-2215: no exact native dispatch receipt names
+                    // this report, so it cannot be promoted to ordinary.
+                    // A legacy candidate is admitted once as operator
+                    // recovery evidence; alias and file name prove nothing.
+                    if delivery::legacy_for_issue(&records, &rep.issue).is_some() {
+                        return Ok((
+                            Outcome::Leave,
+                            "an unverified delivery candidate waits on the operator — \
+                             nothing was routed"
+                                .to_string(),
+                        ));
+                    }
                     return self.adopt_and_route(agent, rep);
                 }
                 None => {}
@@ -207,16 +219,20 @@ impl Shared {
         Ok(None)
     }
 
-    /// A lane the master never dispatched still earned its review:
-    /// the record opens at the done report's own time — the report
-    /// predates the loop — then the routing pass runs.
+    /// A lane the master never dispatched used to be adopted into the
+    /// review loop from its done report. CAD-2215 removed that: a report
+    /// file's `agent:` and name are not provenance, so the candidate is
+    /// recorded for operator recovery and nothing is routed.
     fn adopt_and_route(
         self: &Arc<Self>,
         agent: &Agent,
         rep: &DoneRef,
     ) -> Result<(Outcome, String)> {
-        self.delivery_adopt(&rep.issue, &rep.project, &agent.alias, rep.at)?;
-        self.route_now(&rep.issue)
+        self.delivery_adopt(&rep.issue, &rep.project, &agent.alias, rep.at, &rep.name)?;
+        Ok((
+            Outcome::Leave,
+            "no exact native dispatch receipt — recorded for operator recovery only".to_string(),
+        ))
     }
 
     /// Route the record's outstanding done report now and answer with
@@ -276,6 +292,9 @@ impl Shared {
                 Outcome::Leave,
                 "delivery changed before repair; recheck its current state".to_string(),
             ));
+        }
+        if let Err(error) = self.require_ordinary(&*r, "a fix turn") {
+            return Ok((Outcome::Leave, error.to_string()));
         }
         let head = r.head.as_deref().unwrap_or_default();
         let applicable = if revise {
@@ -626,8 +645,15 @@ impl Shared {
                 format!("{id}'s kickoff is already in flight — nothing sent twice"),
             ));
         }
-        if let Err(e) = self.delivery_start(id, project, &agent.alias) {
-            tracing::warn!("delivery record for {id}: {e}");
+        match out["message"].as_str().filter(|m| !m.is_empty()) {
+            Some(message) => {
+                if let Err(e) = self.delivery_start(id, project, &agent.alias, message) {
+                    tracing::warn!("delivery record for {id}: {e}");
+                }
+            }
+            None => tracing::warn!(
+                "delivery record for {id}: the dispatch answered no accepted message id"
+            ),
         }
         let _ = self.store.event_public(
             DAEMON_ALIAS,
@@ -841,7 +867,7 @@ mod tests {
     /// Plant a delivery record, mutated by `edit`.
     fn record(s: &Arc<Shared>, id: &str, edit: impl FnOnce(&mut Record)) {
         let mut all = delivery::load(&s.state_dir).unwrap();
-        let mut r = Record::new(id, "tst", "w1", 1);
+        let mut r = Record::new_ordinary(id, "tst", "w1", 1, "m-test");
         edit(&mut r);
         all.insert(id.to_string(), r);
         delivery::save(&s.state_dir, &all).unwrap();

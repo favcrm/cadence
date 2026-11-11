@@ -101,6 +101,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection (CAD-561)"),
     ),
     ("update_status", Rule::Read),
+    // CAD-2215: the one explicit bind of the operator-provisioned
+    // scoped-cursor keyring. The handler proves the operator connection
+    // itself, before any key file is read; no agent ever passes.
+    (
+        "scoped_cursor_initialize",
+        Rule::Handler("operator_connection (CAD-2215)"),
+    ),
     (
         "agent_register",
         Rule::Handler(
@@ -159,8 +166,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
             "cli_caller: re-verified cli_envelope on a proven board relay; human owner or grant-bound agents/<h> principal (CAD-1586)",
         ),
     ),
-    ("agent_list", Rule::Read),
-    ("agent_show", Rule::Handler("read; optional profile instructions require authorize_agent_mutation(SelfService)")),
+    ("agent_list", Rule::Handler("agent_read_scope: proven caller or operator relay; CLI envelope re-verified; task bindings scoped")),
+    ("agent_show", Rule::Handler("agent_read_scope and cloud projection; optional profile instructions require authorize_agent_mutation(SelfService)")),
     // CAD-886: `agent_wait` answers a strict subset of what `agent_show`
     // discloses (state/reason/message/turn/waited_secs) — same visibility.
     ("agent_wait", Rule::Read),
@@ -286,8 +293,22 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "topic_read",
         Rule::Handler("topic_caller + may_use_topic: an agent must be a subscriber (CAD-818)"),
     ),
-    ("threads_stamp", Rule::Read),
-    ("master_stamp", Rule::Read),
+    (
+        "threads_stamp",
+        Rule::Handler(
+            "operator connection (CAD-2215): the global topic/message change \
+             counters describe the whole workspace, so only the board watcher \
+             reads them; any other caller is refused before the read",
+        ),
+    ),
+    (
+        "master_stamp",
+        Rule::Handler(
+            "operator connection (CAD-2215): the global master change counters \
+             describe the whole mailbox, so only the board watcher reads them; \
+             any other caller is refused before the read",
+        ),
+    ),
     ("agent_events", Rule::Read),
     (
         "agent_requests",
@@ -333,31 +354,28 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "agent_inbox",
         Rule::Handler(
-            "rpc_inbox: peek is an unguarded read — a mailbox's consumer has no \
-             verifiable identity (CAD-251); a drain consumes, so a proven agent \
-             caller may drain only its own inbox (CAD-480)",
+            "rpc_inbox: proven operator, or the agent whose inbox is named",
         ),
     ),
     (
         "agent_inbox_ack",
         Rule::Handler(
-            "rpc_inbox_ack: consumers pass unauthenticated as on the read \
-             (CAD-251); an agent caller may ack, park or report only on its own \
-             alias, and cursor resets are operator-only (CAD-480)",
+            "rpc_inbox_ack: proven operator, or the agent whose inbox is named; \
+             cursor resets remain operator-only",
         ),
     ),
     (
         "message_read",
         Rule::Handler(
-            "rpc_message_read: an agent caller may read only a message \
-             addressed to its own alias (CAD-565)",
+            "rpc_message_read: proven caller and project scope; an agent may read \
+             only its own mail (CAD-565)",
         ),
     ),
     (
         "message_list",
         Rule::Handler(
-            "rpc_message_list: an agent lists only its own alias; an unproven \
-             caller is refused because listing enumerates ids",
+            "rpc_message_list: proven caller and project scope; an agent lists \
+             only its own alias",
         ),
     ),
     (
@@ -381,8 +399,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
              creating its own job (CAD-422)",
         ),
     ),
-    ("job_list", Rule::Read),
-    ("job_show", Rule::Read),
+    ("job_list", Rule::Handler("agent_caller + project scope")),
+    ("job_show", Rule::Handler("agent_caller + job project")),
     // CAD-1380/AOS-216 member plane: every member_* method re-binds
     // `member_as` to a stored assistant row on a proven operator/board
     // connection only (members_rpc::member_caller); a request field, an
@@ -423,11 +441,11 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("member_job_subscribe", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("member_job_share", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("member_job_reconcile", Rule::Handler("member_caller: member_as on a proven board relay only")),
-    ("job_events", Rule::Read),
+    ("job_events", Rule::Handler("agent_caller + job project")),
     ("job_cancel", Rule::OnJob(Target::Job)),
     ("job_close", Rule::OnJob(Target::Job)),
     ("task_new", Rule::OnJob(Target::Job)),
-    ("task_show", Rule::Read),
+    ("task_show", Rule::Handler("agent_caller + job project")),
     ("cloud_probe", Rule::Read),
     ("task_dispatch", Rule::OnJob(Target::Task)),
     (
@@ -456,6 +474,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("memory_classify", Rule::Handler("rpc_memory_classify: proven_operator")),
     ("memory_feedback", Rule::Handler("rpc_memory_feedback: caller_identity and owned active turn")),
+    // The handler also admits every covered task's project before writing.
     (
         "monitor_register",
         Rule::Attributed {
@@ -463,8 +482,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
             default: Some("operator"),
         },
     ),
-    ("monitor_list", Rule::Read),
-    ("monitor_show", Rule::Read),
+    ("monitor_list", Rule::Handler("agent_caller + covered task projects")),
+    ("monitor_show", Rule::Handler("agent_caller + covered task projects")),
     ("endpoint_add", Rule::Handler("operator_connection: the operator only (CAD-1857)")),
     ("endpoint_list", Rule::Read),
     ("endpoint_show", Rule::Read),
@@ -476,10 +495,11 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "monitor_heartbeat",
         Rule::Handler(
             "rpc_monitor_heartbeat: the operator, or the monitor's owner bound \
-             to a registration that predates the monitor (CAD-422)",
+             to a prior registration and admitted to each covered project (CAD-422)",
         ),
     ),
-    ("monitor_alerts", Rule::Read),
+    ("monitor_alerts", Rule::Handler("agent_caller + covered task projects")),
+    // The handler also checks project visibility before acknowledging.
     ("monitor_alert_ack", BY_OPERATOR),
     (
         "monitor_stop",
@@ -676,7 +696,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     // issue's own lane. Every mutation is operator-only inside the
     // handler — an agent, its detached child, and a forged identity
     // field never reach the worktree.
-    ("lane_show", Rule::Read),
+    ("lane_show", Rule::Handler("agent_caller + issue project")),
     (
         "lane_ask",
         Rule::Handler("operator_connection (CAD-608)"),
@@ -724,7 +744,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     // The frame-GET peer: authority is the burned one-use nonce, not a
     // connection class — the handler binds it to the consuming session.
     ("app_screen_consume", Rule::Handler("operator_connection + burned one-use frame capability + stored-session liveness (CAD-1006)")),
-    ("project_work_approvals", Rule::Read),
+    ("project_work_approvals", Rule::Handler("agent_caller + project scope")),
     ("app_local_install_approve", Rule::Handler("operator_connection (CAD-631)")),
     ("app_local_install_revoke", Rule::Handler("operator_connection (CAD-631)")),
     ("app_run_create", Rule::Handler("operator_connection (CAD-631)")),
@@ -965,6 +985,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection (CAD-1129)"),
     ),
     (
+        "app_member_access_list",
+        Rule::Handler("operator_connection + verified operator session when relayed (CAD-2215)"),
+    ),
+    (
+        "app_member_access_grant",
+        Rule::Handler("operator_connection + live owner roster + exact conversation (CAD-2215)"),
+    ),
+    (
+        "app_member_access_revoke",
+        Rule::Handler("operator_connection + verified operator session when relayed (CAD-2215)"),
+    ),
+    (
         "workflow_approve",
         Rule::Handler("operator_connection (CAD-487)"),
     ),
@@ -1011,9 +1043,16 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     (
         "master_summary",
-        Rule::Handler("reads; `post` needs master_or_operator (CAD-339)"),
+        Rule::Handler("agent_caller + project scope; `post` needs master_or_operator (CAD-339)"),
     ),
-    ("master_state", Rule::Read),
+    (
+        "master_state",
+        Rule::Handler(
+            "reader scope + member-private-job authority (CAD-2215): the handler \
+             answers for the proved reader — operator, member session, anonymous \
+             relay or local agent — never for the whole workspace",
+        ),
+    ),
     (
         "master_models",
         Rule::Handler(
@@ -1082,6 +1121,26 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("agent_caller: the answer's own recorded author (CAD-447)"),
     ),
     ("delivery_list", Rule::Read),
+    (
+        "delivery_private_list",
+        Rule::Handler("agent_caller / operator_connection (CAD-2215 private read)"),
+    ),
+    (
+        "delivery_private_reconcile",
+        Rule::Handler("operator_connection (CAD-2215 private recovery)"),
+    ),
+    (
+        "delivery_legacy_list",
+        Rule::Handler("operator_connection (CAD-2215 legacy recovery)"),
+    ),
+    (
+        "delivery_publish",
+        Rule::Handler("operator_connection (CAD-2215 local publication)"),
+    ),
+    (
+        "delivery_publish_reconcile",
+        Rule::Handler("operator_connection (CAD-2215 publication recovery)"),
+    ),
     ("delivery_requirements", Rule::Read),
     (
         "delivery_review_evidence",

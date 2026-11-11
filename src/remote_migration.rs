@@ -399,7 +399,9 @@ fn transfer(
             plan.packs.len(),
             pack.bytes
         ));
-        let mut reader = PackReader::open(source, pack, &plan.inventory)?;
+        // Stream from the verified private snapshot, not the caller's mutable
+        // package. The snapshot does not isolate processes with the same UID.
+        let mut reader = PackReader::open(package.snapshot_root(), pack, &plan.inventory)?;
         if pack.bytes <= part_bytes {
             let data = call(
                 dir,

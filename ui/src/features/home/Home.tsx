@@ -967,6 +967,7 @@ function MasterHome({
     const warn = "bg-warn/10 text-warn";
     const ok = "bg-ok/15 text-ok";
     if (status.kind === "unknown") return { label: status.kind, tone: "bg-ink-800 text-ink-400" };
+    if (status.kind === "unavailable") return { label: t("Availability unknown"), tone: warn };
     if (status.kind !== "running") return { label: status.kind === "absent" ? t("not started") : status.kind, tone: warn };
     if (streamReconnecting && activeTurn) {
       return { label: link === "stopped" ? t("stream stopped") : t("reconnecting…"), tone: warn };

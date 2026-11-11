@@ -55,10 +55,10 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "task_show",
     "model_defaults_get",
     // CAD-552: the reads behind the completed verb allowlist — `issue
-    // ls --json`'s work block (`project_work_approvals`) and the
-    // `overview`/`status` sections (`monitor_*`, `agent_probe`) — all
-    // Rule::Read. Self-scoped reads like `agent_requests` stay refused:
-    // empty would pass for "nothing pending".
+    // ls --json`'s work block and the `overview`/`status` sections.
+    // Project-scoped handlers apply their own caller and policy checks.
+    // Self-scoped reads like `agent_requests` stay refused: empty would
+    // pass for "nothing pending".
     "project_work_approvals",
     "monitor_list",
     "monitor_alerts",
@@ -586,9 +586,18 @@ impl Shared {
         // it (CAD-323).
         if out["dispatched"] != json!(false) {
             // CAD-431: the ticket enters the review loop; its worker's
-            // done report is what moves it on.
-            if let Err(e) = self.delivery_start(id, &ticket.project, &to) {
-                tracing::warn!("delivery record for {id}: {e}");
+            // done report is what moves it on. CAD-2215: the accepted
+            // kickoff id is the record's exact native receipt — without
+            // one there is no ordinary record to open.
+            match out["message"].as_str().filter(|m| !m.is_empty()) {
+                Some(message) => {
+                    if let Err(e) = self.delivery_start(id, &ticket.project, &to, message) {
+                        tracing::warn!("delivery record for {id}: {e}");
+                    }
+                }
+                None => tracing::warn!(
+                    "delivery record for {id}: the dispatch answered no accepted message id"
+                ),
             }
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
@@ -1183,9 +1192,25 @@ impl Shared {
             self.master_or_operator(params, peer_pid, "posting into the master's thread")?;
         }
         let pm = self.pm()?;
+        let mut actor = self.policy_actor(peer_pid, "master_summary")?;
+        if let Some(claim) = params.get("read_as") {
+            if actor != "operator" {
+                return Err(Error::rejected(
+                    "master_summary refused: only the operator may relay a read identity",
+                ));
+            }
+            let claim = claim
+                .as_str()
+                .filter(|claim| crate::project_policy::caller_of(claim).is_some())
+                .ok_or_else(|| Error::rejected("master_summary refused: invalid read identity"))?;
+            actor = claim.to_string();
+        }
         let escalated = master::escalations(&self.state_dir);
-        let mut out = issue::summary::since(&pm, since, &escalated)?;
-        out["routing_backlog"] = json!(self.router_backlog.load(Ordering::SeqCst));
+        let readable = crate::project_policy::readable(&pm, &actor);
+        let mut out = issue::summary::since(&pm, since, &escalated, Some(&readable))?;
+        if crate::project_policy::reads_every_project(&pm, &actor) {
+            out["routing_backlog"] = json!(self.router_backlog.load(Ordering::SeqCst));
+        }
         if post {
             self.store.ensure_thread(ALIAS)?;
             let seq = self.store.thread_append(

@@ -667,6 +667,91 @@ pub struct MasterState {
     pub queued: i64,
 }
 
+/// CAD-2215: the field any relayed, reader-scoped reply carries. It is not
+/// part of the document/page proper (underscore-prefixed), never appears in a
+/// client's copy, and is the board's only proof that the daemon that answered
+/// is one that applies the reader boundary — a relay must treat its absence
+/// as "unavailable", never as an empty success.
+pub const READER_SCOPE_FIELD: &str = "_reader_scope";
+
+/// The field a reader-scoped `master_state` reply carries (the shared
+/// [`READER_SCOPE_FIELD`]).
+pub const MASTER_STATE_SCOPE_FIELD: &str = READER_SCOPE_FIELD;
+
+/// The exact value of [`READER_SCOPE_FIELD`] on a `master_state` reply: the
+/// daemon understood the relayed reader proof and applied the reader boundary
+/// to this answer — the full document for the operator it re-proved, the
+/// project-policy + member-private-job projection with explicitly granted app
+/// conversations for every other reader. Bump the suffix when this changes.
+pub const MASTER_STATE_SCOPE_ACK: &str = "cad2215.project.v2";
+
+/// The exact value of [`READER_SCOPE_FIELD`] on a `thread_read` page: the
+/// daemon understood the relayed reader proof and scoped THIS page (the same
+/// project-policy + member-private-job filter and explicit app-conversation
+/// grants, applied before pagination). Every polled page carries its own ack.
+pub const THREAD_SCOPE_ACK: &str = "cad2215.thread.v2";
+
+/// Native scoped thread pages require opaque positions; operators keep
+/// numeric pages but acknowledge the protocol when explicitly requested.
+pub const THREAD_CURSOR_FORMAT: &str = "opaque-v1";
+pub const THREAD_OPAQUE_SCOPE_ACK: &str = "cad2215.thread.opaque.v1";
+pub const THREAD_OPERATOR_SCOPE_ACK: &str = "cad2215.thread.operator.v1";
+
+/// Per-response acknowledgements for the agent reads relayed by the board.
+/// A list, detail and event page each prove their own reader scope; a board
+/// must not infer one from another or cache it across daemon replacements.
+pub const AGENT_LIST_SCOPE_ACK: &str = "cad2215.agent-list.v2";
+pub const AGENT_SHOW_SCOPE_ACK: &str = "cad2215.agent-show.v1";
+pub const AGENT_EVENTS_SCOPE_ACK: &str = "cad2215.agent-events.v1";
+/// A scoped agent-events reader must explicitly request opaque positions.
+pub const AGENT_EVENTS_CURSOR_FORMAT: &str = "opaque-v1";
+/// A proven operator requested the format but received legacy numeric positions.
+pub const AGENT_EVENTS_OPERATOR_SCOPE_ACK: &str = "cad2215.agent-events.operator.v1";
+
+/// A signed member job list with current ownership/project scope and private
+/// completion health. The board refuses the whole list without this ack.
+pub const MEMBER_JOB_SCOPE_ACK: &str = "cad2215.member-job-list.v2";
+
+/// The signed member's assistant history uses opaque positions in both
+/// directions. The board requires this per-page acknowledgement before relay.
+pub const MEMBER_ASSIST_HISTORY_CURSOR_FORMAT: &str = "opaque-v1";
+pub const MEMBER_ASSIST_HISTORY_SCOPE_ACK: &str = "cad2215.member-assist-history.opaque.v1";
+
+/// Human-room history, post receipts and read markers use scoped positions.
+pub const HUMAN_ROOM_CURSOR_FORMAT: &str = "opaque-v1";
+pub const HUMAN_ROOM_SCOPE_ACK: &str = "cad2215.human-room.opaque.v1";
+
+/// The `cursor_format` value that asks a job-event read for opaque positions.
+/// A scoped reader must send exactly this; it is never a way to downgrade to
+/// numeric positions, and a proven operator that sends it is answered with
+/// the unchanged numeric document plus [`JOB_EVENTS_OPERATOR_SCOPE_ACK`].
+pub const JOB_EVENTS_CURSOR_FORMAT: &str = "opaque-v1";
+
+/// The `cursor_format` value required for a scoped monitor-alert page.
+pub const MONITOR_CURSOR_FORMAT: &str = "opaque-v1";
+/// A proven operator requested that format but retains numeric alert positions.
+pub const MONITOR_OPERATOR_SCOPE_ACK: &str = "cad2215.monitor-read.operator.v1";
+
+/// Opaque topic-page cursors for a proven non-operator subscriber.
+pub const TOPIC_CURSOR_FORMAT: &str = "opaque-v1";
+pub const TOPIC_SCOPE_ACK: &str = "cad2215.topic.opaque.v1";
+/// A proven operator requested the format but retains numeric positions.
+pub const TOPIC_OPERATOR_SCOPE_ACK: &str = "cad2215.topic.operator.v1";
+
+/// The exact value of [`READER_SCOPE_FIELD`] on a scoped `job_events` (native)
+/// or `member_job_events` (signed) page: every visible event carries a stable
+/// keyed `id` and a purpose-bound forward `cursor`, no global `seq` is
+/// disclosed, and the page `cursor` continues the same feed. The ack is a
+/// protocol confirmation for a reply the daemon produced after re-proving the
+/// reader and the job — it is never authority.
+pub const JOB_EVENTS_SCOPE_ACK: &str = "cad2215.job-events.opaque.v1";
+
+/// The exact value of [`READER_SCOPE_FIELD`] when a PROVEN operator asked for
+/// [`JOB_EVENTS_CURSOR_FORMAT`]: the answer is the legacy numeric document
+/// (numeric `seq`, numeric `cursor`), and the ack says so, so no client ever
+/// mistakes numeric positions for opaque ones.
+pub const JOB_EVENTS_OPERATOR_SCOPE_ACK: &str = "cad2215.job-events.operator.v1";
+
 /// A conversation (thread) row.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ThreadInfo {
@@ -703,7 +788,9 @@ pub struct ThreadEntryRow {
 /// `cursor` is the last row the page scanned in the direction it was read —
 /// the forward resume point, and the newest scanned row of a `tail` page. A
 /// projection can filter another source's rows out of a page, so a consumer
-/// must move by what was SCANNED and never by what was kept:
+/// must move by what was SCANNED and never by what was kept. Project-scoped
+/// reads first exclude entries without a readable issue binding; only that
+/// scoped stream contributes to these page boundaries:
 ///
 /// - `more_before` (backward) says raw rows remain below the page;
 /// - `scanned_before` (backward) is the lowest seq scanned, the `before`

@@ -34,7 +34,8 @@ export interface HumanMember {
 
 export interface HumanPost {
   id: string;
-  seq: number;
+  /** Opaque, per-human marker for this visible post. */
+  read_cursor: string;
   sender: { id: string | null; label: string };
   /** Already sanitized by the daemon (`conversations::body`). Plain text. */
   body: string;
@@ -43,10 +44,13 @@ export interface HumanPost {
 
 export interface HumanRoomPage {
   room: string;
+  scope_id: string;
   members: HumanMember[];
   posts: HumanPost[];
-  /** Fresh permission hint for an explicit Ask. Missing or false offers no Ask. */
-  can_ask?: boolean;
+  before: string | null;
+  more_before: boolean;
+  /** Fresh permission hint for an explicit Ask. */
+  can_ask: boolean;
 }
 
 /** A current agent on the trusted catalog (`uid` is the durable id, never an alias hash). */
@@ -124,21 +128,58 @@ export function createHumanGroup(input: HumanGroupInput): Promise<string> {
   return call<{ room: string }>("POST", "/api/human-threads/groups", input).then((r) => r.room);
 }
 
+function opaqueCursor(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith("csc1_") && value.length > 5;
+}
+
+function humanPost(value: unknown): value is HumanPost {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const post = value as Record<string, unknown>;
+  const sender = post.sender;
+  if (!sender || typeof sender !== "object" || Array.isArray(sender)) return false;
+  const who = sender as Record<string, unknown>;
+  return !("seq" in post)
+    && typeof post.id === "string" && post.id.length > 0
+    && opaqueCursor(post.read_cursor)
+    && typeof post.body === "string"
+    && typeof post.created === "number"
+    && (who.id === null || typeof who.id === "string")
+    && typeof who.label === "string";
+}
+
+function invalidRoomResponse(): ApiError {
+  return new ApiError("The server returned an invalid human room response", 502);
+}
+
 /** `GET /api/human-threads/rooms/<id>` — members and one page of posts. */
-export function readHumanRoom(id: string, at: { before?: number; limit?: number } = {}): Promise<HumanRoomPage> {
+export function readHumanRoom(id: string, at: { before?: string; limit?: number } = {}): Promise<HumanRoomPage> {
   const q = new URLSearchParams();
-  if (at.before !== undefined) q.set("before", String(at.before));
+  if (at.before !== undefined) q.set("before", at.before);
   if (at.limit !== undefined) q.set("limit", String(at.limit));
   const query = q.toString();
-  return call<HumanRoomPage>("GET", `${roomPath(id)}${query ? `?${query}` : ""}`).then((p) => ({
-    ...p,
-    can_ask: p.can_ask === true,
-  }));
+  return call<HumanRoomPage>("GET", `${roomPath(id)}${query ? `?${query}` : ""}`).then((page) => {
+    if (page.room !== id
+      || typeof page.scope_id !== "string" || !page.scope_id.startsWith("csrid_") || page.scope_id.length <= 6
+      || !Array.isArray(page.members) || !page.members.every((member) => member
+        && (member.kind === "human" || member.kind === "agent")
+        && typeof member.id === "string" && typeof member.label === "string")
+      || !Array.isArray(page.posts) || !page.posts.every(humanPost)
+      || typeof page.can_ask !== "boolean"
+      || typeof page.more_before !== "boolean"
+      || !(page.before === null || opaqueCursor(page.before))
+      || (page.posts.length > 0 && page.before === null)) {
+      throw invalidRoomResponse();
+    }
+    return page;
+  });
 }
 
 /** `POST /api/human-threads/rooms/<id>/posts` — a turnless post. */
 export function postHumanRoom(id: string, clientId: string, body: string): Promise<{ post: HumanPost; created: boolean }> {
-  return call("POST", `${roomPath(id)}/posts`, { client_id: clientId, body });
+  return call<{ post: HumanPost; created: boolean }>("POST", `${roomPath(id)}/posts`, { client_id: clientId, body }).then((receipt) => {
+    if (!humanPost(receipt.post) || typeof receipt.created !== "boolean") throw invalidRoomResponse();
+    return receipt;
+  });
 }
 
 /** `GET /api/human-threads/agents` — the current agents this person may ask (`{agents:[{uid,alias}]}`). */
@@ -151,12 +192,19 @@ export function humanAskRoom(
   id: string,
   input: { agent_uid: string; client_id: string; body: string },
 ): Promise<HumanAskReceipt> {
-  return call<HumanAskReceipt>("POST", `${roomPath(id)}/ask`, input);
+  return call<HumanAskReceipt>("POST", `${roomPath(id)}/ask`, input).then((receipt) => {
+    if (!humanPost(receipt.post) || typeof receipt.duplicate !== "boolean"
+      || typeof receipt.request !== "string"
+      || typeof receipt.target?.uid !== "string" || typeof receipt.target?.alias !== "string") {
+      throw invalidRoomResponse();
+    }
+    return receipt;
+  });
 }
 
-/** `POST /api/human-threads/rooms/<id>/read` — the newest seq actually shown. */
-export function markHumanRead(id: string, seq: number): Promise<{ unread: number }> {
-  return call("POST", `${roomPath(id)}/read`, { seq });
+/** `POST /api/human-threads/rooms/<id>/read` — the newest post actually shown. */
+export function markHumanRead(id: string, cursor: string): Promise<{ unread: number }> {
+  return call("POST", `${roomPath(id)}/read`, { cursor });
 }
 
 export interface HumanPerson {

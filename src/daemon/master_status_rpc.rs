@@ -310,7 +310,7 @@ impl Shared {
     /// reused verbatim — the same derivation, never a second one).
     fn registered_status(&self, agent: &store::Agent) -> Result<Value> {
         // `master_state` refuses only an absent row; the row exists.
-        let base = self.rpc_master_state(&Value::Null)?;
+        let base = self.master_state_document()?;
         let policy = pi_policy_for(
             crate::adapter::registry::pi_family_provider(&agent.provider),
             self,
@@ -345,6 +345,10 @@ impl Shared {
                     since: None,
                     limit: 1,
                     include_app: true,
+                    allowed_issues: None,
+                    denied_tasks: None,
+                    denied_issues: None,
+                    exclude_cloud: false,
                 },
             )?
             .rows

@@ -4,6 +4,157 @@ use super::*;
 
 use crate::peer::PeerTies;
 
+/// The readable projects and the issue→project map a row filter needs.
+pub(super) type ProjectScope = (
+    std::collections::BTreeSet<String>,
+    std::collections::HashMap<String, String>,
+);
+
+/// A public board reader whose live session was re-verified by the daemon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PublicReadPrincipal {
+    pub company: String,
+    pub subject: String,
+    pub operator: bool,
+    pub handle: String,
+}
+
+pub(super) fn scope_allows_issue(scope: &Option<ProjectScope>, issue: Option<&str>) -> bool {
+    match scope {
+        None => true,
+        Some((readable, projects)) => issue
+            .and_then(|id| projects.get(id))
+            .is_some_and(|project| readable.contains(project)),
+    }
+}
+
+/// Whether a record that names its own project may be read.
+///
+/// `scope_allows_issue` answers for an issue id, which a row may carry alone;
+/// a record that ALSO names a project must bind to that project, or a project
+/// reusing the id would authorize a row belonging to another one.
+pub(super) fn scope_allows_delivery(
+    scope: &Option<ProjectScope>,
+    issue: &str,
+    project: &str,
+) -> bool {
+    match scope {
+        None => true,
+        Some((readable, projects)) => {
+            projects.get(issue).is_some_and(|bound| bound == project) && readable.contains(project)
+        }
+    }
+}
+
+pub(super) fn scope_allows_message(
+    scope: &Option<ProjectScope>,
+    message: &store::Message,
+    task_issues: &std::collections::HashMap<String, Option<String>>,
+) -> bool {
+    if scope.is_none() {
+        return true;
+    }
+    match (message.issue.as_deref(), message.task_id.as_deref()) {
+        (Some(issue), Some(task)) => {
+            task_issues.get(task).and_then(Option::as_deref) == Some(issue)
+                && scope_allows_issue(scope, Some(issue))
+        }
+        (Some(issue), None) => scope_allows_issue(scope, Some(issue)),
+        (None, Some(task)) => {
+            scope_allows_issue(scope, task_issues.get(task).and_then(Option::as_deref))
+        }
+        (None, None) => false,
+    }
+}
+
+/// Scoped readers must not see table-global message positions.
+pub(super) fn message_json_for_scope(
+    message: &store::Message,
+    scope: &Option<ProjectScope>,
+) -> Value {
+    let mut row = message.to_json();
+    if scope.is_some() {
+        if let Some(fields) = row.as_object_mut() {
+            fields.remove("seq");
+            fields.remove("reply_to");
+            fields.remove("turn_id");
+            fields.remove("worktree");
+        }
+    }
+    row
+}
+
+/// Verdict positions are also shared across projects.
+pub(super) fn verdict_json_for_scope(verdict: &store::Verdict, scoped: bool) -> Value {
+    let mut row = verdict.to_json();
+    if scoped {
+        if let Some(fields) = row.as_object_mut() {
+            fields.remove("seq");
+        }
+    }
+    row
+}
+
+/// The one scoped status rule (CAD-2215): a non-operator reader is told an
+/// agent's state only when that reader's own authorized work proves it, and
+/// is never told `idle`. Taking a message writes `agents.state='busy'`
+/// (src/store/messages.rs), so the stored state moves when a project the
+/// reader cannot read starts or finishes a turn. A running message this
+/// reader may see occupies the agent — only one turn runs at a time — so
+/// the row says `busy`; with none, the daemon reports no state at all
+/// (`null`). Claiming `idle` there would be a fake: a hidden turn may be
+/// running right now.
+pub(super) fn scoped_agent_state(
+    visible_running: Option<&std::collections::BTreeSet<String>>,
+) -> Value {
+    match visible_running {
+        Some(ids) if !ids.is_empty() => json!("busy"),
+        _ => Value::Null,
+    }
+}
+
+/// A scoped agent row: identity, lifecycle and this reader's own work
+/// bindings — never a value that moves when another project's turn starts
+/// or stops. `state` is replaced by [`scoped_agent_state`]. `dead`,
+/// `resumable` and `native_turn_steering_enabled` are dropped outright:
+/// `dead` turns on the `attention` fence (unknown messages), `resumable`
+/// reads a thread id, and the steering flag is gated on `idle|busy` — all
+/// three are derived from work the reader may not see.
+pub(super) fn retain_scoped_agent_fields(
+    agent: &mut Value,
+    visible_running: Option<&std::collections::BTreeSet<String>>,
+) {
+    const FIELDS: &[&str] = &[
+        "alias",
+        "provider",
+        "endpoint_kind",
+        "role",
+        "team_role",
+        "state",
+        "enabled",
+        "archived",
+        "tasks",
+        "lane_issues",
+        "capabilities",
+    ];
+    if let Some(fields) = agent.as_object_mut() {
+        fields.retain(|key, _| FIELDS.contains(&key.as_str()));
+        fields.insert("state".to_string(), scoped_agent_state(visible_running));
+    }
+}
+
+fn project_keys_for(
+    pm: &crate::issue::Pm,
+    caller: &AgentCaller,
+) -> std::collections::BTreeSet<String> {
+    match caller {
+        AgentCaller::Operator => crate::project_policy::readable(pm, "operator"),
+        AgentCaller::Agent(alias) => {
+            crate::project_policy::readable(pm, &format!("agents/{alias}"))
+        }
+    }
+}
+
 impl Shared {
     /// Revalidate the snapshotted active strict enrollments against their owner rows
     /// before a slot call: a missing row, a closed endpoint or a changed
@@ -431,6 +582,227 @@ impl Shared {
         }
     }
 
+    /// The caller's spelling in a project policy, for a daemon read that names
+    /// a project's content. A connection that proves nothing never reaches a
+    /// spelling: [`agent_caller`] refuses it first.
+    pub(super) fn policy_actor(&self, peer_pid: u32, verb: &str) -> Result<String> {
+        use crate::peer::AgentCaller;
+        match self.agent_caller(peer_pid, verb)? {
+            AgentCaller::Operator => Ok("operator".to_string()),
+            AgentCaller::Agent(alias) => Ok(format!("agents/{alias}")),
+        }
+    }
+
+    /// Whether an issue resolves to a project this proven caller may read.
+    pub(super) fn issue_readable_for(&self, caller: &AgentCaller, issue: &str) -> Result<bool> {
+        let pm = self.pm()?;
+        let (project, _) = match crate::issue::write::issue_dir(&pm, issue) {
+            Ok(found) => found,
+            Err(Error::Rejected(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(project_keys_for(&pm, caller).contains(&project.key))
+    }
+
+    /// Refuse an unadmitted issue in the same words as an unknown id.
+    pub(super) fn admit_issue(&self, peer_pid: u32, verb: &str, issue: &str) -> Result<()> {
+        let caller = self.agent_caller(peer_pid, verb)?;
+        if !self.issue_readable_for(&caller, issue)? {
+            return Err(Error::rejected(format!(
+                "Unknown issue '{issue}' — `cadence issue ls` lists what exists"
+            )));
+        }
+        Ok(())
+    }
+
+    /// A proven operator keeps the unscoped management view. Other callers
+    /// need a readable tracker and an issue-to-project binding; an absent
+    /// tracker supplies no bindings, while an unreadable tracker refuses.
+    pub(super) fn project_scope(&self, peer_pid: u32, verb: &str) -> Result<Option<ProjectScope>> {
+        let caller = self.agent_caller(peer_pid, verb)?;
+        self.project_scope_for_caller(&caller)
+    }
+
+    pub(super) fn project_scope_for_caller(
+        &self,
+        caller: &AgentCaller,
+    ) -> Result<Option<ProjectScope>> {
+        match caller {
+            AgentCaller::Operator => Ok(None),
+            AgentCaller::Agent(alias) => self.project_scope_for_actor(&format!("agents/{alias}")),
+        }
+    }
+
+    pub(super) fn project_scope_for_actor(&self, actor: &str) -> Result<Option<ProjectScope>> {
+        if actor == "operator" {
+            return Ok(None);
+        }
+        let caller = crate::project_policy::caller_of(actor)
+            .ok_or_else(|| Error::rejected("invalid project read identity"))?;
+        let pm = match self.pm() {
+            Ok(pm) => pm,
+            Err(error) => {
+                let config = self.pm_dir()?.join("pm.yaml");
+                return match std::fs::symlink_metadata(config) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(Some(Default::default()))
+                    }
+                    _ => Err(error),
+                };
+            }
+        };
+        use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
+
+        let mut readable = BTreeSet::new();
+        let mut issues = HashMap::new();
+        let mut ambiguous = HashSet::new();
+        for (project, project_dir) in crate::issue::write::checked_project_dirs(&pm)? {
+            if project.allows(caller) {
+                readable.insert(project.key.clone());
+            }
+            for entry in std::fs::read_dir(project_dir)? {
+                let entry = entry?;
+                let Ok(id) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if !crate::issue::model::valid_id(&id) || !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let file = entry.path().join("issue.md");
+                let meta = match std::fs::symlink_metadata(file) {
+                    Ok(meta) => meta,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                if !meta.is_file() || meta.file_type().is_symlink() || ambiguous.contains(&id) {
+                    continue;
+                }
+                match issues.entry(id) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(project.key.clone());
+                    }
+                    Entry::Occupied(entry) => {
+                        let (id, _) = entry.remove_entry();
+                        ambiguous.insert(id);
+                    }
+                }
+            }
+        }
+        Ok(Some((readable, issues)))
+    }
+
+    /// Resolve a read relay only after proving its board connection. Hosted
+    /// CLI callers additionally carry the envelope the daemon re-verifies.
+    pub(super) fn agent_read_scope(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+        verb: &str,
+    ) -> Result<(
+        Option<ProjectScope>,
+        Option<super::cli_rpc::CliPrincipal>,
+        Option<PublicReadPrincipal>,
+    )> {
+        if params.get("public_session").is_some() {
+            let (scope, principal) = self.thread_read_scope(params, peer_pid)?;
+            return Ok((scope, None, principal));
+        }
+        if params.get("read_as").is_some() && params.get("cli_envelope").is_some() {
+            return Err(Error::rejected(format!(
+                "{verb} refused: conflicting read identities"
+            )));
+        }
+        if params.get("cli_envelope").is_some() {
+            let principal =
+                self.cli_principal(params, peer_pid, verb, crate::cli_actor::Scope::Read)?;
+            let actor = if principal.actor.principal_kind == "user"
+                && principal.actor.actor != "operator"
+            {
+                crate::project_policy::policy_user_actor(&principal.actor.sub)
+            } else {
+                principal.actor.policy_spelling()
+            };
+            let scope = self.project_scope_for_actor(&actor)?;
+            return Ok((scope, Some(principal), None));
+        }
+        if let Some(claim) = params.get("read_as") {
+            self.proven_operator(verb, peer_pid)?;
+            let actor = claim
+                .as_str()
+                .filter(|actor| crate::project_policy::caller_of(actor).is_some())
+                .ok_or_else(|| Error::rejected(format!("{verb} refused: invalid read identity")))?;
+            return Ok((self.project_scope_for_actor(actor)?, None, None));
+        }
+        Ok((self.project_scope(peer_pid, verb)?, None, None))
+    }
+
+    /// Resolve a thread reader from a live board session or the existing
+    /// operator/agent read path. A board connection is not its reader.
+    pub(super) fn thread_read_scope(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<(Option<ProjectScope>, Option<PublicReadPrincipal>)> {
+        if params.get("cli_envelope").is_some() {
+            return Err(Error::rejected(
+                "thread read refused: unsupported CLI relay proof",
+            ));
+        }
+        let Some(proof) = params.get("public_session") else {
+            let (scope, _, _) = self.agent_read_scope(params, peer_pid, "thread read")?;
+            return Ok((scope, None));
+        };
+        if params.get("read_as").is_some() || params.get("cli_envelope").is_some() {
+            return Err(Error::rejected(
+                "thread read refused: conflicting read identities",
+            ));
+        }
+        self.proven_operator("thread read", peer_pid)?;
+        let token = proof
+            .as_str()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| Error::rejected("thread read refused: malformed session proof"))?;
+        let (realm, subject, role, view) = match self.current_public_session(token)? {
+            super::public_membership::Authority::Granted {
+                realm,
+                sub,
+                role,
+                view,
+                ..
+            } => (realm, sub, role, view),
+            super::public_membership::Authority::Denied => {
+                return Err(Error::rejected("thread read refused: session unavailable"));
+            }
+        };
+        let user = view
+            .user
+            .as_ref()
+            .ok_or_else(|| Error::rejected("thread read refused: session has no user"))?;
+        let principal = PublicReadPrincipal {
+            company: realm.company,
+            subject,
+            operator: role.is_operator(),
+            handle: user.handle.clone(),
+        };
+        let actor = if principal.operator {
+            "operator".to_string()
+        } else {
+            crate::project_policy::policy_user_actor(&principal.subject)
+        };
+        Ok((self.project_scope_for_actor(&actor)?, Some(principal)))
+    }
+
+    /// The projects this connection may read.
+    pub(super) fn readable_projects(
+        &self,
+        peer_pid: u32,
+        verb: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let actor = self.policy_actor(peer_pid, verb)?;
+        let pm = self.pm()?;
+        Ok(crate::project_policy::readable(&pm, actor.as_str()))
+    }
+
     /// CAD-506 visibility for one agent's pending provider requests,
     /// shared by `agent_requests` and `agent_wait` (CAD-886) so the two
     /// cannot drift: the operator, the agent itself, and its PM
@@ -618,20 +990,36 @@ impl Shared {
             (Rule::Shutdown, Who::Agent(_)) => {
                 facts.lease_holder = crate::rollout::granted_lease_holder(&self.state_dir)?;
             }
-            (Rule::OnJob(target), Who::Agent(_)) => {
+            (Rule::OnJob(target), Who::Agent(alias)) => {
                 let job = match target {
                     Target::Job => self.store.job(required_str(params, "job")?)?,
                     Target::Task => {
-                        let task = self.store.task(required_str(params, "task")?)?;
-                        self.store.job(&task.job_id)?
+                        let id = required_str(params, "task")?;
+                        let task = self.store.task(id)?;
+                        match self.store.job(&task.job_id) {
+                            Ok(job) => job,
+                            Err(Error::Rejected(_)) => {
+                                return Err(Error::rejected(format!("No such task '{id}'")));
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     Target::Alias | Target::Message => {
                         return Err(Error::internal("OnJob targets a job or task"))
                     }
                 };
+                if !self.may_read_job(&AgentCaller::Agent(alias.clone()), &job)? {
+                    let (kind, field) = match target {
+                        Target::Job => ("job", "job"),
+                        Target::Task => ("task", "task"),
+                        Target::Alias | Target::Message => unreachable!("checked above"),
+                    };
+                    let id = required_str(params, field)?;
+                    return Err(Error::rejected(format!("No such {kind} '{id}'")));
+                }
                 facts.job = Some((job.id.clone(), job.pm_alias.clone(), self.job_pm(&job)?));
             }
-            (Rule::Shutdown | Rule::OnAgent(..) | Rule::OnJob(..), Who::Unproven(_)) => {
+            (Rule::Shutdown | Rule::OnAgent(..), Who::Unproven(_)) => {
                 facts.sandbox_outsider = self.sandbox_outsider(peer_pid);
             }
             _ => {}

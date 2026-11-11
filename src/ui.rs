@@ -546,6 +546,12 @@ pub struct UiOpts {
     pub board: Option<PublicBoard>,
 }
 
+#[cfg(test)]
+pub(crate) type MemberStreamBatchHook = dyn Fn(&str, &[std::sync::Arc<str>]) + Send + Sync;
+
+#[cfg(test)]
+pub(crate) type AgentDetailReadHook = dyn Fn(&str) + Send + Sync;
+
 /// Everything the running server needs, resolved.
 #[derive(Clone, Default)]
 pub struct ServeOpts {
@@ -588,6 +594,15 @@ pub struct ServeOpts {
     /// command line — a test's board on a thread of the runner stops
     /// with its test instead of serving for the rest of the run.
     pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only barrier after a member batch is captured, before projection.
+    #[cfg(test)]
+    pub(crate) member_stream_batch_hook: Option<std::sync::Arc<MemberStreamBatchHook>>,
+    /// Test-only barrier after an agent detail read, before final projection.
+    #[cfg(test)]
+    pub(crate) agent_detail_read_hook: Option<std::sync::Arc<AgentDetailReadHook>>,
+    /// Test-only barrier between member agent-show and agent-events reads.
+    #[cfg(test)]
+    pub(crate) agent_detail_show_hook: Option<std::sync::Arc<AgentDetailReadHook>>,
     /// An in-process owner's startup notification: success follows binding
     /// and initialization; a bind failure carries its I/O kind. Never set
     /// from the command line. Other startup failures disconnect the channel.
@@ -1213,6 +1228,12 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         delivery_sync_every: None,
         delivery_sync: None,
         stop: None,
+        #[cfg(test)]
+        member_stream_batch_hook: None,
+        #[cfg(test)]
+        agent_detail_read_hook: None,
+        #[cfg(test)]
+        agent_detail_show_hook: None,
         startup: None,
         // `ui run` reads `CADENCE_UI_READY_NONCE` itself; nothing here
         // copies a caller's env into the field.

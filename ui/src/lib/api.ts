@@ -231,15 +231,14 @@ export interface MasterIdentityUpdateResult {
   applies: "next_turn";
 }
 
-/** `POST /api/member-assistant/history` — the member's bound conversation
- *  page. `entries` carry the stored `role`/`kind`/`seq`; `cursor` is the
- *  forward resume watermark. A member names no thread — the binding's
- *  own conversation is always the read. */
+/** The member's bound assistant history, with opaque page positions. */
 export interface MemberAssistHistory {
-  conversation: { id: string; alias: string; created?: string; updated?: string } | null;
+  conversation: { id: string; alias: string };
   entries: unknown[];
-  cursor?: number;
-  more_before?: boolean;
+  cursor: string | null;
+  before_cursor: string | null;
+  more_before: boolean | null;
+  more_after: boolean | null;
 }
 
 /** `POST /api/member-assistant/send` receipt: the accepted message id and
@@ -882,11 +881,10 @@ export const api = {
   memberAssistState: () =>
     post<MemberAssistState>(`/api/member-assistant/state`, {}),
   /** `POST /api/member-assistant/history` — a page of the member's bound
-   *  conversation. `after`/`before`/`tail`/`limit` match the daemon's own
-   *  fields; a member never names a thread (the binding owns it). */
+   *  conversation. Positions are opaque; the binding owns the thread. */
   memberAssistHistory: (page: {
-    after?: number;
-    before?: number;
+    after?: string;
+    before?: string;
     tail?: boolean;
     limit?: number;
   }) => post<MemberAssistHistory>(`/api/member-assistant/history`, { ...page }),

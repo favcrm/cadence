@@ -8,6 +8,8 @@ export const RESUME_COMMAND = "cadence agent resume master";
 export type MasterStatus =
   /** Agents not loaded yet. */
   | { kind: "unknown" }
+  /** Scoped readers cannot see the master's runtime state. */
+  | { kind: "unavailable" }
   /** The daemon is down — nothing can be sent. */
   | { kind: "offline" }
   /** No agent named `master` is registered. */
@@ -30,6 +32,7 @@ export function masterStatus(agents: AgentsPayload | null, threadMissing: boolea
   if (row.state === "stopped" || row.dead) {
     return { kind: "stopped", label: row.state_label ?? (row.dead ? "its process is gone" : "stopped") };
   }
+  if (row.state === null) return { kind: "unavailable" };
   return { kind: "running", state: row.state };
 }
 
@@ -40,6 +43,9 @@ export function composerBlock(block: string | null, status: MasterStatus, hosted
   switch (status.kind) {
     case "unknown":
       return "Checking whether the master is running…";
+    case "unavailable":
+      // Let the daemon decide whether the submitted message can be accepted.
+      return null;
     case "offline":
       return "The daemon is not reachable — messages send once it is back.";
     case "absent":

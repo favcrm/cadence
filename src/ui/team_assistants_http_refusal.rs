@@ -34,6 +34,10 @@
 //! whole-store byte snapshot.
 
 #![cfg(all(test, feature = "test-seam"))]
+// The fixtures below (and the `#[path]` children this module declares) return
+// `Arc<dyn Fn(&str, &str) + Send + Sync>` witnesses and channel pairs beside
+// them; naming every tuple is noise, not clarity.
+#![allow(clippy::type_complexity)]
 
 use super::*;
 use crate::daemon::team_assistants_refusal::AssistantFlagOn;
@@ -43,6 +47,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -56,10 +61,40 @@ use tiny_http::{Header, Response, Server};
 const ORG: &str = "c1380-org";
 const KID: &str = "c1380-http-fixture";
 
+/// `job_request` requires a real, currently readable tracker issue, and
+/// `Store::create_job` admits one nonterminal job per issue, so the fixture
+/// offers one genuine workspace-visible issue per accepted request.
+const FIXTURE_ISSUE: &str = "FIX-1";
+const FIXTURE_ISSUE_2: &str = "FIX-2";
+
+fn fixture_issue_project(pm: &std::path::Path) {
+    let project = pm.join("fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("project.yaml"), "key: fixture\nprefix: FIX\n").unwrap();
+    for id in [FIXTURE_ISSUE, FIXTURE_ISSUE_2] {
+        let issue = project.join(id);
+        std::fs::create_dir_all(&issue).unwrap();
+        std::fs::write(
+            issue.join("issue.md"),
+            format!(
+                "---\nid: {id}\ntitle: {id} fixture\nstatus: backlog\npriority: P2\n\
+                 created: '2026-01-01T00:00:00Z'\n---\n"
+            ),
+        )
+        .unwrap();
+    }
+}
+
 // Child placement reuses private fixture helpers without exporting them or
 // changing production module registration. The parent file is test-seam only.
 #[path = "cad1485_member_chat_refusal.rs"]
 mod cad1485_member_chat_refusal;
+#[path = "cad2215_job_events_opaque_http_acceptance.rs"]
+mod cad2215_job_events_opaque_http_acceptance;
+#[path = "cad2215_member_history_opaque_http_acceptance.rs"]
+mod cad2215_member_history_opaque_http_acceptance;
+#[path = "cad2215_privacy_http_acceptance.rs"]
+mod cad2215_privacy_http_acceptance;
 
 fn loopback_server() -> Server {
     (3110..=3199)
@@ -102,6 +137,7 @@ struct Authority {
     status: u16,
     /// Opt-in response recorder for CAD-1485 only. None preserves the old rig.
     board_authorize: Option<cad1485_member_chat_refusal::BoardAuthorize>,
+    queue_service_token: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -203,14 +239,15 @@ fn answer_platform(
             return;
         }
     };
-    let scope_ok = crate::assistant_actor::AssistVerb::of(&input.operation).is_some_and(|v| {
-        let want = match v.scope() {
-            crate::assistant_actor::AssistScope::Read => "assist.read",
-            crate::assistant_actor::AssistScope::Write => "assist.write",
-            crate::assistant_actor::AssistScope::Jobs => "assist.jobs",
-        };
-        input.scope == want
-    });
+    let scope_ok = (input.operation == "job_dispatch" && input.scope == "assist.jobs")
+        || crate::assistant_actor::AssistVerb::of(&input.operation).is_some_and(|v| {
+            let want = match v.scope() {
+                crate::assistant_actor::AssistScope::Read => "assist.read",
+                crate::assistant_actor::AssistScope::Write => "assist.write",
+                crate::assistant_actor::AssistScope::Jobs => "assist.jobs",
+            };
+            input.scope == want
+        });
     if input.version != "hosted-cadence-assistant.v1"
         || input.organization_id != ORG
         || !scope_ok
@@ -229,25 +266,52 @@ fn answer_platform(
         let guard = authority.lock().unwrap();
         guard.members.get(&input.sub).cloned()
     };
-    let (envelope_credential, envelope_scopes): (Option<String>, Vec<String>) =
-        if let Some(env) = bearer.strip_prefix("Bearer wikienv_") {
-            match verify_envelope(env, verify_public, issuer, host) {
-                Some(claims)
-                    if claims.sub == input.sub
-                        && claims.assistant_id == input.assistant_id
-                        && claims.organization_id == input.organization_id =>
-                {
-                    (Some(claims.credential_id), claims.scope)
-                }
-                _ => {
-                    respond(request, 401, json!({"ok":false,"code":"unauthorized"}));
-                    return;
-                }
-            }
-        } else {
+    let (envelope_credential, envelope_scopes): (Option<String>, Vec<String>) = if let Some(env) =
+        bearer.strip_prefix("Bearer wikienv_")
+    {
+        if input.operation == "job_dispatch" {
             respond(request, 401, json!({"ok":false,"code":"unauthorized"}));
             return;
+        }
+        match verify_envelope(env, verify_public, issuer, host) {
+            Some(claims)
+                if claims.sub == input.sub
+                    && claims.assistant_id == input.assistant_id
+                    && claims.organization_id == input.organization_id =>
+            {
+                (Some(claims.credential_id), claims.scope)
+            }
+            _ => {
+                respond(request, 401, json!({"ok":false,"code":"unauthorized"}));
+                return;
+            }
+        }
+    } else if authority
+        .lock()
+        .unwrap()
+        .queue_service_token
+        .as_ref()
+        .is_some_and(|token| bearer == format!("Bearer {token}"))
+    {
+        // Service authenticates transport only. Prefer the exact queued or
+        // incoming credential whenever supplied; job_request and
+        // job_dispatch must carry their original credential.
+        let original = match input.resource.get("credential_id").and_then(Value::as_str) {
+            Some(value) if !value.is_empty() => value.to_string(),
+            _ if input.operation != "job_request" && input.operation != "job_dispatch" => member
+                .as_ref()
+                .map(|m| m.recorded_credential.clone())
+                .unwrap_or_default(),
+            _ => {
+                respond(request, 401, json!({"ok":false,"code":"unauthorized"}));
+                return;
+            }
         };
+        (Some(original), vec![input.scope.clone()])
+    } else {
+        respond(request, 401, json!({"ok":false,"code":"unauthorized"}));
+        return;
+    };
     let allow = member.is_some_and(|m| {
         let role_ok = matches!(m.role, Some("member") | Some("owner"));
         let credential_ok =
@@ -415,6 +479,22 @@ impl Rig {
 /// plus a LIVE authoritative member record at the platform — the two
 /// halves of a provisioned member.
 fn start(subs: &[&str]) -> Rig {
+    start_with_queue_service(subs, None, false)
+}
+fn start_with_queue_service(
+    subs: &[&str],
+    observer: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+    enroll: bool,
+) -> Rig {
+    start_with_history_fault(subs, observer, enroll, None)
+}
+
+fn start_with_history_fault(
+    subs: &[&str],
+    observer: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+    enroll: bool,
+    member_history_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
+) -> Rig {
     let dir = tempfile::Builder::new()
         .prefix("c1380-http")
         .tempdir()
@@ -422,6 +502,15 @@ fn start(subs: &[&str]) -> Rig {
     let state = dir.path().to_path_buf();
     let pm = state.join("pm");
     crate::issue::Pm::init(&pm).unwrap();
+    fixture_issue_project(&pm);
+    // `tempfile` and `Pm::init` inherit the ambient umask, so a shell running
+    // with `umask 0002` leaves these roots 0775. The daemon's custody chain
+    // requires an owner-only 0700 root and correctly refuses anything else, so
+    // the fixture pins its own roots instead of depending on the launching
+    // shell. No production check changes.
+    for root in [&state, &pm] {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
@@ -432,7 +521,9 @@ fn start(subs: &[&str]) -> Rig {
         let daemon_state = state.clone();
         let opts = ServeOptions {
             test_seam: true,
+            assist_request_sweep_observer: observer,
             stop: Some(stop.clone()),
+            member_history_page_fault,
             ..ServeOptions::default()
         };
         opts.provider_env
@@ -466,6 +557,8 @@ fn start(subs: &[&str]) -> Rig {
         status: 200,
         ..Authority::default()
     }));
+    let queue_service = enroll.then(|| format!("hcs_{}", "q".repeat(43)));
+    authority.lock().unwrap().queue_service_token = queue_service.clone();
     {
         let stop = stop.clone();
         let authority = authority.clone();
@@ -496,6 +589,21 @@ fn start(subs: &[&str]) -> Rig {
         opts.provider_env
             .set("CADENCE_PM_DIR", pm.to_str().unwrap());
         let shared = crate::daemon::Shared::new(&state, &opts).unwrap();
+        if let Some(token) = &queue_service {
+            let key = crate::platform::custody::Key {
+                platform: "hosted-board",
+                account: &public_host,
+            };
+            crate::platform::custody::Custody::open(&state)
+                .unwrap()
+                .put(&key, token.as_bytes())
+                .unwrap();
+            let fingerprint = crate::secret::fingerprint(token.as_bytes());
+            shared.store.fixture_write(|tx| {
+                tx.execute("INSERT OR REPLACE INTO platform_credentials (platform,account,scopes,fingerprint,custody,exchange,enrolled_at,by,connection_id,credential_revision) VALUES('hosted-board',?1,'[\"assist.revalidate\"]',?2,'file','token',1.0,'operator','conn-http-queue',1)", rusqlite::params![&public_host, fingerprint])?;
+                Ok(())
+            }).unwrap();
+        }
         for sub in subs {
             let assistant_id = format!("assist_{sub}");
             shared
@@ -574,6 +682,193 @@ impl Drop for Rig {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
     }
+}
+
+fn enroll_queue_service(rig: &Rig) {
+    let token = format!("hcs_{}", "q".repeat(43));
+    rig.authority.lock().unwrap().queue_service_token = Some(token.clone());
+    let key = crate::platform::custody::Key {
+        platform: "hosted-board",
+        account: &rig.public_host,
+    };
+    crate::platform::custody::Custody::open(rig._dir.path())
+        .unwrap()
+        .put(&key, token.as_bytes())
+        .unwrap();
+    let fingerprint = crate::secret::fingerprint(token.as_bytes());
+    let opts = ServeOptions::default();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", rig.pm.to_str().unwrap());
+    let shared = crate::daemon::Shared::new(rig._dir.path(), &opts).unwrap();
+    shared.store.fixture_write(|tx| {
+        tx.execute("INSERT OR REPLACE INTO platform_credentials (platform,account,scopes,fingerprint,custody,exchange,enrolled_at,by,connection_id,credential_revision) VALUES('hosted-board',?1,'[\"assist.revalidate\"]',?2,'file','token',1.0,'operator','conn-http-queue',1)", rusqlite::params![&rig.public_host, fingerprint])?;
+        Ok(())
+    }).unwrap();
+}
+
+fn queued_http_rig(subs: &[&str]) -> (Rig, std::sync::mpsc::Receiver<(String, String)>) {
+    let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
+    let observer: Arc<dyn Fn(&str, &str) + Send + Sync> = Arc::new(move |id, outcome| {
+        let _ = tx.send((id.to_string(), outcome.to_string()));
+    });
+    let rig = start_with_queue_service(subs, Some(observer), false);
+    assert!(rig.authority.lock().unwrap().queue_service_token.is_none());
+    let key = crate::platform::custody::Key {
+        platform: "hosted-board",
+        account: &rig.public_host,
+    };
+    let custody = crate::platform::custody::Custody::open(rig._dir.path()).unwrap();
+    assert!(
+        custody.load("file", &key).is_err(),
+        "service unexpectedly enrolled before setup"
+    );
+    let db = rusqlite::Connection::open(rig._dir.path().join("cadence.sqlite3")).unwrap();
+    let count: i64 = db.query_row("SELECT COUNT(*) FROM platform_credentials WHERE platform='hosted-board' AND account=?1", [&rig.public_host], |row| row.get(0)).unwrap();
+    assert_eq!(count, 0, "service row unexpectedly existed before setup");
+    enroll_queue_service(&rig);
+    (rig, rx)
+}
+
+/// CAD-2215: bind a fixture scoped-cursor keyring through the real operator
+/// `scoped_cursor_initialize` RPC. A member `job_events` read is scoped only
+/// when the daemon has an initialized keyring; without one every read is
+/// `scoped_cursor_unavailable`, which is not an authorization answer. The key
+/// files live in a private temp dir outside the state dir and the tracker (the
+/// record refuses either), and the returned `TempDir` keeps them alive for the
+/// whole test. The daemon loads the record on every scoped read, so one
+/// started earlier picks it up on its next page.
+fn initialize_queue_keyring(rig: &Rig) -> tempfile::TempDir {
+    const KEY_BYTE: u8 = 0xb7;
+    const IDENTITY_BYTE: u8 = 0xa7;
+    const KEY_ID: u8 = 0x03;
+
+    fn write_private(path: &std::path::Path, bytes: &[u8]) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        drop(file);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // The record is admitted through the strict owner-only state chain:
+    // `tempfile` creates the root 0775 under a permissive umask (0002), which
+    // `private_directory` correctly refuses. The fixture owns this state root,
+    // so pin it 0700 before writing the record — no production check changes.
+    std::fs::set_permissions(rig._dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The record admits the tracker as an owner-controlled chain: pin the
+    // fixture tracker owner-only so no ambient umask can make it refuse.
+    std::fs::set_permissions(&rig.pm, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let keys = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(keys.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_private(&keys.path().join("identity.key"), &[IDENTITY_BYTE; 32]);
+    write_private(&keys.path().join("cursor.key"), &[KEY_BYTE; 32]);
+    let key_id = format!("{KEY_ID:02x}").repeat(16);
+    let config = json!({
+        "version": 1,
+        "identity_key_file": keys.path().join("identity.key").to_str().unwrap(),
+        "active_key_id": key_id.clone(),
+        "keys": [{
+            "id": key_id,
+            "key_file": keys.path().join("cursor.key").to_str().unwrap(),
+        }],
+    });
+    write_private(
+        &rig._dir.path().join("scoped-cursors.json"),
+        &serde_json::to_vec(&config).unwrap(),
+    );
+
+    let opts = ServeOptions::default();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", rig.pm.to_str().unwrap());
+    let shared = crate::daemon::Shared::new(rig._dir.path(), &opts).unwrap();
+    let response = crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
+        shared.dispatch("scoped_cursor_initialize", &json!({}), std::process::id())
+    })
+    .expect("the operator must bind the fixture scoped-cursor keyring");
+    assert_eq!(response["initialized"], json!(true), "{response}");
+    keys
+}
+
+fn promote_http_fixture_and_restore_service(
+    rig: &Rig,
+    rx: &std::sync::mpsc::Receiver<(String, String)>,
+    sub: &str,
+    receipt: &Value,
+) -> String {
+    let id = receipt["request_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .expect("missing accepted request ID")
+        .to_string();
+    assert_eq!(
+        *receipt,
+        json!({"request_id":id,"status":"accepted"}),
+        "unexpected immediate response"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .expect("real worker promotion deadline");
+        let (observed, outcome) = rx
+            .recv_timeout(left)
+            .expect("real worker emitted no promotion outcome");
+        if observed != id {
+            continue;
+        }
+        match outcome.as_str() {
+            "created" => break,
+            "pending" => continue,
+            _ => panic!("fixture worker refused real promotion: {outcome}"),
+        }
+    }
+    let (status, list) = rig.call(
+        "job_list",
+        &rig.envelope(sub, json!({}), json!({})),
+        &json!({}),
+    );
+    assert_eq!(status, 200, "signed owner list failed: {list}");
+    let rows: Vec<_> = list["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["request_id"] == id)
+        .collect();
+    assert_eq!(rows.len(), 1, "owner request missing or duplicated: {list}");
+    assert_eq!(rows[0]["status"], "created");
+    let job = rows[0]["job"]
+        .as_str()
+        .filter(|job| !job.is_empty())
+        .expect("created request has no job")
+        .to_string();
+    // Restore exact original no-service authority/custody/database state
+    // before ANY pre-existing guarded operation.
+    let key = crate::platform::custody::Key {
+        platform: "hosted-board",
+        account: &rig.public_host,
+    };
+    let custody = crate::platform::custody::Custody::open(rig._dir.path()).unwrap();
+    custody.remove("file", &key).unwrap();
+    let db = rusqlite::Connection::open(rig._dir.path().join("cadence.sqlite3")).unwrap();
+    db.execute(
+        "DELETE FROM platform_credentials WHERE platform='hosted-board' AND account=?1",
+        [&rig.public_host],
+    )
+    .unwrap();
+    let count: i64 = db.query_row("SELECT COUNT(*) FROM platform_credentials WHERE platform='hosted-board' AND account=?1", [&rig.public_host], |row| row.get(0)).unwrap();
+    assert_eq!(count, 0, "temporary service row remained");
+    rig.authority.lock().unwrap().queue_service_token = None;
+    assert!(rig.authority.lock().unwrap().queue_service_token.is_none());
+    assert!(
+        custody.load("file", &key).is_err(),
+        "temporary service custody remained"
+    );
+    job
 }
 
 /// A whole-store byte snapshot — the "no effect" probe for refused HTTP calls.
@@ -746,7 +1041,10 @@ fn assist_http_admission_refuses_forged_org_aud_expired_replay_scope_operator() 
     let env = rig.envelope("frank", json!({}), json!({"scope": ["assist.read"]}));
     for (verb, args) in [
         ("assist_send", json!({"text": "x"})),
-        ("job_request", json!({"title": "t", "request_key": "k"})),
+        (
+            "job_request",
+            json!({"title": "t", "request_key": "k", "issue": FIXTURE_ISSUE}),
+        ),
     ] {
         let (status, body) = rig.call(verb, &env, &args);
         assert_eq!(status, 403, "read-scope ran {verb} at HTTP: {body}");
@@ -765,7 +1063,10 @@ fn assist_http_admission_refuses_forged_org_aud_expired_replay_scope_operator() 
 #[test]
 fn assist_http_member_b_cannot_reach_member_a() {
     let _flag = AssistantFlagOn::arm();
-    let rig = start(&["alice", "bob"]);
+    let (rig, events) = queued_http_rig(&["alice", "bob"]);
+    // A scoped `job_events` read needs the fixture keyring: without it every
+    // read is `scoped_cursor_unavailable`, not an authorization answer.
+    let _keys = initialize_queue_keyring(&rig);
     let alice = rig.envelope("alice", json!({}), json!({}));
     let bob = rig.envelope("bob", json!({}), json!({}));
 
@@ -773,10 +1074,10 @@ fn assist_http_member_b_cannot_reach_member_a() {
     let (status, body) = rig.call(
         "job_request",
         &alice,
-        &json!({"title": "a job", "request_key": "a-k1"}),
+        &json!({"title": "a job", "request_key": "a-k1", "issue": FIXTURE_ISSUE}),
     );
     assert_eq!(status, 200, "alice's job_request refused at HTTP: {body}");
-    let job = body["job"].as_str().unwrap_or_default().to_string();
+    let job = promote_http_fixture_and_restore_service(&rig, &events, "alice", &body);
     assert!(!job.is_empty(), "job_request returned no job: {body}");
 
     let before = tree(&rig.pm);
@@ -808,14 +1109,15 @@ fn assist_http_member_b_cannot_reach_member_a() {
 #[test]
 fn removed_member_after_enqueue_cannot_commit_an_effect() {
     let _flag = AssistantFlagOn::arm();
-    let rig = start(&["carol"]);
+    let (rig, events) = queued_http_rig(&["carol"]);
     let carol = rig.envelope("carol", json!({}), json!({}));
     let (status, body) = rig.call(
         "job_request",
         &carol,
-        &json!({"title": "queued", "request_key": "c-q1"}),
+        &json!({"title": "queued", "request_key": "c-q1", "issue": FIXTURE_ISSUE}),
     );
     assert_eq!(status, 200, "live member job_request refused: {body}");
+    let _job = promote_http_fixture_and_restore_service(&rig, &events, "carol", &body);
 
     // The member's platform authority is withdrawn — on the authoritative
     // membership source, NOT by touching the local binding. The next
@@ -826,7 +1128,7 @@ fn removed_member_after_enqueue_cannot_commit_an_effect() {
     let (status, body) = rig.call(
         "job_request",
         &removed,
-        &json!({"title": "late", "request_key": "c-q2"}),
+        &json!({"title": "late", "request_key": "c-q2", "issue": FIXTURE_ISSUE_2}),
     );
     assert!(
         status == 401 || status == 403,
@@ -838,13 +1140,14 @@ fn removed_member_after_enqueue_cannot_commit_an_effect() {
     // A member whose recorded issuing credential is revoked at the
     // platform is refused on the same live pull — the ≤300 s envelope
     // window is not authority.
-    let rig = start(&["dana"]);
+    let (rig, events) = queued_http_rig(&["dana"]);
     let (status, body) = rig.call(
         "job_request",
         &rig.envelope("dana", json!({}), json!({})),
-        &json!({"title": "queued", "request_key": "d-q1"}),
+        &json!({"title": "queued", "request_key": "d-q1", "issue": FIXTURE_ISSUE}),
     );
     assert_eq!(status, 200, "live member job_request refused: {body}");
+    let _job = promote_http_fixture_and_restore_service(&rig, &events, "dana", &body);
     rig.authority
         .lock()
         .unwrap()
@@ -893,15 +1196,18 @@ fn removed_member_after_enqueue_cannot_commit_an_effect() {
 #[test]
 fn assist_http_job_subscribe_needs_owner_share_not_membership() {
     let _flag = AssistantFlagOn::arm();
-    let rig = start(&["ana", "ben", "cid"]);
+    let (rig, events) = queued_http_rig(&["ana", "ben", "cid"]);
+    // The granted member's `job_events` is a real scoped page: the fixture
+    // keyring must exist so a 200 is the grant, not a keyring artifact.
+    let _keys = initialize_queue_keyring(&rig);
     let ana = rig.envelope("ana", json!({}), json!({}));
     let (status, body) = rig.call(
         "job_request",
         &ana,
-        &json!({"title": "shared", "request_key": "a-s1"}),
+        &json!({"title": "shared", "request_key": "a-s1", "issue": FIXTURE_ISSUE}),
     );
     assert_eq!(status, 200, "ana's job_request refused: {body}");
-    let job = body["job"].as_str().unwrap_or_default().to_string();
+    let job = promote_http_fixture_and_restore_service(&rig, &events, "ana", &body);
     assert!(!job.is_empty(), "job_request returned no job: {body}");
 
     // ---- B same-org, UNENTITLED (owner has not shared) → subscribe AND

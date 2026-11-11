@@ -762,7 +762,9 @@ export interface ThreadMessageReq {
  * `cursor` is the last row the page scanned in the direction it was read —
  * the forward resume point, and the newest scanned row of a `tail` page. A
  * projection can filter another source's rows out of a page, so a consumer
- * must move by what was SCANNED and never by what was kept:
+ * must move by what was SCANNED and never by what was kept. Project-scoped
+ * reads first exclude entries without a readable issue binding; only that
+ * scoped stream contributes to these page boundaries:
  * 
  * - `more_before` (backward) says raw rows remain below the page;
  * - `scanned_before` (backward) is the lowest seq scanned, the `before`

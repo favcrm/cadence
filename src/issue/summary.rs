@@ -84,8 +84,20 @@ fn at_or_after(at: Option<&str>, since: i64) -> bool {
 
 /// The summary since `since` (epoch seconds). `escalated` is the
 /// daemon's escalation record, keyed `<issue>/<question report>`.
-pub fn since(pm: &Pm, since: i64, escalated: &serde_json::Map<String, Value>) -> Result<Value> {
-    let views = board::views(&pm.config.notes_dir(), board::load_all(&pm.dir, None)?);
+pub fn since(
+    pm: &Pm,
+    since: i64,
+    escalated: &serde_json::Map<String, Value>,
+    readable: Option<&std::collections::BTreeSet<String>>,
+) -> Result<Value> {
+    let mut views = board::views(&pm.config.notes_dir(), board::load_all(&pm.dir, None)?);
+    // CAD-2215: the summary is rendered prose over these rows — issue titles,
+    // epic and plan names, question bodies — so the rows are scoped before they
+    // are rendered, not after. A project the caller may not read contributes
+    // nothing to the text or to the JSON.
+    if let Some(readable) = readable {
+        views.retain(|v| readable.contains(&v.issue.project));
+    }
     let mut proposed = Vec::new();
     let mut decided = Vec::new();
     let mut reports = Vec::new();

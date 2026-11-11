@@ -387,9 +387,12 @@ impl Shared {
 
     /// `lane_show` — `{issue}`. A caller-supplied agent is an unknown
     /// field, so the card cannot be pointed at another issue's lane.
-    pub(super) fn rpc_lane_show(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_lane_show(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         known_fields(params, &["issue"], "lane show")?;
         let id = issue::model::check_id(required_str(params, "issue")?)?;
+        // The lane names an agent, a branch, a worktree and a PR: a project the
+        // caller's policy does not admit answers as an unknown issue.
+        self.admit_issue(peer_pid, "lane show", &id)?;
         let (_pm, front, _body) = self.load_issue(&id)?;
         let lane = self.resolve_lane(&front)?;
         Ok(json!({

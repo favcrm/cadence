@@ -10,6 +10,86 @@ use serde_json::{json, Value};
 
 use super::*;
 
+/// The owner-facing id of one accepted member job request. Derived from
+/// the same length-prefixed `(org, sub, request_key)` triple the canonical
+/// job id uses, under a domain-separated digest: stable across a replay,
+/// a promotion and a crash, and never reused for a distinct principal or
+/// key. The `request-` prefix keeps it disjoint from every job id.
+pub fn assist_request_id(org: &str, sub: &str, request_key: &str) -> String {
+    let digest = crate::operator_auth::digest(&format!(
+        "assist-request|{}:{}|{}:{}|{}:{}",
+        org.len(),
+        org,
+        sub.len(),
+        sub,
+        request_key.len(),
+        request_key
+    ));
+    format!("request-{}", &digest[..digest.len().min(24)])
+}
+
+/// The canonical job id one request mints. Derived once, at acceptance,
+/// from the same length-prefixed principal+key digest the request id uses,
+/// so: a replay returns the same id, a crash-adoption finds its own
+/// partially-created job, and a delivery reader can prove provenance from
+/// the durable queue row even before the `assist_requests` ledger lands.
+fn assist_job_id(org: &str, sub: &str, request_key: &str) -> String {
+    let key_digest = crate::operator_auth::digest(&format!(
+        "{}:{}|{}:{}|{}:{}",
+        org.len(),
+        org,
+        sub.len(),
+        sub,
+        request_key.len(),
+        request_key
+    ));
+    format!("assist-{}", &key_digest[..key_digest.len().min(24)])
+}
+
+/// CAD-2215: a durable accepted member job request. One row per
+/// `(org, sub, request_key)`, written BEFORE any job publication so an
+/// occupied issue yields a pending request instead of an
+/// occupancy-dependent refusal. `job` is derived from the canonical
+/// `assist_requests` ledger at read time, so acceptance and promotion can
+/// never disagree after a crash: a job row without its ledger is adopted
+/// by the request's own deterministic job id, and a ledger row is one job.
+#[derive(Debug, Clone)]
+pub struct AssistRequestQueued {
+    pub org: String,
+    pub sub: String,
+    pub request_key: String,
+    pub request_id: String,
+    /// The canonical job id this request WILL mint, persisted at
+    /// acceptance before any job row exists. It is never exposed to the
+    /// member (the receipt has only `request_id`); it is the crash-proof
+    /// provenance a delivery reader can match.
+    pub planned_job_id: String,
+    pub issue: String,
+    pub title: String,
+    pub body: String,
+    pub acceptance: String,
+    /// The issuing credential the request was minted under — the ORIGINAL
+    /// provenance a later promotion re-proves, never the member's latest.
+    pub credential_id: String,
+    pub created: f64,
+    /// Last autonomous promotion visit; ordering this first bounds
+    /// starvation by permanently refused older rows.
+    pub last_attempt: f64,
+    /// Last sweep outcome for a still-pending request:
+    /// `pending` (issue held / tracker busy), `refused` (authority,
+    /// original-credential or service-bearer refusal) or `failed`.
+    /// Never names another job or its occupancy.
+    pub last_outcome: Option<String>,
+    /// Durable completion flag: `0` until the canonical job's ledger bind
+    /// AND its idempotent subscription/notice have all succeeded. A crash
+    /// between the bind and those effects leaves `0`, so the worker keeps
+    /// selecting the bound row and finishes it after re-proving the
+    /// original credential.
+    pub completed: bool,
+    /// `Some(job)` once promoted; `None` while the issue is occupied.
+    pub job: Option<String>,
+}
+
 /// A stored member job request — the provenance a deferred commit
 /// re-proves at effect time (SEC-002 / RISK-001).
 #[derive(Debug, Clone)]
@@ -28,6 +108,34 @@ pub struct AssistRequest {
     /// `requested` | `awaiting_approval` | `dispatched` | `done`.
     pub state: String,
     pub created: f64,
+}
+
+pub(crate) enum PrivateJobReader<'a> {
+    User { org: &'a str, sub: &'a str },
+    Agent(&'a str),
+    Unproven,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PrivateJobDenials {
+    pub jobs: std::collections::BTreeSet<String>,
+    pub tasks: std::collections::BTreeSet<String>,
+    /// Issue-only messages cannot prove they are unrelated to these jobs.
+    pub issues: std::collections::BTreeSet<String>,
+    /// A human/anonymous relay cannot borrow the board's cloud identity.
+    pub exclude_cloud: bool,
+}
+
+impl PrivateJobDenials {
+    pub(crate) fn hides_message(&self, message: &super::Message) -> bool {
+        match message.task_id.as_deref() {
+            Some(task) => self.tasks.contains(task),
+            None => message
+                .issue
+                .as_deref()
+                .is_some_and(|issue| self.issues.contains(issue)),
+        }
+    }
 }
 
 /// A stored member-assistant binding.
@@ -79,6 +187,41 @@ fn pin_next(pin: &str) -> String {
 /// float epoch boundary a stringified `f64` would wobble on.
 fn rev_millis(updated: f64) -> i64 {
     (updated * 1000.0) as i64
+}
+
+/// The owner-facing accepted-request projection: the queue row plus the
+/// canonical job (`NULL` while pending) derived from `assist_requests`.
+const QUEUED_SELECT: &str = "SELECT q.org AS org, q.sub AS sub,
+        q.request_key AS request_key, q.issue AS issue, q.title AS title,
+        q.body AS body, q.acceptance AS acceptance,
+        q.credential_id AS credential_id, q.created AS created,
+        q.last_attempt AS last_attempt, q.last_outcome AS last_outcome,
+        q.completed AS completed, q.job_id AS planned_job_id, r.job AS job
+     FROM assist_request_queue q
+     LEFT JOIN assist_requests r
+       ON r.org=q.org AND r.sub=q.sub AND r.request_key=q.request_key";
+
+fn row_queued(row: &rusqlite::Row) -> rusqlite::Result<AssistRequestQueued> {
+    let org: String = row.get("org")?;
+    let sub: String = row.get("sub")?;
+    let request_key: String = row.get("request_key")?;
+    Ok(AssistRequestQueued {
+        request_id: assist_request_id(&org, &sub, &request_key),
+        planned_job_id: row.get("planned_job_id")?,
+        org,
+        sub,
+        request_key,
+        issue: row.get("issue")?,
+        title: row.get("title")?,
+        body: row.get("body")?,
+        acceptance: row.get("acceptance")?,
+        credential_id: row.get("credential_id")?,
+        created: row.get("created")?,
+        last_attempt: row.get("last_attempt")?,
+        last_outcome: row.get("last_outcome")?,
+        completed: row.get::<_, i64>("completed")? != 0,
+        job: row.get("job")?,
+    })
 }
 
 fn row_binding(row: &rusqlite::Row) -> rusqlite::Result<AssistantBinding> {
@@ -772,8 +915,8 @@ impl Store {
     /// The owning member enables (or disables) sharing of their own
     /// assist-bound job inside their org — the ONLY way a job becomes
     /// subscribable by a second member. `enabled=false` clears the row;
-    /// existing subscriber rows are not retro-removed (each still
-    /// re-passes the live member re-prove on every read).
+    /// existing subscriber rows remain recorded but cannot read until sharing
+    /// resumes and live member authority is re-proven.
     pub fn assist_job_share(
         &self,
         job: &str,
@@ -903,18 +1046,241 @@ impl Store {
         }
     }
 
-    /// The job ids `(org, sub)` requested or is subscribed to — the union of
-    /// the request ledger and the subscriber set, for `member_job_list`.
-    pub fn assist_member_jobs(&self, org: &str, sub: &str) -> Result<Vec<String>> {
+    /// The one admissibility rule for member-private job provenance, shared
+    /// by the owner-facing `member_job_list` projection and
+    /// `private_job_denials`, so the two can never disagree about which
+    /// jobs are readable.
+    ///
+    /// `bound` yields one row per job named by either durable record, with
+    /// `provenance=1` only when those records agree exactly:
+    /// * one unique `assist_requests` row (the owner binding) AND exactly
+    ///   one `assist_request_queue` row for its `(org, sub, request_key)`
+    ///   that names this job, is durably `completed=1`, and records the
+    ///   job's ACTUAL `issue_id` (so a moved or malformed job cannot be
+    ///   made readable by stale queue provenance); or
+    /// * the pre-queue LEGACY case: one unique ledger row, no queue row for
+    ///   this job, and none for its triple.
+    ///
+    /// A queue-only job (crash after the job row but before the ledger
+    /// bind), a bound-but-incomplete queue row (`completed=0`), a planned
+    /// job id that disagrees with the ledger, a job whose issue moved away
+    /// from the recorded request issue, and ambiguous ledger or queue
+    /// candidates all yield `provenance=0` and are therefore readable by no
+    /// non-operator reader.
+    const PRIVATE_PROVENANCE_CTE: &str = "owners AS (
+        SELECT job, MIN(org) AS org, MIN(sub) AS sub,
+          MIN(request_key) AS request_key, COUNT(*) AS n
+        FROM assist_requests GROUP BY job
+     ), queued AS (
+        SELECT job_id AS job, COUNT(*) AS n
+        FROM assist_request_queue GROUP BY job_id
+     ), claims AS (
+        SELECT o.job AS job,
+          (SELECT COUNT(*) FROM assist_request_queue q
+            WHERE q.org=o.org AND q.sub=o.sub
+              AND q.request_key=o.request_key) AS claimed,
+          (SELECT COUNT(*) FROM assist_request_queue q
+            WHERE q.org=o.org AND q.sub=o.sub
+              AND q.request_key=o.request_key
+              AND q.job_id=o.job AND q.completed=1
+              AND q.issue=j.issue_id) AS accepted
+        FROM owners o JOIN jobs j ON j.id=o.job
+     ), scoped AS (
+        SELECT job FROM owners
+        UNION
+        SELECT job FROM queued
+     ), bound AS (
+        SELECT j.id AS job, j.issue_id AS issue, j.pm_alias AS pm_alias,
+          o.org AS org, o.sub AS sub, COALESCE(o.n, 0) AS owners,
+          CASE
+            WHEN o.job IS NULL THEN 0
+            WHEN o.n<>1 THEN 0
+            WHEN COALESCE(c.claimed, 0)=1
+                 AND COALESCE(c.accepted, 0)=1
+                 AND COALESCE(q.n, 0)=1 THEN 1
+            WHEN COALESCE(c.claimed, 0)=0
+                 AND COALESCE(q.n, 0)=0 THEN 1
+            ELSE 0
+          END AS provenance
+        FROM scoped s
+        JOIN jobs j ON j.id=s.job
+        LEFT JOIN owners o ON o.job=s.job
+        LEFT JOIN queued q ON q.job=s.job
+        LEFT JOIN claims c ON c.job=s.job
+     )";
+
+    /// Member job IDs whose project binding and current share are readable.
+    /// Only a job with trusted provenance (see `PRIVATE_PROVENANCE_CTE`) is
+    /// listed: a request that crashed before its ledger bind or before
+    /// `completed=1` never appears in the owner's job list while it is
+    /// still pending, so this projection agrees with the read denials.
+    pub(crate) fn assist_member_jobs_scoped(
+        &self,
+        org: &str,
+        sub: &str,
+        issues: &[&str],
+    ) -> Result<Vec<String>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT job FROM assist_requests WHERE org=? AND sub=? \
-             UNION SELECT job FROM job_subscribers WHERE org=? AND sub=?",
+        let issues = serde_json::to_string(issues)?;
+        let provenance = Self::PRIVATE_PROVENANCE_CTE;
+        let mut stmt = conn.prepare(&format!(
+            "WITH {provenance}
+             SELECT b.job FROM bound b
+             WHERE b.provenance=1 AND b.org=?1
+               AND b.issue IN (SELECT value FROM json_each(?3))
+               AND ((b.sub=?2) OR (EXISTS (
+                    SELECT 1 FROM job_subscribers s
+                    WHERE s.job=b.job AND s.org=?1 AND s.sub=?2
+               ) AND EXISTS (
+                    SELECT 1 FROM assist_job_shares h WHERE h.job=b.job AND h.org=?1
+               )))
+             ORDER BY b.job"
+        ))?;
+        let rows = stmt.query_map(params![org, sub, issues], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A job has a usable owner only when its request provenance is unique
+    /// AND settled: one ledger row whose queue row (when one exists) names
+    /// this job, agrees on `(org, sub, request_key)` and is durably
+    /// `completed=1`. A queue-only job, an interrupted bind (`completed=0`),
+    /// a mismatched planned job id and ambiguous candidates all answer
+    /// `None`, so a guessed job id cannot read or mutate a half-promoted
+    /// job. A pre-queue legacy job without any queue row keeps its unique
+    /// ledger owner. `assist_request_owns` stays raw provenance for the
+    /// promotion/recovery path.
+    pub(crate) fn assist_job_owner(&self, job: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn();
+        let provenance = Self::PRIVATE_PROVENANCE_CTE;
+        let mut stmt = conn.prepare(&format!(
+            "WITH {provenance}
+             SELECT b.org, b.sub FROM bound b
+             WHERE b.job=?1 AND b.provenance=1"
+        ))?;
+        let mut owners = stmt.query_map([job], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let first = owners.next().transpose()?;
+        if owners.next().transpose()?.is_some() {
+            return Ok(None);
+        }
+        Ok(first)
+    }
+
+    /// Snapshot private jobs and tasks this already-verified reader cannot
+    /// read. Task assignment grants only that task, never the whole job.
+    ///
+    /// A job carries a TRUSTED provenance only when both durable records
+    /// agree exactly: one `assist_requests` row, one `assist_request_queue`
+    /// row naming the same `(org, sub, request_key)`, that queue row's
+    /// planned canonical job id equal to the ledger job, and that queue row
+    /// durably `completed=1` (the bind AND its idempotent subscription /
+    /// notice effects all landed). A job with no queue row at all keeps the
+    /// pre-queue legacy rule: one unique ledger owner is trusted.
+    ///
+    /// Everything else is untrusted and therefore denied to every
+    /// non-operator reader — a queue-only job (a crash after the job row but
+    /// before the ledger bind), a bound-but-incomplete queue row
+    /// (`completed=0`), a queue row whose planned job disagrees with the
+    /// ledger, ambiguous ledger or queue candidates for the same job, and
+    /// (via `owners`) any job without one exact owner. Untrusted provenance
+    /// revokes the task-assignee exception too: a half-promoted job must not
+    /// reveal its tasks. The operator never reaches this query, so it stays
+    /// recoverable.
+    pub(crate) fn private_job_denials(
+        &self,
+        reader: PrivateJobReader<'_>,
+    ) -> Result<PrivateJobDenials> {
+        let conn = self.conn();
+        self.private_job_denials_in(&conn, reader)
+    }
+
+    /// [`Self::private_job_denials`] on an already-open connection or write
+    /// transaction, so an acknowledgement re-evaluates the grant/share state
+    /// in the transaction that mutates the alert rather than against a
+    /// snapshot captured before it.
+    pub(crate) fn private_job_denials_in(
+        &self,
+        conn: &impl StoreConn,
+        reader: PrivateJobReader<'_>,
+    ) -> Result<PrivateJobDenials> {
+        let (kind, principal, subject) = match reader {
+            PrivateJobReader::User { org, sub } => ("user", org, sub),
+            PrivateJobReader::Agent(alias) => ("agent", alias, ""),
+            PrivateJobReader::Unproven => ("none", "", ""),
+        };
+        let provenance = Self::PRIVATE_PROVENANCE_CTE;
+        #[allow(clippy::type_complexity)] // one query, one row shape
+        let rows: Vec<(
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        )> = conn.query_vec(
+            &format!(
+                "WITH {provenance}, decisions AS (
+                SELECT b.job AS job, b.owners AS owners, b.issue AS issue,
+                  b.provenance AS provenance,
+                  CASE WHEN b.provenance=1 AND (
+                    (?1='user' AND b.org=?2 AND (
+                      (b.sub=?3 AND EXISTS (
+                         SELECT 1 FROM assistants a
+                         WHERE a.org=b.org AND a.sub=b.sub AND a.state='active'
+                      )) OR EXISTS (
+                         SELECT 1 FROM job_subscribers s
+                         JOIN assistants a ON a.org=s.org AND a.sub=s.sub AND a.state='active'
+                         JOIN assist_job_shares h ON h.job=s.job AND h.org=s.org
+                         WHERE s.job=b.job AND s.org=?2 AND s.sub=?3
+                      )
+                    )) OR (?1='agent' AND (
+                      b.pm_alias=?2 OR EXISTS (
+                         SELECT 1 FROM assistants a
+                         WHERE a.org=b.org AND a.sub=b.sub AND a.alias=?2 AND a.state='active'
+                      ) OR EXISTS (
+                         SELECT 1 FROM job_subscribers s
+                         JOIN assistants a ON a.org=s.org AND a.sub=s.sub AND a.state='active'
+                         JOIN assist_job_shares h ON h.job=s.job AND h.org=s.org
+                         WHERE s.job=b.job AND s.org=b.org AND a.alias=?2
+                      )
+                    ))
+                  ) THEN 1 ELSE 0 END AS readable
+                FROM bound b
+             )
+             SELECT d.job, d.owners, t.id, t.assignee, d.issue, d.provenance
+             FROM decisions d LEFT JOIN tasks t ON t.job_id=d.job
+             WHERE d.readable=0"
+            ),
+            params![kind, principal, subject],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
         )?;
-        let rows = stmt
-            .query_map(params![org, sub, org, sub], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        Ok(rows)
+        let mut denied = PrivateJobDenials::default();
+        for (job, owners, task, assignee, issue, provenance) in rows {
+            denied.jobs.insert(job);
+            if let Some(issue) = issue {
+                denied.issues.insert(issue);
+            }
+            if let Some(task) = task {
+                // The assignee exception needs a trusted, exactly-matched
+                // provenance: an interrupted promotion reveals no task.
+                if provenance != 1
+                    || owners != 1
+                    || kind != "agent"
+                    || assignee.as_deref() != Some(principal)
+                {
+                    denied.tasks.insert(task);
+                }
+            }
+        }
+        Ok(denied)
     }
 
     /// Did `(org, sub)` create `job` through a recorded request — the owner
@@ -924,6 +1290,29 @@ impl Store {
         let mut stmt =
             conn.prepare("SELECT 1 FROM assist_requests WHERE job=? AND org=? AND sub=? LIMIT 1")?;
         stmt.exists(params![job, org, sub]).map_err(Into::into)
+    }
+
+    /// Does `job` have ANY member-request provenance — a canonical
+    /// `assist_requests` ledger row OR the durable accepted queue row whose
+    /// planned canonical job id names it (including incomplete and completed
+    /// requests)? Exact indexed `EXISTS` over both, so duplicate/ambiguous
+    /// ledger rows still answer `true`, and a crash after job creation but
+    /// before the ledger bind is still provably member-owned. A delivery
+    /// reader must treat `true` as member-private and fail closed; this API
+    /// never infers provenance from an id prefix. DB errors propagate.
+    pub(crate) fn assist_job_has_request(&self, job: &str) -> Result<bool> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM assist_requests WHERE job=?1
+                 UNION ALL
+                 SELECT 1 FROM assist_request_queue WHERE job_id=?1
+             )",
+            params![job],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|found| found != 0)
+        .map_err(Into::into)
     }
 
     // ---- idempotent job request ledger --------------------------------
@@ -945,6 +1334,215 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    // ---- durable accepted request queue (CAD-2215) --------------------
+
+    /// Accept one member job request durably, before any job publication.
+    /// `INSERT OR IGNORE` makes the `(org, sub, request_key)` triple the
+    /// single acceptance point: a replay never rewrites the winner's text
+    /// and never retargets its issue — a replay naming a different issue
+    /// refuses inside this transaction, with no write. Returns the stored
+    /// record (the acceptance winner), whose `job` is derived from the
+    /// canonical ledger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assist_request_enqueue(
+        &self,
+        org: &str,
+        sub: &str,
+        request_key: &str,
+        issue: &str,
+        title: &str,
+        body: &str,
+        acceptance: &str,
+        credential_id: &str,
+    ) -> Result<AssistRequestQueued> {
+        let now = crate::issue::time::now_epoch() as f64;
+        // Derive the canonical job id ONCE, at acceptance, so the queue row
+        // names the job before any job row exists. A crash after creation
+        // but before the ledger bind therefore remains provably this
+        // member's, and promotion adopts exactly this id.
+        let planned_job_id = assist_job_id(org, sub, request_key);
+        self.write_tx(|tx| {
+            // `INSERT OR IGNORE` is the cross-process single-acceptance
+            // point: a concurrent equivalent (same triple) is a no-op, and
+            // the read-back below is the committed winner. A retry with a
+            // different issue refuses without rewriting the winner.
+            tx.execute(
+                "INSERT OR IGNORE INTO assist_request_queue(
+                     org, sub, request_key, issue, title, body, acceptance,
+                     credential_id, created, last_attempt, job_id)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    org,
+                    sub,
+                    request_key,
+                    issue,
+                    title,
+                    body,
+                    acceptance,
+                    credential_id,
+                    now,
+                    now,
+                    planned_job_id
+                ],
+            )?;
+            let stored = Self::queued_in(&*tx, org, sub, request_key)?;
+            if stored.issue != issue {
+                return Err(Error::rejected(
+                    "member job request replay refused: this request_key is already \
+                     recorded against a different issue",
+                ));
+            }
+            Ok(stored)
+        })
+    }
+
+    /// Record one autonomous promotion visit (and its truthful outcome) so
+    /// the bounded sweep rotates instead of retrying the same oldest
+    /// refused rows forever, and so the owner can observe why a pending
+    /// request is not progressing.
+    pub fn assist_request_attempted(
+        &self,
+        org: &str,
+        sub: &str,
+        request_key: &str,
+        outcome: &str,
+    ) -> Result<()> {
+        let now = crate::issue::time::now_epoch() as f64;
+        self.write_tx(|tx| {
+            tx.execute(
+                "UPDATE assist_request_queue SET last_attempt=?, last_outcome=? \
+                 WHERE org=? AND sub=? AND request_key=?",
+                params![now, outcome, org, sub, request_key],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Mark a bound request fully finished: the canonical ledger, the
+    /// requester's subscription and the inert notice are all durable.
+    /// Idempotent, so a crash after the effects but before this update
+    /// converges on the next sweep.
+    pub fn assist_request_complete(&self, org: &str, sub: &str, request_key: &str) -> Result<()> {
+        self.write_tx(|tx| {
+            tx.execute(
+                "UPDATE assist_request_queue SET completed=1 \
+                 WHERE org=? AND sub=? AND request_key=?",
+                params![org, sub, request_key],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Is `record` still the single unambiguous promotion target for its
+    /// planned canonical job? Read-only — it writes nothing — and the
+    /// caller runs it under `member_job_lock` before ANY promotion effect
+    /// and again before final completion.
+    ///
+    /// It re-reads the durable queue row and requires it to be exactly the
+    /// recorded one (same identity, issue, planned job id and original
+    /// credential) and still incomplete (`completed=0`). It requires
+    /// exactly one queued request to claim the planned job id, and the
+    /// ownership ledger for either this identity or this planned job id to
+    /// be absent (a queue-only promotion) or exactly one row naming the
+    /// same identity AND the same planned job (an interrupted already-bound
+    /// recovery). A retargeted or duplicated ledger row, a second request
+    /// claiming the planned id, a rewritten queue row, or a row another
+    /// promotion already completed all answer `false`, so no effect is
+    /// committed against a different request. `completed=1` is not
+    /// required for admission; only the effects of a still-unfinished
+    /// request may proceed.
+    pub(crate) fn assist_queue_promotion_unambiguous(
+        &self,
+        record: &AssistRequestQueued,
+    ) -> Result<bool> {
+        if record.planned_job_id.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn();
+        let (identity, claims, ledger_rows, bound): (i64, i64, i64, i64) = conn.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM assist_request_queue q
+                 WHERE q.org=?1 AND q.sub=?2 AND q.request_key=?3
+                   AND q.issue=?4 AND q.job_id=?5 AND q.credential_id=?6
+                   AND q.completed=0),
+               (SELECT COUNT(*) FROM assist_request_queue q WHERE q.job_id=?5),
+               (SELECT COUNT(*) FROM assist_requests r
+                 WHERE r.job=?5 OR (r.org=?1 AND r.sub=?2 AND r.request_key=?3)),
+               (SELECT COUNT(*) FROM assist_requests r
+                 WHERE r.job=?5 AND r.org=?1 AND r.sub=?2 AND r.request_key=?3)",
+            params![
+                record.org.as_str(),
+                record.sub.as_str(),
+                record.request_key.as_str(),
+                record.issue.as_str(),
+                record.planned_job_id.as_str(),
+                record.credential_id.as_str()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        Ok(identity == 1 && claims == 1 && (ledger_rows == 0 || (ledger_rows == 1 && bound == 1)))
+    }
+
+    /// The accepted request for `(org, sub, request_key)`, or `None`.
+    pub fn assist_request_queued(
+        &self,
+        org: &str,
+        sub: &str,
+        request_key: &str,
+    ) -> Result<Option<AssistRequestQueued>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "{QUEUED_SELECT} WHERE q.org=? AND q.sub=? AND q.request_key=?"
+        ))?;
+        let mut rows = stmt.query_map(params![org, sub, request_key], row_queued)?;
+        let first = rows.next().transpose()?;
+        if rows.next().transpose()?.is_some() {
+            return Err(Error::internal("duplicate accepted member job request"));
+        }
+        Ok(first)
+    }
+
+    /// Every accepted request this owner holds, oldest first. Owner-only:
+    /// the caller has already proved the signed member and filters the
+    /// rows by its current project scope.
+    pub fn assist_requests_queued(&self, org: &str, sub: &str) -> Result<Vec<AssistRequestQueued>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "{QUEUED_SELECT} WHERE q.org=? AND q.sub=? ORDER BY q.created, q.request_key"
+        ))?;
+        let rows = stmt.query_map(params![org, sub], row_queued)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Pending accepted requests — those not yet fully finished — oldest
+    /// attempt first, bounded. Includes a bound row whose subscription/notice
+    /// effects did not complete before a crash (`completed=0`), so the
+    /// worker's already-bound recovery branch is reachable. A fully finished
+    /// request is `completed=1` and no longer selected.
+    pub fn assist_requests_pending(&self, limit: usize) -> Result<Vec<AssistRequestQueued>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "{QUEUED_SELECT} WHERE q.completed=0 \
+             ORDER BY q.last_attempt, q.created, q.request_key LIMIT ?"
+        ))?;
+        let rows = stmt.query_map([limit as i64], row_queued)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn queued_in(
+        conn: &impl StoreConn,
+        org: &str,
+        sub: &str,
+        request_key: &str,
+    ) -> Result<AssistRequestQueued> {
+        conn.query_opt(
+            &format!("{QUEUED_SELECT} WHERE q.org=? AND q.sub=? AND q.request_key=?"),
+            params![org, sub, request_key],
+            row_queued,
+        )?
+        .ok_or_else(|| Error::internal("accepted member job request vanished"))
     }
 
     /// Bind `(org, sub, request_key)` → `job` — the request's canonical
@@ -1047,31 +1645,33 @@ impl Store {
     /// not created through the member request path.
     pub fn assist_request_for_job(&self, job: &str) -> Result<Option<AssistRequest>> {
         let conn = self.conn();
-        match conn.query_row(
+        let mut stmt = conn.prepare(
             "SELECT org, sub, request_key, job, title, body, acceptance,
                     credential_id, authority_rev, state, created
-             FROM assist_requests WHERE job=? ORDER BY created LIMIT 1",
-            [job],
-            |r| {
-                Ok(AssistRequest {
-                    org: r.get("org")?,
-                    sub: r.get("sub")?,
-                    request_key: r.get("request_key")?,
-                    job: r.get("job")?,
-                    title: r.get("title")?,
-                    body: r.get("body")?,
-                    acceptance: r.get("acceptance")?,
-                    credential_id: r.get("credential_id")?,
-                    authority_rev: r.get("authority_rev")?,
-                    state: r.get("state")?,
-                    created: r.get("created")?,
-                })
-            },
-        ) {
-            Ok(rec) => Ok(Some(rec)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+             FROM assist_requests WHERE job=? LIMIT 2",
+        )?;
+        let mut rows = stmt.query_map([job], |r| {
+            Ok(AssistRequest {
+                org: r.get("org")?,
+                sub: r.get("sub")?,
+                request_key: r.get("request_key")?,
+                job: r.get("job")?,
+                title: r.get("title")?,
+                body: r.get("body")?,
+                acceptance: r.get("acceptance")?,
+                credential_id: r.get("credential_id")?,
+                authority_rev: r.get("authority_rev")?,
+                state: r.get("state")?,
+                created: r.get("created")?,
+            })
+        })?;
+        let first = rows.next().transpose()?;
+        if rows.next().transpose()?.is_some() {
+            return Err(crate::error::Error::rejected(
+                "ambiguous member job ownership",
+            ));
         }
+        Ok(first)
     }
 
     // ---- deduplicated stall checks ------------------------------------

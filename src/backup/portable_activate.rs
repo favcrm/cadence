@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use super::portable::{verify_package_for_replace, INACTIVE_MARKER};
 use super::portable_fence::{FENCE_FILE, FORMAT, MODE_DISABLED};
 use super::portable_replace::{
-    boundaries, lock_target, package_digest, replace_marker, snapshot_target, TargetSnapshot,
+    boundaries, lock_target, replace_marker, snapshot_target, TargetSnapshot,
 };
 use crate::error::{Error, Result};
 
@@ -138,19 +138,12 @@ fn check_request(req: &ActivateRequest) -> Result<()> {
 /// must already have been authorized by the live controller.
 pub fn activate(source: &Path, req: &ActivateRequest) -> Result<Value> {
     check_request(req)?;
-    let manifest_bytes = fs::read(source.join("manifest.json"))
-        .map_err(|e| Error::rejected(format!("cannot read package manifest: {e}")))?;
-    if format!("{:x}", Sha256::digest(&manifest_bytes)) != req.expected_package_digest {
+    let verified = verify_package_for_replace(source)?;
+    if verified.manifest_sha256 != req.expected_package_digest {
         return Err(Error::rejected(
             "package digest does not match expected_package_digest; nothing was written",
         ));
     }
-    if package_digest(source)? != req.expected_package_digest {
-        return Err(Error::rejected(
-            "package digest changed; nothing was written",
-        ));
-    }
-    verify_package_for_replace(source)?;
     let (_controller, target) = boundaries(&req.controller_state, &req.destination, source)?;
     // Only a managed inactive root can be activated. The lock is held for
     // the whole transition; a running daemon holds it and refuses here.

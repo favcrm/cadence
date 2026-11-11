@@ -50,6 +50,9 @@ pub(super) enum RouteId {
     ExplorerRemovePreview,
     ExplorerRemove,
     ExplorerRestore,
+    MemberAccessGet,
+    MemberAccessGrant,
+    MemberAccessRevoke,
     Mount,
     UpdateStart,
     UpdateCheck,
@@ -369,6 +372,27 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
     row!(
         ExplorerRestore,
         "/api/app-installations/{id}/restore",
+        OperatorOnly,
+        EXPLORER_ID
+    ),
+    // CAD-2215: member access is the operator's decision, read and written on
+    // one exact installation. The path's id is the only install the route
+    // names; the live roster proof rides the board's verified public session.
+    get!(
+        MemberAccessGet,
+        "/api/app-installations/{id}/member-access",
+        OperatorOnly,
+        EXPLORER_ID
+    ),
+    row!(
+        MemberAccessGrant,
+        "/api/app-installations/{id}/member-access",
+        OperatorOnly,
+        EXPLORER_ID
+    ),
+    row!(
+        MemberAccessRevoke,
+        "/api/app-installations/{id}/member-access/revoke",
         OperatorOnly,
         EXPLORER_ID
     ),

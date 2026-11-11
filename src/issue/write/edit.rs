@@ -2,6 +2,64 @@
 
 use super::*;
 
+/// Test-only fault/observation point after a keyed comment's real
+/// `commit_who_scoped` succeeded and before the writer handles its result.
+/// The hook may return an artificial error (simulating an uncertain
+/// commit) but cannot fabricate success or alter production, which is
+/// compiled without this module.
+#[cfg(all(test, feature = "test-seam"))]
+pub mod keyed_commit_seam {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use crate::error::Result;
+
+    pub type Hook = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
+    static HOOKS: LazyLock<Mutex<BTreeMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+    /// Tracker-dir-scoped RAII registration; Drop removes only its own hook.
+    pub struct KeyedCommitSeam {
+        tracker_dir: PathBuf,
+        hook: Hook,
+    }
+
+    impl Drop for KeyedCommitSeam {
+        fn drop(&mut self) {
+            let Ok(mut hooks) = HOOKS.lock() else {
+                return;
+            };
+            let ours = hooks
+                .get(&self.tracker_dir)
+                .is_some_and(|hook| Arc::ptr_eq(hook, &self.hook));
+            if ours {
+                hooks.remove(&self.tracker_dir);
+            }
+        }
+    }
+
+    pub fn arm_keyed_commit_after_success(tracker_dir: &Path, hook: Hook) -> KeyedCommitSeam {
+        let tracker_dir = tracker_dir.to_path_buf();
+        if let Ok(mut hooks) = HOOKS.lock() {
+            hooks.insert(tracker_dir.clone(), Arc::clone(&hook));
+        }
+        KeyedCommitSeam { tracker_dir, hook }
+    }
+
+    pub(super) fn fire(tracker_dir: &Path) -> Result<()> {
+        let hook = HOOKS
+            .lock()
+            .ok()
+            .and_then(|hooks| hooks.get(tracker_dir).cloned());
+        match hook {
+            Some(hook) => hook(),
+            None => Ok(()),
+        }
+    }
+}
+
 /// `key=value` pairs that set `status=done` — the one test `issue set`
 /// and `issue edit` share for the worktree-open hint.
 pub(crate) fn sets_done(pairs: &[String]) -> bool {
@@ -657,6 +715,281 @@ pub fn add_comment(
     }
     attach_foreign(&mut out, &foreign);
     Ok(out)
+}
+
+/// CAD-2215: one comment with a caller-held stable key, written exactly
+/// once and safe to retry.
+///
+/// The filename keeps the documented UTC-basic prefix (comment readers
+/// sort by name) and appends the key: `<UTC-basic at>-<author>-<key>.md`.
+/// `at` is the receipt's original timestamp, so a retry reuses the same
+/// name instead of today's clock.
+///
+/// Creation is `write_new` (O_EXCL), never `create_exclusive` (which
+/// auto-suffixes and would duplicate). If the file already exists it is
+/// accepted only when its parsed body is byte-identical AND the exact
+/// file is committed at HEAD; a present-but-uncommitted (interrupted)
+/// file, a conflict, or an unprovable commit is refused and left
+/// untouched. A concurrent caller therefore converges on one file.
+#[allow(clippy::too_many_arguments)]
+pub fn add_comment_keyed(
+    pm: &Pm,
+    id: &str,
+    expected_project: &str,
+    body: &str,
+    author: Option<&str>,
+    kind: Option<&str>,
+    at: i64,
+    key: &str,
+    actor: &str,
+) -> Result<Value> {
+    let (_initial_project, initial_dir) = issue_dir(pm, id)?;
+    let author_opt = author;
+    let author = comment_author(author_opt)?;
+    if body.trim().is_empty() {
+        return Err(Error::rejected("Comment body is empty — pass -m or --file"));
+    }
+    if key.is_empty()
+        || key.len() > 64
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(Error::rejected(
+            "keyed comment key must be 1-64 lowercase letters, digits or '-'",
+        ));
+    }
+    let secret_warnings = crate::secret::guard(&format!("{id}: comment"), body)?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&initial_dir))?;
+    // Re-resolve the ticket under the tracker lock: a move to another
+    // project/directory, or a policy that no longer admits the operator,
+    // must never receive this write.
+    let (project, dir) = issue_dir(pm, id)?;
+    if dir != initial_dir || project.key != expected_project {
+        return Err(Error::rejected(format!(
+            "{id}: issue moved from project {expected_project} to {} while publishing — \
+             refusing",
+            project.key
+        )));
+    }
+    if !project.allows(crate::issue::project::ProjectCaller::Operator) {
+        return Err(Error::rejected(format!(
+            "{id}: project {} no longer admits the operator for this write — refusing",
+            project.key
+        )));
+    }
+    let comments = dir.join("comments");
+    if comments.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{id}: comments/ is a symlink — refusing to write outside the PM dir"
+        )));
+    }
+    std::fs::create_dir_all(&comments)?;
+    let name = format!("{}-{author}-{key}.md", time::basic(at));
+    let path = comments.join(&name);
+    let rel = path
+        .strip_prefix(&pm.dir)
+        .map_err(|_| Error::rejected(format!("{id}: keyed comment is outside the tracker")))?
+        .to_string_lossy()
+        .to_string();
+    // Prove the destination is absent from BOTH HEAD and the worktree
+    // before creating. A successful `ls-tree` with empty output is the
+    // only "absent" answer; a git/read failure is unprovable and refuses.
+    let tracked = match head_names_entry(pm, &rel) {
+        Ok(found) => found,
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "{id}: cannot prove keyed comment {name} is absent at HEAD ({e}) — refusing"
+            )))
+        }
+    };
+    let worktree = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => true,
+        Ok(_) => {
+            return Err(Error::rejected(format!(
+                "{id}: keyed comment {name} is not a regular file"
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    if !worktree && tracked {
+        return Err(Error::rejected(format!(
+            "{id}: keyed comment {name} is tracked at HEAD but missing from the worktree — \
+             refusing to recreate or replace it"
+        )));
+    }
+    let mut duplicate = worktree;
+    let mut created_inode: Option<(u64, u64)> = None;
+    if worktree {
+        verify_keyed_comment(pm, &path, body, id, &name)?;
+    } else {
+        match write_new(
+            &path,
+            parse::render(
+                &crate::issue::model::CommentFront {
+                    author: author.clone(),
+                    at: time::iso(at),
+                    kind: kind.map(str::to_string),
+                },
+                body,
+            )?
+            .as_bytes(),
+        ) {
+            Ok(()) => {
+                use std::os::unix::fs::MetadataExt;
+                created_inode = std::fs::symlink_metadata(&path)
+                    .ok()
+                    .filter(|meta| meta.file_type().is_file())
+                    .map(|meta| (meta.dev(), meta.ino()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A concurrent caller created it after our absence proof.
+                verify_keyed_comment(pm, &path, body, id, &name)?;
+                duplicate = true;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if !duplicate {
+        let committed = {
+            let result = commit_who_scoped(
+                pm,
+                &lock,
+                std::slice::from_ref(&path),
+                &format!("{id}: publication comment by {author}"),
+                &[id],
+                actor,
+                author_opt,
+            );
+            // Test-only: after a genuine commit success the hook may
+            // produce a synthetic uncertain-commit error, which must flow
+            // through the same cleanup/unknown handler below.
+            #[cfg(all(test, feature = "test-seam"))]
+            let result = match result {
+                Ok(foreign) => keyed_commit_seam::fire(&pm.dir).map(|()| foreign),
+                Err(e) => Err(e),
+            };
+            result
+        };
+        let foreign = match committed {
+            Ok(f) => f,
+            Err(e) => {
+                // A nonzero/unknown commit result does not prove HEAD did
+                // not advance. Keep the file unless HEAD provably does not
+                // name it AND the worktree entry is still the inode this
+                // call created; an unprovable case stays for keyed
+                // recovery. Never delete a substituted file.
+                use std::os::unix::fs::MetadataExt;
+                let head_has_it = head_names_entry(pm, &rel).unwrap_or(true);
+                if !head_has_it {
+                    if let Some((dev, ino)) = created_inode {
+                        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                            if meta.file_type().is_file() && meta.dev() == dev && meta.ino() == ino
+                            {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
+        let mut out = json!({"id": id, "comment": name, "author": author,
+                  "committed": true, "duplicate": false});
+        if !secret_warnings.is_empty() {
+            out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
+        }
+        attach_foreign(&mut out, &foreign);
+        return Ok(out);
+    }
+    let mut out = json!({"id": id, "comment": name, "author": author,
+              "committed": true, "duplicate": true});
+    if !secret_warnings.is_empty() {
+        out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
+    }
+    Ok(out)
+}
+
+/// Does HEAD name `rel`? A successful `ls-tree` is the only proof: empty
+/// output = absent, non-empty = present, any git failure is unprovable.
+fn head_names_entry(pm: &Pm, rel: &str) -> Result<bool> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(&pm.dir)
+        .arg("ls-tree")
+        .arg("-z")
+        .arg("HEAD")
+        .arg("--")
+        .arg(rel);
+    let out = crate::reaper::output(&mut cmd)?;
+    if !out.status.success() {
+        return Err(Error::rejected("git ls-tree failed"));
+    }
+    Ok(!out.stdout.is_empty())
+}
+
+/// Accept an existing keyed comment only when it is the exact expected
+/// body and committed at HEAD. Never removes or overwrites it.
+fn verify_keyed_comment(pm: &Pm, path: &Path, body: &str, id: &str, name: &str) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(Error::rejected(format!(
+            "{id}: keyed comment {name} is not a regular file"
+        )));
+    }
+    let existing = std::fs::read_to_string(path)?;
+    let (_front, existing_body) = parse::parse_comment(&existing)?;
+    if existing_body != body {
+        return Err(Error::rejected(format!(
+            "{id}: keyed comment {name} already exists with different content — refusing to \
+             overwrite it"
+        )));
+    }
+    if !committed_at_head(pm, path) {
+        return Err(Error::rejected(format!(
+            "{id}: keyed comment {name} exists but is not committed at HEAD — the write was \
+             interrupted or the tracker is dirty; refusing to claim it"
+        )));
+    }
+    Ok(())
+}
+
+/// Is `path` the committed HEAD version of itself — tracked at HEAD and
+/// clean in the worktree, with the tracker fence intact? Never follows a
+/// symlink (the caller already refuses one) and never guesses.
+fn committed_at_head(pm: &Pm, path: &Path) -> bool {
+    if pm.fence_check().is_err() {
+        return false;
+    }
+    let Ok(rel) = path.strip_prefix(&pm.dir) else {
+        return false;
+    };
+    let rel = rel.to_string_lossy().to_string();
+    // Read the committed blob itself. `diff --quiet` is not byte-proof:
+    // assume-unchanged/skip-worktree index flags can hide modified
+    // worktree content. `issue::git` trims output, so use reaper::output
+    // and compare raw bytes.
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(&pm.dir)
+        .arg("cat-file")
+        .arg("blob")
+        .arg(format!("HEAD:{rel}"));
+    let out = match crate::reaper::output(&mut cmd) {
+        Ok(out) if out.status.success() => out,
+        _ => return false,
+    };
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_file() {
+        return false;
+    }
+    match std::fs::read(path) {
+        Ok(work) => work == out.stdout,
+        Err(_) => false,
+    }
 }
 
 /// CAD-383: write `front` and one comment by `author` in a single tracker

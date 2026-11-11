@@ -1146,7 +1146,8 @@ pub(crate) fn write_route(
             | RouteId::ArtifactVersions
             | RouteId::AgentDetail
             | RouteId::AgentRoles
-            | RouteId::AutomaticUpdatesGet => {
+            | RouteId::AutomaticUpdatesGet
+            | RouteId::MemberAccessGet => {
                 err_response(500, "a read row reached the write dispatcher")
             }
             RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),
@@ -1242,6 +1243,22 @@ pub(crate) fn write_route(
                 opts,
                 caller.as_ref(),
                 app_explorer::WriteAction::Restore,
+                bound.get("id"),
+            ),
+            RouteId::MemberAccessGrant => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::MemberAccessGrant,
+                bound.get("id"),
+            ),
+            RouteId::MemberAccessRevoke => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::MemberAccessRevoke,
                 bound.get("id"),
             ),
             RouteId::Mount => app_screens::mount(
@@ -2096,9 +2113,9 @@ pub(crate) fn write_route(
         return;
     };
     let actor = caller.actor().to_string();
-    // AOS-274: the policy key, built from the variant — `actor()` above is
-    // display text for attribution.
-    let spelling = operator::caller_spelling(&caller);
+    // Project authorization uses the verified subject, not the attribution
+    // handle, which can collide after sanitization.
+    let spelling = operator::policy_caller(&caller);
     let pm = match Pm::at(pm_dir) {
         Ok(pm) => pm,
         Err(e) => {

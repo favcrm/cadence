@@ -52,13 +52,16 @@ pub(crate) enum MonitorAction {
     #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
     Alerts {
         monitor: String,
-        #[arg(long, default_value_t = 0)]
-        after: i64,
+        /// Opaque continuation token from the previous page. A scoped
+        /// reader never continues with a numeric position; the operator's
+        /// legacy numeric cursor is still accepted.
+        #[arg(long, default_value_t = String::new())]
+        after: String,
         #[arg(long)]
         open: bool,
         #[arg(long, default_value_t = 100)]
         limit: i64,
-        /// Sort by seq monitor task kind state created updated;
+        /// Sort by seq id monitor task kind state created updated;
         /// `-KEY` descending.
         #[arg(long, allow_hyphen_values = true)]
         sort: Option<String>,
@@ -72,8 +75,12 @@ pub(crate) enum MonitorAction {
     /// Acknowledge one local alert.
     Ack {
         monitor: String,
+        /// The opaque ack token from a scoped `monitor alerts` row.
         #[arg(long)]
-        alert: i64,
+        ack: Option<String>,
+        /// The operator's numeric alert position (legacy).
+        #[arg(long)]
+        alert: Option<i64>,
     },
     /// Turn monitoring off for this registration. History is retained.
     Stop { monitor: String },
@@ -147,17 +154,42 @@ pub(super) fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i3
             fields,
             json: _,
         } => {
-            let mut out = rpc(
-                "monitor_alerts",
-                json!({"monitor": monitor, "after": after,
-                       "open": open, "limit": limit}),
-            )?;
+            let mut params = json!({
+                "monitor": monitor,
+                "open": open,
+                "limit": limit,
+                // A scoped reader must name the opaque page format; the
+                // operator's numeric reply ignores it.
+                "cursor_format": cadence_core::board_api::MONITOR_CURSOR_FORMAT,
+            });
+            if !after.is_empty() {
+                // A numeric value stays the operator's legacy cursor; it is
+                // forwarded as a number so a scoped reader is refused rather
+                // than silently reset. Everything else is an opaque token.
+                params["after"] = match after.parse::<i64>() {
+                    Ok(position) => json!(position),
+                    Err(_) => json!(after),
+                };
+            }
+            let mut out = rpc("monitor_alerts", params)?;
+            if out[cadence_core::board_api::READER_SCOPE_FIELD].as_str()
+                != Some(cadence_core::board_api::MONITOR_OPERATOR_SCOPE_ACK)
+            {
+                cadence_agent::overview::monitoring::validate_scoped_monitor_alert_response(
+                    monitor,
+                    &out,
+                )
+                .map_err(|error| Error::rejected(format!(
+                    "monitor alerts: the daemon did not confirm a valid scoped or operator page ({error}); no page was printed"
+                )))?;
+            }
             shape_rows(
                 &mut out,
                 "alerts",
                 sort.as_deref(),
                 &[
                     ("seq", "seq"),
+                    ("id", "id"),
                     ("monitor", "monitor"),
                     ("task", "task"),
                     ("kind", "kind"),
@@ -171,12 +203,22 @@ pub(super) fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i3
             )?;
             print_json(&out);
         }
-        MonitorAction::Ack { monitor, alert } => {
-            print_json(&rpc(
-                "monitor_alert_ack",
-                json!({"monitor": monitor, "alert": alert,
-                       "by": pane.as_deref()}),
-            )?);
+        MonitorAction::Ack {
+            monitor,
+            ack,
+            alert,
+        } => {
+            let mut params = json!({"monitor": monitor, "by": pane.as_deref()});
+            match (ack.as_deref(), *alert) {
+                (Some(token), None) => params["ack"] = json!(token),
+                (None, Some(position)) => params["alert"] = json!(position),
+                _ => {
+                    return Err(Error::rejected(
+                        "monitor ack requires exactly one of --ack (scoped token) or --alert (operator position)",
+                    ))
+                }
+            }
+            print_json(&rpc("monitor_alert_ack", params)?);
         }
         MonitorAction::Stop { monitor } => {
             print_json(&rpc("monitor_stop", json!({"monitor": monitor}))?);

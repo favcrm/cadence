@@ -43,7 +43,7 @@ pub(super) const KINDS: &[&str] = &[
 
 // ECMAScript String.trim whitespace: the Home notifier applies that same
 // visible-text rule. SQLite's default trim removes only ordinary spaces.
-pub(super) const REPLY_WHITESPACE: &str = concat!(
+pub(in crate::store) const REPLY_WHITESPACE: &str = concat!(
     "\t\n\u{b}\u{c}\r \u{a0}\u{1680}",
     "\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}",
     "\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}"

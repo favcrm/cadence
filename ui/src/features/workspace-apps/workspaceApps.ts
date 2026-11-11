@@ -2,6 +2,14 @@ import { ApiError } from "../../lib/api";
 import { sessionHeaders, sessionKey } from "../../lib/sessionKey";
 import { onPrivateReadsPaused, onPrivateSessionReset, privateFetch, privateReadsAllowed, privateSessionGeneration, withPrivateOperation } from "../../lib/privateSession";
 import type { Agent } from "../../lib/types";
+import {
+  parseGrantReceipt,
+  parseMemberAccess,
+  parseRevokeReceipt,
+  type MemberAccess,
+  type MemberAccessGrant,
+  type RevokeReceipt,
+} from "../explorer/memberAccess";
 
 export type { Agent };
 
@@ -663,6 +671,26 @@ export const appExplorer = {
   removePreview: (installId: string) => request<RemovePreview>(`/api/app-installations/${part(installId)}/remove-preview`, undefined, {}),
   remove: (installId: string, body: { expected_generation: string; expected_digest: string; request_id: string }) => request<unknown>(`/api/app-installations/${part(installId)}/remove`, undefined, body),
   restore: (installId: string) => request<{ restored: boolean; digest: string }>(`/api/app-installations/${part(installId)}/restore`, undefined, {}),
+  /** CAD-2215: exact-conversation member access. The read is validated
+   * before it reaches a screen, so a malformed answer is an error, not an
+   * empty grant list. `members` is the daemon-verified live roster (or
+   * null when this session cannot prove it); `grant_reason` is "" only
+   * when a grant may proceed. */
+  memberAccess: async (installId: string, signal?: AbortSignal): Promise<MemberAccess> =>
+    parseMemberAccess(await request<unknown>(`/api/app-installations/${part(installId)}/member-access`, signal)),
+  /** One exact member and one exact conversation; the pinned digest is the
+   * one the operator reviewed. */
+  grantMemberAccess: async (
+    installId: string,
+    body: { member_sub: string; conversation_id: string; expected_digest: string },
+  ): Promise<MemberAccessGrant> =>
+    parseGrantReceipt(await request<unknown>(`/api/app-installations/${part(installId)}/member-access`, undefined, body)),
+  /** Revoke exactly that member from exactly that conversation. */
+  revokeMemberAccess: async (
+    installId: string,
+    body: { member_sub: string; conversation_id: string },
+  ): Promise<RevokeReceipt> =>
+    parseRevokeReceipt(await request<unknown>(`/api/app-installations/${part(installId)}/member-access/revoke`, undefined, body)),
 };
 // ---------- CAD-1137: per-session snapshot cache ----------
 

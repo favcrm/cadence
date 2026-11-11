@@ -205,7 +205,7 @@ mod human_current;
 mod human_threads_rpc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_enrolled;
-mod jobs_rpc;
+pub(crate) mod jobs_rpc;
 mod lane_rpc;
 mod master_rpc;
 mod master_session_rpc;
@@ -215,7 +215,7 @@ mod members_rpc;
 mod memory_rpc;
 mod messages_rpc;
 mod models_rpc;
-mod monitors_rpc;
+pub(crate) mod monitors_rpc;
 mod needs_rpc;
 mod next_action;
 mod notify_driver;
@@ -230,9 +230,23 @@ pub(crate) mod protected_runtime;
 #[path = "daemon/protected_runtime_stub.rs"]
 pub(crate) mod protected_runtime;
 mod public_membership;
+#[cfg(test)]
+pub(crate) use public_membership::MembershipMode as TestMembershipMode;
+/// Read by the `test-seam` HTTP acceptance fixtures only, which is why the
+/// re-export carries the same gate as the modules that import it.
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) use public_membership::NativeContext as TestNativeMembershipContext;
+/// CAD-2215: opaque agent-event positions for every non-operator reader.
+mod agent_events_opaque;
+/// CAD-2215: opaque job-event positions for every non-operator reader.
+mod job_events_opaque;
 mod recovery_rpc;
 mod requests_rpc;
 mod review_evidence_rpc;
+/// CAD-2215: the opaque bound-cursor codec (no provisioning here).
+pub(crate) mod scoped_cursor;
+/// CAD-2215: the fixed keyring record and explicit operator initialization.
+mod scoped_cursor_config;
 mod serve;
 mod settings_rpc;
 mod slots_rpc;
@@ -532,11 +546,108 @@ type ShutdownFacts = HashMap<String, (String, u32, String)>;
 type MembershipLookupForTest = Box<
     dyn Fn(&str, &str, &str, &str) -> Result<Option<crate::board_identity::Role>> + Send + Sync,
 >;
+#[cfg(test)]
+pub(crate) type MembershipLookupForFixture = Arc<
+    dyn Fn(&str, &str, &str, &str) -> Result<Option<crate::board_identity::Role>> + Send + Sync,
+>;
+
+/// Test-only witness for outcomes from the real joined request worker.
+#[cfg(test)]
+pub(crate) type AssistRequestSweepObserver = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// Test-only witness for a granted forward read's admission snapshot.
+#[cfg(test)]
+pub(crate) type AppGrantForwardSnapshotHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Test-only witness after a scoped job-event page is selected.
+#[cfg(test)]
+pub(crate) type JobEventsSnapshotHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Test-only witness after a scoped agent-event page's visible rows are
+/// selected and before the reader is re-proved.
+#[cfg(test)]
+pub(crate) type AgentEventsSelectedHook = Arc<dyn Fn(&str, &[crate::store::Event]) + Send + Sync>;
+
+/// Test-only witness after monitor rows are selected and before reproof.
+#[cfg(test)]
+pub(crate) type MonitorReadSnapshotHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Test-only witness inside the scoped acknowledgement critical section:
+/// after the tracker and enrollment guards are held and immediately before
+/// the authoritative store write transaction opens (no store mutex/tx held).
+#[cfg(test)]
+pub(crate) type MonitorAckWriterHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Test-only witness at a job or task detail's selected snapshot. `job_show`
+/// and `task_show` pass their own id after assembly; `task_show` also reports
+/// `task_show_kickoff` between admitting a kickoff and reading that task's
+/// messages, which is the only window where the kickoff is in hand alone.
+#[cfg(test)]
+pub(crate) type JobDetailSnapshotHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// Test-only witness after a scoped `agent_list` page's rows, profiles and
+/// visible-running set are built and before the post-selection reproof.
+#[cfg(test)]
+pub(crate) type AgentListSelectedHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Test-only witness after a scoped `agent_show` projection is complete —
+/// agent row, messages, `context_message` digest and task bindings — and
+/// before the authority and cloud reproof; receives the resolved alias.
+#[cfg(test)]
+pub(crate) type AgentShowSelectedHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct Shared {
     pub store: Arc<Store>,
     #[cfg(feature = "test-seam")]
     cloud_projection_observer: Option<CloudProjectionObserver>,
+    #[cfg(feature = "test-seam")]
+    agent_thread_batch_observer: Option<AgentThreadBatchObserver>,
+    #[cfg(feature = "test-seam")]
+    wait_baseline_observer: Option<WaitBaselineObserver>,
+    #[cfg(feature = "test-seam")]
+    wait_scan_observer: Option<WaitBaselineObserver>,
+    /// CAD-2215 acceptance scaffolding (see
+    /// [`ServeOptions::master_state_ignore_relay`]); test builds only.
+    #[cfg(test)]
+    master_state_ignore_relay: bool,
+    /// CAD-2215 acceptance scaffolding for `job_list` (see
+    /// [`ServeOptions::job_list_ignore_relay`]); test builds only.
+    #[cfg(test)]
+    job_list_ignore_relay: bool,
+    /// CAD-2215 acceptance scaffolding for `thread_read` (see
+    /// [`ServeOptions::thread_read_ignore_relay`]); test builds only.
+    #[cfg(test)]
+    thread_read_ignore_relay: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    member_history_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
+    #[cfg(test)]
+    human_room_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// Test-only bitmask: LIST=1, SHOW=2, EVENTS=4 ignore relay proof.
+    #[cfg(test)]
+    agent_reads_ignore_relay: Option<Arc<std::sync::atomic::AtomicU8>>,
+    #[cfg(test)]
+    assist_request_sweep_observer: Option<AssistRequestSweepObserver>,
+    #[cfg(test)]
+    app_grant_forward_snapshot_hook: Option<AppGrantForwardSnapshotHook>,
+    #[cfg(test)]
+    job_events_snapshot_hook: Option<JobEventsSnapshotHook>,
+    #[cfg(test)]
+    agent_events_selected_hook: Option<AgentEventsSelectedHook>,
+    #[cfg(test)]
+    monitor_read_snapshot_hook: Option<MonitorReadSnapshotHook>,
+    #[cfg(test)]
+    monitor_ack_writer_hook: Option<MonitorAckWriterHook>,
+    #[cfg(test)]
+    job_detail_snapshot_hook: Option<JobDetailSnapshotHook>,
+    #[cfg(test)]
+    job_list_snapshot_hook: Option<JobDetailSnapshotHook>,
+    #[cfg(test)]
+    agent_list_selected_hook: Option<AgentListSelectedHook>,
+    #[cfg(test)]
+    agent_show_selected_hook: Option<AgentShowSelectedHook>,
+    /// Wakes the request worker without coupling it to unrelated daemon events.
+    assist_requests_changed: Notify,
+    assist_request_worker_running: AtomicBool,
     /// Broadcast on any queue/event change.
     changed: Notify,
     /// CAD-1700: the master's push revision (see `bump_master_rev`).
@@ -801,13 +912,11 @@ pub struct Shared {
     /// Serializes local CRM assistant permission checks and their bounded
     /// mutation/receipt writes. Never spans a network operation.
     app_assistant_lock: Mutex<()>,
-    /// Serializes `member_job_request` publication (authority re-proof,
-    /// ledger check, shared spec write, job create, request bind, subscribe)
-    /// so concurrent requests for one request_key cannot overwrite each
-    /// other's spec. It spans the request publication and the member's live
-    /// HTTP proof in `rpc_member_job_request`. It does not itself hold a store
-    /// connection during that HTTP call.
-    member_job_lock: Mutex<()>,
+    /// Request/promotion writers serialize queue and ownership changes.
+    /// Publication holds a read guard from provenance proof through the
+    /// shared effect: concurrent publishers still use their atomic receipt
+    /// claim, while ownership cannot change under either of them.
+    member_job_lock: std::sync::RwLock<()>,
     app_release_claim_gate: Option<effect_rpc::EffectExecuteGate>,
     /// CAD-546: the `local` platform's outbox root — what
     /// `platform_outbox` lists. Set by `platform::local::register`
@@ -922,6 +1031,18 @@ fn pinned_manifest(pin: &Value) -> Option<crate::context_pack::Manifest> {
 }
 
 impl Shared {
+    /// Exercise the production delivery guard from the signed-board fixture.
+    #[cfg(all(test, feature = "test-seam"))]
+    pub(crate) fn delivery_start_for_acceptance(
+        &self,
+        issue: &str,
+        project: &str,
+        worker: &str,
+        receipt: &str,
+    ) -> Result<()> {
+        self.delivery_start(issue, project, worker, receipt)
+    }
+
     /// CAD-1249: drop an agent's provider log after its registry row is
     /// removed. Best effort: a missing file is fine, and a cleanup error
     /// is reported but never fails an already-committed removal.
@@ -996,6 +1117,8 @@ impl Shared {
         if seam.is_some() {
             opts.provider_env.isolate_for_test()?;
         }
+        #[cfg(test)]
+        let membership = opts.membership_mode_for_test.clone().unwrap_or(membership);
         let HotStart {
             instance,
             mut marker,
@@ -1151,6 +1274,8 @@ impl Shared {
         let shared = Arc::new(Self {
             store,
             changed: Notify::new(),
+            assist_requests_changed: Notify::new(),
+            assist_request_worker_running: AtomicBool::new(false),
             pending: Mutex::new(HashMap::new()),
             answered: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(Lifecycle::default()),
@@ -1173,6 +1298,44 @@ impl Shared {
             agent_uid: opts.agent_uid,
             #[cfg(feature = "test-seam")]
             cloud_projection_observer: opts.cloud_projection_observer.clone(),
+            #[cfg(feature = "test-seam")]
+            agent_thread_batch_observer: opts.agent_thread_batch_observer.clone(),
+            #[cfg(feature = "test-seam")]
+            wait_baseline_observer: opts.wait_baseline_observer.clone(),
+            #[cfg(feature = "test-seam")]
+            wait_scan_observer: opts.wait_scan_observer.clone(),
+            #[cfg(test)]
+            master_state_ignore_relay: opts.master_state_ignore_relay,
+            #[cfg(test)]
+            job_list_ignore_relay: opts.job_list_ignore_relay,
+            #[cfg(test)]
+            thread_read_ignore_relay: opts.thread_read_ignore_relay.clone(),
+            #[cfg(test)]
+            member_history_page_fault: opts.member_history_page_fault.clone(),
+            #[cfg(test)]
+            human_room_page_fault: opts.human_room_page_fault.clone(),
+            #[cfg(test)]
+            agent_reads_ignore_relay: opts.agent_reads_ignore_relay.clone(),
+            #[cfg(test)]
+            assist_request_sweep_observer: opts.assist_request_sweep_observer.clone(),
+            #[cfg(test)]
+            app_grant_forward_snapshot_hook: opts.app_grant_forward_snapshot_hook.clone(),
+            #[cfg(test)]
+            job_events_snapshot_hook: opts.job_events_snapshot_hook.clone(),
+            #[cfg(test)]
+            agent_events_selected_hook: opts.agent_events_selected_hook.clone(),
+            #[cfg(test)]
+            monitor_read_snapshot_hook: opts.monitor_read_snapshot_hook.clone(),
+            #[cfg(test)]
+            monitor_ack_writer_hook: opts.monitor_ack_writer_hook.clone(),
+            #[cfg(test)]
+            job_detail_snapshot_hook: opts.job_detail_snapshot_hook.clone(),
+            #[cfg(test)]
+            job_list_snapshot_hook: opts.job_list_snapshot_hook.clone(),
+            #[cfg(test)]
+            agent_list_selected_hook: opts.agent_list_selected_hook.clone(),
+            #[cfg(test)]
+            agent_show_selected_hook: opts.agent_show_selected_hook.clone(),
             open_attach: Mutex::new(HashMap::new()),
             adoptions_pending: Mutex::new(adoptions_pending),
             adoptions_notify: Notify::new(),
@@ -1223,7 +1386,13 @@ impl Shared {
             board_jwks: Mutex::new(crate::board_identity::JwksCache::default()),
             membership_mode: membership,
             #[cfg(test)]
-            membership_lookup_for_test: None,
+            membership_lookup_for_test: opts.membership_lookup_for_test.clone().map(|lookup| {
+                Box::new(
+                    move |hash: &str, sub: &str, company: &str, instance: &str| {
+                        lookup(hash, sub, company, instance)
+                    },
+                ) as MembershipLookupForTest
+            }),
             platform_custody: match &opts.encrypted_custody {
                 Some(config) => {
                     crate::platform::Custody::open(state_dir)?.with_encrypted(std::sync::Arc::new(
@@ -1281,7 +1450,7 @@ impl Shared {
             app_release_lock: Mutex::new(()),
             host_runs_in_flight: Mutex::new(HashSet::new()),
             app_assistant_lock: Mutex::new(()),
-            member_job_lock: Mutex::new(()),
+            member_job_lock: std::sync::RwLock::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),
@@ -2998,6 +3167,39 @@ impl Shared {
         // generic worker verbs (other agents, issues, wiki, dispatch,
         // operator effects).
         self.member_assist_policy(method, params, peer_pid)?;
+        // Simulate a rolling-version daemon that ignores this read's relay
+        // proof. The actual request has already passed the test daemon's
+        // caller/target guard; only the chosen response is made unscoped.
+        #[cfg(test)]
+        let legacy_params = {
+            let bit = match method {
+                "agent_list" => 1,
+                "agent_show" => 2,
+                "agent_events" => 4,
+                _ => 0,
+            };
+            if bit != 0
+                && self
+                    .agent_reads_ignore_relay
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire) & bit != 0)
+                && ["public_session", "read_as", "cli_envelope"]
+                    .iter()
+                    .any(|name| params.get(*name).is_some())
+            {
+                let mut unscoped = params.clone();
+                if let Some(fields) = unscoped.as_object_mut() {
+                    for name in ["public_session", "read_as", "cli_envelope"] {
+                        fields.remove(name);
+                    }
+                }
+                Some(unscoped)
+            } else {
+                None
+            }
+        };
+        #[cfg(test)]
+        let params = legacy_params.as_ref().unwrap_or(params);
         let answer = self.dispatch_method(method, params, peer_pid)?;
         Ok(self.withhold_turn_tokens(answer, peer_pid))
     }
@@ -3137,6 +3339,11 @@ impl Shared {
                     "pid": std::process::id(),
                 })
             }),
+            // CAD-2215: the one explicit operator bind of the fixed
+            // scoped-cursor keyring record. The handler proves the operator
+            // connection before any key file is opened; the request carries
+            // no path, identity or key material.
+            "scoped_cursor_initialize" => self.rpc_scoped_cursor_initialize(params, peer_pid),
             "shutdown" => {
                 self.begin_closing();
                 Ok(json!({"state": "stopping"}))
@@ -3238,25 +3445,133 @@ impl Shared {
                 // CAD-1266: one pass over `tasks` for the whole fleet, not
                 // one query per agent.
                 let mut open_tasks = self.store.open_task_ids_by_assignee()?;
-                // CAD-1752: the issues those tasks serve, for `--project`.
-                let mut lane_issues = self.store.open_task_issues_by_assignee()?;
-                let deliveries = self.store.open_delivery_summary()?;
+                // Keep each task's issue binding alongside the fleet ids.
+                let task_issues = self.store.open_task_issue_bindings()?;
                 let listed_agents = self.store.agents()?;
-                let aliases: Vec<String> = listed_agents.iter().map(|a| a.alias.clone()).collect();
+                // CAD-2215: an agent row carries the issues its tasks serve.
+                // A project the caller's policy does not admit contributes no
+                // issue id, and one that resolves to no project is withheld.
+                let (scope, cli_principal, public_principal) =
+                    self.agent_read_scope(params, peer_pid, "agent list")?;
+                let private_denials = if scope.is_some() {
+                    Some(self.private_job_denials_for_read(
+                        params,
+                        cli_principal.as_ref(),
+                        public_principal.as_ref(),
+                        peer_pid,
+                    )?)
+                } else {
+                    None
+                };
+                // CAD-2215: the stable reader principal this page is built
+                // for, re-derived before the response — the exact verified
+                // CLI identity, board session, relayed actor, or the native
+                // caller's alias + durable uid. Never a handle spelling and
+                // never a request claim.
+                let reader_principal = if private_denials.is_some() || public_principal.is_some() {
+                    job_events_opaque::agent_read_principal(
+                        self,
+                        params,
+                        peer_pid,
+                        cli_principal.as_ref(),
+                        public_principal.as_ref(),
+                        "agent list",
+                    )?
+                } else {
+                    None
+                };
+                // CAD-2215: a scoped row carries no stored state, so every
+                // predicate but the documented visible-running derivation
+                // would evaluate nothing and look like an empty fleet. Refuse
+                // it as unavailable instead; `busy` keeps its meaning.
+                if let Some(unsupported) = states
+                    .iter()
+                    .find(|state| scope.is_some() && state.as_str() != "busy")
+                {
+                    return Err(Error::rejected(format!(
+                        "agent list refused: state filter '{unsupported}' is unavailable to a \
+                         scoped reader — only 'busy' (work this reader can see running) can be \
+                         filtered"
+                    )));
+                }
+                let board = params.get("board").and_then(Value::as_bool) == Some(true);
+                let member_access = match public_principal.as_ref() {
+                    Some(principal) if board && scope.is_some() && !principal.operator => {
+                        self.member_app_access(principal)?
+                    }
+                    _ => app_explorer_rpc::MemberAppAccess::default(),
+                };
+                let app_conversations = member_access.conversations();
+                // CAD-2215: the reader's own running rows, grouped once for
+                // the whole fleet. Board rows carry the ids; every scoped row
+                // derives its status from them (see `scoped_agent_state`), so
+                // a hidden turn can never move a row.
+                let scoped_running = match (&scope, &private_denials) {
+                    (Some((readable, issues)), Some(denied)) => {
+                        let allowed = issues
+                            .iter()
+                            .filter(|(_, project)| readable.contains(*project))
+                            .map(|(issue, _)| issue.as_str())
+                            .collect::<Vec<_>>();
+                        Some(if app_conversations.is_empty() {
+                            self.store.scoped_running_message_ids(&allowed, denied)?
+                        } else {
+                            self.store.scoped_running_message_ids_with_conversations(
+                                &allowed,
+                                denied,
+                                &app_conversations,
+                            )?
+                        })
+                    }
+                    _ => None,
+                };
                 // CAD-96/CAD-1239: one grouped read for the operational
-                // aliases only; archived rows are never enriched.
-                let markers = self
-                    .store
-                    .last_events_of(&aliases, AUTO_STOP_MARKER_KINDS)
-                    .unwrap_or_default();
+                // aliases only; archived rows are never enriched. CAD-2215:
+                // both views observe delivery and auto-stop timing, which a
+                // scoped row never carries, so a scoped read does not take
+                // them at all.
+                let (deliveries, markers) = if scope.is_none() {
+                    let aliases: Vec<String> =
+                        listed_agents.iter().map(|a| a.alias.clone()).collect();
+                    (
+                        self.store.open_delivery_summary()?,
+                        self.store
+                            .last_events_of(&aliases, AUTO_STOP_MARKER_KINDS)
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    (Default::default(), Default::default())
+                };
                 for agent in listed_agents {
-                    if !states.is_empty() && !states.contains(&agent.state) {
-                        continue;
+                    // CAD-2215: a scoped row's status is derived from work the
+                    // reader may see, so the filter reads that projection —
+                    // never the stored column, which moves on a hidden turn.
+                    let visible_running = scoped_running
+                        .as_ref()
+                        .and_then(|running| running.get(&agent.alias));
+                    let projected_state = identity::scoped_agent_state(visible_running);
+                    if !states.is_empty() {
+                        let row_state = if scope.is_some() {
+                            projected_state.as_str()
+                        } else {
+                            Some(agent.state.as_str())
+                        };
+                        if !row_state
+                            .is_some_and(|state| states.iter().any(|want| want.as_str() == state))
+                        {
+                            continue;
+                        }
                     }
                     // CAD-1380: a member-private assistant row is withheld from
                     // every caller but its owner and the operator, before it is
                     // serialized or counted into `live`.
-                    if self.member_agent_row_withheld(&agent.alias, peer_pid)? {
+                    if self.member_agent_row_withheld_for_relay(
+                        &agent.alias,
+                        params,
+                        cli_principal.as_ref(),
+                        public_principal.as_ref(),
+                        peer_pid,
+                    )? {
                         continue;
                     }
                     if !providers.is_empty() && !providers.contains(&agent.provider) {
@@ -3266,52 +3581,78 @@ impl Shared {
                         continue;
                     }
                     let mut j = agent.to_json();
-                    // The alias's current non-terminal task assignments —
-                    // derived from tasks.assignee, never stored.
-                    j["tasks"] = json!(open_tasks.remove(&agent.alias).unwrap_or_default());
-                    j["lane_issues"] = json!(lane_issues.remove(&agent.alias).unwrap_or_default());
+                    let mut tasks = open_tasks.remove(&agent.alias).unwrap_or_default();
+                    tasks.retain(|task| {
+                        identity::scope_allows_issue(
+                            &scope,
+                            task_issues.get(task).and_then(Option::as_deref),
+                        ) && private_denials
+                            .as_ref()
+                            .is_none_or(|denied| !denied.tasks.contains(task))
+                    });
+                    let issues = tasks
+                        .iter()
+                        .filter_map(|task| task_issues.get(task).and_then(Option::as_deref))
+                        .collect::<Vec<_>>();
+                    j["lane_issues"] = json!(issues);
+                    j["tasks"] = json!(tasks);
                     j["capabilities"] =
                         registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
-                    j["native_turn_steering_enabled"] = json!(
-                        agent.enabled
-                            && matches!(agent.state.as_str(), "idle" | "busy")
-                            && self
-                                .adapter_for(&agent.alias)
-                                .is_ok_and(|adapter| adapter.native_turn_steering())
-                    );
-                    let (dead, resumable) = self.agent_liveness(&agent);
-                    j["dead"] = json!(dead);
-                    j["resumable"] = json!(resumable);
-                    // Only queue placement is a mailbox. A hosted runtime
-                    // intentionally has no local actor, but is not an inbox.
-                    let inbox = if registry::placement(&agent.provider, &agent.endpoint_kind)
-                        == registry::Placement::Queue
-                    {
-                        self.store.inbox_status(&agent.alias)?
-                    } else {
-                        None
-                    };
-                    if let Some(inbox) = inbox {
-                        j["inbox"] = inbox;
-                        // CAD-251: stale-consumer evidence + owner.
-                        j["inbox_health"] = self.inbox_health(&agent).unwrap_or(Value::Null);
+                    // CAD-2215: everything below observes either the stored
+                    // state (which a hidden turn moves), endpoint liveness or
+                    // delivery/auto-stop timing. A scoped row carries none of
+                    // it, so it is never computed for a scoped reader — that
+                    // keeps operator behaviour exact and avoids probing
+                    // endpoints the reader has no authority over.
+                    if scope.is_none() {
+                        j["native_turn_steering_enabled"] = json!(
+                            agent.enabled
+                                && matches!(agent.state.as_str(), "idle" | "busy")
+                                && self
+                                    .adapter_for(&agent.alias)
+                                    .is_ok_and(|adapter| adapter.native_turn_steering())
+                        );
+                        let (dead, resumable) = self.agent_liveness(&agent);
+                        j["dead"] = json!(dead);
+                        j["resumable"] = json!(resumable);
+                        // Only queue placement is a mailbox. A hosted runtime
+                        // intentionally has no local actor, but is not an inbox.
+                        let inbox = if registry::placement(&agent.provider, &agent.endpoint_kind)
+                            == registry::Placement::Queue
+                        {
+                            self.store.inbox_status(&agent.alias)?
+                        } else {
+                            None
+                        };
+                        if let Some(inbox) = inbox {
+                            j["inbox"] = inbox;
+                            // CAD-251: stale-consumer evidence + owner.
+                            j["inbox_health"] = self.inbox_health(&agent).unwrap_or(Value::Null);
+                        }
+                        if let Some(view) = self.stall_view(&agent.alias) {
+                            view.apply(&mut j);
+                        }
+                        apply_auto_stop_view(&mut j, &agent, markers.get(&agent.alias));
+                        let (queued, oldest) =
+                            deliveries.get(&agent.alias).copied().unwrap_or((0, None));
+                        apply_delivery_view(&mut j, &agent, queued, oldest);
+                        if let Some(awaiting) = self.awaiting_report_view(&agent) {
+                            j["awaiting_report"] = awaiting;
+                        }
+                        // CAD-325: `board: true` folds what the board read
+                        // per agent through `agent_show` into this one pass.
+                        if board && registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+                            j["board"] = self.board_view(&agent.alias, peer_pid)?;
+                        }
                     }
-                    if let Some(view) = self.stall_view(&agent.alias) {
-                        view.apply(&mut j);
+                    if scope.is_some() {
+                        identity::retain_scoped_agent_fields(&mut j, visible_running);
                     }
-                    apply_auto_stop_view(&mut j, &agent, markers.get(&agent.alias));
-                    let (queued, oldest) =
-                        deliveries.get(&agent.alias).copied().unwrap_or((0, None));
-                    apply_delivery_view(&mut j, &agent, queued, oldest);
-                    if let Some(awaiting) = self.awaiting_report_view(&agent) {
-                        j["awaiting_report"] = awaiting;
-                    }
-                    // CAD-325: `board: true` folds what the board read
-                    // per agent through `agent_show` into this one pass.
-                    if params.get("board").and_then(Value::as_bool) == Some(true)
-                        && registry::has_actor(&agent.provider, &agent.endpoint_kind)
-                    {
-                        j["board"] = self.board_view(&agent.alias, peer_pid)?;
+                    if board {
+                        if let Some(running) = &scoped_running {
+                            j["visible_running_messages"] =
+                                json!(running.get(&agent.alias).cloned().unwrap_or_default());
+                        }
                     }
                     agents.push(j);
                 }
@@ -3319,22 +3660,187 @@ impl Shared {
                 // terminal/fenced state. Summing non-"stopped" states
                 // overcounts: fenced rows are `attention`, and dead
                 // rows can sit in any state.
-                let live = agents
-                    .iter()
-                    .filter(|a| {
-                        a["dead"].as_bool() != Some(true)
-                            && !matches!(
-                                a["state"].as_str().unwrap_or_default(),
-                                "stopping" | "stopped" | "attention" | "offline"
-                            )
-                    })
-                    .count();
+                //
+                // CAD-2215: a scoped row has neither the stored state nor
+                // `dead`, so this reader's capacity is not knowable — it is
+                // reported as unavailable (`null`), never as a count of the
+                // rows it happens to see.
+                let live = if scope.is_some() {
+                    Value::Null
+                } else {
+                    json!(agents
+                        .iter()
+                        .filter(|a| {
+                            a["dead"].as_bool() != Some(true)
+                                && !matches!(
+                                    a["state"].as_str().unwrap_or_default(),
+                                    "stopping" | "stopped" | "attention" | "offline"
+                                )
+                        })
+                        .count())
+                };
+                let mut profile_agents = self.store.agents()?;
+                if scope.is_some() {
+                    let visible = agents
+                        .iter()
+                        .filter_map(|agent| agent["alias"].as_str())
+                        .collect::<std::collections::HashSet<_>>();
+                    profile_agents.retain(|candidate| visible.contains(candidate.alias.as_str()));
+                }
                 let profiles = crate::agent_settings::profile_list(
                     &self.store,
-                    &self.store.agents()?,
-                    self.operator_evidence(peer_pid).is_ok(),
+                    &profile_agents,
+                    scope.is_none(),
                 )?;
-                Ok(json!({"agents": agents, "live": live, "profiles": profiles}))
+                if private_denials.is_some() || public_principal.is_some() {
+                    // The scoped page is complete; a test may now commit a real
+                    // authority change that the reproof below must observe.
+                    #[cfg(test)]
+                    if let Some(hook) = &self.agent_list_selected_hook {
+                        hook();
+                    }
+                    let (current_scope, current_cli, current_public) =
+                        self.agent_read_scope(params, peer_pid, "agent list")?;
+                    let current_access = match current_public.as_ref() {
+                        Some(principal)
+                            if board && current_scope.is_some() && !principal.operator =>
+                        {
+                            self.member_app_access(principal)?
+                        }
+                        _ => app_explorer_rpc::MemberAppAccess::default(),
+                    };
+                    // CAD-2215: re-prove the AUTHORITY this page was built
+                    // under — the reader's identity and its readable project
+                    // set — never the whole issue→project map or the denial
+                    // sets. An unrelated hidden issue or private job created
+                    // meanwhile changes those sets without touching one row
+                    // this reader was shown, and refusing for it would be an
+                    // oracle on hidden activity. The rows this page actually
+                    // selected are re-proved one by one below.
+                    let same_projects = match (&current_scope, &scope) {
+                        (Some((current, _)), Some((previous, _))) => current == previous,
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    let current_principal = job_events_opaque::agent_read_principal(
+                        self,
+                        params,
+                        peer_pid,
+                        current_cli.as_ref(),
+                        current_public.as_ref(),
+                        "agent list",
+                    )?;
+                    let current_denied = match &private_denials {
+                        Some(_) => Some(self.private_job_denials_for_read(
+                            params,
+                            current_cli.as_ref(),
+                            current_public.as_ref(),
+                            peer_pid,
+                        )?),
+                        None => None,
+                    };
+                    if !same_projects
+                        || current_principal != reader_principal
+                        || current_public != public_principal
+                        || current_access != member_access
+                        || current_denied.as_ref().map(|denied| denied.exclude_cloud)
+                            != private_denials.as_ref().map(|denied| denied.exclude_cloud)
+                    {
+                        return Err(Error::rejected("agent list refused: reader access changed"));
+                    }
+                    // Only what this page shows is re-proved: every selected
+                    // row is still this reader's, every selected task still
+                    // resolves to a readable, non-private project, and every
+                    // emitted alias' visible running set is unchanged. Work
+                    // appearing on a row (or alias) this page does not show —
+                    // visible or hidden — moves nothing.
+                    for agent in &agents {
+                        let alias = agent["alias"]
+                            .as_str()
+                            .ok_or_else(|| Error::rejected("agent list scope unavailable"))?;
+                        if self.member_agent_row_withheld_for_relay(
+                            alias,
+                            params,
+                            current_cli.as_ref(),
+                            current_public.as_ref(),
+                            peer_pid,
+                        )? {
+                            return Err(Error::rejected(
+                                "agent list refused: reader access changed",
+                            ));
+                        }
+                        let tasks: Vec<&str> = agent["tasks"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect();
+                        if !tasks.is_empty() {
+                            let bindings = self.store.task_issue_bindings(&tasks)?;
+                            for task in tasks {
+                                // CAD-2215: compare against the binding this row
+                                // was SELECTED under, not just the current one.
+                                // A task moved from issue A to readable issue B
+                                // while A became private would otherwise pass and
+                                // leave A in the stale `lane_issues`.
+                                let selected = task_issues.get(task).and_then(Option::as_deref);
+                                let current = bindings.get(task).and_then(Option::as_deref);
+                                let still_visible = current == selected
+                                    && identity::scope_allows_issue(&current_scope, selected)
+                                    && current_denied
+                                        .as_ref()
+                                        .is_none_or(|denied| !denied.tasks.contains(task));
+                                if !still_visible {
+                                    return Err(Error::rejected(
+                                        "agent list refused: reader access changed",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if let (Some((readable, issues)), Some(denied)) =
+                        (&current_scope, &current_denied)
+                    {
+                        let allowed = issues
+                            .iter()
+                            .filter(|(_, project)| readable.contains(*project))
+                            .map(|(issue, _)| issue.as_str())
+                            .collect::<Vec<_>>();
+                        let current_running = if app_conversations.is_empty() {
+                            self.store.scoped_running_message_ids(&allowed, denied)?
+                        } else {
+                            self.store.scoped_running_message_ids_with_conversations(
+                                &allowed,
+                                denied,
+                                &app_conversations,
+                            )?
+                        };
+                        let none: std::collections::BTreeSet<String> = Default::default();
+                        for agent in &agents {
+                            let alias = agent["alias"].as_str().unwrap_or_default();
+                            let selected = scoped_running
+                                .as_ref()
+                                .and_then(|running| running.get(alias));
+                            if current_running.get(alias).unwrap_or(&none)
+                                != selected.unwrap_or(&none)
+                            {
+                                return Err(Error::rejected(
+                                    "agent list refused: running work changed",
+                                ));
+                            }
+                        }
+                    }
+                }
+                let mut out = json!({"agents": agents, "live": live, "profiles": profiles});
+                if scope.is_some()
+                    && ["public_session", "read_as", "cli_envelope"]
+                        .iter()
+                        .any(|name| params.get(*name).is_some())
+                {
+                    out[cadence_core::board_api::READER_SCOPE_FIELD] =
+                        json!(cadence_core::board_api::AGENT_LIST_SCOPE_ACK);
+                }
+                Ok(out)
             }
             "agent_identity" => {
                 if !params.as_object().is_some_and(|fields| fields.is_empty()) {
@@ -3350,14 +3856,37 @@ impl Shared {
                         // the previous registration's turn token.
                         // CAD-375 redaction does not replace that check.
                         let alias = verified.agent.alias.clone();
+                        let held = self.store.held_turns(&alias)?;
+                        let task_ids = held
+                            .iter()
+                            .filter_map(|message| message.task_id.as_deref())
+                            .collect::<Vec<_>>();
+                        let scope = self.project_scope_for_caller(
+                            &crate::peer::AgentCaller::Agent(alias.clone()),
+                        );
+                        let task_issues = self.store.task_issue_bindings(&task_ids);
+                        let private_denials =
+                            self.private_job_denials_for_read(params, None, None, peer_pid);
+                        let task_scope_available = scope.as_ref().is_ok_and(Option::is_some)
+                            && task_issues.is_ok()
+                            && private_denials.is_ok();
                         let mut running = Vec::new();
-                        for message in self.store.held_turns(&alias)? {
+                        for message in held {
                             if self.store.agent_reads_message(&message, &alias)? {
                                 let mut entry = json!({
                                     "id": message.id,
                                     "turn_id": message.turn_id,
-                                    "task": message.task_id,
                                 });
+                                let task_readable = match (&scope, &task_issues, &private_denials) {
+                                    (Ok(scope @ Some(_)), Ok(issues), Ok(denied)) => {
+                                        identity::scope_allows_message(scope, &message, issues)
+                                            && !denied.hides_message(&message)
+                                    }
+                                    _ => false,
+                                };
+                                if message.task_id.is_none() || task_readable {
+                                    entry["task"] = json!(message.task_id);
+                                }
                                 // CAD-1641: the turn's own verified App stamp
                                 // is the only install/context a caller may
                                 // derive, read under the same proof as the
@@ -3375,7 +3904,11 @@ impl Shared {
                                 running.push(entry);
                             }
                         }
-                        Ok(json!({"alias": alias, "running": running}))
+                        let mut out = json!({"alias": alias, "running": running});
+                        if !task_scope_available {
+                            out["task_scope_unavailable"] = json!(true);
+                        }
+                        Ok(out)
                     }
                     Caller::NoAgentIdentity => Err(Error::rejected(
                         "agent identity requires a verified agent endpoint",
@@ -3386,7 +3919,43 @@ impl Shared {
             | "hosted_local_agent_disconnect"
             | "hosted_local_agent_observe" => self.rpc_hosted_local_agent(method, params, peer_pid),
             "agent_show" => {
+                let (scope, cli_principal, public_principal) =
+                    self.agent_read_scope(params, peer_pid, "agent show")?;
+                let private_denials = if scope.is_some() {
+                    Some(self.private_job_denials_for_read(
+                        params,
+                        cli_principal.as_ref(),
+                        public_principal.as_ref(),
+                        peer_pid,
+                    )?)
+                } else {
+                    None
+                };
+                // CAD-2215: the stable reader principal this page is built
+                // for, re-derived before the response — exact verified
+                // identity, never a handle spelling or a request claim.
+                let reader_principal = if private_denials.is_some() || public_principal.is_some() {
+                    job_events_opaque::agent_read_principal(
+                        self,
+                        params,
+                        peer_pid,
+                        cli_principal.as_ref(),
+                        public_principal.as_ref(),
+                        "agent show",
+                    )?
+                } else {
+                    None
+                };
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
+                if self.member_agent_row_withheld_for_relay(
+                    &alias,
+                    params,
+                    cli_principal.as_ref(),
+                    public_principal.as_ref(),
+                    peer_pid,
+                )? {
+                    return Err(Error::rejected("Unknown managed agent"));
+                }
                 let agent = self.store.agent(&alias)?;
                 // CAD-1853 review: this projection serialises the alias'
                 // messages (cloud requests and their reply text), so it takes
@@ -3461,10 +4030,23 @@ impl Shared {
                 let messages = if params.get("active_only").and_then(Value::as_bool) == Some(true) {
                     self.store.active_messages(&alias)?
                 } else if limit.is_some() || since.is_some() {
+                    let allowed_issues = scope.as_ref().map(|(readable, issues)| {
+                        issues
+                            .iter()
+                            .filter(|(_, project)| readable.contains(*project))
+                            .map(|(issue, _)| issue.as_str())
+                            .collect::<Vec<_>>()
+                    });
                     let (rows, left_out) = self.store.messages_window(
                         &alias,
                         limit.map(|n| n as usize),
                         since.as_deref(),
+                        allowed_issues.as_deref(),
+                        private_denials.as_ref().map(|denied| &denied.tasks),
+                        private_denials.as_ref().map(|denied| &denied.issues),
+                        private_denials
+                            .as_ref()
+                            .is_some_and(|denied| denied.exclude_cloud),
                     )?;
                     omitted = Some(left_out);
                     rows
@@ -3485,13 +4067,55 @@ impl Shared {
                     projection = self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
                 }
                 let messages = projection.messages(&self.store, messages)?;
+                let messages = if scope.is_some() {
+                    let task_ids = messages
+                        .iter()
+                        .filter_map(|message| message.task_id.as_deref())
+                        .collect::<Vec<_>>();
+                    let task_issues = self.store.task_issue_bindings(&task_ids)?;
+                    messages
+                        .into_iter()
+                        .filter(|message| {
+                            identity::scope_allows_message(&scope, message, &task_issues)
+                                && private_denials
+                                    .as_ref()
+                                    .is_none_or(|denied| !denied.hides_message(message))
+                                && private_denials.as_ref().is_none_or(|denied| {
+                                    !denied.exclude_cloud
+                                        || projection.member_ordinary_message(&message.id)
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    messages
+                };
+                // CAD-2215: this reader's own running rows — the only work
+                // whose occupancy it may be told about (see
+                // `retain_scoped_agent_fields`). Derived from the page it was
+                // just handed, so the row's status and its messages cannot
+                // disagree.
+                let visible_running: std::collections::BTreeSet<String> = if scope.is_some() {
+                    messages
+                        .iter()
+                        .filter(|message| message.state == "running")
+                        .map(|message| message.id.clone())
+                        .collect()
+                } else {
+                    std::collections::BTreeSet::new()
+                };
                 let mut agent_json = agent.to_json();
                 if profile_snapshot || catalogue_snapshot {
                     agent_json["instructions"] = json!(agent.instructions);
                 }
                 // CAD-1752: the project of the task this agent is running
                 // (else its cwd's); the briefing's memory section reads it.
-                agent_json["turn_project"] = json!(self.turn_project(&agent).map(|t| t.key));
+                // CAD-2215: that derivation reads raw running/queued work, so a
+                // scoped reader is never told it — hidden work would otherwise
+                // make the readable cwd fallback disappear from the row.
+                if scope.is_none() {
+                    agent_json["turn_project"] =
+                        json!(self.turn_project(&agent).map(|turn| turn.key));
+                }
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
                 // CAD-1853: a cloud agent's truthful projection. Its remote
@@ -3603,28 +4227,58 @@ impl Shared {
                         }
                     }
                 }
+                if scope.is_some() {
+                    identity::retain_scoped_agent_fields(&mut agent_json, Some(&visible_running));
+                }
+                let projected_messages = messages
+                    .iter()
+                    .map(|message| identity::message_json_for_scope(message, &scope))
+                    .collect::<Vec<_>>();
                 let mut out = json!({
                     "agent": agent_json,
-                    "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
-                    "event_cursor": self.store.event_cursor(&alias)?,
-                    // Inbound backlog — what `cadence inbox` would drain
-                    // for a mailbox, what the actor will still take for
-                    // a live endpoint.
-                    "queued": self.store.queued_count(&alias)?,
-                    "inbox": self.store.inbox_status(&alias)?,
-                    // Unreconciled `unknown` count — nonzero means the
-                    // agent is fenced and `message reconcile` /
-                    // `agent unfence` is the only exit.
-                    "unknown": self.store.unknown_messages(&alias)?.len(),
+                    "messages": projected_messages,
                 });
-                if let Some(reason) = projection.withheld {
-                    out["cloud_withheld"] = json!(reason);
+                if scope.is_none() {
+                    out["event_cursor"] = json!(self.store.event_cursor(&alias)?);
+                    out["queued"] = json!(self.store.queued_count(&alias)?);
+                    out["inbox"] = json!(self.store.inbox_status(&alias)?);
+                    out["unknown"] = json!(self.store.unknown_messages(&alias)?.len());
+                }
+                if scope.is_none() {
+                    if let Some(reason) = &projection.withheld {
+                        out["cloud_withheld"] = json!(reason);
+                    }
                 }
                 // Exact stored task semantics for a reported-dispatch retry.
                 // Same read authority as this alias's existing event history;
                 // return no source body and never recapture a source file.
                 if let Some(mid) = optional_str(params, "context_message") {
-                    let pin = self.store.context_pin(&alias, mid)?;
+                    let visible = if scope.is_none() {
+                        true
+                    } else if let Some(message) = self.store.message(mid)? {
+                        let task_ids = message.task_id.as_deref().into_iter().collect::<Vec<_>>();
+                        let task_issues = self.store.task_issue_bindings(&task_ids)?;
+                        if projection.needs_readmission(&self.store, std::iter::once(mid))? {
+                            projection =
+                                self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
+                        }
+                        message.alias == alias
+                            && identity::scope_allows_message(&scope, &message, &task_issues)
+                            && private_denials
+                                .as_ref()
+                                .is_none_or(|denied| !denied.hides_message(&message))
+                            && !projection.messages(&self.store, vec![message])?.is_empty()
+                            && private_denials.as_ref().is_none_or(|denied| {
+                                !denied.exclude_cloud || projection.member_ordinary_message(mid)
+                            })
+                    } else {
+                        false
+                    };
+                    let pin = if visible {
+                        self.store.context_pin(&alias, mid)?
+                    } else {
+                        None
+                    };
                     let contract = pin.and_then(|mut pin| {
                         let manifest: crate::context_pack::Manifest =
                             serde_json::from_value(pin.get_mut("manifest")?.take()).ok()?;
@@ -3634,13 +4288,18 @@ impl Shared {
                             && pin["project"].as_str() == Some(manifest.project.as_str())
                             && pin["task_revision"].as_str()
                                 == Some(manifest.task.revision.as_str())
+                            && scope
+                                .as_ref()
+                                .is_none_or(|(readable, _)| readable.contains(&manifest.project))
                             && manifest.task.task == manifest.task.issue)
                             .then(|| manifest.task.semantic_digest())
                     });
                     out["context_contract_digest"] = json!(contract);
                 }
                 // CAD-1752: the agent page's figures, only when asked.
-                if params.get("include_stats").and_then(Value::as_bool) == Some(true) {
+                if scope.is_none()
+                    && params.get("include_stats").and_then(Value::as_bool) == Some(true)
+                {
                     out["stats"] = self.store.agent_stats(&alias)?;
                 }
                 // CAD-1221: this alias's non-terminal tasks and their
@@ -3650,6 +4309,10 @@ impl Shared {
                     .store
                     .assignee_tasks_bound(&alias)?
                     .iter()
+                    .filter(|b| identity::scope_allows_issue(&scope, b.issue.as_deref())
+                        && private_denials
+                            .as_ref()
+                            .is_none_or(|denied| !denied.tasks.contains(&b.task.id)))
                     .map(|b| json!({
                         "id": b.task.id, "job": b.task.job_id, "title": b.task.title,
                         "state": b.task.state, "issue": b.issue,
@@ -3658,8 +4321,183 @@ impl Shared {
                     .collect::<Vec<_>>());
                 // CAD-879: how many older rows a `limit`/`since` read
                 // left out; absent when the history was not windowed.
-                if let Some(n) = omitted {
+                if let (None, Some(n)) = (&scope, omitted) {
                     out["messages_omitted"] = json!(n);
+                }
+                if private_denials.is_some() || public_principal.is_some() {
+                    // The scoped page is complete; a test may now commit a real
+                    // authority change that the reproof below must observe.
+                    #[cfg(test)]
+                    if let Some(hook) = &self.agent_show_selected_hook {
+                        hook(&alias);
+                    }
+                    let (current_scope, current_cli, current_public) =
+                        self.agent_read_scope(params, peer_pid, "agent show")?;
+                    // CAD-2215: the same stable-authority rule as `agent list`
+                    // — reader identity and readable project set, never the
+                    // whole issue map or denial sets — plus a re-proof of
+                    // exactly the page this response carries.
+                    let same_projects = match (&current_scope, &scope) {
+                        (Some((current, _)), Some((previous, _))) => current == previous,
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    let current_principal = job_events_opaque::agent_read_principal(
+                        self,
+                        params,
+                        peer_pid,
+                        current_cli.as_ref(),
+                        current_public.as_ref(),
+                        "agent show",
+                    )?;
+                    let current_denied = match &private_denials {
+                        Some(_) => Some(self.private_job_denials_for_read(
+                            params,
+                            current_cli.as_ref(),
+                            current_public.as_ref(),
+                            peer_pid,
+                        )?),
+                        None => None,
+                    };
+                    if !same_projects
+                        || current_principal != reader_principal
+                        || current_public != public_principal
+                        || current_denied.as_ref().map(|denied| denied.exclude_cloud)
+                            != private_denials.as_ref().map(|denied| denied.exclude_cloud)
+                        || self.member_agent_row_withheld_for_relay(
+                            &alias,
+                            params,
+                            current_cli.as_ref(),
+                            current_public.as_ref(),
+                            peer_pid,
+                        )?
+                    {
+                        return Err(Error::rejected("agent show refused: reader access changed"));
+                    }
+                    // Re-prove what this response returns, never the cloud
+                    // operation set: every selected message must still be
+                    // readable and un-denied under the current authority, and
+                    // every selected task binding must still resolve to a
+                    // readable, non-private project. A hidden message or task
+                    // inserted meanwhile was never selected, so it revokes
+                    // nothing.
+                    let task_ids: Vec<&str> = messages
+                        .iter()
+                        .filter_map(|message| message.task_id.as_deref())
+                        .collect();
+                    let bindings = self.store.task_issue_bindings(&task_ids)?;
+                    for message in &messages {
+                        let still_visible =
+                            identity::scope_allows_message(&current_scope, message, &bindings)
+                                && current_denied
+                                    .as_ref()
+                                    .is_none_or(|denied| !denied.hides_message(message));
+                        if !still_visible {
+                            return Err(Error::rejected(
+                                "agent show refused: reader access changed",
+                            ));
+                        }
+                    }
+                    // A selected task's row carries its job and issue: re-read
+                    // the alias' CURRENT bindings and require each selected
+                    // task to still resolve to the same job and issue. A task
+                    // that moved to a hidden project — with no selected
+                    // message to catch it — therefore refuses, and no full-map
+                    // comparison is involved.
+                    let selected_bindings = out["task_bindings"]
+                        .as_array()
+                        .filter(|rows| !rows.is_empty())
+                        .map(|_| self.store.assignee_tasks_bound(&alias))
+                        .transpose()?
+                        .unwrap_or_default();
+                    for binding in out["task_bindings"].as_array().into_iter().flatten() {
+                        let task = binding["id"].as_str().unwrap_or_default();
+                        let job = binding["job"].as_str();
+                        let issue = binding["issue"].as_str();
+                        let same_binding = selected_bindings
+                            .iter()
+                            .find(|current| current.task.id == task)
+                            .is_some_and(|current| {
+                                Some(current.task.job_id.as_str()) == job
+                                    && current.issue.as_deref() == issue
+                            });
+                        let still_visible = same_binding
+                            && identity::scope_allows_issue(&current_scope, issue)
+                            && current_denied
+                                .as_ref()
+                                .is_none_or(|denied| !denied.tasks.contains(task));
+                        if !still_visible {
+                            return Err(Error::rejected(
+                                "agent show refused: reader access changed",
+                            ));
+                        }
+                    }
+                    if current_scope.is_some() {
+                        // The page was projected under the cloud admission
+                        // taken when the read began. A fresh admission must
+                        // still admit every returned row with at least the
+                        // content the page carries: an unadmitted row, or a
+                        // Full→Request downgrade of a shown result/error,
+                        // refuses. Nothing is copied — the predicate reads the
+                        // same rule `messages()` applies.
+                        let admitted =
+                            self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
+                        for kept in &messages {
+                            if !admitted.admits_projected_row(kept) {
+                                return Err(Error::rejected(
+                                    "agent show refused: reader access changed",
+                                ));
+                            }
+                        }
+                        // The digest path may name a message outside the
+                        // selected page; re-prove that pin's authority too.
+                        if out["context_contract_digest"].as_str().is_some() {
+                            let mid = optional_str(params, "context_message").unwrap_or_default();
+                            let Some(message) = self.store.message(mid)? else {
+                                return Err(Error::rejected(
+                                    "agent show refused: reader access changed",
+                                ));
+                            };
+                            let task_ids =
+                                message.task_id.as_deref().into_iter().collect::<Vec<_>>();
+                            let bindings = self.store.task_issue_bindings(&task_ids)?;
+                            let pin_project = self
+                                .store
+                                .context_pin(&alias, mid)?
+                                .and_then(|pin| pin["project"].as_str().map(str::to_string));
+                            let pin_readable = pin_project.is_some_and(|project| {
+                                current_scope
+                                    .as_ref()
+                                    .is_none_or(|(readable, _)| readable.contains(&project))
+                            });
+                            let still_visible = message.alias == alias
+                                && identity::scope_allows_message(
+                                    &current_scope,
+                                    &message,
+                                    &bindings,
+                                )
+                                && current_denied.as_ref().is_none_or(|denied| {
+                                    !denied.hides_message(&message)
+                                        && (!denied.exclude_cloud
+                                            || admitted.member_ordinary_message(&message.id))
+                                })
+                                && admitted.admits_row(&message.id)
+                                && pin_readable;
+                            if !still_visible {
+                                return Err(Error::rejected(
+                                    "agent show refused: reader access changed",
+                                ));
+                            }
+                        }
+                    }
+                }
+                if scope.is_some()
+                    && ["public_session", "read_as", "cli_envelope"]
+                        .iter()
+                        .any(|name| params.get(*name).is_some())
+                {
+                    out[cadence_core::board_api::READER_SCOPE_FIELD] =
+                        json!(cadence_core::board_api::AGENT_SHOW_SCOPE_ACK);
                 }
                 Ok(out)
             }
@@ -3689,8 +4527,8 @@ impl Shared {
             "topic_publish" => self.rpc_topic_publish(params, peer_pid),
             "topic_read" => self.rpc_topic_read(params, peer_pid),
             "topic_request" => self.rpc_topic_request(params, peer_pid),
-            "threads_stamp" => self.rpc_threads_stamp(),
-            "master_stamp" => self.rpc_master_stamp(),
+            "threads_stamp" => self.rpc_threads_stamp(params, peer_pid),
+            "master_stamp" => self.rpc_master_stamp(params, peer_pid),
             "work_conversation_read" => self.rpc_work_conversation_read(params, peer_pid),
             "conversation_create" => self.rpc_conversation_create(params, peer_pid),
             "agent_events" => self.rpc_events(params, peer_pid),
@@ -3792,13 +4630,33 @@ impl Shared {
             "member_job_subscribe" => self.rpc_member_job_subscribe(params, peer_pid),
             "member_job_share" => self.rpc_member_job_share(params, peer_pid),
             "member_job_reconcile" => self.rpc_member_job_reconcile(params, peer_pid),
-            "job_list" => self.rpc_job_list(params, peer_pid),
-            "job_show" => self.rpc_job_show(params),
-            "job_events" => self.rpc_job_events(params),
+            "job_list" => {
+                // CAD-2215 acceptance scaffolding: the real handler, with the
+                // relayed proof removed, exactly as a pre-CAD-2215 daemon that
+                // ignored relayed proofs would answer. Nothing else changes,
+                // and production has no such switch.
+                #[cfg(test)]
+                if self.job_list_ignore_relay
+                    && (params.get("public_session").is_some()
+                        || params.get("read_as").is_some()
+                        || params.get("cli_envelope").is_some())
+                {
+                    let mut stripped = params.clone();
+                    if let Some(fields) = stripped.as_object_mut() {
+                        fields.remove("public_session");
+                        fields.remove("read_as");
+                        fields.remove("cli_envelope");
+                    }
+                    return self.rpc_job_list(&stripped, peer_pid);
+                }
+                self.rpc_job_list(params, peer_pid)
+            }
+            "job_show" => self.rpc_job_show(params, peer_pid),
+            "job_events" => self.rpc_job_events(params, peer_pid),
             "job_cancel" => self.rpc_job_cancel(params),
             "job_close" => self.rpc_job_close(params),
             "task_new" => self.rpc_task_new(params),
-            "task_show" => self.rpc_task_show(params),
+            "task_show" => self.rpc_task_show(params, peer_pid),
             "task_dispatch" => self.rpc_task_dispatch(params),
             "cloud_probe" => self.rpc_cloud_probe(params),
             "task_verdict" => self.rpc_task_verdict(params, peer_pid),
@@ -3813,11 +4671,11 @@ impl Shared {
             "memory_classify" => self.rpc_memory_classify(params, peer_pid),
             "memory_feedback" => self.rpc_memory_feedback(params, peer_pid),
             "monitor_register" => self.rpc_monitor_register(params, peer_pid),
-            "monitor_list" => self.rpc_monitor_list(),
-            "monitor_show" => self.rpc_monitor_show(params),
+            "monitor_list" => self.rpc_monitor_list(params, peer_pid),
+            "monitor_show" => self.rpc_monitor_show(params, peer_pid),
             "monitor_heartbeat" => self.rpc_monitor_heartbeat(params, peer_pid),
-            "monitor_alerts" => self.rpc_monitor_alerts(params),
-            "monitor_alert_ack" => self.rpc_monitor_alert_ack(params),
+            "monitor_alerts" => self.rpc_monitor_alerts(params, peer_pid),
+            "monitor_alert_ack" => self.rpc_monitor_alert_ack(params, peer_pid),
             "monitor_stop" => self.rpc_monitor_stop(params, peer_pid),
             "monitor_dispatch" => self.rpc_monitor_dispatch(params, peer_pid),
             "endpoint_add" => self.rpc_endpoint_add(params, peer_pid),
@@ -4083,7 +4941,7 @@ impl Shared {
             // dispatch. Options is the form catalog for the same gate.
             "issue_kickoff" => self.rpc_issue_kickoff(params, peer_pid),
             "issue_kickoff_options" => self.rpc_issue_kickoff_options(params, peer_pid),
-            "lane_show" => self.rpc_lane_show(params),
+            "lane_show" => self.rpc_lane_show(params, peer_pid),
             "lane_ask" => self.rpc_lane_ask(params, peer_pid),
             "lane_instruct" => self.rpc_lane_instruct(params, peer_pid),
             "lane_interrupt" => self.rpc_lane_interrupt(params, peer_pid),
@@ -4104,9 +4962,14 @@ impl Shared {
             "staging_delegate" => self.rpc_staging_delegate(params, peer_pid),
             "staging_revoke" => self.rpc_staging_revoke(params, peer_pid),
             "staging_delegations" => self.rpc_staging_delegations(),
-            "project_work_approvals" => Ok(json!({
-                "approvals": self.store.work_approvals()?,
-            })),
+            "project_work_approvals" => {
+                // CAD-2215: the map is keyed by project, so an unadmitted
+                // project contributes no entry and no approval payload.
+                let readable = self.readable_projects(peer_pid, "project_work_approvals")?;
+                let mut approvals = self.store.work_approvals()?;
+                approvals.retain(|key, _| readable.contains(key));
+                Ok(json!({ "approvals": approvals }))
+            }
             "workflow_approve" => self.rpc_workflow_approve(params, peer_pid),
             "app_local_install_approve" => self.rpc_app_local(method, params, peer_pid),
             "app_local_install_revoke" => self.rpc_app_local(method, params, peer_pid),
@@ -4300,6 +5163,9 @@ impl Shared {
             | "app_workspace_remove_preview"
             | "app_workspace_remove"
             | "app_workspace_restore"
+            | "app_member_access_list"
+            | "app_member_access_grant"
+            | "app_member_access_revoke"
             | "app_automatic_updates_get"
             | "app_automatic_updates_set" => self.rpc_app_explorer(method, params, peer_pid),
             "app_chat_descriptor" => self.rpc_app_chat_descriptor(params, peer_pid),
@@ -4344,7 +5210,7 @@ impl Shared {
             "master_identity_set" => self.rpc_master_identity_set(params, peer_pid),
             "master_start" => self.rpc_master_start(params, peer_pid),
             "master_summary" => self.rpc_master_summary(params, peer_pid),
-            "master_state" => self.rpc_master_state(params),
+            "master_state" => self.rpc_master_state(params, peer_pid),
             "master_models" => self.rpc_master_models(params, peer_pid),
             "master_command" => self.rpc_master_command(params, peer_pid),
             // CAD-615: permission requests. The master files and uses
@@ -4365,7 +5231,12 @@ impl Shared {
             "reports_changed" => self.rpc_reports_changed(peer_pid),
             "report_verdict" => self.rpc_report_verdict(params, peer_pid),
             "answer_route" => self.rpc_answer_route(params, peer_pid),
-            "delivery_list" => self.rpc_delivery_list(params),
+            "delivery_list" => self.rpc_delivery_list(params, peer_pid),
+            "delivery_private_list" => self.rpc_delivery_private_list(params, peer_pid),
+            "delivery_private_reconcile" => self.rpc_delivery_private_reconcile(params, peer_pid),
+            "delivery_legacy_list" => self.rpc_delivery_legacy_list(params, peer_pid),
+            "delivery_publish" => self.rpc_delivery_publish(params, peer_pid),
+            "delivery_publish_reconcile" => self.rpc_delivery_publish_reconcile(params, peer_pid),
             "delivery_requirements" => self.rpc_delivery_requirements(params),
             "delivery_review_evidence" => self.rpc_delivery_review_evidence(params, peer_pid),
             "delivery_observe" => self.rpc_delivery_observe(params, peer_pid),
@@ -4606,6 +5477,37 @@ impl Shared {
         }
     }
 
+    /// CAD-2215: the one scoped-reader cursor codec every current handler
+    /// uses. It is loaded from the fixed `<state>/scoped-cursors.json`
+    /// keyring record on every call and proven against the persisted
+    /// workspace fingerprint, so a changed record, workspace or keyring is
+    /// never silently accepted. Missing configuration, an uninitialized
+    /// store, unsafe material or a mismatch is one generic unavailable
+    /// refusal — never a fallback or an empty success.
+    pub(crate) fn scoped_cursor_codec(&self) -> Result<scoped_cursor::ScopedCursorCodec> {
+        let tracker = self
+            .pm_dir()
+            .map_err(|_| scoped_cursor_config::unavailable())?;
+        scoped_cursor_config::load_codec(&self.state_dir, &tracker, &self.store)
+    }
+
+    /// CAD-2215: `cadence daemon cursor-key-init` — the only writer of the
+    /// scoped-cursor keyring bind. The caller must be the proven operator
+    /// connection BEFORE any key file is read; the request carries no path,
+    /// identity or key material.
+    fn rpc_scoped_cursor_initialize(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("scoped_cursor_initialize", params, peer_pid)?;
+        if !params.as_object().is_some_and(|object| object.is_empty()) {
+            return Err(Error::rejected(
+                "scoped_cursor_initialize takes no parameters",
+            ));
+        }
+        let tracker = self
+            .pm_dir()
+            .map_err(|_| scoped_cursor_config::unavailable())?;
+        scoped_cursor_config::initialize(&self.state_dir, &tracker, &self.store)
+    }
+
     /// The tracker dir recipes and memory are read from: this daemon's own
     /// `CADENCE_PM_DIR` (its per-instance env — tests), else the
     /// process default.
@@ -4700,6 +5602,7 @@ but the host could not read their list; do not claim to have read them.]";
             }
         }
         self.closing.store(true, Ordering::SeqCst);
+        self.assist_requests_changed.notify_all();
         self.wake();
         if let Ok(coordinator) = self.protected_runtime() {
             coordinator.stop_all("daemon shutdown");
@@ -5773,13 +6676,109 @@ pub type FlushGate = Arc<dyn Fn() + Send + Sync>;
 #[cfg(feature = "test-seam")]
 pub type CloudProjectionObserver = std::sync::Arc<dyn Fn(&str, Option<&str>) + Send + Sync>;
 
+/// Test-only witness after a scoped thread scan batch or authority refresh.
+#[cfg(feature = "test-seam")]
+pub type AgentThreadBatchObserver = Arc<dyn Fn(&str, &str, usize) + Send + Sync>;
+
+/// Test-only witness after an agent wait captures its baseline cursor.
+#[cfg(feature = "test-seam")]
+pub type WaitBaselineObserver = Arc<dyn Fn(&str, i64) + Send + Sync>;
+
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
     #[cfg(test)]
     pub(crate) custody_acceptance_shared: Option<Arc<Mutex<Option<Arc<Shared>>>>>,
+    #[cfg(test)]
+    pub(crate) membership_mode_for_test: Option<TestMembershipMode>,
+    #[cfg(test)]
+    pub(crate) membership_lookup_for_test: Option<MembershipLookupForFixture>,
+    /// Observes each real autonomous request outcome; never supplied by RPC.
+    #[cfg(test)]
+    pub(crate) assist_request_sweep_observer: Option<AssistRequestSweepObserver>,
+    /// Observes the admitted grant before a forward read; never supplied by RPC.
+    #[cfg(test)]
+    pub(crate) app_grant_forward_snapshot_hook: Option<AppGrantForwardSnapshotHook>,
+    /// Observes the selected job-event page before reproof; never supplied by RPC.
+    #[cfg(test)]
+    pub(crate) job_events_snapshot_hook: Option<JobEventsSnapshotHook>,
+    /// Observes the selected scoped agent-event rows before reproof; never
+    /// supplied by RPC.
+    #[cfg(test)]
+    pub(crate) agent_events_selected_hook: Option<AgentEventsSelectedHook>,
+    /// Observes monitor reads before reproof; never supplied by RPC.
+    #[cfg(test)]
+    pub(crate) monitor_read_snapshot_hook: Option<MonitorReadSnapshotHook>,
+    /// CAD-2215 acceptance scaffolding only: called inside the native scoped
+    /// acknowledgement critical section, after the tracker/enrollment guards
+    /// are held and immediately before the authoritative store write opens.
+    /// The callback must not be used to inject authority; it only lets a test
+    /// commit a real revocation in the exact remaining window.
+    #[cfg(test)]
+    pub(crate) monitor_ack_writer_hook: Option<MonitorAckWriterHook>,
+    /// Observes a job/task detail before reproof; never supplied by RPC.
+    #[cfg(test)]
+    pub(crate) job_detail_snapshot_hook: Option<JobDetailSnapshotHook>,
+    /// Observes a scoped `job_list` after selection and before its reproof, so
+    /// a test can commit a real interleaving; never supplied by RPC.
+    #[cfg(test)]
+    pub(crate) job_list_snapshot_hook: Option<JobDetailSnapshotHook>,
+    /// Observes the selected scoped `agent_list` rows before reproof; never
+    /// supplied by RPC.
+    #[cfg(test)]
+    pub(crate) agent_list_selected_hook: Option<AgentListSelectedHook>,
+    /// Observes a completed scoped `agent_show` projection before the
+    /// authority and cloud reproof; never supplied by RPC.
+    #[cfg(test)]
+    pub(crate) agent_show_selected_hook: Option<AgentShowSelectedHook>,
+    /// CAD-2215 acceptance scaffolding only: a PROVEN relayed
+    /// `master_state` request is answered with the real unscoped document
+    /// and NO relay ack, exactly as a pre-CAD-2215 daemon that ignored the
+    /// relayed proof would. Session verification, the thread scope and the
+    /// operator path stay real, so this can only simulate a rolling-version
+    /// daemon — it is not a production switch (compiled only in tests).
+    #[cfg(test)]
+    pub(crate) master_state_ignore_relay: bool,
+    /// CAD-2215 acceptance scaffolding only, `job_list` only: strip a
+    /// supplied `public_session`/`read_as` proof before the real handler, so
+    /// the daemon answers with the genuine unscoped job list and no scope
+    /// acknowledgement — what a pre-CAD-2215 daemon that ignored relayed
+    /// proofs would produce. Every other RPC (and every signed session) stays
+    /// real; compiled only in tests.
+    #[cfg(test)]
+    pub(crate) job_list_ignore_relay: bool,
+    /// CAD-2215 acceptance scaffolding only, `thread_read` only and
+    /// dynamic: after the real session/proof admission, an armed flag makes
+    /// a relayed non-operator page come back as the genuine unscoped page
+    /// with no scope acknowledgement (a pre-CAD-2215 daemon that ignored the
+    /// proof). Toggleable while a member SSE polls, so refusal/EOF before any
+    /// unscoped page is forwarded can be exercised. Operator reads and every
+    /// other RPC are untouched; compiled only in tests.
+    #[cfg(test)]
+    pub(crate) thread_read_ignore_relay: Option<Arc<AtomicBool>>,
+    /// Test-only response corruption after genuine member-history selection:
+    /// 1 removes the acknowledgement, 2 makes the cursor numeric, 3 changes
+    /// the acknowledgement, and 4 adds private conversation metadata.
+    /// No mode bypasses the member admission.
+    #[cfg(test)]
+    pub(crate) member_history_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// Test-only corruption of an already-authorized human-room page or
+    /// receipt: 1 removes its scope acknowledgement, 2 adds a numeric post
+    /// position, and 3 substitutes a wrong acknowledgement.
+    #[cfg(test)]
+    pub(crate) human_room_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// Test-only rolling-version simulation. Bits 1, 2 and 4 strip only the
+    /// selected agent-list, agent-show or agent-events relay proof.
+    #[cfg(test)]
+    pub(crate) agent_reads_ignore_relay: Option<Arc<std::sync::atomic::AtomicU8>>,
     #[cfg(feature = "test-seam")]
     pub cloud_projection_observer: Option<CloudProjectionObserver>,
+    #[cfg(feature = "test-seam")]
+    pub agent_thread_batch_observer: Option<AgentThreadBatchObserver>,
+    #[cfg(feature = "test-seam")]
+    pub wait_baseline_observer: Option<WaitBaselineObserver>,
+    #[cfg(feature = "test-seam")]
+    pub wait_scan_observer: Option<WaitBaselineObserver>,
     /// In-process fixture override; `serve()` leaves this unset and
     /// resolves the private state record. Never sourced from an RPC.
     pub agent_uid: Option<u32>,
@@ -6343,6 +7342,16 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             spawn_watch_joined("monitor watch", move || shared.run_monitor_watch())
         })
         .flatten();
+    // Request promotion writes jobs and specs: join it before releasing the
+    // daemon lease, rather than leaving an effectful watcher detached.
+    let assist_request_watch = (!fenced)
+        .then(|| {
+            let shared = Arc::clone(&shared);
+            spawn_watch_joined("member request watch", move || {
+                shared.run_assist_request_watch()
+            })
+        })
+        .flatten();
     // WAL watch: provider stores checkpointed while their provider
     // idles — CAD-132, the 30 GiB sessions.db-wal that ate the disk.
     if !fenced {
@@ -6539,6 +7548,9 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // or at the end of the tick it is in. Joining before the actors stop
     // lets a kickoff from that last tick settle into the shutdown marker.
     if let Some(handle) = monitor_watch {
+        let _ = handle.join();
+    }
+    if let Some(handle) = assist_request_watch {
         let _ = handle.join();
     }
     if let Some(handle) = test_watch {

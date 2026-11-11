@@ -11,6 +11,16 @@ use std::collections::BTreeSet;
 
 use crate::issue::{project, Pm};
 
+/// Noncanonical subjects can collide after sanitization; they receive only
+/// workspace-visible access until the project grant identity is migrated.
+pub(crate) fn policy_user_actor(subject: &str) -> String {
+    if crate::ident::is_handle(subject, crate::ident::HANDLE_MAX) {
+        format!("users/{subject}")
+    } else {
+        "service/unresolved-member".to_string()
+    }
+}
+
 /// The project caller an actor spelling names.
 ///
 /// `None` for a spelling outside the known forms — the caller is then
@@ -112,14 +122,8 @@ pub(crate) fn refused(pm: &Pm, key: &str, actor: &str) -> bool {
     Access::of(pm, actor).refused(key)
 }
 
-/// True when this caller may read every project in the tracker.
-///
-/// The board's live stream is one shared `Model` whose frames carry
-/// issue/agent/plan rows and aggregate counts, and it cannot yet be
-/// filtered per subscriber. Serving it to a caller who cannot read every
-/// project would leak rows and counts from the restricted ones, so that
-/// caller is refused live updates instead (AOS-274 / SEC-006). Fail
-/// closed: an unreadable tracker or unknown spelling is not complete.
+/// True when `actor` may read every registered project. An unreadable
+/// tracker or unknown caller spelling is not complete.
 pub(crate) fn reads_every_project(pm: &Pm, actor: &str) -> bool {
     Access::of(pm, actor).reads_every_project()
 }
@@ -242,11 +246,11 @@ mod tests {
         assert!(reads_every_project(&pm, "operator"));
         assert!(reads_every_project(&pm, "users/mia"));
         // An unselected member, a reserved kind and an unknown spelling
-        // are all refused the shared stream.
+        // do not have complete project visibility.
         for spelling in ["users/stranger", "agents/dev", "service/svc", "mystery"] {
             assert!(
                 !reads_every_project(&pm, spelling),
-                "{spelling} was offered the shared stream"
+                "{spelling} had complete project visibility"
             );
         }
         // With no recorded policy every project is readable, so the

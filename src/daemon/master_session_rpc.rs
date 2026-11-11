@@ -1,10 +1,28 @@
 //! CAD-534: `cadence daemon` master session RPC handlers — moved verbatim from src/daemon.rs.
 
+use super::app_explorer_rpc::MemberAppAccess;
 use super::*;
 use cadence_core::board_api::{
     AppOrigin, AvatarLook, MasterContext, MasterIdentity, MasterQueued, MasterSession, MasterState,
-    MasterTurn,
+    MasterTurn, MASTER_STATE_SCOPE_ACK, READER_SCOPE_FIELD,
 };
+
+/// The provider/session configuration `master_state` shows, in one
+/// derivation shared by the operator document and the scoped projection.
+/// Session identity and context usage describe the WHOLE provider session,
+/// so `stats` is asked for only when the caller will disclose it — a scoped
+/// reader is never handed global telemetry it may not see.
+struct MasterHeader {
+    provider: String,
+    endpoint_kind: String,
+    live: bool,
+    model: Option<String>,
+    model_label: Value,
+    effort: Option<String>,
+    commands: Vec<String>,
+    session: Option<MasterSession>,
+    context: Option<MasterContext>,
+}
 
 impl Shared {
     /// The coordinator's committed identity: the protected IDENTITY.md/SOUL.md
@@ -65,7 +83,24 @@ impl Shared {
     /// this cheaply (indexed SQL, no provider call). It changes whenever
     /// the master's running/queued turns, any master thread entry, or the
     /// app assistant / master permission revision (`master_rev`) changes.
-    pub(super) fn rpc_master_stamp(&self) -> Result<Value> {
+    ///
+    /// CAD-2215: those counters describe the WHOLE master mailbox, so only
+    /// the operator's own connection — the board watcher — reads them. Any
+    /// other caller (a local agent's own RPC, a relay, an unattributable
+    /// connection) is refused BEFORE the read and without a number: a
+    /// signal that moves on work the caller cannot see is itself a
+    /// disclosure, and a narrowed count would still be an oracle. A
+    /// per-reader invalidation signal comes from the scoped `master_state`.
+    pub(super) fn rpc_master_stamp(&self, _params: &Value, peer_pid: u32) -> Result<Value> {
+        if !matches!(
+            self.connection_caller(peer_pid)?,
+            caller_rule::Who::Operator
+        ) {
+            return Err(Error::rejected(
+                "master stamp refused: the master change signal is not readable \
+                 from this connection",
+            ));
+        }
         let alias = crate::master::ALIAS;
         let (live_seq, running, queued, entries, transition_ms) = self.store.master_stamp(alias)?;
         Ok(json!({
@@ -78,13 +113,285 @@ impl Shared {
         }))
     }
 
-    /// `master_state` (CAD-551) — what the board's master header shows:
-    /// the provider, the live session's model/effort/context (when the
-    /// provider answers — Pi's `get_state`/`get_session_stats`), the
-    /// verbs its session commands accept, and the turn in flight or
-    /// queued. Read-only like `agent_show`; a master without a live
-    /// endpoint still answers with its stored fields.
-    pub(super) fn rpc_master_state(&self, _params: &Value) -> Result<Value> {
+    /// `master_state` (CAD-551, CAD-2215) — the board's master header read,
+    /// answered for the reader THIS connection proved, never for whoever
+    /// relays it. The full document is the operator's; a project-scoped
+    /// reader — a member's signed board session, an anonymous relay, or a
+    /// local agent connection — is answered with only the master turns that
+    /// reader's own `thread_read` can actually prove, under the same
+    /// project-policy and member-private-job boundary. Work hidden from the
+    /// reader moves nothing here: no count, queue, position, provider
+    /// session or context reports it.
+    ///
+    /// Authority is resolved BEFORE the document is built, so a refused or
+    /// unattributable caller never causes a provider session command and
+    /// never reads a global projection it may not see.
+    pub(super) fn rpc_master_state(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let relayed = params.get("public_session").is_some()
+            || params.get("read_as").is_some()
+            || params.get("cli_envelope").is_some();
+        let (scope, principal) = self.thread_read_scope(params, peer_pid)?;
+        // CAD-2215 acceptance scaffolding: the relayed proof was really
+        // verified above; answer with the real unscoped document and no ack,
+        // exactly as a pre-CAD-2215 daemon that ignored relayed proofs
+        // would. The board must refuse this answer as unavailable.
+        #[cfg(test)]
+        if relayed && self.master_state_ignore_relay {
+            return self.master_state_document();
+        }
+        let Some(scope) = scope else {
+            // A proven operator (including an operator-role session) gets
+            // the full document and no ack: an ack only ever means "this
+            // answer was narrowed for a non-operator reader".
+            return self.master_state_document();
+        };
+        let denied =
+            self.private_job_denials_for_read(params, None, principal.as_ref(), peer_pid)?;
+        // A relay is a request that names another reader (a member's signed
+        // session, the anonymous service identity). `thread_read` serves a
+        // relay an EMPTY master Home page, so a Home turn is not the relay's
+        // at all; only a local agent's own connection reads Home under its
+        // project scope.
+        let relay = principal.is_some() || params.get("read_as").is_some();
+        // CAD-2215: a verified member's exact app-conversation grants. This
+        // is resolved from the live `(company, subject)` session, never from
+        // a request field; a local agent or `read_as` relay gets none.
+        let access = match principal.as_ref() {
+            Some(principal) => self.member_app_access(principal)?,
+            None => MemberAppAccess::default(),
+        };
+        let mut state = self.scoped_master_state(&scope, &denied, relay, &access)?;
+        // The projection and its admission are two reads of a live queue.
+        // Re-prove the reader BEFORE the answer leaves: a revoked session,
+        // a changed project policy, a newly private job or a revoked/changed
+        // grant is a refusal, not a stale success built from the earlier
+        // admission.
+        let (current_scope, current_principal) = self.thread_read_scope(params, peer_pid)?;
+        let current_access = match current_principal.as_ref() {
+            Some(principal) => self.member_app_access(principal)?,
+            None => MemberAppAccess::default(),
+        };
+        if current_scope.as_ref() != Some(&scope)
+            || current_principal != principal
+            || current_access != access
+            || self.private_job_denials_for_read(
+                params,
+                None,
+                current_principal.as_ref(),
+                peer_pid,
+            )? != denied
+        {
+            return Err(Error::rejected(
+                "master state refused: reader access changed",
+            ));
+        }
+        // The relay gets the ack that this daemon applied the relayed-reader
+        // boundary. A direct local read has no relay to check it; the field
+        // is never part of a client's document and the board strips it.
+        if relayed {
+            state[READER_SCOPE_FIELD] = json!(MASTER_STATE_SCOPE_ACK);
+        }
+        Ok(state)
+    }
+
+    /// The `master_state` a project-scoped reader may see: the same
+    /// provider/session configuration every reader gets, plus only the
+    /// master turns that reader's own `thread_read` can actually prove.
+    /// A relay is served an EMPTY master Home page, and a local agent's
+    /// connection reads Home under its own project scope. A verified
+    /// member additionally receives the exact app conversations an
+    /// operator explicitly granted them (CAD-2215), and only those:
+    /// `conversation` and `app_origin` are emitted only when the turn's
+    /// conversation is one of the resolved exact bindings. `summary`,
+    /// `session` and `context` describe the operator's text and the whole
+    /// provider session, so they are never reported here.
+    fn scoped_master_state(
+        &self,
+        scope: &super::identity::ProjectScope,
+        denied: &store::PrivateJobDenials,
+        relay: bool,
+        access: &MemberAppAccess,
+    ) -> Result<Value> {
+        let alias = crate::master::ALIAS;
+        let header = self.master_header(false)?;
+        let (readable, projects) = scope;
+        // The issue bindings this reader's policy admits — the same set the
+        // scoped thread read hands its filter. The granted conversations are
+        // a separate, exact set, never an issue/project substitute.
+        let allowed = projects
+            .iter()
+            .filter(|(_, project)| readable.contains(*project))
+            .map(|(issue, _)| issue.as_str())
+            .collect::<Vec<_>>();
+        let conversations = access.conversations();
+        let mut threads: std::collections::HashMap<String, (bool, bool)> = Default::default();
+        let mut waiting = Vec::new();
+        for (id, state, created, thread) in self.store.queued_metadata_scoped_with_conversations(
+            alias,
+            &allowed,
+            denied,
+            &conversations,
+        )? {
+            // No enqueue note in a thread of this alias: no page can prove
+            // this turn, so it is not reported at all.
+            let Some(thread) = thread else { continue };
+            let (home, granted) = match threads.get(&thread) {
+                Some(cached) => *cached,
+                None => {
+                    let home = self
+                        .store
+                        .thread_by_id(&thread)?
+                        .is_some_and(|t| t.runs_as_home());
+                    let granted = access.conversation(&thread);
+                    threads.insert(thread.clone(), (home, granted));
+                    (home, granted)
+                }
+            };
+            let conversation = (granted && !home).then(|| thread.clone());
+            if !self.turn_page_readable(home, relay) && conversation.is_none() {
+                continue;
+            }
+            waiting.push((id, state == "queued", created, conversation));
+        }
+        let running = match self.running_message_with_grants(alias, &allowed, denied, access)? {
+            Some((message, thread)) => {
+                let home = thread.as_ref().is_some_and(|t| t.runs_as_home());
+                let conversation = thread
+                    .as_ref()
+                    .map(|t| t.id.clone())
+                    .filter(|id| access.conversation(id));
+                let readable = self.turn_page_readable(home, relay) || conversation.is_some();
+                readable.then(|| {
+                    let working = message.state == "running";
+                    (
+                        message.id.clone(),
+                        working,
+                        if working {
+                            message.started.unwrap_or(message.created)
+                        } else {
+                            message.created
+                        },
+                        conversation,
+                    )
+                })
+            }
+            None => None,
+        };
+        let turn = match &running {
+            Some((id, working, since, conversation)) => Some(MasterTurn {
+                state: if *working {
+                    "working".to_string()
+                } else {
+                    "queued".to_string()
+                },
+                message: id.clone(),
+                conversation: (*conversation).clone(),
+                app_origin: conversation
+                    .as_ref()
+                    .and_then(|_| self.granted_turn_app_origin(access, id)),
+                // CAD-1767: the operator's own text is the operator's.
+                summary: None,
+                since: *since,
+                // A global position is not this reader's data.
+                position: None,
+            }),
+            None => waiting
+                .first()
+                .map(|(id, _, created, conversation)| MasterTurn {
+                    state: "queued".to_string(),
+                    message: id.clone(),
+                    conversation: (*conversation).clone(),
+                    app_origin: conversation
+                        .as_ref()
+                        .and_then(|_| self.granted_turn_app_origin(access, id)),
+                    summary: None,
+                    since: *created,
+                    position: None,
+                }),
+        };
+        let queue = waiting
+            .iter()
+            .map(|(id, _, _, conversation)| MasterQueued {
+                message: id.clone(),
+                conversation: (*conversation).clone(),
+            })
+            .collect::<Vec<_>>();
+        let queued = waiting.iter().filter(|(_, queued, _, _)| *queued).count() as i64;
+        Ok(serde_json::to_value(MasterState {
+            alias: alias.to_string(),
+            identity: self.master_identity()?,
+            actor_identity: None,
+            provider: header.provider,
+            endpoint_kind: header.endpoint_kind,
+            live: header.live,
+            model: header.model,
+            model_label: header.model_label,
+            effort: header.effort,
+            // Withheld, not narrowed: these describe the whole session.
+            context: None,
+            session: None,
+            commands: header.commands,
+            turn,
+            queue,
+            queued,
+        })
+        .expect("master state serializes"))
+    }
+
+    /// The reader's in-flight master turn together with the conversation its
+    /// enqueue note landed in. Admission comes from the one scoped query,
+    /// whose granted-conversation branch enforces every private-job, project
+    /// and cloud denial itself.
+    fn running_message_with_grants(
+        &self,
+        alias: &str,
+        issues: &[&str],
+        denied: &store::PrivateJobDenials,
+        access: &MemberAppAccess,
+    ) -> Result<Option<(store::Message, Option<store::Thread>)>> {
+        let conversations = access.conversations();
+        let Some(message) = self.store.running_message_scoped_with_conversations(
+            alias,
+            issues,
+            denied,
+            &conversations,
+        )?
+        else {
+            return Ok(None);
+        };
+        let thread = self.store.message_conversation(alias, &message.id)?;
+        Ok(Some((message, thread)))
+    }
+
+    /// The app origin of a granted master turn, but only when the derived
+    /// origin is one of the exact bindings the grant covers. No install or
+    /// project visibility is ever inferred into an origin.
+    fn granted_turn_app_origin(
+        &self,
+        access: &MemberAppAccess,
+        message_id: &str,
+    ) -> Option<AppOrigin> {
+        let origin = self.master_turn_app_origin(message_id)?;
+        access.allows_origin(&origin).then_some(origin)
+    }
+
+    /// Can this reader's OWN `thread_read` reach the page a master turn
+    /// landed in? Only the master's Home page, and only for a local agent:
+    /// a relay is served an EMPTY Home page. An app conversation is
+    /// admitted only when it is an exact conversation a verified member's
+    /// grant covers (CAD-2215); a project-readable issue and an existing
+    /// installation are not a grant, so an ungranted app turn is withheld
+    /// WHOLE — not just its `app_origin`.
+    fn turn_page_readable(&self, home: bool, relay: bool) -> bool {
+        home && !relay
+    }
+
+    /// The one derivation of the master's provider/session configuration,
+    /// shared by the operator document and the scoped projection so the two
+    /// cannot drift. `with_stats` is the caller's disclosure: a scoped
+    /// reader never receives `context`, so the whole-session `stats` read is
+    /// not made for it at all.
+    fn master_header(&self, with_stats: bool) -> Result<MasterHeader> {
         let alias = crate::master::ALIAS;
         let agent = self.store.agent(alias).map_err(|_| {
             Error::rejected("the master is not started — `cadence master start` registers it")
@@ -112,12 +419,16 @@ impl Shared {
                     .and_then(|a| a.session_command("state", None).ok())
             })
             .flatten();
-        let stats = commands
-            .contains(&"stats")
+        let stats = with_stats
             .then(|| {
-                adapter
-                    .as_ref()
-                    .and_then(|a| a.session_command("stats", None).ok())
+                commands
+                    .contains(&"stats")
+                    .then(|| {
+                        adapter
+                            .as_ref()
+                            .and_then(|a| a.session_command("stats", None).ok())
+                    })
+                    .flatten()
             })
             .flatten();
         let model = session
@@ -168,6 +479,35 @@ impl Shared {
             streaming: s.get("isStreaming").cloned().unwrap_or(Value::Null),
             compacting: s.get("isCompacting").cloned().unwrap_or(Value::Null),
         });
+        Ok(MasterHeader {
+            provider: agent.provider.clone(),
+            endpoint_kind: agent.endpoint_kind.clone(),
+            live,
+            model: model_id,
+            model_label: model
+                .as_ref()
+                .and_then(|m| m.get("name").or_else(|| m.get("id")))
+                .cloned()
+                .unwrap_or(Value::Null),
+            effort,
+            commands: commands.iter().map(|c| (*c).to_string()).collect(),
+            session,
+            context,
+        })
+    }
+
+    /// The unscoped `master_state` document: what the board's master header
+    /// shows — the provider, the live session's model/effort/context (when
+    /// the provider answers — Pi's `get_state`/`get_session_stats`), the
+    /// verbs its session commands accept, and the turn in flight or
+    /// queued. Read-only like `agent_show`; a master without a live
+    /// endpoint still answers with its stored fields. Operator-only: the
+    /// settings-gated `master.status` reuses it, and [`Self::rpc_master_state`]
+    /// is the only request path that can reach a non-operator, always
+    /// through its scoped projection.
+    pub(super) fn master_state_document(&self) -> Result<Value> {
+        let alias = crate::master::ALIAS;
+        let header = self.master_header(true)?;
         // The turn the working row mirrors: `running` first, else the
         // queue head. `since` is epoch seconds — `started` while it
         // runs, `created` while it waits.
@@ -231,19 +571,15 @@ impl Shared {
             alias: alias.to_string(),
             identity: self.master_identity()?,
             actor_identity: None,
-            provider: agent.provider.clone(),
-            endpoint_kind: agent.endpoint_kind.clone(),
-            live,
-            model: model_id,
-            model_label: model
-                .as_ref()
-                .and_then(|m| m.get("name").or_else(|| m.get("id")))
-                .cloned()
-                .unwrap_or(Value::Null),
-            effort,
-            context,
-            session,
-            commands: commands.iter().map(|c| (*c).to_string()).collect(),
+            provider: header.provider,
+            endpoint_kind: header.endpoint_kind,
+            live: header.live,
+            model: header.model,
+            model_label: header.model_label,
+            effort: header.effort,
+            context: header.context,
+            session: header.session,
+            commands: header.commands,
             turn,
             queue,
             queued: self.store.queued_count(alias)?,

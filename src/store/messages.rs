@@ -30,7 +30,6 @@ pub(crate) fn take_decoded_messages() -> usize {
 pub(crate) struct WorkerTurn {
     pub id: String,
     pub state: String,
-    pub created: f64,
     pub sha: Option<String>,
 }
 
@@ -363,6 +362,70 @@ const INDEX_COLS: &str = "seq, id, alias, state, source, sender, reply_to, task_
           AND json_valid(result) AND json_extract(result,'$.status')='submitted' \
           THEN 1 ELSE 0 END";
 
+// A message is in scope only when its own issue and its task's job issue,
+// when both exist, agree. An unbound or missing task never supplies a scope.
+pub(super) const INDEX_PROJECT_FILTER: &str = " AND EXISTS (
+    SELECT 1 FROM (SELECT ? AS scope) visible
+    WHERE COALESCE(messages.issue, (
+        SELECT jobs.issue_id FROM tasks JOIN jobs ON jobs.id=tasks.job_id
+        WHERE tasks.id=messages.task_id
+    )) IN (SELECT value FROM json_each(visible.scope, '$.issues'))
+    AND (messages.task_id IS NULL OR NOT EXISTS (
+        SELECT 1 FROM json_each(visible.scope, '$.denied_tasks')
+        WHERE value=messages.task_id
+    ))
+    AND (messages.task_id IS NOT NULL OR NOT EXISTS (
+        SELECT 1 FROM json_each(visible.scope, '$.denied_issues')
+        WHERE value=messages.issue
+    ))
+    AND (COALESCE(json_extract(visible.scope, '$.exclude_cloud'), 0)=0 OR (
+        NOT EXISTS (SELECT 1 FROM cloud_agents WHERE alias=messages.alias)
+        AND NOT EXISTS (
+            WITH RECURSIVE ancestry(id, origin, source) AS (
+                SELECT messages.id, messages.origin, messages.source
+                UNION
+                SELECT parent.id, parent.origin, parent.source
+                FROM ancestry JOIN messages parent ON parent.id=ancestry.origin
+                WHERE ancestry.source<>'cloud_agent'
+            )
+            SELECT 1 FROM ancestry
+            WHERE source='cloud_agent'
+               OR (origin IS NOT NULL AND NOT EXISTS (
+                   SELECT 1 FROM messages parent WHERE parent.id=ancestry.origin
+               ))
+            UNION ALL
+            SELECT 1 WHERE NOT EXISTS (
+                SELECT 1 FROM ancestry WHERE origin IS NULL
+            )
+        )
+    ))
+    AND (messages.issue IS NULL OR messages.task_id IS NULL OR messages.issue = (
+        SELECT jobs.issue_id FROM tasks JOIN jobs ON jobs.id=tasks.job_id
+        WHERE tasks.id=messages.task_id
+    )))";
+
+#[derive(serde::Serialize)]
+struct ProjectFilter<'a> {
+    issues: &'a [&'a str],
+    denied_tasks: Option<&'a std::collections::BTreeSet<String>>,
+    denied_issues: Option<&'a std::collections::BTreeSet<String>>,
+    exclude_cloud: bool,
+}
+
+pub(super) fn project_filter_json(
+    issues: &[&str],
+    denied_tasks: Option<&std::collections::BTreeSet<String>>,
+    denied_issues: Option<&std::collections::BTreeSet<String>>,
+    exclude_cloud: bool,
+) -> Result<String> {
+    Ok(serde_json::to_string(&ProjectFilter {
+        issues,
+        denied_tasks,
+        denied_issues,
+        exclude_cloud,
+    })?)
+}
+
 /// One index row. `body_chars` is SQLite's character length of the stored
 /// body; the text itself is not loaded.
 #[derive(Debug, Clone, PartialEq)]
@@ -433,6 +496,14 @@ pub struct MessageIndexQuery<'a> {
     pub limit: usize,
     /// Operator listings include app-dispatch rows. Agent listings do not.
     pub include_app: bool,
+    /// None is an operator view; otherwise only these issue bindings are readable.
+    pub allowed_issues: Option<&'a [&'a str]>,
+    /// Tasks withheld by the member-owned job boundary, when scoped.
+    pub denied_tasks: Option<&'a std::collections::BTreeSet<String>>,
+    /// Issue-only messages cannot be attributed when these issues include
+    /// private jobs outside the reader's authority.
+    pub denied_issues: Option<&'a std::collections::BTreeSet<String>>,
+    pub exclude_cloud: bool,
 }
 
 #[derive(Clone)]
@@ -450,6 +521,31 @@ impl rusqlite::types::ToSql for Bind {
             Bind::Int(value) => value.to_sql(),
         }
     }
+}
+
+fn scoped_message_seq(
+    conn: &rusqlite::Connection,
+    alias: &str,
+    id: &str,
+    allowed_issues: Option<&str>,
+) -> Result<Option<i64>> {
+    let seq = match allowed_issues {
+        Some(issues) => conn
+            .query_row(
+                &format!("SELECT seq FROM messages WHERE alias=?1 AND id=?2{INDEX_PROJECT_FILTER}"),
+                params![alias, id, issues],
+                |row| row.get(0),
+            )
+            .optional()?,
+        None => conn
+            .query_row(
+                "SELECT seq FROM messages WHERE alias=?1 AND id=?2",
+                params![alias, id],
+                |row| row.get(0),
+            )
+            .optional()?,
+    };
+    Ok(seq)
 }
 
 fn index_query(
@@ -2691,23 +2787,30 @@ impl Store {
     /// or a unix timestamp (rows created at or after it); an id wins when
     /// a message of that alias carries it. Returns the rows in `seq`
     /// order and how many of this registration's rows were left out.
+    #[allow(clippy::too_many_arguments)]
     pub fn messages_window(
         &self,
         alias: &str,
         limit: Option<usize>,
         since: Option<&str>,
+        allowed_issues: Option<&[&str]>,
+        denied_tasks: Option<&std::collections::BTreeSet<String>>,
+        denied_issues: Option<&std::collections::BTreeSet<String>>,
+        exclude_cloud: bool,
     ) -> Result<(Vec<Message>, usize)> {
         let conn = self.conn();
+        let allowed_issues = allowed_issues
+            .map(|issues| project_filter_json(issues, denied_tasks, denied_issues, exclude_cloud))
+            .transpose()?;
+        let filter = if allowed_issues.is_some() {
+            INDEX_PROJECT_FILTER
+        } else {
+            ""
+        };
         let agent = self.agent_in(&conn, alias)?;
         let (mut after_seq, mut after_ts) = (0i64, f64::MIN);
         if let Some(since) = since {
-            let by_id = conn
-                .query_row(
-                    "SELECT seq FROM messages WHERE alias=?1 AND id=?2",
-                    params![alias, since],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?;
+            let by_id = scoped_message_seq(&conn, alias, since, allowed_issues.as_deref())?;
             match (by_id, since.parse::<f64>()) {
                 (Some(seq), _) => after_seq = seq,
                 (None, Ok(ts)) if ts.is_finite() => after_ts = ts,
@@ -2722,30 +2825,42 @@ impl Store {
             "state NOT IN ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}"
         );
         let mut rows = {
-            let mut stmt =
-                conn.prepare(&format!("SELECT * FROM messages WHERE alias=?1 AND {live}"))?;
-            let rows = stmt.query_map([alias], row_message)?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT * FROM messages WHERE alias=? AND {live}{filter}"
+            ))?;
+            let rows = match &allowed_issues {
+                Some(issues) => stmt.query_map(params![alias, issues], row_message)?,
+                None => stmt.query_map(params![alias], row_message)?,
+            };
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut stmt = conn.prepare(&format!(
-            "SELECT * FROM messages WHERE alias=?1 AND NOT ({live})
-             AND created >= ?2 AND created >= ?3 AND seq > ?4
-             ORDER BY seq DESC LIMIT ?5"
+            "SELECT * FROM messages WHERE alias=? AND NOT ({live})
+             AND created >= ? AND created >= ? AND seq > ?{filter}
+             ORDER BY seq DESC LIMIT ?"
         ))?;
         let cap = limit.map_or(-1, |n| n.min(i64::MAX as usize) as i64);
-        let recent = stmt.query_map(
-            params![alias, agent.created, after_ts, after_seq, cap],
-            row_message,
-        )?;
+        let recent = match &allowed_issues {
+            Some(issues) => stmt.query_map(
+                params![alias, agent.created, after_ts, after_seq, issues, cap],
+                row_message,
+            )?,
+            None => stmt.query_map(
+                params![alias, agent.created, after_ts, after_seq, cap],
+                row_message,
+            )?,
+        };
         rows.extend(recent.collect::<rusqlite::Result<Vec<_>>>()?);
         rows.sort_by_key(|m| m.seq);
-        let total: i64 = conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM messages WHERE alias=?1 AND (created >= ?2 OR ({live}))"
-            ),
-            params![alias, agent.created],
-            |r| r.get(0),
-        )?;
+        let sql = format!(
+            "SELECT COUNT(*) FROM messages WHERE alias=? AND (created >= ? OR ({live})){filter}"
+        );
+        let total: i64 = match &allowed_issues {
+            Some(issues) => {
+                conn.query_row(&sql, params![alias, agent.created, issues], |r| r.get(0))?
+            }
+            None => conn.query_row(&sql, params![alias, agent.created], |r| r.get(0))?,
+        };
         let omitted = (total as usize).saturating_sub(rows.len());
         Ok((rows, omitted))
     }
@@ -2768,18 +2883,19 @@ impl Store {
             since,
             limit,
             include_app,
+            allowed_issues,
+            denied_tasks,
+            denied_issues,
+            exclude_cloud,
         } = *query;
         let conn = self.conn();
+        let allowed_issues = allowed_issues
+            .map(|issues| project_filter_json(issues, denied_tasks, denied_issues, exclude_cloud))
+            .transpose()?;
         let agent = self.agent_in(&conn, alias)?;
         let (mut after_seq, mut after_ts) = (0i64, f64::MIN);
         if let Some(since) = since {
-            let by_id = conn
-                .query_row(
-                    "SELECT seq FROM messages WHERE alias=?1 AND id=?2",
-                    params![alias, since],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?;
+            let by_id = scoped_message_seq(&conn, alias, since, allowed_issues.as_deref())?;
             match (by_id, since.parse::<f64>()) {
                 (Some(seq), _) => after_seq = seq,
                 (None, Ok(ts)) if ts.is_finite() => after_ts = ts,
@@ -2813,6 +2929,10 @@ impl Store {
         }
         if !include_app {
             filter.push_str(" AND source!='app_run_dispatch'");
+        }
+        if let Some(issues) = allowed_issues {
+            filter.push_str(INDEX_PROJECT_FILTER);
+            filter_binds.push(Bind::Text(issues));
         }
         let live = format!(
             "state NOT IN ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}"
@@ -2879,6 +2999,38 @@ impl Store {
         )?;
         let rows = stmt.query_map([alias], row_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Running message IDs admitted to one scoped board reader, grouped in
+    /// one query so cached fleet rows never inherit operator-only IDs.
+    pub(crate) fn scoped_running_message_ids(
+        &self,
+        issues: &[&str],
+        denied: &super::PrivateJobDenials,
+    ) -> Result<std::collections::HashMap<String, std::collections::BTreeSet<String>>> {
+        let conn = self.conn();
+        let filter = project_filter_json(
+            issues,
+            Some(&denied.tasks),
+            Some(&denied.issues),
+            denied.exclude_cloud,
+        )?;
+        let sql = format!(
+            "SELECT alias,id FROM messages WHERE state='running' AND source<>'topic_notice' {INDEX_PROJECT_FILTER}"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([filter], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut grouped = std::collections::HashMap::new();
+        for row in rows {
+            let (alias, id) = row?;
+            grouped
+                .entry(alias)
+                .or_insert_with(std::collections::BTreeSet::new)
+                .insert(id);
+        }
+        Ok(grouped)
     }
 
     /// CAD-1353: one grouped read for the fleet status view — how many
@@ -3064,7 +3216,7 @@ impl Store {
         worker: &str,
     ) -> Result<Option<WorkerTurn>> {
         self.read_worker_turn(
-            "SELECT id,state,created,CASE WHEN state='completed' THEN result END \
+            "SELECT id,state,CASE WHEN state='completed' THEN result END \
              FROM messages WHERE alias=?1 AND issue=?2 AND worktree IS NOT NULL \
              AND (source='dispatch' OR (source='review' AND sender_uid IS NULL)) \
              ORDER BY seq DESC LIMIT 1",
@@ -3096,14 +3248,14 @@ impl Store {
         query: &str,
         parameters: impl rusqlite::Params,
     ) -> Result<Option<WorkerTurn>> {
-        let row: Option<(String, String, f64, Option<String>)> = {
+        let row: Option<(String, String, Option<String>)> = {
             let conn = self.conn();
             conn.query_row(query, parameters, |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .optional()?
         };
-        let Some((id, state, created, raw)) = row else {
+        let Some((id, state, raw)) = row else {
             return Ok(None);
         };
         let sha = if let Some(raw) = raw {
@@ -3126,12 +3278,7 @@ impl Store {
         } else {
             None
         };
-        Ok(Some(WorkerTurn {
-            id,
-            state,
-            created,
-            sha,
-        }))
+        Ok(Some(WorkerTurn { id, state, sha }))
     }
 
     /// CAD-250: the agent's delivered, unreported pty turns, oldest
@@ -3427,6 +3574,10 @@ mod index_tests {
                     since: None,
                     limit: 20,
                     include_app: false,
+                    allowed_issues: None,
+                    denied_tasks: None,
+                    denied_issues: None,
+                    exclude_cloud: false,
                 },
             )
             .unwrap()

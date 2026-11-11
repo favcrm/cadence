@@ -454,6 +454,12 @@ impl Shared {
                                 return Err(error);
                             }
                         }
+                        // CAD-2215: a polled kickoff completing here is the
+                        // private ledger's trigger, exactly like the other
+                        // completion paths. Never a shared effect.
+                        if status == "completed" && pending.source == "job_dispatch" {
+                            let _ = self.settle_private_completion(&pending.id);
+                        }
                         cloud_held = None;
                         ctl.cloud_held.store(false, Ordering::SeqCst);
                         recover_started = None;
@@ -1112,6 +1118,13 @@ impl Shared {
         } else {
             self.store
                 .finish(message, &status, &stored, result.error.as_deref())?;
+            // CAD-2215: the adapter's own completion is the private
+            // ledger's trigger. A ledger failure is reported beside the
+            // committed completion, never folded into it. Only a kickoff
+            // can own a private delivery, so ordinary turns do no work.
+            if status == "completed" && message.source == "job_dispatch" {
+                let _ = self.settle_private_completion(&message.id);
+            }
         }
         self.notify_routed_target(message, &stored);
         self.wake();

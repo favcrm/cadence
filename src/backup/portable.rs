@@ -11,12 +11,37 @@
 //! store and tracker privately, and commits inactive: no actor is enabled,
 //! no session or dispatch starts, and no default changes. Replacement and
 //! activation remain refused until native operator admission is wired.
+//!
+//! CAD-2215: a coordination package never carries private or private-capable
+//! state. Member-private job ownership, queued member requests, member
+//! assistants and subscriptions, app contexts, app team defaults,
+//! per-installation app record files, app conversations, app member grants
+//! (revoked tombstones included), chat attachments, issue artifacts,
+//! human-room transcripts and membership, cloud-agent state, the private
+//! delivery and publication ledger, publication comments and a private
+//! project policy are all outside the profile, so rather than dropping them
+//! the export classifies the source first: any such record — or one it cannot
+//! read — refuses with no package written, and the source keeps its data and
+//! receipts. Only a workspace proven to hold none of them exports.
+//! The store snapshot, the pinned tracker tree and the private ledger are
+//! separate sources, not one atomic snapshot, so the source is classified
+//! again after the package is built: private work observed during packaging
+//! refuses publication instead of being published outside the classification
+//! that admitted it.
+//! Inspection and restore apply the same rule to a package: the PM root is
+//! derived from the verified member inventory (never only from the manifest
+//! field), a project-shaped record that root cannot authorize refuses, and a
+//! staged store carrying an app conversation, a human-room topic or a
+//! cloud-agent marker, or a tracker carrying a publication comment or a
+//! private project policy, is refused rather than imported without the
+//! provenance it would lose. Every tracker member is read once and that same
+//! buffer is hashed and classified for the package, on inspection and on the
+//! staged restore before publication.
 
-#[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -323,6 +348,27 @@ const CATALOG: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        // CAD-2215: explicit per-member app grants, including revoked
+        // tombstones. A row is the member's exact conversation binding, so
+        // the pre-export private-work classification refuses any row; the
+        // catalog entry exists so an empty table is never an unknown table.
+        "app_member_grants",
+        &[
+            "org",
+            "sub",
+            "install_id",
+            "conversation_id",
+            "context_id",
+            "install_digest",
+            "state",
+            "granted_at",
+            "granted_by",
+            "revoked_at",
+            "revoked_by",
+            "authorization_epoch",
+        ],
+    ),
+    (
         "app_run_artifact_fetches",
         &["artifact_id", "message_id", "turn_hash", "created"],
     ),
@@ -479,6 +525,28 @@ const CATALOG: &[(&str, &[&str])] = &[
         ],
     ),
     ("assist_job_shares", &["job", "org", "shared_by", "created"]),
+    (
+        // CAD-2215: accepted member requests, including queued rows that no
+        // ledger row has bound yet (`completed=0`). The row carries the
+        // member, the request text and the planned job id, so the
+        // pre-export private-work classification refuses any row.
+        "assist_request_queue",
+        &[
+            "org",
+            "sub",
+            "request_key",
+            "issue",
+            "title",
+            "body",
+            "acceptance",
+            "credential_id",
+            "created",
+            "last_attempt",
+            "last_outcome",
+            "completed",
+            "job_id",
+        ],
+    ),
     (
         "assist_requests",
         &[
@@ -766,6 +834,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "database_epoch",
             "ledger_sequence",
             "ledger_digest",
+            "cursor_keyring_fingerprint",
         ],
     ),
     (
@@ -1489,6 +1558,13 @@ pub struct PortableExportOptions {
     pub tracker: PathBuf,
     /// Redact credential-shaped spans in private-copy message bodies.
     pub redact_history_secrets: bool,
+    /// The operator's explicit claim that no unidentified chat-attachment
+    /// custody root holds private bytes for this source. Proving that from the
+    /// store cannot be done by this process — the daemon resolves the root
+    /// from its in-process provider environment and persists no binding — so
+    /// an otherwise-clean source refuses unless the operator states the fact.
+    /// A source that does hold a classifiable private record refuses anyway.
+    pub attest_chat_custody_absent: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -1563,21 +1639,84 @@ pub fn export_portable(
     refuse_existing(out)?;
     let allow = Allowlist::load(state_dir)?;
     let head = admit_tracker(&opts.tracker)?;
+    // CAD-2215: refuse a workspace that evidences private work BEFORE any
+    // snapshot copy of its store is written. `build_package` repeats this on
+    // the snapshot, which is the authoritative copy it would project.
+    classify_private_work(
+        &live,
+        state_dir,
+        &opts.tracker,
+        &opts.tracker,
+        &head,
+        opts.attest_chat_custody_absent,
+    )?;
     let staging = private_staging(out)?;
-    match build_package(
+    let manifest = match build_package(
+        state_dir,
+        &opts.tracker,
         &live,
         &staging,
         &opts.tracker,
         &head,
         &allow,
-        opts.redact_history_secrets,
+        opts,
     ) {
-        Ok(manifest) => publish(&staging, out, &manifest),
+        Ok(manifest) => manifest,
         Err(error) => {
             let _ = fs::remove_dir_all(&staging);
-            Err(error)
+            return Err(error);
         }
+    };
+    // CAD-2215: the store snapshot, the pinned tracker tree and the private
+    // delivery ledger are three sources, not one atomic snapshot. The
+    // package's own bytes were classified above; re-read the SOURCE now that
+    // it is complete, so private work that appeared while it was packaged
+    // refuses publication instead of being published outside the
+    // classification that admitted it. Private content that appears after
+    // this check is not in the package at all.
+    if let Err(error) = classify_private_work(
+        &live,
+        state_dir,
+        &opts.tracker,
+        &opts.tracker,
+        &head,
+        opts.attest_chat_custody_absent,
+    ) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
     }
+    if let Err(error) = reverify_tracker(&opts.tracker, &head) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    publish(&staging, out, &manifest)
+}
+
+/// CAD-2215: re-prove, after the package is built, that the source tracker
+/// is still the clean revision the package pinned. The package carries only
+/// `head`'s tree, so a change here cannot make it unsafe — it makes the
+/// receipt name a revision the source has moved past, which is refused
+/// rather than published. The snapshot export instead re-stamps the whole
+/// source through `TrackerCapture::verify_unchanged`.
+fn reverify_tracker(tracker: &Path, head: &str) -> Result<()> {
+    let now = git_plain(tracker, &["rev-parse", "--verify", "HEAD"])?;
+    if now != head {
+        return Err(Error::rejected(
+            "portable export refused: the source tracker moved while the package was being \
+             built; no package was written and the source is unchanged",
+        ));
+    }
+    let status = git_plain(
+        tracker,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if !status.trim().is_empty() {
+        return Err(Error::rejected(
+            "portable export refused: the source tracker changed while the package was being \
+             built; no package was written and the source is unchanged",
+        ));
+    }
+    Ok(())
 }
 
 /// `export_portable` with an explicit app selection. No app schema is
@@ -1626,15 +1765,27 @@ pub fn export_portable_snapshot_selected(
     let allow = Allowlist::load(state_dir)?;
     let captured = capture::TrackerCapture::new(&opts.tracker)?;
     let head = admit_tracker(captured.path())?;
+    // CAD-2215: refuse before the store snapshot is written, classifying the
+    // live store and the same captured tracker `build_package` would copy.
+    classify_private_work(
+        &live,
+        state_dir,
+        &opts.tracker,
+        captured.path(),
+        &head,
+        opts.attest_chat_custody_absent,
+    )?;
     let staging = private_staging(out)?;
     let result = (|| {
         let manifest = build_package(
+            state_dir,
+            &opts.tracker,
             &live,
             &staging,
             captured.path(),
             &head,
             &allow,
-            opts.redact_history_secrets,
+            opts,
         )?;
         let mut report = inspect_portable(&staging)?;
         captured.verify_package(&staging, &manifest.members)?;
@@ -1644,6 +1795,20 @@ pub fn export_portable_snapshot_selected(
         report["source_fidelity"] = json!("captured_tracker_matches_package_and_rechecked");
         report["atomic_database_and_tracker"] = json!(false);
         report["bundle"] = json!(out);
+        // CAD-2215: same three-source window as the ordinary export. The
+        // package bytes were classified in `build_package`; re-read the LIVE
+        // store and private ledger now that the package is complete, so
+        // private work that appeared while packaging refuses publication.
+        // `verify_unchanged` above separately re-proves the source tracker
+        // still matches the private capture.
+        classify_private_work(
+            &live,
+            state_dir,
+            &opts.tracker,
+            captured.path(),
+            &head,
+            opts.attest_chat_custody_absent,
+        )?;
         rename_noreplace(&staging, out)?;
         Ok(report)
     })();
@@ -1691,6 +1856,18 @@ pub struct VerifiedPackage {
     pub manifest_bytes: Vec<u8>,
     pub manifest_sha256: String,
     pub report: Value,
+    /// The private copy every verified member was written to and re-read from.
+    /// Consumers must open or stream members from here, never from the mutable
+    /// caller-supplied package.
+    snapshot: tempfile::TempDir,
+}
+
+impl VerifiedPackage {
+    /// Root of the private verified snapshot. Same-UID processes are not
+    /// isolated from it.
+    pub fn snapshot_root(&self) -> &Path {
+        self.snapshot.path()
+    }
 }
 
 /// `inspect_portable` plus the verified package internals a remote transfer
@@ -1874,39 +2051,579 @@ pub const TRANSFER_MANIFEST_MAX: usize = 4 * 1024 * 1024;
 /// matches the server bound instead of admitting what the server rejects.
 pub const TRANSFER_MEMBERS_MAX: usize = 19998;
 
-fn inspect_package(source: &Path) -> Result<VerifiedPackage> {
-    if !source.symlink_metadata()?.is_dir() {
-        return Err(Error::rejected("package is not a plain directory"));
+/// Manifest structure checks that read no member: format/scope, the admitted
+/// PM root, every member path, the exact PM root derived from the member
+/// inventory, and the presence of the core store. Shared by every verifier so
+/// inspection, transfer, activation and restore admit the same shape.
+fn admit_manifest(manifest_bytes: &[u8]) -> Result<PortableManifest> {
+    let manifest: PortableManifest = serde_json::from_slice(manifest_bytes)
+        .map_err(|e| Error::rejected(format!("malformed manifest: {e}")))?;
+    if manifest.format != PORTABLE_FORMAT
+        || manifest.scope != "coordination"
+        || manifest.full_workspace
+    {
+        return Err(Error::rejected(
+            "manifest is not a coordination portable package",
+        ));
     }
-    require_regular(&source.join(PKG_MANIFEST))?;
+    if !matches!(manifest.pm_root.as_deref(), None | Some(".") | Some("pm")) {
+        return Err(Error::rejected(
+            "manifest pm_root is not an admitted PM root",
+        ));
+    }
+    // CAD-2215: the PM root is decided by the MEMBER INVENTORY that is about
+    // to be verified, never by the manifest's own field. A manifest that says
+    // `null` while its tracker carries `pm.yaml` would otherwise skip every
+    // project record in the package.
+    let tracker_prefix = format!("{PKG_TRACKER}/");
+    let mut seen = std::collections::BTreeSet::new();
+    for m in &manifest.members {
+        let rel = Path::new(&m.path);
+        if !safe_relative(rel) {
+            return Err(Error::rejected(format!("unsafe member path {}", m.path)));
+        }
+        if m.path != PKG_DB && !m.path.starts_with(&tracker_prefix) {
+            return Err(Error::rejected(format!(
+                "member {} is outside the core store and tracker",
+                m.path
+            )));
+        }
+        if !seen.insert(m.path.clone()) {
+            return Err(Error::rejected(format!("duplicate member {}", m.path)));
+        }
+    }
+    if !seen.contains(PKG_DB) {
+        return Err(Error::rejected("package has no store member"));
+    }
+    let tracker_paths: Vec<&str> = manifest
+        .members
+        .iter()
+        .filter_map(|m| m.path.strip_prefix(&tracker_prefix))
+        .collect();
+    if pm_root_from_paths(tracker_paths.iter().copied())? != manifest.pm_root {
+        return Err(Error::rejected(
+            "package manifest pm_root does not match its tracker members",
+        ));
+    }
+    Ok(manifest)
+}
+
+/// Copy every manifest member into a fresh 0700 private directory, verifying
+/// and classifying the SAME bytes it writes. Inspection, activation preflight
+/// and remote transfer then read only this snapshot, so a later change to the
+/// mutable source package cannot be validated as clean and then streamed or
+/// planned as private.
+fn snapshot_members(root: &PackageRoot, manifest: &PortableManifest) -> Result<tempfile::TempDir> {
+    let dir = tempfile::Builder::new()
+        .prefix("cadence-verified-")
+        .tempdir()?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+    let prefix = format!("{PKG_TRACKER}/");
+    for m in &manifest.members {
+        let rel = Path::new(&m.path);
+        let dst = dir.path().join(rel);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+        if m.path == PKG_DB {
+            // The store can be large: hash and copy in one streamed pass,
+            // refusing the moment the streamed bytes disagree.
+            stream_member(root.open_member(rel)?, &dst, m)?;
+            continue;
+        }
+        // One read through the pinned descriptor: the bytes hashed are the
+        // bytes classified and the bytes written into the snapshot.
+        let bytes = read_member(root, rel, m.bytes)?;
+        if hex_digest(&bytes) != m.sha256 || bytes.len() as u64 != m.bytes {
+            return Err(Error::rejected(format!(
+                "member {} changed (digest or size mismatch)",
+                m.path
+            )));
+        }
+        if let Some(tracked) = m.path.strip_prefix(&prefix) {
+            check_tracker_path(tracked)?;
+            check_tracker_content(tracked, &bytes)?;
+            check_tracker_private_content("package", manifest.pm_root.as_deref(), tracked, &bytes)?;
+        }
+        write_private_mode(&dst, &bytes, 0o600)?;
+    }
+    Ok(dir)
+}
+
+/// Hash-and-copy one large member in a single pass into the private snapshot.
+/// `input` is already an opened, fstat-checked member of the pinned root.
+fn stream_member(mut input: std::fs::File, dst: &Path, m: &Member) -> Result<()> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dst)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > m.bytes {
+            return Err(Error::rejected(format!(
+                "member {} changed (digest or size mismatch)",
+                m.path
+            )));
+        }
+        hasher.update(&buf[..n]);
+        output.write_all(&buf[..n])?;
+    }
+    if total != m.bytes || format!("{:x}", hasher.finalize()) != m.sha256 {
+        return Err(Error::rejected(format!(
+            "member {} changed (digest or size mismatch)",
+            m.path
+        )));
+    }
+    output.sync_all()?;
+    Ok(())
+}
+
+/// A descriptor-pinned package directory. Every manifest and member read walks
+/// from this descriptor with `openat(O_NOFOLLOW)`, and the leaf is fstat'ed on
+/// the opened inode, so a symlink swapped into the leaf or any ancestor after
+/// the pin cannot redirect a read outside the package. The package may be
+/// owned by a different unprivileged UID, so path-based checks are not enough.
+struct PackageRoot {
+    fd: std::os::fd::OwnedFd,
+}
+
+impl PackageRoot {
+    fn open(root: &Path) -> Result<Self> {
+        // Traverse the caller's spelling component by component with pinned,
+        // no-follow directory handles. `..` returns to the pinned parent only
+        // after the preceding component was itself opened as a real
+        // directory, so `a/../b` keeps POSIX traversal semantics and a
+        // symlinked or missing `a` refuses instead of being skipped as text.
+        // `canonicalize` is never used: it would follow a swapped ancestor.
+        let mut stack: Vec<std::fs::File> = if root.is_absolute() {
+            vec![std::fs::File::open("/")?]
+        } else {
+            vec![std::fs::File::open(".")?]
+        };
+        for component in root.components() {
+            match component {
+                std::path::Component::RootDir => {
+                    stack.truncate(1);
+                    stack[0] = std::fs::File::open("/")?;
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if stack.len() > 1 {
+                        stack.pop();
+                    } else {
+                        let parent = CString::new("..").expect("parent has no NUL");
+                        let raw = unsafe {
+                            libc::openat(
+                                stack[0].as_raw_fd(),
+                                parent.as_ptr(),
+                                libc::O_RDONLY
+                                    | libc::O_DIRECTORY
+                                    | libc::O_NOFOLLOW
+                                    | libc::O_CLOEXEC,
+                            )
+                        };
+                        if raw < 0 {
+                            return Err(Error::rejected("package parent directory is unavailable"));
+                        }
+                        stack[0] = unsafe { std::fs::File::from_raw_fd(raw) };
+                    }
+                }
+                std::path::Component::Normal(name) => {
+                    let encoded = CString::new(name.as_bytes())
+                        .map_err(|_| Error::rejected("package path has NUL"))?;
+                    let raw = unsafe {
+                        libc::openat(
+                            stack
+                                .last()
+                                .expect("the stack starts with a root handle")
+                                .as_raw_fd(),
+                            encoded.as_ptr(),
+                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        )
+                    };
+                    if raw < 0 {
+                        return Err(Error::rejected(format!(
+                            "package {} is not reachable through real directories",
+                            root.display()
+                        )));
+                    }
+                    stack.push(unsafe { std::fs::File::from_raw_fd(raw) });
+                }
+                std::path::Component::Prefix(_) => {
+                    return Err(Error::rejected("unsupported package path prefix"))
+                }
+            }
+        }
+        let current = stack
+            .pop()
+            .ok_or_else(|| Error::rejected("package path is empty"))?;
+        if !current.metadata()?.is_dir() {
+            return Err(Error::rejected("package is not a plain directory"));
+        }
+        Ok(Self {
+            fd: std::os::fd::OwnedFd::from(current),
+        })
+    }
+
+    /// Open one package-relative member through the pinned descriptor.
+    fn open_member(&self, rel: &Path) -> Result<std::fs::File> {
+        let mut parts = Vec::new();
+        for component in rel.components() {
+            match component {
+                std::path::Component::Normal(name) => parts.push(name.to_owned()),
+                _ => return Err(Error::rejected("unsafe package member path")),
+            }
+        }
+        let Some((leaf, dirs)) = parts.split_last() else {
+            return Err(Error::rejected("empty package member path"));
+        };
+        let mut dir = self.fd.try_clone()?;
+        for name in dirs {
+            let encoded = CString::new(name.as_bytes())
+                .map_err(|_| Error::rejected("package member path has NUL"))?;
+            let raw = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    encoded.as_ptr(),
+                    libc::O_RDONLY
+                        | libc::O_DIRECTORY
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK,
+                )
+            };
+            if raw < 0 {
+                return Err(Error::rejected(format!(
+                    "package member {} is not reachable through a real directory",
+                    rel.display()
+                )));
+            }
+            dir = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        }
+        let encoded =
+            CString::new(leaf.as_bytes()).map_err(|_| Error::rejected("member path has NUL"))?;
+        let raw = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                encoded.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if raw < 0 {
+            return Err(Error::rejected(format!(
+                "package member {} is not a plain readable file",
+                rel.display()
+            )));
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(raw) };
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.nlink() != 1 {
+            return Err(Error::rejected(format!(
+                "{} is not a plain single-link regular file",
+                rel.display()
+            )));
+        }
+        Ok(file)
+    }
+}
+
+/// Every package-relative regular file, walked through pinned directory
+/// handles. Linux: `/proc/self/fd/<fd>` names the exact open inode and each
+/// step descends with `openat(O_NOFOLLOW)`, so no path component can be
+/// swapped mid-walk.
+#[cfg(target_os = "linux")]
+fn package_paths(root: &PackageRoot) -> Result<Vec<String>> {
+    fn walk(dir: &std::os::fd::OwnedFd, prefix: &str, out: &mut Vec<String>) -> Result<()> {
+        let view = format!("/proc/self/fd/{}", dir.as_raw_fd());
+        for entry in fs::read_dir(&view)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let encoded = std::ffi::CString::new(name.as_bytes())
+                .map_err(|_| Error::rejected("package entry name has NUL"))?;
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    encoded.as_ptr(),
+                    &mut stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::rejected("package entry cannot be classified"));
+            }
+            let rel = format!("{prefix}{}", name.to_string_lossy());
+            match stat.st_mode & libc::S_IFMT {
+                libc::S_IFLNK => {
+                    return Err(Error::rejected("package contains a symlink"));
+                }
+                libc::S_IFDIR => {
+                    let raw = unsafe {
+                        libc::openat(
+                            dir.as_raw_fd(),
+                            encoded.as_ptr(),
+                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        )
+                    };
+                    if raw < 0 {
+                        return Err(Error::rejected("package directory is not reachable"));
+                    }
+                    let child = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+                    walk(&child, &format!("{rel}/"), out)?;
+                }
+                libc::S_IFREG => out.push(rel),
+                _ => {
+                    return Err(Error::rejected("package contains a non-regular file"));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    let fd = root.fd.try_clone()?;
+    walk(&fd, "", &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// macOS enumeration through pinned directory handles.
+#[cfg(target_os = "macos")]
+fn package_paths(root: &PackageRoot) -> Result<Vec<String>> {
+    struct DirectoryStream(*mut libc::DIR);
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    fn walk(dir: &std::os::fd::OwnedFd, prefix: &str, out: &mut Vec<String>) -> Result<()> {
+        let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            return Err(Error::rejected(
+                "cannot duplicate a package directory handle",
+            ));
+        }
+        let stream = unsafe { libc::fdopendir(dup) };
+        if stream.is_null() {
+            unsafe { libc::close(dup) };
+            return Err(Error::rejected("cannot enumerate a package directory"));
+        }
+        let stream = DirectoryStream(stream);
+        loop {
+            unsafe { *libc::__error() = 0 };
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                if unsafe { *libc::__error() } != 0 {
+                    return Err(Error::rejected("cannot enumerate a package directory"));
+                }
+                break;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let encoded = std::ffi::CString::new(name)
+                .map_err(|_| Error::rejected("package entry name has NUL"))?;
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    encoded.as_ptr(),
+                    &mut stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            let rel = format!("{prefix}{}", String::from_utf8_lossy(name));
+            match rc {
+                0 => match stat.st_mode & libc::S_IFMT {
+                    libc::S_IFLNK => {
+                        return Err(Error::rejected("package contains a symlink"));
+                    }
+                    libc::S_IFDIR => {
+                        let raw = unsafe {
+                            libc::openat(
+                                dir.as_raw_fd(),
+                                encoded.as_ptr(),
+                                libc::O_RDONLY
+                                    | libc::O_DIRECTORY
+                                    | libc::O_NOFOLLOW
+                                    | libc::O_CLOEXEC,
+                            )
+                        };
+                        if raw < 0 {
+                            return Err(Error::rejected("package directory is not reachable"));
+                        }
+                        let child = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+                        // Recurse here, as the Linux enumeration does: `rel`
+                        // is only consumed by the regular-file arm, so a
+                        // deferred `walk` after the match would use it after a
+                        // move.
+                        walk(&child, &format!("{rel}/"), out)?;
+                    }
+                    libc::S_IFREG => out.push(rel),
+                    _ => {
+                        return Err(Error::rejected("package contains a non-regular file"));
+                    }
+                },
+                _ => {
+                    return Err(Error::rejected("package entry cannot be classified"));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    let fd = root.fd.try_clone()?;
+    walk(&fd, "", &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn package_paths(_root: &PackageRoot) -> Result<Vec<String>> {
+    Err(Error::rejected(
+        "package inspection is unavailable on this platform",
+    ))
+}
+
+/// Read a pinned member fully.
+fn read_member(root: &PackageRoot, rel: &Path, limit: u64) -> Result<Vec<u8>> {
+    // Check the opened inode's size before allocating, and never read more
+    // than the declared length: a sparse or oversized source cannot make this
+    // allocate beyond the manifest's own bound.
+    let file = root.open_member(rel)?;
+    if file.metadata()?.len() != limit {
+        return Err(Error::rejected(format!(
+            "member {} changed (digest or size mismatch)",
+            rel.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(limit.min(1024 * 1024) as usize);
+    let read = file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if read as u64 != limit {
+        return Err(Error::rejected(format!(
+            "member {} changed (digest or size mismatch)",
+            rel.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// The manifest itself, capped before allocation.
+fn read_manifest_file(root: &PackageRoot) -> Result<Vec<u8>> {
+    let file = root.open_member(Path::new(PKG_MANIFEST))?;
+    let declared = file.metadata()?.len();
+    if declared > TRANSFER_MANIFEST_MAX as u64 {
+        return Err(Error::rejected(
+            "package manifest exceeds the transfer limit",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(declared as usize);
+    let read = file
+        .take(TRANSFER_MANIFEST_MAX as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if read as u64 != declared {
+        return Err(Error::rejected("package manifest changed while being read"));
+    }
+    Ok(bytes)
+}
+
+/// Hash the manifest through the pinned package root without admitting its contents.
+pub(crate) fn package_manifest_digest(source: &Path) -> Result<String> {
+    let root = PackageRoot::open(source)?;
+    Ok(hex_digest(&read_manifest_file(&root)?))
+}
+
+/// Hosted transfer bounds, enforced before a snapshot is created so a hostile
+/// manifest cannot make inspection copy or allocate beyond them.
+fn enforce_transfer_bounds(manifest: &PortableManifest) -> Result<()> {
+    if manifest.members.len() > TRANSFER_MEMBERS_MAX {
+        return Err(Error::rejected(
+            "package member count exceeds the transfer limit",
+        ));
+    }
+    let mut total = 0u64;
+    for member in &manifest.members {
+        if member.bytes > TRANSFER_MEMBER_MAX_BYTES {
+            return Err(Error::rejected(
+                "package member exceeds the transfer byte limit",
+            ));
+        }
+        if member.path.encode_utf16().count() > TRANSFER_MEMBER_PATH_MAX_UNITS {
+            return Err(Error::rejected(
+                "package member path exceeds the transfer limit",
+            ));
+        }
+        total = total
+            .checked_add(member.bytes)
+            .ok_or_else(|| Error::rejected("package byte total overflows"))?;
+    }
+    if total > TRANSFER_INVENTORY_MAX_BYTES {
+        return Err(Error::rejected(
+            "package byte total exceeds the transfer limit",
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_package(source: &Path) -> Result<VerifiedPackage> {
+    let root = PackageRoot::open(source)?;
     // Reject linked directories before reading any listed member through them.
-    let mut paths = Vec::new();
-    collect_package_members(source, source, &mut paths)?;
-    let manifest_bytes = fs::read(source.join(PKG_MANIFEST))?;
+    // (Member reads walk the pinned descriptor below, so this only enumerates
+    // names for the unlisted-member check.)
+    let paths = package_paths(&root)?;
+    let manifest_bytes = read_manifest_file(&root)?;
     let manifest_sha256 = format!("{:x}", Sha256::digest(&manifest_bytes));
-    let manifest = verify_manifest_bytes(source, &manifest_bytes)?;
-    // Ordinary read-only SQLite opens can still create WAL/SHM files.
-    // Native exports are rollback-journal single-file databases; admit that
-    // header before any SQLite connection touches the supplied package.
+    let manifest = admit_manifest(&manifest_bytes)?;
+    // Hosted transfer bounds are enforced before the snapshot copies or
+    // allocates anything.
+    enforce_transfer_bounds(&manifest)?;
+    // The manifest's member set must be exactly what the package holds (plus
+    // the manifest itself); an unlisted file could carry content no
+    // classification saw.
+    for path in &paths {
+        if path != PKG_MANIFEST && !manifest.members.iter().any(|m| &m.path == path) {
+            return Err(Error::rejected(format!(
+                "package contains unlisted member {path}"
+            )));
+        }
+    }
+    // Verify and classify each member while copying it into a private
+    // snapshot, then use that snapshot rather than the mutable source.
+    // This does not isolate the copy from other processes with the same UID.
+    let snapshot = snapshot_members(&root, &manifest)?;
+    let snapshot_db = snapshot.path().join(PKG_DB);
+    // Ordinary read-only SQLite opens can still create WAL/SHM files. Native
+    // exports are rollback-journal single-file databases; admit that header
+    // before any SQLite connection touches the snapshot.
     let mut header = [0u8; 20];
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(source.join(PKG_DB))?
+        .open(&snapshot_db)?
         .read_exact(&mut header)?;
     if &header[..16] != b"SQLite format 3\0" || header[18] != 1 || header[19] != 1 {
         return Err(Error::rejected(
             "portable inspection requires a single-file rollback-journal SQLite database",
         ));
     }
-    validate_staged_store(&source.join(PKG_DB), &manifest)?;
-    let tracker = source.join(PKG_TRACKER);
-    if pm_root_of(&tracker)? != manifest.pm_root {
+    validate_staged_store(&snapshot_db, &manifest)?;
+    let snapshot_tracker = snapshot.path().join(PKG_TRACKER);
+    if pm_root_of(&snapshot_tracker)? != manifest.pm_root {
         return Err(Error::rejected(
             "package tracker PM root differs from manifest",
         ));
     }
-    if hash_file(&source.join(PKG_MANIFEST))?.0 != manifest_sha256 {
+    if hex_digest(&read_manifest_file(&root)?) != manifest_sha256 {
         return Err(Error::rejected(
             "package manifest changed during inspection",
         ));
@@ -1950,6 +2667,7 @@ fn inspect_package(source: &Path) -> Result<VerifiedPackage> {
         manifest_bytes,
         manifest_sha256,
         report,
+        snapshot,
     })
 }
 
@@ -1994,13 +2712,16 @@ fn private_staging(out: &Path) -> Result<PathBuf> {
     Ok(staging)
 }
 
+#[allow(clippy::too_many_arguments)] // the package inputs are positional by design
 fn build_package(
+    state_dir: &Path,
+    workspace: &Path,
     live: &Path,
     staging: &Path,
     tracker: &Path,
     head: &str,
     allow: &Allowlist,
-    redact_history_secrets: bool,
+    opts: &PortableExportOptions,
 ) -> Result<PortableManifest> {
     let mut output = ArtifactDir::open(staging, false)?;
     let temp_name = format!(".{PKG_DB}.partial");
@@ -2009,12 +2730,24 @@ fn build_package(
     artifact_snapshot(live, &mut output, temp_name.as_ref())?;
     let source_uuid = read_source_uuid(&partial)?;
     check_catalog(&partial)?;
+    // CAD-2215: prove the source holds no private member work BEFORE the
+    // projection touches this copy and before any tracker blob is copied.
+    // A refusal here leaves the staging dir to the caller's cleanup, never
+    // a package: the source store, tracker and state dir are only read.
+    classify_private_work(
+        &partial,
+        state_dir,
+        workspace,
+        tracker,
+        head,
+        opts.attest_chat_custody_absent,
+    )?;
     output.sqlite_sidecars(temp_name.as_ref())?;
     let omitted_rows = project(&partial)?;
     // Existing redaction on the private copy, then a read-only secret scan
     // and integrity check of the projected copy.
     output.sqlite_sidecars(temp_name.as_ref())?;
-    let scrub = scrub(&partial, redact_history_secrets)?;
+    let scrub = scrub(&partial, opts.redact_history_secrets)?;
     scan_db(&partial, allow)?;
     let (integrity, schema) = inspect(&partial)?;
     require_ok(&partial, &integrity)?;
@@ -2024,12 +2757,24 @@ fn build_package(
     let tracker_dir = staging.join(PKG_TRACKER);
     copy_tracker(tracker, &tracker_dir, head)?;
     let pm_root = pm_root_of(&tracker_dir)?;
+    // CAD-2215: build every tracker member from ONE read, hashing and
+    // classifying that same buffer. The bytes recorded in the manifest are
+    // therefore exactly the bytes classification admitted, and a concurrent
+    // swap between a classified copy and a hashed one cannot occur.
+    let tracker_members = package_tracker_members(&tracker_dir, pm_root.as_deref())?;
     let mut members = vec![member_for(&db, PKG_DB)?];
-    members.extend(tracker_members(staging, &tracker_dir)?);
+    members.extend(tracker_members);
     let mut package_exclusions = exclusions();
-    if redact_history_secrets {
+    if opts.redact_history_secrets {
         package_exclusions.push(
             "credential-shaped spans in UTF-8 text messages.body (opt-in; includes warn-only findings)"
+                .into(),
+        );
+    }
+    if opts.attest_chat_custody_absent {
+        package_exclusions.push(
+            "chat attachment custody outside the store, tracker and state directory (operator \
+             asserted absent for this source; this package does not carry it)"
                 .into(),
         );
     }
@@ -2205,9 +2950,10 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         tx.execute(&format!("DROP TRIGGER {}", quote_ident(name)), [])?;
     }
     // CAD-1412: human-room transcripts reuse the coordination topic tables.
-    // Scrub those rows before the room metadata is dropped, so no private
-    // human post, delivery or membership leaks through the coordination
-    // profile.
+    // Classification already refuses a source that holds human rooms; this is
+    // defence in depth for a copy that somehow still carries one. Scrub those
+    // rows before the room metadata is dropped, so no private human post,
+    // delivery or membership leaks through the coordination profile.
     if tx.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='human_rooms'",
         [],
@@ -2232,7 +2978,10 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
     // coordination profile, so their connection, grant, session and receipt
     // authority never travels — but the cloud request and result TEXT reuses
     // the coordination tables (`messages`, `thread_entries`, `threads`,
-    // `events`). Exporting that text against an alias whose authority rows
+    // `events`). Classification already refuses a source with any cloud-agent
+    // marker (tables, alias provider or `source='cloud_agent'` message), so
+    // the closure below is defence in depth for a copy that somehow still
+    // carries one. Exporting that text against an alias whose authority rows
     // are omitted would hand whoever restores the package a cloud
     // conversation that reads as an ordinary local one. Cloud content is
     // private to the source/owner that was admitted on the live workspace,
@@ -2455,6 +3204,678 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
     tx.commit()?;
     conn.execute_batch("VACUUM")?;
     Ok(omitted)
+}
+
+// ---------- CAD-2215: private-work classification ----------
+
+/// CAD-2215: private or private-capable work the coordination profile cannot
+/// carry. Every table here holds member identity or ownership, an app
+/// conversation binding, an app grant, private chat/artifact content, a
+/// human-room transcript or cloud-agent state. They are all outside the
+/// profile, so a package built from a workspace that holds them would publish
+/// the surrounding jobs, messages and tracker while silently dropping the
+/// ownership, grants, receipts or bytes that make them private. ANY row
+/// refuses the export, in any state: a revoked grant is still a tombstone
+/// naming the member and conversation, a queued row is a request whose job
+/// may not exist yet, and a single chat row is an upload whose bytes are not
+/// in the package. The second element is the refusal vocabulary — a class
+/// name, never a member, job, conversation, file or request.
+const PRIVATE_STORE_TABLES: &[(&str, &str)] = &[
+    // Queued-but-unpromoted: accepted, maybe half-bound, no ledger row.
+    ("assist_request_queue", "queued member requests"),
+    // The owning member's request ledger, the share list, the stall
+    // provenance and the job subscription all name the person.
+    ("assist_requests", "member-private job ownership"),
+    ("assist_job_shares", "member-private job ownership"),
+    ("assist_stall_checks", "member-private job ownership"),
+    ("job_subscribers", "member job subscriptions"),
+    // Per-member assistant bindings carry the member's private conversation.
+    ("assistants", "member assistants"),
+    // Active grants AND revoked tombstones: both are exact per-member
+    // conversation bindings.
+    ("app_member_grants", "app member grants"),
+    // App contexts (per-request app state) and the workspace's app team
+    // default: the coordination profile carries neither, and either can
+    // name a member's work.
+    ("app_contexts", "app contexts"),
+    // Chat attachments and issue artifacts: content plus the member identity
+    // that uploaded or produced it. Both byte stores live outside the
+    // package, so publishing the surrounding rows would drop the work.
+    //
+    // `chat_upload_accounts` is NOT proof of an upload: an account row is
+    // minted on operator login as well as at upload. It is refused
+    // conservatively because an account is the precondition for any
+    // operational put, and the operational custody root cannot be inspected
+    // from an export; refusing every workspace that ever minted one keeps that
+    // unreadable root empty for every export that proceeds. The cost is real:
+    // a board where anyone logged in through the upload-session RPC refuses a
+    // coordination export even if it never uploaded.
+    ("chat_files", "chat files"),
+    (
+        "chat_upload_accounts",
+        "chat upload accounts (conservative)",
+    ),
+    ("artifacts", "artifacts"),
+    // Human-room transcripts and membership. The projection used to strip
+    // these rows; a source holding them now refuses instead, so no private
+    // human conversation is silently dropped.
+    ("human_rooms", "human-room transcripts"),
+    ("human_room_members", "human-room transcripts"),
+    ("human_room_mutes", "human-room transcripts"),
+    // Cloud-agent connections, grants, sessions and operations, and the
+    // request/result text they own. Projected away before; now a refused
+    // source, never a publication without its authority rows.
+    ("cloud_agents", "cloud-agent state"),
+    ("cloud_agent_sources", "cloud-agent state"),
+    ("cloud_agent_sessions", "cloud-agent state"),
+    ("cloud_agent_operations", "cloud-agent state"),
+];
+
+/// CAD-2215: prove the source holds no private work before a coordination
+/// package exists.
+///
+/// This is a refusal, not a scrub. The coordination profile exports jobs,
+/// messages, threads, events and the tracker, but nothing that makes member
+/// work private — so a workspace with private work cannot be exported
+/// safely at any fidelity. Classification is deliberately presence-based
+/// and fail-closed: any row (active, revoked, queued, tombstones included),
+/// any per-installation app record file, chat attachment, artifact, human-room
+/// topic or cloud-agent marker, any recorded private delivery, any private
+/// project policy or any publication marker refuses, and so does a record that
+/// cannot be read or decoded. Nothing is published: the pre-check runs before
+/// staging exists, a later refusal removes the private staging dir, and the
+/// source store, tracker and state dir are only ever read (see
+/// `export_portable`).
+///
+/// `db` is the database to classify — the live store for the pre/post checks
+/// and the private snapshot for the authoritative one. `tracker` is the
+/// tracker whose committed tree `head` would be copied (the private capture
+/// for a snapshot export). The export calls this three times: before any
+/// snapshot copy is written (a refusal creates nothing), on the snapshot that
+/// the package is projected from, and on the live source once the package is
+/// complete, because the store, tracker and private ledger are not one atomic
+/// snapshot. Only counts and fixed class names leave this function; no column
+/// value, path content or member identity does.
+fn classify_private_work(
+    db: &Path,
+    state_dir: &Path,
+    workspace: &Path,
+    tracker: &Path,
+    head: &str,
+    attest_chat_custody_absent: bool,
+) -> Result<()> {
+    // The proven cross-process read of the daemon store: read-only, shared
+    // busy timeout, never creates or migrates the file. The live store may
+    // be inside a daemon write, so a transient lock waits rather than reads
+    // as an unclassifiable workspace.
+    let conn = crate::store::open_read_only(db)?;
+    let mut found: Vec<&'static str> = Vec::new();
+    for &(table, class) in PRIVATE_STORE_TABLES {
+        if count_where(&conn, table, "1")? > 0 {
+            found.push(class);
+        }
+    }
+    if app_conversation_rows(&conn)? > 0 {
+        found.push("app conversations");
+    }
+    // Human-room transcripts reuse the coordination topic tables; the
+    // projection used to delete them, which published the room's remaining
+    // metadata without its posts. Presence now refuses instead.
+    if count_where(&conn, "topics", "type='human_room'")? > 0 {
+        found.push("human-room transcripts");
+    }
+    // Cloud traffic is also marked on the coordination tables: the alias
+    // carries the provider and the messages carry the source. Refusing both
+    // markers means the projection's cloud strip is never the only thing
+    // standing between a cloud conversation and a package.
+    let cloud_provider = format!("provider={}", sql_string(crate::cloud_agent::PROVIDER));
+    if count_where(&conn, "agents", &cloud_provider)? > 0
+        || count_where(&conn, "messages", "source='cloud_agent'")? > 0
+    {
+        found.push("cloud-agent state");
+    }
+    drop(conn);
+    classify_state_dir(state_dir, &mut found)?;
+    // Chat attachment custody has no single establishable root.
+    //
+    // The legacy PM-rooted custody is `<pm dir>/.cadence/chat-files`, and a
+    // nested tracker (`pm/pm.yaml`) roots its PM at `<tracker>/pm`. Both
+    // admitted layouts are inspected here, so no PM-dir guess is needed.
+    refuse_state_entries(
+        &workspace.join(".cadence"),
+        "chat-files",
+        "chat files",
+        &mut found,
+    )?;
+    refuse_state_entries(
+        &workspace.join("pm").join(".cadence"),
+        "chat-files",
+        "chat files",
+        &mut found,
+    )?;
+    classify_tracker(tracker, head, &mut found)?;
+    if found.is_empty() && !attest_chat_custody_absent {
+        // The operational custody root — per-user trees under the workspace
+        // the daemon resolved from its CAPTURED provider environment — has no
+        // durable binding: it is in-process only, and neither the store nor
+        // the state directory records it. `restore --force` can replace the
+        // store with an older copy while that root keeps attachment bytes no
+        // surviving row names, so neither an empty `chat_files` nor an empty
+        // `chat_upload_accounts` proves it empty. The root is never guessed,
+        // and an export that cannot prove it empty refuses unless the operator
+        // states the fact for this source (`--attest-chat-custody-absent`).
+        return Err(Error::rejected(
+            "portable export refused: chat attachment custody cannot be proven absent for this \
+             source. The daemon resolves an operational upload workspace from its in-process \
+             provider environment and persists no binding; a store restore can replace the \
+             database while an earlier root keeps attachment bytes that no surviving row names. \
+             Proving absence needs a complete, restore-surviving record of every operational \
+             workspace this store has ever used, and no such record exists; a forward-only \
+             sidecar or the current environment cannot establish history. Re-run with \
+             `--attest-chat-custody-absent` to state for this source that no such root holds \
+             attachment bytes. No package was written and the source is unchanged.",
+        ));
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    let mut classes: Vec<&'static str> = Vec::with_capacity(found.len());
+    for class in found {
+        if !classes.contains(&class) {
+            classes.push(class);
+        }
+    }
+    Err(Error::rejected(format!(
+        "portable export refused: this workspace holds private work ({}). A coordination \
+         package carries jobs, messages, threads, events and the tracker, but not the member \
+         ownership, grants, conversations and receipts that make that work private, so \
+         publishing one would expose private work without its provenance. No package was \
+         written and the source is unchanged. Keep the source workspace (its store, tracker \
+         and state directory) as the record of that private work, and export a workspace \
+         that holds none of it.",
+        classes.join(", ")
+    )))
+}
+
+/// State-directory custody roots beside the store that hold private or
+/// private-capable content and are never package members, so no package can
+/// disclose them and no export may drop them silently. Any entry refuses; an
+/// absent root, or an empty real directory (it holds nothing), stays clean.
+const PRIVATE_STATE_DIRS: &[(&str, &str)] = &[
+    // `store::app_records::RECORDS_DIR`: one app-owned SQLite file per
+    // installation. A grant and a conversation thread can both be gone while
+    // the record file remains, so no store marker can prove it holds no
+    // member work. Every entry counts, including WAL sidecars and
+    // interrupted-restore dotfiles: calling one class "ordinary" would be a
+    // guess.
+    (crate::store::app_records::RECORDS_DIR, "app record state"),
+    // `store::chat_files::CHAT_FILES_DIR` and `store::artifacts::ARTIFACTS_DIR`
+    // (private module constants; these are their on-disk names): chat
+    // attachments and issue artifact bytes, plus the member identity that
+    // uploaded or produced them.
+    ("chat-files", "chat files"),
+    ("artifacts", "artifacts"),
+    // `daemon::members_rpc`'s private job spec custody. A crash can leave a
+    // spec whose queue/ledger binding never landed, so any entry — and any
+    // unreadable or non-directory path — blocks instead of being read as "no
+    // private job".
+    ("assist_jobs", "member-private job specs"),
+    // `wiki::UPLOAD_DIR`: the one staging root uploads are read through.
+    // A successful put moves the file out, so an entry here is an upload this
+    // export cannot attribute — chat attachment or workspace wiki file — and
+    // is refused rather than guessed as ordinary.
+    (crate::wiki::UPLOAD_DIR, "wiki upload staging"),
+];
+
+/// `daemon::app_teams_rpc`'s workspace app-team default file.
+const APP_TEAMS_FILE: &str = "app-teams.json";
+
+/// State-directory artifacts beside the store that can hold private member
+/// work and are never package members, so no package can disclose them and
+/// no export can drop them silently.
+///
+/// * Every root in [`PRIVATE_STATE_DIRS`] refuses on any entry.
+/// * `app-teams.json` names each installation's owner PM and workflow roles.
+///   A coordination package does not carry it and cannot prove an
+///   installation's team is unrelated to member work, so any recorded team
+///   refuses; an absent file or an empty JSON object is clean, and an
+///   unreadable, linked or non-JSON file refuses rather than reading as "no
+///   team".
+/// * `delivery-private.json` is the durable private delivery and publication
+///   ledger: results, receipts and publication attempts for member-private
+///   jobs. Any recorded delivery refuses, and the loader treats an unreadable
+///   ledger as an error, never as an empty one.
+///
+/// This is not a claim to identify arbitrary private text with no
+/// provenance: an artifact that leaves no row, no ledger record and no marker
+/// here is outside what this classification can observe, and the docs say so.
+fn classify_state_dir(state_dir: &Path, found: &mut Vec<&'static str>) -> Result<()> {
+    for &(name, class) in PRIVATE_STATE_DIRS {
+        refuse_state_entries(state_dir, name, class, found)?;
+    }
+    classify_app_teams(state_dir, found)?;
+    let deliveries = crate::delivery::private::load(state_dir)
+        .map_err(|error| refuse_unclassifiable_state(&error.to_string()))?;
+    if !deliveries.is_empty() {
+        found.push("private delivery/publication state");
+    }
+    Ok(())
+}
+
+/// Refuse when `<state_dir>/<name>` holds any entry. A missing path, or an
+/// empty real directory, holds nothing.
+fn refuse_state_entries(
+    state_dir: &Path,
+    name: &str,
+    class: &'static str,
+    found: &mut Vec<&'static str>,
+) -> Result<()> {
+    let path = state_dir.join(name);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(refuse_unclassifiable_state(&format!(
+            "the {name} root beside the store cannot be read ({error})"
+        ))),
+        Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+            Err(refuse_unclassifiable_state(&format!(
+                "the {name} path beside the store is not a real directory"
+            )))
+        }
+        Ok(_) => {
+            let mut entries = fs::read_dir(&path).map_err(|error| {
+                refuse_unclassifiable_state(&format!(
+                    "the {name} root beside the store cannot be listed ({error})"
+                ))
+            })?;
+            if entries.next().is_some() {
+                found.push(class);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Refuse when the workspace app-team default file records any team.
+fn classify_app_teams(state_dir: &Path, found: &mut Vec<&'static str>) -> Result<()> {
+    let path = state_dir.join(APP_TEAMS_FILE);
+    let meta = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(refuse_unclassifiable_state(&format!(
+                "the app team record beside the store cannot be read ({error})"
+            )))
+        }
+        Ok(meta) => meta,
+    };
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.nlink() != 1 {
+        return Err(refuse_unclassifiable_state(
+            "the app team record beside the store is not a plain single-link regular file",
+        ));
+    }
+    let bytes = fs::read(&path).map_err(|error| {
+        refuse_unclassifiable_state(&format!(
+            "the app team record beside the store cannot be read ({error})"
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+        refuse_unclassifiable_state("the app team record beside the store is not valid JSON")
+    })?;
+    match value.as_object() {
+        Some(teams) if teams.is_empty() => Ok(()),
+        Some(_) => {
+            found.push("app teams");
+            Ok(())
+        }
+        None => Err(refuse_unclassifiable_state(
+            "the app team record beside the store is not a JSON object",
+        )),
+    }
+}
+
+/// The refusal for a state-directory artifact this export cannot read well
+/// enough to prove it holds no private member work. The reason names the
+/// artifact and never its content.
+fn refuse_unclassifiable_state(why: &str) -> Error {
+    Error::rejected(format!(
+        "portable export refused: {why}, so private member app data cannot be ruled out; \
+         no package was written and the source is unchanged"
+    ))
+}
+
+/// `count(*)` over `table` (quoted) with an internal predicate, or 0 when
+/// the store predates the table. The caller has already proved the table's
+/// exact columns, so this only counts rows; no column value is read.
+fn count_where(conn: &Connection, table: &str, predicate: &str) -> Result<i64> {
+    let present: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |r| r.get(0),
+    )?;
+    if present == 0 {
+        return Ok(0);
+    }
+    Ok(conn.query_row(
+        &format!(
+            "SELECT count(*) FROM {} WHERE {predicate}",
+            quote_ident(table)
+        ),
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// App installation conversations are `threads` rows with an `install_id`
+/// (CAD-1098). A conversation is private whether or not a grant names it.
+/// A store whose `threads` predates that column has none.
+fn app_conversation_rows(conn: &Connection) -> Result<i64> {
+    if !has_column(conn, "threads", "install_id")? {
+        return Ok(0);
+    }
+    count_where(conn, "threads", "install_id IS NOT NULL")
+}
+
+/// Is `column` one of `table`'s physical columns? Used only to prove an
+/// internal predicate can run against a store that may predate the column;
+/// absence is "no such rows", never an inferred value.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let present: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM pragma_table_info({}) WHERE name=?1",
+            sql_string(table)
+        ),
+        [column],
+        |r| r.get(0),
+    )?;
+    Ok(present > 0)
+}
+
+/// Private tracker content, read from the SAME committed tree `copy_tracker`
+/// packages, so a snapshot export classifies exactly what it would copy.
+///
+/// * A project whose recorded policy is `visibility: private` hides its
+///   tickets behind grants; packaging the tracker would publish them while
+///   leaving the policy that restricted them behind.
+/// * A publication comment is the tracker-side receipt that a
+///   member-private delivery was shared here. The other half (which
+///   delivery, which results, which attempt) is the private ledger beside
+///   the store, which no package carries.
+///
+/// A project record that cannot be decoded refuses: an unreadable policy is
+/// not a public one. The tracker admission already refused symlinks and
+/// non-regular files, so every listed path is a real blob.
+fn classify_tracker(tracker: &Path, head: &str, found: &mut Vec<&'static str>) -> Result<()> {
+    let listing = git_plain(tracker, &["ls-tree", "-r", "-z", "--full-tree", head])?;
+    let mut paths: Vec<&str> = Vec::new();
+    for record in listing.split('\0').filter(|r| !r.is_empty()) {
+        let (_, path) = record
+            .split_once('\t')
+            .ok_or_else(|| Error::rejected("malformed tracker listing"))?;
+        paths.push(path);
+    }
+    // The PM root comes from the SAME tree `copy_tracker` reads. Asking the
+    // worktree could say "no pm.yaml" while `head` still carries one, which
+    // would skip every project record the package would then include.
+    let pm_root = pm_root_from_paths(paths.iter().copied())?;
+    classify_tracker_paths(
+        paths.iter().copied(),
+        pm_root.as_deref(),
+        "export",
+        |path| git_bytes(tracker, &["show", &format!("{head}:{path}")]),
+        found,
+    )
+}
+
+/// Classify a tracker member set. `read` returns the exact bytes of one
+/// tracker-relative path, so the caller decides whether they come from a Git
+/// blob or a copied/staged file — classification never re-derives paths and
+/// never trusts a tree layout the caller did not enumerate.
+fn classify_tracker_paths<'a, F>(
+    paths: impl Iterator<Item = &'a str>,
+    pm_root: Option<&str>,
+    what: &str,
+    mut read: F,
+    found: &mut Vec<&'static str>,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<Vec<u8>>,
+{
+    let paths: Vec<&str> = paths.collect();
+    refuse_ambiguous_project_layout(&paths, pm_root, what)?;
+    for path in paths {
+        // Publication evidence needs no PM root: the file name is proof on
+        // its own, so a tracker without `pm.yaml` is still scanned for it.
+        if publication_comment(path) {
+            found.push("private delivery/publication state");
+            continue;
+        }
+        let Some(root) = pm_root else {
+            continue;
+        };
+        if project_record_key(root, path).is_none() {
+            continue;
+        }
+        let bytes = read(path)?;
+        if project_record_is_private(path, &bytes, what)? {
+            found.push("private project policy");
+        }
+    }
+    Ok(())
+}
+
+/// Refuse project-shaped records that no carried PM root can authorize, and a
+/// second project layout beside the authoritative one. Both are ambiguous
+/// evidence of a private policy, never permission to ignore it.
+fn refuse_ambiguous_project_layout(
+    paths: &[&str],
+    pm_root: Option<&str>,
+    what: &str,
+) -> Result<()> {
+    let mut at_root = false;
+    let mut nested = false;
+    for path in paths {
+        if project_record_key(".", path).is_some() {
+            at_root = true;
+        }
+        if project_record_key("pm", path).is_some() {
+            nested = true;
+        }
+    }
+    let unproven = match pm_root {
+        None => at_root || nested,
+        Some(".") => nested,
+        Some("pm") => at_root,
+        Some(_) => true,
+    };
+    if unproven {
+        return Err(Error::rejected(format!(
+            "portable {what} refused: the tracker carries project-shaped records whose PM root \
+             is missing or ambiguous, so a private project policy cannot be ruled out; nothing \
+             was published"
+        )));
+    }
+    Ok(())
+}
+
+/// Decode one project record and answer whether it records a private policy.
+/// Shared by the Git classifier, the copied-tree classifier and the per-member
+/// package check, so all three apply the same rule to the same bytes.
+fn project_record_is_private(path: &str, bytes: &[u8], what: &str) -> Result<bool> {
+    let decoded =
+        serde_yaml::from_slice::<crate::issue::project::Project>(bytes).map_err(|_| {
+            Error::rejected(format!(
+                "portable {what} refused: tracker project record {path} cannot be decoded, so a \
+             private project policy cannot be ruled out; nothing was published"
+            ))
+        })?;
+    Ok(decoded
+        .policy
+        .as_ref()
+        .is_some_and(|policy| policy.visibility == crate::issue::project::Visibility::Private))
+}
+
+/// `<key>/project.yaml` or `pm/<key>/project.yaml`: project-shaped in either
+/// admitted layout, whatever PM root the tree carries.
+fn project_shaped(path: &str) -> bool {
+    project_record_key(".", path).is_some() || project_record_key("pm", path).is_some()
+}
+
+/// A project record sits at exactly `<pm-root>/<key>/project.yaml`; nothing
+/// deeper or shallower is one, and the PM root already came from `pm.yaml`.
+fn project_record_key<'a>(pm_root: &str, path: &'a str) -> Option<&'a str> {
+    let rel = if pm_root == "." {
+        path
+    } else {
+        path.strip_prefix("pm/")?
+    };
+    let (key, file) = rel.split_once('/')?;
+    if key.is_empty() || file != "project.yaml" {
+        return None;
+    }
+    Some(key)
+}
+
+/// The publication writer keys its comment `publication`, so a tracker file
+/// ending `-publication.md` under a ticket's `comments/` dir is one of its
+/// publications. The name is not caller-chosen: `add_comment_keyed` is
+/// internal, so this is evidence, not a guess.
+fn publication_comment(path: &str) -> bool {
+    path.split('/').any(|part| part == "comments")
+        && path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.ends_with("-publication.md"))
+}
+
+/// The PM root carried by an enumerated tracker member set. Mirrors
+/// `pm_root_of`'s ambiguity refusal, but over the exact paths being packaged
+/// or verified, so classification, copy and manifest verification can never
+/// disagree about which project records exist.
+fn pm_root_from_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Result<Option<String>> {
+    let mut at_root = false;
+    let mut nested = false;
+    for path in paths {
+        match path {
+            "pm.yaml" => at_root = true,
+            "pm/pm.yaml" => nested = true,
+            _ => {}
+        }
+    }
+    match (at_root, nested) {
+        (true, true) => Err(Error::rejected(
+            "tracker has pm.yaml at its root and in pm/; the PM root is ambiguous",
+        )),
+        (true, false) => Ok(Some(".".into())),
+        (false, true) => Ok(Some("pm".into())),
+        (false, false) => Ok(None),
+    }
+}
+
+/// Tracker-relative regular files under a copied tracker tree, sorted.
+/// Symlinks and special files refuse rather than being skipped.
+fn walk_tracker_paths(dir: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(&current)? {
+            let path = entry?.path();
+            let meta = path.symlink_metadata()?;
+            if meta.file_type().is_symlink() {
+                return Err(Error::rejected("tracker copy contains a symlink"));
+            }
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() {
+                out.push(
+                    path.strip_prefix(dir)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            } else {
+                return Err(Error::rejected("tracker copy contains a non-regular file"));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Walk a copied package tracker once, and for each file read the bytes ONCE,
+/// then hash and classify that same buffer. The returned members are exactly
+/// what the manifest will record; a private or undecodable record refuses, as
+/// does project-shaped evidence the copied tree's PM root cannot authorize.
+fn package_tracker_members(tracker: &Path, pm_root: Option<&str>) -> Result<Vec<Member>> {
+    let paths = walk_tracker_paths(tracker)?;
+    let as_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    refuse_ambiguous_project_layout(&as_refs, pm_root, "export")?;
+    let mut members = Vec::with_capacity(paths.len());
+    for rel in paths {
+        let file = tracker.join(&rel);
+        let bytes = fs::read(&file).map_err(|error| {
+            Error::rejected(format!(
+                "portable export refused: tracker file {rel} cannot be read ({error}); nothing \
+                 was published"
+            ))
+        })?;
+        check_tracker_path(&rel)?;
+        check_tracker_content(&rel, &bytes)?;
+        check_tracker_private_content("export", pm_root, &rel, &bytes)?;
+        members.push(Member {
+            path: format!("{PKG_TRACKER}/{rel}"),
+            bytes: bytes.len() as u64,
+            sha256: hex_digest(&bytes),
+        });
+    }
+    Ok(members)
+}
+
+/// Lowercase hex SHA-256 of the exact bytes a check classified.
+fn hex_digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// CAD-2215: a package's tracker copy must not carry content whose provenance
+/// the coordination profile cannot carry. Runs on the exact bytes
+/// `verify_manifest_bytes` already hashed and matched, so `inspect-portable`
+/// and every restore refuse an older or crafted package instead of admitting
+/// it:
+///
+/// * a publication comment is the tracker-side receipt of a member-private
+///   delivery, and no package carries the delivery it names;
+/// * a project record whose policy is `visibility: private` hides its tickets
+///   behind grants that are not in the package, so the tickets would be
+///   admitted to every reader. A project-shaped record the carried PM root
+///   cannot authorize, or one this binary cannot decode, refuses too: an
+///   unreadable policy is not a public one.
+fn check_tracker_private_content(
+    what: &str,
+    pm_root: Option<&str>,
+    path: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    if publication_comment(path) {
+        return Err(Error::rejected(format!(
+            "portable {what} refused: tracker file {path} is a publication comment; a \
+             coordination package cannot carry the receipt of a member-private delivery"
+        )));
+    }
+    let authorized = pm_root.is_some_and(|root| project_record_key(root, path).is_some());
+    if !authorized {
+        if !project_shaped(path) {
+            return Ok(());
+        }
+        return Err(Error::rejected(format!(
+            "portable {what} refused: tracker file {path} is project-shaped but the carried \
+             PM root does not authorize it, so a private project policy cannot be ruled out"
+        )));
+    }
+    if project_record_is_private(path, bytes, what)? {
+        return Err(Error::rejected(format!(
+            "portable {what} refused: tracker project record {path} records a private project \
+             policy; a coordination package cannot carry it without its grants"
+        )));
+    }
+    Ok(())
 }
 
 // ---------- tracker admission and copy ----------
@@ -2929,32 +4350,6 @@ fn safe_relative(path: &Path) -> bool {
     !path.as_os_str().is_empty() && path.components().all(|c| matches!(c, Component::Normal(_)))
 }
 
-fn tracker_members(root: &Path, dir: &Path) -> Result<Vec<Member>> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for entry in fs::read_dir(&d)? {
-            let path = entry?.path();
-            let meta = path.symlink_metadata()?;
-            if meta.file_type().is_symlink() {
-                return Err(Error::rejected("tracker copy contains a symlink"));
-            }
-            if meta.is_dir() {
-                stack.push(path);
-            } else {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .into_owned();
-                out.push(member_for(&path, &rel)?);
-            }
-        }
-    }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
-}
-
 fn member_for(file: &Path, rel: &str) -> Result<Member> {
     let (sha256, bytes) = hash_file(file)?;
     Ok(Member {
@@ -3067,12 +4462,13 @@ fn rename_noreplace(_src: &Path, _dst: &Path) -> Result<()> {
 
 fn exclusions() -> Vec<String> {
     [
-        "authority: platform_credentials, platform_grants, platform_defaults, platform_drafts, platform_effects, app_grants, rollout_grants, rollout_leases, staging_grants, staging_instances, daemon_build, assistants, assist_requests, assist_stall_checks, assist_job_shares, job_subscribers (rows deleted from the private copy)",
+        "authority: platform_credentials, platform_grants, platform_defaults, platform_drafts, platform_effects, app_grants, rollout_grants, rollout_leases, staging_grants, staging_instances, daemon_build (rows deleted from the private copy)",
+        "private or private-capable state is never exported at any fidelity, and a source holding any of it refuses export instead of dropping it: queued-but-unpromoted member requests (assist_request_queue), member-private job ownership (assist_requests, assist_job_shares, assist_stall_checks), member job subscriptions (job_subscribers), member assistants (assistants), app member grants in any state including revoked tombstones (app_member_grants), app conversations (threads.install_id), app contexts (app_contexts), app team defaults (app-teams.json), per-installation app records (app-records/), chat attachments (chat_files, chat-file custody under the workspace .cadence/chat-files and the state chat-files/), chat upload accounts (chat_upload_accounts), issue artifacts (artifacts, artifacts/), member-private job specs (assist_jobs/), upload staging under wiki-uploads/, human-room topics and membership (human_rooms, human_room_members, human_room_mutes, topics.type=human_room), cloud-agent state (cloud_agents, cloud_agent_sources, cloud_agent_sessions, cloud_agent_operations, provider=agenticos-cloud aliases, source=cloud_agent messages), the state-dir private delivery/publication ledger (delivery-private.json), publication comments in the tracker, and private project policies (project.yaml visibility private). This package was classified as holding none of it",
         "live execution authority nulled: agents.generation, pid, pid_start, endpoint, thread_id, session_id, params; messages.turn_id; token-shaped values redacted by the existing scrub",
         "imported actors disabled: agents.enabled=0; monitors dispatch flags=0",
         "provenance purged: connection_metadata (source UUID recorded in the manifest only), model_defaults, settings_authority",
-        "business app data outside the coordination profile: app_*, crm_*, social_publish_intents, cloud_dispatch_outbox, chat_files, artifacts (rows deleted from the private copy; declared omitted, not a full workspace)",
-        "cloud-agent private content: cloud_agents, cloud_agent_sources, cloud_agent_sessions and cloud_agent_operations, plus the cloud alias' messages, thread entries, threads and events and every request/result copy DERIVED from a cloud message by origin (a routed worker_result/worker_notice on an ordinary alias, with its thread entries and receipt) (rows deleted from the private copy). The alias row itself is kept inert with no authority; cloud projections of it fail closed until it is reconnected explicitly",
+        "other app/business data outside the coordination profile and not classified above: app_installations, app_bindings, app_runs, app media/assets/records/sends, crm_*, social_publish_intents, cloud_dispatch_outbox (rows deleted from the private copy; declared omitted, not a full workspace)",
+        "residual cloud-agent and human-room rows: the projection still deletes any it finds as defence in depth, but export already refuses a source holding cloud-agent or human-room state, so a published package carries none",
         "local checkouts, process identity, sockets and runtime files: not included",
     ]
     .iter()
@@ -3119,7 +4515,10 @@ pub fn restore_inactive(
             "replacing a destination needs native operator admission, which is not wired yet; nothing was written",
         ));
     }
-    let manifest = verify_package(source)?;
+    // Verify once into the immutable snapshot and stage only from it: no
+    // source path (or any of its ancestors) is read after verification.
+    let verified = inspect_package(source)?;
+    let manifest = verified.manifest.clone();
     refuse_nonempty(destination)?;
     let parent = destination
         .parent()
@@ -3140,7 +4539,7 @@ pub fn restore_inactive(
     // not at all.
     let stage = parent.join(format!(".portable-stage-{}", nonce()));
     fs::DirBuilder::new().mode(0o700).create(&stage)?;
-    if let Err(error) = stage_and_validate(source, &stage, &manifest) {
+    if let Err(error) = stage_and_validate(verified.snapshot_root(), &stage, &manifest) {
         let _ = fs::remove_dir_all(&stage);
         return Err(error);
     }
@@ -3168,8 +4567,9 @@ pub fn restore_activate_disabled(
     destination: &Path,
     reconciliation: &[crate::backup::portable_activate::Reconciliation],
 ) -> Result<Value> {
-    let manifest = verify_package(source)?;
-    let digest = crate::backup::portable_replace::package_digest(source)?;
+    let verified = inspect_package(source)?;
+    let manifest = &verified.manifest;
+    let digest = &verified.manifest_sha256;
     refuse_existing_activation(destination)?;
     // The package and the target must be disjoint: staging beside, inside or
     // over the package would read and write the same tree.
@@ -3180,12 +4580,12 @@ pub fn restore_activate_disabled(
     let stage = parent.join(format!(".portable-stage-{}", nonce()));
     fs::DirBuilder::new().mode(0o700).create(&stage)?;
     let outcome = (|| {
-        stage_and_validate(source, &stage, &manifest)?;
+        stage_and_validate(verified.snapshot_root(), &stage, manifest)?;
         let before = crate::backup::portable_replace::snapshot_target_dir(&stage)?;
         let mut report = crate::backup::portable_activate::activate_in_place(
             &stage,
             &before,
-            &digest,
+            digest,
             reconciliation,
         )?;
         publish_stage(&stage, &target)?;
@@ -3205,9 +4605,10 @@ pub fn restore_activate_disabled(
 /// AOS-339/CAD-1705: the read-only activation plan for a package. Reads the
 /// package's own store and writes nothing persistent.
 pub fn activate_preflight(source: &Path) -> Result<Value> {
-    verify_package(source)?;
-    let digest = crate::backup::portable_replace::package_digest(source)?;
-    let required = crate::backup::portable_activate::required_inventory(source)?;
+    // Inspect the private snapshot before producing the reconciliation plan.
+    let verified = inspect_package(source)?;
+    let digest = &verified.manifest_sha256;
+    let required = crate::backup::portable_activate::required_inventory(verified.snapshot_root())?;
     Ok(json!({
         "package_digest": digest,
         "execution_mode": "disabled",
@@ -3319,18 +4720,44 @@ fn ensure_coordination_metadata(db: &Path, schema_version: i64) -> Result<()> {
 /// Re-hash every staged core and tracker member immediately before commit:
 /// a source change after verify but before copy must not survive.
 fn verify_staged_members(stage: &Path, manifest: &PortableManifest) -> Result<()> {
+    let tracker_prefix = format!("{PKG_TRACKER}/");
+    let mut seen = std::collections::BTreeSet::new();
     for m in manifest.members.iter() {
-        let staged = match m.path.strip_prefix(&format!("{PKG_TRACKER}/")) {
+        let staged = match m.path.strip_prefix(&tracker_prefix) {
             Some(rel) => stage.join(TRACKER_DIR).join(rel),
             None => stage.join(&m.path),
         };
-        let (sha, bytes) = hash_file(&staged)?;
-        if sha != m.sha256 || bytes != m.bytes {
-            return Err(Error::rejected(format!(
-                "staged member {} does not match the manifest",
-                m.path
-            )));
+        if let Some(rel) = m.path.strip_prefix(&tracker_prefix) {
+            // Re-read and re-classify the staged bytes that are about to be
+            // published. Hashing and classification use the same buffer, so a
+            // replacement after the earlier verification cannot publish
+            // content no classification saw.
+            let bytes = fs::read(&staged)
+                .map_err(|_| Error::rejected(format!("staged member {} unreadable", m.path)))?;
+            if hex_digest(&bytes) != m.sha256 || bytes.len() as u64 != m.bytes {
+                return Err(Error::rejected(format!(
+                    "staged member {} does not match the manifest",
+                    m.path
+                )));
+            }
+            seen.insert(rel.to_string());
+            check_tracker_private_content("package", manifest.pm_root.as_deref(), rel, &bytes)?;
+        } else {
+            let (sha, bytes) = hash_file(&staged)?;
+            if sha != m.sha256 || bytes != m.bytes {
+                return Err(Error::rejected(format!(
+                    "staged member {} does not match the manifest",
+                    m.path
+                )));
+            }
         }
+    }
+    // An unlisted staged file could carry content no classification saw.
+    let paths = walk_tracker_paths(&stage.join(TRACKER_DIR))?;
+    if paths.len() != seen.len() || paths.iter().any(|path| !seen.contains(path)) {
+        return Err(Error::rejected(
+            "staged tracker member set differs from the manifest",
+        ));
     }
     Ok(())
 }
@@ -3350,81 +4777,6 @@ fn publish_stage(stage: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read the manifest and verify every listed member: plain relative paths,
-/// the exact member set (core store plus tracker files, nothing else),
-/// exact bytes and sha256, and only regular non-linked files.
-fn verify_package(source: &Path) -> Result<PortableManifest> {
-    let bytes = fs::read(source.join(PKG_MANIFEST))
-        .map_err(|e| Error::rejected(format!("cannot read manifest: {e}")))?;
-    verify_manifest_bytes(source, &bytes)
-}
-
-/// The manifest bytes parsed and every member check applied.
-/// Verification works on the caller-supplied exact bytes, so the digest a
-/// caller binds is provably the digest of what was checked.
-fn verify_manifest_bytes(source: &Path, manifest_bytes: &[u8]) -> Result<PortableManifest> {
-    let manifest: PortableManifest = serde_json::from_slice(manifest_bytes)
-        .map_err(|e| Error::rejected(format!("malformed manifest: {e}")))?;
-    if manifest.format != PORTABLE_FORMAT
-        || manifest.scope != "coordination"
-        || manifest.full_workspace
-    {
-        return Err(Error::rejected(
-            "manifest is not a coordination portable package",
-        ));
-    }
-    if !matches!(manifest.pm_root.as_deref(), None | Some(".") | Some("pm")) {
-        return Err(Error::rejected(
-            "manifest pm_root is not an admitted PM root",
-        ));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for m in &manifest.members {
-        let rel = Path::new(&m.path);
-        if !safe_relative(rel) {
-            return Err(Error::rejected(format!("unsafe member path {}", m.path)));
-        }
-        if m.path != PKG_DB && !m.path.starts_with(&format!("{PKG_TRACKER}/")) {
-            return Err(Error::rejected(format!(
-                "member {} is outside the core store and tracker",
-                m.path
-            )));
-        }
-        if !seen.insert(m.path.clone()) {
-            return Err(Error::rejected(format!("duplicate member {}", m.path)));
-        }
-        if let Some(tracked) = m.path.strip_prefix(&format!("{PKG_TRACKER}/")) {
-            check_tracker_path(tracked)?;
-            let file = source.join(rel);
-            require_regular(&file)?;
-            check_tracker_content(tracked, &fs::read(&file)?)?;
-        }
-        let file = source.join(rel);
-        require_regular(&file)?;
-        let (sha, bytes) = hash_file(&file)
-            .map_err(|_| Error::rejected(format!("member {} missing or unreadable", m.path)))?;
-        if sha != m.sha256 || bytes != m.bytes {
-            return Err(Error::rejected(format!(
-                "member {} changed (digest or size mismatch)",
-                m.path
-            )));
-        }
-    }
-    if !seen.contains(PKG_DB) {
-        return Err(Error::rejected("package has no store member"));
-    }
-    let mut actual = Vec::new();
-    collect_package_members(source, source, &mut actual)?;
-    for p in &actual {
-        if p != PKG_MANIFEST && !seen.contains(p) {
-            return Err(Error::rejected(format!(
-                "package contains unlisted member {p}"
-            )));
-        }
-    }
-    Ok(manifest)
-}
-
 /// A member must be a regular file with a single link: not a symlink,
 /// device, fifo, socket or hardlink.
 fn require_regular(path: &Path) -> Result<()> {
@@ -3436,27 +4788,6 @@ fn require_regular(path: &Path) -> Result<()> {
             "{} is not a plain single-link regular file",
             path.display()
         )));
-    }
-    Ok(())
-}
-
-fn collect_package_members(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        let meta = path.symlink_metadata()?;
-        if meta.file_type().is_symlink() {
-            return Err(Error::rejected("package contains a symlink"));
-        }
-        if meta.is_dir() {
-            collect_package_members(root, &path, out)?;
-        } else {
-            out.push(
-                path.strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
     }
     Ok(())
 }
@@ -3538,6 +4869,39 @@ fn validate_staged_store(db: &Path, manifest: &PortableManifest) -> Result<()> {
             )));
         }
     }
+    // CAD-2215: a coordination store never carries an app installation
+    // conversation (`threads.install_id`). A conversation is private member
+    // work whose installation, grants and member provenance are all outside
+    // this profile, so a package that still carries one was produced
+    // without the export classification and cannot be imported as proven
+    // clean. The `threads` row is not an omitted table, so the loop above
+    // cannot see it.
+    if app_conversation_rows(&conn)? > 0 {
+        return Err(Error::rejected(
+            "staged store carries app conversations; a coordination package cannot be proven \
+             free of private member work",
+        ));
+    }
+    // The same rule for the coordinated tables that can carry private
+    // content: human-room topics and cloud-agent markers. Their provenance
+    // tables are omitted, so these markers are the only evidence a package
+    // could carry, and a package carrying them was produced without the
+    // export classification.
+    if count_where(&conn, "topics", "type='human_room'")? > 0 {
+        return Err(Error::rejected(
+            "staged store carries human-room topics; a coordination package cannot be proven \
+             free of private conversation",
+        ));
+    }
+    let cloud_provider = format!("provider={}", sql_string(crate::cloud_agent::PROVIDER));
+    if count_where(&conn, "agents", &cloud_provider)? > 0
+        || count_where(&conn, "messages", "source='cloud_agent'")? > 0
+    {
+        return Err(Error::rejected(
+            "staged store carries cloud-agent state; a coordination package cannot be proven \
+             free of private cloud content",
+        ));
+    }
     let enabled: i64 = conn.query_row("SELECT count(*) FROM agents WHERE enabled<>0", [], |r| {
         r.get(0)
     })?;
@@ -3595,29 +4959,46 @@ fn verify_tracker_content(tracker: &Path, manifest: &PortableManifest) -> Result
     // Actual members are relative to the tracker dir; manifest members carry
     // the package's `tracker/` prefix. Compare on the path below that prefix.
     let prefix = format!("{PKG_TRACKER}/");
-    let actual = tracker_members(tracker.parent().unwrap_or(tracker), tracker)?;
-    let expected: Vec<&Member> = manifest
-        .members
-        .iter()
-        .filter(|m| m.path.starts_with(&prefix))
-        .collect();
-    if actual.len() != expected.len() {
+    let paths = walk_tracker_paths(tracker)?;
+    let actual_pm_root = pm_root_from_paths(paths.iter().map(String::as_str))?;
+    if actual_pm_root != manifest.pm_root {
+        return Err(Error::rejected(
+            "tracker copy PM root does not match the manifest",
+        ));
+    }
+    // Manifest members are named with the package's `tracker/` prefix, while
+    // the staged tree is keyed by its tracker-relative path (and lives under
+    // `TRACKER_DIR` on disk). Index by the relative path so the two namespaces
+    // are compared exactly once.
+    let mut expected: std::collections::BTreeMap<&str, &Member> = std::collections::BTreeMap::new();
+    for m in manifest.members.iter() {
+        if let Some(rel) = m.path.strip_prefix(&prefix) {
+            expected.insert(rel, m);
+        }
+    }
+    if paths.len() != expected.len() {
         return Err(Error::rejected(
             "tracker copy member set differs from the manifest",
         ));
     }
-    for m in expected {
-        let rel = &m.path[prefix.len()..];
-        let want = format!("{TRACKER_DIR}/{rel}");
-        match actual.iter().find(|a| a.path == want) {
-            Some(a) if a.sha256 == m.sha256 && a.bytes == m.bytes => {}
-            _ => {
-                return Err(Error::rejected(format!(
-                    "tracker member {} does not match the manifest",
-                    m.path
-                )))
-            }
+    for rel in &paths {
+        let file = tracker.join(rel);
+        // One read for both the digest comparison and the content
+        // classification: the staged bytes that verify are the bytes that get
+        // classified, so a concurrent replacement cannot slip unclassified
+        // content past the check that just passed.
+        let bytes = fs::read(&file)
+            .map_err(|_| Error::rejected(format!("tracker member {rel} unreadable")))?;
+        let sha = hex_digest(&bytes);
+        let matches = expected
+            .get(rel.as_str())
+            .is_some_and(|m| m.sha256 == sha && m.bytes == bytes.len() as u64);
+        if !matches {
+            return Err(Error::rejected(format!(
+                "tracker member {rel} does not match the manifest"
+            )));
         }
+        check_tracker_private_content("package", actual_pm_root.as_deref(), rel, &bytes)?;
     }
     Ok(())
 }
@@ -3715,8 +5096,8 @@ pub fn activate(_state_dir: &Path, _proof: &NativeOperatorProof) -> Result<Value
 
 /// Closed verifier for replacement: the same package verification as
 /// [`restore_inactive`], exposed crate-internally.
-pub(crate) fn verify_package_for_replace(source: &Path) -> Result<PortableManifest> {
-    verify_package(source)
+pub(crate) fn verify_package_for_replace(source: &Path) -> Result<VerifiedPackage> {
+    inspect_package(source)
 }
 
 /// Stage and validate the complete inactive member set into the empty

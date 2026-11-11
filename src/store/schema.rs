@@ -1724,6 +1724,103 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=63", [])?;
                 tx.commit()?;
             }
+            if version < 64 {
+                // CAD-2215: a member job request is accepted DURABLY before
+                // any job publication, so an issue already held by another
+                // nonterminal job yields a pending request instead of an
+                // occupancy-dependent refusal. New table only; no existing
+                // row is read or rewritten, and the canonical
+                // `assist_requests` promotion ledger is unchanged. The
+                // primary key is the same `(org, sub, request_key)`
+                // idempotency triple, so a replay can never retarget an
+                // accepted request.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS assist_request_queue(
+                        org TEXT NOT NULL, sub TEXT NOT NULL,
+                        request_key TEXT NOT NULL, issue TEXT NOT NULL,
+                        title TEXT NOT NULL, body TEXT NOT NULL,
+                        acceptance TEXT NOT NULL, credential_id TEXT NOT NULL,
+                        created REAL NOT NULL,
+                        last_attempt REAL NOT NULL DEFAULT 0,
+                        last_outcome TEXT,
+                        completed INTEGER NOT NULL DEFAULT 0,
+                        job_id TEXT NOT NULL,
+                        PRIMARY KEY (org, sub, request_key));
+                     CREATE INDEX IF NOT EXISTS assist_request_queue_owner
+                        ON assist_request_queue(org, sub, created);
+                     -- The canonical job id is persisted at acceptance, so a
+                     -- delivery reader can prove member provenance even in
+                     -- the crash window before assist_requests is bound.
+                     CREATE INDEX IF NOT EXISTS assist_request_queue_job
+                        ON assist_request_queue(job_id);
+                     CREATE INDEX IF NOT EXISTS assist_requests_job
+                        ON assist_requests(job);
+                     UPDATE schema_version SET version=64;",
+                )?;
+                tx.commit()?;
+            }
+            if version < 65 {
+                // CAD-2215: explicit per-member app grants (exact
+                // conversation/context bindings). New table only; no
+                // existing row is read or rewritten. `(org, sub)` is the
+                // platform's exact person; `install_digest` pins the
+                // reviewed bundle; revoked rows are retained tombstones.
+                // The authoritative DDL lives in
+                // `store::app_member_grants::SCHEMA`.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_member_grants::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=65", [])?;
+                tx.commit()?;
+            }
+            if version < 66 {
+                // CAD-2215: the one nullable scoped-cursor keyring bind.
+                // NULL means "never explicitly initialized": the migration
+                // only creates the column and never writes a value, so no
+                // store can gain cursor-key authority without the explicit
+                // operator RPC. Column-checked so a half-applied store
+                // converges on reopen.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                let columns = tx
+                    .prepare("PRAGMA table_info(connection_metadata)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if !columns
+                    .iter()
+                    .any(|name| name == super::scoped_cursor_keys::COLUMN)
+                {
+                    tx.execute_batch(
+                        "ALTER TABLE connection_metadata \
+                           ADD COLUMN cursor_keyring_fingerprint TEXT;",
+                    )?;
+                }
+                tx.execute("UPDATE schema_version SET version=66", [])?;
+                tx.commit()?;
+            }
+            if version < 67 {
+                // Give every existing grant a stable incarnation without
+                // changing its authority. A later explicit grant receives a
+                // new one, so revoke/re-grant cannot masquerade as the same
+                // access snapshot to an in-flight reader.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                let columns = tx
+                    .prepare("PRAGMA table_info(app_member_grants)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if !columns.iter().any(|name| name == "authorization_epoch") {
+                    tx.execute_batch(
+                        "ALTER TABLE app_member_grants ADD COLUMN authorization_epoch TEXT;",
+                    )?;
+                }
+                tx.execute(
+                    "UPDATE app_member_grants
+                     SET authorization_epoch=lower(hex(randomblob(16)))
+                     WHERE authorization_epoch IS NULL",
+                    [],
+                )?;
+                tx.execute("UPDATE schema_version SET version=67", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(
@@ -2292,6 +2389,39 @@ impl Store {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(alias, pid, start)| {
+                Some((
+                    alias,
+                    u32::try_from(pid).ok()?,
+                    start.and_then(|s| u64::try_from(s).ok()),
+                ))
+            })
+            .collect())
+    }
+
+    /// The registered pty panes on an already-open connection or write
+    /// transaction — the same rows [`Self::pty_pane_pids`] reads — so a scoped
+    /// acknowledgement's identity re-proof reads the same registration rows as
+    /// the transaction that mutates the alert.
+    pub(crate) fn pty_pane_pids_in(
+        &self,
+        conn: &impl StoreConn,
+    ) -> Result<Vec<(String, u32, Option<u64>)>> {
+        let rows = conn.query_vec(
+            "SELECT alias, pid, pid_start FROM agents
+             WHERE endpoint_kind='pty'
+               AND generation IS NOT NULL AND pid IS NOT NULL",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )?;
         Ok(rows
             .into_iter()
             .filter_map(|(alias, pid, start)| {

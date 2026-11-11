@@ -2,6 +2,29 @@
 
 use super::*;
 
+/// Resolve the tracker project roots without following a forged key or link.
+pub(crate) fn checked_project_dirs(pm: &Pm) -> Result<Vec<(project::Project, PathBuf)>> {
+    let projects = project::list_checked(&pm.dir)?;
+    let mut keys = std::collections::HashSet::with_capacity(projects.len());
+    let mut dirs = Vec::with_capacity(projects.len());
+    for project in projects {
+        if !model::valid_key(&project.key) || !keys.insert(project.key.clone()) {
+            return Err(Error::rejected(
+                "tracker has an invalid or duplicate project key",
+            ));
+        }
+        let dir = pm.dir.join(&project.key);
+        let meta = std::fs::symlink_metadata(&dir)?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(Error::rejected(
+                "tracker project directory is not a real directory",
+            ));
+        }
+        dirs.push((project, dir));
+    }
+    Ok(dirs)
+}
+
 /// Locate an issue folder by id. The id's prefix must match the
 /// project's prefix — ids cannot smuggle across projects. Symlinks are
 /// never followed: a linked folder or issue.md does not exist as far
@@ -10,9 +33,22 @@ use super::*;
 pub(crate) fn issue_dir(pm: &Pm, id: &str) -> Result<(project::Project, PathBuf)> {
     model::check_id(id)?;
     let mut found: Vec<(project::Project, PathBuf)> = Vec::new();
-    for project in project::list(&pm.dir)? {
-        let dir = pm.dir.join(&project.key).join(id);
-        if board::is_real_dir(&dir) && board::is_real_file(&dir.join("issue.md")) {
+    for (project, root) in checked_project_dirs(pm)? {
+        let dir = root.join(id);
+        let meta = match std::fs::symlink_metadata(&dir) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let file = match std::fs::symlink_metadata(dir.join("issue.md")) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if file.is_file() && !file.file_type().is_symlink() {
             found.push((project, dir));
         }
     }

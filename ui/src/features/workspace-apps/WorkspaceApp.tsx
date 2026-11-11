@@ -900,7 +900,7 @@ export default function WorkspaceApp({
     rows.map((agent) => ({
       value: agent.alias,
       label: agent.alias,
-      hint: agent.state_label || agent.state,
+      hint: agent.state_label || agent.state || undefined,
       group: agent.group,
     }));
   const workflowOptions = ["instagram", "facebook"]

@@ -220,6 +220,10 @@ pub(super) struct CloudProjection {
     /// succeeds and the page carries this, so a reader is told the cloud
     /// history is incomplete rather than shown an empty one as if complete.
     pub(super) withheld: Option<String>,
+    /// Denials attributed to the caller's own cloud messages. A scoped
+    /// thread may report one only after that message passes its thread,
+    /// project and private-work filters.
+    scoped_denials: std::collections::HashMap<String, String>,
 }
 
 impl Default for CloudProjection {
@@ -236,11 +240,43 @@ impl Default for CloudProjection {
             admitted_owners: std::collections::HashMap::new(),
             operator: false,
             withheld: None,
+            scoped_denials: std::collections::HashMap::new(),
         }
     }
 }
 
 impl CloudProjection {
+    pub(super) fn scoped_denial(&self, message_id: &str) -> Option<&str> {
+        self.scoped_denials.get(message_id).map(String::as_str)
+    }
+
+    /// A member relayed by the board cannot use its operator cloud proof.
+    pub(super) fn member_ordinary_message(&self, id: &str) -> bool {
+        !self.cloud_alias && self.ordinary.contains(id)
+    }
+
+    /// Whether a row this read ALREADY PROJECTED is still admissible under
+    /// this (fresh) projection with the content the page carries. A settled
+    /// admission accepts; a request-only admission accepts only when the
+    /// projected row carries no `result`/`error`, because its redaction would
+    /// remove content this page already shows; an unadmitted row refuses.
+    /// Mirrors [`Self::messages`] without copying any payload.
+    pub(super) fn admits_projected_row(&self, message: &crate::store::Message) -> bool {
+        match self.row(&message.id) {
+            Row::Full => true,
+            Row::Request => message.result.is_none() && message.error.is_none(),
+            Row::Never => false,
+        }
+    }
+
+    /// Whether a row stays ADMITTED at all under this (fresh) projection:
+    /// settled or request-only both qualify, an unknown or denied row does
+    /// not. For content derived from a named row the page does not return,
+    /// where no `result`/`error` is projected.
+    pub(super) fn admits_row(&self, message_id: &str) -> bool {
+        !matches!(self.row(message_id), Row::Never)
+    }
+
     /// A cloud alias, admitted per operation for this caller's own source.
     fn cloud(scopes: Vec<CloudScope>, known: std::collections::BTreeSet<String>) -> Self {
         Self {
@@ -253,6 +289,7 @@ impl CloudProjection {
             admitted_owners: std::collections::HashMap::new(),
             operator: false,
             withheld: None,
+            scoped_denials: std::collections::HashMap::new(),
         }
     }
 
@@ -279,6 +316,7 @@ impl CloudProjection {
             admitted_owners: std::collections::HashMap::new(),
             operator,
             withheld: None,
+            scoped_denials: std::collections::HashMap::new(),
         }
     }
 
@@ -371,6 +409,14 @@ impl CloudProjection {
     /// Either way the caller has not been admitted for it, so a read that
     /// projects it under the old snapshot would widen its own view beyond
     /// what authority was proven for.
+    ///
+    /// It is deliberately NOT a revocation check: an id this snapshot already
+    /// names stays "covered" here even when the grant, credential, owner or
+    /// upstream read scope behind it was withdrawn afterwards. A reader that
+    /// selects rows and answers later must re-resolve the admission after
+    /// selection instead (`Shared::reprove_selected_cloud_rows` in the
+    /// agents-events reader), because that narrowing is invisible to this
+    /// predicate.
     pub(super) fn needs_readmission<'a>(
         &self,
         store: &crate::store::Store,
@@ -413,10 +459,9 @@ impl CloudProjection {
     pub(super) fn entries(
         &self,
         _store: &crate::store::Store,
-        entries: Vec<crate::store::ThreadEntry>,
+        mut entries: Vec<crate::store::ThreadEntry>,
     ) -> Result<Vec<crate::store::ThreadEntry>> {
-        let mut kept = Vec::with_capacity(entries.len());
-        for entry in entries {
+        entries.retain_mut(|entry| {
             let row = match entry.message_id.as_deref() {
                 Some(id) => self.row(id),
                 // A cloud thread carries no unattributable entry: an entry
@@ -435,7 +480,6 @@ impl CloudProjection {
                 // the operator can drop it without having to see the request
                 // and the reply on the same page. The board layer enforces the
                 // member rule; it cannot see the daemon's admission.
-                let mut entry = entry;
                 let origin = entry.message_id.as_deref().and_then(|id| {
                     if self.cloud_alias {
                         self.scopes
@@ -456,10 +500,10 @@ impl CloudProjection {
                     payload.insert("cloud_agent".to_string(), Value::String(origin.to_string()));
                     entry.payload = Some(Value::Object(payload));
                 }
-                kept.push(entry);
             }
-        }
-        Ok(kept)
+            keep
+        });
+        Ok(entries)
     }
 
     pub(super) fn messages(
@@ -484,32 +528,17 @@ impl CloudProjection {
         Ok(kept)
     }
 
-    pub(super) fn events(
-        &self,
-        _store: &crate::store::Store,
-        events: Vec<crate::store::Event>,
-    ) -> Result<Vec<crate::store::Event>> {
-        let mut kept = Vec::with_capacity(events.len());
-        for event in events {
-            let row = match event.payload.get("message").and_then(Value::as_str) {
-                Some(id) => self.row(id),
-                // Alias-level metadata (the connection itself) carries no
-                // request or result text; the read authority above already
-                // admitted the caller to this connection.
-                None => Row::Full,
-            };
-            let keep = match row {
+    pub(super) fn admits_event(&self, event: &crate::store::Event) -> bool {
+        match event.payload.get("message").and_then(Value::as_str) {
+            Some(id) => match self.row(id) {
                 Row::Full => true,
-                // An unsettled operation keeps only its non-result events:
-                // the settlement payload is exactly what must not be shown.
+                // An unsettled operation must not expose settlement data.
                 Row::Request => event.payload.get("result").is_none(),
                 Row::Never => false,
-            };
-            if keep {
-                kept.push(event);
-            }
+            },
+            // Alias-level metadata carries no request or result text.
+            None => true,
         }
-        Ok(kept)
     }
 }
 
@@ -681,6 +710,19 @@ impl Shared {
         peer_pid: u32,
         verb: &str,
     ) -> Result<(Sender, Source)> {
+        let (sender, source) = self.cloud_agent_identity_source(agent, peer_pid, verb)?;
+        self.cloud_agent_source_active(agent, &source)?;
+        Ok((sender, source))
+    }
+
+    /// Resolve source identity without treating it as active authority. This
+    /// can attribute a denial; it never admits a cloud row.
+    fn cloud_agent_identity_source(
+        &self,
+        agent: &crate::store::CloudAgent,
+        peer_pid: u32,
+        verb: &str,
+    ) -> Result<(Sender, Source)> {
         let caller = self.agent_caller(peer_pid, verb)?;
         if matches!(&caller, crate::peer::AgentCaller::Agent(_)) {
             self.cloud_peer_isolation(peer_pid)?;
@@ -688,7 +730,6 @@ impl Shared {
         let sender = Sender::from_caller(&caller);
         let target = Self::cloud_agent_target(agent);
         let source = sender.source_for(&self.store, &target)?;
-        self.cloud_agent_source_active(agent, &source)?;
         Ok((sender, source))
     }
 
@@ -785,11 +826,13 @@ impl Shared {
     ) -> Result<CloudProjection> {
         let cloud_agents = self.store.cloud_agents_for_alias(alias)?;
         if cloud_agents.is_empty() {
-            let cloud_target = self
-                .store
-                .agent_opt(alias)?
+            let registered = self.store.agent_opt(alias)?;
+            let cloud_target = registered
+                .as_ref()
                 .is_some_and(|agent| agent.provider == crate::cloud_agent::PROVIDER);
-            if cloud_target || self.store.alias_has_cloud_content(alias)? {
+            if cloud_target
+                || (registered.is_none() && self.store.alias_has_cloud_content(alias)?)
+            {
                 // Missing cloud authority never supplies caller authority.
                 if matches!(
                     self.agent_caller(peer_pid, verb)?,
@@ -814,6 +857,7 @@ impl Shared {
         let mut scopes = Vec::with_capacity(cloud_agents.len());
         let mut known = std::collections::BTreeSet::new();
         let mut withheld: Option<String> = None;
+        let mut scoped_denials = std::collections::HashMap::new();
         for agent in cloud_agents {
             let operations = self.store.cloud_agent_operations(&agent.id, None)?;
             known.extend(
@@ -824,7 +868,18 @@ impl Shared {
             let source = match self.cloud_agent_caller_source(&agent, peer_pid, verb) {
                 Ok((_, source)) => source,
                 Err(error) => {
-                    withheld = Some(projection_denial(error)?);
+                    let reason = projection_denial(error)?;
+                    if let Ok((_, source)) =
+                        self.cloud_agent_identity_source(&agent, peer_pid, verb)
+                    {
+                        for operation in operations
+                            .iter()
+                            .filter(|operation| source.matches(operation))
+                        {
+                            scoped_denials.insert(operation.operation_id.clone(), reason.clone());
+                        }
+                    }
+                    withheld = Some(reason);
                     continue;
                 }
             };
@@ -854,7 +909,11 @@ impl Shared {
             // operator must not read stored replies through a generic
             // projection.
             if let Err(error) = self.cloud_agent_authority(&agent, &source, SCOPE_READ) {
-                withheld = Some(projection_denial(error)?);
+                let reason = projection_denial(error)?;
+                for id in admitted.keys() {
+                    scoped_denials.insert(id.clone(), reason.clone());
+                }
+                withheld = Some(reason);
                 continue;
             }
             // The local copy proves what the workspace STORED, not what the
@@ -865,7 +924,11 @@ impl Shared {
             let answer = match self.cloud_read_authority(&agent, &source, &operations) {
                 Ok(answer) => answer,
                 Err(error) => {
-                    withheld = Some(projection_denial(error)?);
+                    let reason = projection_denial(error)?;
+                    for id in admitted.keys() {
+                        scoped_denials.insert(id.clone(), reason.clone());
+                    }
+                    withheld = Some(reason);
                     continue;
                 }
             };
@@ -874,6 +937,7 @@ impl Shared {
             if let Some((operation_id, PlatformState::Unsettled)) = answer {
                 admitted.remove(&operation_id);
                 withheld = Some("cloud_agent_not_settled".to_string());
+                scoped_denials.insert(operation_id, "cloud_agent_not_settled".to_string());
             }
             scopes.push(CloudScope {
                 cloud_agent_id: agent.id,
@@ -883,6 +947,7 @@ impl Shared {
         }
         let mut projection = CloudProjection::cloud(scopes, known);
         projection.withheld = withheld;
+        projection.scoped_denials = scoped_denials;
         Ok(projection)
     }
 
@@ -942,6 +1007,7 @@ impl Shared {
         // mail without attempting cloud access. Each eligible origin below
         // still proves the peer's isolation before resolving its credential.
         let mut projection = CloudProjection::derived_rows(rows, ordinary, viewer, operator);
+        let mut denied_origins = std::collections::HashMap::new();
         let mut origins = std::collections::BTreeSet::new();
         for row in projection.derived.values() {
             if !projection.bound(row) {
@@ -957,24 +1023,43 @@ impl Shared {
         // admission; a denied B cannot erase A or become ordinary mail.
         for agent_id in origins {
             let Some(agent) = self.store.cloud_agent(&agent_id)? else {
-                projection.withheld = Some("cloud_agent_authority_missing".to_string());
+                let reason = "cloud_agent_authority_missing".to_string();
+                projection.withheld = Some(reason.clone());
+                denied_origins.insert(agent_id, (reason, None));
                 continue;
             };
+            // Resolve identity separately from live authority: it can
+            // attribute a warning to the same owner, never admit a row.
+            let (_, source) = match self.cloud_agent_identity_source(&agent, peer_pid, "cloud read")
+            {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let reason = projection_denial(error)?;
+                    projection.withheld = Some(reason.clone());
+                    denied_origins.insert(agent_id, (reason, None));
+                    continue;
+                }
+            };
             let proof = (|| {
-                let (_, source) = self.cloud_agent_caller_source(&agent, peer_pid, "cloud read")?;
+                self.cloud_agent_source_active(&agent, &source)?;
                 self.cloud_agent_authority(&agent, &source, SCOPE_READ)?;
                 let operations = self.store.cloud_agent_operations(&agent.id, None)?;
                 self.cloud_read_authority(&agent, &source, &operations)
-                    .map(|answer| (answer, source.owner.clone()))
             })();
             match proof {
-                Ok((Some((_, PlatformState::Unsettled)), _)) => {
-                    projection.withheld = Some("cloud_agent_not_settled".to_string());
+                Ok(Some((_, PlatformState::Unsettled))) => {
+                    let reason = "cloud_agent_not_settled".to_string();
+                    projection.withheld = Some(reason.clone());
+                    denied_origins.insert(agent_id, (reason, Some(source.owner)));
                 }
-                Ok((_, owner)) => {
-                    projection.admitted_owners.insert(agent_id, owner);
+                Ok(_) => {
+                    projection.admitted_owners.insert(agent_id, source.owner);
                 }
-                Err(error) => projection.withheld = Some(projection_denial(error)?),
+                Err(error) => {
+                    let reason = projection_denial(error)?;
+                    projection.withheld = Some(reason.clone());
+                    denied_origins.insert(agent_id, (reason, Some(source.owner)));
+                }
             }
         }
         // A row whose backing operation belongs to another verified owner is
@@ -999,6 +1084,29 @@ impl Shared {
         });
         if replaced {
             projection.withheld = Some("cloud_agent_owner_changed".to_string());
+        }
+        for (message_id, row) in &projection.derived {
+            if !projection.bound(row) {
+                continue;
+            }
+            let reason = row
+                .cloud_agent_id
+                .as_ref()
+                .and_then(|id| denied_origins.get(id))
+                .and_then(|(reason, owner)| {
+                    owner
+                        .as_ref()
+                        .filter(|owner| {
+                            row.owner_issuer.as_deref() == Some(owner.issuer.as_str())
+                                && row.owner_subject.as_deref() == Some(owner.subject.as_str())
+                        })
+                        .map(|_| reason.as_str())
+                });
+            if let Some(reason) = reason {
+                projection
+                    .scoped_denials
+                    .insert(message_id.clone(), reason.to_string());
+            }
         }
         Ok(projection)
     }

@@ -8,17 +8,21 @@ import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
 import { tailTop } from "./dock";
 import { useDockHeight } from "./useDockHeight";
-import { memberHistory, memberThreadStore, memberWrite, sendToAssistant } from "./memberThread";
+import {
+  applyMemberEarlier,
+  fetchMemberEarlier,
+  memberHistory,
+  memberThreadStore,
+  memberWrite,
+  sendToAssistant,
+} from "./memberThread";
 import { initialFollow, motionBehavior, onSend, type Follow } from "./scrollFollow";
 import {
-  applyEarlier,
-  fetchEarlier,
   lastSeq,
   threadItems,
   visibleWindow,
   WINDOW,
 } from "./thread";
-import { memberThreadReader } from "./memberThread";
 import { ImageConversation } from "../canvas/imageConversation";
 import { useCanvasFeed } from "../canvas/feed";
 import { BrowserCard } from "../canvas/BrowserPanel";
@@ -263,11 +267,8 @@ export default function MemberChat({
     scrollPanel("glide");
   }, [glideTick, scrollPanel]);
 
-  // Mirrors the Master thread's earlier-history handler: reveal
-  // already-held hidden rows first by widening the bounded window; only
-  // then fetch and merge an older page (widening again so the merged
-  // rows actually render). An impossible page (the earliest seq is 1)
-  // clears `moreBefore` so the button stops offering unreachable history.
+  // Reveal held rows first, then continue with the server's opaque
+  // backward cursor without changing the forward continuation.
   const onEarlier = useCallback(() => {
     const data = store.get().data;
     if (!data) return;
@@ -276,15 +277,12 @@ export default function MemberChat({
       setLimit((l) => l + WINDOW);
       return;
     }
-    const page = fetchEarlier(memberThreadReader(), data);
-    if (!page) {
-      memberWrite(store, (s) => ({ ...(s ?? data), moreBefore: false }));
-      return;
-    }
+    const page = fetchMemberEarlier(data);
+    if (!page) return;
     setLoadingEarlier(true);
     void page
       .then((older) => {
-        memberWrite(store, (s) => applyEarlier(s, older));
+        memberWrite(store, (s) => applyMemberEarlier(s ?? data, older));
         setLimit((l) => l + WINDOW);
       })
       .catch(() => undefined)
