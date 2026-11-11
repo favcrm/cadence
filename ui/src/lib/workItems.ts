@@ -1,6 +1,7 @@
 import type { AssignmentContext, MyWorkIssue, WriteResp } from "./api";
 import type { IssueCard, IssueDetail } from "./types";
 import type { HomeNeed } from "../features/home/needs";
+import { hasCodeDelivery } from "../features/issues/model";
 
 /**
  * CAD-1811 (first slice): one issue-backed work item, opened from Home, My
@@ -198,16 +199,23 @@ export function workItemFacts(
   };
 }
 
-/** Dev work shows Code. Epics are planning records; a missing read is not dev. */
-export function isDevWork(detail: IssueDetail | null): boolean {
-  const type = detail?.work?.type;
-  return type !== undefined && type !== "epic";
+/** Dev work shows Code. Epics and non-repo items stay domain-neutral unless code evidence exists. */
+export function isDevWork(
+  detail: IssueDetail | null,
+  projectRepos?: readonly unknown[] | null,
+  hosted?: boolean,
+): boolean {
+  return hasCodeDelivery(detail, projectRepos, hosted);
 }
 
 /** The shared detail's tabs, in the accepted order. */
-export function workItemTabs(detail: IssueDetail | null): WorkItemTabId[] {
+export function workItemTabs(
+  detail: IssueDetail | null,
+  projectRepos?: readonly unknown[] | null,
+  hosted?: boolean,
+): WorkItemTabId[] {
   const tabs: WorkItemTabId[] = ["overview"];
-  if (isDevWork(detail)) tabs.push("code");
+  if (isDevWork(detail, projectRepos, hosted)) tabs.push("code");
   tabs.push("evidence", "approvals", "activity", "audit");
   return tabs;
 }

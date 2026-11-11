@@ -6,6 +6,7 @@ import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import { IconClose } from "../../ui/icons";
+import { useLocale } from "../../lib/locale";
 import { shownLinks } from "./model";
 import { type IssuePageProps as Props } from "./issuePageProps";
 
@@ -29,9 +30,10 @@ export function Links({
   onWrite: Props["onWrite"];
   onError: Props["onError"];
 }) {
+  const { t } = useLocale();
   const [kind, setKind] = useState("relates");
   const [target, setTarget] = useState("");
-  const rows = shownLinks(detail.links);
+  const rows = shownLinks(detail.links, detail.relates);
   const references = detail.refs.filter(
     (r) => r.kind === "note" || r.kind === "url",
   );
@@ -42,15 +44,15 @@ export function Links({
       .catch((err) => onError(err, "unlink"));
   };
   return (
-    <section className="card p-3.5 grid gap-2" aria-label="Links">
-      <div className="slabel">Links</div>
+    <section className="card p-3.5 grid gap-2" aria-label={t("Links")}>
+      <div className="slabel">{t("Links")}</div>
       {rows.length === 0 && references.length === 0 && (
-        <p className="text-secondary text-ink-500 m-0">No links yet.</p>
+        <p className="text-secondary text-ink-500 m-0">{t("No links yet.")}</p>
       )}
       <dl className="grid grid-cols-[92px_minmax(0,1fr)] gap-x-2 gap-y-1.5">
         {rows.map((row) => (
           <span key={`${row.label}-${row.id}`} className="contents">
-            <dt className="slabel">{row.label}</dt>
+            <dt className="slabel">{t(row.label)}</dt>
             <dd className="text-secondary min-w-0 flex items-center gap-1.5">
               <span className="min-w-0 truncate">
                 {row.missing ? (
@@ -63,6 +65,9 @@ export function Links({
                 {row.title ? (
                   <span className="text-ink-400"> · {row.title}</span>
                 ) : null}
+                {row.status ? (
+                  <span className="text-ink-500">{` (${t(row.status)})`}</span>
+                ) : null}
               </span>
               {row.unlinkKind && !readOnly && (
                 <Button
@@ -70,7 +75,7 @@ export function Links({
                   size="sm"
                   className="ml-auto shrink-0"
                   aria-label={`Unlink ${row.label} ${row.id}`}
-                  title="Remove this link"
+                  title={t("Remove this link")}
                   onClick={() => unlink(row.unlinkKind!, row.id)}
                 >
                   <IconClose />
@@ -82,7 +87,7 @@ export function Links({
         {references.map((r, i) => (
           <span key={`reference-${i}`} className="contents">
             <dt className="slabel">
-              {r.kind === "note" ? "Note" : "Reference"}
+              {r.kind === "note" ? t("Note") : t("Reference")}
             </dt>
             <dd
               className="text-secondary min-w-0 truncate"
@@ -104,12 +109,12 @@ export function Links({
           className="issue-link-form"
           onSubmit={(e) => {
             e.preventDefault();
-            const t = target.trim();
-            if (!t) return;
+            const trimmed = target.trim();
+            if (!trimmed) return;
             api
-              .link(detail.id, kind, t, detail.rev)
+              .link(detail.id, kind, trimmed, detail.rev)
               .then((r) => {
-                onWrite(r, `${detail.id} ${kind} ${t}`);
+                onWrite(r, `${detail.id} ${kind} ${trimmed}`);
                 setTarget("");
               })
               .catch((err) => onError(err, "link"));
@@ -118,7 +123,7 @@ export function Links({
           <Select
             value={kind}
             aria-label="link type"
-            options={LINK_KINDS}
+            options={LINK_KINDS.map((opt) => ({ value: opt.value, label: t(opt.label) }))}
             onChange={setKind}
           />
           <input
@@ -129,7 +134,7 @@ export function Links({
             aria-label="link target"
           />
           <Button type="submit" disabled={!target.trim()}>
-            Link
+            {t("Link")}
           </Button>
         </form>
       )}

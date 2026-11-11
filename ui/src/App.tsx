@@ -413,10 +413,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   openIdRef.current = openId;
   const pageIssueRef = useRef<string | null>(route.screen === "issue" ? route.id : null);
   pageIssueRef.current = route.screen === "issue" ? route.id : null;
+  const hostedRef = useRef(meta?.hosted === true);
+  hostedRef.current = meta?.hosted === true;
   const loadDetail = useCallback(() => {
     for (const id of refreshIssueIds(openIdRef.current, pageIssueRef.current)) {
       void resources.issue(id).invalidate();
-      void resources.lane(id).invalidate();
+      if (!hostedRef.current) void resources.lane(id).invalidate();
     }
     // The peek's quick actions need a current membership too, so a refresh
     // recovers a failed membership read without reopening the peek.
@@ -1336,6 +1338,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             readOnly={readOnly}
             writeBlock={block}
             kickoffBlock={operatorKickoffBlock(meta)}
+            hosted={meta?.hosted === true}
+            projectRepos={projects.find((p) => p.key === route.project)?.repos ?? null}
+            stagedActions={decisions.rows}
             onWrite={applyWrite}
             onError={writeError}
             onOpen={(issueId) => {
@@ -1612,13 +1617,18 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               if (privateSessionGeneration() === personalGeneration) notifyPersonalDrafts((version) => version + 1);
             },
           } : undefined}
-          href={(() => {
+          {...(() => {
             const fromDetail = detailState?.data?.id === openId ? detailState.data.project : null;
             const fromCard = personalState?.data?.issues.find((row) => row.id === openId)?.project
               ?? issues.find((i) => i.id === openId)?.project ?? null;
             const key = fromDetail ?? fromCard ?? (project !== "all" ? project : null);
-            return key ? issuePath(key, openId) : null;
+            return {
+              href: key ? issuePath(key, openId) : null,
+              projectRepos: key ? projects.find((p) => p.key === key)?.repos ?? null : null,
+            };
           })()}
+          hosted={meta?.hosted === true}
+          stagedActions={decisions.rows}
           onClose={closeWorkItem}
         />
       )}

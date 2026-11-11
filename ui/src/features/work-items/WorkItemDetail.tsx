@@ -12,13 +12,17 @@ import { privateReadsAllowed, privateSessionGeneration } from "../../lib/private
 import { resources } from "../../lib/resources";
 import {
   acceptanceItems,
+  hostedAssignmentText,
   laneState,
+  matchingStagedActions,
   peekSummary,
   prRef,
   reportView,
+  shownLinks,
   timelineRows,
   verdictStale,
 } from "../issues/model";
+import { askedBy, isolate, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
 import { PRIORITY_CHIP, STATUS_CHIP } from "../issues/chips";
 import { noDragReason } from "../projects/Card";
 import { Evidence } from "../issues/Evidence";
@@ -68,6 +72,12 @@ export interface WorkItemDetailProps {
     onDone: (done: HomeDecisionOpen, key: string, text: string) => void;
     onAsk: (need: HomeNeed, lead: string) => void;
   };
+  /** True on hosted workspaces where non-repository items default to domain-neutral tabs. */
+  hosted?: boolean;
+  /** Configured repositories for the item's project (`[]` on non-repository projects). */
+  projectRepos?: readonly unknown[] | null;
+  /** Staged/decided assistant actions from the shared decisions store, when available. */
+  stagedActions?: readonly StagedWrite[];
 }
 
 /**
@@ -81,7 +91,7 @@ export interface WorkItemDetailProps {
  */
 export default function WorkItemDetail(props: WorkItemDetailProps) {
   const { t } = useLocale();
-  const { id, origin, detail, readState, onRetry, href, onClose, readOnly, onOpen, card, myWork, home } = props;
+  const { id, origin, detail, readState, onRetry, href, onClose, readOnly, onOpen, card, myWork, home, hosted, projectRepos, stagedActions } = props;
   const facts = useMemo(() => workItemFacts(detail, card ?? null), [detail, card]);
   const known = detail !== null && detail.id === id;
   const title = facts.title ?? (home ? home.open.need.shortTitle ?? t("Decision") : t("Work item"));
@@ -93,7 +103,7 @@ export default function WorkItemDetail(props: WorkItemDetailProps) {
     activity: "Activity",
     audit: "Audit",
   };
-  const tabs = workItemTabs(detail).map((tabId) => ({
+  const tabs = workItemTabs(known ? detail : null, projectRepos, hosted).map((tabId) => ({
     id: tabId,
     label: t(labels[tabId]),
     panel:
@@ -109,13 +119,14 @@ export default function WorkItemDetail(props: WorkItemDetailProps) {
           myWork={myWork}
           readOnly={readOnly}
           home={home}
+          stagedActions={stagedActions}
         />
       ) : tabId === "code" ? (
         <CodePanel detail={known ? detail : null} />
       ) : tabId === "evidence" ? (
         <EvidencePanel detail={known ? detail : null} />
       ) : tabId === "approvals" ? (
-        <ApprovalsPanel detail={known ? detail : null} />
+        <ApprovalsPanel detail={known ? detail : null} stagedActions={stagedActions} />
       ) : tabId === "activity" ? (
         <ActivityPanel detail={known ? detail : null} />
       ) : (
@@ -232,6 +243,7 @@ function OverviewPanel({
   myWork,
   readOnly,
   home,
+  stagedActions,
 }: {
   id: string;
   facts: WorkItemFacts;
@@ -243,14 +255,34 @@ function OverviewPanel({
   myWork?: MyWorkWorkItemProps;
   readOnly: boolean;
   home?: WorkItemDetailProps["home"];
+  stagedActions?: readonly StagedWrite[];
 }) {
-  const { t } = useLocale();
+  const { t, formatNumber } = useLocale();
   const [requirementsOpen, setRequirementsOpen] = useState(false);
   const body = detail?.body ?? "";
   const items = useMemo(() => acceptanceItems(body), [body]);
   const checksDone = items.reduce((count, item) => count + Number(item.checked), 0);
   const agents = detail?.agents ?? [];
+  const hasHostedAssignment = Boolean(
+    (detail?.local_assignment?.available && detail.local_assignment.assignments.length > 0) ||
+      detail?.agent_run?.agent ||
+      detail?.agent_run?.agent_name,
+  );
   const lane = agents.length === 0 ? t("No lane yet") : agents.map((a) => a.alias).join(", ");
+  const linkedRows = useMemo(
+    () => (detail ? shownLinks(detail.links, detail.relates) : []),
+    [detail],
+  );
+  const approvalsUnavailable = Boolean(detail?.approvals && !detail.approvals.available);
+  const inForceHeads = (detail?.approvals?.heads ?? []).filter((h) => h.state === "in-force").length;
+  const stagedMatches = useMemo(
+    () => (detail ? matchingStagedActions(detail.id, stagedActions) : []),
+    [detail, stagedActions],
+  );
+  const activeOrAppliedStaged = stagedMatches.filter((s) => {
+    const o = outcomeOf(s);
+    return o === "applied" || o === "pending";
+  }).length;
   const owner = myWork && facts.owner === myWork.owner ? t("you") : facts.owner ?? t("unassigned");
   const gone = Boolean(
     myWork &&
@@ -296,13 +328,22 @@ function OverviewPanel({
           />
           <Fact label="Comments" value={String(facts.comments)} />
           {detail && (
-            <>
-              <dt className="slabel">{t("Lane")}</dt>
-              <dd className="text-secondary text-ink-200 min-w-0 truncate" title={lane}>
-                {lane}
-                {agents.length > 0 ? ` · ${laneState(agents)}` : ""}
-              </dd>
-            </>
+            agents.length === 0 && hasHostedAssignment && !myWork ? (
+              <>
+                <dt className="slabel">{t("Assignment")}</dt>
+                <dd className="text-secondary text-ink-200 min-w-0 truncate">
+                  {hostedAssignmentText(detail, t)}
+                </dd>
+              </>
+            ) : (
+              <>
+                <dt className="slabel">{t("Lane")}</dt>
+                <dd className="text-secondary text-ink-200 min-w-0 truncate" title={lane}>
+                  {lane}
+                  {agents.length > 0 ? ` · ${laneState(agents)}` : ""}
+                </dd>
+              </>
+            )
           )}
           {myWork && (
             <>
@@ -315,10 +356,47 @@ function OverviewPanel({
         </dl>
       </section>
 
+      {linkedRows.length > 0 && (
+        <section className="grid gap-2" aria-label={t("Related & follow-ups")}>
+          <h4 className="rv-h">{t("Related & follow-ups")}</h4>
+          <ul className="issue-peek-list">
+            {linkedRows.map((row) => (
+              <li key={`${row.label}-${row.id}`} className="issue-peek-act">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="dim">{t(row.label)}:</span>
+                  {row.missing ? (
+                    <span className="num dim">{row.id}</span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="lnk num bg-transparent border-0 p-0 cursor-pointer"
+                      onClick={() => onOpen(row.id)}
+                    >
+                      {row.id}
+                    </button>
+                  )}
+                  {row.status && (
+                    <span className={`chip ${STATUS_CHIP[row.status] ?? "bg-ink-800 text-ink-400"}`}>
+                      {t(row.status)}
+                    </span>
+                  )}
+                  {row.missing && <span className="dim">{`(${t("missing")})`}</span>}
+                </div>
+                {row.title && <div className="text-secondary text-ink-300">{row.title}</div>}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section className="grid gap-1" aria-label={t("Policy and effect")}>
         <h4 className="rv-h">{t("Policy and effect")}</h4>
         <p className="rv-note">
-          {t("No policy is recorded on this issue. Approvals and merges keep their own pinned-head paths; this detail adds none.")}
+          {approvalsUnavailable
+            ? `${t("Approval records could not be read.")} ${t("Approvals and merges keep their own pinned-head paths; this detail adds none.")}`
+            : inForceHeads > 0 || activeOrAppliedStaged > 0
+              ? `${formatNumber(inForceHeads + activeOrAppliedStaged)} ${t("recorded in Approvals.")} ${t("Approvals and merges keep their own pinned-head paths; this detail adds none.")}`
+              : t("No policy is recorded on this issue. Approvals and merges keep their own pinned-head paths; this detail adds none.")}
         </p>
         <p className="rv-note">{t("No external effect is recorded on this issue.")}</p>
       </section>
@@ -433,15 +511,83 @@ function EvidencePanel({ detail }: { detail: IssueDetail | null }) {
   );
 }
 
-function ApprovalsPanel({ detail }: { detail: IssueDetail | null }) {
+function ApprovalsPanel({
+  detail,
+  stagedActions,
+}: {
+  detail: IssueDetail | null;
+  stagedActions?: readonly StagedWrite[];
+}) {
   const { t } = useLocale();
   if (!detail) return <p className="issue-peek-note dim m-0">{t("Approvals are listed once the item loads.")}</p>;
   const reports = detail.reports ?? [];
   const verdicts = reports.filter((report) => report.kind === "verdict");
   const latest = reportView(reports).verdict;
   const stale = latest ? verdictStale(latest, detail) : false;
+  const heads = detail.approvals?.heads ?? [];
+  const approvalsUnavailable = detail.approvals !== undefined && detail.approvals !== null && !detail.approvals.available;
+  const stagedMatches = matchingStagedActions(detail.id, stagedActions);
   return (
     <div className="wi-panel">
+      <section className="grid gap-2" aria-label={t("Recorded approvals")}>
+        <h4 className="rv-h">{t("Recorded approvals")}</h4>
+        {approvalsUnavailable && (
+          <p className="issue-peek-note warn m-0">{t("Approval records could not be read.")}</p>
+        )}
+        {!approvalsUnavailable && heads.length === 0 && (
+          <p className="issue-peek-note dim m-0">{t("No approval heads are recorded on this item.")}</p>
+        )}
+        {heads.length > 0 && (
+          <ul className="issue-peek-list">
+            {heads.map((head) => (
+              <li key={`${head.repo}#${head.pr}@${head.head_sha}`} className="issue-peek-act">
+                <div>
+                  <span className="who num">{`${head.repo} #${head.pr}`}</span>
+                  {head.recorded_at && <span className="when"> · {fmtTime(head.recorded_at)}</span>}
+                </div>
+                <div className="num">
+                  <span>{`${head.head_sha.slice(0, 12)} · ${t(head.state)}`}</span>
+                  {head.source ? (
+                    <>
+                      {" · "}
+                      <bdi>{isolate(head.source)}</bdi>
+                    </>
+                  ) : null}
+                  {head.action ? ` (${head.action})` : ""}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+      {stagedMatches.length > 0 && (
+        <section className="grid gap-2" aria-label={t("Staged & decided actions")}>
+          <h4 className="rv-h">{t("Staged & decided actions")}</h4>
+          <ul className="issue-peek-list">
+            {stagedMatches.map((item) => {
+              const who = askedBy(item, t);
+              const ts = item.decidedAt ?? item.createdAt;
+              return (
+                <li key={item.id} className="issue-peek-act">
+                  <div>
+                    <bdi className="who">{isolate(item.title)}</bdi>
+                    {ts ? <span className="when"> · {fmtTime(new Date(ts).toISOString())}</span> : null}
+                  </div>
+                  <div>
+                    <span className="num">{t(outcomeOf(item))}</span>
+                    {who ? (
+                      <>
+                        {" · "}
+                        <bdi>{isolate(who)}</bdi>
+                      </>
+                    ) : null}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      )}
       <section className="grid gap-2" aria-label={t("Recorded reviews")}>
         <h4 className="rv-h">{t("Recorded reviews")}</h4>
         {verdicts.length === 0 ? (

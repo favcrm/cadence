@@ -89,6 +89,63 @@ export interface LinkRef {
   missing: boolean;
 }
 
+/** CAD-2195 / CAD-2253: one project-scoped approval head on `GET /api/issues/:id`. */
+export interface IssueApprovalHead {
+  head_sha: string;
+  repo: string;
+  pr: number;
+  state: "in-force" | "missing" | "unavailable";
+  approval_id?: string;
+  source?: string;
+  action?: string;
+  recorded_at?: string;
+  reason?: string;
+}
+
+/** Hosted issue approval projection (`hosted-cadence-issue-approvals.v1`). */
+export interface IssueApprovals {
+  version: string;
+  scope: string;
+  available: boolean;
+  reason: string | null;
+  complete: boolean;
+  heads: IssueApprovalHead[];
+  heads_truncated?: boolean;
+}
+
+/** One participant-visible hosted assignment row on `GET /api/issues/:id`. */
+export interface IssueAssignmentRow {
+  assignment_id?: string;
+  issue_id?: string;
+  target?: string | null;
+  state: string;
+  text?: string | null;
+  text_truncated?: boolean;
+  deliverable?: { type: "artifact" | "link"; ref: string; title?: string | null } | null;
+  deliverable_check?: { found: boolean | null; reason: string | null };
+  updated_at?: string | null;
+}
+
+/** Hosted participant-scoped assignment projection on `GET /api/issues/:id`. */
+export interface IssueLocalAssignment {
+  version?: string;
+  source?: string;
+  scope?: string;
+  available: boolean;
+  reason: string | null;
+  observed_at?: string;
+  truncated?: boolean;
+  complete?: boolean;
+  assignments: IssueAssignmentRow[];
+}
+
+/** Hosted agent run summary on `GET /api/issues/:id`. */
+export interface IssueAgentRun {
+  agent?: string | null;
+  agent_name?: string | null;
+  state?: string | null;
+}
+
 export interface ActivityItem {
   at: string;
   kind: "note" | "comment" | "commit";
@@ -163,6 +220,12 @@ export interface IssueDetail extends Omit<IssueCard, "counts"> {
   plan?: PlanBlock | null;
   /** CAD-341 task reports on the ticket (questions carry `open`). */
   reports?: TaskReport[];
+  /** Hosted project-scoped approval heads (`hosted-cadence-issue-approvals.v1`). */
+  approvals?: IssueApprovals | null;
+  /** Hosted participant-scoped assignment read. */
+  local_assignment?: IssueLocalAssignment | null;
+  /** Hosted agent-run state when an agent run was dispatched on the ticket. */
+  agent_run?: IssueAgentRun | null;
 }
 
 /** One ticket of a plan, with its derived status. */
