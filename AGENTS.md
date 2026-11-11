@@ -11,10 +11,13 @@ and discover peers with `cadence agent list`.
 
 ## Reviewer agents are read-only
 
-An agent is a headless process the daemon starts, or a hosted board session;
-no agent runs in a terminal pane, for any role. The daemon sets a reviewer's
-credentials and environment when it starts the process, so they are read-only at
-launch, not by brief. The mechanisms, in the order they apply:
+A reviewer is always a headless process the daemon starts, or a hosted board
+session: a reviewer pane is refused at register, build, open and adoption. The
+daemon pins a reviewer's `gh` credentials when it starts the process (at
+launch), not by brief. That is not a claim about the whole environment: the
+operator's SSH agent and the git credential helpers under `HOME` are NOT
+covered, so a local reviewer can still `git push` as the operator. The
+mechanisms, in the order they apply:
 
 - `gh` runs with a private empty `GH_CONFIG_DIR` under the reviewer's state dir
   (`adapter::reviewer_gh_env`, CAD-844); `GH_TOKEN` is set only from the
@@ -22,11 +25,11 @@ launch, not by brief. The mechanisms, in the order they apply:
   (`contents:read`, `pull_requests:read`, `metadata:read`). `GITHUB_TOKEN`,
   `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` are emptied. With no
   token, `gh` is unauthenticated and fails closed. Every local headless launch
-  applies it; a pane (`devin`, `cursor`, `claude --tui`) is refused.
+  applies it.
 - The hosted gate refuses every tracker-mutation verb from a live
   `role='reviewer'` agent credential (`checkCliCall`, code `reviewer_read_only`,
-  HTTP 403). It keeps the `cli.read` verbs, the reviewer's own verdict
-  (`issue_review`, `audit_verdict`, `audit_verdict_project`) and `artifact_put`.
+  HTTP 403). It keeps the reads, the reviewer's own verdict (`issue_review`,
+  `audit_verdict`, `audit_verdict_project`) and `artifact_put`.
 - A reviewer reports back (its turn result, or its ticket tools in a hosted
   session). Whoever dispatched it posts the PR comment or ticket comment.
 - Never run a reviewer under the operator's login or under a bridge grant that
@@ -312,7 +315,8 @@ the code you just wrote.
   `>` header lines follow the title directly; a bare `Issue:` line does not
   link the note to the ticket. The title and the section must say the same
   thing. Link the note from the ticket. Hosted: the dispatcher posts one PR comment per
-  review axis from the reviewer's report, linked in the ticket comment (no verdict note); under the temporary
+  review axis from the reviewer's report, linked in the ticket comment (no
+  verdict note); under the temporary
   `--exception` the gate wants `standards=` and `spec-security=` as two
   distinct PR comment URLs even when one review is required.
 - Before enqueueing, post one ticket comment for that head: every required

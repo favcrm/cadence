@@ -277,8 +277,8 @@ impl Shared {
                 Box::new(move |request| shared.on_provider_request(&owned, request))
             },
         };
-        // Taken before `build`: an agent refused at build (CAD-2239: a pane
-        // agent) must settle its in-flight adoption like a refused adoption,
+        // Taken before `build`: an agent refused at build (CAD-2239: a reviewer
+        // pane row) must settle its in-flight adoption like a refused adoption,
         // not leave the message `running`.
         let adoption = self.store.take_adoption(alias);
         let adapter =

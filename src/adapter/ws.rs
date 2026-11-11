@@ -154,14 +154,14 @@ impl WsAdapter {
     /// failure kills it. The pre-bind/drop leaves a small reclaim race,
     /// bounded to loopback and detected by the connect loop.
     ///
-    /// `env` is the role's launch environment (CAD-2239). The child is a
-    /// local process, so the pairs are applied after the scrub exactly as
+    /// `role` is the role's launch environment (CAD-2239). The child is a
+    /// local process, so it is applied last, after the scrub, exactly as
     /// `StdioAdapter::launch` does.
     pub fn launch(
         self: &Arc<Self>,
         cwd: &str,
         stderr_log: &std::path::Path,
-        env: &[(String, String)],
+        role: &super::RoleEnv,
     ) -> Result<Launch> {
         let port = {
             let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -180,9 +180,7 @@ impl WsAdapter {
         for name in &self.env_scrub {
             command.env_remove(name);
         }
-        for (key, value) in env {
-            command.env(key, value);
-        }
+        role.apply(&mut command);
         // Own process group: signals reach only this provider.
         unsafe {
             command.pre_exec(|| {

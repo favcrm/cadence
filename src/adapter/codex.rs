@@ -540,16 +540,16 @@ pub struct Launched {
 }
 
 impl Transport {
-    /// Both transports spawn a local child, so `env` (the role's launch
-    /// environment) reaches either one after its scrub (CAD-2239).
-    fn launch(&self, cwd: &str, log: &Path, env: &[(String, String)]) -> Result<Launched> {
+    /// Both transports spawn a local child, so the role's launch environment
+    /// reaches either one, applied last (CAD-2239).
+    fn launch(&self, cwd: &str, log: &Path, role: &super::RoleEnv) -> Result<Launched> {
         match self {
             Transport::Stdio(adapter) => Ok(Launched {
-                pid: adapter.launch(cwd, log, env)?,
+                pid: adapter.launch(cwd, log, &[], role)?,
                 endpoint: None,
             }),
             Transport::Ws(adapter) => {
-                let launched = adapter.launch(cwd, log, env)?;
+                let launched = adapter.launch(cwd, log, role)?;
                 Ok(Launched {
                     pid: launched.pid,
                     endpoint: Some(launched.endpoint),
@@ -1477,29 +1477,40 @@ mod tests {
         let state = dir.path().join("state");
         let env = ProviderEnv::default();
         env.set("CADENCE_REVIEWER_GH_TOKEN", "synthetic-read-only");
-        let pairs =
+        let role =
             super::super::reviewer_gh_env(&env, "reviewer", &state.join("agents/r")).unwrap();
-        // The scrub names the same variables the pairs set: the pairs must
-        // win, so they are applied after it.
-        let scrub = ["GH_TOKEN", "GITHUB_TOKEN"];
+        // The codex scrub plus the very names the role sets: the role
+        // environment must win, so it is applied after the scrub.
+        let mut scrub: Vec<&str> = scrub_names().to_vec();
+        scrub.extend([
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ]);
         let dump = vec![
             "sh".to_string(),
             "-c".to_string(),
-            "env >&2".to_string(),
+            "env >&2; echo END-OF-ENV >&2".to_string(),
             "sh".to_string(),
         ];
         let launch = |transport: Transport, log: PathBuf| {
-            let _ = transport.launch(dir.path().to_str().unwrap(), &log, &pairs);
-            // A stdio launch returns at spawn; give the child time to dump.
+            let _ = transport.launch(dir.path().to_str().unwrap(), &log, &role);
+            // A stdio launch returns at spawn: wait for the child's end
+            // marker, and fail loudly if it never comes.
             let started = Instant::now();
-            while started.elapsed() < Duration::from_secs(10)
-                && !std::fs::read_to_string(&log)
-                    .is_ok_and(|t| t.contains("GITHUB_ENTERPRISE_TOKEN="))
-            {
-                std::thread::sleep(Duration::from_millis(50));
+            loop {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                if text.contains("END-OF-ENV") {
+                    transport.close();
+                    return text;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "the child never finished dumping its environment: {text}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
             }
-            transport.close();
-            std::fs::read_to_string(&log).unwrap()
         };
         let stdio = launch(
             Transport::Stdio(StdioAdapter::new(
@@ -1622,7 +1633,18 @@ mod tests {
         // Launch the peer by hand — `open` is a full provider
         // handshake; the steer seam needs only the transport.
         if let Transport::Stdio(a) = &adapter.transport {
-            a.launch("/tmp", &adapter.log_path, &[]).unwrap();
+            a.launch(
+                "/tmp",
+                &adapter.log_path,
+                &[],
+                &super::super::reviewer_gh_env(
+                    &ProviderEnv::default(),
+                    "worker",
+                    &dir.path().join("a"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         }
         (adapter, dir)
     }
