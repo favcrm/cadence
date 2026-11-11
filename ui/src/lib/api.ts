@@ -360,6 +360,31 @@ async function write<T extends object | undefined>(
   });
 }
 
+function unwrapPostJson<T>(status: number, fallbackMessage: string, parsed: unknown): T {
+  if (status < 200 || status >= 300) {
+    const record =
+      parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    const nested =
+      record && typeof record.error === "object" && record.error !== null && !Array.isArray(record.error)
+        ? (record.error as Record<string, unknown>)
+        : null;
+    const nestedCode =
+      typeof record?.code === "string"
+        ? record.code
+        : typeof nested?.code === "string"
+          ? nested.code
+          : undefined;
+    throw new ApiError(
+      errorMessage(parsed, fallbackMessage),
+      status,
+      record ? { ...record, ...(nestedCode === undefined ? {} : { code: nestedCode }) } : undefined,
+    );
+  }
+  return parsed as T;
+}
+
 /** A board write that answers its own JSON (not an issue `WriteResp`). */
 async function post<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
   return usingPrivateOperation(operation, async (op) => {
@@ -374,16 +399,7 @@ async function post<T>(path: string, body: object, operation?: PrivateOperation)
     }, op);
     const parsed = await resp.json().catch(() => null);
     op.assertCurrent();
-    if (!resp.ok) {
-      // Some routes nest the code under `error`, as the read path already allows for.
-      const nestedCode = parsed?.code ?? parsed?.error?.code;
-      throw new ApiError(
-        errorMessage(parsed, `${resp.status} ${resp.statusText}`),
-        resp.status,
-        parsed ? { ...parsed, ...(nestedCode === undefined ? {} : { code: nestedCode }) } : undefined,
-      );
-    }
-    return parsed as T;
+    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
   });
 }
 
@@ -794,12 +810,10 @@ export const api = {
       (mediaRefs !== undefined && mediaRefs.length > 0) ||
       Boolean(expectedRecipientUid);
     if (alias === "master" && !hasNativeOnlyContext) {
-      const viaSocket = await sendMasterMessageViaSocket<Record<string, unknown>>(
-        alias,
-        payload,
-        operation,
-      );
-      if (viaSocket.handled) return viaSocket.value;
+      const viaSocket = await sendMasterMessageViaSocket(alias, payload, operation);
+      if (viaSocket !== null) {
+        return unwrapPostJson<Record<string, unknown>>(viaSocket.status, `${viaSocket.status}`, viaSocket.body);
+      }
     }
     return post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
