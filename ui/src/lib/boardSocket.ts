@@ -77,7 +77,7 @@ function unrefTimer(timer: unknown): void {
  * `__CADENCE_ENTRY_MODE__`. Only hosted cookie-authenticated browser tabs open `/api/ws`.
  */
 function canUseBoardSocket(): boolean {
-  if (typeof window === "undefined" || typeof window.WebSocket !== "function") return false;
+  if (typeof window === "undefined" || typeof WebSocket !== "function") return false;
   if ((globalThis as { __CADENCE_ENTRY_MODE__?: boolean }).__CADENCE_ENTRY_MODE__ === true) return false;
   if (sessionKey() !== null || !privateReadsAllowed()) return false;
   const proto = window.location?.protocol;
@@ -163,7 +163,7 @@ class SharedBoardSocket {
   constructor() {
     this.generation = privateSessionGeneration();
     const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-    this.ws = new window.WebSocket(`${scheme}//${window.location.host}/api/ws`);
+    this.ws = new WebSocket(`${scheme}//${window.location.host}/api/ws`);
     this.ws.addEventListener("message", (event) => this.handleMessage(event.data));
     this.ws.addEventListener("error", () => {
       if (!this.welcomed && this.ws.readyState === WS_CLOSED) this.teardown("socket_error");

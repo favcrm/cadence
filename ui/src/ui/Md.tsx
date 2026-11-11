@@ -29,30 +29,57 @@ const CALLOUT_LABELS: Record<CalloutKind, string> = {
 
 const CALLOUT_MARKER = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](?:[ \t]*\r?\n|[ \t]+|$)/i;
 
+function stripBlockquotePrefix(line: string): { quotes: number; rest: string } {
+  let pos = 0;
+  let quotes = 0;
+  while (pos < line.length) {
+    let spaces = 0;
+    while (spaces < 3 && pos + spaces < line.length && line.charCodeAt(pos + spaces) === 0x20) {
+      spaces += 1;
+    }
+    if (pos + spaces >= line.length || line.charCodeAt(pos + spaces) !== 0x3e) break;
+    quotes += 1;
+    pos += spaces + 1;
+    if (pos < line.length && line.charCodeAt(pos) === 0x20) pos += 1;
+  }
+  return { quotes, rest: line.slice(pos) };
+}
+
+function scanFence(rest: string): { ch: "`" | "~"; len: number; after: string } | null {
+  let i = 0;
+  while (i < 3 && i < rest.length && rest.charCodeAt(i) === 0x20) i += 1;
+  const first = rest[i];
+  if (first !== "`" && first !== "~") return null;
+  let end = i;
+  while (end < rest.length && rest[end] === first) end += 1;
+  const len = end - i;
+  return len >= 3 ? { ch: first, len, after: rest.slice(end) } : null;
+}
+
 /** Close an unfinished fenced code block at the end of an in-flight preview so
  *  live streaming Markdown renders as a code surface instead of raw fences.
  *  Presentation-only: stored entries and stream state keep the server's text. */
 export function healStreamingMarkdown(text: string): string {
   let open: { ch: "`" | "~"; len: number; quotes: number } | null = null;
-  for (const line of text.split(/\r?\n/)) {
-    const bq = /^((?: {0,3}> ?)*)(.*)$/.exec(line)!;
-    const quotes = (bq[1].match(/>/g) ?? []).length;
-    const rest = bq[2];
+  for (const line of text.split(/\r?\n|\u2028|\u2029/)) {
+    const { quotes, rest } = stripBlockquotePrefix(line);
     if (open !== null) {
       if (quotes < open.quotes) {
         open = null;
       } else {
         if (quotes === open.quotes) {
-          const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(rest);
-          if (close && close[1][0] === open.ch && close[1].length >= open.len) open = null;
+          const close = scanFence(rest);
+          if (close && close.ch === open.ch && close.len >= open.len && /^[ \t]*$/.test(close.after)) {
+            open = null;
+          }
         }
         continue;
       }
     }
-    const tick = /^ {0,3}(`{3,})([^`]*)$/.exec(rest);
-    const tilde = tick === null ? /^ {0,3}(~{3,})/.exec(rest) : null;
-    const fence = tick?.[1] ?? tilde?.[1];
-    if (fence) open = { ch: fence[0] as "`" | "~", len: fence.length, quotes };
+    const fence = scanFence(rest);
+    if (fence && (fence.ch === "~" || !fence.after.includes("`"))) {
+      open = { ch: fence.ch, len: fence.len, quotes };
+    }
   }
   if (open === null) return text;
   return `${text}${text.endsWith("\n") ? "" : "\n"}${"> ".repeat(open.quotes)}${open.ch.repeat(open.len)}`;
@@ -67,8 +94,12 @@ function walkCallouts(node: MdNode): void {
     const match = firstText?.type === "text" && firstText.value ? CALLOUT_MARKER.exec(firstText.value) : null;
     if (match && firstText?.value !== undefined && firstPara.children) {
       const rest = firstText.value.slice(match[0].length);
-      if (rest === "") firstPara.children.shift();
-      else firstText.value = rest;
+      if (rest === "") {
+        firstPara.children.shift();
+        if (firstPara.children[0]?.type === "break") firstPara.children.shift();
+      } else {
+        firstText.value = rest;
+      }
       if (firstPara.children.length === 0) kids.shift();
       const kind = match[1].toLowerCase();
       node.data = {

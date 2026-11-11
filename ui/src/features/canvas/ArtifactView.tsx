@@ -79,11 +79,14 @@ export function imageDataUrl(data: Loaded): string {
 export function openPdfInTab(bytes: ArrayBuffer): void {
   const tab = window.open("about:blank", "_blank");
   if (tab === null) return;
+  let href: string | null = null;
   try {
-    const href = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+    href = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
     tab.location.replace(href);
-    window.setTimeout(() => URL.revokeObjectURL(href), 30_000);
+    const created = href;
+    window.setTimeout(() => URL.revokeObjectURL(created), 30_000);
   } catch {
+    if (href !== null) URL.revokeObjectURL(href);
     tab.close();
   }
 }
@@ -218,7 +221,7 @@ export default function ArtifactView({
         <div className="canvas-doc canvas-pdf" data-artifact-view="pdf">
           <p className="text-body text-ink-100">{title}</p>
           <p className="num text-micro text-ink-500">PDF · {sizeLabel(data.bytes.byteLength)}</p>
-          <p className="text-micro text-ink-400">{t("A preview is not available yet. Use Download.")}</p>
+          <p className="text-micro text-ink-400">{t("A preview is not available yet. Open in a new tab or use Download.")}</p>
           <div className="flex flex-wrap items-center gap-3 pt-1">
             <button
               type="button"

@@ -70,14 +70,19 @@ export default function AttachmentMedia({
   const t = useTranslate();
   const [openId, setOpenId] = useState<string | null>(null);
   const [failed, setFailed] = useState<Record<string, true>>({});
-  if (!hosted || conversation === null) return null;
-  const shown = files.flatMap((file) => {
-    const kind = attachmentPreviewKind(file.mime);
-    return kind === null || failed[file.id] === true ? [] : [{ file, kind }];
-  });
-  if (shown.length === 0) return null;
+  const shown =
+    hosted && conversation !== null
+      ? files.flatMap((file) => {
+          const kind = attachmentPreviewKind(file.mime);
+          return kind === null || failed[file.id] === true ? [] : [{ file, kind }];
+        })
+      : [];
   const images = shown.flatMap((entry) => (entry.kind === "image" ? [entry.file] : []));
   const openIndex = openId === null ? -1 : images.findIndex((image) => image.id === openId);
+  useEffect(() => {
+    if (openId !== null && openIndex < 0) setOpenId(null);
+  }, [openId, openIndex]);
+  if (!hosted || conversation === null || shown.length === 0) return null;
   return (
     <div className="sentmedia" data-entry-media>
       {shown.map(({ file, kind }) =>
@@ -187,12 +192,18 @@ function AttachmentLightbox({
     document.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("keydown", onKey);
-      returnTo?.focus?.();
+      if (returnTo instanceof HTMLElement && returnTo.isConnected) returnTo.focus();
     };
   }, []);
   const file = images[index];
   const src = attachmentHref(file.id, conversation);
   const multi = images.length > 1;
+  useEffect(() => {
+    const active = document.activeElement;
+    if (!multi && dialogRef.current && (active === null || !dialogRef.current.contains(active))) {
+      closeRef.current?.focus();
+    }
+  }, [multi]);
   const step = (delta: -1 | 1) => {
     const next = images[(index + delta + images.length) % images.length];
     if (next) onSelect(next.id);

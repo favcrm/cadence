@@ -1986,4 +1986,5 @@ Object.assign(zhTW, {
   "Previous image": "上一張圖片",
   "Next image": "下一張圖片",
   "Open in new tab": "在新分頁開啟",
+  "A preview is not available yet. Open in a new tab or use Download.": "目前尚未提供內嵌預覽，請在新分頁開啟或下載。",
 });

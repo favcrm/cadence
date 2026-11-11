@@ -412,7 +412,7 @@ export function attachHold(key: string): AttachItem[] {
 }
 
 /** The ready rows one submit is about to carry, frozen by row identity:
- *  the `{id}` array for the send plus each row's key and upload
+ *  the attachment list for the send plus each row's key and upload
  *  generation. File ids are not row identity — two distinct rows can
  *  legitimately hold the same dedup id. */
 export interface ReadyCapture {
