@@ -4113,7 +4113,11 @@ mod cad2081_workflow_verdicts {
         }
 
         fn set_paths(d: &mut toml::Table, table: &str, value: toml::Value) {
-            d.get_mut(table).unwrap().as_table_mut().unwrap().insert("paths".into(), value);
+            d.get_mut(table)
+                .unwrap()
+                .as_table_mut()
+                .unwrap()
+                .insert("paths".into(), value);
         }
 
         fn merges(f: &Fixture, case: Scenario) {
@@ -4134,14 +4138,18 @@ mod cad2081_workflow_verdicts {
             assert!(stdout.contains("class: human"), "{stdout}");
             let said = format!("{stdout}{stderr}");
             for text in [NO_APPROVAL].iter().chain(named) {
-                assert!(said.contains(text), "no {text:?}\nstdout: {stdout}\nstderr: {stderr}");
+                assert!(
+                    said.contains(text),
+                    "no {text:?}\nstdout: {stdout}\nstderr: {stderr}"
+                );
             }
             assert!(!stdout.contains("class: auto"), "{stdout}");
             assert!(!stdout.contains("every rule holds"), "{stdout}");
         }
 
         #[test]
-        fn the_real_workflow_auto_paths_file_is_exactly_the_delegable_set_and_crosses_no_src_glob() {
+        fn the_real_workflow_auto_paths_file_is_exactly_the_delegable_set_and_crosses_no_src_glob()
+        {
             let read = |path: &str| -> toml::Table {
                 std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
                     .unwrap()
@@ -4172,7 +4180,9 @@ mod cad2081_workflow_verdicts {
             for glob in &auto {
                 assert_ne!(glob, "**", "{auto:?}");
                 assert!(
-                    !glob.starts_with("**") && !glob.starts_with("src/**") && !glob.starts_with("*"),
+                    !glob.starts_with("**")
+                        && !glob.starts_with("src/**")
+                        && !glob.starts_with("*"),
                     "{glob} crosses src/"
                 );
                 if glob.starts_with("src/") {
@@ -4185,7 +4195,8 @@ mod cad2081_workflow_verdicts {
         }
 
         #[test]
-        fn with_the_repos_own_lists_served_as_they_are_only_delegable_and_docs_paths_merge_as_class_auto() {
+        fn with_the_repos_own_lists_served_as_they_are_only_delegable_and_docs_paths_merge_as_class_auto(
+        ) {
             let f = Fixture::new();
             for path in [
                 "src/issue/blocked.rs",
@@ -4274,7 +4285,11 @@ mod cad2081_workflow_verdicts {
                 put(d, "src/wiki/ok.rs", "// ok\n");
                 put(d, "design-plans/x.md", "x\n");
             });
-            operator(&f, case_on(&f, head, tip_with(&f, AUTO_LIST)), &["design-plans/x.md"]);
+            operator(
+                &f,
+                case_on(&f, head, tip_with(&f, AUTO_LIST)),
+                &["design-plans/x.md"],
+            );
         }
 
         const NEVER: &[&str] = &[
@@ -4296,11 +4311,7 @@ mod cad2081_workflow_verdicts {
             let f = Fixture::new();
             for list in [AUTO_LIST, EVERYTHING] {
                 for path in NEVER {
-                    operator(
-                        &f,
-                        case_on(&f, f.touch(path), tip_with(&f, list)),
-                        &[*path],
-                    );
+                    operator(&f, case_on(&f, f.touch(path), tip_with(&f, list)), &[*path]);
                 }
             }
             // Excluded trees that `src/**` does not even reach, listed by `**` alone.
@@ -4352,7 +4363,12 @@ mod cad2081_workflow_verdicts {
                     set_paths(d, t, toml::Value::Array(vec![]));
                 }
             });
-            for path in ["src/daemon/x.rs", "src/adapter/x.rs", "src/store/x.rs", "ui/src/x.tsx"] {
+            for path in [
+                "src/daemon/x.rs",
+                "src/adapter/x.rs",
+                "src/store/x.rs",
+                "ui/src/x.tsx",
+            ] {
                 let mut tip = tip_with(&f, EVERYTHING);
                 tip[RISK_PATHS] = json!(no_triggers);
                 operator(&f, case_on(&f, f.touch(path), tip), &[path]);
@@ -4377,11 +4393,27 @@ mod cad2081_workflow_verdicts {
                 broken.push((what, tip));
             };
             add("one-review missing", ONE_REVIEW, None);
-            add("one-review malformed", ONE_REVIEW, Some("one_review_exclude = [".into()));
-            add("one-review without an exclude list", ONE_REVIEW, Some("one_review_include = [\"src/**\"]\n".into()));
-            add("one-review exclude of the wrong type", ONE_REVIEW, Some("one_review_exclude = [1, 2]\n".into()));
+            add(
+                "one-review malformed",
+                ONE_REVIEW,
+                Some("one_review_exclude = [".into()),
+            );
+            add(
+                "one-review without an exclude list",
+                ONE_REVIEW,
+                Some("one_review_include = [\"src/**\"]\n".into()),
+            );
+            add(
+                "one-review exclude of the wrong type",
+                ONE_REVIEW,
+                Some("one_review_exclude = [1, 2]\n".into()),
+            );
             add("risk-paths missing", RISK_PATHS, None);
-            add("risk-paths malformed", RISK_PATHS, Some("[trigger1\npaths = ".into()));
+            add(
+                "risk-paths malformed",
+                RISK_PATHS,
+                Some("[trigger1\npaths = ".into()),
+            );
             add(
                 "risk-paths without trigger1",
                 RISK_PATHS,
@@ -4400,21 +4432,35 @@ mod cad2081_workflow_verdicts {
                 "risk-paths trigger3 of the wrong type",
                 RISK_PATHS,
                 Some(edited(&risk, |d| {
-                    set_paths(d, "trigger3", toml::Value::Array(vec![toml::Value::Integer(1)]));
+                    set_paths(
+                        d,
+                        "trigger3",
+                        toml::Value::Array(vec![toml::Value::Integer(1)]),
+                    );
                 })),
             );
             add(
                 "risk-paths trigger1 paths missing",
                 RISK_PATHS,
                 Some(edited(&risk, |d| {
-                    d.get_mut("trigger1").unwrap().as_table_mut().unwrap().remove("paths");
+                    d.get_mut("trigger1")
+                        .unwrap()
+                        .as_table_mut()
+                        .unwrap()
+                        .remove("paths");
                 })),
             );
             for (what, tip) in broken {
                 let (code, stdout, stderr) = f.gate(&case_on(&f, head.clone(), tip));
-                assert_eq!(code, 1, "{what}: must need the operator\nstdout: {stdout}\nstderr: {stderr}");
+                assert_eq!(
+                    code, 1,
+                    "{what}: must need the operator\nstdout: {stdout}\nstderr: {stderr}"
+                );
                 assert!(stdout.contains("class: human"), "{what}: {stdout}");
-                assert!(format!("{stdout}{stderr}").contains(NO_APPROVAL), "{what}: {stdout}{stderr}");
+                assert!(
+                    format!("{stdout}{stderr}").contains(NO_APPROVAL),
+                    "{what}: {stdout}{stderr}"
+                );
                 assert!(!stdout.contains("class: auto"), "{what}: {stdout}");
             }
         }
@@ -4437,7 +4483,12 @@ mod cad2081_workflow_verdicts {
                 v[RISK_PATHS] = json!(loose_risk);
                 v
             };
-            for path in ["src/daemon/x.rs", "src/secret/x.rs", "src/remote_cli.rs", "src/store/x.rs"] {
+            for path in [
+                "src/daemon/x.rs",
+                "src/secret/x.rs",
+                "src/remote_cli.rs",
+                "src/store/x.rs",
+            ] {
                 // Loose lists only in the PR's own head.
                 let mut case = case_on(&f, f.touch(path), tip_with(&f, AUTO_LIST));
                 case.head_files = Some(loose());
@@ -4478,15 +4529,15 @@ mod cad2081_workflow_verdicts {
                     "src/delivery/x.rs",
                     "src/audit/x.rs",
                 ] {
-                    operator(
-                        &f,
-                        case_on(&f, f.touch(path), tip_with(&f, list)),
-                        &[path],
-                    );
+                    operator(&f, case_on(&f, f.touch(path), tip_with(&f, list)), &[path]);
                 }
                 // More than 1500 changed lines.
                 let big = f.make_head("big", |d| put(d, "src/wiki/big.rs", &"x\n".repeat(1501)));
-                operator(&f, case_on(&f, big, tip_with(&f, list)), &["1501 changed lines"]);
+                operator(
+                    &f,
+                    case_on(&f, big, tip_with(&f, list)),
+                    &["1501 changed lines"],
+                );
                 // A delete, a rename, a mode change, an executable add, a symlink.
                 let heads = [
                     f.make_head("c2254-delete", |d| {
@@ -4538,12 +4589,19 @@ mod cad2081_workflow_verdicts {
                 let mut revise = if kind == "std" { f.std() } else { f.spec() };
                 revise["outcome"] = json!("revise");
                 revise["section_outcome"] = json!("revise");
-                let rows = if kind == "std" { vec![revise, f.spec()] } else { vec![f.std(), revise] };
+                let rows = if kind == "std" {
+                    vec![revise, f.spec()]
+                } else {
+                    vec![f.std(), revise]
+                };
                 let mut case = case_on(&f, f.touch("src/wiki/x.rs"), tip_with(&f, AUTO_LIST));
                 case.rows = rows;
                 let (code, stdout, stderr) = f.gate(&case);
                 assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
-                assert!(format!("{stdout}{stderr}").contains("is not a pass"), "{stdout}{stderr}");
+                assert!(
+                    format!("{stdout}{stderr}").contains("is not a pass"),
+                    "{stdout}{stderr}"
+                );
                 assert!(!stdout.contains("every rule holds"), "{stdout}");
             }
             // One review alone is still not two.
@@ -4560,7 +4618,10 @@ mod cad2081_workflow_verdicts {
             // design-plans/** is on neither the one-review include list nor the exclude
             // list. When main's list names it, it merges, alone or beside an ordinary path.
             let list = "[auto]\npaths = [\"design-plans/**\", \"src/**\"]\n";
-            merges(&f, case_on(&f, f.touch("design-plans/p/new.md"), tip_with(&f, list)));
+            merges(
+                &f,
+                case_on(&f, f.touch("design-plans/p/new.md"), tip_with(&f, list)),
+            );
             let head = f.make_head("plans-and-src", |d| {
                 put(d, "design-plans/p/n.md", "x\n");
                 put(d, "src/wiki/x.rs", "// x\n");
@@ -4569,7 +4630,11 @@ mod cad2081_workflow_verdicts {
             // And the same path is not eligible when the list does not name it.
             operator(
                 &f,
-                case_on(&f, f.touch("design-plans/p/new.md"), tip_with(&f, AUTO_LIST)),
+                case_on(
+                    &f,
+                    f.touch("design-plans/p/new.md"),
+                    tip_with(&f, AUTO_LIST),
+                ),
                 &[OPERATOR],
             );
         }
