@@ -246,20 +246,21 @@ the code you just wrote.
     applies. The gate therefore inverts the rule: a PR with any workflow-issued
   row needs the operator's approval unless EVERY changed path matches
   `docs/roles/workflow-auto-paths.toml`, read at main's live tip, and every
-  change is a plain add or modify (mode 100644). That list is exactly the
-  `[delegable]` set of `docs/roles/risk-paths.toml` (CAD-2254): the named
-  `src/issue/` and `src/cli/` files and `docs/**`. A PR wholly inside it, with
-  both workflow reviews passing at its head, merges without the operator.
-  Every other PR still takes the operator's approval, and workflow rows only
-  satisfy its two reviews. No directory glob over `src/` is listed, because
-  the path lists are not a complete map of sensitive code. Adding a path is
-  one reviewed line and a deliberate decision, made only after reading what
-  the path holds. Whatever the list
-  says, three kinds of path are never eligible: a path with a segment starting
-  with `.`; a basename starting `agents.`, `claude.` or `gemini.`; and a path
-  that `docs/roles/one-review-paths.toml` excludes or that is on risk-paths
-  trigger 1 or 3 (the trust-boundary, identity, secret and UI trees). If
-  either of those two lists cannot be read, every path needs the operator.
+  change is a plain add or modify (mode 100644). That list names Markdown
+  documentation only, `docs/**/*.md` (CAD-2254). A PR whose every path is on
+  it and in no human-class list (`docs/roles/**`, `docs/AUDIT.md` and the
+  other rule-7 documents stay human), with both workflow reviews passing at
+  its head, merges without the operator. Every other PR still takes the
+  operator's approval, and workflow rows only satisfy its two reviews. No
+  code is listed: the path lists are not a complete map of sensitive code.
+  Adding a path is one reviewed line and a deliberate decision, made only
+  after reading what the path holds. Whatever the list says, four kinds of
+  path are never eligible: a path with a segment starting with `.`; a
+  basename starting `agents.`, `claude.` or `gemini.`; a path that
+  `docs/roles/one-review-paths.toml` excludes or that is on risk-paths
+  trigger 1 or 3 (the trust-boundary, identity, secret and UI trees); and a
+  name that differs only by case from a protected path. If either of those
+  two lists cannot be read, every path needs the operator.
   `cadence delivery requirements` does not report this rule; the
   script adds it. Rule-7 paths, the size trigger and a non-`auto` `Risk:` also
   force the operator. A workflow row that is not a pass refuses in every class.
@@ -514,10 +515,11 @@ limitation; only an authorized operator can decide an exception.
 - Ask the operator only when the gate does (CAD-2254). Run
   `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run` and read its
   `class:` line:
-  - `class: auto`: enqueue the PR yourself and report the merge. Do not ask
-    for an approval the gate does not need.
-  - `class: human (...)`: ask the operator once, and name the trigger the
-    line gives.
+  - `class: auto` and the dry run ends with every rule holding: enqueue the
+    PR yourself and report the merge. Do not ask for an approval the gate
+    does not need.
+  - `class: human (...)`, or a refusal that names a missing operator
+    approval: ask the operator once, and name the trigger the gate gives.
   - A workflow review that says revise: fix the finding, push, and let the
     new head be reviewed. Ask for `cadence audit accept-revise` only when
     the finding is wrong, and say why it is wrong.

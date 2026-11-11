@@ -712,9 +712,10 @@ During implementation and handoff:
   A second attested human is not required.
 - Ask a person only when the gate does. In the Cadence repository, run
   `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run` and read its
-  `class:` line. On `class: auto`, enqueue the PR yourself and report the
-  merge. On `class: human (...)`, ask the operator once and name the trigger
-  the line gives. When a workflow review says revise, fix the finding, push
+  `class:` line. On `class: auto` with every rule holding, enqueue the PR
+  yourself and report the merge. On `class: human (...)`, or a refusal that
+  names a missing operator approval, ask the operator once and name the
+  trigger the gate gives. When a workflow review says revise, fix the finding, push
   and let the new head be reviewed; ask the operator to accept a revise only
   when the finding is wrong, and say why (CAD-2254).
 - Make review converge. First inspect the complete change against acceptance;

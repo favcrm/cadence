@@ -53,7 +53,9 @@ unless ALL of these hold for the pinned head:
     the other gates pass; dry-run only checks an existing comment);
   * for a human-class diff (a path trigger, more than 1500 changed lines, any
     head-pinned note whose Risk is not exactly `auto`, or a workflow-issued
-    review on any change outside docs/roles/workflow-auto-paths.toml),
+    review on any change outside docs/roles/workflow-auto-paths.toml or on a
+    path that list can never make eligible: a one-review exclude, a risk-paths
+    trigger 1 or 3 path, or a case alias of a protected path, CAD-2254),
     `cadence audit approval` reports an approval in
     force for exactly this head. This script never records an approval.
 
@@ -66,7 +68,8 @@ under one login. CAD-2081 adds workflow-issued rows (see AGENTS.md "Review"); th
 workflows (CAD-2088) are live, a cheap first pass beside fresh-session reviews on
 gate, security, schema and release PRs, and two of them satisfy other PRs. A
 hosted board has no readiness record, so a hosted `routine` PR takes those two
-workflow reviews and the operator approval they carry (CAD-2135). A hosted `ui/**`
+workflow reviews and, unless every changed path is on the workflow auto list
+(CAD-2254), the operator approval they carry (CAD-2135). A hosted `ui/**`
 PR takes those two workflow reviews, operator approval, and `--browser-qa <url>`
 naming a comment on this PR that is exactly the lines `Browser QA: pass` and
 `Head: <full sha>` (CAD-2173). This binds the claim to the head; it cannot prove the QA ran, and the
@@ -427,7 +430,23 @@ def workflow_never_globs(one_text, risk_text):
     return None if any(g is None for g in lists) else [g for globs in lists for g in globs]
 
 
-def workflow_auto_reasons(changes, toml_text, never):
+def protected_ignoring_case(path, risk, never):
+    """Is `path`, compared without case, a human-class or never-eligible path (CAD-2254)?
+
+    Git treats `docs/Roles/x.md` and `docs/roles/x.md` as different paths, but a
+    case-insensitive checkout (the macOS build) puts them in one directory, so a
+    name that differs only by case from a protected path is not ordinary. `risk`
+    is risk_globs' list and `never` is workflow_never_globs' list."""
+    low = path.casefold()
+    base, segs = low.rsplit("/", 1)[-1], low.split("/")[:-1]
+    return (low in {p.casefold() for p in HUMAN_EXACT}
+            or low.startswith(tuple(p.casefold() for p in HUMAN_PREFIXES))
+            or base in {b.casefold() for b in HUMAN_BASENAMES}
+            or ".github" in segs or ".cargo" in segs
+            or any(glob_match(g.casefold(), low) for g in list(risk) + list(never)))
+
+
+def workflow_auto_reasons(changes, toml_text, never, risk=()):
     """Why a PR with a workflow-issued review needs the operator's approval (CAD-2081).
 
     A positive allowlist: every change must be a plain add or modify of a regular
@@ -439,8 +458,10 @@ def workflow_auto_reasons(changes, toml_text, never):
     segment starting with `.` (.github, .claude, .gitattributes) or a basename
     starting `agents.`, `claude.` or `gemini.` (any case, any directory: they can
     load as agent instructions) is never eligible, and neither is a path matching
-    `never`, the globs of workflow_never_globs (CAD-2254). `never` is None when
-    those lists could not be read, which needs the operator for every path."""
+    `never`, the globs of workflow_never_globs, nor a path that is not itself
+    human-class but matches a human-class or `never` path once case is ignored
+    (CAD-2254). `never` is None when those lists could not be read, which needs the
+    operator for every path. `risk` is risk_globs' list, used for the case check."""
     globs = glob_list(toml_text, ("auto", "paths"))
     if globs is None:
         return [f"cannot read {WORKFLOW_AUTO_FILE} at main's live tip, so a workflow review "
@@ -459,6 +480,8 @@ def workflow_auto_reasons(changes, toml_text, never):
             why = "a hidden or agent-instruction file name"
         elif any(glob_match(g, path) for g in never):
             why = "a trust-boundary, identity, secret or UI path, never eligible"
+        elif not is_human_path(path, risk) and protected_ignoring_case(path, risk, never):
+            why = "a name that differs only by case from a protected path, never eligible"
         elif not ((status == "A" and old_mode == "000000" and new_mode == "100644")
                   or (status == "M" and old_mode == "100644" and new_mode == "100644")):
             why = "not a plain add or modify of a 100644 file"
@@ -2050,7 +2073,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                                     f"repos/{repo}/contents/{WORKFLOW_AUTO_FILE}?ref={main_tip}"])
             auto_text = auto_text if rc == 0 else None
         why += workflow_auto_reasons(changes, auto_text,
-                                     workflow_never_globs(one_text, risk_text))
+                                     workflow_never_globs(one_text, risk_text), risk or ())
     not_auto = [v for v in verdicts if v["risk"] != "auto"]
     if not_auto:
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
@@ -2257,7 +2280,7 @@ def enqueue(args, repo):
 
 
 def self_test():
-    """CAD-2049: the independence rule over fixed documents. No network, no files.
+    """CAD-2049, CAD-2254: the gate's rules over fixed documents. No network, no files.
 
     The gate cannot approve its own change, so this is the reproducible check
     the ticket asks for: it runs the counting function the gate runs, over the
@@ -2325,6 +2348,45 @@ def self_test():
         ok = not counted and any(expected in r for r in reasons)
         print(f"{'ok  ' if ok else 'FAIL'} {label}: {'; '.join(reasons) or 'no refusal'}")
         failures += 0 if ok else 1
+
+    # CAD-2254: the workflow-only route's path rules over fixed lists. The size
+    # trigger and a non-`auto` Risk are decided inline in evaluate; the suite's
+    # cad2254 block covers those two.
+    auto = '[auto]\npaths = ["docs/**/*.md", "src/**"]\n'
+    risk = ["docs/roles/**", "scripts/**"]
+    never = workflow_never_globs(
+        'one_review_exclude = ["src/daemon/**", "ui/**"]\n',
+        '[trigger1]\npaths = ["src/peer.rs"]\n[trigger3]\npaths = ["src/secret/**"]\n')
+
+    def plain(path):
+        return [("M", "100644", "100644", path)]
+
+    auto_cases = [
+        ("an ordinary listed path is eligible", plain("docs/guides/x.md"), never, None),
+        ("a one-review excluded tree keeps the operator", plain("src/daemon/x.rs"), never, "never eligible"),
+        ("a UI path keeps the operator", plain("ui/src/x.tsx"), never, "never eligible"),
+        ("a trigger 1 path keeps the operator", plain("src/peer.rs"), never, "never eligible"),
+        ("a trigger 3 path keeps the operator", plain("src/secret/x.rs"), never, "never eligible"),
+        ("an excluded path beside an ordinary one keeps the operator",
+         plain("docs/x.md") + plain("src/daemon/x.rs"), never, "never eligible"),
+        ("a case alias of a protected path keeps the operator",
+         plain("docs/Roles/x.md"), never, "differs only by case"),
+        ("an unlisted path keeps the operator", plain("contracts/x.json"), never, "not on the list"),
+        ("a delete keeps the operator", [("D", "100644", "000000", "docs/x.md")], never,
+         "not a plain add or modify"),
+        ("a mode change keeps the operator", [("M", "100644", "100755", "docs/x.md")], never,
+         "not a plain add or modify"),
+        ("unreadable never-eligible lists keep the operator", plain("docs/x.md"),
+         workflow_never_globs(None, None), "fail closed"),
+    ]
+    for label, changes, never_globs, expected in auto_cases:
+        reasons = workflow_auto_reasons(changes, auto, never_globs, risk)
+        ok = (not reasons) if expected is None else any(expected in r for r in reasons)
+        print(f"{'ok  ' if ok else 'FAIL'} {label}: {'; '.join(reasons) or 'eligible'}")
+        failures += 0 if ok else 1
+    ok = is_human_path("scripts/x.py", risk) and is_human_path("docs/roles/x.md", risk)
+    print(f"{'ok  ' if ok else 'FAIL'} a trigger-list path is human-class whatever the auto list says")
+    failures += 0 if ok else 1
     return 0 if not failures else 1
 
 
