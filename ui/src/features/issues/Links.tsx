@@ -6,6 +6,7 @@ import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import { IconClose } from "../../ui/icons";
+import { useLocale } from "../../lib/locale";
 import { shownLinks } from "./model";
 import { type IssuePageProps as Props } from "./issuePageProps";
 
@@ -29,9 +30,10 @@ export function Links({
   onWrite: Props["onWrite"];
   onError: Props["onError"];
 }) {
+  const { t } = useLocale();
   const [kind, setKind] = useState("relates");
   const [target, setTarget] = useState("");
-  const rows = shownLinks(detail.links);
+  const rows = shownLinks(detail.links, detail.relates);
   const references = detail.refs.filter(
     (r) => r.kind === "note" || r.kind === "url",
   );
@@ -42,15 +44,15 @@ export function Links({
       .catch((err) => onError(err, "unlink"));
   };
   return (
-    <section className="card p-3.5 grid gap-2" aria-label="Links">
-      <div className="slabel">Links</div>
+    <section className="card p-3.5 grid gap-2" aria-label={t("Links")}>
+      <div className="slabel">{t("Links")}</div>
       {rows.length === 0 && references.length === 0 && (
-        <p className="text-secondary text-ink-500 m-0">No links yet.</p>
+        <p className="text-secondary text-ink-500 m-0">{t("No links yet.")}</p>
       )}
       <dl className="grid grid-cols-[92px_minmax(0,1fr)] gap-x-2 gap-y-1.5">
         {rows.map((row) => (
           <span key={`${row.label}-${row.id}`} className="contents">
-            <dt className="slabel">{row.label}</dt>
+            <dt className="slabel">{t(row.label)}</dt>
             <dd className="text-secondary min-w-0 flex items-center gap-1.5">
               <span className="min-w-0 truncate">
                 {row.missing ? (
@@ -62,6 +64,9 @@ export function Links({
                 )}
                 {row.title ? (
                   <span className="text-ink-400"> · {row.title}</span>
+                ) : null}
+                {row.status ? (
+                  <span className="text-ink-500">{` (${t(row.status)})`}</span>
                 ) : null}
               </span>
               {row.unlinkKind && !readOnly && (
