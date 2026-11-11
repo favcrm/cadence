@@ -1255,6 +1255,7 @@ impl PtyAdapter {
 
 impl ProviderAdapter for PtyAdapter {
     fn open(&self, agent: &Agent) -> Result<Identity> {
+        super::registry::refuse_pane_agent(&agent.provider, &agent.endpoint_kind)?;
         let (session, desired) = {
             let s = self.state.lock().unwrap();
             (s.session.clone(), self.desired_session.clone())
@@ -1505,11 +1506,8 @@ impl ProviderAdapter for PtyAdapter {
     /// missing proof means the endpoint genuinely changed, not that it
     /// is still coming up. The recorded generation is reused, which is
     /// what keeps the in-flight token valid for `message_report`.
-    fn open_adopted(
-        &self,
-        _agent: &Agent,
-        adoption: &crate::store::AdoptEntry,
-    ) -> Result<Identity> {
+    fn open_adopted(&self, agent: &Agent, adoption: &crate::store::AdoptEntry) -> Result<Identity> {
+        super::registry::refuse_pane_agent(&agent.provider, &agent.endpoint_kind)?;
         let session = self.session();
         if !self.has_session(&session) {
             return Err(Error::provider("pane is gone"));

@@ -67,7 +67,7 @@ cadence skill install company-outputs # workflow + business-document guidance on
 cadence skill status           # per-skill files/content and provider-link status
 
 cadence claude --alias pm --role pm       # named headless PM
-cadence join pm devin --alias w1 --detach # named worker; keep this shell free
+cadence join pm claude --alias w1 --detach # named headless worker; keep this shell free
 cadence dispatch CAD-1 --to w1 --reply-to pm # use an existing issue ID
 
 cadence status                 # one-screen fleet overview

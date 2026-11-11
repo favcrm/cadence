@@ -9,6 +9,7 @@ impl Shared {
         let provider = required_str(params, "provider")?;
         let endpoint =
             optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND);
+        registry::refuse_pane_agent(provider, endpoint)?;
         let role = optional_str(params, "role").unwrap_or("worker");
         let caller_team_role = optional_text(params, "team_role")?;
         let model_policy = optional_text(params, "model_policy")?;

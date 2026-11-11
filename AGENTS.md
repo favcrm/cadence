@@ -11,23 +11,30 @@ and discover peers with `cadence agent list`.
 
 ## Reviewer agents are read-only
 
-A reviewer's credentials and environment are read-only by construction, not by
-brief. The mechanisms, in the order they apply:
+An agent is a headless process the daemon starts, or a hosted board session;
+no agent runs in a terminal pane, for any role. The daemon sets a reviewer's
+credentials and environment when it starts the process, so they are read-only at
+launch, not by brief. The mechanisms, in the order they apply:
 
 - `gh` runs with a private empty `GH_CONFIG_DIR` under the reviewer's state dir
   (`adapter::reviewer_gh_env`, CAD-844); `GH_TOKEN` is set only from the
   operator's `CADENCE_REVIEWER_GH_TOKEN`, which must carry read-only scopes
-  (`contents:read`, `pull_requests:read`, `metadata:read`). With no token, `gh`
-  is unauthenticated and fails closed.
+  (`contents:read`, `pull_requests:read`, `metadata:read`). `GITHUB_TOKEN`,
+  `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` are emptied. With no
+  token, `gh` is unauthenticated and fails closed. Every local headless launch
+  applies it; a pane (`devin`, `cursor`, `claude --tui`) is refused.
 - The hosted gate refuses every tracker-mutation verb from a live
   `role='reviewer'` agent credential (`checkCliCall`, code `reviewer_read_only`,
   HTTP 403). It keeps the reads, the reviewer's own verdict (`issue_review`,
   `audit_verdict`, `audit_verdict_project`) and `artifact_put`.
-- A reviewer's output is a verdict file in its scratch directory; the operator
-  or the PM posts it to the ticket.
+- A reviewer reports back (its turn result, or its ticket tools in a hosted
+  session). Whoever dispatched it posts the PR comment or ticket comment.
 - Never run a reviewer under the operator's login or under a bridge grant that
   carries `cli.write`. A brief is a denylist; this section names the credential
   and the gate instead.
+- The pin is an environment, not an identity boundary: a same-user worker can
+  override it or read the operator's saved login, and only a separate user is a
+  credential boundary (`docs/REMOTE-AUTH.md`).
 
 ## Where the rules live
 
@@ -175,9 +182,9 @@ the code you just wrote.
   advisory. Of the advisory links, it checks
   only that they are separate https URLs; it proves neither head binding nor
   that Browser QA ran. A second attested human is not required.
-- **Agents file no hosted verdict in this workspace.** Post findings as a PR
-  comment; that comment is the advisory link for `standards`, `spec-security` or
-  `browser-qa`. `favcrm-dev` and `cc-syntax` are one person, and the gate
+- **Agents file no hosted verdict in this workspace.** A reviewer reports its
+  findings back; the dispatcher posts them as a PR comment, and that comment is
+  the advisory link for `standards`, `spec-security` or `browser-qa`. `favcrm-dev` and `cc-syntax` are one person, and the gate
   refuses every owner-attested row while the author's login has no attested
   principal. A filed row has no retraction verb and is head-pinned; a
   same-person row refuses, `--exception` included, and moving the head voids
@@ -304,8 +311,8 @@ the code you just wrote.
   `Risk:` is `auto` or `human (<triggers>)`. The
   `>` header lines follow the title directly; a bare `Issue:` line does not
   link the note to the ticket. The title and the section must say the same
-  thing. Link the note from the ticket. Hosted: one PR comment per review axis,
-  linked in the ticket comment (no verdict note); under the temporary
+  thing. Link the note from the ticket. Hosted: the dispatcher posts one PR comment per
+  review axis from the reviewer's report, linked in the ticket comment (no verdict note); under the temporary
   `--exception` the gate wants `standards=` and `spec-security=` as two
   distinct PR comment URLs even when one review is required.
 - Before enqueueing, post one ticket comment for that head: every required

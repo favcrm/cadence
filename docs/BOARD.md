@@ -299,9 +299,8 @@ pi:
   ids remain supported at open.
   Candidate launch and all open initialization share one error-cleanup boundary;
   effort/setup failure closes the transport just as model verification failure does.
-  Use the native adapter:
-  `cadence join <pm> cursor --model grok-4.7-high`; it delivers prompts through
-  its terminal rather than a conversation argv. Installed packages and operator
+  A Cursor pane is no longer started (CAD-2239), so there is no native Cursor
+  agent to use meanwhile. Installed packages and operator
   pins are not modified. A future upstream stdin fix needs a separate reviewed
   transport capability change before Pi Cursor can be enabled again. Cursor's
   [official output documentation](https://docs.cursor.com/en/cli/reference/output-format)

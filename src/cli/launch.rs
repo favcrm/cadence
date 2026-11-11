@@ -91,6 +91,7 @@ pub(crate) fn launch_endpoint_kind(provider: &str, cloud: bool, tui: bool) -> Re
     }
     if tui {
         if registry::spec_opt(provider, "pty").is_some() {
+            registry::refuse_pane_agent(provider, "pty")?;
             return Ok("pty");
         }
         return Err(Error::rejected(format!(
@@ -98,7 +99,9 @@ pub(crate) fn launch_endpoint_kind(provider: &str, cloud: bool, tui: bool) -> Re
              meaningful for claude (devin is already a TUI)"
         )));
     }
-    registry::default_kind(provider)
+    let kind = registry::default_kind(provider)?;
+    registry::refuse_pane_agent(provider, kind)?;
+    Ok(kind)
 }
 
 /// `cadence devin [-r slug]` / `cadence codex` / `cadence claude`:

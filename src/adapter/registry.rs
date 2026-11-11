@@ -972,11 +972,27 @@ pub fn spec_opt(provider: &str, kind: &str) -> Option<&'static EndpointSpec> {
         })
 }
 
+/// CAD-2239: an agent is a headless process the daemon starts, or a hosted
+/// board session. A `pty` endpoint on a real provider (a terminal pane) is
+/// refused for every role. The `tui-stub` harness provider is not a real
+/// provider and stays buildable.
+pub fn refuse_pane_agent(provider: &str, kind: &str) -> Result<()> {
+    if kind != "pty" || !matches!(provider, "devin" | "claude" | "cursor") {
+        return Ok(());
+    }
+    Err(Error::rejected(format!(
+        "{provider} in a terminal pane is no longer started: agents run headless. \
+         Use `cadence join <pm> claude`, `cadence join <pm> pi` or `cadence join <pm> codex` \
+         (add `--cloud` for a Devin cloud session)"
+    )))
+}
+
 /// Validating lookup used by the factory: unknown pairs are rejected
 /// with the supported combinations, reproducing the historical per-kind
 /// error text ("No <kind> adapter for provider 'x' (implemented: …)",
 /// "Endpoint kind 'x' is not implemented (implemented: …)").
 pub fn spec(provider: &str, kind: &str) -> Result<&'static EndpointSpec> {
+    refuse_pane_agent(provider, kind)?;
     if let Some(s) = spec_opt(provider, kind) {
         return Ok(s);
     }
@@ -1989,7 +2005,7 @@ mod tests {
             ("fake", "fake", false),
         ] {
             assert_eq!(
-                spec(provider, kind)
+                spec_opt(provider, kind)
                     .unwrap()
                     .supports_native_turn_steering(),
                 expected,
@@ -2005,10 +2021,7 @@ mod tests {
             ("codex", "managed"),
             ("codex", "managed-ws"),
             ("claude", "managed"),
-            ("claude", "pty"),
-            ("devin", "pty"),
             ("devin", "cloud"),
-            ("cursor", "pty"),
             ("tui-stub", "pty"),
             ("fake", "fake"),
         ] {
@@ -2016,10 +2029,23 @@ mod tests {
             assert!(spec(provider, kind).is_ok(), "{provider}/{kind}");
         }
         // …and every actor-owning spec constructs through the factory —
-        // the pair table and the match arms cannot drift apart.
+        // the pair table and the match arms cannot drift apart. A pane
+        // pair on a real provider keeps its spec but is refused (CAD-2239).
         for s in SPECS.iter().filter(|s| s.has_actor) {
-            assert!(spec(s.provider, s.endpoint_kind).is_ok());
+            let pane = refuse_pane_agent(s.provider, s.endpoint_kind).is_err();
+            assert_eq!(spec(s.provider, s.endpoint_kind).is_err(), pane);
         }
+    }
+
+    #[test]
+    fn a_real_provider_pane_is_refused_with_the_headless_form() {
+        for provider in ["devin", "claude", "cursor"] {
+            let message = spec(provider, "pty").unwrap_err().to_string();
+            assert!(message.contains("cadence join <pm> claude"), "{message}");
+            assert!(message.contains("cadence join <pm> pi"), "{message}");
+        }
+        assert!(spec("claude", "managed").is_ok());
+        assert!(spec("tui-stub", "pty").is_ok());
     }
 
     #[test]

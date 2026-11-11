@@ -76,7 +76,14 @@ pub(super) fn reviewer_gh_env(
         .var("CADENCE_REVIEWER_GH_TOKEN")
         .filter(|value| !value.trim().is_empty());
     pairs.push(("GH_TOKEN".to_string(), token.unwrap_or_default()));
-    pairs.push(("GITHUB_TOKEN".to_string(), String::new()));
+    // The enterprise-host variants are read the same way for a GHE host.
+    for name in [
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ] {
+        pairs.push((name.to_string(), String::new()));
+    }
     Ok(pairs)
 }
 
@@ -1628,6 +1635,37 @@ mod reviewer_env_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// CAD-2239 guard. A local provider child is spawned only by the two
+    /// transport primitives, and both take the role's launch environment as a
+    /// required argument; the adapters that drive them must call
+    /// `reviewer_gh_env`. A new file that spawns a provider child, or an
+    /// adapter that stops calling it, fails here until the new path is
+    /// reviewed for the role environment.
+    #[test]
+    fn every_local_launch_path_is_known_and_sets_the_role_env() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/adapter");
+        let mut spawners = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                if text.contains(&["reaper", "::spawn("].concat()) {
+                    spawners.push(path.file_name().unwrap().to_string_lossy().to_string());
+                }
+            }
+        }
+        spawners.sort();
+        assert_eq!(
+            spawners,
+            ["stdio.rs", "ws.rs"],
+            "a new local launch path must take the role env (CAD-2239)"
+        );
+        for adapter in ["claude.rs", "codex.rs", "pi.rs"] {
+            let text = std::fs::read_to_string(dir.join(adapter)).unwrap();
+            assert!(text.contains("reviewer_gh_env("), "{adapter}");
+        }
+    }
+
     // CAD-844: a reviewer's `gh` must not read the operator's saved login. It
     // gets a private empty config plus, only when provisioned, a token under
     // its own name; other roles are unchanged.
@@ -1657,7 +1695,12 @@ mod reviewer_env_tests {
         );
         // Both token names are pinned empty: an inherited value would
         // otherwise override the config pin and authenticate as the operator.
-        for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        for name in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ] {
             assert!(
                 pairs
                     .iter()
