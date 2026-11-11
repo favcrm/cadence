@@ -54,6 +54,7 @@ import {
   threadItems,
   threadRuns,
   visibleWindow,
+  type PendingAttachment,
   type ThreadItem,
 } from "../../home/thread";
 import type { Viewer } from "../../projects/work";
@@ -193,7 +194,7 @@ export interface HomeListProps {
     message: string,
     text: string,
     refs?: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
   ) => void;
   onDiscard: (message: string) => void;
   /** Extra content under a row (Home's plan cards). */
@@ -616,7 +617,7 @@ function AppRow({
     message: string,
     text: string,
     refs?: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
   ) => void;
   onDiscard: (message: string) => void;
   question?: string;
@@ -1290,7 +1291,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           const refs = objects(listOf("refs"), (r) =>
             typeof r.kind === "string" && typeof r.id === "string" ? { kind: r.kind, id: r.id } : null,
           );
-          const attachments = objects(listOf("attachments"), (a) => (typeof a.id === "string" ? { id: a.id } : null));
+          const attachments = objects(listOf("attachments"), (a): PendingAttachment | null =>
+            typeof a.id === "string"
+              ? {
+                  id: a.id,
+                  ...(typeof a.name === "string" ? { name: a.name } : {}),
+                  ...(typeof a.size === "number" ? { size: a.size } : {}),
+                  ...(typeof a.mime === "string" ? { mime: a.mime } : {}),
+                }
+              : null,
+          );
           const mediaRefs = objects(listOf("media_refs"), (m) =>
             typeof m.asset_id === "string" && typeof m.revision === "number" && typeof m.sha256 === "string"
               ? { asset_id: m.asset_id, revision: m.revision, sha256: m.sha256 }
@@ -1395,7 +1405,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       message: string,
       body: string,
       refs?: ThreadRef[],
-      attachments?: { id: string }[],
+      attachments?: PendingAttachment[],
       app?: { install_id: string; context_id?: string },
       operation?: PrivateOperation,
       mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
@@ -1562,7 +1572,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const send = (
     body: string,
     refs: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
     mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
     originalApp?: OutboxEnvelope["app"] | null,
   ): Promise<void> => {

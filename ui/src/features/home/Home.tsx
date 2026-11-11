@@ -84,6 +84,7 @@ import {
   threadItems,
   visibleWindow,
   WINDOW,
+  type PendingAttachment,
   type ThreadEntry,
   type ThreadItem,
 } from "./thread";
@@ -536,7 +537,7 @@ const retry = (
   message: string,
   text: string,
   refs?: ThreadRef[],
-  attachments?: { id: string }[],
+  attachments?: PendingAttachment[],
   conversation?: string,
 ) => sendToMaster(text, message, refs, attachments, conversation);
 const discard = (message: string) => resources.masterThread.write((s) => discardPending(s, message));
@@ -579,7 +580,7 @@ const ThreadList = memo(function ThreadList({
     message: string,
     text: string,
     refs?: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
     conversation?: string,
   ) => void;
   /** The live turn: its own `message` id picks the row the activity
@@ -1155,7 +1156,7 @@ function MasterHome({
       message: string,
       text: string,
       refs?: ThreadRef[],
-      attachments?: { id: string }[],
+      attachments?: PendingAttachment[],
       conversation?: string,
     ) => {
       engage();
@@ -1604,9 +1605,16 @@ function MasterHome({
                             ? [{ kind: r.kind, id: r.id }]
                             : [];
                         });
-                        const attachments = list("attachments").flatMap((item) => {
-                          const a = item as { id?: unknown };
-                          return typeof a.id === "string" ? [{ id: a.id }] : [];
+                        const attachments = list("attachments").flatMap((item): PendingAttachment[] => {
+                          const a = item as { id?: unknown; name?: unknown; size?: unknown; mime?: unknown };
+                          return typeof a.id === "string"
+                            ? [{
+                                id: a.id,
+                                ...(typeof a.name === "string" ? { name: a.name } : {}),
+                                ...(typeof a.size === "number" ? { size: a.size } : {}),
+                                ...(typeof a.mime === "string" ? { mime: a.mime } : {}),
+                              }]
+                            : [];
                         });
                         const mediaRefs = list("media_refs").flatMap((item) => {
                           if (!item || typeof item !== "object") return [];

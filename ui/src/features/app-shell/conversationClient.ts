@@ -6,7 +6,15 @@ import { useQuery } from "../../lib/useResource";
 import type { Resource } from "../../lib/cache";
 import { beginPrivateOperation, onPrivateReadsPaused, onPrivateSessionReset, withPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import type { MasterState, ThreadRef } from "../../lib/types";
-import { EMPTY_THREAD, loadThread, type PageReader, type ThreadEntry, type ThreadState, type PendingMessage } from "../home/thread";
+import {
+  EMPTY_THREAD,
+  loadThread,
+  type PageReader,
+  type PendingAttachment,
+  type PendingMessage,
+  type ThreadEntry,
+  type ThreadState,
+} from "../home/thread";
 
 /**
  * CAD-1098: the UI's one view of per-app assistant conversations
@@ -333,7 +341,7 @@ export interface OutboxEnvelope {
   message: string;
   text: string;
   refs?: ThreadRef[];
-  attachments?: { id: string }[];
+  attachments?: PendingAttachment[];
   mediaRefs?: { asset_id: string; revision: number; sha256: string }[];
   app?: { install_id: string; context_id?: string };
   /** The unsaved subject this envelope was submitted under — a retry

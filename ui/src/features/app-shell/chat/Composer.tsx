@@ -11,6 +11,7 @@ import {
 import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
+import type { PendingAttachment } from "../../home/thread";
 import { attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
 import type { UiNotice } from "../../../lib/uiNotice";
 import {
@@ -61,8 +62,9 @@ import {
 export interface ComposerSend {
   body: string;
   refs: ThreadRef[];
-  /** CAD-1168: daemon-minted ids of the retained uploads that are `ready`. */
-  attachments?: { id: string }[];
+  /** CAD-1168: daemon-minted ids of the retained uploads that are `ready`
+   *  (plus local metadata so the pending bubble renders chips/previews). */
+  attachments?: PendingAttachment[];
   /** One host-resolved library image pin. Not a file upload. */
   mediaRefs?: { asset_id: string; revision: number; sha256: string }[];
 }

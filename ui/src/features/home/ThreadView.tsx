@@ -3,7 +3,7 @@ import { useTranslate } from "../../lib/locale";
 import { AssistantFace, useAssistantActor } from "../assistant/AssistantIdentity";
 import { displayName } from "../assistant/identity";
 import type { ThreadRef } from "../../lib/types";
-import Md from "../../ui/Md";
+import Md, { healStreamingMarkdown } from "../../ui/Md";
 import { attachMeta } from "../app-shell/chat/attach";
 import { askLabel } from "../canvas/askRefs";
 import HireProposalCard from "../agents/HireProposalCard";
@@ -15,7 +15,15 @@ import { useImageConversation } from "../canvas/imageConversation";
 import { hostedOrigin } from "../auth/hosted";
 import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import { ThreadPermission } from "./PermissionCard";
-import { isArtifactPutCall, isCardItem, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
+import {
+  isArtifactPutCall,
+  isCardItem,
+  stepSummary,
+  toolSteps,
+  type PendingAttachment,
+  type ThreadEntry,
+  type ThreadItem,
+} from "./thread";
 import { carriesSecret } from "../app-shell/chat/directive";
 import { useConversationPreview } from "../app-shell/chat/conversationPreview";
 
@@ -167,7 +175,7 @@ export function ThreadItemView({
     message: string,
     text: string,
     refs?: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
     conversation?: string,
   ) => void;
   onDiscard: (message: string) => void;
@@ -218,6 +226,7 @@ export function ThreadItemView({
             data-pending={item.pending.state}
           >
             {item.pending.text}
+            <AttachmentRows files={pendingAttachments(item.pending.attachments)} />
           </div>
           <RefChips refs={item.pending.refs ?? []} onOpenIssue={onOpenIssue} />
           {item.pending.state === "failed" && (
@@ -458,6 +467,21 @@ export function entryAttachments(payload: unknown): EntryAttachment[] {
       typeof (a as EntryAttachment).name === "string" &&
       typeof (a as EntryAttachment).size === "number" &&
       typeof (a as EntryAttachment).mime === "string",
+  );
+}
+
+/** Optimistic attachment rows carried on a pending send while it awaits its
+ *  stored `operator` entry. Entries that carry `{id}` only (for example a retry
+ *  seeded from a legacy envelope) omit chips until the stored row arrives. */
+export function pendingAttachments(attachments?: PendingAttachment[]): EntryAttachment[] {
+  if (!Array.isArray(attachments)) return [];
+  return attachments.filter(
+    (a): a is EntryAttachment =>
+      !!a &&
+      typeof a.id === "string" &&
+      typeof a.name === "string" &&
+      typeof a.size === "number" &&
+      typeof a.mime === "string",
   );
 }
 
@@ -935,6 +959,7 @@ export function ThreadTurn({
   const preview = useConversationPreview(previewConversation, streaming);
   const previewText =
     preview === null || previewTransform === undefined ? preview : previewTransform(preview);
+  const hasPreview = previewText !== null && previewText.trim() !== "";
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,
@@ -972,21 +997,17 @@ export function ThreadTurn({
       {/* Its name row and trace say the turn is live; this is the only
           place its own words appear before the committed answer replaces
           them. No timestamp, no copy, no stored row. */}
-      {previewText !== null && previewText.trim() !== "" && (
-        <div
-          className={`min-w-0 max-w-[40rem] mt-1 whitespace-pre-wrap break-words text-ink-200 ${
-            density === "compact" ? "text-secondary" : "text-body"
-          }`}
-          data-kind="preview"
-          aria-live="off"
-        >
-          {previewText}
+      {hasPreview && previewText !== null && (
+        <div className="answer" data-kind="preview" aria-live="off">
+          <div className={`answer-body issue-reader ${density === "compact" ? "text-secondary" : "text-body"}`}>
+            <Md text={healStreamingMarkdown(previewText)} onOpen={onOpenIssue} />
+          </div>
         </div>
       )}
       {/* Dots, then the current step. Under the trace once steps exist,
           so the disclosure names the turn and the bubble names what is
           running now. */}
-      {streaming && <TypingDots label={typingLabel} />}
+      {streaming && (!hasPreview || tool !== "") && <TypingDots label={typingLabel} />}
       {shown && (
         <div data-item-key={shown.key}>
           <AnswerSurface entry={shown.entry} density={density} onOpenIssue={onOpenIssue} earlier={legacy !== null} />
