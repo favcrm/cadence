@@ -1,4 +1,5 @@
 import type { Resource } from "./cache";
+import { openBoardSocketStream } from "./boardSocket";
 import { beginPrivateOperation, bindPrivateAbort, onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration, withPrivateOperation, type PrivateOperation } from "./privateSession";
 import { sessionHeaders } from "./sessionKey";
 
@@ -84,6 +85,7 @@ export interface EventSourceLike {
   close(): void;
   onerror: ((e: Event) => void) | null;
   onopen: ((e: Event) => void) | null;
+  lastStatus?: () => number | null;
 }
 
 /** What an error means for the subscription. */
@@ -171,7 +173,7 @@ export function withResume(url: string, lastEventId: string | null): string {
 
 /** Fetch-backed SSE keeps the local tab credential in a header, never a URL.
  * subscribeSse owns reconnect/backoff; this adapter owns one connection. */
-function openAuthenticatedStream(url: string): EventSourceLike {
+function openHttpAuthenticatedStream(url: string): EventSourceLike {
   const generation = privateSessionGeneration();
   const controller = new AbortController();
   let operation: PrivateOperation | null = null;
@@ -279,6 +281,10 @@ function openAuthenticatedStream(url: string): EventSourceLike {
   return source;
 }
 
+function openAuthenticatedStream(url: string): EventSourceLike {
+  return openBoardSocketStream(url, openHttpAuthenticatedStream);
+}
+
 export function subscribeSse(opts: SseOptions): SseSubscription {
   const open = opts.open ?? openAuthenticatedStream;
   const probe = opts.probe ?? probeStatus;
@@ -367,7 +373,9 @@ export function subscribeSse(opts: SseOptions): SseSubscription {
       // A callback that closed the subscription owns the outcome now: no
       // probe, no scheduled reconnect.
       if (closed) return;
-      void probe(url).then((status) => {
+      const knownStatus = opts.probe ? null : (es.lastStatus?.() ?? null);
+      const statusPromise = knownStatus !== null ? Promise.resolve(knownStatus) : probe(url);
+      void statusPromise.then((status) => {
         if (closed) return;
         if (isPermanent(status)) {
           closed = true;

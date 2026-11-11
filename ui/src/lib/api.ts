@@ -1,4 +1,5 @@
 import type { LanePayload } from "../features/issues/lane";
+import { sendMasterMessageViaSocket } from "./boardSocket";
 import { ConditionalGet } from "./conditionalGet";
 import { ApiError, errorMessage } from "./apiError";
 import { sessionKey, sessionHeaders } from "./sessionKey";
@@ -359,6 +360,31 @@ async function write<T extends object | undefined>(
   });
 }
 
+function unwrapPostJson<T>(status: number, fallbackMessage: string, parsed: unknown): T {
+  if (status < 200 || status >= 300) {
+    const record =
+      parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    const nested =
+      record && typeof record.error === "object" && record.error !== null && !Array.isArray(record.error)
+        ? (record.error as Record<string, unknown>)
+        : null;
+    const nestedCode =
+      typeof record?.code === "string"
+        ? record.code
+        : typeof nested?.code === "string"
+          ? nested.code
+          : undefined;
+    throw new ApiError(
+      errorMessage(parsed, fallbackMessage),
+      status,
+      record ? { ...record, ...(nestedCode === undefined ? {} : { code: nestedCode }) } : undefined,
+    );
+  }
+  return parsed as T;
+}
+
 /** A board write that answers its own JSON (not an issue `WriteResp`). */
 async function post<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
   return usingPrivateOperation(operation, async (op) => {
@@ -373,16 +399,7 @@ async function post<T>(path: string, body: object, operation?: PrivateOperation)
     }, op);
     const parsed = await resp.json().catch(() => null);
     op.assertCurrent();
-    if (!resp.ok) {
-      // Some routes nest the code under `error`, as the read path already allows for.
-      const nestedCode = parsed?.code ?? parsed?.error?.code;
-      throw new ApiError(
-        errorMessage(parsed, `${resp.status} ${resp.statusText}`),
-        resp.status,
-        parsed ? { ...parsed, ...(nestedCode === undefined ? {} : { code: nestedCode }) } : undefined,
-      );
-    }
-    return parsed as T;
+    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
   });
 }
 
@@ -763,7 +780,7 @@ export const api = {
    *  authority: the contextual Threads reply pins the recorded sender it
    *  is answering, and the daemon refuses before any side effect when
    *  the alias now names a different uid. Ordinary sends omit it. */
-  threadSend: (
+  threadSend: async (
     alias: string,
     text: string,
     message: string,
@@ -774,24 +791,36 @@ export const api = {
     operation?: PrivateOperation,
     mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
     expectedRecipientUid?: string,
-  ) =>
-    post<Record<string, unknown>>(
+  ): Promise<Record<string, unknown>> => {
+    const payload: Record<string, unknown> = {
+      text,
+      message,
+      ...(refs && refs.length > 0 ? { refs } : {}),
+      ...(app ? { app } : {}),
+      // CAD-1098: only a selector; the daemon resolves scope, subject and install.
+      ...(conversation ? { conversation } : {}),
+      // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
+      // grammar and existence, never the client's metadata.
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
+      ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
+      ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
+    };
+    const hasNativeOnlyContext =
+      (refs !== undefined && refs.length > 0) ||
+      (mediaRefs !== undefined && mediaRefs.length > 0) ||
+      Boolean(expectedRecipientUid);
+    if (alias === "master" && !hasNativeOnlyContext) {
+      const viaSocket = await sendMasterMessageViaSocket(alias, payload, operation);
+      if (viaSocket !== null) {
+        return unwrapPostJson<Record<string, unknown>>(viaSocket.status, `${viaSocket.status}`, viaSocket.body);
+      }
+    }
+    return post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
-      {
-        text,
-        message,
-        ...(refs && refs.length > 0 ? { refs } : {}),
-        ...(app ? { app } : {}),
-        // CAD-1098: only a selector; the daemon resolves scope, subject and install.
-        ...(conversation ? { conversation } : {}),
-        // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
-        // grammar and existence, never the client's metadata.
-        ...(attachments && attachments.length > 0 ? { attachments } : {}),
-        ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
-        ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
-      },
+      payload,
       operation,
-    ),
+    );
+  },
   /** `POST /api/chat/upload` — one retained chat attachment (CAD-1168).
    *  Operator-only multipart; returns the native daemon row or the hosted receipt. `signal`
    *  aborts only this upload's transport (a canceled row's late answer
