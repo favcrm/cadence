@@ -1329,6 +1329,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <ProjectSettings
             project={route.slug}
             block={policyBlock(meta)}
+            hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
             onToast={(text) => say("ok", text)}
           />
         )}

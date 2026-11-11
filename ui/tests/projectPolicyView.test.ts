@@ -1,5 +1,6 @@
 import { invalidatedBy } from "../src/lib/cache";
-import { cliCommand, policyDirty } from "../src/features/projects/policyView";
+import { cliCommand } from "../src/features/projects/policyView";
+import { draftDirty, readPolicy, type PolicyView } from "../src/features/projects/policyContract";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -10,19 +11,19 @@ function equal(actual: unknown, expected: unknown, what: string): void {
 // CAD-1950: the Settings page prints the CLI command for the state on screen.
 // The two must not drift, because `--grant` replaces and omitting it clears.
 equal(
-  cliCommand("pay", { visibility: "workspace_visible", members: [] }),
+  cliCommand("pay", { visibility: "workspace_visible", grants: [] }),
   "cadence issue project policy pay --visibility workspace-visible",
   "visible with no grants",
 );
 equal(
-  cliCommand("pay", { visibility: "private", members: ["users/alex"] }),
+  cliCommand("pay", { visibility: "private", grants: ["users/alex"] }),
   "cadence issue project policy pay --visibility private --grant users/alex",
   "private with one grant",
 );
 equal(
   cliCommand("pay", {
     visibility: "workspace_visible",
-    members: ["users/sarah", "operator"],
+    grants: ["users/sarah", "operator"],
   }),
   "cadence issue project policy pay --visibility workspace-visible --grant users/sarah --grant operator",
   "a visible project still spells out the grants it would keep",
@@ -31,31 +32,43 @@ equal(
 // A project with no recorded policy is always a change: recording
 // workspace-visible is a write, and without this the page could never create
 // the policy it invites the operator to create.
-const visible = { visibility: "workspace_visible" as const, members: [] };
-equal(policyDirty(false, visible, visible), true, "no policy is always dirty");
-equal(policyDirty(true, visible, visible), false, "an unchanged record is clean");
+const visibleView: PolicyView = {
+  kind: "recorded",
+  visibility: "workspace_visible",
+  grants: [],
+  revision: 1,
+  privateOffered: false,
+};
+const visible = { visibility: "workspace_visible" as const, grants: [] };
 equal(
-  policyDirty(true, visible, { visibility: "private", members: [] }),
+  draftDirty(readPolicy({ recorded: false, policy: null }, false), visible),
+  true,
+  "no policy is always dirty",
+);
+equal(draftDirty(visibleView, visible), false, "an unchanged record is clean");
+equal(
+  draftDirty(visibleView, { visibility: "private", grants: [] }),
   true,
   "a visibility change is dirty",
 );
 equal(
-  policyDirty(true, { visibility: "private", members: ["users/alex"] }, {
-    visibility: "private",
-    members: ["users/alex", "users/sarah"],
-  }),
+  draftDirty(
+    { kind: "recorded", visibility: "private", grants: ["users/alex"], revision: 2, privateOffered: true },
+    { visibility: "private", grants: ["users/alex", "users/sarah"] },
+  ),
   true,
   "an added grant is dirty",
 );
 equal(
-  policyDirty(true, { visibility: "private", members: ["users/alex"] }, {
-    visibility: "private",
-    members: ["users/sarah"],
-  }),
+  draftDirty(
+    { kind: "recorded", visibility: "private", grants: ["users/alex"], revision: 2, privateOffered: true },
+    { visibility: "private", grants: ["users/sarah"] },
+  ),
   true,
   "a replaced grant is dirty",
 );
-equal(policyDirty(true, null, null), false, "nothing loaded is not a change");
+equal(draftDirty({ kind: "unreadable", reason: "x" }, visible), false, "nothing loaded is not a change");
+equal(draftDirty({ kind: "absent", privateOffered: null }, visible), true, "an absent native record is a write");
 
 // The server names `projectPolicy` in an `issues` event. `invalidatedBy`
 // drops any name missing from the client allowlist, which would leave the

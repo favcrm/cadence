@@ -60,8 +60,6 @@ import type {
   Overview,
   Project,
   ProjectContext,
-  ProjectPolicy,
-  ProjectPolicyPayload,
   ContextRole,
   ThreadRef,
   WorkflowPreview,
@@ -421,6 +419,24 @@ async function post<T>(path: string, body: object, operation?: PrivateOperation)
   });
 }
 
+/** A board write whose verb is PUT and which answers its own JSON. */
+async function put<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: JSON.stringify(body),
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
+  });
+}
+
 /** A plan decision's request: approve takes nothing, reject a reason. */
 export function planDecision(
   epic: string,
@@ -618,21 +634,26 @@ export const api = {
   myWork: (query: string, signal?: AbortSignal) => get<MyWorkPayload>(`/api/my-work?${query}`, signal),
   myWorkIssue: (id: string) => get<MyWorkMembership>(`/api/my-work/issues/${encodeURIComponent(id)}`),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
-  /** `GET /api/projects/<key>/policy` (CAD-1950) — the recorded access
-   *  policy, whether there is one, and whether this build may record
-   *  `private`. */
+  /** `GET /api/projects/<key>/policy` — the board's own policy record. The
+   *  native and hosted shapes differ (CAD-2255), so this is handed back
+   *  untyped and `features/projects/policyContract` validates it. */
   projectPolicy: (project: string) =>
-    get<ProjectPolicyPayload>(`/api/projects/${encodeURIComponent(project)}/policy`),
-  /** `POST /api/projects/<key>/policy` (CAD-1950) — the same writer the CLI
-   *  calls. `members` is the full grant list and replaces what was there. */
-  setProjectPolicy: (
+    get<unknown>(`/api/projects/${encodeURIComponent(project)}/policy`),
+  /** `POST /api/projects/<key>/policy` (CAD-1950, native) — the same writer
+   *  the CLI calls. `members` is the full grant list. */
+  setProjectPolicyNative: (
     project: string,
     req: { visibility: "workspace-visible" | "private"; members: string[] },
   ) =>
-    post<{ project: string; policy: ProjectPolicy; committed: boolean }>(
-      `/api/projects/${encodeURIComponent(project)}/policy`,
-      req,
-    ),
+    post<unknown>(`/api/projects/${encodeURIComponent(project)}/policy`, req),
+  /** `PUT /api/projects/<key>/policy` (AOS-530, hosted) — `grants` are
+   *  verified member subject ids and `if_rev` pins the stored revision
+   *  (`""` for a project with no row yet). */
+  setProjectPolicyHosted: (
+    project: string,
+    req: { visibility: "workspace-visible" | "private"; grants: string[]; if_rev: string },
+  ) =>
+    put<unknown>(`/api/projects/${encodeURIComponent(project)}/policy`, req),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
     const query = new URLSearchParams({ role });
     if (expectedRevision) query.set("expected_revision", expectedRevision);
