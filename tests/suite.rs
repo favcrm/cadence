@@ -1350,6 +1350,7 @@ mod cad2081_workflow_verdicts {
             let mut case = scenario(rows);
             case.class = "consequential";
             case.head = Some(head.clone());
+            case.tip_files = Some(empty_auto_list(&f));
             case
         };
         refused(
@@ -1907,6 +1908,7 @@ mod cad2081_workflow_verdicts {
         let mut case = scenario(vec![f.std(), f.spec()]);
         case.class = "consequential";
         case.head = Some(head.clone());
+        case.tip_files = Some(empty_auto_list(&f));
         let (code, stdout, stderr) = f.gate(&case);
         assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
         for one in [f.std(), f.spec()] {
@@ -4028,6 +4030,7 @@ mod cad2081_workflow_verdicts {
         let mut case = scenario(vec![f.std(), f.spec()]);
         case.class = "routine";
         case.head = Some(head.clone());
+        case.tip_files = Some(empty_auto_list(&f));
         let (code, stdout, stderr) = f.gate(&case);
         assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
         // An owner row that is not a pass behaves as it does on main: routine reads no reviews.
@@ -4148,73 +4151,53 @@ mod cad2081_workflow_verdicts {
         }
 
         #[test]
-        fn the_real_workflow_auto_paths_file_is_exactly_the_delegable_set_and_crosses_no_src_glob()
-        {
-            let read = |path: &str| -> toml::Table {
-                std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
-                    .unwrap()
-                    .parse()
-                    .unwrap()
-            };
-            let paths = |doc: &toml::Table, table: &str| -> Vec<String> {
-                doc[table]["paths"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|v| v.as_str().unwrap().to_string())
-                    .collect()
-            };
-            let auto_doc = read(AUTO_PATHS);
-            let auto = paths(&auto_doc, "auto");
-            let delegable = paths(&read(RISK_PATHS), "delegable");
-            // Same entries, so the two lists cannot drift apart.
-            let sorted = |mut v: Vec<String>| {
-                v.sort();
-                v
-            };
-            assert_eq!(sorted(auto.clone()), sorted(delegable));
-            assert!(!auto.is_empty());
-            assert_eq!(auto_doc.len(), 1, "no table but [auto]: {auto_doc:?}");
-            assert_eq!(auto_doc["auto"].as_table().unwrap().len(), 1);
-            // No glob that reaches across src/: no `**`, no `src/**`, no `src/*` directory glob.
+        fn the_real_workflow_auto_paths_file_is_exactly_markdown_under_docs_and_crosses_no_src_glob(
+        ) {
+            let text =
+                std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(AUTO_PATHS))
+                    .unwrap();
+            let doc: toml::Table = text.parse().unwrap();
+            let auto: Vec<&str> = doc["auto"]["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(auto, ["docs/**/*.md"]);
+            assert_eq!(doc.len(), 1, "no table but [auto]: {doc:?}");
+            assert_eq!(doc["auto"].as_table().unwrap().len(), 1);
+            // Nothing reaches across src/, and no bare `**`.
             for glob in &auto {
-                assert_ne!(glob, "**", "{auto:?}");
+                assert_ne!(*glob, "**");
                 assert!(
-                    !glob.starts_with("**")
-                        && !glob.starts_with("src/**")
-                        && !glob.starts_with("*"),
-                    "{glob} crosses src/"
+                    !glob.starts_with("**") && !glob.starts_with('*') && !glob.starts_with("src/"),
+                    "{glob} reaches into code"
                 );
-                if glob.starts_with("src/") {
-                    assert!(
-                        glob.ends_with(".rs") && !glob.contains('*'),
-                        "a src/ entry must name one file: {glob}"
-                    );
-                }
             }
         }
 
         #[test]
-        fn with_the_repos_own_lists_served_as_they_are_only_delegable_and_docs_paths_merge_as_class_auto(
-        ) {
+        fn with_the_repos_own_lists_served_as_they_are_only_markdown_docs_merge_as_class_auto() {
             let f = Fixture::new();
             for path in [
-                "src/issue/blocked.rs",
-                "src/cli/issue.rs",
                 "docs/guides/x.md",
+                "docs/y/z/deep.md",
+                "docs/RELEASING.md",
+                "docs/guides/New-Thing.md",
             ] {
                 merges(&f, case_on(&f, f.touch(path), f.base_files()));
             }
-            // Two delegable files and a docs file in one diff.
-            let head = f.make_head("delegable-mixed", |d| {
-                put(d, "src/issue/lint.rs", "// x\n");
-                put(d, "src/cli/help.rs", "// x\n");
-                put(d, "docs/guides/y.md", "y\n");
+            // Two Markdown docs in one diff.
+            let head = f.make_head("docs-pair", |d| {
+                put(d, "docs/guides/a.md", "a\n");
+                put(d, "docs/b/c.md", "c\n");
             });
             merges(&f, case_on(&f, head, f.base_files()));
-            // The tree a directory glob would have opened stays with the operator: files
-            // no list classifies but that are plainly not ordinary.
+            // No code is listed, delegable client files included; nor are the trees a
+            // directory glob would have opened; nor non-Markdown files under docs/.
             for path in [
+                "src/issue/blocked.rs",
+                "src/cli/status.rs",
                 "src/upgrade/trusted_root.jsonl",
                 "src/protected_runtime/keys.rs",
                 "src/rollout_gate.rs",
@@ -4222,16 +4205,73 @@ mod cad2081_workflow_verdicts {
                 "src/wiki/x.rs",
                 "contracts/x.json",
                 "src/daemon/x.rs",
-                "src/issue/other.rs",
+                "docs/x.toml",
+                "docs/x.rs",
+                "docs/x.sh",
+                "docs/x.MD",
             ] {
                 operator(&f, case_on(&f, f.touch(path), f.base_files()), &[path]);
             }
-            // One delegable file does not carry a non-delegable one beside it.
-            let head = f.make_head("delegable-beside", |d| {
-                put(d, "src/issue/blocked.rs", "// x\n");
-                put(d, "src/wiki/x.rs", "// x\n");
-            });
-            operator(&f, case_on(&f, head, f.base_files()), &["src/wiki/x.rs"]);
+            // A docs file does not carry a non-listed file beside it.
+            for other in ["src/issue/blocked.rs", "src/wiki/x.rs", "docs/x.toml"] {
+                let head = f.make_head("docs-beside", |d| {
+                    put(d, "docs/guides/ok.md", "ok\n");
+                    put(d, other, "// x\n");
+                });
+                operator(&f, case_on(&f, head, f.base_files()), &[other]);
+            }
+        }
+
+        /// Names that are not protected as spelled but are the same path on a
+        /// case-insensitive checkout, or that sit under a protected tree once case is
+        /// ignored.
+        const ALIASES: &[&str] = &[
+            "docs/Roles/x.md",
+            "docs/ROLES/risk-classes.md",
+            "docs/Roles/risk-paths.toml",
+            "docs/charter.md",
+            "docs/Audit.md",
+            "docs/team.md",
+            "docs/Design/x.md",
+            "docs/CADENCE/x.md",
+            "docs/start-here.md",
+            "Scripts/x.md",
+            "Src/Daemon/x.rs",
+            "UI/x.tsx",
+        ];
+
+        #[test]
+        fn a_case_alias_of_a_protected_path_never_reaches_class_auto() {
+            let f = Fixture::new();
+            for path in ALIASES {
+                // Under the real list, and under a wide served list.
+                operator(&f, case_on(&f, f.touch(path), f.base_files()), &[*path]);
+                operator(
+                    &f,
+                    case_on(&f, f.touch(path), tip_with(&f, EVERYTHING)),
+                    &[*path],
+                );
+                // Beside an ordinary docs file, under the same two lists.
+                let head = f.make_head("alias-beside", |d| {
+                    put(d, "docs/guides/ok.md", "ok\n");
+                    put(d, path, "x\n");
+                });
+                operator(&f, case_on(&f, head.clone(), f.base_files()), &[*path]);
+                operator(&f, case_on(&f, head, tip_with(&f, EVERYTHING)), &[*path]);
+            }
+        }
+
+        #[test]
+        fn legitimate_mixed_case_docs_stay_class_auto_even_under_a_wide_list() {
+            let f = Fixture::new();
+            for path in [
+                "docs/RELEASING.md",
+                "docs/guides/New-Thing.md",
+                "docs/Guides/Intro.md",
+            ] {
+                merges(&f, case_on(&f, f.touch(path), f.base_files()));
+                merges(&f, case_on(&f, f.touch(path), tip_with(&f, EVERYTHING)));
+            }
         }
 
         #[test]
