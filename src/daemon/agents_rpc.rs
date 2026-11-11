@@ -10,6 +10,7 @@ impl Shared {
         let endpoint =
             optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND);
         let role = optional_str(params, "role").unwrap_or("worker");
+        registry::refuse_reviewer_pane(provider, endpoint, role)?;
         let caller_team_role = optional_text(params, "team_role")?;
         let model_policy = optional_text(params, "model_policy")?;
         let cwd = optional_str(params, "cwd");

@@ -1352,7 +1352,13 @@ function OperatorComposer({
           const text = reply
             ? contextualReplyText(body.trim(), { id: reply.messageId, body: reply.body })
             : body;
-          const key = JSON.stringify({ alias, body: text, refs, attachments: attachments ?? [], reply: reply?.messageId ?? null });
+          const key = JSON.stringify({
+            alias,
+            body: text,
+            refs,
+            attachments: (attachments ?? []).map((a) => ({ id: a.id })),
+            reply: reply?.messageId ?? null,
+          });
           const id = envelopeId(scope, key);
           try {
             await withPrivateOperation(async (op) => {

@@ -504,7 +504,7 @@ pub(super) fn reviewer_gh_env(
     role: &str,
     state_dir: &std::path::Path,
     alias: &str,
-) -> Result<Vec<(String, String)>> {
+) -> Result<crate::adapter::RoleEnv> {
     crate::adapter::reviewer_gh_env(env, role, &pi_worker_dir(state_dir, alias)?)
 }
 

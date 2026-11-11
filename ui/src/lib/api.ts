@@ -802,7 +802,9 @@ export const api = {
       ...(conversation ? { conversation } : {}),
       // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
       // grammar and existence, never the client's metadata.
-      ...(attachments && attachments.length > 0 ? { attachments } : {}),
+      ...(attachments && attachments.length > 0
+        ? { attachments: attachments.map((a) => ({ id: a.id })) }
+        : {}),
       ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
       ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
     };

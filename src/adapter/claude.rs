@@ -886,11 +886,11 @@ impl ProviderAdapter for ClaudeAdapter {
             }
         }
         // CAD-844: a reviewer must not use the operator's saved `gh` login.
-        env.extend(super::reviewer_gh_env(
+        let role_env = super::reviewer_gh_env(
             &self.env,
             &agent.role,
             &self.state_dir.join("agents").join(&agent.alias),
-        )?);
+        )?;
         let params = agent.params.clone().unwrap_or(Value::Null);
         let idle_secs = params
             .get("turn_idle_secs")
@@ -903,7 +903,7 @@ impl ProviderAdapter for ClaudeAdapter {
             .map(|s| Duration::from_secs(s.max(1)));
         *self.shared.last_activity.lock().unwrap() = Instant::now();
         let transport = self.transport_for(&command, master);
-        let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
+        let pid = transport.launch(&agent.cwd, &self.log_path, &env, &role_env)?;
         *self.transport.write().unwrap() = transport;
         Ok(Identity {
             thread_id: session_id.clone(),

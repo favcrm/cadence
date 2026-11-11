@@ -957,6 +957,12 @@ pre {
 .chat-bubble.issue-reader td:first-child {
   min-width: 9rem;
 }
+.answer .issue-reader th:not(:first-child),
+.answer .issue-reader td:not(:first-child),
+.chat-bubble.issue-reader th:not(:first-child),
+.chat-bubble.issue-reader td:not(:first-child) {
+  min-width: 6rem;
+}
 .answer .issue-reader blockquote {
   padding: .65rem .85rem;
   border-inline-start: 0;
@@ -964,10 +970,16 @@ pre {
   background: color-mix(in srgb, var(--color-ink-800) 65%, transparent);
   color: var(--color-ink-300);
 }
-.answer .issue-reader blockquote p {
+.answer .issue-reader blockquote p,
+.chat-bubble.issue-reader blockquote p {
   margin: 0;
 }
-.answer .issue-reader blockquote strong {
+.answer .issue-reader blockquote p + p,
+.chat-bubble.issue-reader blockquote p + p {
+  margin-top: .5rem;
+}
+.answer .issue-reader blockquote strong,
+.chat-bubble.issue-reader blockquote strong {
   color: var(--color-ink-100);
 }
 .answer .issue-reader code,
@@ -1476,6 +1488,27 @@ pre {
   color: var(--color-ink-300);
   padding: .65rem .85rem;
 }
+.issue-reader blockquote[data-callout] {
+  --callout-tone: var(--color-accent);
+  border-inline-start: 3px solid var(--callout-tone);
+  background: color-mix(in srgb, var(--callout-tone) 8%, var(--color-ink-850));
+}
+.issue-reader blockquote[data-callout="tip"] {
+  --callout-tone: var(--color-ok);
+}
+.issue-reader blockquote[data-callout="warning"] {
+  --callout-tone: var(--color-warn);
+}
+.issue-reader blockquote[data-callout="caution"] {
+  --callout-tone: var(--color-fail);
+}
+.md-callout-head {
+  margin-bottom: .25rem;
+  color: var(--callout-tone, var(--color-accent));
+  font-size: var(--text-label);
+  font-weight: 600;
+  line-height: 1.35;
+}
 .issue-reader code {
   overflow-wrap: anywhere;
   color: var(--color-ink-200);
@@ -1525,6 +1558,21 @@ pre {
 }
 /* CAD-551 r2: GFM tables (the /help card) — the command column keeps a
  * real gap so an arg like `provider/id` never runs into the blurb. */
+.md-table-wrap {
+  max-inline-size: 100%;
+  margin-block: .6rem;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.md-table-wrap > table {
+  margin-block: 0;
+}
+.issue-reader .md-table-wrap > table {
+  display: table;
+  width: 100%;
+  border-collapse: collapse;
+}
 .issue-reader table {
   border-collapse: collapse;
   display: block;

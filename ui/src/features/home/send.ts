@@ -3,7 +3,7 @@ import { resources } from "../../lib/resources";
 import { usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import type { ThreadRef } from "../../lib/types";
 import { MASTER } from "./master";
-import { addPending, newMessageId, settlePending } from "./thread";
+import { addPending, newMessageId, settlePending, type PendingAttachment } from "./thread";
 
 /** Queue `text` to the master: optimistic entry, reconciled by message id.
  *  `refs` are the needs-me subjects an Ask-master draft cites — they
@@ -16,7 +16,7 @@ export function sendToMaster(
   text: string,
   message = newMessageId(),
   refs?: ThreadRef[],
-  attachments?: { id: string }[],
+  attachments?: PendingAttachment[],
   conversation?: string,
   operation?: PrivateOperation,
   mediaRefs?: { asset_id: string; revision: number; sha256: string }[],

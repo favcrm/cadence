@@ -540,16 +540,16 @@ pub struct Launched {
 }
 
 impl Transport {
-    /// `env` reaches a local stdio child only; a managed-WS endpoint is
-    /// remote and receives no local environment.
-    fn launch(&self, cwd: &str, log: &Path, env: &[(String, String)]) -> Result<Launched> {
+    /// Both transports spawn a local child, so the role's launch environment
+    /// reaches either one, applied last (CAD-2239).
+    fn launch(&self, cwd: &str, log: &Path, role: &super::RoleEnv) -> Result<Launched> {
         match self {
             Transport::Stdio(adapter) => Ok(Launched {
-                pid: adapter.launch(cwd, log, env)?,
+                pid: adapter.launch(cwd, log, &[], role)?,
                 endpoint: None,
             }),
             Transport::Ws(adapter) => {
-                let launched = adapter.launch(cwd, log)?;
+                let launched = adapter.launch(cwd, log, role)?;
                 Ok(Launched {
                     pid: launched.pid,
                     endpoint: Some(launched.endpoint),
@@ -1468,6 +1468,90 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// CAD-2239: every local transport hands its child the role's `gh`
+    /// environment after its own scrub — the managed-WS child included. The
+    /// child is `env`, so the assertion is on what the process really got.
+    #[test]
+    fn a_pinned_role_child_gets_the_role_gh_env_on_both_transports() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        let env = ProviderEnv::default();
+        env.set("CADENCE_REVIEWER_GH_TOKEN", "synthetic-read-only");
+        let role =
+            super::super::reviewer_gh_env(&env, "reviewer", &state.join("agents/r")).unwrap();
+        // The codex scrub plus the very names the role sets: the role
+        // environment must win, so it is applied after the scrub.
+        let mut scrub: Vec<&str> = scrub_names().to_vec();
+        scrub.extend([
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ]);
+        let dump = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "env >&2; echo END-OF-ENV >&2".to_string(),
+            "sh".to_string(),
+        ];
+        let launch = |transport: Transport, log: PathBuf| {
+            let _ = transport.launch(dir.path().to_str().unwrap(), &log, &role);
+            // A stdio launch returns at spawn: wait for the child's end
+            // marker, and fail loudly if it never comes.
+            let started = Instant::now();
+            loop {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                if text.contains("END-OF-ENV") {
+                    transport.close();
+                    return text;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "the child never finished dumping its environment: {text}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let stdio = launch(
+            Transport::Stdio(StdioAdapter::new(
+                &dump,
+                EnvScrub::names(&scrub),
+                Box::new(|_| {}),
+                Box::new(|| {}),
+            )),
+            dir.path().join("stdio.log"),
+        );
+        let ws = launch(
+            Transport::Ws(WsAdapter::new(
+                &dump,
+                &scrub,
+                Box::new(|_| {}),
+                Box::new(|| {}),
+            )),
+            dir.path().join("ws.log"),
+        );
+        for (name, log) in [("stdio", stdio), ("ws", ws)] {
+            let lines: Vec<&str> = log.lines().collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("GH_CONFIG_DIR=") && l.contains("gh-review")),
+                "{name}: {log}"
+            );
+            assert!(
+                lines.contains(&"GH_TOKEN=synthetic-read-only"),
+                "{name}: {log}"
+            );
+            for empty in [
+                "GITHUB_TOKEN=",
+                "GH_ENTERPRISE_TOKEN=",
+                "GITHUB_ENTERPRISE_TOKEN=",
+            ] {
+                assert!(lines.contains(&empty), "{name} missing {empty}: {log}");
+            }
+        }
+    }
+
     #[test]
     fn steering_requires_the_verified_initialize_version() {
         for version in ["0.160.0", "0.161.0"] {
@@ -1549,7 +1633,18 @@ mod tests {
         // Launch the peer by hand — `open` is a full provider
         // handshake; the steer seam needs only the transport.
         if let Transport::Stdio(a) = &adapter.transport {
-            a.launch("/tmp", &adapter.log_path, &[]).unwrap();
+            a.launch(
+                "/tmp",
+                &adapter.log_path,
+                &[],
+                &super::super::reviewer_gh_env(
+                    &ProviderEnv::default(),
+                    "worker",
+                    &dir.path().join("a"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         }
         (adapter, dir)
     }
