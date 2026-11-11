@@ -375,7 +375,8 @@ Do not force-push a branch with auto-merge enabled; disable it first.
 Finish fresh-session review and CI, post the ticket evidence, then run
 `scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA> --dry-run`. If it
 reports `class: auto` and every rule holds, enqueue without asking: the gate
-needs no approval (AGENTS.md "Merging", CAD-2254). Otherwise request a
+needs no approval (AGENTS.md "Merging", CAD-2254). If it reports
+`class: human` or names a missing operator approval, request a
 merge approval on the **literal full SHA** just reviewed. Example syntax
 (the example SHA must be replaced with the actual reviewed head before use):
 

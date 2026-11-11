@@ -250,7 +250,9 @@ the code you just wrote.
   documentation only, `docs/**/*.md` (CAD-2254). A PR whose every path is on
   it and in no human-class list (`docs/roles/**`, `docs/AUDIT.md` and the
   other rule-7 documents stay human), with both workflow reviews passing at
-  its head, merges without the operator. Every other PR still takes the
+  its head, merges without the operator unless the size trigger, a non-`auto`
+  `Risk:` or the board's own approval requirement applies. Every other PR
+  still takes the
   operator's approval, and workflow rows only satisfy its two reviews. No
   code is listed: the path lists are not a complete map of sensitive code.
   Adding a path is one reviewed line and a deliberate decision, made only
