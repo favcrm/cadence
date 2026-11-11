@@ -28,8 +28,8 @@ mechanisms, in the order they apply:
   applies it.
 - The hosted gate refuses every tracker-mutation verb from a live
   `role='reviewer'` agent credential (`checkCliCall`, code `reviewer_read_only`,
-  HTTP 403). It keeps the reads, the reviewer's own verdict (`issue_review`,
-  `audit_verdict`, `audit_verdict_project`) and `artifact_put`.
+  HTTP 403). It keeps the `cli.read` verbs, the reviewer's own verdict
+  (`issue_review`, `audit_verdict`, `audit_verdict_project`) and `artifact_put`.
 - A reviewer reports back (its turn result, or its ticket tools in a hosted
   session). Whoever dispatched it posts the PR comment or ticket comment.
 - Never run a reviewer under the operator's login or under a bridge grant that
