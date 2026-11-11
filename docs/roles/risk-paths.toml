@@ -69,10 +69,16 @@ paths = ["src/rollout.rs", "src/update.rs", "src/upgrade.rs", "src/cli/rollout.r
 # Trigger 7: the rules, the gates, their inputs and their proofs. Never
 # delegable. tests/** is here because the safety floor proves the gates
 # themselves; the CAD-1073-retired test names were dropped (CAD-1100).
+# docs/INSTALL-AGENT.md and docs/REMOTE-AUTH.md are here by operator decision
+# (CAD-2256): the first holds the public install command and the attestation
+# trust root, the second is the credential diagnosis the binary sends people to.
+# Without this entry both would merge on two workflow reviews
+# (workflow-auto-paths.toml).
 [trigger7]
 paths = ["docs/roles/**", "docs/CHARTER.md", "docs/AUDIT.md",
   "docs/design/**", "docs/cadence/**", "docs/START-HERE.md",
   "docs/ARCHITECTURE.md", "docs/BOARD.md",
+  "docs/INSTALL-AGENT.md", "docs/REMOTE-AUTH.md",
   "AGENTS.md", "cadence-review.toml", "clippy.toml", "src/review.rs", "src/review/**",
   "src/audit/**", "src/delegation.rs", "src/delegation/**",
   "src/daemon/approvals_rpc.rs", "src/store/events.rs", "src/overview.rs",
