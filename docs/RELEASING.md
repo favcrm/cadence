@@ -112,6 +112,7 @@ and operational verification; none follows implicitly from this release.
 | Artifact ready | Exact main `ci.yml` push run and attested `cadence-<sha>-x86_64-linux` artifact; verify source SHA/run attempt/digest, not just a green job name. |
 | Staged | Successful `stage` job and staging evidence for the selected artifact and installed baseline. |
 | Promoted | Successful manual `staging.yml` dispatch, successful `promote` job after GitHub `production` approval, and matching `production-candidate.json` in the `production-candidate` artifact. |
+| Published | Successful `promotion-completion` run for that promotion, its `publish-release` job included; the source's `releases/<product>/<profile>/<sha>` path answers 200. |
 | Installed | Operator update result and installed/running build match the intended SHA. |
 | Operationally verified | Read-only health/status and affected behavior checked on that build; fixture QA is not live verification. |
 
@@ -151,11 +152,11 @@ Report any remaining operator rollout work explicitly.
    intended target. Installation, drain, backup and health checks remain in
    the supported update flow, not a hand-built restart recipe.
    `promotion-completion` publishes the operator-host catalogue record only
-   after the promotion run completes, so an update relayed while `promote` is
-   still waiting refuses with `release detail (not_found)`. Confirm the record
-   exists first — the source's `releases/<product>/<profile>/<sha>` path
-   answers 200 — and read that refusal as "not published yet", never as a
-   wrong command.
+   after the promotion run completes. Until then the default update still
+   selects the previously published build, and a pinned `--to` refuses with
+   `release detail (not_found)`. Confirm the record exists first — the
+   source's `releases/<product>/<profile>/<sha>` path answers 200 — and read
+   either result as "not published yet", never as a wrong command.
 
 ### Bundled guidance on native update (CAD-1472)
 

@@ -79,9 +79,11 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
 9. Follow the [artifact-specific rollout checklist](guides/rollout-checklist.md)
    and [host release cycle](RELEASING.md). For a native host:
    merged → attested main CI artifact → staged → manually promoted with GitHub
-   `production` approval → operator-installed → operationally verified.
+   `production` approval → published (`promotion-completion`) →
+   operator-installed → operationally verified.
    **Automatic staging is not production promotion.** Check the successful
-   manual `staging.yml` run and its `production-candidate` receipt before
+   manual `staging.yml` run, its `production-candidate` receipt and the
+   successful `promotion-completion` run before
    handing over the default update commands; a green CI/staging run alone
    cannot advance the updater's candidate. Public version tags use the
    separate numbered-release path, not a tag on every merge.
