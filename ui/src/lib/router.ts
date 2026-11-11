@@ -42,7 +42,7 @@ import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } fr
  * routing is unit-tested in plain node (tests/router.test.ts).
  */
 
-export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows" | "settings";
+export type ProjectSection = "overview" | "timeline" | "issues" | "epics" | "milestones" | "context" | "workflows" | "settings";
 /** `members` is hosted-only (CAD-2115): a native board serves no tenant member
  *  list, so nothing links there. `matchRoute` still parses the URL — dropping
  *  it would turn a stale link into "nothing lives here"; `settingsRedirect`
@@ -239,7 +239,7 @@ export function matchRoute(pathname: string): Route {
       if (!a) return { screen: "projects", slug: null, section: "overview" };
       const slug = segment(a);
       if (slug && !b) return { screen: "projects", slug, section: "overview" };
-      if (slug && (b === "overview" || b === "issues" || b === "context" || b === "epics" || b === "milestones" || b === "workflows" || b === "settings")) {
+      if (slug && (b === "overview" || b === "timeline" || b === "issues" || b === "context" || b === "epics" || b === "milestones" || b === "workflows" || b === "settings")) {
         return { screen: "projects", slug, section: b };
       }
     }

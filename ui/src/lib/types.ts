@@ -1742,3 +1742,31 @@ export interface ConnectionVerificationReceipt {
 export interface ConnectionVerificationPayload {
   verification: ConnectionVerificationReceipt;
 }
+
+/** CAD-2240: `GET /api/projects/<key>/timeline` on a hosted board
+ *  (`hosted-cadence-project-timeline.v1`), newest first. */
+export type TimelineKind = "created" | "status" | "owner" | "claim" | "comment" | "message" | "review";
+export interface TimelineEvent {
+  id: string;
+  at: string;
+  kind: TimelineKind;
+  ticket: string;
+  title: string;
+  actor: { name: string; kind: "member" | "agent" | "system" } | null;
+  from: string | null;
+  to: string | null;
+  landed: boolean;
+  text: string | null;
+  to_role: string | null;
+  decision: string | null;
+  open: boolean;
+  open_days: number | null;
+}
+export interface ProjectTimeline {
+  version: string;
+  project: string;
+  recording_since: string | null;
+  events: TimelineEvent[];
+  next_before: string | null;
+  truncated: boolean;
+}

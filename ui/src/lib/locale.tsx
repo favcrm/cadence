@@ -1988,3 +1988,30 @@ Object.assign(zhTW, {
   "Open in new tab": "在新分頁開啟",
   "A preview is not available yet. Open in a new tab or use Download.": "目前尚未提供內嵌預覽，請在新分頁開啟或下載。",
 });
+
+// CAD-2240: the project Timeline tab.
+Object.assign(zhTW, {
+  "Project timeline": "專案時間軸",
+  "What happened, newest first: ticket changes, comments, messages and reviews.": "發生過的事，最新在前：工單變更、留言、訊息與審閱。",
+  "Reading the timeline…": "正在讀取時間軸…",
+  "The timeline could not be loaded": "無法載入時間軸",
+  "The timeline is not available on this board yet.": "此看板尚未提供時間軸。",
+  "Filter the timeline": "篩選時間軸",
+  "Still open only": "僅顯示仍未處理",
+  "entry loaded": "則記錄已載入",
+  "entries loaded": "則記錄已載入",
+  "Ticket changes are recorded from": "工單變更自此日起記錄",
+  "No messages are still open.": "沒有仍未處理的訊息。",
+  "No entries yet.": "暫時沒有記錄。",
+  "No entries of this kind.": "沒有此類記錄。",
+  "Ticket changes are not recorded on this board yet. They start with the next change; comments, messages and reviews are shown.": "此看板尚未記錄工單變更，將從下一次變更開始記錄；現時顯示的是留言、訊息與審閱。",
+  "Open {n} day": "已 {n} 日未處理",
+  "Open {n} days": "已 {n} 日未處理",
+  "You were last here": "你上次到訪於此",
+  "Landed": "已落實",
+  "Created this ticket": "建立了此工單",
+  "to": "發給",
+  "Open today": "今日未處理",
+  "Show earlier": "顯示更早",
+  "Earlier entries could not be loaded.": "無法載入更早的記錄。",
+});

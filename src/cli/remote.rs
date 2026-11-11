@@ -17,6 +17,11 @@ fn unsupported(verb: &str, flag: &str, why: &str) -> Error {
     Error::rejected(format!("remote `{verb}` cannot {flag} — {why}"))
 }
 
+/// The kinds a hosted project timeline entry can carry (CAD-2240).
+const TIMELINE_KINDS: [&str; 7] = [
+    "created", "status", "owner", "claim", "comment", "message", "review",
+];
+
 pub(super) const HOSTED_ISSUE_LS_REFUSAL: &str = "the remote route's filter does not implement it";
 
 /// The presence checks and names used by both hosted routing and offline discovery.
@@ -831,6 +836,83 @@ fn verb_for(
                 }
             }
             "project_ls"
+        }
+        // CAD-2240: `issue project timeline <key>` reads one project's
+        // timeline. `--since` takes the grammar other listers accept and
+        // crosses the wire as an ISO instant; a kind the board does not
+        // know refuses here, before a request exists.
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Project {
+                    action:
+                        cadence_agent::issue::cli::ProjectAction::Timeline {
+                            key,
+                            since,
+                            kinds,
+                            open,
+                            limit,
+                            before,
+                            json: _,
+                        },
+                },
+        } => {
+            let key_ok = key.len() <= 32
+                && key.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !key_ok {
+                return Err(Error::rejected(format!(
+                    "'{key}' is not a project key (lower-case letters, digits and hyphens, \
+                     at most 32) — nothing was sent"
+                )));
+            }
+            args.insert("project".into(), json!(key));
+            if let Some(n) = limit {
+                if !(1..=100).contains(n) {
+                    return Err(Error::rejected(
+                        "--limit must be 1 to 100 — nothing was sent",
+                    ));
+                }
+                args.insert("limit".into(), json!(n));
+            }
+            if let Some(cursor) = before {
+                args.insert("before".into(), json!(cursor));
+            }
+            if let Some(bad) = kinds.iter().find(|k| !TIMELINE_KINDS.contains(&k.as_str())) {
+                return Err(Error::rejected(format!(
+                    "--kind '{bad}' is not a timeline kind ({}) — nothing was sent",
+                    TIMELINE_KINDS.join(", ")
+                )));
+            }
+            if !kinds.is_empty() {
+                let mut unique: Vec<&String> = Vec::new();
+                for kind in kinds {
+                    if !unique.contains(&kind) {
+                        unique.push(kind);
+                    }
+                }
+                args.insert("kinds".into(), json!(unique));
+            }
+            if let Some(spec) = since {
+                let at = cadence_agent::filter::parse_time(
+                    "since",
+                    spec,
+                    cadence_agent::issue::time::now_epoch(),
+                )?;
+                // An instant past year 9999 has no ISO form the board can read; its
+                // 400 would read as an older board (see `timeline_board_too_old`).
+                if !(0..=253_402_300_799).contains(&at) {
+                    return Err(Error::rejected(
+                        "--since is outside years 0000 to 9999 (an epoch is in seconds) — nothing was sent",
+                    ));
+                }
+                args.insert("since".into(), json!(cadence_agent::issue::time::iso(at)));
+            }
+            if *open {
+                args.insert("open_only".into(), json!(true));
+            }
+            "project_timeline"
         }
         Commands::Message {
             action:
@@ -5634,6 +5716,52 @@ mod read_contract_tests {
         .unwrap();
         assert_eq!(verb, "project_ls");
         assert_eq!(args, json!({}));
+
+        let timeline = |kinds: Vec<String>, limit| {
+            outcome(&Commands::Issue {
+                action: IssueAction::Project {
+                    action: ProjectAction::Timeline {
+                        key: "atlas".into(),
+                        since: Some("2026-11-01".into()),
+                        kinds,
+                        open: true,
+                        limit,
+                        before: Some("cursor".into()),
+                        json: false,
+                    },
+                },
+            })
+        };
+        let (verb, args) = timeline(vec!["status".into(), "review".into()], Some(20)).unwrap();
+        assert_eq!(verb, "project_timeline");
+        assert_eq!(
+            args,
+            json!({"project": "atlas", "limit": 20, "before": "cursor",
+                   "kinds": ["status", "review"], "since": "2026-11-01T00:00:00Z",
+                   "open_only": true})
+        );
+        assert!(timeline(vec!["decision".into()], None)
+            .unwrap_err()
+            .contains("--kind"));
+        assert!(timeline(vec![], Some(101)).unwrap_err().contains("--limit"));
+        let (_, args) = timeline(vec!["status".into(), "status".into()], None).unwrap();
+        assert_eq!(args["kinds"], json!(["status"]));
+        // A millisecond epoch is past year 9999: refused here, so the board's 400
+        // for it can never be read as "this board is too old".
+        let far = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Timeline {
+                    key: "atlas".into(),
+                    since: Some("1762819200000".into()),
+                    kinds: vec![],
+                    open: false,
+                    limit: None,
+                    before: None,
+                    json: false,
+                },
+            },
+        });
+        assert!(far.unwrap_err().contains("--since"));
 
         let err = outcome(&Commands::Issue {
             action: IssueAction::Project {

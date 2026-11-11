@@ -699,6 +699,10 @@ cadence --org <slug> issue project ls       # CAD-1999: the org's projects —
                                             # key (name = key for those).
                                             # --sort/--limit/--fields are local
                                             # transforms and refuse remotely
+cadence --org <slug> issue project timeline <key> [--since 7d] [--kind status,review] [--open] [--limit 50] [--before <cursor>]
+                                            # CAD-2240: the project's timeline,
+                                            # newest first (hosted only); page
+                                            # on with the `next_before` cursor
 cadence --org <slug> issue ls --project fav-bd
                                             # CAD-1999: one project's tickets; an
                                             # empty registered project reads as an

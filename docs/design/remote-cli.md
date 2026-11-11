@@ -128,7 +128,7 @@ login. Two consequences:
 
 Reads: `issue ls`, `issue show`, `issue history`, `agent list`,
 `agent show`, `message read`, `message inbox`, `team list`,
-`issue project ls`, `status`.
+`issue project ls`, `issue project timeline`, `status`.
 Writes shipped by CAD-1179: `issue new`, `issue comment`, `issue set`
 (frontmatter fields only — status/priority/owner/component/title/tags/
 type/milestone/size; body edits are not part of the field vocabulary).
@@ -145,6 +145,13 @@ member or an owner-role agent is refused before a write. The native policy
 commit records `Actor: users/<handle>` from that verified Owner, not the
 container's ambient alias. Local CLI writes retain their existing actor
 resolution. `issue project add` and `issue project set-remote` stay local.
+CAD-2240: `issue project timeline <key>` maps to `project_timeline`
+(cli.read; arguments `{project, limit?, before?, kinds?, since?, open_only?}`),
+the same read the board's Timeline tab makes. A board that predates the verb
+(`501`, or `400 invalid_request`/`unknown_verb` from an older relay when no
+`--before` was sent) is refused with "this board cannot serve the project
+timeline yet"; there is no fallback. The client validates the project key and
+dedupes `--kind` first so that a 400 is unambiguous.
 CAD-1999: `project new` maps to `project_new` (cli.write, live human owner
 only) and `issue project ls` maps to `project_ls` (cli.read). A hosted
 project exists before any ticket does — the tenant board keeps its own

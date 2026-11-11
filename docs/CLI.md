@@ -311,6 +311,11 @@ an empty project, requires `--name` and an authorized live human owner, and
 does not create a local repository. Inspect `cadence schema project new` before
 acting.
 
+`issue project timeline <key>` reads a hosted workspace's project timeline
+(ticket changes, comments, role messages and reviews, newest first) with
+`--since`, `--kind`, `--open`, `--limit` and `--before <cursor>`; a local board
+refuses it.
+
 These streams stay raw and are not part of discovery: inbox and events
 NDJSON, logs and content bytes, a bare `build-slot acquire` token, and
 `build-slot run` child stdout.

@@ -149,6 +149,9 @@ pub const REMOTE_VERBS: &[&str] = &[
     // workspace has registered, plus the ones that exist only as their
     // tickets' key. A read; the write beside it is `project_new`.
     "project_ls",
+    // CAD-2240: one project's timeline (ticket changes, comments, messages,
+    // reviews), newest first. A read.
+    "project_timeline",
     // cli.write
     "issue_new",
     "issue_comment",
@@ -245,7 +248,8 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "agent_profile_context"
         | "agent_profile_show"
         | "agent_roles"
-        | "project_ls" => &["cli.read"],
+        | "project_ls"
+        | "project_timeline" => &["cli.read"],
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
         "audit_verdict" | "audit_verdict_project" => &["cli.write"],
@@ -395,7 +399,8 @@ fn cli_effect(verb: &str) -> Effect {
         | "audit_verdicts_project"
         | "audit_reviewers_project"
         | "audit_identities"
-        | "project_ls" => Effect::Read,
+        | "project_ls"
+        | "project_timeline" => Effect::Read,
         // cli.write: every one of these can change durable state.
         "issue_new" => mutation(RECONCILE_ISSUE_NEW),
         "issue_comment" => mutation(RECONCILE_ISSUE_COMMENT),
@@ -5298,6 +5303,34 @@ fn profile_board_too_old(verb: &str, status: u16) -> Option<Error> {
     ))
 }
 
+/// CAD-2240: a board that predates `project_timeline` answers `501
+/// not_implemented`; an older control relay rejects the unknown verb name as
+/// `400 invalid_request`/`unknown_verb`. Both are a release-order problem, not
+/// an outage. A current board also answers 400 to a bad cursor, so a 400 only
+/// counts when no `--before` was sent; the client validates the key, kinds
+/// and `--since` range locally, the inputs a current board answers 400 to.
+fn timeline_board_too_old(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    arguments: &Map<String, Value>,
+) -> Option<String> {
+    if verb != "project_timeline" {
+        return None;
+    }
+    let unknown_verb = status == 400
+        && matches!(code, Some("invalid_request" | "unknown_verb"))
+        && !arguments.contains_key("before");
+    if status != 501 && !unknown_verb {
+        return None;
+    }
+    Some(format!(
+        "this board cannot serve the project timeline yet (HTTP {status}{}) — update the board \
+         first, then use this client. Nothing was read",
+        code.map_or(String::new(), |c| format!(", {c}"))
+    ))
+}
+
 /// Whether a ticket message write's 2xx names the write that was asked for.
 /// The ticket id can come back in its stored case.
 fn ticket_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String, Value>) -> bool {
@@ -5870,6 +5903,10 @@ fn call_verb_until_retry(
         // update it, not that coordination is unavailable.
         if let Some(error) = profile_board_too_old(verb, status) {
             return Err(error);
+        }
+        if let Some(why) = timeline_board_too_old(verb, status, refusal_code.as_deref(), &arguments)
+        {
+            return Err(reject(why));
         }
         let platform_details = if platform_outcome_unknown {
             platform_error_details(body.as_ref())
