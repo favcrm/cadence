@@ -174,6 +174,7 @@ impl StdioAdapter {
         cwd: &str,
         stderr_log: &std::path::Path,
         env: &[(String, String)],
+        role: &super::RoleEnv,
     ) -> Result<u32> {
         let log = super::open_provider_log(stderr_log)?;
         let mut command = Command::new(&self.command[0]);
@@ -213,6 +214,8 @@ impl StdioAdapter {
         for (key, value) in env {
             command.env(key, value);
         }
+        // The role's environment goes last so nothing above can override it.
+        role.apply(&mut command);
         // Own process group: signals reach only this provider.
         unsafe {
             command.pre_exec(|| {
@@ -613,7 +616,17 @@ mod tests {
             Box::new(|| {}),
         );
         adapter
-            .launch(dir.to_str().unwrap(), &dir.join("stderr.log"), &[])
+            .launch(
+                dir.to_str().unwrap(),
+                &dir.join("stderr.log"),
+                &[],
+                &crate::adapter::reviewer_gh_env(
+                    &crate::adapter::ProviderEnv::default(),
+                    "worker",
+                    dir,
+                )
+                .unwrap(),
+            )
             .unwrap();
         adapter
     }

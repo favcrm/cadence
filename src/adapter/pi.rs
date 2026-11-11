@@ -1225,6 +1225,9 @@ impl ProviderAdapter for PiAdapter {
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();
         *self.shared.generation.lock().unwrap() = generation.clone();
         self.shared.dead.store(false, Ordering::SeqCst);
+        // A master carries no role pin (an empty role is never a review); the
+        // worker branch below replaces this with the role's environment.
+        let mut role_env = super::reviewer_gh_env(&self.env, "", &self.state_dir)?;
         let mut env = if self.agent_uid.is_none() {
             let mut env = vec![
                 ("CADENCE_ALIAS".to_string(), agent.alias.clone()),
@@ -1333,12 +1336,12 @@ impl ProviderAdapter for PiAdapter {
                 // read the operator's saved login and could post with their
                 // account. Pin a private, empty gh config instead; a read-only
                 // token, when the operator provisions one, is a separate input.
-                env.extend(pi_launch::reviewer_gh_env(
+                role_env = pi_launch::reviewer_gh_env(
                     &self.env,
                     &agent.role,
                     &self.state_dir,
                     &agent.alias,
-                )?);
+                )?;
                 if confinement.is_some() {
                     // CAD-556: under Landlock the daemon's TMPDIR may be a
                     // shared root — the worker gets its own so `mktemp`
@@ -1397,11 +1400,11 @@ impl ProviderAdapter for PiAdapter {
                             .map_err(Error::rejected)?;
                         transport.launch_protected(ctx, &routing, &self.log_path)?
                     }
-                    None => transport.launch(&workdir, &self.log_path, &env)?,
+                    None => transport.launch(&workdir, &self.log_path, &env, &role_env)?,
                 }
             };
             #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
-            let pid = transport.launch(&workdir, &self.log_path, &env)?;
+            let pid = transport.launch(&workdir, &self.log_path, &env, &role_env)?;
             // Effort: validate against the model's real levels, then verify
             // what stuck — Pi answers success even on a silent fallback.
             if let Some(effort) = params.get("effort").and_then(Value::as_str) {
@@ -2507,6 +2510,7 @@ for raw in sys.stdin:
                         commands.to_string_lossy().to_string(),
                     ),
                 ],
+                &crate::adapter::reviewer_gh_env(&env, "worker", dir.path()).unwrap(),
             )
             .unwrap();
         *adapter.transport.write().unwrap() = transport;

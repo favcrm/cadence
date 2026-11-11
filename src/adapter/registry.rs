@@ -972,6 +972,24 @@ pub fn spec_opt(provider: &str, kind: &str) -> Option<&'static EndpointSpec> {
         })
 }
 
+/// CAD-2239: a reviewer is always a headless process. A `pty` endpoint (a
+/// terminal pane) on a non-internal pair is refused for a review role; every
+/// other role keeps its pane. The `tui-stub` harness pair is internal and
+/// stays buildable.
+pub fn refuse_reviewer_pane(provider: &str, kind: &str, role: &str) -> Result<()> {
+    if kind != "pty"
+        || !super::is_reviewer_role(role)
+        || !spec_opt(provider, kind).is_some_and(|s| !s.internal)
+    {
+        return Ok(());
+    }
+    Err(Error::rejected(format!(
+        "a reviewer does not run in a terminal pane ({provider} pty): use a headless \
+         endpoint, `cadence join <pm> claude`, `cadence join <pm> pi` or \
+         `cadence join <pm> codex`"
+    )))
+}
+
 /// Validating lookup used by the factory: unknown pairs are rejected
 /// with the supported combinations, reproducing the historical per-kind
 /// error text ("No <kind> adapter for provider 'x' (implemented: …)",
@@ -2020,6 +2038,27 @@ mod tests {
         for s in SPECS.iter().filter(|s| s.has_actor) {
             assert!(spec(s.provider, s.endpoint_kind).is_ok());
         }
+    }
+
+    #[test]
+    fn a_reviewer_pane_is_refused_and_other_roles_keep_theirs() {
+        for provider in ["devin", "cursor", "claude"] {
+            for role in ["reviewer", "Reviewer", "code-reviewer"] {
+                let message = refuse_reviewer_pane(provider, "pty", role)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    message.contains("a reviewer does not run in a terminal pane"),
+                    "{message}"
+                );
+                assert!(message.contains("cadence join <pm> claude"), "{message}");
+            }
+            for role in ["worker", "pm"] {
+                assert!(refuse_reviewer_pane(provider, "pty", role).is_ok());
+            }
+        }
+        assert!(refuse_reviewer_pane("claude", "managed", "reviewer").is_ok());
+        assert!(refuse_reviewer_pane("tui-stub", "pty", "reviewer").is_ok());
     }
 
     #[test]

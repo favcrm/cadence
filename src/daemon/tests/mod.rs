@@ -12,6 +12,8 @@ mod cad1989_group_root_profile_read;
 #[cfg(feature = "test-seam")]
 mod cad1989_profile_context_refusal;
 mod cad1989_profile_create_refusal;
+#[cfg(feature = "test-seam")]
+mod cad2239_reviewer_pane_refusal;
 mod pty_retry_tests;
 mod unit;
 mod unknown_fence_guidance;

@@ -148,22 +148,32 @@ for these local endpoints:
   paths. Explicit extra grants or another allowed path can include the login.
 - **Claude, Devin or Cursor PTY:** a normal same-user launch has no
   separate-user credential boundary. Real profiles refuse the split-UID path
-  until native session preparation is supported.
+  until native session preparation is supported. A reviewer role is refused
+  here: a reviewer is always a headless process or a hosted board session.
 
-Reviewer agents (`role: reviewer`) are the exception on the Pi path: a Pi
-reviewer worker does not inherit the operator's `gh` configuration. The daemon
+Reviewer agents (`role: reviewer`) are the exception for `gh`: a reviewer is
+always a headless process the daemon starts, or a hosted board session, and at
+launch its worker does not inherit the operator's `gh` configuration. The daemon
 pins a private, empty `GH_CONFIG_DIR` under the worker's state directory and
 passes `CADENCE_REVIEWER_GH_TOKEN` as `GH_TOKEN` when the operator has
 provisioned a read-only token. With no such token `gh` is unauthenticated — the
 fail-closed direction, never the operator's account. The token's scope is the
-operator's responsibility; nothing here can verify it. `GH_TOKEN` and
-`GITHUB_TOKEN` are always overridden too — empty when nothing is provisioned —
-because `gh` prefers them over the config file and an inherited value would
-defeat the config pin. A role that reads as a review (`reviewer`, `Reviewer`,
-`code-reviewer`, `review`) gets the pin; other roles are unchanged. The pin
-covers all four managed adapters — **Pi, Claude, Codex and PTY**: the stdio
-adapters hand the pairs to their child launch, and the PTY adapter adds them to
-the pane through tmux `-e` (or the split-launch helper's environment).
+operator's responsibility; nothing here can verify it. `GH_TOKEN`,
+`GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` are always
+overridden — empty when nothing is provisioned — because `gh` prefers them over
+the config file and an inherited value would defeat the config pin. A role that
+reads as a review (`reviewer`, `Reviewer`, `code-reviewer`, `review`) gets the
+pin; other roles are unchanged. The daemon applies it when it starts the child,
+after the adapter's own scrub, on every local headless launch: Pi/OMP, Claude,
+Codex stdio and Codex managed-WS.
+
+The pin covers `gh` only. The operator's SSH agent and the git credential
+helpers under `HOME` are NOT covered, so a local reviewer can still push as the
+operator. The pin is an environment, not an identity boundary: a same-user
+worker can override its environment or read the operator's saved hosted login
+(the limits above), so only a separate user is a credential boundary. A
+reviewer reports its findings back (turn result, or hosted ticket tools);
+whoever dispatched it posts the PR comment or ticket comment.
 
 The remote Devin and cloud sandbox adapters launch no local actor. That does
 not establish what credentials or access the remote runtime receives.
