@@ -5,7 +5,7 @@ export const TIMELINE_KINDS: { kind: TimelineKind; label: string }[] = [
   { kind: "created", label: "Created" },
   { kind: "status", label: "Status" },
   { kind: "owner", label: "Owner" },
-  { kind: "claim", label: "Claim" },
+  { kind: "claim", label: "Claimed" },
   { kind: "comment", label: "Comment" },
   { kind: "message", label: "Message" },
   { kind: "review", label: "Review" },

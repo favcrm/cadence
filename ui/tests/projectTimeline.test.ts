@@ -18,6 +18,10 @@ const fail = (message: string) => { throw new Error(message); };
 
 if (FILTER_KINDS.some((k) => k.kind === "claim") || FILTER_KINDS.length !== 6) fail("the chips are the six recorded kinds, no Claim");
 
+// "Claim" is already a zh-TW key with another meaning (the email test-send receipt), and the
+// table is flat, so a second "Claim" entry would replace that translation.
+if (entryLabel(ev("f", "2026-11-09T08:00:00.000Z", "claim")) !== "Claimed") fail("a claim entry reads Claimed, not the email receipt's Claim");
+
 if (entryLabel(events[1]) !== "Landed" || entryLabel(events[2]) !== "Status") fail("only a landed status event reads Landed");
 const change = entryChange(events[2]);
 if (change?.from !== "doing" || change.to !== "review" || entryChange(events[1])?.to !== "done") fail("a status change shows from and to, landed or not");

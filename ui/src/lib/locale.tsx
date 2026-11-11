@@ -2007,7 +2007,6 @@ Object.assign(zhTW, {
   "Ticket changes are not recorded on this board yet. They start with the next change; comments, messages and reviews are shown.": "此看板尚未記錄工單變更，將從下一次變更開始記錄；現時顯示的是留言、訊息與審閱。",
   "Open {n} day": "已 {n} 日未處理",
   "Open {n} days": "已 {n} 日未處理",
-  "Claim": "認領",
   "You were last here": "你上次到訪於此",
   "Landed": "已落實",
   "Created this ticket": "建立了此工單",
