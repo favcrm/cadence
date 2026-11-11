@@ -69,8 +69,8 @@ attested principal and, since CAD-2049, refuses the author's principal; local
 notes count by their self-declared `From:` alias, which is not attested. It
 cannot tell a fresh session from the author under one login. A hosted `routine` PR
 takes two workflow reviews, and operator approval while `workflow-auto-paths.toml`
-does not list its paths, because a hosted board has no readiness record (CAD-2135). That list names
-`src/**`, `docs/**` and `contracts/**`; a path the one-review list excludes or on trigger 1 or 3 is
+does not list its paths, because a hosted board has no readiness record (CAD-2135). That list is
+exactly the `[delegable]` set of `risk-paths.toml`; a path the one-review list excludes or on trigger 1 or 3 is
 never eligible, whatever the list says (CAD-2254). A hosted `ui/**` PR takes those two reviews, operator
 approval and a `--browser-qa` comment naming its exact head (CAD-2173), or until it ends, the
 temporary exception (`--exception --advisory ...`: exact-head

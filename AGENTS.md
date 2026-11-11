@@ -246,12 +246,15 @@ the code you just wrote.
     applies. The gate therefore inverts the rule: a PR with any workflow-issued
   row needs the operator's approval unless EVERY changed path matches
   `docs/roles/workflow-auto-paths.toml`, read at main's live tip, and every
-  change is a plain add or modify (mode 100644). That list names `src/**`,
-  `docs/**` and `contracts/**` (CAD-2254): a PR wholly inside them, with both
-  workflow reviews passing at its head, merges without the operator. Every
-  other PR still takes the operator's approval, and workflow rows only satisfy
-  its two reviews. Adding a path is one reviewed line and a deliberate
-  decision, made only after reading what the path holds. Whatever the list
+  change is a plain add or modify (mode 100644). That list is exactly the
+  `[delegable]` set of `docs/roles/risk-paths.toml` (CAD-2254): the named
+  `src/issue/` and `src/cli/` files and `docs/**`. A PR wholly inside it, with
+  both workflow reviews passing at its head, merges without the operator.
+  Every other PR still takes the operator's approval, and workflow rows only
+  satisfy its two reviews. No directory glob over `src/` is listed, because
+  the path lists are not a complete map of sensitive code. Adding a path is
+  one reviewed line and a deliberate decision, made only after reading what
+  the path holds. Whatever the list
   says, three kinds of path are never eligible: a path with a segment starting
   with `.`; a basename starting `agents.`, `claude.` or `gemini.`; and a path
   that `docs/roles/one-review-paths.toml` excludes or that is on risk-paths
