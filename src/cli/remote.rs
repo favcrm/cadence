@@ -900,6 +900,13 @@ fn verb_for(
                     spec,
                     cadence_agent::issue::time::now_epoch(),
                 )?;
+                // An instant past year 9999 has no ISO form the board can read; its
+                // 400 would read as an older board (see `timeline_board_too_old`).
+                if !(0..=253_402_300_799).contains(&at) {
+                    return Err(Error::rejected(
+                        "--since is outside years 0000 to 9999 (an epoch is in seconds) — nothing was sent",
+                    ));
+                }
                 args.insert("since".into(), json!(cadence_agent::issue::time::iso(at)));
             }
             if *open {
@@ -5739,6 +5746,22 @@ mod read_contract_tests {
         assert!(timeline(vec![], Some(101)).unwrap_err().contains("--limit"));
         let (_, args) = timeline(vec!["status".into(), "status".into()], None).unwrap();
         assert_eq!(args["kinds"], json!(["status"]));
+        // A millisecond epoch is past year 9999: refused here, so the board's 400
+        // for it can never be read as "this board is too old".
+        let far = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Timeline {
+                    key: "atlas".into(),
+                    since: Some("1762819200000".into()),
+                    kinds: vec![],
+                    open: false,
+                    limit: None,
+                    before: None,
+                    json: false,
+                },
+            },
+        });
+        assert!(far.unwrap_err().contains("--since"));
 
         let err = outcome(&Commands::Issue {
             action: IssueAction::Project {

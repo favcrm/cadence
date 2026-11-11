@@ -2458,6 +2458,8 @@ button.project-focus-preview:hover { color: var(--color-accent); }
 .tl-what button { margin-right: .4rem; }
 .tl-meta { margin-top: .2rem; color: var(--color-ink-500); font-size: var(--text-label); line-height: 1.5; overflow-wrap: anywhere; }
 .tl-here { display: flex; align-items: center; gap: .75rem; margin: .5rem 0 .5rem -1.25rem; list-style: none; font: 500 var(--text-micro) "IBM Plex Mono", monospace; color: var(--color-accent); }
+/* A refetch keeps the old entries on screen; dim them so they do not read as the new filter's. */
+.tl-busy { opacity: .5; }
 .tl-here::before, .tl-here::after { content: ""; flex: 1; height: 1px; background: color-mix(in srgb, var(--color-accent) 40%, transparent); }
 .tl-more { margin: 1rem 0 0 7.5rem; }
 .tl-empty { margin-left: 7.5rem; padding-block: 1.5rem; color: var(--color-ink-500); font-size: var(--text-secondary); }

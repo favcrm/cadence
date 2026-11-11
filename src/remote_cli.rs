@@ -5307,8 +5307,8 @@ fn profile_board_too_old(verb: &str, status: u16) -> Option<Error> {
 /// not_implemented`; an older control relay rejects the unknown verb name as
 /// `400 invalid_request`/`unknown_verb`. Both are a release-order problem, not
 /// an outage. A current board also answers 400 to a bad cursor, so a 400 only
-/// counts when no `--before` was sent; the client validates the key and kinds
-/// locally so nothing else can make a current board answer 400.
+/// counts when no `--before` was sent; the client validates the key, kinds
+/// and `--since` range locally, the inputs a current board answers 400 to.
 fn timeline_board_too_old(
     verb: &str,
     status: u16,

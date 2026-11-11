@@ -26,6 +26,8 @@ export default function Timeline({ project, hosted, onOpenIssue, browseHref }: {
   const [lastVisit] = useState(() => readLastVisit(project));
   const stamped = useRef(false);
   const statusLine = useRef<HTMLParagraphElement>(null);
+  // Bumped on every refetch, so a "Show earlier" reply for a superseded view is dropped.
+  const view = useRef(0);
   const kinds = kind === "all" ? undefined : [kind];
 
   useEffect(() => {
@@ -36,6 +38,7 @@ export default function Timeline({ project, hosted, onOpenIssue, browseHref }: {
     setPage((cur) => cur.status === "ok" ? cur : { status: "loading" });
     setBusy(true);
     setMore("idle");
+    view.current += 1;
     api.projectTimeline(project, { open: openOnly, kinds }, controller.signal).then(
       (r) => { setBusy(false); setPage({ status: "ok", events: r.events, next: r.next_before, since: r.recording_since }); },
       (e: unknown) => {
@@ -57,11 +60,13 @@ export default function Timeline({ project, hosted, onOpenIssue, browseHref }: {
   }, [page.status, project]);
 
   const showEarlier = () => {
-    if (page.status !== "ok" || !page.next || more === "loading") return;
+    if (page.status !== "ok" || !page.next || more === "loading" || busy) return;
     const cursor = page.next;
+    const mine = view.current;
     setMore("loading");
     api.projectTimeline(project, { open: openOnly, kinds, before: cursor }).then(
       (r) => {
+        if (view.current !== mine) return;
         setPage((cur) => cur.status === "ok" && cur.next === cursor
           ? { ...cur, events: [...cur.events, ...r.events.filter((e) => !cur.events.some((x) => x.id === e.id))], next: r.next_before }
           : cur);
@@ -69,7 +74,7 @@ export default function Timeline({ project, hosted, onOpenIssue, browseHref }: {
         // The button leaves with the last page; keep keyboard focus on the page.
         if (r.next_before === null) setTimeout(() => statusLine.current?.focus(), 0);
       },
-      () => setMore("failed"),
+      () => { if (view.current === mine) setMore("failed"); },
     );
   };
 
@@ -109,7 +114,7 @@ export default function Timeline({ project, hosted, onOpenIssue, browseHref }: {
     </div>}
     {page.status === "unavailable" && <p className="card px-4 py-5 text-secondary text-ink-400" role="note">{t("The timeline is not available on this board yet.")}</p>}
 
-    {page.status === "ok" && <div aria-busy={busy}>
+    {page.status === "ok" && <div aria-busy={busy} className={busy ? "tl-busy" : undefined}>
       <p ref={statusLine} tabIndex={-1} className="text-micro text-ink-500 mb-2" role="status">
         {formatNumber(loaded.length)} {loaded.length === 1 ? t("entry loaded") : t("entries loaded")}
         {page.since && <> · {t("Ticket changes are recorded from")} <time dateTime={page.since}>{formatDate(page.since, { dateStyle: "medium" })}</time></>}
