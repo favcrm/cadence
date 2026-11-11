@@ -727,6 +727,11 @@ During implementation and handoff:
   reviewed, merged, installed and operationally verified distinct. A moving
   head or changed integration tree needs evidence revalidation; passing CI
   does not itself authorize a merge, deployment, cleanup or message replay.
+- Close on the outcome, not on the last step you performed. Name the point
+  where the work takes effect (a build installed and running, a proposal sent,
+  a quotation issued, a page published) and say on its own line whether it is
+  met, with evidence, or not yet and who owns the next step. Merged, approved
+  or drafted is not in effect, and `done` on a ticket does not say that it is.
 
 After the increment merges, follow the selected workspace's supported ticket
 reconciliation and the repository's completion rules; report an unavailable
@@ -744,8 +749,19 @@ checklist report for every trivial edit or spend model turns on empty retros.
 
 ## Asking for a production deploy
 
-Never restart the daemon. When production needs a new build, send the
-operator exactly these two lines and nothing else:
+Never restart the daemon. A merge is not a release: green main CI and the
+automatic `staging` run promote nothing. Before you hand over an update, check
+in this order (docs/RELEASING.md, "Prepare and promote the exact candidate"):
+
+1. **Promoted.** A manual `staging.yml` dispatch for the exact build finished,
+   its `promote` job succeeded after the operator's GitHub `production`
+   approval, and its `production-candidate` receipt names that build. If none
+   exists, say so. Dispatch one only when the operator asks, and never approve
+   it.
+2. **Published.** The `promotion-completion` run for that promotion succeeded.
+   An update relayed before it refuses with `release detail (not_found)`.
+3. **Then** send the operator exactly these two lines, to run from a plain
+   terminal. An agent session refuses them, its `!` commands included:
 
 ```
 cadence update --check --as operator:<name>
