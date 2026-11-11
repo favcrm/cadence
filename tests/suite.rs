@@ -1708,7 +1708,7 @@ mod cad2081_workflow_verdicts {
 
     /// Main's tip serving an explicitly EMPTY workflow auto list, the state the CAD-2135
     /// and CAD-2081 cases were written under. Serving it keeps them independent of what
-    /// the checkout's own list file holds (CAD-2254 turned three trees on).
+    /// the checkout's own list file holds (CAD-2254 turned Markdown under docs/ on).
     fn empty_auto_list(f: &Fixture) -> Value {
         let mut files = f.base_files();
         files[AUTO_PATHS] = json!("[auto]\npaths = []\n");
@@ -4087,8 +4087,9 @@ mod cad2081_workflow_verdicts {
         use super::*;
 
         /// A wide list (three directory globs), served explicitly: the never-eligible guard
-        /// must hold even under a list this wide. The real list is narrower (the delegable
-        /// set); one test pins it, and the tests that serve `base_files()` use it as it is.
+        /// must hold even under a list this wide. The real list is far narrower
+        /// (`docs/**/*.md`); one test pins it, and the tests that serve `base_files()` use
+        /// it as it is.
         const AUTO_LIST: &str = "[auto]\npaths = [\"src/**\", \"docs/**\", \"contracts/**\"]\n";
         const EVERYTHING: &str = "[auto]\npaths = [\"**\"]\n";
 
@@ -4238,6 +4239,9 @@ mod cad2081_workflow_verdicts {
             "Scripts/x.md",
             "Src/Daemon/x.rs",
             "UI/x.tsx",
+            // A name that only casefolds to an agent-instruction file (U+017F, long s).
+            "docs/agent\u{17f}.md",
+            "docs/AGENT\u{17f}.md",
         ];
 
         #[test]
