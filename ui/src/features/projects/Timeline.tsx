@@ -3,7 +3,7 @@ import { ApiError, api } from "../../lib/api";
 import { useLocale } from "../../lib/locale";
 import type { TimelineEvent, TimelineKind } from "../../lib/types";
 import Link from "../../ui/Link";
-import { FILTER_KINDS, entryChange, entryLabel, groupByDay, readLastVisit, writeLastVisit } from "./timeline";
+import { FILTER_KINDS, entryChange, entryLabel, groupByDay, readLastVisit, writeLastVisit } from "./timelineModel";
 
 type Page =
   | { status: "loading" }

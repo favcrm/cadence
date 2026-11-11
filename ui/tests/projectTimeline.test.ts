@@ -1,4 +1,4 @@
-import { FILTER_KINDS, entryChange, entryLabel, groupByDay, localDay } from "../src/features/projects/timeline";
+import { FILTER_KINDS, entryChange, entryLabel, groupByDay, localDay } from "../src/features/projects/timelineModel";
 import type { TimelineEvent } from "../src/lib/types";
 
 // Shaped like agenticos-v2's `project-timeline.contract.json` (hosted-cadence-project-timeline.v1).
