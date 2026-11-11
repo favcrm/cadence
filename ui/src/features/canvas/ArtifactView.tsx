@@ -73,6 +73,21 @@ export function imageDataUrl(data: Loaded): string {
   return `data:${data.mime.split(";")[0]};base64,${btoa(bin)}`;
 }
 
+/** Open already-loaded PDF bytes in the browser's own top-level PDF viewer.
+ *  Inline `<embed>`/`<iframe>` PDFs are blocked by the board's `object-src`,
+ *  while a top-level `blob:` navigation opened from a click succeeds. */
+export function openPdfInTab(bytes: ArrayBuffer): void {
+  const tab = window.open("about:blank", "_blank");
+  if (tab === null) return;
+  try {
+    const href = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+    tab.location.replace(href);
+    window.setTimeout(() => URL.revokeObjectURL(href), 30_000);
+  } catch {
+    tab.close();
+  }
+}
+
 function sizeLabel(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
@@ -198,12 +213,21 @@ export default function ArtifactView({
       );
     case "pdf":
       // No inline PDF: the board CSP allows no blob/object source, so the
-      // drawer offers Download (in the footer) and says so.
+      // drawer offers Open in new tab (top-level blob navigation) and Download.
       return (
         <div className="canvas-doc canvas-pdf" data-artifact-view="pdf">
           <p className="text-body text-ink-100">{title}</p>
           <p className="num text-micro text-ink-500">PDF · {sizeLabel(data.bytes.byteLength)}</p>
           <p className="text-micro text-ink-400">{t("A preview is not available yet. Use Download.")}</p>
+          <div className="flex flex-wrap items-center gap-3 pt-1">
+            <button
+              type="button"
+              className="lnk text-micro"
+              onClick={() => openPdfInTab(data.bytes)}
+            >
+              {t("Open in new tab")}
+            </button>
+          </div>
         </div>
       );
   }

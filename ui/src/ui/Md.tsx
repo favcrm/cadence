@@ -14,7 +14,73 @@ interface MdNode {
   value?: string;
   url?: string;
   children?: MdNode[];
+  data?: { hProperties?: Record<string, unknown> };
 }
+
+type CalloutKind = "note" | "tip" | "important" | "warning" | "caution";
+
+const CALLOUT_LABELS: Record<CalloutKind, string> = {
+  note: "Note",
+  tip: "Tip",
+  important: "Important",
+  warning: "Warning",
+  caution: "Caution",
+};
+
+const CALLOUT_MARKER = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](?:[ \t]*\r?\n|[ \t]+|$)/i;
+
+/** Close an unfinished fenced code block at the end of an in-flight preview so
+ *  live streaming Markdown renders as a code surface instead of raw fences.
+ *  Presentation-only: stored entries and stream state keep the server's text. */
+export function healStreamingMarkdown(text: string): string {
+  let open: { ch: "`" | "~"; len: number; quotes: number } | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    const bq = /^((?: {0,3}> ?)*)(.*)$/.exec(line)!;
+    const quotes = (bq[1].match(/>/g) ?? []).length;
+    const rest = bq[2];
+    if (open !== null) {
+      if (quotes < open.quotes) {
+        open = null;
+      } else {
+        if (quotes === open.quotes) {
+          const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(rest);
+          if (close && close[1][0] === open.ch && close[1].length >= open.len) open = null;
+        }
+        continue;
+      }
+    }
+    const tick = /^ {0,3}(`{3,})([^`]*)$/.exec(rest);
+    const tilde = tick === null ? /^ {0,3}(~{3,})/.exec(rest) : null;
+    const fence = tick?.[1] ?? tilde?.[1];
+    if (fence) open = { ch: fence[0] as "`" | "~", len: fence.length, quotes };
+  }
+  if (open === null) return text;
+  return `${text}${text.endsWith("\n") ? "" : "\n"}${"> ".repeat(open.quotes)}${open.ch.repeat(open.len)}`;
+}
+
+function walkCallouts(node: MdNode): void {
+  const kids = node.children;
+  if (!kids) return;
+  if (node.type === "blockquote" && kids[0]?.type === "paragraph") {
+    const firstPara = kids[0];
+    const firstText = firstPara.children?.[0];
+    const match = firstText?.type === "text" && firstText.value ? CALLOUT_MARKER.exec(firstText.value) : null;
+    if (match && firstText?.value !== undefined && firstPara.children) {
+      const rest = firstText.value.slice(match[0].length);
+      if (rest === "") firstPara.children.shift();
+      else firstText.value = rest;
+      if (firstPara.children.length === 0) kids.shift();
+      const kind = match[1].toLowerCase();
+      node.data = {
+        ...node.data,
+        hProperties: { ...node.data?.hProperties, "data-callout": kind },
+      };
+    }
+  }
+  for (const kid of kids) walkCallouts(kid);
+}
+
+const remarkCallouts = () => (tree: MdNode) => walkCallouts(tree);
 
 // One id shape for both the linkifier (bounded, global) and the `issue:`
 // validator (anchored); digits are capped so a long run is not an id.
@@ -161,6 +227,24 @@ export function CodeSurface({ label, code, children }: { label: string; code: st
   );
 }
 
+function CalloutBlockquote({
+  callout,
+  children,
+}: {
+  callout?: string;
+  children?: ReactNode;
+}) {
+  const t = useTranslate();
+  const label = callout && Object.hasOwn(CALLOUT_LABELS, callout) ? CALLOUT_LABELS[callout as CalloutKind] : null;
+  if (label === null) return <blockquote>{children}</blockquote>;
+  return (
+    <blockquote data-callout={callout}>
+      <div className="md-callout-head">{t(label)}</div>
+      {children}
+    </blockquote>
+  );
+}
+
 const InLinkContext = createContext(false);
 const handlerComponents = new WeakMap<object, Components>();
 let noHandlerComponents: Components | null = null;
@@ -173,6 +257,16 @@ let pageComponents: { page: string; components: Components } | null = null;
  *  code, links and images, which a live log would announce as new content. */
 function buildComponents(onOpen?: (id: string) => void, wikiPage?: string): Components {
   return {
+    table: ({ children }) => (
+      <div className="md-table-wrap">
+        <table>{children}</table>
+      </div>
+    ),
+    blockquote: (props) => (
+      <CalloutBlockquote callout={(props as { "data-callout"?: string })["data-callout"]}>
+        {props.children}
+      </CalloutBlockquote>
+    ),
     img: ({ src, alt }) => {
       const linked = useContext(InLinkContext);
       const safe = markdownImageSrc(src);
@@ -239,7 +333,7 @@ function componentsFor(onOpen?: (id: string) => void, wikiPage?: string): Compon
   return built;
 }
 
-const PLUGINS = [remarkGfm, remarkWikiCitations, remarkIssueLinks];
+const PLUGINS = [remarkGfm, remarkCallouts, remarkWikiCitations, remarkIssueLinks];
 const PAGE_PLUGINS = [...PLUGINS, remarkDropComments];
 
 export default function Md({

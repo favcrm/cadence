@@ -68,7 +68,7 @@ export default function AttachmentMedia({
   hosted: boolean;
 }) {
   const t = useTranslate();
-  const [open, setOpen] = useState<AttachmentFile | null>(null);
+  const [openId, setOpenId] = useState<string | null>(null);
   const [failed, setFailed] = useState<Record<string, true>>({});
   if (!hosted || conversation === null) return null;
   const shown = files.flatMap((file) => {
@@ -76,6 +76,8 @@ export default function AttachmentMedia({
     return kind === null || failed[file.id] === true ? [] : [{ file, kind }];
   });
   if (shown.length === 0) return null;
+  const images = shown.flatMap((entry) => (entry.kind === "image" ? [entry.file] : []));
+  const openIndex = openId === null ? -1 : images.findIndex((image) => image.id === openId);
   return (
     <div className="sentmedia" data-entry-media>
       {shown.map(({ file, kind }) =>
@@ -96,7 +98,7 @@ export default function AttachmentMedia({
             type="button"
             className="sentthumb"
             aria-label={`${t("Open")} ${file.name}`}
-            onClick={() => setOpen(file)}
+            onClick={() => setOpenId(file.id)}
           >
             <img
               src={attachmentHref(file.id, conversation)}
@@ -108,36 +110,79 @@ export default function AttachmentMedia({
           </button>
         ),
       )}
-      {open !== null && (
+      {openIndex >= 0 && (
         <AttachmentLightbox
-          file={open}
-          src={attachmentHref(open.id, conversation)}
-          onClose={() => setOpen(null)}
+          images={images}
+          index={openIndex}
+          conversation={conversation}
+          onSelect={setOpenId}
+          onClose={() => setOpenId(null)}
         />
       )}
     </div>
   );
 }
 
-/** The one picture at a readable size, with its name, size and a Download. */
+/** The one picture at a readable size, with its name, size and a Download.
+ *  When a message carries more than one picture, Previous/Next and the arrow
+ *  keys step through them inside the trapped modal. */
 function AttachmentLightbox({
-  file,
-  src,
+  images,
+  index,
+  conversation,
+  onSelect,
   onClose,
 }: {
-  file: AttachmentFile;
-  src: string;
+  images: AttachmentFile[];
+  index: number;
+  conversation: string;
+  onSelect: (id: string) => void;
   onClose: () => void;
 }) {
   const t = useTranslate();
+  const dialogRef = useRef<HTMLDivElement | null>(null);
   const closeRef = useRef<HTMLButtonElement | null>(null);
   const dismiss = useRef(onClose);
   dismiss.current = onClose;
+  const nav = useRef({ images, index, onSelect });
+  nav.current = { images, index, onSelect };
   useEffect(() => {
     const returnTo = document.activeElement as HTMLElement | null;
     closeRef.current?.focus();
+    const focusables = () =>
+      Array.from(
+        dialogRef.current?.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), [href], input:not([disabled]), select, textarea, [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") dismiss.current();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        dismiss.current();
+        return;
+      }
+      if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && nav.current.images.length > 1) {
+        event.preventDefault();
+        const count = nav.current.images.length;
+        const delta = event.key === "ArrowLeft" ? -1 : 1;
+        const next = nav.current.images[(nav.current.index + delta + count) % count];
+        if (next) nav.current.onSelect(next.id);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      const inside = active !== null && dialogRef.current?.contains(active) === true;
+      if (event.shiftKey && (!inside || active === first)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (!inside || active === last)) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     document.addEventListener("keydown", onKey);
     return () => {
@@ -145,8 +190,16 @@ function AttachmentLightbox({
       returnTo?.focus?.();
     };
   }, []);
+  const file = images[index];
+  const src = attachmentHref(file.id, conversation);
+  const multi = images.length > 1;
+  const step = (delta: -1 | 1) => {
+    const next = images[(index + delta + images.length) % images.length];
+    if (next) onSelect(next.id);
+  };
   return createPortal(
     <div
+      ref={dialogRef}
       className="sentlight"
       role="dialog"
       aria-modal="true"
@@ -158,6 +211,27 @@ function AttachmentLightbox({
         <div className="sentlight-bar">
           <b>{file.name}</b>
           <span className="num">{attachMeta(file.name, file.size, t)}</span>
+          {multi && (
+            <>
+              <span className="num" data-lightbox-count>{`${index + 1} / ${images.length}`}</span>
+              <button
+                type="button"
+                className="lnk"
+                aria-label={t("Previous image")}
+                onClick={() => step(-1)}
+              >
+                {t("Previous")}
+              </button>
+              <button
+                type="button"
+                className="lnk"
+                aria-label={t("Next image")}
+                onClick={() => step(1)}
+              >
+                {t("Next")}
+              </button>
+            </>
+          )}
           <a className="lnk" href={src} download={file.name}>
             {t("Download")}
           </a>

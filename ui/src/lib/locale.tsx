@@ -1977,4 +1977,13 @@ Object.assign(zhTW, {
   "{n} default also set": "另設定 {n} 項預設值",
   "{n} defaults also set": "另設定 {n} 項預設值",
   "(unnamed field)": "（未命名欄位）",
+  // CAD-2244: Markdown callout headings, multi-image lightbox controls, and PDF tab open.
+  "Note": "備註",
+  "Tip": "提示",
+  "Important": "重要",
+  "Warning": "警告",
+  "Caution": "注意",
+  "Previous image": "上一張圖片",
+  "Next image": "下一張圖片",
+  "Open in new tab": "在新分頁開啟",
 });

@@ -273,7 +273,7 @@ function AgentConversation({
               readOnly={block !== null}
               liveAfter={liveAfter.current ?? 0}
               onOpenIssue={onOpenIssue}
-              onRetry={(message: string, text: string, refs?: ThreadRef[], attachments?: { id: string }[]) => {
+              onRetry={(message: string, text: string, refs?: ThreadRef[], attachments?) => {
                 void sendToAgent(alias, text, message, refs, attachments);
               }}
               onDiscard={(message: string) => store.write((s) => discardPending(s, message))}
