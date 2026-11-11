@@ -4683,6 +4683,80 @@ mod cad2081_workflow_verdicts {
             );
         }
     }
+
+    // CAD-2256: independently authored by the ticket author; implementers must not edit.
+    // The two procedure documents go back to the operator; other docs stay eligible. Every
+    // case serves the repository's own lists as the lane tree ships them.
+    mod cad2256 {
+        use super::*;
+
+        /// Both workflow reviews pass at `head`, no approval recorded, the real lists at
+        /// main; the gate's verdict as (exit code, stdout, stderr).
+        fn gate_real(f: &Fixture, head: String) -> (i32, String, String) {
+            let mut case = scenario(vec![f.std(), f.spec()]);
+            case.head = Some(head);
+            case.approved = false;
+            case.tip_files = Some(f.base_files());
+            f.gate(&case)
+        }
+
+        /// Class human, refused for the missing approval, every `named` path reported.
+        fn needs_operator(f: &Fixture, head: String, named: &[&str]) {
+            let (code, stdout, stderr) = gate_real(f, head);
+            let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+            assert_eq!(code, 1, "expected the operator to be needed\n{ctx}");
+            assert!(stdout.contains("class: human"), "{ctx}");
+            assert!(!stdout.contains("class: auto"), "{ctx}");
+            assert!(!stdout.contains("every rule holds"), "{ctx}");
+            let said = format!("{stdout}{stderr}");
+            for text in [NO_APPROVAL].iter().chain(named) {
+                assert!(said.contains(text), "no {text:?}\n{ctx}");
+            }
+        }
+
+        const PROCEDURE_DOCS: [&str; 2] = ["docs/INSTALL-AGENT.md", "docs/REMOTE-AUTH.md"];
+
+        #[test]
+        fn each_procedure_document_alone_needs_the_operator() {
+            let f = Fixture::new();
+            for path in PROCEDURE_DOCS {
+                needs_operator(&f, f.touch(path), &[path]);
+            }
+        }
+
+        #[test]
+        fn a_procedure_document_beside_an_ordinary_doc_keeps_the_operator_for_the_whole_diff() {
+            let f = Fixture::new();
+            for path in PROCEDURE_DOCS {
+                let head = f.make_head("procedure-beside", |d| {
+                    put(d, "docs/guides/app-development.md", "ok\n");
+                    put(d, path, "x\n");
+                });
+                needs_operator(&f, head, &[path]);
+            }
+        }
+
+        #[test]
+        fn a_name_differing_only_by_case_from_a_procedure_document_needs_the_operator() {
+            let f = Fixture::new();
+            for path in ["docs/install-agent.md", "docs/Remote-Auth.md"] {
+                needs_operator(&f, f.touch(path), &[path]);
+            }
+        }
+
+        #[test]
+        fn control_ordinary_docs_stay_class_auto_under_the_same_fixture() {
+            let f = Fixture::new();
+            for path in ["docs/RELEASING.md", "docs/guides/app-development.md"] {
+                let (code, stdout, stderr) = gate_real(&f, f.touch(path));
+                let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+                assert_eq!(code, 0, "{ctx}");
+                assert!(stdout.contains("class: auto"), "{ctx}");
+                assert!(!stdout.contains("class: human"), "{ctx}");
+                assert!(!stderr.contains(NO_APPROVAL), "{ctx}");
+            }
+        }
+    }
 }
 
 // CAD-2009: independently authored by the ticket author; implementers must not edit.
