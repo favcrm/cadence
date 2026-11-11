@@ -21,7 +21,7 @@ if (counts.status !== 2 || counts.owner !== 1 || counts.message !== 1 || counts.
 
 if (entryLabel(events[1]) !== "Landed" || entryLabel(events[2]) !== "Status") fail("only a landed status event reads Landed");
 const change = entryChange(events[2]);
-if (change?.from !== "doing" || change.to !== "review" || entryChange(events[1]) !== null) fail("a status change shows from and to; a landed one is just Landed");
+if (change?.from !== "doing" || change.to !== "review" || entryChange(events[1])?.to !== "done") fail("a status change shows from and to, landed or not");
 
 const days = groupByDay(events, null);
 const keys = events.map((e) => localDay(Date.parse(e.at)));

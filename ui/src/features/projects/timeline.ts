@@ -24,9 +24,9 @@ export function entryLabel(event: TimelineEvent): string {
   return TIMELINE_KINDS.find((k) => k.kind === event.kind)?.label ?? event.kind;
 }
 
-/** The change an entry records, as untranslated parts (`from`/`to` stay as the board wrote them). */
+/** The change an entry records, as untranslated parts (`from`/`to` stay as the board wrote them). A landed one keeps its change: the label already says "Landed". */
 export function entryChange(event: TimelineEvent): { from: string | null; to: string | null } | null {
-  if (event.kind === "status" && !event.landed) return { from: event.from, to: event.to };
+  if (event.kind === "status") return { from: event.from, to: event.to };
   if (event.kind === "owner") return { from: event.from, to: event.to };
   if (event.kind === "claim" && (event.from || event.to)) return { from: event.from, to: event.to };
   return null;

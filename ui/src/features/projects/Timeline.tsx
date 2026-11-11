@@ -77,7 +77,6 @@ export default function Timeline({ project, hosted, onOpenIssue, browseHref }: {
   const dayName = (at: string) => formatDate(at, { day: "numeric", month: "short" });
 
   const changeText = (e: TimelineEvent): string | null => {
-    if (e.kind === "status" && e.landed) return t("Landed");
     const c = entryChange(e);
     if (c) return `${c.from ?? t("none")} → ${c.to ?? t("none")}`;
     if (e.kind === "created") return t("Created this ticket");
@@ -102,13 +101,13 @@ export default function Timeline({ project, hosted, onOpenIssue, browseHref }: {
     {page.status === "unavailable" && <p className="card px-4 py-5 text-secondary text-ink-400" role="note">{t("The timeline is not available on this board yet.")}</p>}
 
     {page.status === "ok" && <>
-      <div className="tl-filters" role="group" aria-label={t("Filter the timeline")}>
+      {(loaded.length > 0 || openOnly) && <div className="tl-filters" role="group" aria-label={t("Filter the timeline")}>
         <span className="tl-kinds">
           <button className="chip chip-btn chip-sans" aria-pressed={kind === "all"} onClick={() => setKind("all")}>{t("All")}<span className="count">{formatNumber(loaded.length)}</span></button>
-          {TIMELINE_KINDS.map((k) => <button key={k.kind} className="chip chip-btn chip-sans" aria-pressed={kind === k.kind} onClick={() => setKind(k.kind)}>{t(k.label)}<span className="count">{formatNumber(counts[k.kind])}</span></button>)}
+          {TIMELINE_KINDS.filter((k) => counts[k.kind] > 0 || kind === k.kind).map((k) => <button key={k.kind} className="chip chip-btn chip-sans" aria-pressed={kind === k.kind} onClick={() => setKind(k.kind)}>{t(k.label)}<span className="count">{formatNumber(counts[k.kind])}</span></button>)}
         </span>
         <button className="chip chip-btn chip-sans tl-open" aria-pressed={openOnly} onClick={() => setOpenOnly(!openOnly)}>{t("Still open only")}</button>
-      </div>
+      </div>}
       <p className="text-micro text-ink-500 mb-4" role="status">
         {formatNumber(loaded.length)} {loaded.length === 1 ? t("entry loaded") : t("entries loaded")}
         {page.since && <> · {t("Ticket changes are recorded from")} <time dateTime={page.since}>{formatDate(page.since, { dateStyle: "medium" })}</time></>}

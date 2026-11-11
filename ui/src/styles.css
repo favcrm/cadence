@@ -2443,12 +2443,11 @@ button.project-focus-preview:hover { color: var(--color-accent); }
 .tl-open { margin-left: auto; }
 .tl-day { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr); gap: 0 1rem; }
 .tl-date { padding-top: .8rem; font: 500 var(--text-label) "IBM Plex Mono", monospace; color: var(--color-ink-400); }
-.tl-date small { display: block; margin-top: .15rem; font: 400 var(--text-micro) inherit; color: var(--color-ink-500); }
+.tl-date small { display: block; margin-top: .15rem; font-family: var(--font-sans); font-weight: 400; font-size: var(--text-micro); color: var(--color-ink-500); }
 .tl-list { border-left: 1px solid var(--color-ink-700); padding-left: 1.25rem; max-width: 50rem; min-width: 0; }
 .tl-item { position: relative; padding-block: .75rem; }
 .tl-item + .tl-item { border-top: 1px solid var(--color-ink-800); }
 .tl-item::before { content: ""; position: absolute; left: calc(-1.25rem - 4px); top: 1.1rem; width: 7px; height: 7px; border-radius: 9999px; background: var(--c, var(--color-ink-500)); box-shadow: 0 0 0 3px var(--color-ink-900); }
-.tl-item[data-kind="created"] { --c: var(--color-accent); }
 .tl-item[data-landed="true"] { --c: var(--color-ok); }
 .tl-item[data-kind="review"] { --c: var(--color-info); }
 .tl-item[data-kind="message"][data-open="true"] { --c: var(--color-warn); }
