@@ -149,6 +149,9 @@ pub const REMOTE_VERBS: &[&str] = &[
     // workspace has registered, plus the ones that exist only as their
     // tickets' key. A read; the write beside it is `project_new`.
     "project_ls",
+    // CAD-2240: one project's timeline (ticket changes, comments, messages,
+    // reviews), newest first. A read.
+    "project_timeline",
     // cli.write
     "issue_new",
     "issue_comment",
@@ -245,7 +248,8 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "agent_profile_context"
         | "agent_profile_show"
         | "agent_roles"
-        | "project_ls" => &["cli.read"],
+        | "project_ls"
+        | "project_timeline" => &["cli.read"],
         // The owner's merge approval and the delivery inputs it binds both
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
         "audit_verdict" | "audit_verdict_project" => &["cli.write"],
@@ -395,7 +399,8 @@ fn cli_effect(verb: &str) -> Effect {
         | "audit_verdicts_project"
         | "audit_reviewers_project"
         | "audit_identities"
-        | "project_ls" => Effect::Read,
+        | "project_ls"
+        | "project_timeline" => Effect::Read,
         // cli.write: every one of these can change durable state.
         "issue_new" => mutation(RECONCILE_ISSUE_NEW),
         "issue_comment" => mutation(RECONCILE_ISSUE_COMMENT),

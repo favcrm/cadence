@@ -28,6 +28,7 @@ import IssuePage from "./features/issues/IssuePage";
 import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
 import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
+import Timeline from "./features/projects/Timeline";
 import MasterPermissions from "./features/settings/MasterPermissions";
 import CanvasDrawer from "./features/canvas/CanvasDrawer";
 import { onBrowserAlert } from "./features/canvas/browserStore";
@@ -1236,6 +1237,16 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 href: hrefFor({ screen: "projects", slug: route.screen === "issue" ? route.project : route.slug, section: "overview" }),
                 on: route.screen === "projects" && route.section === "overview",
               },
+              // CAD-2240: the project timeline is a hosted-board read.
+              ...(meta?.hosted !== true ? [] : [{
+                label: "Timeline",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "timeline",
+                }),
+                on: route.screen === "projects" && route.section === "timeline",
+              }]),
               {
                 label: "Issues",
                 href: hrefFor({
@@ -1297,6 +1308,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
         {route.screen === "projects" && route.section === "overview" && (
           <ProjectsOverview project={project} projects={projects} issues={issuesState} onOpenIssue={openIssue} onRetry={() => void resources.issues.refresh()} />
+        )}
+        {route.screen === "projects" && route.slug && route.section === "timeline" && hosted !== undefined && (
+          <Timeline
+            project={route.slug}
+            hosted={hosted}
+            onOpenIssue={openIssue}
+            browseHref={hrefFor({ screen: "projects", slug: route.slug, section: "issues" })}
+          />
         )}
         {route.screen === "projects" && route.slug && route.section === "settings" && (
           <ProjectSettings

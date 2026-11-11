@@ -212,6 +212,9 @@ fn project_verbs_are_a_registered_read_and_owner_write() {
 
     assert!(REMOTE_VERBS.contains(&"project_ls"));
     assert!(REMOTE_VERBS.contains(&"project_new"));
+    assert!(REMOTE_VERBS.contains(&"project_timeline"));
+    assert_eq!(cli_requested_scopes("project_timeline"), &["cli.read"]);
+    assert!(!mutating_cli_verb("project_timeline"));
     assert_eq!(cli_requested_scopes("project_ls"), &["cli.read"]);
     assert_eq!(cli_requested_scopes("project_new"), &["cli.write"]);
     assert!(!mutating_cli_verb("project_ls"));

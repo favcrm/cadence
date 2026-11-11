@@ -145,6 +145,10 @@ member or an owner-role agent is refused before a write. The native policy
 commit records `Actor: users/<handle>` from that verified Owner, not the
 container's ambient alias. Local CLI writes retain their existing actor
 resolution. `issue project add` and `issue project set-remote` stay local.
+CAD-2240: `issue project timeline <key>` maps to `project_timeline`
+(cli.read; arguments `{project, limit?, before?, kinds?, since?, open_only?}`),
+the same read the board's Timeline tab makes. A board that predates the verb
+is refused by `tenant_cannot_serve`; there is no fallback.
 CAD-1999: `project new` maps to `project_new` (cli.write, live human owner
 only) and `issue project ls` maps to `project_ls` (cli.read). A hosted
 project exists before any ticket does — the tenant board keeps its own

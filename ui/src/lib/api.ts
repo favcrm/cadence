@@ -34,6 +34,7 @@ import type {
   ConnectionVerificationPayload,
   CredentialRequest,
   Health,
+  ProjectTimeline,
   ProtectedEntry,
   IssueCard,
   IssueDetail,
@@ -1472,6 +1473,16 @@ export const api = {
   /** `GET /api/milestones?project=` — progress and worst health per milestone. */
   milestones: (project: string) =>
     get<{ milestones: MilestoneRow[] }>(`/api/milestones?project=${encodeURIComponent(project)}`),
+  /** CAD-2240: `GET /api/projects/<key>/timeline` — hosted boards only; any other board answers 501. */
+  projectTimeline: (project: string, query: { before?: string | null; kinds?: string[]; open?: boolean; limit?: number }, signal?: AbortSignal) => {
+    const params = new URLSearchParams();
+    if (query.limit) params.set("limit", String(query.limit));
+    if (query.before) params.set("before", query.before);
+    if (query.kinds?.length) params.set("kind", query.kinds.join(","));
+    if (query.open) params.set("open", "1");
+    const qs = params.toString();
+    return get<ProjectTimeline>(`/api/projects/${encodeURIComponent(project)}/timeline${qs ? `?${qs}` : ""}`, signal);
+  },
   /** `POST /api/epics/<id>/stage` — relays `epic_stage`; operator-only on the board. */
   moveStage: (epic: string, stage: string, note?: string) =>
     post<{ epic: string; from: string; to: string; by: string; at: string }>(

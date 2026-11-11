@@ -632,6 +632,7 @@ cadence --org acme issue new "Review shared handover" --project demo
 cadence --org acme issue show <issue-id>
 cadence --org acme issue comment <issue-id> -m "Read projects/demo/handover.md; updating the agreed approach."
 cadence --org acme issue set <issue-id> status=doing --if-rev <issue-rev>
+cadence --org acme issue project timeline demo --since 7d
 ```
 
 Use the exact revision returned by each corresponding read, not a guessed one.

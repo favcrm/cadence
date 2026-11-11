@@ -69,6 +69,10 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 "`issue project delivery` records a hosted org's delivery inputs; \
                  locally, `issue project add --repo` and the project's PROJECT.md hold them",
             )),
+            ProjectAction::Timeline { .. } => Err(Error::usage(
+                "`issue project timeline` reads a hosted org's project timeline; \
+                 a local board records none",
+            )),
             ProjectAction::ApproveWork { key } => {
                 model::check_key(key)?;
                 print_json(&crate::client::rpc(
