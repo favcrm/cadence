@@ -645,14 +645,15 @@ Cadence's setting is the source of truth; this file names no model.
   `~/.local/state/cadence`, `~/pm` (apart from `cadence issue …` commands),
   port 3010, the installed `~/.local/bin/cadence` or the tailnet. Never
   restart the daemon. Never signal or kill a process you did not start.
-- A merge is not a release. Before handing over an update, confirm the exact
-  build is promoted and published (`docs/RELEASING.md`, "Prepare and promote
-  the exact candidate"): a manual `staging.yml` dispatch whose `promote` job
-  succeeded with a matching `production-candidate` receipt, then a successful
-  `promotion-completion` run. Green main CI and the automatic staging run
-  promote nothing. Dispatch a promotion only when the operator asks, and never
-  approve it. Only then does a production deploy need exactly these two lines
-  to the operator, run from a plain terminal:
+- A merge is not a release. Before handing over an update, confirm a build
+  that contains the change is promoted and published (`docs/RELEASING.md`,
+  "Prepare and promote the exact candidate"): a manual `staging.yml` dispatch
+  whose `promote` job succeeded with a matching `production-candidate`
+  receipt, then a successful `promotion-completion` run, its `publish-release`
+  job included. Green main CI and the automatic staging run promote nothing.
+  Dispatch a promotion only when the operator asks, and never approve it. Only
+  then send the operator exactly these two lines, and nothing else, to run
+  from a plain terminal. Never run them yourself, even when asked:
 
   ```
   cadence update --check --as operator:<name>

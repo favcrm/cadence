@@ -751,17 +751,22 @@ checklist report for every trivial edit or spend model turns on empty retros.
 
 Never restart the daemon. A merge is not a release: green main CI and the
 automatic `staging` run promote nothing. Before you hand over an update, check
-in this order (docs/RELEASING.md, "Prepare and promote the exact candidate"):
+in this order (Cadence's `docs/RELEASING.md`, "Prepare and promote the exact
+candidate"):
 
-1. **Promoted.** A manual `staging.yml` dispatch for the exact build finished,
-   its `promote` job succeeded after the operator's GitHub `production`
-   approval, and its `production-candidate` receipt names that build. If none
-   exists, say so. Dispatch one only when the operator asks, and never approve
-   it.
-2. **Published.** The `promotion-completion` run for that promotion succeeded.
-   An update relayed before it refuses with `release detail (not_found)`.
-3. **Then** send the operator exactly these two lines, to run from a plain
-   terminal. An agent session refuses them, its `!` commands included:
+1. **Promoted.** A manual `staging.yml` dispatch for a build that contains
+   your merge finished, its `promote` job succeeded after the operator's
+   GitHub `production` approval, and its `production-candidate` receipt names
+   that build and CI run. If none has succeeded, say so and say what it is
+   waiting on. Dispatch one only when the operator asks, and never approve it.
+2. **Published.** The `promotion-completion` run for that promotion succeeded,
+   its `publish-release` job included. Before that the default `--check`
+   still offers the previously published build, and a pinned `--to` refuses
+   with `release detail (not_found)`.
+3. **Then** send the operator exactly these two lines and nothing else, to run
+   from a plain terminal. Never run them yourself, even when asked:
+   `cadence update` refuses an agent session, its `!` commands included, and a
+   missing refusal is not permission.
 
 ```
 cadence update --check --as operator:<name>
@@ -783,7 +788,8 @@ those are recovery internals (docs/CLI.md). If `--check` refuses, report
 the refusal text and stop. If `--check` shows `available` older than
 `current`, or a `blocked:` line naming an older build or unproven
 ancestry, report it and stop: the approved candidate
-is stale (CAD-1235). For dev work use `cadence dev up|reload|down`
+is stale (CAD-1235). If `available` is not the build you promoted, the
+candidate did not advance: report it and stop. For dev work use `cadence dev up|reload|down`
 on a disposable instance, never production.
 
 ## Refresh a delegated staging instance
