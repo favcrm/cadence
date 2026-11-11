@@ -1484,6 +1484,7 @@ mod cad2081_workflow_verdicts {
             case.class = "routine";
             case.no_readiness = true;
             case.head = Some(head.clone());
+            case.tip_files = Some(empty_auto_list(&f));
             case
         };
         refused(&f, routine(vec![f.std(), revise.clone()]), "is not a pass");
@@ -1703,6 +1704,15 @@ mod cad2081_workflow_verdicts {
 
     const OPERATOR: &str = "a workflow review cannot stand in for the operator";
     const NO_APPROVAL: &str = "no operator approval recorded";
+
+    /// Main's tip serving an explicitly EMPTY workflow auto list, the state the CAD-2135
+    /// and CAD-2081 cases were written under. Serving it keeps them independent of what
+    /// the checkout's own list file holds (CAD-2254 turned three trees on).
+    fn empty_auto_list(f: &Fixture) -> Value {
+        let mut files = f.base_files();
+        files[AUTO_PATHS] = json!("[auto]\npaths = []\n");
+        files
+    }
 
     /// Workflow rows, no approval recorded, and a one-entry list at main's tip.
     fn unapproved(f: &Fixture, head: String) -> Scenario {
@@ -2314,10 +2324,11 @@ mod cad2081_workflow_verdicts {
     }
 
     #[test]
-    fn the_real_empty_list_sends_every_path_to_the_operator_and_is_not_unreadable() {
+    fn an_empty_list_sends_every_path_to_the_operator_and_is_not_unreadable() {
         let f = Fixture::new();
         let mut case = scenario(vec![f.std(), f.spec()]);
         case.head = Some(f.touch("design-plans/p/new.md"));
+        case.tip_files = Some(empty_auto_list(&f));
         case.approved = false;
         let (code, stdout, stderr) = f.gate(&case);
         assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
@@ -2333,6 +2344,7 @@ mod cad2081_workflow_verdicts {
         // With the operator's approval recorded, the workflow rows still satisfy the reviews.
         let mut case = scenario(vec![f.std(), f.spec()]);
         case.head = Some(f.touch("design-plans/p/new.md"));
+        case.tip_files = Some(empty_auto_list(&f));
         let (code, stdout, stderr) = f.gate(&case);
         assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
         assert!(stdout.contains("approval in force"), "{stdout}");
@@ -2349,6 +2361,7 @@ mod cad2081_workflow_verdicts {
             case.class = "routine";
             case.no_readiness = true;
             case.head = Some(head.clone());
+            case.tip_files = Some(empty_auto_list(&f));
             case
         };
         let (code, stdout, stderr) = f.gate(&routine(vec![f.std(), f.spec()]));
@@ -2477,6 +2490,7 @@ mod cad2081_workflow_verdicts {
             case.class = "routine";
             case.no_readiness = true;
             case.head = Some(head.clone());
+            case.tip_files = Some(empty_auto_list(&f));
             case
         };
         let filed_at = |mut row: Value, at: &str| {
@@ -2797,7 +2811,7 @@ mod cad2081_workflow_verdicts {
         case.approved = false;
         case.head_files = Some(f.listed("docs/**"));
         case.base_files = Some(f.listed("docs/**"));
-        case.tip_files = Some(f.base_files());
+        case.tip_files = Some(empty_auto_list(&f));
         check(
             "listed only at the PR's head and base",
             case,
@@ -4179,6 +4193,17 @@ mod cad2081_workflow_verdicts {
             // Exactly the size trigger's boundary is still ordinary; one line more is not.
             let at_limit = f.make_head("limit", |d| put(d, "src/wiki/big.rs", &"x\n".repeat(1500)));
             merges(&f, case_on(&f, at_limit, tip_with(&f, AUTO_LIST)));
+        }
+
+        #[test]
+        fn a_hosted_routine_docs_pr_with_both_workflow_passes_and_the_three_globs_is_class_auto() {
+            // The CAD-2135 cases serve an empty list and prove the approval a workflow row
+            // carries while the path is unlisted. With the list on, the same PR needs none.
+            let f = Fixture::new();
+            let mut case = case_on(&f, f.touch("docs/x.md"), tip_with(&f, AUTO_LIST));
+            case.class = "routine";
+            case.no_readiness = true;
+            merges(&f, case);
         }
 
         #[test]
