@@ -177,6 +177,9 @@ RISK_HUMAN_TABLES = ("schema", "trigger4", "trigger6", "trigger7")
 # default.
 WORKFLOW_AUTO_FILE = "docs/roles/workflow-auto-paths.toml"
 WORKFLOW_NEVER_PREFIXES = ("agents.", "claude.", "gemini.")  # basename prefixes, lower-case
+# CAD-2254: whatever that list says, the trust-boundary, identity, secret and UI
+# trees keep the operator: every one-review exclude glob and these risk-paths tables.
+WORKFLOW_NEVER_TABLES = ("trigger1", "trigger3")
 HUMAN_LINES = 1500  # risk-classes trigger 5
 HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml",
                    "package-lock.json", ".npmrc", "yarn.lock", "bun.lockb",
@@ -412,7 +415,19 @@ def risk_globs(toml_text):
     return globs if all(isinstance(g, str) for g in globs) else None
 
 
-def workflow_auto_reasons(changes, toml_text):
+def workflow_never_globs(one_text, risk_text):
+    """The globs no workflow review may carry to merge (CAD-2254), or None if unreadable.
+
+    Every `one_review_exclude` glob of the one-review list plus risk-paths trigger 1
+    and trigger 3: the trust-boundary, identity, secret and UI trees. Either list
+    missing, malformed or without one of those keys is unreadable, so the caller
+    fails closed."""
+    lists = [glob_list(one_text, ("one_review_exclude",))]
+    lists += [glob_list(risk_text, (table, "paths")) for table in WORKFLOW_NEVER_TABLES]
+    return None if any(g is None for g in lists) else [g for globs in lists for g in globs]
+
+
+def workflow_auto_reasons(changes, toml_text, never):
     """Why a PR with a workflow-issued review needs the operator's approval (CAD-2081).
 
     A positive allowlist: every change must be a plain add or modify of a regular
@@ -423,11 +438,17 @@ def workflow_auto_reasons(changes, toml_text):
     means every path needs the operator. Whatever the list says, a path with a
     segment starting with `.` (.github, .claude, .gitattributes) or a basename
     starting `agents.`, `claude.` or `gemini.` (any case, any directory: they can
-    load as agent instructions) is never eligible."""
+    load as agent instructions) is never eligible, and neither is a path matching
+    `never`, the globs of workflow_never_globs (CAD-2254). `never` is None when
+    those lists could not be read, which needs the operator for every path."""
     globs = glob_list(toml_text, ("auto", "paths"))
     if globs is None:
         return [f"cannot read {WORKFLOW_AUTO_FILE} at main's live tip, so a workflow review "
                 "cannot stand in for the operator (fail closed)"]
+    if never is None:
+        return [f"cannot read the one-review excludes of {ONE_REVIEW_FILE} or trigger 1 and 3 of "
+                f"{RISK_PATHS_FILE} at the diff's anchor, so a workflow review cannot stand in "
+                "for the operator (fail closed)"]
     out = []
     for status, old_mode, new_mode, path in changes:
         segs = path.split("/")
@@ -436,6 +457,8 @@ def workflow_auto_reasons(changes, toml_text):
             why = "an odd path name"
         elif any(seg.startswith(".") for seg in segs) or segs[-1].lower().startswith(WORKFLOW_NEVER_PREFIXES):
             why = "a hidden or agent-instruction file name"
+        elif any(glob_match(g, path) for g in never):
+            why = "a trust-boundary, identity, secret or UI path, never eligible"
         elif not ((status == "A" and old_mode == "000000" and new_mode == "100644")
                   or (status == "M" and old_mode == "100644" and new_mode == "100644")):
             why = "not a plain add or modify of a 100644 file"
@@ -2026,7 +2049,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             rc, auto_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
                                     f"repos/{repo}/contents/{WORKFLOW_AUTO_FILE}?ref={main_tip}"])
             auto_text = auto_text if rc == 0 else None
-        why += workflow_auto_reasons(changes, auto_text)
+        why += workflow_auto_reasons(changes, auto_text,
+                                     workflow_never_globs(one_text, risk_text))
     not_auto = [v for v in verdicts if v["risk"] != "auto"]
     if not_auto:
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
