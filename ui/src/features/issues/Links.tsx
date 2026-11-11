@@ -75,7 +75,7 @@ export function Links({
                   size="sm"
                   className="ml-auto shrink-0"
                   aria-label={`Unlink ${row.label} ${row.id}`}
-                  title="Remove this link"
+                  title={t("Remove this link")}
                   onClick={() => unlink(row.unlinkKind!, row.id)}
                 >
                   <IconClose />
@@ -87,7 +87,7 @@ export function Links({
         {references.map((r, i) => (
           <span key={`reference-${i}`} className="contents">
             <dt className="slabel">
-              {r.kind === "note" ? "Note" : "Reference"}
+              {r.kind === "note" ? t("Note") : t("Reference")}
             </dt>
             <dd
               className="text-secondary min-w-0 truncate"
@@ -109,12 +109,12 @@ export function Links({
           className="issue-link-form"
           onSubmit={(e) => {
             e.preventDefault();
-            const t = target.trim();
-            if (!t) return;
+            const trimmed = target.trim();
+            if (!trimmed) return;
             api
-              .link(detail.id, kind, t, detail.rev)
+              .link(detail.id, kind, trimmed, detail.rev)
               .then((r) => {
-                onWrite(r, `${detail.id} ${kind} ${t}`);
+                onWrite(r, `${detail.id} ${kind} ${trimmed}`);
                 setTarget("");
               })
               .catch((err) => onError(err, "link"));
@@ -123,7 +123,7 @@ export function Links({
           <Select
             value={kind}
             aria-label="link type"
-            options={LINK_KINDS}
+            options={LINK_KINDS.map((opt) => ({ value: opt.value, label: t(opt.label) }))}
             onChange={setKind}
           />
           <input
@@ -134,7 +134,7 @@ export function Links({
             aria-label="link target"
           />
           <Button type="submit" disabled={!target.trim()}>
-            Link
+            {t("Link")}
           </Button>
         </form>
       )}

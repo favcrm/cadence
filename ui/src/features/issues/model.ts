@@ -1,4 +1,11 @@
-import type { CardAgent, IssueDetail, IssueHistoryEntry, Ref, TaskReport } from "../../lib/types";
+import type {
+  CardAgent,
+  IssueAssignmentRow,
+  IssueDetail,
+  IssueHistoryEntry,
+  Ref,
+  TaskReport,
+} from "../../lib/types";
 import type { StagedWrite } from "../decisions/stagedWrite";
 
 /** Tabs on `/projects/<project>/issues/<id>`. `overview` is the bare path. */
@@ -469,21 +476,33 @@ export function hasCodeDelivery(
   return detail.work?.type !== undefined;
 }
 
+/**
+ * Newest recorded hosted assignment row (`agenticos-v2` returns `assignments`
+ * ordered `updated_at DESC, id DESC`, so `rows[0]` wins on equal/missing timestamps).
+ */
+export function latestHostedAssignment(detail: IssueDetail | null): IssueAssignmentRow | null {
+  const rows = detail?.local_assignment?.available ? detail.local_assignment.assignments : [];
+  if (rows.length === 0) return null;
+  return rows.reduce((best, cur) =>
+    timeKey(cur.updated_at ?? null) > timeKey(best.updated_at ?? null) ? cur : best,
+  );
+}
+
 /** Human-readable summary of a hosted work item's recorded assignment/owner state. */
 export function hostedAssignmentText(
   detail: IssueDetail,
   t: (s: string) => string,
 ): string {
-  const rows = detail.local_assignment?.available ? detail.local_assignment.assignments : [];
-  if (rows.length > 0) {
-    const latest = rows[rows.length - 1];
+  const latest = latestHostedAssignment(detail);
+  if (latest) {
     const actor = latest.target ?? detail.owner ?? t("Assigned");
     return `${actor} · ${t(latest.state)}`;
   }
-  if (detail.agent_run?.agent) {
-    return detail.agent_run.state
-      ? `${detail.agent_run.agent} · ${t(detail.agent_run.state)}`
-      : detail.agent_run.agent;
+  const runActor = detail.agent_run?.agent_name || detail.agent_run?.agent;
+  if (runActor) {
+    return detail.agent_run?.state
+      ? `${runActor} · ${t(detail.agent_run.state)}`
+      : runActor;
   }
   if (detail.owner) return detail.owner;
   if (
@@ -496,12 +515,6 @@ export function hostedAssignmentText(
   return t("Unassigned");
 }
 
-function hasIssueToken(text: string | null | undefined, issueId: string): boolean {
-  if (!text || !issueId) return false;
-  const escaped = issueId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?:^|[^A-Za-z0-9_-])${escaped}(?:$|[^A-Za-z0-9_-])`).test(text);
-}
-
 /**
  * Staged/decided assistant actions (`/api/assist/actions`) that explicitly
  * target or reference `issueId`. Bounded token matching prevents `CAD-22`
@@ -512,14 +525,17 @@ export function matchingStagedActions(
   rows: readonly StagedWrite[] | undefined,
 ): StagedWrite[] {
   if (!issueId || !rows || rows.length === 0) return [];
+  const escaped = issueId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const tokenRe = new RegExp(`(?:^|[^A-Za-z0-9_-])${escaped}(?:$|[^A-Za-z0-9_-])`);
+  const hasToken = (text: string | null | undefined) => Boolean(text && tokenRe.test(text));
   return rows.filter(
     (row) =>
       row.result?.ticket === issueId ||
       row.target?.id === issueId ||
-      hasIssueToken(row.recordLink, issueId) ||
-      hasIssueToken(row.title, issueId) ||
-      hasIssueToken(row.reason, issueId) ||
-      hasIssueToken(row.raw, issueId),
+      hasToken(row.recordLink) ||
+      hasToken(row.title) ||
+      hasToken(row.reason) ||
+      hasToken(row.raw),
   );
 }
 

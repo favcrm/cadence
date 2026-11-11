@@ -8,11 +8,12 @@ import type { IssueDetail, TaskReport } from "../../lib/types";
 import { stageLabel } from "../projects/work";
 import { composerBlocked, type LanePayload } from "./lane";
 import { WriteGate } from "../auth/WriteGate";
-import { outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
+import { isolate, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
 import {
   deployRefs,
   hasCodeDelivery,
   hostedAssignmentText,
+  latestHostedAssignment,
   matchingStagedActions,
   mergeState,
   prRef,
@@ -53,16 +54,35 @@ function nextAction({
   if (detail.status === "done" || detail.status === "dropped")
     return t("The issue is closed; nothing is pending here.");
   if (hosted && !lane?.lane) {
+    if (detail.blocked) {
+      return detail.blocked_reason
+        ? `${t("Blocked.")} ${detail.blocked_reason}`
+        : t("This item cannot proceed until the block is cleared.");
+    }
     if (questions.length > 0)
       return `${t("Answer the open question")} — ${questions[0].body?.split("\n")[0] ?? questions[0].name}`;
     if (verdict?.verdict === "revise")
       return t("The independent review asked for a revision.");
-    if (detail.status === "review")
+    const latestAssign = latestHostedAssignment(detail);
+    const runState = detail.agent_run?.state;
+    if (detail.status === "review" || latestAssign?.state === "result" || runState === "finished")
       return t("Review the deliverable and recorded checks below.");
+    if (
+      latestAssign &&
+      (latestAssign.state === "blocked" || latestAssign.state === "failed" || latestAssign.state === "cancelled")
+    ) {
+      return t("The latest assignment stopped — review Activity or reassign.");
+    }
+    if (
+      runState &&
+      (runState === "failed" || runState === "refused" || runState === "stopped" || runState === "no_report")
+    ) {
+      return t("The latest agent run stopped — review Activity or reassign.");
+    }
     const hasAssignment =
       Boolean(detail.owner) ||
-      Boolean(detail.agent_run?.agent) ||
-      Boolean(detail.local_assignment?.available && detail.local_assignment.assignments.length > 0);
+      Boolean(detail.agent_run?.agent || detail.agent_run?.agent_name) ||
+      Boolean(latestAssign);
     if (hasAssignment)
       return t("Assigned work is active — check Activity or Evidence for updates.");
     return t("Assign an owner or update acceptance checks to move this item forward.");
@@ -134,11 +154,7 @@ export function WorkResult({
   const laneView = lane?.lane ?? null;
   const workerOwn = latest?.agent && laneView?.agent === latest.agent;
   const feedbackBlocked = composerBlocked(laneView?.state) || writeBlock != null;
-  const assignmentRows = detail.local_assignment?.available
-    ? detail.local_assignment.assignments
-    : [];
-  const latestAssignment =
-    assignmentRows.length > 0 ? assignmentRows[assignmentRows.length - 1] : null;
+  const latestAssignment = latestHostedAssignment(detail);
   const approvalHeads = detail.approvals?.heads ?? [];
   const inForceHeads = approvalHeads.filter((h) => h.state === "in-force");
   const stagedMatches = matchingStagedActions(detail.id, stagedActions);
@@ -161,9 +177,14 @@ export function WorkResult({
             latest.at ? ` · ${fmtTime(latest.at)}` : ""
           }`
         : latestAssignment && (latestAssignment.text || latestAssignment.deliverable)
-          ? `${latestAssignment.target ?? detail.owner ?? t("Assigned")} · ${t(latestAssignment.state)}${
-              latestAssignment.updated_at ? ` · ${fmtTime(latestAssignment.updated_at)}` : ""
-            }`
+          ? (
+              <>
+                <bdi>{isolate(latestAssignment.target ?? detail.owner ?? t("Assigned"))}</bdi>
+                {` · ${t(latestAssignment.state)}${
+                  latestAssignment.updated_at ? ` · ${fmtTime(latestAssignment.updated_at)}` : ""
+                }`}
+              </>
+            )
           : t("Nothing reported yet — no completion claim exists."),
     },
   ];
@@ -174,45 +195,61 @@ export function WorkResult({
     (detail.approvals !== undefined && detail.approvals !== null && !detail.approvals.available) ||
     !codeDelivery
   ) {
-    const pendingStaged = stagedMatches.some((s) => outcomeOf(s) === "pending" || outcomeOf(s) === "failed");
+    const approvalsUnavailable = Boolean(detail.approvals && !detail.approvals.available);
+    const warnApprovals =
+      approvalsUnavailable ||
+      approvalHeads.some((h) => h.state === "unavailable") ||
+      stagedMatches.some((s) => {
+        const o = outcomeOf(s);
+        return o === "pending" || o === "failed" || o === "unconfirmed";
+      });
     const appliedStaged = stagedMatches.some((s) => outcomeOf(s) === "applied");
     rows.push({
       title: t("Approvals"),
-      tone:
-        (detail.approvals && !detail.approvals.available) || pendingStaged
-          ? "warn"
-          : inForceHeads.length > 0 || appliedStaged
-            ? "done"
-            : "wait",
+      tone: warnApprovals
+        ? "warn"
+        : inForceHeads.length > 0 || appliedStaged
+          ? "done"
+          : "wait",
       detail:
-        detail.approvals && !detail.approvals.available && stagedMatches.length === 0 ? (
+        approvalsUnavailable && approvalHeads.length === 0 && stagedMatches.length === 0 ? (
           t("Approval records could not be read.")
         ) : approvalHeads.length > 0 || stagedMatches.length > 0 ? (
-          <ul className="m-0 p-0 list-none grid gap-1">
-            {approvalHeads.map((head) => (
-              <li
-                key={`${head.repo}#${head.pr}@${head.head_sha}`}
-                className="num text-secondary"
-              >
-                <span>{`${head.repo} #${head.pr} @ ${head.head_sha.slice(0, 12)}`}</span>
-                {" · "}
-                <span>{t(head.state)}</span>
-                {head.source ? ` · ${head.source}` : ""}
-                {head.action ? ` (${head.action})` : ""}
-                {head.recorded_at ? ` · ${fmtTime(head.recorded_at)}` : ""}
-              </li>
-            ))}
-            {stagedMatches.map((item) => (
-              <li key={item.id} className="text-secondary">
-                <span>{item.title}</span>
-                {" · "}
-                <span className="num">{t(outcomeOf(item))}</span>
-                {item.decidedAt || item.createdAt
-                  ? ` · ${fmtTime(new Date(item.decidedAt ?? item.createdAt).toISOString())}`
-                  : ""}
-              </li>
-            ))}
-          </ul>
+          <div className="grid gap-1">
+            {approvalsUnavailable && (
+              <p className="m-0 text-warn">{t("Approval records could not be read.")}</p>
+            )}
+            <ul className="m-0 p-0 list-none grid gap-1">
+              {approvalHeads.map((head) => (
+                <li
+                  key={`${head.repo}#${head.pr}@${head.head_sha}`}
+                  className="num text-secondary"
+                >
+                  <span>{`${head.repo} #${head.pr} @ ${head.head_sha.slice(0, 12)}`}</span>
+                  {" · "}
+                  <span>{t(head.state)}</span>
+                  {head.source ? (
+                    <>
+                      {" · "}
+                      <bdi>{isolate(head.source)}</bdi>
+                    </>
+                  ) : null}
+                  {head.action ? ` (${head.action})` : ""}
+                  {head.recorded_at ? ` · ${fmtTime(head.recorded_at)}` : ""}
+                </li>
+              ))}
+              {stagedMatches.map((item) => (
+                <li key={item.id} className="text-secondary">
+                  <bdi>{isolate(item.title)}</bdi>
+                  {" · "}
+                  <span className="num">{t(outcomeOf(item))}</span>
+                  {item.decidedAt || item.createdAt
+                    ? ` · ${fmtTime(new Date(item.decidedAt ?? item.createdAt).toISOString())}`
+                    : ""}
+                </li>
+              ))}
+            </ul>
+          </div>
         ) : (
           t("No approvals recorded on this item.")
         ),
@@ -378,7 +415,8 @@ export function WorkResult({
         ) : latestAssignment && (latestAssignment.text || latestAssignment.deliverable) ? (
           <>
             <p className="text-secondary text-ink-300 m-0">
-              {`${latestAssignment.target ?? detail.owner ?? t("Assigned")} · ${t(latestAssignment.state)}${
+              <bdi>{isolate(latestAssignment.target ?? detail.owner ?? t("Assigned"))}</bdi>
+              {` · ${t(latestAssignment.state)}${
                 latestAssignment.updated_at ? ` · ${fmtTime(latestAssignment.updated_at)}` : ""
               }`}
             </p>
@@ -387,11 +425,24 @@ export function WorkResult({
                 <Md text={latestAssignment.text} onOpen={onOpen} />
               </div>
             )}
-            {latestAssignment.deliverable?.title && (
+            {latestAssignment.deliverable && (latestAssignment.deliverable.ref || latestAssignment.deliverable.title) && (
               <p className="text-secondary text-ink-200 m-0">
-                {`${t("Deliverable")}: ${latestAssignment.deliverable.title}${
-                  latestAssignment.deliverable.ref ? ` (${latestAssignment.deliverable.ref})` : ""
-                }`}
+                {`${t("Deliverable")}: `}
+                {latestAssignment.deliverable.type === "link" && latestAssignment.deliverable.ref ? (
+                  <SafeLink className="lnk" href={latestAssignment.deliverable.ref}>
+                    {latestAssignment.deliverable.title ?? latestAssignment.deliverable.ref}
+                  </SafeLink>
+                ) : (
+                  <bdi>
+                    {isolate(
+                      latestAssignment.deliverable.title
+                        ? `${latestAssignment.deliverable.title}${
+                            latestAssignment.deliverable.ref ? ` (${latestAssignment.deliverable.ref})` : ""
+                          }`
+                        : latestAssignment.deliverable.ref,
+                    )}
+                  </bdi>
+                )}
               </p>
             )}
           </>

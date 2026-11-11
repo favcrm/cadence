@@ -71,6 +71,7 @@ async function main() {
   const {
     hasCodeDelivery,
     hostedAssignmentText,
+    latestHostedAssignment,
     matchingStagedActions,
     shownLinks,
   } = require("../src/features/issues/model") as typeof import("../src/features/issues/model");
@@ -124,10 +125,17 @@ async function main() {
       assignments: [
         {
           target: "priya",
-          state: "completed",
+          state: "result",
           updated_at: "2026-11-11T09:00:00Z",
           text: "Uploaded final Q3 pricing matrix.",
-          deliverable: { type: "document", title: "Pricing memo v2", ref: "doc-q3-pricing" },
+          deliverable: { type: "link", ref: "https://docs.example.com/q3-pricing-v2" },
+        },
+        {
+          target: "alex",
+          state: "cancelled",
+          updated_at: "2026-11-11T08:15:00Z",
+          text: "Superseded initial draft.",
+          deliverable: null,
         },
       ],
     },
@@ -184,7 +192,19 @@ async function main() {
     "outgoing relates unlinks; incoming symmetric relates has unlinkKind null",
   );
 
-  equal(hostedAssignmentText(nonDev, (s) => s), "priya · completed", "hosted assignment summary reads local_assignment");
+  equal(latestHostedAssignment(nonDev)?.target, "priya", "latestHostedAssignment picks newest row over older cancelled row");
+  equal(hostedAssignmentText(nonDev, (s) => s), "priya · result", "hosted assignment summary reads newest local_assignment");
+  equal(
+    hostedAssignmentText(
+      baseIssue({
+        local_assignment: { available: false, reason: "not_supported", assignments: [] },
+        agent_run: { agent: "agents/ap_1", agent_name: "Atlas", state: "working" },
+      }),
+      (s) => s,
+    ),
+    "Atlas · working",
+    "hosted assignment summary prefers agent_run.agent_name over raw profile path",
+  );
 
   const stagedRows: StagedWrite[] = [
     {
@@ -308,9 +328,12 @@ async function main() {
     assert(!text.includes("No merge recorded"), "non-dev item omits Merge verification row");
     assert(!text.includes("No deployment evidence"), "non-dev item omits Deployment verification row");
     assert(text.includes("Assignment"), "hosted overview shows Assignment label");
-    assert(text.includes("priya · completed"), "hosted overview shows recorded assignment state");
-    assert(text.includes("Pricing memo v2"), "hosted Result surfaces assignment deliverable");
+    assert(text.includes("priya · result"), "hosted overview shows newest recorded assignment state");
+    assert(!text.includes("alex · cancelled"), "hosted overview does not render older superseded assignment");
+    const deliverableLink = host.querySelector('a[href="https://docs.example.com/q3-pricing-v2"]');
+    assert(deliverableLink, "hosted Result renders link deliverable via SafeLink");
     assert(text.includes("Approve Q3 enterprise pricing"), "hosted Approvals row surfaces matching staged action");
+    assert(host.querySelectorAll("bdi").length >= 2, "untrusted target and staged title are wrapped in <bdi>");
     assert(text.includes("Related & follow-ups"), "hosted Verification surfaces follow-up links");
 
     const tabLinks = Array.from(host.querySelectorAll(".section-nav-link")).map((a) => a.textContent?.trim());
@@ -475,7 +498,9 @@ async function main() {
     });
     const tabs = Array.from(host.querySelectorAll('[role="tab"]')) as HTMLButtonElement[];
     equal(tabs.length, 6, "PR/approval-bearing WorkItemDetail keeps all 6 tabs including Code");
+    assert(tabs.some((b) => b.textContent?.trim() === "程式碼"), "zh-TW translates Code tab");
     assert(host.textContent?.includes("相關與跟進項目"), "zh-TW translates Related & follow-ups");
+    assert(host.textContent?.includes("策略與外部影響"), "zh-TW translates Policy and effect");
     const approvalsTab = tabs.find((b) => b.textContent?.trim() === "批准記錄");
     assert(approvalsTab, "zh-TW translates Approvals tab");
     await React.act(() => approvalsTab.click());
@@ -485,6 +510,112 @@ async function main() {
     win.localStorage.removeItem("cadence-locale");
     await React.act(async () => root.unmount());
     host.remove();
+  }
+
+  // 6. Truthfulness guards: approvals.available === false coexists with stagedMatches, and detail === null withholds counts
+  {
+    const unavailableIssue = baseIssue({
+      approvals: {
+        version: "hosted-cadence-issue-approvals.v1",
+        scope: "project",
+        available: false,
+        reason: "read_failed",
+        complete: false,
+        heads: [],
+      },
+      local_assignment: {
+        available: true,
+        reason: null,
+        assignments: [
+          {
+            target: "priya",
+            state: "result",
+            updated_at: "2026-11-11T09:00:00Z",
+            text: "Artifact deliverable without title.",
+            deliverable: { type: "artifact", ref: "pricing-memo-v2.pdf" },
+          },
+        ],
+      },
+    });
+    detailsById["DEMOCOMPANY-1"] = unavailableIssue;
+
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    await React.act(async () => {
+      root.render(
+        React.createElement(
+          LocaleProvider,
+          null,
+          React.createElement(NavigationProvider, {
+            adapter: hostNavigation,
+            children: React.createElement(IssuePage, {
+              project: "demo-company",
+              id: "DEMOCOMPANY-1",
+              tab: "overview",
+              tabHref: (tab) => `/projects/demo-company/issues/DEMOCOMPANY-1?tab=${tab}`,
+              issues: [],
+              agents: null,
+              readOnly: false,
+              writeBlock: null,
+              kickoffBlock: null,
+              hosted: true,
+              projectRepos: [],
+              stagedActions: stagedRows,
+              planHref: "/home",
+              onWrite: () => {},
+              onError: () => {},
+              onOpen: () => {},
+              onToast: () => {},
+            }),
+          }),
+        ),
+      );
+    });
+    await React.act(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    const pageText = host.textContent ?? "";
+    assert(pageText.includes("Approval records could not be read."), "WorkResult keeps unavailability warning when stagedMatches exist");
+    assert(pageText.includes("Approve Q3 enterprise pricing"), "WorkResult still renders stagedMatches alongside unavailability warning");
+    assert(pageText.includes("Deliverable: pricing-memo-v2.pdf"), "WorkResult renders ref-only artifact deliverable");
+    await React.act(async () => root.unmount());
+    host.remove();
+
+    // Unloaded / discarded detail === null must never claim "recorded in Approvals."
+    const discardedHost = document.createElement("div");
+    document.body.append(discardedHost);
+    const discardedRoot = createRoot(discardedHost);
+    await React.act(async () => {
+      discardedRoot.render(
+        React.createElement(
+          LocaleProvider,
+          null,
+          React.createElement(WorkItemDetail, {
+            id: "DEMOCOMPANY-1",
+            origin: "threads",
+            detail: null,
+            readState: { data: null, status: "failed", error: "Forbidden", discarded: true, asOf: null, inFlight: false },
+            href: null,
+            onClose: () => {},
+            readOnly: true,
+            onOpen: () => {},
+            hosted: true,
+            projectRepos: [],
+            stagedActions: stagedRows,
+          }),
+        ),
+      );
+    });
+    await React.act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    assert(
+      !discardedHost.textContent?.includes("recorded in Approvals."),
+      "discarded/unloaded WorkItemDetail never claims recorded approvals from stagedActions",
+    );
+    await React.act(async () => discardedRoot.unmount());
+    discardedHost.remove();
   }
 
   console.log("CAD-2253 generic work item, approvals, and follow-up checks passed");

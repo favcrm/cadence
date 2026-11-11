@@ -22,7 +22,7 @@ import {
   timelineRows,
   verdictStale,
 } from "../issues/model";
-import { askedBy, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
+import { askedBy, isolate, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
 import { PRIORITY_CHIP, STATUS_CHIP } from "../issues/chips";
 import { noDragReason } from "../projects/Card";
 import { Evidence } from "../issues/Evidence";
@@ -103,7 +103,7 @@ export default function WorkItemDetail(props: WorkItemDetailProps) {
     activity: "Activity",
     audit: "Audit",
   };
-  const tabs = workItemTabs(detail, projectRepos, hosted).map((tabId) => ({
+  const tabs = workItemTabs(known ? detail : null, projectRepos, hosted).map((tabId) => ({
     id: tabId,
     label: t(labels[tabId]),
     panel:
@@ -265,15 +265,24 @@ function OverviewPanel({
   const agents = detail?.agents ?? [];
   const hasHostedAssignment = Boolean(
     (detail?.local_assignment?.available && detail.local_assignment.assignments.length > 0) ||
-      detail?.agent_run?.agent,
+      detail?.agent_run?.agent ||
+      detail?.agent_run?.agent_name,
   );
   const lane = agents.length === 0 ? t("No lane yet") : agents.map((a) => a.alias).join(", ");
   const linkedRows = useMemo(
     () => (detail ? shownLinks(detail.links, detail.relates) : []),
     [detail],
   );
+  const approvalsUnavailable = Boolean(detail?.approvals && !detail.approvals.available);
   const inForceHeads = (detail?.approvals?.heads ?? []).filter((h) => h.state === "in-force").length;
-  const stagedCount = matchingStagedActions(id, stagedActions).length;
+  const stagedMatches = useMemo(
+    () => (detail ? matchingStagedActions(detail.id, stagedActions) : []),
+    [detail, stagedActions],
+  );
+  const activeOrAppliedStaged = stagedMatches.filter((s) => {
+    const o = outcomeOf(s);
+    return o === "applied" || o === "pending";
+  }).length;
   const owner = myWork && facts.owner === myWork.owner ? t("you") : facts.owner ?? t("unassigned");
   const gone = Boolean(
     myWork &&
@@ -383,9 +392,11 @@ function OverviewPanel({
       <section className="grid gap-1" aria-label={t("Policy and effect")}>
         <h4 className="rv-h">{t("Policy and effect")}</h4>
         <p className="rv-note">
-          {inForceHeads > 0 || stagedCount > 0
-            ? `${formatNumber(inForceHeads + stagedCount)} ${t("recorded in Approvals.")} ${t("Approvals and merges keep their own pinned-head paths; this detail adds none.")}`
-            : t("No policy is recorded on this issue. Approvals and merges keep their own pinned-head paths; this detail adds none.")}
+          {approvalsUnavailable
+            ? `${t("Approval records could not be read.")} ${t("Approvals and merges keep their own pinned-head paths; this detail adds none.")}`
+            : inForceHeads > 0 || activeOrAppliedStaged > 0
+              ? `${formatNumber(inForceHeads + activeOrAppliedStaged)} ${t("recorded in Approvals.")} ${t("Approvals and merges keep their own pinned-head paths; this detail adds none.")}`
+              : t("No policy is recorded on this issue. Approvals and merges keep their own pinned-head paths; this detail adds none.")}
         </p>
         <p className="rv-note">{t("No external effect is recorded on this issue.")}</p>
       </section>
@@ -520,11 +531,13 @@ function ApprovalsPanel({
     <div className="wi-panel">
       <section className="grid gap-2" aria-label={t("Recorded approvals")}>
         <h4 className="rv-h">{t("Recorded approvals")}</h4>
-        {approvalsUnavailable ? (
+        {approvalsUnavailable && (
           <p className="issue-peek-note warn m-0">{t("Approval records could not be read.")}</p>
-        ) : heads.length === 0 ? (
+        )}
+        {!approvalsUnavailable && heads.length === 0 && (
           <p className="issue-peek-note dim m-0">{t("No approval heads are recorded on this item.")}</p>
-        ) : (
+        )}
+        {heads.length > 0 && (
           <ul className="issue-peek-list">
             {heads.map((head) => (
               <li key={`${head.repo}#${head.pr}@${head.head_sha}`} className="issue-peek-act">
@@ -533,8 +546,13 @@ function ApprovalsPanel({
                   {head.recorded_at && <span className="when"> · {fmtTime(head.recorded_at)}</span>}
                 </div>
                 <div className="num">
-                  {`${head.head_sha.slice(0, 12)} · ${t(head.state)}`}
-                  {head.source ? ` · ${head.source}` : ""}
+                  <span>{`${head.head_sha.slice(0, 12)} · ${t(head.state)}`}</span>
+                  {head.source ? (
+                    <>
+                      {" · "}
+                      <bdi>{isolate(head.source)}</bdi>
+                    </>
+                  ) : null}
                   {head.action ? ` (${head.action})` : ""}
                 </div>
               </li>
@@ -552,12 +570,17 @@ function ApprovalsPanel({
               return (
                 <li key={item.id} className="issue-peek-act">
                   <div>
-                    <span className="who">{item.title}</span>
+                    <bdi className="who">{isolate(item.title)}</bdi>
                     {ts ? <span className="when"> · {fmtTime(new Date(ts).toISOString())}</span> : null}
                   </div>
                   <div>
                     <span className="num">{t(outcomeOf(item))}</span>
-                    {who ? ` · ${who}` : ""}
+                    {who ? (
+                      <>
+                        {" · "}
+                        <bdi>{isolate(who)}</bdi>
+                      </>
+                    ) : null}
                   </div>
                 </li>
               );

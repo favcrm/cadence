@@ -121,7 +121,7 @@ export interface IssueAssignmentRow {
   state: string;
   text?: string | null;
   text_truncated?: boolean;
-  deliverable?: { type: string; ref: string; title?: string | null } | null;
+  deliverable?: { type: "artifact" | "link"; ref: string; title?: string | null } | null;
   deliverable_check?: { found: boolean | null; reason: string | null };
   updated_at?: string | null;
 }
@@ -142,6 +142,7 @@ export interface IssueLocalAssignment {
 /** Hosted agent run summary on `GET /api/issues/:id`. */
 export interface IssueAgentRun {
   agent?: string | null;
+  agent_name?: string | null;
   state?: string | null;
 }
 

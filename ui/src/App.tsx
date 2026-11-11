@@ -1597,19 +1597,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               if (privateSessionGeneration() === personalGeneration) notifyPersonalDrafts((version) => version + 1);
             },
           } : undefined}
-          href={(() => {
+          {...(() => {
             const fromDetail = detailState?.data?.id === openId ? detailState.data.project : null;
             const fromCard = personalState?.data?.issues.find((row) => row.id === openId)?.project
               ?? issues.find((i) => i.id === openId)?.project ?? null;
             const key = fromDetail ?? fromCard ?? (project !== "all" ? project : null);
-            return key ? issuePath(key, openId) : null;
-          })()}
-          projectRepos={(() => {
-            const fromDetail = detailState?.data?.id === openId ? detailState.data.project : null;
-            const fromCard = personalState?.data?.issues.find((row) => row.id === openId)?.project
-              ?? issues.find((i) => i.id === openId)?.project ?? null;
-            const key = fromDetail ?? fromCard ?? (project !== "all" ? project : null);
-            return key ? projects.find((p) => p.key === key)?.repos ?? null : null;
+            return {
+              href: key ? issuePath(key, openId) : null,
+              projectRepos: key ? projects.find((p) => p.key === key)?.repos ?? null : null,
+            };
           })()}
           hosted={meta?.hosted === true}
           stagedActions={decisions.rows}
