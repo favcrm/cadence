@@ -4055,6 +4055,447 @@ mod cad2081_workflow_verdicts {
         case.no_identity_map = true;
         refused(&f, case, "cannot read the workspace identity map");
     }
+
+    // CAD-2254 acceptance: the workflow auto-paths list is turned on for ordinary
+    // trees, with one new never-eligible rule. Authored from the ticket (body and the
+    // 2026-11-11 "Design refinement" comment) by someone other than the implementer;
+    // implementers must not edit it.
+    //
+    // Rule 2: whatever the list says (even `**`), a changed path that one-review-paths
+    // `one_review_exclude` excludes, or that risk-paths `trigger1`/`trigger3` names, keeps
+    // the operator, and an unreadable one-review or risk-paths list at main's live tip
+    // means the operator. Paths that match no one-review include glob (design-plans/**)
+    // are NOT touched by it; the CAD-2081 cases above prove that and stay as they are.
+    mod cad2254 {
+        use super::*;
+
+        /// The post-change list text, served explicitly so the cases below do not depend
+        /// on the checkout (one test pins the real file to it).
+        const AUTO_LIST: &str = "[auto]\npaths = [\"src/**\", \"docs/**\", \"contracts/**\"]\n";
+        const EVERYTHING: &str = "[auto]\npaths = [\"**\"]\n";
+
+        /// Main's tip serving the real one-review and risk-paths lists and this auto list.
+        fn tip_with(f: &Fixture, auto: &str) -> Value {
+            let mut files = f.base_files();
+            files[AUTO_PATHS] = json!(auto);
+            files
+        }
+
+        /// Both workflow reviews pass at the head, no approval recorded, `tip` at main.
+        fn case_on(f: &Fixture, head: String, tip: Value) -> Scenario {
+            let mut case = scenario(vec![f.std(), f.spec()]);
+            case.head = Some(head);
+            case.approved = false;
+            case.tip_files = Some(tip);
+            case
+        }
+
+        /// Parse a served list, let `edit` change it, serve it back.
+        fn edited(text: &str, edit: impl FnOnce(&mut toml::Table)) -> String {
+            let mut doc: toml::Table = text.parse().unwrap();
+            edit(&mut doc);
+            toml::to_string(&doc).unwrap()
+        }
+
+        fn set_paths(d: &mut toml::Table, table: &str, value: toml::Value) {
+            d.get_mut(table).unwrap().as_table_mut().unwrap().insert("paths".into(), value);
+        }
+
+        fn merges(f: &Fixture, case: Scenario) {
+            let (code, stdout, stderr) = f.gate(&case);
+            assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+            assert!(stdout.contains("class: auto"), "{stdout}");
+            assert!(!stdout.contains("class: human"), "{stdout}");
+            assert!(!stderr.contains(NO_APPROVAL), "{stderr}");
+        }
+
+        /// Refused as class human with no approval; every `named` string is said.
+        fn operator(f: &Fixture, case: Scenario, named: &[&str]) {
+            let (code, stdout, stderr) = f.gate(&case);
+            assert_eq!(
+                code, 1,
+                "expected the operator to be needed\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            assert!(stdout.contains("class: human"), "{stdout}");
+            let said = format!("{stdout}{stderr}");
+            for text in [NO_APPROVAL].iter().chain(named) {
+                assert!(said.contains(text), "no {text:?}\nstdout: {stdout}\nstderr: {stderr}");
+            }
+            assert!(!stdout.contains("class: auto"), "{stdout}");
+            assert!(!stdout.contains("every rule holds"), "{stdout}");
+        }
+
+        #[test]
+        fn the_real_workflow_auto_paths_file_lists_exactly_src_docs_and_contracts() {
+            let text =
+                std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(AUTO_PATHS))
+                    .unwrap();
+            let doc: toml::Table = text.parse().unwrap();
+            let paths: Vec<&str> = doc["auto"]["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(paths, ["src/**", "docs/**", "contracts/**"]);
+            assert_eq!(doc.len(), 1, "no table but [auto]: {doc:?}");
+            assert_eq!(doc["auto"].as_table().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn with_the_repos_own_lists_served_as_they_are_an_ordinary_pr_merges_as_class_auto() {
+            let f = Fixture::new();
+            for path in ["src/wiki/x.rs", "docs/guides/x.md", "contracts/x.json"] {
+                merges(&f, case_on(&f, f.touch(path), f.base_files()));
+            }
+            // The same real lists still keep the excluded trees with the operator.
+            operator(
+                &f,
+                case_on(&f, f.touch("src/daemon/x.rs"), f.base_files()),
+                &["src/daemon/x.rs"],
+            );
+        }
+
+        #[test]
+        fn ordinary_paths_on_the_list_with_both_reviews_merge_as_class_auto_without_an_approval() {
+            let f = Fixture::new();
+            for path in [
+                "src/wiki/x.rs",
+                "src/cli/notes.rs",
+                "docs/guides/x.md",
+                "docs/y/z/deep.md",
+                "contracts/app-chat/x.json",
+            ] {
+                merges(&f, case_on(&f, f.touch(path), tip_with(&f, AUTO_LIST)));
+            }
+            // All three trees in one diff, and a modify of an existing ordinary file.
+            let head = f.make_head("ordinary-mixed", |d| {
+                put(d, "src/wiki/a.rs", "// a\n");
+                put(d, "docs/guides/b.md", "b\n");
+                put(d, "contracts/c.json", "{}\n");
+                put(d, "src/authz.rs", "changed\n");
+            });
+            merges(&f, case_on(&f, head, tip_with(&f, AUTO_LIST)));
+            // Exactly the size trigger's boundary is still ordinary; one line more is not.
+            let at_limit = f.make_head("limit", |d| put(d, "src/wiki/big.rs", &"x\n".repeat(1500)));
+            merges(&f, case_on(&f, at_limit, tip_with(&f, AUTO_LIST)));
+        }
+
+        #[test]
+        fn a_path_outside_the_listed_trees_still_needs_the_operator_under_the_real_list() {
+            let f = Fixture::new();
+            for path in ["design-plans/x.md", "newtop/x.md", "src2/x.rs", "README.md"] {
+                operator(
+                    &f,
+                    case_on(&f, f.touch(path), tip_with(&f, AUTO_LIST)),
+                    &[OPERATOR, path],
+                );
+            }
+            // An ordinary listed path beside one unlisted path.
+            let head = f.make_head("beside-unlisted", |d| {
+                put(d, "src/wiki/ok.rs", "// ok\n");
+                put(d, "design-plans/x.md", "x\n");
+            });
+            operator(&f, case_on(&f, head, tip_with(&f, AUTO_LIST)), &["design-plans/x.md"]);
+        }
+
+        const NEVER: &[&str] = &[
+            "src/daemon/x.rs",
+            "src/adapter/x.rs",
+            "src/store/x.rs",
+            "src/secret/x.rs",
+            "src/remote_cli.rs",
+            "src/platform/x.rs",
+            "src/bin/x.rs",
+            "src/confine.rs",
+            "src/session.rs",
+            "src/cli/connection.rs",
+            "ui/src/x.tsx",
+        ];
+
+        #[test]
+        fn an_excluded_or_trigger_one_or_three_path_keeps_the_operator_whatever_the_list_says() {
+            let f = Fixture::new();
+            for list in [AUTO_LIST, EVERYTHING] {
+                for path in NEVER {
+                    operator(
+                        &f,
+                        case_on(&f, f.touch(path), tip_with(&f, list)),
+                        &[*path],
+                    );
+                }
+            }
+            // Excluded trees that `src/**` does not even reach, listed by `**` alone.
+            for path in ["agents/x.md", "ui/x.tsx"] {
+                operator(
+                    &f,
+                    case_on(&f, f.touch(path), tip_with(&f, EVERYTHING)),
+                    &[path],
+                );
+            }
+        }
+
+        #[test]
+        fn one_excluded_path_beside_ordinary_ones_keeps_the_operator_for_the_whole_diff() {
+            let f = Fixture::new();
+            for (list, ordinary, never) in [
+                (AUTO_LIST, "src/wiki/ok.rs", "src/daemon/x.rs"),
+                (AUTO_LIST, "docs/guides/ok.md", "src/secret/x.rs"),
+                (AUTO_LIST, "contracts/ok.json", "src/remote_cli.rs"),
+                (EVERYTHING, "docs/guides/ok.md", "ui/src/x.tsx"),
+            ] {
+                let head = f.make_head("mixed-never", |d| {
+                    put(d, ordinary, "// ok\n");
+                    put(d, never, "// never\n");
+                });
+                operator(&f, case_on(&f, head, tip_with(&f, list)), &[never]);
+            }
+        }
+
+        #[test]
+        fn each_of_the_two_never_eligible_lists_holds_on_its_own() {
+            let f = Fixture::new();
+            let files = f.base_files();
+            let one_review = files[ONE_REVIEW].as_str().unwrap().to_string();
+            let risk = files[RISK_PATHS].as_str().unwrap().to_string();
+            // No one-review exclusions at all: the risk-paths trigger 1 and 3 lists alone
+            // keep these with the operator (trigger1 names remote_cli, trigger3 names session).
+            let no_exclude = edited(&one_review, |d| {
+                d.insert("one_review_exclude".into(), toml::Value::Array(vec![]));
+            });
+            for path in ["src/remote_cli.rs", "src/session.rs", "src/secret/x.rs"] {
+                let mut tip = tip_with(&f, AUTO_LIST);
+                tip[ONE_REVIEW] = json!(no_exclude);
+                operator(&f, case_on(&f, f.touch(path), tip), &[path]);
+            }
+            // No trigger 1 or 3 paths at all: the one-review exclusions alone keep these.
+            let no_triggers = edited(&risk, |d| {
+                for t in ["trigger1", "trigger3"] {
+                    set_paths(d, t, toml::Value::Array(vec![]));
+                }
+            });
+            for path in ["src/daemon/x.rs", "src/adapter/x.rs", "src/store/x.rs", "ui/src/x.tsx"] {
+                let mut tip = tip_with(&f, EVERYTHING);
+                tip[RISK_PATHS] = json!(no_triggers);
+                operator(&f, case_on(&f, f.touch(path), tip), &[path]);
+            }
+        }
+
+        #[test]
+        fn an_unreadable_one_review_or_risk_paths_list_at_the_tip_means_the_operator() {
+            let f = Fixture::new();
+            let files = f.base_files();
+            let risk = files[RISK_PATHS].as_str().unwrap().to_string();
+            let head = f.touch("src/wiki/x.rs");
+            let mut broken: Vec<(&str, Value)> = vec![];
+            let mut add = |what: &'static str, path: &str, text: Option<String>| {
+                let mut tip = tip_with(&f, AUTO_LIST);
+                match text {
+                    Some(text) => tip[path] = json!(text),
+                    None => {
+                        tip.as_object_mut().unwrap().remove(path);
+                    }
+                }
+                broken.push((what, tip));
+            };
+            add("one-review missing", ONE_REVIEW, None);
+            add("one-review malformed", ONE_REVIEW, Some("one_review_exclude = [".into()));
+            add("one-review without an exclude list", ONE_REVIEW, Some("one_review_include = [\"src/**\"]\n".into()));
+            add("one-review exclude of the wrong type", ONE_REVIEW, Some("one_review_exclude = [1, 2]\n".into()));
+            add("risk-paths missing", RISK_PATHS, None);
+            add("risk-paths malformed", RISK_PATHS, Some("[trigger1\npaths = ".into()));
+            add(
+                "risk-paths without trigger1",
+                RISK_PATHS,
+                Some(edited(&risk, |d| {
+                    d.remove("trigger1");
+                })),
+            );
+            add(
+                "risk-paths without trigger3",
+                RISK_PATHS,
+                Some(edited(&risk, |d| {
+                    d.remove("trigger3");
+                })),
+            );
+            add(
+                "risk-paths trigger3 of the wrong type",
+                RISK_PATHS,
+                Some(edited(&risk, |d| {
+                    set_paths(d, "trigger3", toml::Value::Array(vec![toml::Value::Integer(1)]));
+                })),
+            );
+            add(
+                "risk-paths trigger1 paths missing",
+                RISK_PATHS,
+                Some(edited(&risk, |d| {
+                    d.get_mut("trigger1").unwrap().as_table_mut().unwrap().remove("paths");
+                })),
+            );
+            for (what, tip) in broken {
+                let (code, stdout, stderr) = f.gate(&case_on(&f, head.clone(), tip));
+                assert_eq!(code, 1, "{what}: must need the operator\nstdout: {stdout}\nstderr: {stderr}");
+                assert!(stdout.contains("class: human"), "{what}: {stdout}");
+                assert!(format!("{stdout}{stderr}").contains(NO_APPROVAL), "{what}: {stdout}{stderr}");
+                assert!(!stdout.contains("class: auto"), "{what}: {stdout}");
+            }
+        }
+
+        #[test]
+        fn a_pr_cannot_loosen_the_one_review_or_risk_lists_by_editing_them_or_by_a_stale_base() {
+            let f = Fixture::new();
+            let files = f.base_files();
+            let loose_one = edited(files[ONE_REVIEW].as_str().unwrap(), |d| {
+                d.insert("one_review_exclude".into(), toml::Value::Array(vec![]));
+            });
+            let loose_risk = edited(files[RISK_PATHS].as_str().unwrap(), |d| {
+                for t in ["trigger1", "trigger3"] {
+                    set_paths(d, t, toml::Value::Array(vec![]));
+                }
+            });
+            let loose = || {
+                let mut v = tip_with(&f, AUTO_LIST);
+                v[ONE_REVIEW] = json!(loose_one);
+                v[RISK_PATHS] = json!(loose_risk);
+                v
+            };
+            for path in ["src/daemon/x.rs", "src/secret/x.rs", "src/remote_cli.rs", "src/store/x.rs"] {
+                // Loose lists only in the PR's own head.
+                let mut case = case_on(&f, f.touch(path), tip_with(&f, AUTO_LIST));
+                case.head_files = Some(loose());
+                operator(&f, case, &[path]);
+                // Loose lists only at a stale base; main's tip is what counts.
+                let mut case = case_on(&f, f.touch(path), tip_with(&f, AUTO_LIST));
+                case.base_files = Some(loose());
+                operator(&f, case, &[path]);
+                // Both, and a wide auto list too.
+                let mut case = case_on(&f, f.touch(path), tip_with(&f, AUTO_LIST));
+                case.base_files = Some(loose());
+                case.head_files = Some({
+                    let mut v = loose();
+                    v[AUTO_PATHS] = json!(EVERYTHING);
+                    v
+                });
+                operator(&f, case, &[path]);
+            }
+            // Good lists at the head and base do not rescue an unreadable tip: no fallback.
+            let mut tip = tip_with(&f, AUTO_LIST);
+            tip.as_object_mut().unwrap().remove(ONE_REVIEW);
+            let mut case = case_on(&f, f.touch("src/wiki/x.rs"), tip);
+            case.base_files = Some(tip_with(&f, AUTO_LIST));
+            case.head_files = Some(tip_with(&f, AUTO_LIST));
+            operator(&f, case, &[]);
+        }
+
+        #[test]
+        fn trigger_list_paths_size_deletes_renames_and_mode_changes_still_need_the_operator() {
+            let f = Fixture::new();
+            for list in [AUTO_LIST, EVERYTHING] {
+                // Risk trigger-list paths (4, 7 and exact names), listed or not.
+                for path in [
+                    "scripts/x.sh",
+                    "tests/x.rs",
+                    "docs/roles/x.md",
+                    "AGENTS.md",
+                    "src/delivery/x.rs",
+                    "src/audit/x.rs",
+                ] {
+                    operator(
+                        &f,
+                        case_on(&f, f.touch(path), tip_with(&f, list)),
+                        &[path],
+                    );
+                }
+                // More than 1500 changed lines.
+                let big = f.make_head("big", |d| put(d, "src/wiki/big.rs", &"x\n".repeat(1501)));
+                operator(&f, case_on(&f, big, tip_with(&f, list)), &["1501 changed lines"]);
+                // A delete, a rename, a mode change, an executable add, a symlink.
+                let heads = [
+                    f.make_head("c2254-delete", |d| {
+                        std::fs::remove_file(d.join("src/authz.rs")).unwrap()
+                    }),
+                    f.make_head("c2254-rename", |d| {
+                        std::fs::rename(d.join("src/authz.rs"), d.join("src/authz_moved.rs"))
+                            .unwrap()
+                    }),
+                    f.make_head("c2254-chmod", |d| {
+                        std::fs::set_permissions(
+                            d.join("src/authz.rs"),
+                            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                        )
+                        .unwrap();
+                    }),
+                    f.make_head("c2254-exec", |d| {
+                        put(d, "src/wiki/run.rs", "x\n");
+                        std::fs::set_permissions(
+                            d.join("src/wiki/run.rs"),
+                            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                        )
+                        .unwrap();
+                    }),
+                    f.make_head("c2254-symlink", |d| {
+                        std::os::unix::fs::symlink("x.rs", d.join("src/wiki_link.rs")).unwrap()
+                    }),
+                ];
+                for head in heads {
+                    operator(&f, case_on(&f, head, tip_with(&f, list)), &[OPERATOR]);
+                }
+            }
+        }
+
+        #[test]
+        fn a_verdict_whose_risk_is_not_auto_still_needs_the_operator_on_an_ordinary_path() {
+            let f = Fixture::new();
+            let mut risky = f.std();
+            risky["risk"] = json!("human");
+            let mut case = case_on(&f, f.touch("src/wiki/x.rs"), tip_with(&f, AUTO_LIST));
+            case.rows = vec![risky, f.spec()];
+            operator(&f, case, &["Risk 'human'"]);
+        }
+
+        #[test]
+        fn a_workflow_review_that_is_not_a_pass_still_refuses_on_an_ordinary_path() {
+            let f = Fixture::new();
+            for kind in ["std", "spec"] {
+                let mut revise = if kind == "std" { f.std() } else { f.spec() };
+                revise["outcome"] = json!("revise");
+                revise["section_outcome"] = json!("revise");
+                let rows = if kind == "std" { vec![revise, f.spec()] } else { vec![f.std(), revise] };
+                let mut case = case_on(&f, f.touch("src/wiki/x.rs"), tip_with(&f, AUTO_LIST));
+                case.rows = rows;
+                let (code, stdout, stderr) = f.gate(&case);
+                assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+                assert!(format!("{stdout}{stderr}").contains("is not a pass"), "{stdout}{stderr}");
+                assert!(!stdout.contains("every rule holds"), "{stdout}");
+            }
+            // One review alone is still not two.
+            let mut case = case_on(&f, f.touch("src/wiki/x.rs"), tip_with(&f, AUTO_LIST));
+            case.rows = vec![f.std()];
+            let (code, stdout, stderr) = f.gate(&case);
+            assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+            assert!(format!("{stdout}{stderr}").contains("no pass Spec/security verdict"));
+        }
+
+        #[test]
+        fn a_path_that_matches_no_one_review_include_glob_is_not_touched_by_the_new_rule() {
+            let f = Fixture::new();
+            // design-plans/** is on neither the one-review include list nor the exclude
+            // list. When main's list names it, it merges, alone or beside an ordinary path.
+            let list = "[auto]\npaths = [\"design-plans/**\", \"src/**\"]\n";
+            merges(&f, case_on(&f, f.touch("design-plans/p/new.md"), tip_with(&f, list)));
+            let head = f.make_head("plans-and-src", |d| {
+                put(d, "design-plans/p/n.md", "x\n");
+                put(d, "src/wiki/x.rs", "// x\n");
+            });
+            merges(&f, case_on(&f, head, tip_with(&f, list)));
+            // And the same path is not eligible when the list does not name it.
+            operator(
+                &f,
+                case_on(&f, f.touch("design-plans/p/new.md"), tip_with(&f, AUTO_LIST)),
+                &[OPERATOR],
+            );
+        }
+    }
 }
 
 // CAD-2009: independently authored by the ticket author; implementers must not edit.
