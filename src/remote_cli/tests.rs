@@ -247,6 +247,150 @@ fn timeline_on_an_older_board_is_a_release_order_refusal() {
     assert!(timeline_board_too_old("project_ls", 501, None, &args(false)).is_none());
 }
 
+/// CAD-2260. The statuses and codes are the ones the tenant board gives in
+/// agenticos-v2 `apps/api/src/tenant-board/cli.ts` (`tenantWikiCall`): a
+/// `write` carrying `transfer` fails the argument check, `job_status` is not
+/// implemented, and a `read` of a missing path is `404 not_found`.
+#[test]
+fn wiki_cp_on_a_board_without_transfers_names_the_limit_and_what_works() {
+    use super::wiki_copy_unserved;
+    let transfer = |op: &str| {
+        let mut m = serde_json::Map::new();
+        m.insert("path".into(), json!("projects/demo/notes"));
+        m.insert("transfer".into(), json!({ "op": op }));
+        m
+    };
+    for (verb, op, status, code) in [
+        // local → wiki, into a new or an existing folder
+        ("write", "begin", 400, Some("invalid_request")),
+        // wiki → local
+        ("job_status", "export", 501, Some("not_implemented")),
+        // --resume and --wait-index
+        ("job_status", "status", 501, Some("not_implemented")),
+    ] {
+        let error = wiki_copy_unserved(verb, status, code, &transfer(op)).unwrap();
+        let text = error.to_string();
+        assert_eq!(error.code(), Some("not_implemented"), "{text}");
+        assert_eq!(error.kind(), "rejected", "{text}");
+        assert!(text.contains("does not serve `wiki cp`"), "{text}");
+        assert!(
+            text.contains("wiki put") && text.contains("wiki upload"),
+            "{text}"
+        );
+        assert!(text.contains(&status.to_string()), "{text}");
+        assert!(
+            !text.contains("unknown") && !text.contains("retry"),
+            "a healthy board must not read as an outage or an unrecognised refusal: {text}"
+        );
+    }
+    // A board that serves transfers answers 400 to a bad chunk: its own refusal.
+    assert!(
+        wiki_copy_unserved("write", 400, Some("invalid_request"), &transfer("chunk")).is_none()
+    );
+    // A text `wiki put` carries no transfer and keeps its own refusals.
+    let mut put = serde_json::Map::new();
+    put.insert("path".into(), json!("projects/demo/notes/a.md"));
+    put.insert("text".into(), json!("hello"));
+    assert!(wiki_copy_unserved("write", 400, Some("invalid_request"), &put).is_none());
+    assert!(wiki_copy_unserved("write", 501, Some("not_implemented"), &put).is_none());
+}
+
+#[test]
+fn a_missing_wiki_page_on_a_hosted_board_is_named_by_code() {
+    let error = message_family_refusal("read", 404, Some("not_found"), reject("generic"));
+    assert_eq!(error.code(), Some("not_found"));
+    let text = error.to_string();
+    assert!(text.contains("no page at that path"), "{text}");
+    assert!(!text.contains("generic"), "{text}");
+    // Another verb's 404 keeps the decoded refusal.
+    let other = message_family_refusal("enumerate", 404, Some("not_found"), reject("generic"));
+    assert!(other.to_string().contains("generic"));
+}
+
+/// CAD-2260: one wiki call against a fake board that answers every
+/// `/__platform/wiki/call` in the body shape the tenant board's `fail()` writes.
+/// Returns the refusal and the request paths the board saw.
+fn wiki_call_refused(
+    status_line: &'static str,
+    code: &'static str,
+    verb: &str,
+    args: Value,
+) -> (Error, Vec<String>) {
+    let (listener, paths, server) = upload_deadline_worker(move |path, socket, _raw| {
+        if path == "/__platform/wiki/authorize" {
+            upload_authorize_answer(socket);
+        } else {
+            write_answer(
+                socket,
+                status_line,
+                "",
+                &json!({"ok": false, "error": {
+                    "code": code, "message": "Tenant remote call refused."}}),
+            );
+        }
+    });
+    let (target, _root, dir) = credentialed(&listener);
+    let out = call_verb_in(
+        &target,
+        verb,
+        args.as_object().unwrap().clone(),
+        5,
+        &dir,
+        |_| {},
+        |_| {},
+    );
+    server.join().unwrap();
+    let seen = paths.lock().unwrap().clone();
+    (out.unwrap_err(), seen)
+}
+
+/// CAD-2260, through the request path: the requests `wiki cp` sends to a board
+/// without transfers each come back as one clear refusal, sent once.
+#[test]
+fn wiki_cp_against_a_board_without_transfers_is_one_clear_refusal_sent_once() {
+    let manifest = json!({"version": 1, "source_id": "local:demo",
+        "root": "projects/demo/notes", "entries": []});
+    for (verb, args, status_line, code) in [
+        (
+            "write",
+            json!({"path": "projects/demo/notes",
+                "transfer": {"op": "begin", "job_id": "job-1", "manifest": manifest}}),
+            "400 Bad Request",
+            "invalid_request",
+        ),
+        (
+            "job_status",
+            json!({"path": "projects/demo/notes/a.md",
+                "transfer": {"op": "export", "path": "projects/demo/notes/a.md"}}),
+            "501 Not Implemented",
+            "not_implemented",
+        ),
+    ] {
+        let (error, seen) = wiki_call_refused(status_line, code, verb, args);
+        let text = error.to_string();
+        assert_eq!(error.code(), Some("not_implemented"), "{verb}: {text}");
+        assert!(text.contains("does not serve `wiki cp`"), "{verb}: {text}");
+        assert!(
+            !text.contains("unknown") && !text.contains("retry"),
+            "{verb}: {text}"
+        );
+        assert!(!text.contains("Tenant remote call"), "{verb}: {text}");
+        assert_eq!(
+            seen,
+            ["/__platform/wiki/authorize", "/__platform/wiki/call"],
+            "{verb}: one request, never replayed"
+        );
+    }
+    // The discovery read of a destination that does not exist yet.
+    let (error, _) = wiki_call_refused(
+        "404 Not Found",
+        "not_found",
+        "read",
+        json!({"path": "projects/demo/notes", "offset": 0, "bytes": 0}),
+    );
+    assert_eq!(error.code(), Some("not_found"), "{error}");
+}
+
 #[test]
 fn project_verbs_are_a_registered_read_and_owner_write() {
     // CAD-1999: the client refuses a verb missing from REMOTE_VERBS before a

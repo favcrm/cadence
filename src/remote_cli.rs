@@ -4489,6 +4489,13 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
              agent, service or ordinary-member credential cannot register \
              workspace structure",
         )),
+        // CAD-2260: the tenant board answers a wiki `read` of a missing path
+        // with `404 not_found`. The code is what `wiki cp` reads as "the
+        // destination is new".
+        ("read", Some("not_found")) => Some((
+            "not_found",
+            "this workspace's wiki has no page at that path for this login; nothing was read",
+        )),
         ("project_new", Some("invalid_request")) => Some((
             "invalid_request",
             "the project was refused at the request boundary — the key must be \
@@ -5331,6 +5338,43 @@ fn timeline_board_too_old(
     ))
 }
 
+/// CAD-2260: a hosted tenant board serves the wiki's text `write`, `read` and
+/// `enumerate`, but not the `wiki cp` transfer operations (CAD-914). It answers
+/// `job_status` with `501 not_implemented`, and refuses a `write` that carries
+/// `transfer` at its argument check with `400 invalid_request`. Neither is an
+/// outage or a mistake in the command, so say the board does not serve the
+/// copy and name the verbs it does serve. A board that serves transfers also
+/// answers 400 to a bad chunk or receipt, so a 400 only counts on `begin`,
+/// whose manifest this client checked before sending it.
+fn wiki_copy_unserved(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    arguments: &Map<String, Value>,
+) -> Option<Error> {
+    let op = arguments
+        .get("transfer")
+        .and_then(|transfer| transfer.get("op"))
+        .and_then(Value::as_str)?;
+    if !matches!(verb, "write" | "job_status") {
+        return None;
+    }
+    let refused_shape =
+        status == 400 && matches!(code, Some("invalid_request" | "unknown_verb")) && op == "begin";
+    if status != 501 && !refused_shape {
+        return None;
+    }
+    Some(Error::invalid(
+        "not_implemented",
+        format!(
+            "this workspace's board does not serve `wiki cp` (HTTP {status}{}). Copy one page \
+             at a time instead: `wiki put <path> --file <file>` writes a text page, `wiki \
+             upload` sends a binary file and `wiki cat` reads a page. Nothing was copied",
+            code.map_or(String::new(), |c| format!(", {c}"))
+        ),
+    ))
+}
+
 /// Whether a ticket message write's 2xx names the write that was asked for.
 /// The ticket id can come back in its stored case.
 fn ticket_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String, Value>) -> bool {
@@ -5907,6 +5951,9 @@ fn call_verb_until_retry(
         if let Some(why) = timeline_board_too_old(verb, status, refusal_code.as_deref(), &arguments)
         {
             return Err(reject(why));
+        }
+        if let Some(error) = wiki_copy_unserved(verb, status, refusal_code.as_deref(), &arguments) {
+            return Err(error);
         }
         let platform_details = if platform_outcome_unknown {
             platform_error_details(body.as_ref())
