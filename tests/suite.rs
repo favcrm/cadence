@@ -4083,8 +4083,9 @@ mod cad2081_workflow_verdicts {
     mod cad2254 {
         use super::*;
 
-        /// The post-change list text, served explicitly so the cases below do not depend
-        /// on the checkout (one test pins the real file to it).
+        /// A wide list (three directory globs), served explicitly: the never-eligible guard
+        /// must hold even under a list this wide. The real list is narrower (the delegable
+        /// set); one test pins it, and the tests that serve `base_files()` use it as it is.
         const AUTO_LIST: &str = "[auto]\npaths = [\"src/**\", \"docs/**\", \"contracts/**\"]\n";
         const EVERYTHING: &str = "[auto]\npaths = [\"**\"]\n";
 
@@ -4140,34 +4141,86 @@ mod cad2081_workflow_verdicts {
         }
 
         #[test]
-        fn the_real_workflow_auto_paths_file_lists_exactly_src_docs_and_contracts() {
-            let text =
-                std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(AUTO_PATHS))
-                    .unwrap();
-            let doc: toml::Table = text.parse().unwrap();
-            let paths: Vec<&str> = doc["auto"]["paths"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap())
-                .collect();
-            assert_eq!(paths, ["src/**", "docs/**", "contracts/**"]);
-            assert_eq!(doc.len(), 1, "no table but [auto]: {doc:?}");
-            assert_eq!(doc["auto"].as_table().unwrap().len(), 1);
+        fn the_real_workflow_auto_paths_file_is_exactly_the_delegable_set_and_crosses_no_src_glob() {
+            let read = |path: &str| -> toml::Table {
+                std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            };
+            let paths = |doc: &toml::Table, table: &str| -> Vec<String> {
+                doc[table]["paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect()
+            };
+            let auto_doc = read(AUTO_PATHS);
+            let auto = paths(&auto_doc, "auto");
+            let delegable = paths(&read(RISK_PATHS), "delegable");
+            // Same entries, so the two lists cannot drift apart.
+            let sorted = |mut v: Vec<String>| {
+                v.sort();
+                v
+            };
+            assert_eq!(sorted(auto.clone()), sorted(delegable));
+            assert!(!auto.is_empty());
+            assert_eq!(auto_doc.len(), 1, "no table but [auto]: {auto_doc:?}");
+            assert_eq!(auto_doc["auto"].as_table().unwrap().len(), 1);
+            // No glob that reaches across src/: no `**`, no `src/**`, no `src/*` directory glob.
+            for glob in &auto {
+                assert_ne!(glob, "**", "{auto:?}");
+                assert!(
+                    !glob.starts_with("**") && !glob.starts_with("src/**") && !glob.starts_with("*"),
+                    "{glob} crosses src/"
+                );
+                if glob.starts_with("src/") {
+                    assert!(
+                        glob.ends_with(".rs") && !glob.contains('*'),
+                        "a src/ entry must name one file: {glob}"
+                    );
+                }
+            }
         }
 
         #[test]
-        fn with_the_repos_own_lists_served_as_they_are_an_ordinary_pr_merges_as_class_auto() {
+        fn with_the_repos_own_lists_served_as_they_are_only_delegable_and_docs_paths_merge_as_class_auto() {
             let f = Fixture::new();
-            for path in ["src/wiki/x.rs", "docs/guides/x.md", "contracts/x.json"] {
+            for path in [
+                "src/issue/blocked.rs",
+                "src/cli/issue.rs",
+                "docs/guides/x.md",
+            ] {
                 merges(&f, case_on(&f, f.touch(path), f.base_files()));
             }
-            // The same real lists still keep the excluded trees with the operator.
-            operator(
-                &f,
-                case_on(&f, f.touch("src/daemon/x.rs"), f.base_files()),
-                &["src/daemon/x.rs"],
-            );
+            // Two delegable files and a docs file in one diff.
+            let head = f.make_head("delegable-mixed", |d| {
+                put(d, "src/issue/lint.rs", "// x\n");
+                put(d, "src/cli/help.rs", "// x\n");
+                put(d, "docs/guides/y.md", "y\n");
+            });
+            merges(&f, case_on(&f, head, f.base_files()));
+            // The tree a directory glob would have opened stays with the operator: files
+            // no list classifies but that are plainly not ordinary.
+            for path in [
+                "src/upgrade/trusted_root.jsonl",
+                "src/protected_runtime/keys.rs",
+                "src/rollout_gate.rs",
+                "src/cli/client_update.rs",
+                "src/wiki/x.rs",
+                "contracts/x.json",
+                "src/daemon/x.rs",
+                "src/issue/other.rs",
+            ] {
+                operator(&f, case_on(&f, f.touch(path), f.base_files()), &[path]);
+            }
+            // One delegable file does not carry a non-delegable one beside it.
+            let head = f.make_head("delegable-beside", |d| {
+                put(d, "src/issue/blocked.rs", "// x\n");
+                put(d, "src/wiki/x.rs", "// x\n");
+            });
+            operator(&f, case_on(&f, head, f.base_files()), &["src/wiki/x.rs"]);
         }
 
         #[test]
@@ -4207,7 +4260,7 @@ mod cad2081_workflow_verdicts {
         }
 
         #[test]
-        fn a_path_outside_the_listed_trees_still_needs_the_operator_under_the_real_list() {
+        fn a_path_outside_the_listed_trees_still_needs_the_operator_under_the_three_glob_list() {
             let f = Fixture::new();
             for path in ["design-plans/x.md", "newtop/x.md", "src2/x.rs", "README.md"] {
                 operator(
