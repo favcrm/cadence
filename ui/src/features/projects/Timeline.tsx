@@ -94,13 +94,6 @@ export default function Timeline({ project, hosted, onOpenIssue, browseHref }: {
       <Link className="project-action" href={browseHref}>{t("Browse issues")} <span aria-hidden>↗</span></Link>
     </header>
 
-    {page.status === "loading" && <div className="card px-4 py-5 text-secondary text-ink-400" role="status">{t("Reading the timeline…")}</div>}
-    {page.status === "failed" && <div className="card px-4 py-5 text-secondary text-fail border-fail/40 flex flex-wrap items-center gap-3" role="alert">
-      <span className="min-w-0">{t("The timeline could not be loaded")} — {page.error}</span>
-      <button onClick={() => setAttempt((n) => n + 1)} className="chip bg-fail/10 text-fail hover:bg-fail/20 transition-colors ml-auto">{t("retry")}</button>
-    </div>}
-    {page.status === "unavailable" && <p className="card px-4 py-5 text-secondary text-ink-400" role="note">{t("The timeline is not available on this board yet.")}</p>}
-
     {page.status !== "unavailable" && <div className="tl-filters" role="group" aria-label={t("Filter the timeline")}>
       <span className="tl-kinds">
         <button className="chip chip-btn chip-sans" aria-pressed={kind === "all"} onClick={() => setKind("all")}>{t("All")}</button>
@@ -108,6 +101,13 @@ export default function Timeline({ project, hosted, onOpenIssue, browseHref }: {
       </span>
       <button className="chip chip-btn chip-sans tl-open" aria-pressed={openOnly} onClick={() => setOpenOnly(!openOnly)}>{t("Still open only")}</button>
     </div>}
+
+    {page.status === "loading" && <div className="card px-4 py-5 text-secondary text-ink-400" role="status">{t("Reading the timeline…")}</div>}
+    {page.status === "failed" && <div className="card px-4 py-5 text-secondary text-fail border-fail/40 flex flex-wrap items-center gap-3" role="alert">
+      <span className="min-w-0">{t("The timeline could not be loaded")} — {page.error}</span>
+      <button onClick={() => setAttempt((n) => n + 1)} className="chip bg-fail/10 text-fail hover:bg-fail/20 transition-colors ml-auto">{t("retry")}</button>
+    </div>}
+    {page.status === "unavailable" && <p className="card px-4 py-5 text-secondary text-ink-400" role="note">{t("The timeline is not available on this board yet.")}</p>}
 
     {page.status === "ok" && <div aria-busy={busy}>
       <p ref={statusLine} tabIndex={-1} className="text-micro text-ink-500 mb-2" role="status">
