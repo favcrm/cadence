@@ -5303,6 +5303,34 @@ fn profile_board_too_old(verb: &str, status: u16) -> Option<Error> {
     ))
 }
 
+/// CAD-2240: a board that predates `project_timeline` answers `501
+/// not_implemented`; an older control relay rejects the unknown verb name as
+/// `400 invalid_request`/`unknown_verb`. Both are a release-order problem, not
+/// an outage. A current board also answers 400 to a bad cursor, so a 400 only
+/// counts when no `--before` was sent; the client validates the key and kinds
+/// locally so nothing else can make a current board answer 400.
+fn timeline_board_too_old(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    arguments: &Map<String, Value>,
+) -> Option<String> {
+    if verb != "project_timeline" {
+        return None;
+    }
+    let unknown_verb = status == 400
+        && matches!(code, Some("invalid_request" | "unknown_verb"))
+        && !arguments.contains_key("before");
+    if status != 501 && !unknown_verb {
+        return None;
+    }
+    Some(format!(
+        "this board cannot serve the project timeline yet (HTTP {status}{}) — update the board \
+         first, then use this client. Nothing was read",
+        code.map_or(String::new(), |c| format!(", {c}"))
+    ))
+}
+
 /// Whether a ticket message write's 2xx names the write that was asked for.
 /// The ticket id can come back in its stored case.
 fn ticket_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String, Value>) -> bool {
@@ -5875,6 +5903,10 @@ fn call_verb_until_retry(
         // update it, not that coordination is unavailable.
         if let Some(error) = profile_board_too_old(verb, status) {
             return Err(error);
+        }
+        if let Some(why) = timeline_board_too_old(verb, status, refusal_code.as_deref(), &arguments)
+        {
+            return Err(reject(why));
         }
         let platform_details = if platform_outcome_unknown {
             platform_error_details(body.as_ref())

@@ -1,4 +1,4 @@
-import { entryChange, entryLabel, groupByDay, kindCounts, localDay } from "../src/features/projects/timeline";
+import { FILTER_KINDS, entryChange, entryLabel, groupByDay, localDay } from "../src/features/projects/timeline";
 import type { TimelineEvent } from "../src/lib/types";
 
 // Shaped like agenticos-v2's `project-timeline.contract.json` (hosted-cadence-project-timeline.v1).
@@ -16,8 +16,7 @@ const events = [
 
 const fail = (message: string) => { throw new Error(message); };
 
-const counts = kindCounts(events);
-if (counts.status !== 2 || counts.owner !== 1 || counts.message !== 1 || counts.review !== 0) fail("kind counts cover the loaded entries");
+if (FILTER_KINDS.some((k) => k.kind === "claim") || FILTER_KINDS.length !== 6) fail("the chips are the six recorded kinds, no Claim");
 
 if (entryLabel(events[1]) !== "Landed" || entryLabel(events[2]) !== "Status") fail("only a landed status event reads Landed");
 const change = entryChange(events[2]);

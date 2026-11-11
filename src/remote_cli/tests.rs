@@ -203,6 +203,51 @@ fn audit_reviewers_set_is_a_registered_owner_write() {
 }
 
 #[test]
+fn timeline_on_an_older_board_is_a_release_order_refusal() {
+    use super::timeline_board_too_old;
+    let args = |before: bool| {
+        let mut m = serde_json::Map::new();
+        m.insert("project".into(), serde_json::json!("atlas"));
+        if before {
+            m.insert("before".into(), serde_json::json!("cursor"));
+        }
+        m
+    };
+    let old = timeline_board_too_old(
+        "project_timeline",
+        501,
+        Some("not_implemented"),
+        &args(false),
+    )
+    .unwrap();
+    assert!(
+        old.contains("cannot serve the project timeline yet"),
+        "{old}"
+    );
+    assert!(old.contains("501") && !old.contains("retry"), "{old}");
+    let relay = timeline_board_too_old(
+        "project_timeline",
+        400,
+        Some("invalid_request"),
+        &args(false),
+    )
+    .unwrap();
+    assert!(
+        relay.contains("cannot serve the project timeline yet"),
+        "{relay}"
+    );
+    // A bad cursor is a real 400 from a current board; other verbs are untouched.
+    assert!(timeline_board_too_old(
+        "project_timeline",
+        400,
+        Some("invalid_request"),
+        &args(true)
+    )
+    .is_none());
+    assert!(timeline_board_too_old("project_ls", 501, None, &args(false)).is_none());
+}
+
+#[test]
 fn project_verbs_are_a_registered_read_and_owner_write() {
     // CAD-1999: the client refuses a verb missing from REMOTE_VERBS before a
     // request exists, so the registry read and the owner write must both be

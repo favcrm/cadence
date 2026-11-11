@@ -1311,6 +1311,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
         {route.screen === "projects" && route.slug && route.section === "timeline" && hosted !== undefined && (
           <Timeline
+            key={route.slug}
             project={route.slug}
             hosted={hosted}
             onOpenIssue={openIssue}

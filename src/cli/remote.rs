@@ -856,6 +856,17 @@ fn verb_for(
                         },
                 },
         } => {
+            let key_ok = key.len() <= 32
+                && key.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !key_ok {
+                return Err(Error::rejected(format!(
+                    "'{key}' is not a project key (lower-case letters, digits and hyphens, \
+                     at most 32) — nothing was sent"
+                )));
+            }
             args.insert("project".into(), json!(key));
             if let Some(n) = limit {
                 if !(1..=100).contains(n) {
@@ -875,7 +886,13 @@ fn verb_for(
                 )));
             }
             if !kinds.is_empty() {
-                args.insert("kinds".into(), json!(kinds));
+                let mut unique: Vec<&String> = Vec::new();
+                for kind in kinds {
+                    if !unique.contains(&kind) {
+                        unique.push(kind);
+                    }
+                }
+                args.insert("kinds".into(), json!(unique));
             }
             if let Some(spec) = since {
                 let at = cadence_agent::filter::parse_time(
@@ -5720,6 +5737,8 @@ mod read_contract_tests {
             .unwrap_err()
             .contains("--kind"));
         assert!(timeline(vec![], Some(101)).unwrap_err().contains("--limit"));
+        let (_, args) = timeline(vec!["status".into(), "status".into()], None).unwrap();
+        assert_eq!(args["kinds"], json!(["status"]));
 
         let err = outcome(&Commands::Issue {
             action: IssueAction::Project {

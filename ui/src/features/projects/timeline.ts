@@ -11,12 +11,9 @@ export const TIMELINE_KINDS: { kind: TimelineKind; label: string }[] = [
   { kind: "review", label: "Review" },
 ];
 
-/** Counts over the entries loaded so far, one per kind. */
-export function kindCounts(events: readonly TimelineEvent[]): Record<TimelineKind, number> {
-  const counts = Object.fromEntries(TIMELINE_KINDS.map((k) => [k.kind, 0])) as Record<TimelineKind, number>;
-  for (const event of events) counts[event.kind] += 1;
-  return counts;
-}
+/** The kind chips. No Claim chip: boards record no claim events yet (agenticos-v2#1945);
+ *  add it when they do. A claim entry that does arrive still renders under All. */
+export const FILTER_KINDS = TIMELINE_KINDS.filter((k) => k.kind !== "claim");
 
 /** The kind label shown on an entry; a status event that landed work reads "Landed". */
 export function entryLabel(event: TimelineEvent): string {
