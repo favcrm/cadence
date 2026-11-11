@@ -1,22 +1,49 @@
 # CAD-2081: the ONLY paths a workflow-issued review may carry to merge without the
 # operator. A PR with any workflow-issued verdict row needs the operator's approval
 # unless EVERY changed path matches `paths` below and every change is a plain add
-# or modify (mode 100644). The list is EMPTY, so today the operator approves every
-# merge and workflow rows only satisfy the two reviews. An empty list is valid, not
-# an error. `scripts/enqueue-reviewed` reads this file at the live tip of `main`;
-# a missing or unreadable file also means the operator. Turning a path on later is
-# one reviewed line and a deliberate decision, made only after reading what the
-# path holds: a workflow review can say `risk: auto` and a prompt-injected model can
+# or modify (mode 100644). An empty list is valid and means the operator approves
+# every merge. `scripts/enqueue-reviewed` reads this file at the live tip of `main`;
+# a missing or unreadable file also means the operator. Adding a path is one
+# reviewed line and a deliberate decision, made only after reading what the path
+# holds: a workflow review can say `risk: auto` and a prompt-injected model can
 # write that, so the safe default for a path nobody has classified is the operator.
 # It does not widen anything for owner-attested reviews, the size trigger, or a
 # verdict whose Risk is not `auto`.
 #
-# Whatever `paths` says, the script never treats as eligible a path with a segment
-# starting with `.` (.github, .claude, .gitattributes) or a basename starting
-# `agents.`, `claude.` or `gemini.` in any directory (they can load as agent
-# instructions), and a modify must keep mode 100644.
+# Whatever `paths` says, the script never treats as eligible:
+# - a path with a segment starting with `.` (.github, .claude, .gitattributes) or a
+#   basename starting `agents.`, `claude.` or `gemini.` in any directory (they can
+#   load as agent instructions; compared casefolded), and a modify must keep mode
+#   100644;
+# - a path that `one-review-paths.toml` excludes or that is on `risk-paths.toml`
+#   trigger 1 or 3: the trust-boundary, identity, secret and UI trees (CAD-2254).
+#   If either of those lists cannot be read, every path needs the operator;
+# - a path that is not itself protected but matches a human-class or never-eligible
+#   path once case is ignored (`docs/Roles/x.md`): a case-insensitive checkout puts
+#   it in the protected directory (CAD-2254).
+# The human-class path and size triggers apply as before, so the list does not cover
+# `docs/roles/**` or any other trigger-list path inside `docs/`.
+#
+# CAD-2254 (after the operator's 2026-11-03 decision on CAD-2081 that ordinary PRs may
+# merge without a person): Markdown documentation only. No code is listed. The path
+# lists are not a complete map of sensitive code, so a glob over `src/` would cover
+# unclassified files such as the upgrade trust root, the installer and the rollout
+# gates; and the `[delegable]` client files run with the operator's authority, where
+# the recorded safeguard is a reviewer who flags a new RPC call (docs/AUDIT.md), which
+# a workflow review is not told to do. Other file types under `docs/` stay with the
+# operator. Widen this one tree at a time, after reading the tree.
+#
+# Limit: many of these documents are procedures agents and people follow, and a
+# change to one now merges on two workflow reviews. They include docs/DEV-CYCLE.md
+# (the approval handoff), docs/RELEASING.md and docs/guides/rollout-checklist.md
+# (production handover), docs/INSTALL-AGENT.md (the install and attestation
+# commands), docs/REMOTE-AUTH.md, docs/guides/hosted-workspace.md,
+# docs/CLEAN-INSTALL.md, docs/FIRST-RUN.md, docs/CI-DELIVERY.md,
+# docs/REVIEW-EVIDENCE.md and docs/TRUSTED-TEAM-ACTIVITY.md. Rule 7's "any change
+# to who approves what" is enforced for them only by the review's Risk line. Moving
+# one to the operator means adding it to risk-paths.toml trigger 7.
 #
 # Changing this file is class `human` (risk-classes.md trigger 7).
 
 [auto]
-paths = []
+paths = ["docs/**/*.md"]
