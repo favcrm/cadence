@@ -1,4 +1,5 @@
 import type { LanePayload } from "../features/issues/lane";
+import { sendMasterMessageViaSocket } from "./boardSocket";
 import { ConditionalGet } from "./conditionalGet";
 import { ApiError, errorMessage } from "./apiError";
 import { sessionKey, sessionHeaders } from "./sessionKey";
@@ -763,7 +764,7 @@ export const api = {
    *  authority: the contextual Threads reply pins the recorded sender it
    *  is answering, and the daemon refuses before any side effect when
    *  the alias now names a different uid. Ordinary sends omit it. */
-  threadSend: (
+  threadSend: async (
     alias: string,
     text: string,
     message: string,
@@ -774,24 +775,38 @@ export const api = {
     operation?: PrivateOperation,
     mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
     expectedRecipientUid?: string,
-  ) =>
-    post<Record<string, unknown>>(
+  ): Promise<Record<string, unknown>> => {
+    const payload: Record<string, unknown> = {
+      text,
+      message,
+      ...(refs && refs.length > 0 ? { refs } : {}),
+      ...(app ? { app } : {}),
+      // CAD-1098: only a selector; the daemon resolves scope, subject and install.
+      ...(conversation ? { conversation } : {}),
+      // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
+      // grammar and existence, never the client's metadata.
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
+      ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
+      ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
+    };
+    const hasNativeOnlyContext =
+      (refs !== undefined && refs.length > 0) ||
+      (mediaRefs !== undefined && mediaRefs.length > 0) ||
+      Boolean(expectedRecipientUid);
+    if (alias === "master" && !hasNativeOnlyContext) {
+      const viaSocket = await sendMasterMessageViaSocket<Record<string, unknown>>(
+        alias,
+        payload,
+        operation,
+      );
+      if (viaSocket.handled) return viaSocket.value;
+    }
+    return post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
-      {
-        text,
-        message,
-        ...(refs && refs.length > 0 ? { refs } : {}),
-        ...(app ? { app } : {}),
-        // CAD-1098: only a selector; the daemon resolves scope, subject and install.
-        ...(conversation ? { conversation } : {}),
-        // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
-        // grammar and existence, never the client's metadata.
-        ...(attachments && attachments.length > 0 ? { attachments } : {}),
-        ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
-        ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
-      },
+      payload,
       operation,
-    ),
+    );
+  },
   /** `POST /api/chat/upload` — one retained chat attachment (CAD-1168).
    *  Operator-only multipart; returns the native daemon row or the hosted receipt. `signal`
    *  aborts only this upload's transport (a canceled row's late answer
