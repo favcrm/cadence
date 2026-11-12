@@ -132,6 +132,17 @@ async function main() {
     assert(!uploads(view.host), "myWork/assigned: Evidence still offers no upload");
     await view.done();
   }
+  {
+    const view = await render({
+      origin: "myWork",
+      myWork: myWork("assigned"),
+      writeBlock: "This project is archived — restore it before changing its work.",
+    });
+    const textarea = view.host.querySelector("textarea") as HTMLTextAreaElement | null;
+    assert(textarea?.disabled, "myWork/archived: the bounded comment write is disabled");
+    assert(view.host.textContent?.includes("This project is archived"), "myWork/archived: the reason is shown");
+    await view.done();
+  }
 
   console.log("work-item evidence checks passed");
 }

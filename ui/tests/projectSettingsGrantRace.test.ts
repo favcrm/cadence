@@ -70,6 +70,21 @@ async function main() {
       return await rosterDeferred.promise;
     }
     if (url.pathname === "/api/projects/sample/policy" && method === "GET") return json(policy);
+    // CAD-2255: the settings page reads the project's archive state before it
+    // offers policy mutation; an active receipt keeps this policy test valid.
+    if (url.pathname === "/api/projects/sample/lifecycle" && method === "GET") {
+      return json({
+        archive_capability: "cad2255.project-archive.v1",
+        project: "sample",
+        archived: false,
+        revision: 0,
+        archived_at: null,
+        archived_by: null,
+        changed_at: null,
+        changed_by: null,
+        blockers: [],
+      });
+    }
     if (url.pathname === "/api/projects/sample/policy" && method === "PUT") {
       sent = JSON.parse(String(init?.body));
       return await writeDeferred.promise;

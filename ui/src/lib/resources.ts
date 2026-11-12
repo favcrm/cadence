@@ -38,6 +38,12 @@ let connectionsListPartial = false;
 const unavailablePrivateRecord = (error: unknown) => error instanceof ApiError &&
   (error.status === 401 || error.status === 403 || error.status === 404);
 
+/** CAD-2255: statuses with which a server answers that it does not serve the
+ *  archive routes. The status rides along: only an explicit 501 proves the
+ *  capability absent — a 404 is an unanswered route (older server, another
+ *  gate, or a project this caller cannot see) and stays unknown. */
+const ARCHIVE_UNSERVED = new Set([404, 501]);
+
 let myWorkController: AbortController | null = null;
 const unavailableIssueListeners = new Set<(id: string) => void>();
 
@@ -181,6 +187,47 @@ export const resources = {
   projects: cache.resource<Project[]>("projects", () => api.projects().then((r) => r.projects), {
     isEmpty: (rows) => rows.length === 0,
   }),
+  /**
+   * `GET /api/issues?project=<key>&archived=1` — one archived project's own
+   * rows. The global `issues` list omits archived work, so reusing it would
+   * claim the project has no issues. Only a proved archived lifecycle mounts
+   * this read; the opt-in query keeps an older server from answering the
+   * ordinary (empty) project list.
+   */
+  projectIssues: cache.family<string, IssueCard[]>(
+    "projectIssues",
+    (project) => api.archivedProjectIssues(project).then((r) => r.issues),
+    { isEmpty: (rows) => rows.length === 0 },
+  ),
+  /**
+   * `GET /api/projects?archived=1` — archived project rows (CAD-2255).
+   * Read untyped: an older server ignores the query, and
+   * `features/projects/archiveContract` refuses to treat that answer as an
+   * empty archived list. An unserved route (404/501) is an unavailable view,
+   * not a failure to retry.
+   */
+  archivedProjects: cache.resource<unknown>("archivedProjects", () =>
+    api.projectsArchived().catch((error: unknown) => {
+      if (error instanceof ApiError && ARCHIVE_UNSERVED.has(error.status)) {
+        return { archive_unavailable: true, status: error.status };
+      }
+      throw error;
+    }),
+  ),
+  /**
+   * `GET /api/projects/<key>/lifecycle` — the archive receipt. The status
+   * rides with an unserved answer: only an explicit 501 proves the capability
+   * absent; a 404 stays unknown (and therefore fails closed for policy
+   * mutation), never active.
+   */
+  projectLifecycle: cache.family<string, unknown>("projectLifecycle", (project) =>
+    api.projectLifecycle(project).catch((error: unknown) => {
+      if (error instanceof ApiError && ARCHIVE_UNSERVED.has(error.status)) {
+        return { archive_unavailable: true, status: error.status };
+      }
+      throw error;
+    }),
+  ),
   /** `GET /api/projects/<key>/policy` — the board's policy record. Native and
    *  hosted answer different shapes (CAD-2255), validated by policyContract. */
   projectPolicy: cache.family<string, unknown>("projectPolicy", (project) =>

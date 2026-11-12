@@ -46,6 +46,14 @@ export const RESOURCE_NAMES = [
   // `invalidatedBy`, so the Settings page would keep a stale policy and could
   // save over a newer record.
   "projectPolicy",
+  // CAD-2255: the archive receipt and the archived-project view are reads of
+  // their own. `projects` events name both; a name missing here is dropped by
+  // `invalidatedBy`, which would leave a stale archived list or fence on
+  // screen after another tab archives a project.
+  "projectLifecycle",
+  "archivedProjects",
+  // CAD-2255: an archived project's own rows are read per project.
+  "projectIssues",
 ] as const;
 export type ResourceName = (typeof RESOURCE_NAMES)[number];
 

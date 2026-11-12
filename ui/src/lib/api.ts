@@ -617,6 +617,25 @@ export const api = {
   myWork: (query: string, signal?: AbortSignal) => get<MyWorkPayload>(`/api/my-work?${query}`, signal),
   myWorkIssue: (id: string) => get<MyWorkMembership>(`/api/my-work/issues/${encodeURIComponent(id)}`),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
+  /** `GET /api/projects?archived=1` — archived project rows (CAD-2255).
+   *  Untyped: an older server ignores the query, and only an explicit
+   *  `archive_supported` beside rows that each say `archived` proves the
+   *  view. `features/projects/archiveContract` validates it. */
+  projectsArchived: () => get<unknown>("/api/projects?archived=1"),
+  /** `GET /api/projects/<key>/lifecycle` — the archive receipt (CAD-2255). */
+  projectLifecycle: (project: string) =>
+    get<unknown>(`/api/projects/${encodeURIComponent(project)}/lifecycle`),
+  /** `POST /api/projects/<key>/archive` — `confirmation` is the exact
+   *  project key and `expected_revision` is the last read fence. */
+  archiveProject: (
+    project: string,
+    req: { confirmation: string; expected_revision: number },
+  ) => post<unknown>(`/api/projects/${encodeURIComponent(project)}/archive`, req),
+  /** `POST /api/projects/<key>/restore` — the same fence and confirmation. */
+  restoreProject: (
+    project: string,
+    req: { confirmation: string; expected_revision: number },
+  ) => post<unknown>(`/api/projects/${encodeURIComponent(project)}/restore`, req),
   /** `GET /api/projects/<key>/policy` — the board's own policy record. The
    *  native and hosted shapes differ (CAD-2255), so this is handed back
    *  untyped and `features/projects/policyContract` validates it. */
@@ -647,6 +666,14 @@ export const api = {
   issues: (project?: string) =>
     get<{ issues: IssueCard[] }>(
       project ? `/api/issues?project=${encodeURIComponent(project)}` : "/api/issues",
+    ),
+  /** `GET /api/issues?project=<key>&archived=1` — one archived project's own
+   *  rows (CAD-2255). The opt-in query is sent only after the lifecycle
+   *  proves the project archived; an older server rejects it instead of
+   *  answering a misleading empty list. */
+  archivedProjectIssues: (project: string) =>
+    get<{ issues: IssueCard[] }>(
+      `/api/issues?project=${encodeURIComponent(project)}&archived=1`,
     ),
   issue: (id: string) => get<IssueDetail>(`/api/issues/${id}`),
   history: (id: string, limit = 10) =>

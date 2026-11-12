@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { privateSessionGeneration } from "../../lib/privateSession";
@@ -10,6 +10,8 @@ import { objectField } from "../../lib/wire";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import Select from "../../ui/Select";
 import { cliCommand, type PolicyDraft } from "./policyView";
+import ProjectArchivePanel from "./ProjectArchivePanel";
+import type { ArchiveGateState } from "./archiveContract";
 import {
   draftDirty,
   draftOf,
@@ -58,6 +60,26 @@ export default function ProjectSettings({
   const [roster, setRoster] = useState<TeamMember[] | null>(null);
   const [rosterError, setRosterError] = useState<string | null>(null);
   const [rosterAttempt, setRosterAttempt] = useState(0);
+  // CAD-2255: the archive panel proves the current state. While a confirm is
+  // open or a transition is in flight (`archiveActivity`), or the project is
+  // proven archived, the policy editor is locked so the two writes never race.
+  const [archiveActivity, setArchiveActivity] = useState(false);
+  // The gate is keyed by project AND private-session generation, so a previous
+  // project's (or session's) proved state can never unlock the next render.
+  // Until this project's read proves something, the gate is unknown: policy
+  // mutation stays off rather than defaulting to active.
+  const [archiveGate, setArchiveGate] = useState<{
+    project: string;
+    generation: number;
+    state: ArchiveGateState;
+  } | null>(null);
+  const onArchiveActivity = useCallback((active: boolean) => setArchiveActivity(active), []);
+  const onArchiveState = useCallback(
+    (state: ArchiveGateState) => {
+      setArchiveGate({ project, generation: privateSessionGeneration(), state });
+    },
+    [project],
+  );
   const selectId = useId();
 
   const view: PolicyView = useMemo(
@@ -78,6 +100,7 @@ export default function ProjectSettings({
     setPicked("");
     setAdding(false);
     setBusy(false);
+    setArchiveActivity(false);
   }, [project]);
 
   // The hosted roster is the only source of verified member subject ids.
@@ -109,7 +132,30 @@ export default function ProjectSettings({
   const base = draftOf(view);
   const draft = edits ?? base;
   const dirty = draftDirty(view, draft);
-  const locked = block !== null;
+  const gateState: ArchiveGateState =
+    archiveGate !== null &&
+    archiveGate.project === project &&
+    archiveGate.generation === privateSessionGeneration()
+      ? archiveGate.state
+      : "unknown";
+  const archived = gateState === "archived";
+  const unsavedPolicyEdits = edits !== null && dirty;
+  // CAD-2255: only a proved ACTIVE receipt unlocks access changes. Archived,
+  // unknown, and unavailable all fail closed: a 501 or a foreign capability
+  // proves only that this server lacks the endpoint — not that its storage
+  // never held an archived project (a rollback would). Deploy order therefore
+  // matters: the backend must serve this contract before this UI ships, or
+  // project access settings are read-only on that board.
+  const locked = block !== null || gateState !== "active" || archiveActivity;
+  const policyLockReason = archived
+    ? t("This project is archived. Restore it in the Archive panel before changing who can see it.")
+    : gateState === "unavailable"
+      ? t("This server does not serve the project archive contract, so access changes are locked here until the backend is updated.")
+      : gateState === "unknown"
+        ? t("The archive state of this project could not be proved, so access changes are locked until it answers.")
+        : archiveActivity
+          ? t("Access settings are locked while the archive change is open.")
+          : null;
   const unreadable = view.kind === "unreadable";
   const privateOffered =
     view.kind === "recorded"
@@ -518,6 +564,11 @@ export default function ProjectSettings({
                   </p>
                 )}
                 {block && <p className="mt-4 text-label text-ink-400">{block}</p>}
+                {policyLockReason && (
+                  <p className="mt-4 text-label text-warn" role="status">
+                    {policyLockReason}
+                  </p>
+                )}
                 {error && (
                   <p className="mt-3 text-secondary text-fail" role="alert">
                     {error}
@@ -558,6 +609,18 @@ export default function ProjectSettings({
 
         </>
       )}
+
+      {/* The panel reads its own contract, so it is offered even when the
+          policy shape is unprovable — and it never defaults a capability on. */}
+      <ProjectArchivePanel
+        project={project}
+        block={block}
+        policyBusy={busy || adding}
+        unsavedPolicyEdits={unsavedPolicyEdits}
+        onActivity={onArchiveActivity}
+        onArchiveState={onArchiveState}
+        onToast={onToast}
+      />
     </main>
   );
 }

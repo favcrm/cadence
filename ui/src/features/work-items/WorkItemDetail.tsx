@@ -59,6 +59,10 @@ export interface WorkItemDetailProps {
   onClose: () => void;
   /** The write gate for the hosted Home decision panels; artifacts stay on the issue page. */
   readOnly: boolean;
+  /** Why this drawer's bounded writes are off for the item's own project
+   *  (that project is archived, or its archive state is unverified), or null.
+   *  Derived per opened item, never from the route it was opened on. */
+  writeBlock?: string | null;
   /** Open another issue inside this detail (body links). */
   onOpen: (id: string) => void;
   /** The My work row that opened it, when one did. */
@@ -91,7 +95,7 @@ export interface WorkItemDetailProps {
  */
 export default function WorkItemDetail(props: WorkItemDetailProps) {
   const { t } = useLocale();
-  const { id, origin, detail, readState, onRetry, href, onClose, readOnly, onOpen, card, myWork, home, hosted, projectRepos, stagedActions } = props;
+  const { id, origin, detail, readState, onRetry, href, onClose, readOnly, writeBlock, onOpen, card, myWork, home, hosted, projectRepos, stagedActions } = props;
   const facts = useMemo(() => workItemFacts(detail, card ?? null), [detail, card]);
   const known = detail !== null && detail.id === id;
   const title = facts.title ?? (home ? home.open.need.shortTitle ?? t("Decision") : t("Work item"));
@@ -118,6 +122,7 @@ export default function WorkItemDetail(props: WorkItemDetailProps) {
           onClose={onClose}
           myWork={myWork}
           readOnly={readOnly}
+          writeBlock={writeBlock ?? null}
           home={home}
           stagedActions={stagedActions}
         />
@@ -242,6 +247,7 @@ function OverviewPanel({
   onClose,
   myWork,
   readOnly,
+  writeBlock,
   home,
   stagedActions,
 }: {
@@ -254,6 +260,7 @@ function OverviewPanel({
   onClose: () => void;
   myWork?: MyWorkWorkItemProps;
   readOnly: boolean;
+  writeBlock: string | null;
   home?: WorkItemDetailProps["home"];
   stagedActions?: readonly StagedWrite[];
 }) {
@@ -297,7 +304,7 @@ function OverviewPanel({
         <DecisionPanel
           key={home.open.need.key}
           need={home.open.need}
-          readOnly={readOnly}
+          readOnly={readOnly || writeBlock !== null}
           index={home.open.index}
           total={home.open.total}
           onDone={(key, text) => home.onDone(home.open, key, text)}
@@ -307,6 +314,10 @@ function OverviewPanel({
       )}
 
       <ReadState readState={readState} onRetry={onRetry} />
+
+      {writeBlock !== null && (
+        <p className="issue-peek-note warn m-0" role="status">{t(writeBlock)}</p>
+      )}
 
       <section className="grid gap-2" aria-label={t("Recorded details")}>
         <h4 className="rv-h">{t("What this item records")}</h4>
@@ -408,7 +419,13 @@ function OverviewPanel({
         </div>
       )}
       {myWork && detail && !gone && (
-        <QuickActions key={myWork.draftKey} id={id} detail={detail} readState={readState} personal={myWork} />
+        <QuickActions
+          key={myWork.draftKey}
+          id={id}
+          detail={detail}
+          readState={readState}
+          personal={writeBlock === null ? myWork : { ...myWork, writeBlock: myWork.writeBlock ?? writeBlock }}
+        />
       )}
 
       {detail && (

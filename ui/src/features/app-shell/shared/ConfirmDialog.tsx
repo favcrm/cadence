@@ -6,13 +6,20 @@ import { useTranslate } from "../../../lib/localeText";
 /** A modal confirm: the operator's typed `expect` must equal
  *  `match` before `confirmLabel` enables. Esc cancels, the input or the
  *  dialog takes focus on open, Tab stays inside, and focus returns to the
- *  opener on close. */
+ *  opener on close.
+ *
+ *  `inputMode` keeps the numeric default exact: a numeric code ignores
+ *  surrounding whitespace. An exact text key (`"text"`) must be typed
+ *  character for character — no trimming, no case folding — and the field
+ *  grows past the numeric cap so a project key is never cut off. */
 export default function ConfirmDialog({
   title,
   body,
   expect,
   match,
   inputLabel,
+  inputPlaceholder,
+  inputMode = "numeric",
   confirmLabel,
   pending,
   error,
@@ -26,6 +33,9 @@ export default function ConfirmDialog({
   expect?: string;
   match?: string;
   inputLabel?: string;
+  inputPlaceholder?: string;
+  /** `numeric` (default) trims a code; `text` compares the exact key. */
+  inputMode?: "numeric" | "text";
   confirmLabel: string;
   pending: boolean;
   error: string | null;
@@ -40,7 +50,13 @@ export default function ConfirmDialog({
   const openerRef = useRef<HTMLElement | null>(null);
   const gatedInput = useRef(expect !== undefined);
   gatedInput.current = expect !== undefined;
-  const gated = expect !== undefined ? typed.trim() === (match ?? "") : true;
+  const exactText = inputMode === "text";
+  const gated =
+    expect !== undefined
+      ? exactText
+        ? typed === (match ?? "")
+        : typed.trim() === (match ?? "")
+      : true;
 
   useEffect(() => {
     const active = document.activeElement;
@@ -112,12 +128,16 @@ export default function ConfirmDialog({
             <input
               id={inputId}
               ref={inputRef}
-              className="field num"
-              inputMode="numeric"
+              className={exactText ? "field" : "field num"}
+              inputMode={exactText ? "text" : "numeric"}
               value={typed}
               onChange={(e) => setTyped(e.target.value)}
-              maxLength={12}
+              maxLength={exactText ? Math.max(64, (match ?? "").length + 16) : 12}
               autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              placeholder={inputPlaceholder}
               disabled={pending}
             />
           </div>

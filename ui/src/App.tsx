@@ -24,6 +24,8 @@ import { restoreDetailFocus } from "./features/work-items/focus";
 import { applyDecisionDone, homeNeedIssueId, type HomeDecisionOpen, type MyWorkDraft, type WorkItemOrigin } from "./lib/workItems";
 import ProjectSettings from "./features/projects/ProjectSettings";
 import ProjectsOverview from "./features/projects/ProjectsOverview";
+import { readLifecycle } from "./features/projects/archiveContract";
+import { drawerArchiveGate, issuePageWriteBlock } from "./features/projects/drawerArchiveGate";
 import IssuePage from "./features/issues/IssuePage";
 import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
 import Epics from "./features/projects/Epics";
@@ -246,6 +248,39 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // Per-resource state (lib/cache.ts): loading, failed and empty stay
   // distinct, and a failed refresh keeps the last good payload as stale.
   const issuesState = useResource(resources.issues);
+  // CAD-2255: an archived project's overview and board read that project's
+  // own rows — the shared list omits archived work, and reusing it would
+  // claim the project has no issues. Only a proved receipt switches the
+  // route; unknown or unavailable keeps the shared list and grants no write.
+  const projectLifecycleState = useMaybeResource(
+    route.screen === "projects" && route.slug ? resources.projectLifecycle(route.slug) : null,
+  );
+  const routeArchive = route.screen === "projects" && route.slug
+    ? readLifecycle(projectLifecycleState?.data, route.slug)
+    : null;
+  const archivedRoute =
+    routeArchive !== null && routeArchive.kind === "available" && routeArchive.receipt.archived;
+  const projectIssueState = useMaybeResource(
+    archivedRoute && route.screen === "projects" && route.slug ? resources.projectIssues(route.slug) : null,
+  );
+  const routeIssues = archivedRoute && projectIssueState !== null ? projectIssueState : issuesState;
+  const retryRouteIssues = () => {
+    if (archivedRoute && route.screen === "projects" && route.slug) {
+      void resources.projectIssues(route.slug).refresh();
+    } else {
+      void resources.issues.refresh();
+    }
+  };
+  // `useMaybeResource` only subscribes; the route owns the read. The archived
+  // opt-in query runs only after the lifecycle proves the project archived.
+  useEffect(() => {
+    if (route.screen === "projects" && route.slug) void resources.projectLifecycle(route.slug).revalidate();
+  }, [route.screen, route.screen === "projects" ? route.slug : null]);
+  useEffect(() => {
+    if (archivedRoute && route.screen === "projects" && route.slug) {
+      void resources.projectIssues(route.slug).revalidate();
+    }
+  }, [archivedRoute, route.screen, route.screen === "projects" ? route.slug : null]);
   const projectsState = useResource(resources.projects);
   const agentsState = useResource(resources.agents);
   const overviewState = useResource(resources.overview);
@@ -258,6 +293,30 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const homeCount = useHomeCount(overviewState.data?.needs_me, decisions.pending.length);
   const issues = issuesState.data ?? [];
   const projects = projectsState.data ?? [];
+  // A slug outside the active list may be archived; while its lifecycle read
+  // is in flight — or after it answered without proving the state — the
+  // shared issue list proves nothing about that project's work.
+  const routeSlugOutsideActive =
+    route.screen === "projects" &&
+    route.slug !== null &&
+    projectsState.data !== null &&
+    !projects.some((row) => row.key === route.slug);
+  const routeArchiveReading =
+    routeSlugOutsideActive &&
+    !archivedRoute &&
+    projectLifecycleState !== null &&
+    projectLifecycleState.data === null &&
+    projectLifecycleState.status === "loading";
+  const routeArchiveUnproved =
+    routeSlugOutsideActive &&
+    !archivedRoute &&
+    projectLifecycleState !== null &&
+    (routeArchive?.kind === "unknown" || routeArchive?.kind === "unreadable");
+  const routeArchivedPending: "reading" | "unproved" | undefined = routeArchiveReading
+    ? "reading"
+    : routeArchiveUnproved
+      ? "unproved"
+      : undefined;
   const agents = agentsState.data;
   const [health, setHealth] = useState<Health | null | "unavailable">(null);
   const [partialUpdates, setPartialUpdates] = useState(false);
@@ -282,6 +341,57 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const personalState = useMaybeResource(screen === "myWork" ? resources.myWork : null);
   // The peek's membership: one issue, asked of the server (the list holds one page).
   const membershipState = useMaybeResource(screen === "myWork" && openId ? resources.myWorkIssue(openId) : null);
+  // The drawer's writes follow the item's own project, never the route that
+  // opened it: an issue opened from another project derives that project's
+  // lifecycle. Archived, or an unverified archive state, blocks the drawer's
+  // bounded writes; the detail read must be current before any write anyway.
+  const drawerDetail = detailState?.data?.id === openId ? detailState.data : null;
+  // The item's OWN project: loaded detail, then its card. Never the route key
+  // — a drawer opened on one project can show an issue from another.
+  const drawerItemProject =
+    openId === null
+      ? null
+      : drawerDetail?.project ??
+        personalState?.data?.issues.find((row) => row.id === openId)?.project ??
+        issues.find((row) => row.id === openId)?.project ??
+        null;
+  const drawerDisplayProject = drawerItemProject ?? (project !== "all" ? project : null);
+  const drawerLifecycleState = useMaybeResource(
+    openId !== null && drawerItemProject !== null
+      ? resources.projectLifecycle(drawerItemProject)
+      : null,
+  );
+  useEffect(() => {
+    if (openId !== null && drawerItemProject !== null) {
+      void resources.projectLifecycle(drawerItemProject).revalidate();
+    }
+  }, [openId, drawerItemProject]);
+  const drawerWriteBlock =
+    openId === null
+      ? null
+      : drawerArchiveGate({ project: drawerItemProject, state: drawerLifecycleState }).writeBlock;
+  // The direct issue page is gated by its own loaded issue project, not the
+  // route key alone; unloaded or mismatched items fail closed.
+  const pageIssueId = route.screen === "issue" ? route.id : null;
+  const pageIssueState = useMaybeResource(pageIssueId !== null ? resources.issue(pageIssueId) : null);
+  const pageIssueDetail = pageIssueState?.data?.id === pageIssueId ? pageIssueState.data : null;
+  const pageIssueProject = pageIssueDetail?.project ?? null;
+  const pageLifecycleState = useMaybeResource(
+    pageIssueProject !== null ? resources.projectLifecycle(pageIssueProject) : null,
+  );
+  useEffect(() => {
+    if (pageIssueProject !== null) {
+      void resources.projectLifecycle(pageIssueProject).revalidate();
+    }
+  }, [pageIssueProject]);
+  const pageWriteBlock =
+    route.screen === "issue"
+      ? issuePageWriteBlock({
+          routeProject: route.project,
+          detailProject: pageIssueProject,
+          state: pageLifecycleState,
+        })
+      : null;
   const personalWanted = useRef(screen === "myWork");
   personalWanted.current = screen === "myWork";
   const [personalDrafts] = useState(() => new Map<string, MyWorkDraft>());
@@ -496,6 +606,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         });
       void resources.projects.refresh();
       void resources.issues.refresh();
+      // Observed project pages re-read their lifecycle and archived rows on
+      // the same refresh; unobserved stores are only marked.
+      cache.invalidate("projectLifecycle");
+      cache.invalidate("projectIssues");
       void resources.agents.refresh();
       if (overviewWantedRef.current) void resources.overview.refresh();
       if (personalWanted.current) void resources.myWork.refresh();
@@ -542,6 +656,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         // or jobs. Entity patches queue that through LiveUpdates; legacy
         // resource names still have to.
         if (laneFollowsStream([key])) cache.invalidate("lane");
+        if (key === "issues" || key === "projects") {
+          // Work moved: refresh the per-project rows an archived route shows.
+          cache.invalidate("projectIssues");
+        }
+        if (key === "projects") {
+          // A project's lifecycle or membership changed.
+          cache.invalidate("projectLifecycle");
+          cache.invalidate("archivedProjects");
+        }
         if (key === "issues" || key === "issue" || key === "agents") invalidatePersonal();
         if (key === "threads") noteThreadsChanged();
         if (key === "master") noteMasterChanged();
@@ -561,6 +684,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           resources.myWork.mutate((body) => data.op === "delete"
             ? { ...body, issues: body.issues.filter((row) => row.id !== data.id) }
             : mergePersonalCard(body, data.issue as IssueCard));
+          cache.invalidate("projectIssues");
           invalidatePersonal();
         } else if (event.type === "agent") {
           if (typeof data.id !== "string" || !["upsert", "delete"].includes(String(data.op)) ||
@@ -1309,7 +1433,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           />
         )}
         {route.screen === "projects" && route.section === "overview" && (
-          <ProjectsOverview project={project} projects={projects} issues={issuesState} onOpenIssue={openIssue} onRetry={() => void resources.issues.refresh()} />
+          <ProjectsOverview project={project} projects={projects} issues={routeIssues} archivePending={routeArchivedPending} onOpenIssue={openIssue} onRetry={retryRouteIssues} />
         )}
         {route.screen === "projects" && route.slug && route.section === "timeline" && hosted !== undefined && (
           <Timeline
@@ -1328,7 +1452,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onToast={(text) => say("ok", text)}
           />
         )}
-        {route.screen === "issue" && (
+        {route.screen === "issue" && (<>
+          {pageWriteBlock !== null && (
+            <p className="roadmap-notice px-4 lg:px-8" role="status">{t(pageWriteBlock)}</p>
+          )}
           <IssuePage
             project={route.project}
             id={route.id}
@@ -1336,11 +1463,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             tabHref={(tab) => locationHref({ ...loc, route: { ...route, tab } }, search)}
             issues={issues}
             agents={agents ?? null}
-            readOnly={readOnly}
-            writeBlock={block}
-            kickoffBlock={operatorKickoffBlock(meta)}
+            readOnly={readOnly || pageWriteBlock !== null}
+            writeBlock={pageWriteBlock ?? block}
+            kickoffBlock={pageWriteBlock ?? operatorKickoffBlock(meta)}
             hosted={meta?.hosted === true}
-            projectRepos={projects.find((p) => p.key === route.project)?.repos ?? null}
+            projectRepos={projects.find((p) => p.key === (pageIssueProject ?? route.project))?.repos ?? null}
             stagedActions={decisions.rows}
             onWrite={applyWrite}
             onError={writeError}
@@ -1357,11 +1484,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             planHref={hrefFor({ screen: "home" })}
             onToast={(text) => say("ok", text)}
           />
-        )}
+        </>)}
         {route.screen === "projects" && route.section === "issues" && (
           <Board
-            issues={issuesState}
-            onRetry={() => void resources.issues.refresh()}
+            issues={routeIssues}
+            onRetry={retryRouteIssues}
             projects={projects}
             agents={agents}
             health={health}
@@ -1369,7 +1496,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             view={view}
             onView={setView}
             query={query}
-            readOnly={readOnly || meta === null}
+            readOnly={readOnly || archivedRoute || meta === null}
             sessionId={meta === null ? undefined : meta.session?.id ?? null}
             hosted={meta?.hosted === true}
             actor={actor}
@@ -1386,19 +1513,19 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {route.screen === "projects" && route.slug && route.section === "epics" && (
           <Epics
             project={route.slug}
-            issues={issuesState}
-            viewer={viewer}
+            issues={routeIssues}
+            viewer={archivedRoute ? { ...viewer, readOnly: true } : viewer}
             onOpenIssue={openIssue}
-            onRetry={() => void resources.issues.refresh()}
+            onRetry={retryRouteIssues}
           />
         )}
         {route.screen === "projects" && route.slug && route.section === "milestones" && (
-          <Milestones project={route.slug} issues={issuesState} onOpenIssue={openIssue} />
+          <Milestones project={route.slug} issues={routeIssues} onOpenIssue={openIssue} />
         )}
         {route.screen === "projects" && route.slug && route.section === "workflows" && (
           <Workflows
             project={route.slug}
-            viewer={viewer}
+            viewer={archivedRoute ? { ...viewer, readOnly: true } : viewer}
             onOpenIssue={openIssue}
             onHome={() => goRoute({ screen: "home" })}
           />
@@ -1408,8 +1535,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             noWiki={!wikiAvailable(meta)}
             hosted={hosted}
             viewerSub={viewerSub}
-            readOnly={readOnly}
-            readOnlyReason={block}
+            readOnly={readOnly || archivedRoute}
+            readOnlyReason={archivedRoute ? "This project is archived — restore it before changing its context." : block}
             actor={actor}
             onToast={say}
             navHref={hrefFor}
@@ -1618,16 +1745,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               if (privateSessionGeneration() === personalGeneration) notifyPersonalDrafts((version) => version + 1);
             },
           } : undefined}
-          {...(() => {
-            const fromDetail = detailState?.data?.id === openId ? detailState.data.project : null;
-            const fromCard = personalState?.data?.issues.find((row) => row.id === openId)?.project
-              ?? issues.find((i) => i.id === openId)?.project ?? null;
-            const key = fromDetail ?? fromCard ?? (project !== "all" ? project : null);
-            return {
-              href: key ? issuePath(key, openId) : null,
-              projectRepos: key ? projects.find((p) => p.key === key)?.repos ?? null : null,
-            };
-          })()}
+          href={drawerDisplayProject !== null ? issuePath(drawerDisplayProject, openId) : null}
+          projectRepos={drawerDisplayProject !== null ? projects.find((p) => p.key === drawerDisplayProject)?.repos ?? null : null}
+          writeBlock={drawerWriteBlock}
           hosted={meta?.hosted === true}
           stagedActions={decisions.rows}
           onClose={closeWorkItem}
