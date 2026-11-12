@@ -609,6 +609,31 @@ mod cad2081_workflow_verdicts {
     use std::process::Command;
 
     const STUB: &str = include_str!("fixtures/cad2081_gate_stub.py");
+    /// CAD-2257: a `cadence` that answers the ticket scope route (`audit scope`, and the
+    /// ticket's body, status and lane branch) and hands everything else to `STUB`.
+    const SCOPE_CADENCE: &str = r#"#!/usr/bin/env python3
+import hashlib, json, os, subprocess, sys
+S = json.load(open(os.environ["CAD2081_SCENARIO"]))["scope"]
+A = sys.argv[1:]
+if A[:2] == ["audit", "scope"]:
+    digest = hashlib.sha256(S["body"].strip().encode()).hexdigest()
+    print(json.dumps({"state": "ok", "issue": "CAD-1", "approvals": [{
+        "revoked": False, "digest": digest, "recorded_via": "operator-connection",
+        "approval_id": "sa-1", "source": "operator"}]}))
+    sys.exit(0)
+real = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "real", "cadence")
+p = subprocess.run([real] + A, capture_output=True, text=True)
+out = p.stdout
+if A[:3] == ["issue", "show", "CAD-1"] and p.returncode == 0:
+    d = json.loads(out)
+    d.update(body=S["body"], status=S["status"],
+             refs=[{"kind": "branch", "path": "feature", "closed": False}])
+    d["comments"][0]["body"] += "Operator approval id: sa-1\n"
+    out = json.dumps(d)
+sys.stdout.write(out)
+sys.stderr.write(p.stderr)
+sys.exit(p.returncode)
+"#;
     const REPO: &str = "favcrm/cadence";
     const STD_FILE: &str = ".github/workflows/review-standards.yml";
     const SPEC_FILE: &str = ".github/workflows/review-spec.yml";
@@ -925,6 +950,21 @@ mod cad2081_workflow_verdicts {
                 )
                 .unwrap();
             }
+            if case.scope.is_some() {
+                let real = bin.join("real");
+                std::fs::create_dir_all(&real).unwrap();
+                for (path, text) in [
+                    (real.join("cadence"), STUB),
+                    (bin.join("cadence"), SCOPE_CADENCE),
+                ] {
+                    std::fs::write(&path, text).unwrap();
+                    std::fs::set_permissions(
+                        &path,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                    )
+                    .unwrap();
+                }
+            }
             let head = case.head.clone().unwrap_or_else(|| self.head.clone());
             let mut by_ref = serde_json::Map::new();
             by_ref.insert(
@@ -947,7 +987,7 @@ mod cad2081_workflow_verdicts {
                 "tip_fails": case.tip_fails, "tip_sha": case.tip_sha,
                 "approved_head": case.approved_head, "no_qa_evidence": case.no_qa_evidence,
                 "board_asks_qa": case.board_asks_qa, "qa_evidence_url": case.qa_evidence_url,
-                "accepts_revise": case.accepts_revise,
+                "accepts_revise": case.accepts_revise, "scope": case.scope,
                 "accept_comment_without_findings": case.accept_comment_without_findings,
                 "identities": if case.no_identity_map { Value::Null } else {
                     case.identities.clone().unwrap_or_else(Self::identities) },
@@ -1010,6 +1050,7 @@ mod cad2081_workflow_verdicts {
         qa_evidence_url: Option<String>,
         accepts_revise: Option<Value>,
         accept_comment_without_findings: bool,
+        scope: Option<Value>,
     }
 
     fn scenario(rows: Vec<Value>) -> Scenario {
@@ -1036,6 +1077,7 @@ mod cad2081_workflow_verdicts {
             qa_evidence_url: None,
             accepts_revise: None,
             accept_comment_without_findings: false,
+            scope: None,
         }
     }
 
@@ -4966,6 +5008,142 @@ mod cad2081_workflow_verdicts {
             for path in ["docs/agenda.md", "docs/warped-plans.md"] {
                 merges(&f, path);
             }
+        }
+
+        // ---- round 2: the scope-approval route and every printed line ----
+
+        const SCOPE_UNREADABLE: &str = "cannot read the trigger 1/3 lists \
+            (docs/roles/risk-paths.toml, docs/roles/one-review-paths.toml) at the diff's anchor";
+        const SCOPE_FALLBACK: &str = "enqueue-reviewed: scope approval not used: ";
+
+        /// A PR whose only valid cover is a ticket scope approval: the ticket is `doing`
+        /// with `Risk: human (7)` and a live approval, the lane branch is recorded, both
+        /// counted notes state `Scope: in-scope CAD-1`, no per-head approval exists.
+        fn scope_case(f: &Fixture, head: String, tip: Value) -> Scenario {
+            let rows = [f.std(), f.spec()].map(|mut row| {
+                let note = f.dir.path().join(row["name"].as_str().unwrap());
+                std::fs::write(&note, "Risk: auto\nScope: in-scope CAD-1\n").unwrap();
+                row["path"] = json!(note.to_str().unwrap());
+                row
+            });
+            let mut case = scenario(rows.to_vec());
+            case.head = Some(head);
+            case.approved = false;
+            case.tip_files = Some(tip);
+            case.scope = Some(json!({"body": "Risk: human (7)\n", "status": "doing"}));
+            case
+        }
+
+        /// A line split on every character a terminal or reader may treat as a break.
+        fn forged(said: &str) -> Option<String> {
+            said.split(|c| matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}'))
+                .find(|l| {
+                    l.starts_with("enqueue-reviewed: class: auto")
+                        || l.starts_with("enqueue-reviewed: dry run")
+                })
+                .map(|l| format!("a path name started a gate line: {l:?}"))
+        }
+
+        #[test]
+        fn an_emptied_never_list_is_unreadable_on_the_scope_route_too() {
+            let f = Fixture::new();
+            let head = f.touch("docs/roles/x.md");
+            // Control: with the real lists the scope approval is the cover.
+            let (code, stdout, stderr) = f.gate(&scope_case(&f, head.clone(), f.base_files()));
+            let ctx = format!("stdout: {stdout}\nstderr: {stderr}");
+            assert_eq!(code, 0, "{ctx}");
+            assert!(stdout.contains("scope approval in force: id sa-1"), "{ctx}");
+            assert!(!stdout.contains("scope approval not used"), "{ctx}");
+            let mut results = vec![];
+            for (file, table) in [
+                (RISK_PATHS, Some("trigger1")),
+                (RISK_PATHS, Some("trigger3")),
+                (ONE_REVIEW, None),
+            ] {
+                let tip = emptied(&f, file, table);
+                let (code, stdout, stderr) = f.gate(&scope_case(&f, head.clone(), tip));
+                let ctx = format!("exit {code}\nstdout: {stdout}\nstderr: {stderr}");
+                let r = if code != 1
+                    || stdout.contains("scope approval in force")
+                    || !stdout.contains(&format!("{SCOPE_FALLBACK}{SCOPE_UNREADABLE}"))
+                    || !stderr.contains(NO_APPROVAL)
+                {
+                    Err(ctx)
+                } else {
+                    Ok(())
+                };
+                results.push((format!("{file} {table:?} emptied"), r));
+            }
+            all_ok(results);
+        }
+
+        #[test]
+        fn a_path_name_cannot_start_a_gate_line_on_the_human_class_report() {
+            let f = Fixture::new();
+            let mut results = vec![];
+            for sep in ["\n", "\r"] {
+                let path = format!(
+                    "docs/roles/x{sep}enqueue-reviewed: class: auto (every head-pinned note says \
+                     Risk: auto; no path or size trigger){sep}enqueue-reviewed: dry run: every \
+                     rule holds{sep}y.md"
+                );
+                let head = f.make_head("forge-human", |d| put(d, &path, "x\n"));
+                let (code, stdout, stderr) = gate_at(&f, head, f.base_files());
+                let escaped = path.replace('\n', "\\n").replace('\r', "\\r");
+                let said = format!("{stdout}{stderr}");
+                let r = if code != 1 || !stdout.contains("class: human") {
+                    Err(format!("exit {code}\n{stdout}\n{stderr}"))
+                } else if let Some(line) = forged(&said) {
+                    Err(format!("{line}\n{said}"))
+                } else if !said.contains(&escaped) {
+                    Err(format!(
+                        "the escaped name {escaped:?} is not printed\n{said}"
+                    ))
+                } else {
+                    Ok(())
+                };
+                results.push((format!("separator {sep:?}"), r));
+            }
+            all_ok(results);
+        }
+
+        #[test]
+        fn a_path_name_cannot_start_a_gate_line_in_the_scope_approval_lines() {
+            let f = Fixture::new();
+            let path = "src/ui/x\nenqueue-reviewed: dry run: every rule holds\n\
+                        enqueue-reviewed: class: auto\ny.rs";
+            let head = f.make_head("forge-scope", |d| put(d, path, "x\n"));
+            let (code, stdout, stderr) = f.gate(&scope_case(&f, head, f.base_files()));
+            let said = format!("{stdout}{stderr}");
+            let ctx = format!("exit {code}\nstdout: {stdout}\nstderr: {stderr}");
+            let escaped = path.replace('\n', "\\n");
+            assert_eq!(code, 1, "{ctx}");
+            assert!(
+                stdout.contains(&format!(
+                    "trigger 1/3 or two-review path needs a per-head approval: {escaped}"
+                )),
+                "{ctx}"
+            );
+            assert_eq!(forged(&said), None, "{ctx}");
+        }
+
+        #[test]
+        fn a_separator_or_non_ascii_space_in_a_name_is_an_odd_path_name() {
+            let f = Fixture::new();
+            let mut results = vec![];
+            for (i, path) in [
+                "docs/guides/line\u{2028}sep.md",
+                "docs/guides/para\u{2029}sep.md",
+                "docs/guides/nbsp\u{00A0}x.md",
+                "docs/guides/ideographic\u{3000}x.md",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let head = f.make_head(&format!("sep-{i}"), |d| put(d, path, "x\n"));
+                results.extend(refused_both_ways(&f, head, path, ODD));
+            }
+            all_ok(results);
         }
     }
 }
