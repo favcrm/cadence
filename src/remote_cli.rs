@@ -5347,26 +5347,26 @@ fn timeline_board_too_old(
 /// outage or a mistake in the command, so say the board does not serve the
 /// copy and name the verbs it does serve.
 ///
-/// Only the first request of a copy counts: `begin` (an import), `export`, and
-/// the `status` a `--resume` reads first. A board that serves transfers also
-/// answers 400 to a bad chunk or receipt, and a refusal after `begin` was
-/// admitted is not proof that nothing moved, so `chunk`, `apply` and `finish`
-/// keep the decoded refusal. A 400 counts on `begin` alone, whose manifest this
-/// client checked before sending it.
+/// Matched by operation, and only the ones a copy opens with: `begin` (an
+/// import), an `export` that carries no `rev` (planning; the per-entry byte
+/// reads always pin one), and `status` (what `--resume` reads first). A board
+/// that serves transfers also answers 400 to a bad chunk or receipt, and a
+/// refusal after part of a copy moved is not proof that nothing did, so
+/// `chunk`, `apply`, `finish` and a pinned `export` keep the decoded refusal.
+/// A 400 counts on `begin` alone, whose manifest this client checked before
+/// sending it. `status` is also read after `begin` and by `--wait-index`, so
+/// it claims only that nothing was read.
 fn wiki_copy_unserved(
     verb: &str,
     status: u16,
     code: Option<&str>,
     arguments: &Map<String, Value>,
 ) -> Option<Error> {
-    let op = arguments
-        .get("transfer")
-        .and_then(|transfer| transfer.get("op"))
-        .and_then(Value::as_str)?;
+    let transfer = arguments.get("transfer")?;
+    let op = transfer.get("op").and_then(Value::as_str)?;
     let outcome = match (verb, op, status, code) {
-        ("write", "begin", 400, Some("invalid_request"))
-        | ("write", "begin", 501, _)
-        | ("job_status", "export", 501, _) => "copied",
+        ("write", "begin", 400, Some("invalid_request")) | ("write", "begin", 501, _) => "copied",
+        ("job_status", "export", 501, _) if transfer.get("rev").is_none() => "copied",
         ("job_status", "status", 501, _) => "read",
         _ => return None,
     };

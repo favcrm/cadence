@@ -311,6 +311,11 @@ fn wiki_cp_on_a_board_without_transfers_names_the_limit_and_what_works() {
             "{op} {status} {code:?}"
         );
     }
+    // A per-entry export read pins a `rev`; earlier entries may already be on
+    // disk, so it keeps the decoded refusal too.
+    let mut pinned = transfer("export");
+    pinned["transfer"]["rev"] = json!("rev-1");
+    assert!(wiki_copy_unserved("job_status", 501, Some("not_implemented"), &pinned).is_none());
     // A text `wiki put` carries no transfer and keeps its own refusals.
     let mut put = serde_json::Map::new();
     put.insert("path".into(), json!("projects/demo/notes/a.md"));
