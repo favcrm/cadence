@@ -1834,6 +1834,11 @@ fn optional_sha(body: &Value) -> Result<Option<String>> {
 }
 
 fn is_absent(error: &Error) -> bool {
+    // A hosted board names a missing path by code (CAD-2260); a daemon says it
+    // in its message.
+    if error.code() == Some("not_found") {
+        return true;
+    }
     let text = error.to_string().to_ascii_lowercase();
     text.contains("no such") || text.contains("not found") || text.contains("does not exist")
 }
@@ -2701,6 +2706,19 @@ mod tests {
         fn current_rev(&mut self, _path: &str) -> Result<String> {
             Ok(ABSENT.to_string())
         }
+    }
+
+    /// CAD-2260: a hosted board names a missing path by code, with no
+    /// "not found" wording. Discovery must read that as a new import root, and
+    /// must not hide any other refusal.
+    #[test]
+    fn a_hosted_not_found_is_a_new_destination_for_discovery() {
+        let missing = || Error::invalid("not_found", "no page at that path (HTTP 404)");
+        assert!(is_absent(&missing()));
+        discover_read_or_list(Err(missing()), || unreachable!("absent needs no listing")).unwrap();
+        let denied = Error::invalid("forbidden", "not permitted (HTTP 403)");
+        assert!(!is_absent(&denied));
+        assert!(discover_read_or_list(Err(denied), || unreachable!()).is_err());
     }
 
     #[test]

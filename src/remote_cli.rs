@@ -4343,9 +4343,10 @@ const PROFILE_WRITE_NOT_PERMITTED: &str = "defining or editing a profile is a li
 /// CAD-1568: actionable text for a verb's typed refusals, keyed on the
 /// container's bounded `error.code` — the raw `error.message` the route
 /// returns is never shown (a `cli_fail` body can carry arbitrary server
-/// text). Today it covers the `cli_message_*` family and CAD-1999's
-/// `project_new` registry refusals. Unknown or absent codes keep the
-/// generic decoded refusal unchanged.
+/// text). Today it covers the `cli_message_*` family, CAD-1999's
+/// `project_new` registry refusals and a wiki `read` of a missing path
+/// (CAD-2260). Unknown or absent codes keep the generic decoded refusal
+/// unchanged.
 fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Error) -> Error {
     let action: Option<(&'static str, &'static str)> = match (verb, code) {
         ("message_send", Some("recipient_class_unsupported")) => Some((
@@ -4494,6 +4495,14 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "the project was refused at the request boundary — the key must be \
              1-32 lowercase letters, digits or hyphens, --name 1-200 bytes, and \
              --prefix 1-16 letters/digits starting with a letter; nothing was written",
+        )),
+        // CAD-2260: the tenant board answers a wiki `read` with `404
+        // not_found` for a missing path, and for a blob whose stored bytes are
+        // gone. The code is what `wiki cp` reads as "the destination is new".
+        ("read", Some("not_found")) => Some((
+            "not_found",
+            "this workspace's wiki has no readable page at that path for this login; nothing \
+             was read",
         )),
         _ => None,
     };
@@ -5331,6 +5340,51 @@ fn timeline_board_too_old(
     ))
 }
 
+/// CAD-2260: a hosted tenant board serves the wiki's text `write`, `read` and
+/// `enumerate`, but not the `wiki cp` transfer operations (CAD-914). It answers
+/// `job_status` with `501 not_implemented`, and refuses a `write` that carries
+/// `transfer` at its argument check with `400 invalid_request`. Neither is an
+/// outage or a mistake in the command, so say the board does not serve the
+/// copy and name the verbs it does serve.
+///
+/// Matched by operation, and only the ones a copy opens with: `begin` (an
+/// import), an `export` that carries no `rev` (planning; the per-entry byte
+/// reads always pin one), and `status` (what `--resume` reads first). A board
+/// that serves transfers also answers 400 to a bad chunk or receipt, and a
+/// refusal after part of a copy moved is not proof that nothing did, so
+/// `chunk`, `apply`, `finish` and a pinned `export` keep the decoded refusal.
+/// A 400 counts on `begin` alone, whose manifest this client checked before
+/// sending it. `status` is also read after `begin` and by `--wait-index`, so
+/// it claims only that nothing was read.
+fn wiki_copy_unserved(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    arguments: &Map<String, Value>,
+) -> Option<Error> {
+    let transfer = arguments.get("transfer")?;
+    let op = transfer.get("op").and_then(Value::as_str)?;
+    let outcome = match (verb, op, status, code) {
+        ("write", "begin", 400, Some("invalid_request")) | ("write", "begin", 501, _) => "copied",
+        ("job_status", "export", 501, _) if transfer.get("rev").is_none() => "copied",
+        ("job_status", "status", 501, _) => "read",
+        _ => return None,
+    };
+    // Echo only a code this client names itself, never other board text.
+    let shown = match code {
+        Some(known @ ("invalid_request" | "not_implemented")) => format!(", {known}"),
+        _ => String::new(),
+    };
+    Some(Error::invalid(
+        "not_implemented",
+        format!(
+            "this workspace's board does not serve `wiki cp` (HTTP {status}{shown}). Copy one \
+             page at a time instead: `wiki put <path> --file <file>` writes a text page, `wiki \
+             upload` sends a binary file and `wiki cat` reads a page. Nothing was {outcome}"
+        ),
+    ))
+}
+
 /// Whether a ticket message write's 2xx names the write that was asked for.
 /// The ticket id can come back in its stored case.
 fn ticket_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String, Value>) -> bool {
@@ -5907,6 +5961,9 @@ fn call_verb_until_retry(
         if let Some(why) = timeline_board_too_old(verb, status, refusal_code.as_deref(), &arguments)
         {
             return Err(reject(why));
+        }
+        if let Some(error) = wiki_copy_unserved(verb, status, refusal_code.as_deref(), &arguments) {
+            return Err(error);
         }
         let platform_details = if platform_outcome_unknown {
             platform_error_details(body.as_ref())

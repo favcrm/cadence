@@ -644,6 +644,10 @@ read the actual page and cite its canonical path and revision. Wiki and CLI
 scopes are separate, and the target path/project still has to be authorized.
 An issue `status=doing` update is not a local assignment claim or delivery.
 
+`wiki cp` is not served by a hosted board: it exits with `not_implemented` and
+copies nothing. Write pages one at a time with `wiki put` (text) or
+`wiki upload` (binary).
+
 To start the issue on the already connected local default agent, the person
 operating that machine explicitly runs:
 

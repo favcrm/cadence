@@ -167,6 +167,10 @@ the same transfer operations (`begin`, `chunk`, `apply`, `finish`, `status`,
 empty files are kept. `.md`, `.markdown`, and `.txt` are text pages; other
 regular files are attachments.
 
+A hosted workspace board does not serve these transfer operations. There
+`wiki cp` exits with `not_implemented` and copies nothing; write each text page
+with `wiki put` and send each binary file with `wiki upload`.
+
 The command hashes the source and refuses symlinks, special files, and
 internal paths before it mutates the wiki. It prints the job id and digest
 before entry writes. Repeat the same source and `--resume JOB_ID` after an
