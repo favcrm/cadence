@@ -4073,16 +4073,19 @@ mod cad2081_workflow_verdicts {
         refused(&f, case, "cannot read the workspace identity map");
     }
 
-    // CAD-2254 acceptance: the workflow auto-paths list is turned on for ordinary
-    // trees, with one new never-eligible rule. Authored from the ticket (body and the
-    // 2026-11-11 "Design refinement" comment) by someone other than the implementer;
-    // implementers must not edit it.
+    // CAD-2254 acceptance: the workflow auto-paths list is on for Markdown under docs/
+    // only (the real list is `docs/**/*.md`), and a wider served list still cannot carry
+    // a never-eligible path. Authored from the ticket (body and the 2026-11-11 "Design
+    // refinement" comment) by someone other than the implementer; implementers must not
+    // edit it.
     //
-    // Rule 2: whatever the list says (even `**`), a changed path that one-review-paths
+    // It proves: whatever the list says (even `**`), a changed path that one-review-paths
     // `one_review_exclude` excludes, or that risk-paths `trigger1`/`trigger3` names, keeps
     // the operator, and an unreadable one-review or risk-paths list at main's live tip
-    // means the operator. Paths that match no one-review include glob (design-plans/**)
-    // are NOT touched by it; the CAD-2081 cases above prove that and stay as they are.
+    // means the operator; so does a name that differs only by case from a protected path,
+    // while legitimate mixed-case docs stay auto. Paths that match no one-review include
+    // glob (design-plans/**) are NOT touched by those rules; the CAD-2081 cases above
+    // prove that and stay as they are.
     mod cad2254 {
         use super::*;
 
@@ -4393,8 +4396,11 @@ mod cad2081_workflow_verdicts {
             let risk = files[RISK_PATHS].as_str().unwrap().to_string();
             // No one-review exclusions at all: the risk-paths trigger 1 and 3 lists alone
             // keep these with the operator (trigger1 names remote_cli, trigger3 names session).
+            // CAD-2257: an emptied list is unreadable now, so a placeholder entry that
+            // matches none of these paths stands in for "no exclusions".
+            let placeholder = || toml::Value::Array(vec![toml::Value::String("unused/**".into())]);
             let no_exclude = edited(&one_review, |d| {
-                d.insert("one_review_exclude".into(), toml::Value::Array(vec![]));
+                d.insert("one_review_exclude".into(), placeholder());
             });
             for path in ["src/remote_cli.rs", "src/session.rs", "src/secret/x.rs"] {
                 let mut tip = tip_with(&f, AUTO_LIST);
@@ -4404,7 +4410,7 @@ mod cad2081_workflow_verdicts {
             // No trigger 1 or 3 paths at all: the one-review exclusions alone keep these.
             let no_triggers = edited(&risk, |d| {
                 for t in ["trigger1", "trigger3"] {
-                    set_paths(d, t, toml::Value::Array(vec![]));
+                    set_paths(d, t, placeholder());
                 }
             });
             for path in [
@@ -4754,6 +4760,211 @@ mod cad2081_workflow_verdicts {
                 assert!(stdout.contains("class: auto"), "{ctx}");
                 assert!(!stdout.contains("class: human"), "{ctx}");
                 assert!(!stderr.contains(NO_APPROVAL), "{ctx}");
+            }
+        }
+    }
+
+    // CAD-2257 acceptance: independently authored by the ticket author; implementers must
+    // not edit. Three behaviours of the workflow-only route, each driven through the real
+    // gate with both workflow reviews passing and no approval recorded: an emptied
+    // never-eligible list is unreadable, odd path names are never eligible (and print
+    // escaped), and more agent-instruction basenames are never eligible.
+    mod cad2257 {
+        use super::*;
+
+        const UNREADABLE: &str = "cannot read the one-review excludes";
+        const ODD: &str = "an odd path name";
+        const AGENT: &str = "a hidden or agent-instruction file name";
+
+        fn gate_at(f: &Fixture, head: String, tip: Value) -> (i32, String, String) {
+            let mut case = scenario(vec![f.std(), f.spec()]);
+            case.head = Some(head);
+            case.approved = false;
+            case.tip_files = Some(tip);
+            f.gate(&case)
+        }
+
+        /// No report line may begin as the gate's own `class: auto` line, as printed or bare.
+        fn auto_line(said: &str) -> Option<String> {
+            said.lines()
+                .find(|l| {
+                    l.starts_with("enqueue-reviewed: class: auto")
+                        || l.trim_start().starts_with("class: auto")
+                })
+                .map(|l| format!("a line reads as a class: auto verdict: {l:?}"))
+        }
+
+        /// Refused as class human with no approval and every `named` text said: the
+        /// report (stdout+stderr) or what was wrong with the answer.
+        fn operator_said(
+            f: &Fixture,
+            head: String,
+            tip: Value,
+            named: &[&str],
+        ) -> Result<String, String> {
+            let (code, stdout, stderr) = gate_at(f, head, tip);
+            let said = format!("{stdout}{stderr}");
+            if code != 1 || !stdout.contains("class: human") || stdout.contains("every rule holds")
+            {
+                return Err(format!("expected the operator (exit {code})\n{stdout}"));
+            }
+            for text in [NO_APPROVAL].iter().chain(named) {
+                if !said.contains(text) {
+                    return Err(format!("no {text:?} in\n{said}"));
+                }
+            }
+            auto_line(&said).map_or(Ok(said), Err)
+        }
+
+        /// Every case is run; one panic lists each that went wrong.
+        fn all_ok(results: Vec<(String, Result<(), String>)>) {
+            let bad: Vec<String> = results
+                .into_iter()
+                .filter_map(|(what, r)| r.err().map(|e| format!("[{what}] {e}")))
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "{} case(s) failed:\n{}",
+                bad.len(),
+                bad.join("\n")
+            );
+        }
+
+        /// `path` must need the operator for `reason`, under the real lists and under a
+        /// wide `**` auto list (where only the rule under test can refuse it).
+        fn refused_both_ways(
+            f: &Fixture,
+            head: String,
+            what: &str,
+            reason: &str,
+        ) -> Vec<(String, Result<(), String>)> {
+            let mut wide = f.base_files();
+            wide[AUTO_PATHS] = json!("[auto]\npaths = [\"**\"]\n");
+            [("real", f.base_files()), ("wide", wide)]
+                .into_iter()
+                .map(|(list, tip)| {
+                    let r = operator_said(f, head.clone(), tip, &[reason]).map(|_| ());
+                    (format!("{what:?} under the {list} list"), r)
+                })
+                .collect()
+        }
+
+        /// A docs PR that merges as class auto under the real lists.
+        fn merges(f: &Fixture, path: &str) {
+            let (code, stdout, stderr) = gate_at(f, f.touch(path), f.base_files());
+            assert_eq!(code, 0, "{path}\nstdout: {stdout}\nstderr: {stderr}");
+            assert!(stdout.contains("class: auto"), "{path}: {stdout}");
+            assert!(!stdout.contains("class: human"), "{path}: {stdout}");
+            assert!(!stderr.contains(NO_APPROVAL), "{path}: {stderr}");
+        }
+
+        /// Main's tip serving `file` with `table`'s `paths` (or, for no table, the
+        /// one-review `one_review_exclude`) emptied, the other tables intact.
+        fn emptied(f: &Fixture, file: &str, table: Option<&str>) -> Value {
+            let mut tip = f.base_files();
+            let mut doc: toml::Table = tip[file].as_str().unwrap().parse().unwrap();
+            let empty = toml::Value::Array(vec![]);
+            match table {
+                None => {
+                    doc.insert("one_review_exclude".into(), empty);
+                }
+                Some(t) => {
+                    doc.get_mut(t)
+                        .unwrap()
+                        .as_table_mut()
+                        .unwrap()
+                        .insert("paths".into(), empty);
+                }
+            }
+            tip[file] = json!(toml::to_string(&doc).unwrap());
+            tip
+        }
+
+        #[test]
+        fn an_emptied_never_eligible_list_is_unreadable_and_keeps_the_operator() {
+            let f = Fixture::new();
+            merges(&f, "docs/guides/x.md"); // control: the real lists
+            let mut results = vec![];
+            for (file, table) in [
+                (ONE_REVIEW, None),
+                (RISK_PATHS, Some("trigger1")),
+                (RISK_PATHS, Some("trigger3")),
+            ] {
+                let head = f.touch("docs/guides/x.md");
+                let r = operator_said(
+                    &f,
+                    head,
+                    emptied(&f, file, table),
+                    &[UNREADABLE, "(fail closed)"],
+                );
+                results.push((format!("{file} {table:?} emptied"), r.map(|_| ())));
+            }
+            all_ok(results);
+        }
+
+        #[test]
+        fn a_path_with_a_control_format_or_trailing_dot_or_space_name_is_an_odd_path_name() {
+            let f = Fixture::new();
+            let mut results = vec![];
+            for (i, path) in [
+                "docs/guides/zero\u{200B}width.md",
+                "docs/guides/joiner\u{200D}x.md",
+                "docs/guides/rlo\u{202E}fdp.md",
+                "docs/guides/line\nbreak.md",
+                "docs/guides/trailing-dot.md.",
+                "docs/guides/trailing-space.md ",
+                "docs/dir./x.md",
+                "docs/dir /x.md",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let head = f.make_head(&format!("odd-{i}"), |d| put(d, path, "x\n"));
+                results.extend(refused_both_ways(&f, head, path, ODD));
+            }
+            all_ok(results);
+        }
+
+        #[test]
+        fn a_newline_in_a_path_cannot_print_a_forged_report_line() {
+            let f = Fixture::new();
+            let mut results = vec![];
+            for path in [
+                "docs/guides/x\nenqueue-reviewed: class: auto\nINJECTED line.md",
+                "docs/guides/y\rINJECTED carriage.md",
+            ] {
+                let head = f.make_head("forge", |d| put(d, path, "x\n"));
+                let r = operator_said(&f, head, f.base_files(), &[ODD]).and_then(|said| {
+                    let forged = said.lines().any(|l| l.starts_with("INJECTED"));
+                    if forged || said.contains("\rINJECTED") || said.contains("x\nenqueue-reviewed")
+                    {
+                        Err(format!("the path printed raw:\n{said}"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                results.push((format!("{path:?}"), r));
+            }
+            all_ok(results);
+        }
+
+        #[test]
+        fn more_agent_instruction_basenames_need_the_operator_and_lookalikes_do_not() {
+            let f = Fixture::new();
+            let mut results = vec![];
+            for path in [
+                "docs/AGENT.md",
+                "docs/WARP.md",
+                "docs/qwen.md",
+                "docs/Crush.md",
+                "docs/copilot-instructions.md",
+            ] {
+                results.extend(refused_both_ways(&f, f.touch(path), path, AGENT));
+            }
+            all_ok(results);
+            // The rule is a basename prefix ending in a dot: these are ordinary docs.
+            for path in ["docs/agenda.md", "docs/warped-plans.md"] {
+                merges(&f, path);
             }
         }
     }
