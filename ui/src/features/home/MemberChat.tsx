@@ -30,8 +30,14 @@ import { useBrowserFeed } from "../canvas/browserStore";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
+  AssistantBootstrapCard,
   AssistantFace,
+  postPersonalProfile,
+  toPersonalCompleteMutation,
+  toPersonalUpdateMutation,
   type AssistantActorValue,
+  type PersonalProfileSaveChange,
+  type PersonalProfileSaveResult,
 } from "../assistant/AssistantIdentity";
 import {
   displayName,
@@ -41,6 +47,8 @@ import {
   scopeDescriptor,
   type AvatarLook,
   type IdentityRead,
+  type PersonalProfileMutation,
+  type PersonalProfileOutcome,
 } from "../assistant/identity";
 
 /**
@@ -301,10 +309,56 @@ export default function MemberChat({
   );
 
   const identity = surface?.identity ?? LOADING_IDENTITY;
-  // CAD-1817: an avatar pick is an ordinary explicit chat request through
-  // the existing private send. It never writes profile state from the
-  // browser; the displayed look changes only after an authorized state
-  // refresh reads the committed `profile.look`.
+  const [resumingBootstrap, setResumingBootstrap] = useState(false);
+
+  const runProfileMutation = useCallback(
+    async (req: PersonalProfileMutation): Promise<PersonalProfileOutcome> => {
+      const outcome = await postPersonalProfile(req);
+      if (outcome.ok) {
+        setSurface((prev) => ({
+          ok: true,
+          bootstrap: outcome.bootstrap,
+          conversation: outcome.conversation ?? prev?.conversation ?? null,
+          alias: outcome.alias,
+          identity: { state: "ready", identity: outcome.identity },
+        }));
+      } else if (outcome.conflict) {
+        scheduleSurface(0);
+      }
+      return outcome;
+    },
+    [scheduleSurface],
+  );
+
+  const saveProfile = useCallback(
+    async (change: PersonalProfileSaveChange): Promise<PersonalProfileSaveResult> => {
+      const outcome = await runProfileMutation(toPersonalUpdateMutation(change));
+      if (!outcome.ok) return outcome;
+      return { ok: true, identity: outcome.identity };
+    },
+    [runProfileMutation],
+  );
+
+  const completeBootstrap = useCallback(
+    (input: { expected_revision: number; name?: string; look: AvatarLook }) =>
+      runProfileMutation(toPersonalCompleteMutation(input)),
+    [runProfileMutation],
+  );
+
+  const deferBootstrap = useCallback(
+    (expected_revision: number) => runProfileMutation({ expected_revision, action: "defer" }),
+    [runProfileMutation],
+  );
+
+  const resumeBootstrap = useCallback(async () => {
+    if (identity.state !== "ready" || resumingBootstrap) return;
+    setResumingBootstrap(true);
+    await runProfileMutation({ expected_revision: Number(identity.identity.revision), action: "resume" });
+    setResumingBootstrap(false);
+  }, [identity, resumingBootstrap, runProfileMutation]);
+
+  // CAD-1817: an avatar pick fallback through the existing private send
+  // when a board predates `POST /api/member-assistant/profile`.
   const requestLook = useCallback(
     async (look: AvatarLook) => {
       if (identity.state === "ready" && identity.identity.look === look) return { ok: true };
@@ -327,12 +381,11 @@ export default function MemberChat({
       scope: "personal",
       alias: surface?.alias ?? "",
       read: identity,
-      // A read-only board cannot send the chat request, so it offers no
-      // editor rather than a control whose only outcome is a refusal.
-      personal: readOnly ? null : { requestLook, pendingLook },
+      // A read-only board cannot mutate or send, so it offers no editor.
+      personal: readOnly ? null : { requestLook, pendingLook, saveProfile },
       workspace: null,
     }),
-    [surface?.alias, identity, requestLook, pendingLook, readOnly],
+    [surface?.alias, identity, requestLook, pendingLook, saveProfile, readOnly],
   );
 
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
@@ -342,6 +395,8 @@ export default function MemberChat({
   // actual successful refresh, and a pending send/discard cannot
   // produce it.
   const empty = loaded && history.error === undefined && items.length === 0;
+  const showBootstrapCard =
+    !readOnly && surface?.bootstrap === "pending" && identity.state === "ready";
 
   return (
     <AssistantActorProvider actor={actor}>
@@ -367,6 +422,16 @@ export default function MemberChat({
               <p className="assistant-scope">{scopeDescriptor("personal", t)}</p>
             </div>
             <div className="assistant-heading-actions">
+              {!readOnly && surface?.bootstrap === "deferred" && identity.state === "ready" && (
+                <button
+                  type="button"
+                  className="lnk text-label"
+                  disabled={resumingBootstrap}
+                  onClick={() => void resumeBootstrap()}
+                >
+                  {t("Finish setup")}
+                </button>
+              )}
               <AssistantAboutButton />
             </div>
           </div>
@@ -388,7 +453,14 @@ export default function MemberChat({
           )}
 
           <div className="chat-scroll min-h-0 flex-1 overflow-y-auto pt-3" ref={scrollRef} data-chat-scroll>
-            {empty && (
+            {showBootstrapCard && identity.state === "ready" && (
+              <AssistantBootstrapCard
+                identity={identity.identity}
+                onComplete={completeBootstrap}
+                onDefer={deferBootstrap}
+              />
+            )}
+            {empty && !showBootstrapCard && (
               <div className="chat-empty">
                 <p className="text-label text-ink-400">
                   {t("This is your private assistant — say hello to begin.")}

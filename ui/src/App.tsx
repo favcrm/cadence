@@ -1212,7 +1212,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             overviewHref={hrefFor({ screen: "overview" })}
             permissionsHref={hrefFor({ screen: "settings", section: "permissions" })}
             resolveAppPath={resolveAppPath}
-            setupNotice={<SetupNudge readOnly={meta ? boardReadOnly : null} />}
+            setupNotice={
+              <SetupNudge
+                readOnly={meta ? boardReadOnly : null}
+                hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
+              />
+            }
           />
         )}
         {screen === "overview" && (

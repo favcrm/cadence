@@ -31,9 +31,11 @@ import Composer from "./Composer";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
+  AssistantBootstrapCard,
   AssistantFace,
   useAssistantActor,
   useConversationActor,
+  useHostedPersonalBootstrap,
 } from "../assistant/AssistantIdentity";
 import { displayName, readConversationIdentity, scopeDescriptor } from "../assistant/identity";
 import type { AttachDestination } from "../app-shell/chat/attach";
@@ -1145,11 +1147,26 @@ function MasterHome({
     const receipt = await sendToMaster(text, newMessageId(), undefined, undefined, homeConversation);
     if (!receipt.ok) throw new Error(receipt.error);
   }, [readOnly, block, homeConversation, engage]);
+  const homePersonalRevision =
+    homeProjection?.scope === "personal" &&
+    homeProjection.identity !== null &&
+    typeof homeProjection.identity === "object" &&
+    "revision" in homeProjection.identity &&
+    typeof homeProjection.identity.revision === "number"
+      ? homeProjection.identity.revision
+      : null;
+  const personalBootstrap = useHostedPersonalBootstrap(
+    hosted === true && !readOnly && homeProjection?.scope === "personal",
+    homeConversation ?? null,
+    homePersonalRevision,
+  );
   const actor = useConversationActor(
     master,
     operator === true && !readOnly,
     homeConversation ?? null,
     readOnly || !!block || homeConversation === undefined ? null : sendPersonalRequest,
+    !readOnly,
+    personalBootstrap.identity,
   );
   const onRetrySend = useCallback(
     (
@@ -1442,6 +1459,10 @@ function MasterHome({
 
   const showNotStarted = status.kind === "absent" || status.kind === "stopped";
   const empty = loaded && !missing && items.length === 0;
+  const bootstrapCardIdentity =
+    !readOnly && actor.scope === "personal" && personalBootstrap.bootstrap === "pending"
+      ? personalBootstrap.identity ?? (actor.read.state === "ready" ? actor.read.identity : null)
+      : null;
 
   /** Ask master: a prefilled draft with the row's subject as refs —
    *  never sends; the operator reviews it in the composer. */
@@ -1508,12 +1529,25 @@ function MasterHome({
                 <span className={`chip chip-sans ${headerChip.tone}`} data-assistant-status>
                   {headerChip.label}
                 </span>
+                {actor.scope === "personal" && personalBootstrap.bootstrap === "pending" && (
+                  <span className="text-micro text-ink-500">{t("first-time setup")}</span>
+                )}
                 <MasterChips master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} />
                 <HeaderMenu master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} scope={scopeDescriptor(actor.scope, t)} />
               </div>
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
             <div className="assistant-heading-actions">
+              {!readOnly && actor.scope === "personal" && personalBootstrap.bootstrap === "deferred" && (
+                <button
+                  type="button"
+                  className="lnk text-label"
+                  disabled={personalBootstrap.resuming}
+                  onClick={() => void personalBootstrap.resume()}
+                >
+                  {t("Finish setup")}
+                </button>
+              )}
               <AssistantAboutButton />
             </div>
           </div>
@@ -1539,12 +1573,19 @@ function MasterHome({
             data-chat-scroll
           >
             <CloudContentNotice withheld={thread.data?.cloudWithheld} />
-            {thread.data?.cloudWithheld == null && showNotStarted && items.length === 0 && (
+            {thread.data?.cloudWithheld == null && bootstrapCardIdentity !== null && (
+              <AssistantBootstrapCard
+                identity={bootstrapCardIdentity}
+                onComplete={personalBootstrap.complete}
+                onDefer={personalBootstrap.defer}
+              />
+            )}
+            {thread.data?.cloudWithheld == null && showNotStarted && items.length === 0 && bootstrapCardIdentity === null && (
               <div className="chat-empty">
                 <NotStarted status={status} hosted={hosted} />
               </div>
             )}
-            {thread.data?.cloudWithheld == null && empty && !showNotStarted && (
+            {thread.data?.cloudWithheld == null && empty && !showNotStarted && bootstrapCardIdentity === null && (
               <div className="chat-empty">
                 <Examples onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))} disabled={!!block} />
               </div>
