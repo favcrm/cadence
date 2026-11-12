@@ -18,10 +18,16 @@ import { setupResource } from "./setupApi";
  * checks load or fail — a tailnet viewer's refused request included
  * (Home must not depend on them) — and on a read-only board.
  */
-export default function SetupNudge({ readOnly }: { readOnly: boolean | null }) {
-  // A read-only viewer is not the operator on the host: no checks, no
-  // link — and nothing is fetched before `/api/meta` says which it is.
-  return readOnly === false ? <Nudge /> : null;
+export default function SetupNudge({
+  readOnly,
+  hosted = false,
+}: {
+  readOnly: boolean | null;
+  hosted?: boolean | null;
+}) {
+  // A read-only viewer is not the operator on the host, and hosted boards
+  // manage setup on the platform (`GET /api/setup` answers 501 there).
+  return readOnly === false && hosted === false ? <Nudge /> : null;
 }
 
 function Nudge() {

@@ -217,6 +217,23 @@ export interface MemberAssistantIdentity {
   revision: number;
 }
 
+export type MemberAssistProfileAction = "update" | "complete" | "skip" | "defer" | "resume";
+
+/** CAD-2269 / AOS-570: `POST /api/member-assistant/profile` — zero-token
+ *  fenced update of the signed-in subject's personal assistant identity
+ *  (`name`, `look`) and `bootstrap_state` lifecycle. */
+export interface MemberAssistProfileRequest {
+  expected_revision: number;
+  action: MemberAssistProfileAction;
+  name?: string;
+  look?: AvatarLook;
+}
+
+export interface MemberAssistProfileResult extends MemberAssistState {
+  action: MemberAssistProfileAction;
+  applies: "next_turn";
+}
+
 /** `POST /api/master/identity` (CAD-1817): the proven operator's
  *  workspace-identity edit. Only the supplied fields change; an empty
  *  string clears `name`/`tone`. */
@@ -912,6 +929,10 @@ export const api = {
    *  assistant envelope server-side. Body is `{}`. */
   memberAssistState: () =>
     post<MemberAssistState>(`/api/member-assistant/state`, {}),
+  /** CAD-2269 / AOS-570: `POST /api/member-assistant/profile` — fenced
+   *  actor-bound personal identity and bootstrap lifecycle update. */
+  memberAssistProfileUpdate: (body: MemberAssistProfileRequest) =>
+    post<MemberAssistProfileResult>(`/api/member-assistant/profile`, body),
   /** `POST /api/member-assistant/history` — a page of the member's bound
    *  conversation. Positions are opaque; the binding owns the thread. */
   memberAssistHistory: (page: {

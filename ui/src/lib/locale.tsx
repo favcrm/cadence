@@ -2077,3 +2077,20 @@ Object.assign(zhTW, {
 Object.assign(zhTW, {
   "You have unsaved changes. Leave this page and discard your local edits?": "你有未儲存的變更。要離開此頁面並捨棄本機編輯內容嗎？",
 });
+
+// CAD-2269: minimal personal assistant first-entry setup and hosted profile edits.
+Object.assign(zhTW, {
+  "first-time setup": "首次設定",
+  "Name your assistant": "為你的個人助理命名",
+  "Private to you in this workspace.": "僅限你在此工作區內私人使用。",
+  "e.g. Nova": "例如 Nova",
+  "Skip for now": "暫時略過",
+  "Start with {name}": "以 {name} 開始",
+  "Save assistant": "儲存助理",
+  "Finish setup": "完成設定",
+  "Your assistant identity changed elsewhere. Reload before saving.": "你的助理身分已在別處變更。請重新載入後再儲存。",
+  "Your assistant identity changed elsewhere. Your draft has been kept. Reload before editing again.": "你的助理身分已在別處變更。草稿已保留，請重新載入後再編輯。",
+  "Private to you in this workspace. Ask in chat anytime to adjust how I communicate.": "僅限你在此工作區內私人使用。隨時可在對話中調整我的溝通方式。",
+  "Direct profile edits aren’t available on this board yet. Ask in chat to change my name.": "此看板尚未提供直接修改個人助理資料。請在對話中要求更改我的名稱。",
+  "Direct assistant setup isn’t available on this board yet. Say hello below to name your assistant.": "此看板尚未提供直接設定助理功能。請在下方打聲招呼來為你的助理命名。",
+});

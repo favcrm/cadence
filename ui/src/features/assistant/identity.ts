@@ -97,6 +97,89 @@ export function readPersonalIdentity(state: unknown): IdentityRead {
   }
 }
 
+export type PersonalProfileAction = "update" | "complete" | "skip" | "defer" | "resume";
+
+export interface PersonalProfileMutation {
+  expected_revision: number;
+  action: PersonalProfileAction;
+  name?: string;
+  look?: AvatarLook;
+}
+
+export type PersonalProfileOutcome =
+  | {
+      ok: true;
+      identity: IdentityRecord;
+      bootstrap: string | null;
+      conversation: string | null;
+      alias: string;
+    }
+  | {
+      ok: false;
+      unsupported?: true;
+      conflict?: true;
+      error: string;
+    };
+
+/** Read `assistant.bootstrap_state` from `POST /api/member-assistant/{state,profile}`. */
+export function readPersonalBootstrap(state: unknown): string | null {
+  if (state === null || typeof state !== "object" || !("assistant" in state)) return null;
+  const assistant = state.assistant;
+  if (assistant === null || typeof assistant !== "object" || !("bootstrap_state" in assistant)) return null;
+  return typeof assistant.bootstrap_state === "string" ? assistant.bootstrap_state : null;
+}
+
+/** Execute and validate one fenced personal-profile mutation. Malformed 200
+ *  payloads fail closed; 404/501 degrade cleanly when a board predates AOS-570;
+ *  409 marks revision/state conflicts so callers refresh committed state. */
+export async function mutatePersonalProfile(
+  send: (req: PersonalProfileMutation) => Promise<unknown>,
+  req: PersonalProfileMutation,
+): Promise<PersonalProfileOutcome> {
+  try {
+    const raw = await send(req);
+    if (raw === null || typeof raw !== "object" || !("applies" in raw) || raw.applies !== "next_turn") {
+      return { ok: false, error: "The saved assistant identity response was not recognized." };
+    }
+    const parsed = readPersonalIdentity(raw);
+    if (parsed.state !== "ready") {
+      return { ok: false, error: "The saved assistant identity response was not recognized." };
+    }
+    const assistant = "assistant" in raw && raw.assistant !== null && typeof raw.assistant === "object"
+      ? (raw.assistant as Record<string, unknown>)
+      : null;
+    const conversation = "conversation_id" in raw && typeof raw.conversation_id === "string"
+      ? raw.conversation_id
+      : null;
+    const alias = assistant !== null && typeof assistant.alias === "string" && assistant.alias.trim() !== ""
+      ? assistant.alias
+      : "assistant";
+    return {
+      ok: true,
+      identity: parsed.identity,
+      bootstrap: readPersonalBootstrap(raw),
+      conversation,
+      alias,
+    };
+  } catch (error) {
+    const status = error !== null && typeof error === "object" && "status" in error && typeof error.status === "number"
+      ? error.status
+      : null;
+    if (status === 404 || status === 501) {
+      return {
+        ok: false,
+        unsupported: true,
+        error: "Direct assistant setup isn’t available on this board yet. Say hello below to name your assistant.",
+      };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (status === 409) {
+      return { ok: false, conflict: true, error: message };
+    }
+    return { ok: false, error: message };
+  }
+}
+
 /** The workspace identity, read from the coordinator's own state. */
 export function readWorkspaceIdentity(master: unknown): IdentityRead {
   if (master === null || typeof master !== "object" || !("identity" in master)) return { state: "unavailable" };
