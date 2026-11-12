@@ -639,13 +639,14 @@ Use the exact revision returned by each corresponding read, not a guessed one.
 To create a new wiki page, pass the create-only sentinel `--if-rev none`, which
 refuses the write if the path already exists; to update an existing page, pass
 the revision returned by its read to avoid overwriting another writer.
-`wiki cp` is not served by a hosted board: it exits with `not_implemented` and
-copies nothing, so write pages one at a time with `wiki put` (text) or
-`wiki upload` (binary).
 Search results are discovery, not evidence:
 read the actual page and cite its canonical path and revision. Wiki and CLI
 scopes are separate, and the target path/project still has to be authorized.
 An issue `status=doing` update is not a local assignment claim or delivery.
+
+`wiki cp` is not served by a hosted board: it exits with `not_implemented` and
+copies nothing. Write pages one at a time with `wiki put` (text) or
+`wiki upload` (binary).
 
 To start the issue on the already connected local default agent, the person
 operating that machine explicitly runs:

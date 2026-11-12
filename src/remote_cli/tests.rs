@@ -260,13 +260,23 @@ fn wiki_cp_on_a_board_without_transfers_names_the_limit_and_what_works() {
         m.insert("transfer".into(), json!({ "op": op }));
         m
     };
-    for (verb, op, status, code) in [
+    for (verb, op, status, code, nothing) in [
         // local → wiki, into a new or an existing folder
-        ("write", "begin", 400, Some("invalid_request")),
+        ("write", "begin", 400, Some("invalid_request"), "copied"),
+        // the same, from a board that refuses the transfer by one stable code
+        ("write", "begin", 501, Some("not_implemented"), "copied"),
         // wiki → local
-        ("job_status", "export", 501, Some("not_implemented")),
-        // --resume and --wait-index
-        ("job_status", "status", 501, Some("not_implemented")),
+        (
+            "job_status",
+            "export",
+            501,
+            Some("not_implemented"),
+            "copied",
+        ),
+        // --resume reads the admitted job first
+        ("job_status", "status", 501, Some("not_implemented"), "read"),
+        // a 501 whose code this client does not know: the code is not echoed
+        ("job_status", "export", 501, Some("unknown_verb"), "copied"),
     ] {
         let error = wiki_copy_unserved(verb, status, code, &transfer(op)).unwrap();
         let text = error.to_string();
@@ -277,16 +287,30 @@ fn wiki_cp_on_a_board_without_transfers_names_the_limit_and_what_works() {
             text.contains("wiki put") && text.contains("wiki upload"),
             "{text}"
         );
-        assert!(text.contains(&status.to_string()), "{text}");
+        assert!(text.contains(&format!("HTTP {status}")), "{text}");
+        assert!(text.ends_with(&format!("Nothing was {nothing}")), "{text}");
         assert!(
             !text.contains("unknown") && !text.contains("retry"),
             "a healthy board must not read as an outage or an unrecognised refusal: {text}"
         );
     }
-    // A board that serves transfers answers 400 to a bad chunk: its own refusal.
-    assert!(
-        wiki_copy_unserved("write", 400, Some("invalid_request"), &transfer("chunk")).is_none()
-    );
+    // After `begin` was admitted a refusal is not proof that nothing moved, and
+    // a board that serves transfers answers 400 to a bad chunk: both keep the
+    // decoded refusal.
+    for (op, status, code) in [
+        ("chunk", 400, Some("invalid_request")),
+        ("chunk", 501, Some("not_implemented")),
+        ("apply", 501, Some("not_implemented")),
+        ("finish", 501, Some("not_implemented")),
+        ("begin", 400, Some("unknown_verb")),
+        ("begin", 400, None),
+        ("begin", 409, Some("path_conflict")),
+    ] {
+        assert!(
+            wiki_copy_unserved("write", status, code, &transfer(op)).is_none(),
+            "{op} {status} {code:?}"
+        );
+    }
     // A text `wiki put` carries no transfer and keeps its own refusals.
     let mut put = serde_json::Map::new();
     put.insert("path".into(), json!("projects/demo/notes/a.md"));
@@ -300,24 +324,24 @@ fn a_missing_wiki_page_on_a_hosted_board_is_named_by_code() {
     let error = message_family_refusal("read", 404, Some("not_found"), reject("generic"));
     assert_eq!(error.code(), Some("not_found"));
     let text = error.to_string();
-    assert!(text.contains("no page at that path"), "{text}");
+    assert!(text.contains("no readable page at that path"), "{text}");
     assert!(!text.contains("generic"), "{text}");
     // Another verb's 404 keeps the decoded refusal.
     let other = message_family_refusal("enumerate", 404, Some("not_found"), reject("generic"));
     assert!(other.to_string().contains("generic"));
 }
 
-/// CAD-2260: one wiki call against a fake board that answers every
-/// `/__platform/wiki/call` in the body shape the tenant board's `fail()` writes.
-/// Returns the refusal and the request paths the board saw.
+/// CAD-2260: one wiki call against a fake board that authorizes it and then
+/// refuses it in the body shape the tenant board's `fail()` writes. The board
+/// serves exactly those two requests. Returns the refusal and the paths it saw.
 fn wiki_call_refused(
     status_line: &'static str,
     code: &'static str,
     verb: &str,
     args: Value,
 ) -> (Error, Vec<String>) {
-    let (listener, paths, server) = upload_deadline_worker(move |path, socket, _raw| {
-        if path == "/__platform/wiki/authorize" {
+    let (listener, seen, server) = finite_worker(2, move |i, socket, _req| {
+        if i == 0 {
             upload_authorize_answer(socket);
         } else {
             write_answer(
@@ -340,8 +364,13 @@ fn wiki_call_refused(
         |_| {},
     );
     server.join().unwrap();
-    let seen = paths.lock().unwrap().clone();
-    (out.unwrap_err(), seen)
+    let paths = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.path.clone())
+        .collect();
+    (out.unwrap_err(), paths)
 }
 
 /// CAD-2260, through the request path: the requests `wiki cp` sends to a board

@@ -4343,9 +4343,10 @@ const PROFILE_WRITE_NOT_PERMITTED: &str = "defining or editing a profile is a li
 /// CAD-1568: actionable text for a verb's typed refusals, keyed on the
 /// container's bounded `error.code` — the raw `error.message` the route
 /// returns is never shown (a `cli_fail` body can carry arbitrary server
-/// text). Today it covers the `cli_message_*` family and CAD-1999's
-/// `project_new` registry refusals. Unknown or absent codes keep the
-/// generic decoded refusal unchanged.
+/// text). Today it covers the `cli_message_*` family, CAD-1999's
+/// `project_new` registry refusals and a wiki `read` of a missing path
+/// (CAD-2260). Unknown or absent codes keep the generic decoded refusal
+/// unchanged.
 fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Error) -> Error {
     let action: Option<(&'static str, &'static str)> = match (verb, code) {
         ("message_send", Some("recipient_class_unsupported")) => Some((
@@ -4489,18 +4490,19 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
              agent, service or ordinary-member credential cannot register \
              workspace structure",
         )),
-        // CAD-2260: the tenant board answers a wiki `read` of a missing path
-        // with `404 not_found`. The code is what `wiki cp` reads as "the
-        // destination is new".
-        ("read", Some("not_found")) => Some((
-            "not_found",
-            "this workspace's wiki has no page at that path for this login; nothing was read",
-        )),
         ("project_new", Some("invalid_request")) => Some((
             "invalid_request",
             "the project was refused at the request boundary — the key must be \
              1-32 lowercase letters, digits or hyphens, --name 1-200 bytes, and \
              --prefix 1-16 letters/digits starting with a letter; nothing was written",
+        )),
+        // CAD-2260: the tenant board answers a wiki `read` with `404
+        // not_found` for a missing path, and for a blob whose stored bytes are
+        // gone. The code is what `wiki cp` reads as "the destination is new".
+        ("read", Some("not_found")) => Some((
+            "not_found",
+            "this workspace's wiki has no readable page at that path for this login; nothing \
+             was read",
         )),
         _ => None,
     };
@@ -5343,9 +5345,14 @@ fn timeline_board_too_old(
 /// `job_status` with `501 not_implemented`, and refuses a `write` that carries
 /// `transfer` at its argument check with `400 invalid_request`. Neither is an
 /// outage or a mistake in the command, so say the board does not serve the
-/// copy and name the verbs it does serve. A board that serves transfers also
-/// answers 400 to a bad chunk or receipt, so a 400 only counts on `begin`,
-/// whose manifest this client checked before sending it.
+/// copy and name the verbs it does serve.
+///
+/// Only the first request of a copy counts: `begin` (an import), `export`, and
+/// the `status` a `--resume` reads first. A board that serves transfers also
+/// answers 400 to a bad chunk or receipt, and a refusal after `begin` was
+/// admitted is not proof that nothing moved, so `chunk`, `apply` and `finish`
+/// keep the decoded refusal. A 400 counts on `begin` alone, whose manifest this
+/// client checked before sending it.
 fn wiki_copy_unserved(
     verb: &str,
     status: u16,
@@ -5356,21 +5363,24 @@ fn wiki_copy_unserved(
         .get("transfer")
         .and_then(|transfer| transfer.get("op"))
         .and_then(Value::as_str)?;
-    if !matches!(verb, "write" | "job_status") {
-        return None;
-    }
-    let refused_shape =
-        status == 400 && matches!(code, Some("invalid_request" | "unknown_verb")) && op == "begin";
-    if status != 501 && !refused_shape {
-        return None;
-    }
+    let outcome = match (verb, op, status, code) {
+        ("write", "begin", 400, Some("invalid_request"))
+        | ("write", "begin", 501, _)
+        | ("job_status", "export", 501, _) => "copied",
+        ("job_status", "status", 501, _) => "read",
+        _ => return None,
+    };
+    // Echo only a code this client names itself, never other board text.
+    let shown = match code {
+        Some(known @ ("invalid_request" | "not_implemented")) => format!(", {known}"),
+        _ => String::new(),
+    };
     Some(Error::invalid(
         "not_implemented",
         format!(
-            "this workspace's board does not serve `wiki cp` (HTTP {status}{}). Copy one page \
-             at a time instead: `wiki put <path> --file <file>` writes a text page, `wiki \
-             upload` sends a binary file and `wiki cat` reads a page. Nothing was copied",
-            code.map_or(String::new(), |c| format!(", {c}"))
+            "this workspace's board does not serve `wiki cp` (HTTP {status}{shown}). Copy one \
+             page at a time instead: `wiki put <path> --file <file>` writes a text page, `wiki \
+             upload` sends a binary file and `wiki cat` reads a page. Nothing was {outcome}"
         ),
     ))
 }

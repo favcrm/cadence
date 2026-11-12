@@ -115,8 +115,8 @@ pub enum WikiAction {
     /// needs `--recursive`. `--update` pins current revisions and may
     /// replace bytes; the default is create-only. `--resume` continues
     /// one import job. `--wait-index` polls that job until the command
-    /// deadline. A hosted workspace board does not serve it: use `wiki put`
-    /// and `wiki upload` there.
+    /// deadline. Served by a local board. A hosted workspace (`--org`)
+    /// does not serve it: use `wiki put` and `wiki upload` there.
     Cp {
         source: String,
         dest: String,
