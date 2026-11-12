@@ -89,6 +89,7 @@ async function main() {
   await act(async () => {
     root.render(
       React.createElement(AssistantBootstrapCard, {
+        key: "supported",
         identity: initialIdentity,
         onComplete: async (input): Promise<PersonalProfileOutcome> => {
           completions.push(input);
@@ -153,6 +154,42 @@ async function main() {
     skipBtn.click();
   });
   assert(defers.length === 1 && defers[0] === 0, "Skip for now sends defer with current revision");
+
+  // 2b. Older-server 404/501 on Skip for now stays fail-closed (ok: false, pending, alert shown, controls disabled).
+  await act(async () => {
+    root.render(
+      React.createElement(AssistantBootstrapCard, {
+        key: "unsupported",
+        identity: initialIdentity,
+        onComplete: async (): Promise<PersonalProfileOutcome> => ({
+          ok: false,
+          unsupported: true,
+          error: "Direct assistant setup isn’t available on this board yet. Say hello below to name your assistant.",
+        }),
+        onDefer: async (): Promise<PersonalProfileOutcome> => ({
+          ok: false,
+          unsupported: true,
+          error: "Direct assistant setup isn’t available on this board yet. Say hello below to name your assistant.",
+        }),
+      }),
+    );
+  });
+  const unsupportedSkipBtn = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find(
+    (btn) => btn.textContent === "Skip for now",
+  );
+  assert(unsupportedSkipBtn !== undefined, "Skip for now button present on older-server card");
+  await act(async () => {
+    unsupportedSkipBtn.click();
+  });
+  assert(
+    host.querySelector("[data-assistant-bootstrap='pending']") !== null,
+    "404/501 defer keeps bootstrap pending rather than inventing deferred success",
+  );
+  assert(
+    host.querySelector("[role='alert']")?.textContent?.includes("Direct assistant setup isn’t available") === true,
+    "404/501 defer surfaces truthful unsupported alert",
+  );
+  assert(unsupportedSkipBtn.disabled, "404/501 defer disables retrying unsupported endpoint");
 
   // 3. Hosted AssistantAboutDialog saves Name + Avatar directly, and falls back to requestLook on 501.
   const chatLookRequests: AvatarLook[] = [];

@@ -32,6 +32,9 @@ import {
   AssistantActorProvider,
   AssistantBootstrapCard,
   AssistantFace,
+  postPersonalProfile,
+  toPersonalCompleteMutation,
+  toPersonalUpdateMutation,
   type AssistantActorValue,
   type PersonalProfileSaveChange,
   type PersonalProfileSaveResult,
@@ -40,11 +43,11 @@ import {
   displayName,
   messageLabel,
   messagePlaceholder,
-  mutatePersonalProfile,
   readPersonalIdentity,
   scopeDescriptor,
   type AvatarLook,
   type IdentityRead,
+  type PersonalProfileMutation,
   type PersonalProfileOutcome,
 } from "../assistant/identity";
 
@@ -306,11 +309,11 @@ export default function MemberChat({
   );
 
   const identity = surface?.identity ?? LOADING_IDENTITY;
-  const [bootstrapDismissed, setBootstrapDismissed] = useState(false);
   const [resumingBootstrap, setResumingBootstrap] = useState(false);
 
-  const applyProfileOutcome = useCallback(
-    (outcome: PersonalProfileOutcome) => {
+  const runProfileMutation = useCallback(
+    async (req: PersonalProfileMutation): Promise<PersonalProfileOutcome> => {
+      const outcome = await postPersonalProfile(req);
       if (outcome.ok) {
         setSurface((prev) => ({
           ok: true,
@@ -319,81 +322,40 @@ export default function MemberChat({
           alias: outcome.alias,
           identity: { state: "ready", identity: outcome.identity },
         }));
-        setBootstrapDismissed(false);
-        return;
+      } else if (outcome.conflict) {
+        scheduleSurface(0);
       }
-      if (outcome.conflict) scheduleSurface(0);
+      return outcome;
     },
     [scheduleSurface],
   );
 
   const saveProfile = useCallback(
     async (change: PersonalProfileSaveChange): Promise<PersonalProfileSaveResult> => {
-      const outcome = await mutatePersonalProfile(
-        (req) => api.memberAssistProfileUpdate(req),
-        {
-          expected_revision: change.expected_revision,
-          action: "update",
-          ...(change.name !== undefined ? { name: change.name ?? "" } : {}),
-          ...(change.look !== undefined ? { look: change.look } : {}),
-        },
-      );
-      applyProfileOutcome(outcome);
+      const outcome = await runProfileMutation(toPersonalUpdateMutation(change));
       if (!outcome.ok) return outcome;
       return { ok: true, identity: outcome.identity };
     },
-    [applyProfileOutcome],
+    [runProfileMutation],
   );
 
   const completeBootstrap = useCallback(
-    async (input: { expected_revision: number; name?: string; look: AvatarLook }): Promise<PersonalProfileOutcome> => {
-      const outcome = await mutatePersonalProfile(
-        (req) => api.memberAssistProfileUpdate(req),
-        {
-          expected_revision: input.expected_revision,
-          action: "complete",
-          ...(input.name !== undefined ? { name: input.name } : {}),
-          look: input.look,
-        },
-      );
-      applyProfileOutcome(outcome);
-      return outcome;
-    },
-    [applyProfileOutcome],
+    (input: { expected_revision: number; name?: string; look: AvatarLook }) =>
+      runProfileMutation(toPersonalCompleteMutation(input)),
+    [runProfileMutation],
   );
 
   const deferBootstrap = useCallback(
-    async (expected_revision: number): Promise<PersonalProfileOutcome> => {
-      const outcome = await mutatePersonalProfile(
-        (req) => api.memberAssistProfileUpdate(req),
-        { expected_revision, action: "defer" },
-      );
-      if (!outcome.ok && outcome.unsupported && identity.state === "ready") {
-        setBootstrapDismissed(true);
-        return {
-          ok: true,
-          identity: identity.identity,
-          bootstrap: "deferred",
-          conversation: surface?.conversation ?? null,
-          alias: surface?.alias ?? "assistant",
-        };
-      }
-      applyProfileOutcome(outcome);
-      return outcome;
-    },
-    [applyProfileOutcome, identity, surface?.conversation, surface?.alias],
+    (expected_revision: number) => runProfileMutation({ expected_revision, action: "defer" }),
+    [runProfileMutation],
   );
 
   const resumeBootstrap = useCallback(async () => {
     if (identity.state !== "ready" || resumingBootstrap) return;
     setResumingBootstrap(true);
-    const outcome = await mutatePersonalProfile(
-      (req) => api.memberAssistProfileUpdate(req),
-      { expected_revision: Number(identity.identity.revision), action: "resume" },
-    );
+    await runProfileMutation({ expected_revision: Number(identity.identity.revision), action: "resume" });
     setResumingBootstrap(false);
-    applyProfileOutcome(outcome);
-  }, [identity, resumingBootstrap, applyProfileOutcome]);
+  }, [identity, resumingBootstrap, runProfileMutation]);
 
   // CAD-1817: an avatar pick fallback through the existing private send
   // when a board predates `POST /api/member-assistant/profile`.
@@ -434,7 +396,7 @@ export default function MemberChat({
   // produce it.
   const empty = loaded && history.error === undefined && items.length === 0;
   const showBootstrapCard =
-    !readOnly && !bootstrapDismissed && surface?.bootstrap === "pending" && identity.state === "ready";
+    !readOnly && surface?.bootstrap === "pending" && identity.state === "ready";
 
   return (
     <AssistantActorProvider actor={actor}>
@@ -453,14 +415,14 @@ export default function MemberChat({
                 {surface?.ok === false && (
                   <span className="chip bg-warn/10 text-warn">{t("unavailable")}</span>
                 )}
-                {surface?.bootstrap === "pending" && !bootstrapDismissed && (
+                {surface?.bootstrap === "pending" && (
                   <span className="text-micro text-ink-500">{t("first-time setup")}</span>
                 )}
               </div>
               <p className="assistant-scope">{scopeDescriptor("personal", t)}</p>
             </div>
             <div className="assistant-heading-actions">
-              {!readOnly && !bootstrapDismissed && surface?.bootstrap === "deferred" && identity.state === "ready" && (
+              {!readOnly && surface?.bootstrap === "deferred" && identity.state === "ready" && (
                 <button
                   type="button"
                   className="lnk text-label"

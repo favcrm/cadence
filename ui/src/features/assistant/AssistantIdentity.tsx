@@ -53,6 +53,7 @@ import {
   type IdentityRead,
   type ConversationIdentityRead,
   type IdentityRecord,
+  type PersonalProfileMutation,
   type PersonalProfileOutcome,
 } from "./identity";
 import "./assistant-identity.css";
@@ -66,6 +67,32 @@ export type PersonalProfileSaveChange = {
 export type PersonalProfileSaveResult =
   | { ok: true; identity: IdentityRecord }
   | { ok: false; unsupported?: true; conflict?: true; error: string };
+
+export function postPersonalProfile(req: PersonalProfileMutation): Promise<PersonalProfileOutcome> {
+  return mutatePersonalProfile((body) => api.memberAssistProfileUpdate(body), req);
+}
+
+export function toPersonalUpdateMutation(change: PersonalProfileSaveChange): PersonalProfileMutation {
+  return {
+    expected_revision: change.expected_revision,
+    action: "update",
+    ...(change.name !== undefined ? { name: change.name ?? "" } : {}),
+    ...(change.look !== undefined ? { look: change.look } : {}),
+  };
+}
+
+export function toPersonalCompleteMutation(input: {
+  expected_revision: number;
+  name?: string;
+  look: AvatarLook;
+}): PersonalProfileMutation {
+  return {
+    expected_revision: input.expected_revision,
+    action: "complete",
+    ...(input.name !== undefined ? { name: input.name } : {}),
+    look: input.look,
+  };
+}
 
 /** Personal identity controls. Hosted boards carry `saveProfile` (`POST /api/member-assistant/profile`);
  *  native boards (or boards predating AOS-570) use `requestLook` chat turns.
@@ -196,15 +223,7 @@ export function useConversationActor(
         return { ok: false, error: "The saved assistant identity could not be read." };
       }
       const before = String(change.expected_revision);
-      const outcome = await mutatePersonalProfile(
-        (req) => api.memberAssistProfileUpdate(req),
-        {
-          expected_revision: change.expected_revision,
-          action: "update",
-          ...(change.name !== undefined ? { name: change.name ?? "" } : {}),
-          ...(change.look !== undefined ? { look: change.look } : {}),
-        },
-      );
+      const outcome = await postPersonalProfile(toPersonalUpdateMutation(change));
       void source.refresh();
       if (source !== resources.masterState) void resources.masterState.refresh();
       if (!outcome.ok) return outcome;
@@ -502,7 +521,6 @@ export function useHostedPersonalBootstrap(
     scope: string;
     bootstrap: string | null;
     identity: IdentityRecord | null;
-    dismissed: boolean;
   } | null>(null);
   const [resuming, setResuming] = useState(false);
   const gate = useRef<{ inflight: boolean; again: boolean; scope: string }>({
@@ -533,12 +551,11 @@ export function useHostedPersonalBootstrap(
         if (!alive.current || gate.current.scope !== scopeKey) return;
         const parsed = readPersonalIdentity(next);
         const bootstrap = readPersonalBootstrap(next);
-        setState((prev) => ({
+        setState({
           scope: scopeKey,
           bootstrap,
           identity: parsed.state === "ready" ? parsed.identity : null,
-          dismissed: prev?.scope === scopeKey ? prev.dismissed : false,
-        }));
+        });
       })
       .catch(() => undefined)
       .finally(() => {
@@ -563,23 +580,14 @@ export function useHostedPersonalBootstrap(
     load();
   }, [enabled, load, observedRevision]);
 
-  const complete = useCallback(
-    async (input: { expected_revision: number; name?: string; look: AvatarLook }): Promise<PersonalProfileOutcome> => {
-      const outcome = await mutatePersonalProfile(
-        (req) => api.memberAssistProfileUpdate(req),
-        {
-          expected_revision: input.expected_revision,
-          action: "complete",
-          ...(input.name !== undefined ? { name: input.name } : {}),
-          look: input.look,
-        },
-      );
+  const runMutation = useCallback(
+    async (req: PersonalProfileMutation): Promise<PersonalProfileOutcome> => {
+      const outcome = await postPersonalProfile(req);
       if (outcome.ok) {
         setState({
           scope: scopeKey,
           bootstrap: outcome.bootstrap,
           identity: outcome.identity,
-          dismissed: false,
         });
         refreshMaster();
         return outcome;
@@ -593,65 +601,27 @@ export function useHostedPersonalBootstrap(
     [scopeKey, refreshMaster, load],
   );
 
+  const complete = useCallback(
+    (input: { expected_revision: number; name?: string; look: AvatarLook }) =>
+      runMutation(toPersonalCompleteMutation(input)),
+    [runMutation],
+  );
+
   const defer = useCallback(
-    async (expected_revision: number): Promise<PersonalProfileOutcome> => {
-      const outcome = await mutatePersonalProfile(
-        (req) => api.memberAssistProfileUpdate(req),
-        { expected_revision, action: "defer" },
-      );
-      if (outcome.ok) {
-        setState({
-          scope: scopeKey,
-          bootstrap: outcome.bootstrap,
-          identity: outcome.identity,
-          dismissed: false,
-        });
-        refreshMaster();
-        return outcome;
-      }
-      if (outcome.unsupported && current?.identity) {
-        setState({ ...current, dismissed: true });
-        return {
-          ok: true,
-          identity: current.identity,
-          bootstrap: "deferred",
-          conversation,
-          alias: "assistant",
-        };
-      }
-      if (outcome.conflict) {
-        load();
-        refreshMaster();
-      }
-      return outcome;
-    },
-    [scopeKey, current, conversation, refreshMaster, load],
+    (expected_revision: number) => runMutation({ expected_revision, action: "defer" }),
+    [runMutation],
   );
 
   const resume = useCallback(async () => {
     if (current === null || current.identity === null || resuming) return;
     setResuming(true);
-    const outcome = await mutatePersonalProfile(
-      (req) => api.memberAssistProfileUpdate(req),
-      { expected_revision: Number(current.identity.revision), action: "resume" },
-    );
+    await runMutation({ expected_revision: Number(current.identity.revision), action: "resume" });
     setResuming(false);
-    if (outcome.ok) {
-      setState({
-        scope: scopeKey,
-        bootstrap: outcome.bootstrap,
-        identity: outcome.identity,
-        dismissed: false,
-      });
-      refreshMaster();
-      return;
-    }
-    if (outcome.conflict) load();
-  }, [current, resuming, scopeKey, refreshMaster, load]);
+  }, [current, resuming, runMutation]);
 
   return useMemo<HostedPersonalBootstrap>(
     () => ({
-      bootstrap: current === null || current.dismissed ? null : current.bootstrap,
+      bootstrap: current?.bootstrap ?? null,
       identity: current?.identity ?? null,
       resuming,
       complete,
@@ -683,6 +653,7 @@ export function AssistantBootstrapCard({
   const [name, setName] = useState(identity.name ?? "");
   const [look, setLook] = useState<AvatarLook>(identity.look);
   const [busy, setBusy] = useState<"complete" | "defer" | null>(null);
+  const [unsupported, setUnsupported] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const trimmed = name.trim();
@@ -699,7 +670,7 @@ export function AssistantBootstrapCard({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (busy !== null || stale) return;
+    if (busy !== null || stale || unsupported) return;
     setBusy("complete");
     setError(null);
     const outcome = await onComplete({
@@ -708,16 +679,22 @@ export function AssistantBootstrapCard({
       look,
     });
     setBusy(null);
-    if (!outcome.ok) setError(t(outcome.error));
+    if (!outcome.ok) {
+      if (outcome.unsupported) setUnsupported(true);
+      setError(t(outcome.error));
+    }
   };
 
   const skip = async () => {
-    if (busy !== null) return;
+    if (busy !== null || unsupported) return;
     setBusy("defer");
     setError(null);
     const outcome = await onDefer(Number(identity.revision));
     setBusy(null);
-    if (!outcome.ok) setError(t(outcome.error));
+    if (!outcome.ok) {
+      if (outcome.unsupported) setUnsupported(true);
+      setError(t(outcome.error));
+    }
   };
 
   return (
@@ -739,7 +716,7 @@ export function AssistantBootstrapCard({
       </div>
 
       <form className="assistant-edit" onSubmit={(event) => void submit(event)}>
-        <fieldset className="assistant-looks" disabled={busy !== null}>
+        <fieldset className="assistant-looks" disabled={busy !== null || unsupported}>
           <legend className="text-label text-ink-300">{t("Avatar")}</legend>
           <div className="assistant-look-grid">
             {AVATAR_LOOKS.map((option) => (
@@ -768,7 +745,7 @@ export function AssistantBootstrapCard({
               className="field"
               value={name}
               maxLength={80}
-              disabled={busy !== null}
+              disabled={busy !== null || unsupported}
               autoComplete="off"
               placeholder={t("e.g. Nova")}
               onChange={(event) => setName(event.target.value)}
@@ -781,7 +758,7 @@ export function AssistantBootstrapCard({
                 type="button"
                 className="chip assistant-name-chip"
                 aria-pressed={trimmed === preset}
-                disabled={busy !== null}
+                disabled={busy !== null || unsupported}
                 onClick={() => setName(preset)}
               >
                 {preset}
@@ -799,7 +776,7 @@ export function AssistantBootstrapCard({
               <Button
                 type="button"
                 size="sm"
-                disabled={busy !== null}
+                disabled={busy !== null || unsupported}
                 onClick={() => {
                   setBase(identity);
                   setName(identity.name ?? "");
@@ -825,7 +802,7 @@ export function AssistantBootstrapCard({
             size="sm"
             variant="ghost"
             loading={busy === "defer"}
-            disabled={busy !== null}
+            disabled={busy !== null || unsupported}
             onClick={() => void skip()}
           >
             {t("Skip for now")}
@@ -835,7 +812,7 @@ export function AssistantBootstrapCard({
             size="sm"
             variant="primary"
             loading={busy === "complete"}
-            disabled={busy !== null || stale}
+            disabled={busy !== null || stale || unsupported}
           >
             {busy === "complete"
               ? t("Saving…")
@@ -970,7 +947,7 @@ function PersonalIdentityEditor({
         onUnsupported(look !== base.look ? look : null);
         return;
       }
-      setError(result.error);
+      setError(t(result.error));
       return;
     }
     setBase(result.identity);

@@ -217,7 +217,7 @@ export interface MemberAssistantIdentity {
   revision: number;
 }
 
-export type MemberAssistProfileAction = "update" | "complete" | "skip" | "defer" | "resume";
+export type MemberAssistProfileAction = "update" | "complete" | "defer" | "resume";
 
 /** CAD-2269 / AOS-570: `POST /api/member-assistant/profile` — zero-token
  *  fenced update of the signed-in subject's personal assistant identity

@@ -2093,4 +2093,6 @@ Object.assign(zhTW, {
   "Private to you in this workspace. Ask in chat anytime to adjust how I communicate.": "僅限你在此工作區內私人使用。隨時可在對話中調整我的溝通方式。",
   "Direct profile edits aren’t available on this board yet. Ask in chat to change my name.": "此看板尚未提供直接修改個人助理資料。請在對話中要求更改我的名稱。",
   "Direct assistant setup isn’t available on this board yet. Say hello below to name your assistant.": "此看板尚未提供直接設定助理功能。請在下方打聲招呼來為你的助理命名。",
+  "The saved assistant identity response was not recognized.": "無法識別已儲存的個人助理身分回應。",
+  "The saved assistant identity could not be read.": "無法讀取已儲存的個人助理身分。",
 });

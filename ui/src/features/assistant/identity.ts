@@ -97,7 +97,7 @@ export function readPersonalIdentity(state: unknown): IdentityRead {
   }
 }
 
-export type PersonalProfileAction = "update" | "complete" | "skip" | "defer" | "resume";
+export type PersonalProfileAction = "update" | "complete" | "defer" | "resume";
 
 export interface PersonalProfileMutation {
   expected_revision: number;
