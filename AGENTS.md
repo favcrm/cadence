@@ -257,13 +257,12 @@ the code you just wrote.
   operator's approval, and workflow rows only satisfy its two reviews. No
   code is listed: the path lists are not a complete map of sensitive code.
   Adding a path is one reviewed line and a deliberate decision, made only
-  after reading what the path holds. Whatever the list says, four kinds of
-  path are never eligible: a path with a segment starting with `.`; a
-  basename starting `agents.`, `claude.` or `gemini.`; a path that
-  `docs/roles/one-review-paths.toml` excludes or that is on risk-paths
-  trigger 1 or 3 (the trust-boundary, identity, secret and UI trees); and a
-  name that differs only by case from a protected path. If either of those
-  two lists cannot be read, every path needs the operator.
+  after reading what the path holds. Whatever the list says, some paths are
+  never eligible (hidden, agent-instruction and odd names, the one-review
+  excludes, the trigger 1 and 3 trees, and case variants of protected
+  paths), and an unreadable or emptied list means the operator:
+  `docs/roles/risk-classes.md` trigger 7 states the rule and
+  `workflow_auto_reasons` in `scripts/enqueue-reviewed` enforces it.
   `cadence delivery requirements` does not report this rule; the
   script adds it. Rule-7 paths, the size trigger and a non-`auto` `Risk:` also
   force the operator. A workflow row that is not a pass refuses in every class.

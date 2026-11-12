@@ -1,10 +1,10 @@
 # CAD-957: the ALLOWLIST of paths whose PRs need ONE fresh-session review
 # (standards + spec). Read by AGENTS.md "Review" and by scripts (CAD-959).
 # Changing this file is class `human` (risk-classes.md trigger 7).
-# CAD-2254: `one_review_exclude` also decides which paths a workflow review can
-# never carry to merge without the operator (docs/roles/risk-classes.md trigger 7),
-# so removing an exclude widens that too, and an empty list counts as unreadable
-# there (CAD-2257).
+# CAD-2254: `one_review_exclude` also names paths that neither a workflow review
+# nor a ticket scope approval can carry to merge without the operator's per-head
+# approval (docs/roles/risk-classes.md trigger 7), so removing an exclude widens
+# those routes too, and an empty list counts as unreadable on both (CAD-2257).
 #
 # Match semantics (a script must implement exactly this):
 # - Diff source: `git diff --raw -z --no-renames <merge-base> <head>` (two-dot).
