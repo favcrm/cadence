@@ -1,0 +1,584 @@
+{
+  "description": "AOS-566: what the Cadence client sends for `wiki cp` (import then export) and what the tenant board answers. Synthetic data only. `envelope` is omitted: each request is preceded by an authorize call.",
+  "version": "hosted-cadence-wiki.v1",
+  "steps": [
+    {
+      "label": "import: discover",
+      "action": "read",
+      "arguments": {
+        "path": "projects/fixture",
+        "offset": 0,
+        "bytes": 0
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "not_found",
+            "message": "Tenant remote call refused."
+          }
+        }
+      }
+    },
+    {
+      "label": "import: begin",
+      "action": "write",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "begin",
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "manifest": {
+            "version": 1,
+            "source_id": "25f562c91509c97aef3d355d2e7e3bb192f523ca3741e1b4797f5517b33158f8",
+            "root": "projects/fixture",
+            "entries": [
+              {
+                "id": "8bf729ffe074caee622c02928173467e658e19e28233cff8a445819e3cae4d50",
+                "path": "assets",
+                "kind": "dir",
+                "size": 0,
+                "sha256": null,
+                "if_rev": "none"
+              },
+              {
+                "id": "e6ec43ea0e8d635228ef55f479c31345fe038e77f8e78e0ad7e9280bd9899a73",
+                "path": "assets/data.pdf",
+                "kind": "blob",
+                "size": 70,
+                "sha256": "863237bf008155938df5ebdca631d267a7418b20e5f5aa423c01c47057cf543e",
+                "if_rev": "none"
+              },
+              {
+                "id": "754b6dc3f8728b1991298d8359218165de3ef7439963168565aaaaf7a99b3edd",
+                "path": "notes.md",
+                "kind": "text",
+                "size": 31,
+                "sha256": "165eb9745343fb1f2b24e6fcd06b535a983a2277b4baeddeea5bc415cce5fbf9",
+                "if_rev": "none"
+              }
+            ]
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "digest": "10ba8eb8f69b768eb9762ba66ec4374e78596fc8d1d3e9d4b0ef2702e4d74a43",
+          "root": "projects/fixture",
+          "source_id": "25f562c91509c97aef3d355d2e7e3bb192f523ca3741e1b4797f5517b33158f8",
+          "state": "open",
+          "entries": 3
+        }
+      }
+    },
+    {
+      "label": "import: status",
+      "action": "job_status",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "status",
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "root": "projects/fixture",
+          "offset": 0,
+          "limit": 32
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "digest": "10ba8eb8f69b768eb9762ba66ec4374e78596fc8d1d3e9d4b0ef2702e4d74a43",
+          "source_id": "25f562c91509c97aef3d355d2e7e3bb192f523ca3741e1b4797f5517b33158f8",
+          "root": "projects/fixture",
+          "state": "open",
+          "index": "pending",
+          "entries": [
+            {
+              "entry_id": "8bf729ffe074caee622c02928173467e658e19e28233cff8a445819e3cae4d50",
+              "path": "assets",
+              "full_path": "projects/fixture/assets",
+              "kind": "dir",
+              "size": 0,
+              "sha256": null,
+              "received": 0,
+              "outcome": "pending",
+              "manifest_entry": {
+                "id": "8bf729ffe074caee622c02928173467e658e19e28233cff8a445819e3cae4d50",
+                "path": "assets",
+                "kind": "dir",
+                "size": 0,
+                "sha256": null,
+                "if_rev": "none"
+              },
+              "extraction": "not_applicable"
+            },
+            {
+              "entry_id": "e6ec43ea0e8d635228ef55f479c31345fe038e77f8e78e0ad7e9280bd9899a73",
+              "path": "assets/data.pdf",
+              "full_path": "projects/fixture/assets/data.pdf",
+              "kind": "blob",
+              "size": 70,
+              "sha256": "863237bf008155938df5ebdca631d267a7418b20e5f5aa423c01c47057cf543e",
+              "received": 0,
+              "outcome": "pending",
+              "manifest_entry": {
+                "id": "e6ec43ea0e8d635228ef55f479c31345fe038e77f8e78e0ad7e9280bd9899a73",
+                "path": "assets/data.pdf",
+                "kind": "blob",
+                "size": 70,
+                "sha256": "863237bf008155938df5ebdca631d267a7418b20e5f5aa423c01c47057cf543e",
+                "if_rev": "none"
+              },
+              "extraction": "not_applicable"
+            },
+            {
+              "entry_id": "754b6dc3f8728b1991298d8359218165de3ef7439963168565aaaaf7a99b3edd",
+              "path": "notes.md",
+              "full_path": "projects/fixture/notes.md",
+              "kind": "text",
+              "size": 31,
+              "sha256": "165eb9745343fb1f2b24e6fcd06b535a983a2277b4baeddeea5bc415cce5fbf9",
+              "received": 0,
+              "outcome": "pending",
+              "manifest_entry": {
+                "id": "754b6dc3f8728b1991298d8359218165de3ef7439963168565aaaaf7a99b3edd",
+                "path": "notes.md",
+                "kind": "text",
+                "size": 31,
+                "sha256": "165eb9745343fb1f2b24e6fcd06b535a983a2277b4baeddeea5bc415cce5fbf9",
+                "if_rev": "none"
+              },
+              "extraction": "not_applicable"
+            }
+          ],
+          "next_offset": null
+        }
+      }
+    },
+    {
+      "label": "import: apply",
+      "action": "write",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "apply",
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "root": "projects/fixture",
+          "entry_id": "8bf729ffe074caee622c02928173467e658e19e28233cff8a445819e3cae4d50"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "entry_id": "8bf729ffe074caee622c02928173467e658e19e28233cff8a445819e3cae4d50",
+          "path": "projects/fixture/assets",
+          "outcome": "applied",
+          "extraction": "not_applicable"
+        }
+      }
+    },
+    {
+      "label": "import: chunk",
+      "action": "write",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "chunk",
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "root": "projects/fixture",
+          "entry_id": "e6ec43ea0e8d635228ef55f479c31345fe038e77f8e78e0ad7e9280bd9899a73",
+          "offset": 0,
+          "data_base64": "JVBERi0xLjQKMSAwIG9iaiA8PCAvVHlwZSAvQ2F0YWxvZyA+PiBlbmRvYmoKJSBhb3M1NjYgc3ludGhldGljCiUlRU9GCg=="
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "entry_id": "e6ec43ea0e8d635228ef55f479c31345fe038e77f8e78e0ad7e9280bd9899a73",
+          "received": 70,
+          "size": 70
+        }
+      }
+    },
+    {
+      "label": "import: apply",
+      "action": "write",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "apply",
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "root": "projects/fixture",
+          "entry_id": "e6ec43ea0e8d635228ef55f479c31345fe038e77f8e78e0ad7e9280bd9899a73"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "entry_id": "e6ec43ea0e8d635228ef55f479c31345fe038e77f8e78e0ad7e9280bd9899a73",
+          "path": "projects/fixture/assets/data.pdf",
+          "outcome": "applied",
+          "extraction": "pending",
+          "rev": "863237bf008155938df5ebdca631d267a7418b20e5f5aa423c01c47057cf543e"
+        }
+      }
+    },
+    {
+      "label": "import: chunk",
+      "action": "write",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "chunk",
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "root": "projects/fixture",
+          "entry_id": "754b6dc3f8728b1991298d8359218165de3ef7439963168565aaaaf7a99b3edd",
+          "offset": 0,
+          "data_base64": "IyBOb3RlcwpzeW50aGV0aWMgZml4dHVyZSBwYWdlCg=="
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "entry_id": "754b6dc3f8728b1991298d8359218165de3ef7439963168565aaaaf7a99b3edd",
+          "received": 31,
+          "size": 31
+        }
+      }
+    },
+    {
+      "label": "import: apply",
+      "action": "write",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "apply",
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "root": "projects/fixture",
+          "entry_id": "754b6dc3f8728b1991298d8359218165de3ef7439963168565aaaaf7a99b3edd"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "entry_id": "754b6dc3f8728b1991298d8359218165de3ef7439963168565aaaaf7a99b3edd",
+          "path": "projects/fixture/notes.md",
+          "outcome": "applied",
+          "extraction": "indexed",
+          "rev": "165eb9745343fb1f2b24e6fcd06b535a983a2277b4baeddeea5bc415cce5fbf9"
+        }
+      }
+    },
+    {
+      "label": "import: finish",
+      "action": "write",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "finish",
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "root": "projects/fixture"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "digest": "10ba8eb8f69b768eb9762ba66ec4374e78596fc8d1d3e9d4b0ef2702e4d74a43",
+          "root": "projects/fixture",
+          "state": "complete",
+          "index": "pending"
+        }
+      }
+    },
+    {
+      "label": "export: discover",
+      "action": "read",
+      "arguments": {
+        "path": "projects/fixture",
+        "offset": 0,
+        "bytes": 0
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "kind": "dir",
+          "path": "projects/fixture"
+        }
+      }
+    },
+    {
+      "label": "export: directory page",
+      "action": "job_status",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "export",
+          "path": "projects/fixture",
+          "offset": 0,
+          "bytes": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "path": "projects/fixture",
+          "kind": "dir",
+          "entries": [
+            {
+              "path": "projects/fixture/assets",
+              "name": "assets",
+              "kind": "dir",
+              "rev": null,
+              "size": 0,
+              "sha256": null
+            },
+            {
+              "path": "projects/fixture/notes.md",
+              "name": "notes.md",
+              "kind": "text",
+              "rev": "165eb9745343fb1f2b24e6fcd06b535a983a2277b4baeddeea5bc415cce5fbf9",
+              "size": 31,
+              "sha256": "165eb9745343fb1f2b24e6fcd06b535a983a2277b4baeddeea5bc415cce5fbf9"
+            }
+          ],
+          "next_offset": null
+        }
+      }
+    },
+    {
+      "label": "export: probe",
+      "action": "job_status",
+      "arguments": {
+        "path": "projects/fixture/notes.md",
+        "transfer": {
+          "op": "export",
+          "path": "projects/fixture/notes.md",
+          "offset": 0,
+          "bytes": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "path": "projects/fixture/notes.md",
+          "kind": "text",
+          "rev": "165eb9745343fb1f2b24e6fcd06b535a983a2277b4baeddeea5bc415cce5fbf9",
+          "size": 31,
+          "sha256": "165eb9745343fb1f2b24e6fcd06b535a983a2277b4baeddeea5bc415cce5fbf9",
+          "offset": 0,
+          "data_base64": "Iw==",
+          "next_offset": 1
+        }
+      }
+    },
+    {
+      "label": "export: slice",
+      "action": "job_status",
+      "arguments": {
+        "path": "projects/fixture/notes.md",
+        "transfer": {
+          "op": "export",
+          "path": "projects/fixture/notes.md",
+          "offset": 0,
+          "bytes": 31,
+          "rev": "165eb9745343fb1f2b24e6fcd06b535a983a2277b4baeddeea5bc415cce5fbf9"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "path": "projects/fixture/notes.md",
+          "kind": "text",
+          "rev": "165eb9745343fb1f2b24e6fcd06b535a983a2277b4baeddeea5bc415cce5fbf9",
+          "size": 31,
+          "sha256": "165eb9745343fb1f2b24e6fcd06b535a983a2277b4baeddeea5bc415cce5fbf9",
+          "offset": 0,
+          "data_base64": "IyBOb3RlcwpzeW50aGV0aWMgZml4dHVyZSBwYWdlCg==",
+          "next_offset": null
+        }
+      }
+    },
+    {
+      "label": "export: probe",
+      "action": "job_status",
+      "arguments": {
+        "path": "projects/fixture/assets/data.pdf",
+        "transfer": {
+          "op": "export",
+          "path": "projects/fixture/assets/data.pdf",
+          "offset": 0,
+          "bytes": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "path": "projects/fixture/assets/data.pdf",
+          "kind": "blob",
+          "rev": "863237bf008155938df5ebdca631d267a7418b20e5f5aa423c01c47057cf543e",
+          "size": 70,
+          "sha256": "863237bf008155938df5ebdca631d267a7418b20e5f5aa423c01c47057cf543e",
+          "offset": 0,
+          "data_base64": "JQ==",
+          "next_offset": 1
+        }
+      }
+    },
+    {
+      "label": "export: slice",
+      "action": "job_status",
+      "arguments": {
+        "path": "projects/fixture/assets/data.pdf",
+        "transfer": {
+          "op": "export",
+          "path": "projects/fixture/assets/data.pdf",
+          "offset": 0,
+          "bytes": 70,
+          "rev": "863237bf008155938df5ebdca631d267a7418b20e5f5aa423c01c47057cf543e"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "path": "projects/fixture/assets/data.pdf",
+          "kind": "blob",
+          "rev": "863237bf008155938df5ebdca631d267a7418b20e5f5aa423c01c47057cf543e",
+          "size": 70,
+          "sha256": "863237bf008155938df5ebdca631d267a7418b20e5f5aa423c01c47057cf543e",
+          "offset": 0,
+          "data_base64": "JVBERi0xLjQKMSAwIG9iaiA8PCAvVHlwZSAvQ2F0YWxvZyA+PiBlbmRvYmoKJSBhb3M1NjYgc3ludGhldGljCiUlRU9GCg==",
+          "next_offset": null
+        }
+      }
+    },
+    {
+      "label": "refusal: the job id is bound to another manifest",
+      "action": "write",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "begin",
+          "job_id": "00000000-0000-4000-8000-000000000900",
+          "manifest": {
+            "version": 1,
+            "source_id": "25f562c91509c97aef3d355d2e7e3bb192f523ca3741e1b4797f5517b33158f8",
+            "root": "projects/fixture",
+            "entries": [
+              {
+                "id": "b0e446f13dad8ceb001f46d2a445fedc1475c1f461d9cf3e59e88358209963c8",
+                "path": "other.md",
+                "kind": "text",
+                "size": 5,
+                "sha256": "d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa",
+                "if_rev": "none"
+              }
+            ]
+          }
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "job_conflict",
+            "message": "Tenant remote call refused."
+          }
+        }
+      }
+    },
+    {
+      "label": "refusal: a destination changed since it was read",
+      "action": "write",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "begin",
+          "job_id": "00000000-0000-4000-8000-000000000901",
+          "manifest": {
+            "version": 1,
+            "source_id": "25f562c91509c97aef3d355d2e7e3bb192f523ca3741e1b4797f5517b33158f8",
+            "root": "projects/fixture",
+            "entries": [
+              {
+                "id": "754b6dc3f8728b1991298d8359218165de3ef7439963168565aaaaf7a99b3edd",
+                "path": "notes.md",
+                "kind": "text",
+                "size": 7,
+                "sha256": "d67e2e944994496c8d8ec76eed0cf9f09679448d584b532bebf941852a37f5ed",
+                "if_rev": "none"
+              }
+            ]
+          }
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "destination_changed",
+            "message": "Tenant remote call refused."
+          }
+        }
+      }
+    },
+    {
+      "label": "refusal: no such job",
+      "action": "job_status",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "status",
+          "job_id": "00000000-0000-4000-8000-000000000902",
+          "root": "projects/fixture",
+          "offset": 0,
+          "limit": 32
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "not_found",
+            "message": "Tenant remote call refused."
+          }
+        }
+      }
+    },
+    {
+      "label": "refusal: a malformed transfer",
+      "action": "write",
+      "arguments": {
+        "path": "projects/fixture",
+        "transfer": {
+          "op": "finish",
+          "job_id": "not-a-uuid",
+          "root": "projects/fixture",
+          "extra": true
+        }
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "transfer_invalid",
+            "message": "Tenant remote call refused."
+          }
+        }
+      }
+    }
+  ]
+}

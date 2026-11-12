@@ -5378,10 +5378,134 @@ fn wiki_copy_unserved(
     Some(Error::invalid(
         "not_implemented",
         format!(
-            "this workspace's board does not serve `wiki cp` (HTTP {status}{shown}). Copy one \
-             page at a time instead: `wiki put <path> --file <file>` writes a text page, `wiki \
-             upload` sends a binary file and `wiki cat` reads a page. Nothing was {outcome}"
+            "this workspace's board does not serve `wiki cp` (HTTP {status}{shown}): it predates \
+             transfer support, so the board has to be updated first. Until then copy one page at \
+             a time: `wiki put <path> --file <file>` writes a text page, `wiki upload` sends a \
+             binary file and `wiki cat` reads a page. Nothing was {outcome}"
         ),
+    ))
+}
+
+/// CAD-2261: every code [`wiki_copy_refusal`] gives a hosted board's refusal
+/// of a transfer. A refusal carrying one of these was answered by the board
+/// before it changed anything, so the copy client may treat it as definite.
+/// A local daemon never answers a transfer with these codes.
+pub(crate) const WIKI_COPY_REFUSAL_CODES: &[&str] = &[
+    "destination_changed",
+    "payload_too_large",
+    "job_conflict",
+    "manifest_invalid",
+    "transfer_invalid",
+    "not_found",
+    "stage_incomplete",
+    "entries_pending",
+    "chunk_conflict",
+    "job_closed",
+    "entry_decided",
+    "revision_changed",
+];
+
+/// CAD-2261: a board that serves `wiki cp` (AOS-566) refuses a transfer
+/// operation with a code of its own. Say what happened and what to do, keep
+/// the board's code as the error's code, and never show the board's text.
+///
+/// Only a request that carries `transfer` is mapped: a text `wiki put` shares
+/// the `write` verb, and the board's request cap answers it with
+/// `413 payload_too_large` too. A transfer-serving board never answers a
+/// transfer operation with `invalid_request` or 501, so this never meets the
+/// "does not serve" answers of [`wiki_copy_unserved`], which runs first. The
+/// board's limits are its own: no number is named here.
+fn wiki_copy_refusal(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    arguments: &Map<String, Value>,
+) -> Option<Error> {
+    if !matches!(verb, "write" | "job_status") {
+        return None;
+    }
+    let op = arguments
+        .get("transfer")?
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (code, text): (&'static str, &'static str) = match (status, code?) {
+        (409, "destination_changed") => (
+            "destination_changed",
+            "a file this copy would write is already on the board with other content, changed \
+             after it was read, or has a folder in its place, so the board refused this copy and \
+             wrote nothing new. Copy again with `--update` to replace a changed file. \
+             `--update` cannot replace a folder: to copy a file into a folder, name the file \
+             inside it (`wiki:<folder>/<name>`)",
+        ),
+        (413, "payload_too_large") => (
+            "payload_too_large",
+            "a file in this copy, or the copy as a whole, is larger than this board accepts \
+             through `wiki cp`, so it refused this copy and wrote nothing new. Send a large \
+             binary file on its own with `wiki upload`, split a long page, or copy fewer files at \
+             a time",
+        ),
+        (409, "job_conflict") => (
+            "job_conflict",
+            "the board already holds this job id for a different copy (another source, \
+             destination or member), so it refused the job and wrote nothing new. Copy again \
+             without `--resume` to start a new job",
+        ),
+        (400, "manifest_invalid") => (
+            "manifest_invalid",
+            "the board does not accept this copy's file list: a name, path, kind or size is \
+             outside what it allows, for example a path longer than its limit. It wrote nothing \
+             new; rename or leave out that file and copy again",
+        ),
+        (400, "transfer_invalid") => (
+            "transfer_invalid",
+            "the board refused this request as malformed or out of range and changed nothing. \
+             If it repeats, update this Cadence client; the board may need an update too",
+        ),
+        (404, "not_found") if op == "export" => (
+            "not_found",
+            "the board has no readable page or folder at that path for this login",
+        ),
+        (404, "not_found") if op == "status" => (
+            "not_found",
+            "the board has no such copy job for this login and destination: it may have been \
+             removed after being left idle, started for another destination, or belong to \
+             someone else. Copy again without `--resume`",
+        ),
+        // Mid-job, the job wrapper adds the job id and what to try next.
+        (404, "not_found") if matches!(op, "chunk" | "apply" | "finish") => (
+            "not_found",
+            "the board no longer has this copy job for this login",
+        ),
+        (409, "stage_incomplete") => (
+            "stage_incomplete",
+            "the board has not received all of this file's bytes yet, so the rest still has to \
+             be sent",
+        ),
+        (409, "entries_pending") => (
+            "entries_pending",
+            "the board still has files in this job that were not applied",
+        ),
+        (409, "chunk_conflict") => (
+            "chunk_conflict",
+            "the bytes sent for this file differ from what the board already holds for it, \
+             usually because two runs of the same job overlapped or the local file changed",
+        ),
+        (409, "job_closed") => ("job_closed", "this copy job is already finished"),
+        (409, "entry_decided") => (
+            "entry_decided",
+            "the board already settled this file in this job",
+        ),
+        (409, "revision_changed") => (
+            "revision_changed",
+            "the file changed on the board while it was being copied out; copy it out again \
+             with `--update` to replace what was already written",
+        ),
+        _ => return None,
+    };
+    Some(Error::invalid(
+        code,
+        format!("{text} ({code}, HTTP {status})"),
     ))
 }
 
@@ -5964,6 +6088,15 @@ fn call_verb_until_retry(
         }
         if let Some(error) = wiki_copy_unserved(verb, status, refusal_code.as_deref(), &arguments) {
             return Err(error);
+        }
+        // A 409 that carries a `conflict` body stays a checked conflict.
+        let conflict_body = body.as_ref().is_some_and(|b| b.get("conflict").is_some());
+        if !conflict_body {
+            if let Some(error) =
+                wiki_copy_refusal(verb, status, refusal_code.as_deref(), &arguments)
+            {
+                return Err(error);
+            }
         }
         let platform_details = if platform_outcome_unknown {
             platform_error_details(body.as_ref())
