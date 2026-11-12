@@ -483,6 +483,7 @@ impl ScreenOperation {
             Self::RecordsCsvPreview | Self::RecordsCsvImport | Self::RecordsCsvConfirm => 327_680,
             Self::RecordsCreate
             | Self::RecordsUpdate
+            | Self::RecordsBatch
             | Self::ContentSave
             | Self::ScreenPreviewShow
             | Self::WhatsappReplyPrepare
@@ -1832,6 +1833,8 @@ mod tests {
             ]
         );
         assert!(checked.operations().iter().all(|op| !op.is_slot()));
+        assert_eq!(ScreenOperation::RecordsBatch.args_limit(), 49_152);
+        assert_eq!(ScreenOperation::RecordsAggregate.args_limit(), 16_384);
         assert!(validate_facts(&call, &facts(BODY)).is_ok());
 
         let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &operations);

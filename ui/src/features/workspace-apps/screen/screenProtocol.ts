@@ -245,7 +245,7 @@ export function parseScreenAudioCapture(value: unknown): ScreenAudioCapture | nu
 /** Larger envelopes are admitted only after verified records negotiation and rights. */
 export function recordArgsLimit(verb: string): number {
   return ["records.csv.preview", "records.csv.import", "records.csv.confirm"].includes(verb) ? 327680
-    : ["records.create", "records.update", "content.save", "screen.preview.show", "whatsapp.reply.prepare", "whatsapp.reply.send", "whatsapp.template.prepare", "whatsapp.template.send"].includes(verb) ? 49152
+    : ["records.create", "records.update", "records.batch", "content.save", "screen.preview.show", "whatsapp.reply.prepare", "whatsapp.reply.send", "whatsapp.template.prepare", "whatsapp.template.send"].includes(verb) ? 49152
     : ["works.create", "works.patch"].includes(verb) ? 81920
     : verb === "whatsapp.broadcast.draft" ? 196608 : ACTION_ARGS_BYTES;
 }

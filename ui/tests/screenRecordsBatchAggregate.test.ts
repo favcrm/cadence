@@ -1,4 +1,4 @@
-import { parseChild, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
+import { parseChild, recordArgsLimit, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
 import { parseMount, ScreenChannel, type MountReceipt } from "../src/features/workspace-apps/screen/screenLifecycle";
 import { recordServices } from "../src/features/workspace-apps/screen/screenServices";
 
@@ -42,6 +42,8 @@ for (const verb of VERBS) {
 }
 assert.ok(parseMount(receipt, "app"), "a receipt listing both verbs parses");
 assert.equal(parseMount({ ...receipt, operations: [...VERBS, "records.truncate"] }, "app"), null, "an unknown verb still refuses the receipt");
+assert.equal(recordArgsLimit(BATCH), 49152, "records.batch shares the create/update argument limit");
+assert.equal(recordArgsLimit(AGGREGATE), 16384, "records.aggregate keeps the default limit");
 for (const verb of VERBS) {
   const parsed = parseChild({ v: 2, op: "call", id: "k1", verb, args: { table: "t" } }, VERBS);
   assert.ok(parsed !== null && parsed.op === "call" && parsed.verb === verb, `${verb} parses as a granted call`);
@@ -83,8 +85,28 @@ port.receive({ v: 2, op: "call", id: "life-1", verb: BATCH, args: { table: "t", 
 port.receive({ v: 2, op: "call", id: "life-2", verb: AGGREGATE, args: { table: "t" } });
 assert.equal(calls.join(","), `${BATCH},${AGGREGATE}`, "both verbs are handed to the host actions");
 assert.equal(port.closed, false, "an admitted call keeps the mount");
-port.receive({ v: 2, op: "call", id: "life-3", verb: "records.update", args: {} });
-assert.equal(port.closed, true, "a verb the receipt does not list still closes the mount");
+// The limit is measured on the serialized args: just under forwards, over is refused.
+const closedBy = (verb: string, args: Record<string, unknown>): boolean => {
+  const p = new Port();
+  const c = new ScreenChannel(source, receipt, projection, () => {}, () => {}, () => {},
+    async () => null, { call: async () => ({ ok: true, data: null }), planner: async () => ({ code: "forbidden", text: "not a slot" }), onSlot: () => {}, onLink: () => {} });
+  c.receive({ source, origin: "null", data: { v: 1, op: "init", tag: "app", bridge_nonce: receipt.bridge_nonce, generation: 1 }, ports: [p as unknown as MessagePort] });
+  p.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-records.v1"] });
+  p.receive({ v: 2, op: "call", id: "x1", verb, args });
+  return p.closed;
+};
+assert.equal(closedBy("records.update", {}), true, "a verb the receipt does not list still closes the mount");
+const sized = (bytes: number) => ({ table: "t", pad: "x".repeat(bytes - JSON.stringify({ table: "t", pad: "" }).length) });
+assert.equal(JSON.stringify(sized(49152)).length, 49152, "fixture hits the limit exactly");
+port.receive({ v: 2, op: "call", id: "life-big", verb: BATCH, args: sized(49152) });
+assert.equal(calls.length, 3, "a batch at the limit is forwarded");
+assert.equal(port.closed, false, "a batch at the limit keeps the mount");
+assert.equal(closedBy(BATCH, sized(49152)), false, "a batch at the limit does not close a fresh mount");
+assert.equal(closedBy(BATCH, sized(49153)), true, "a batch over the limit is refused");
+port.receive({ v: 2, op: "call", id: "life-over", verb: BATCH, args: sized(49153) });
+assert.equal(calls.length, 3, "a batch over the limit is not forwarded");
+assert.equal(port.closed, true, "a batch over the limit closes the mount");
+
 
 async function run(): Promise<void> {
   const requests: { operation: string }[] = [];
