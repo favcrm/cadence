@@ -165,6 +165,13 @@ pub enum ScreenOperation {
     RecordsUpdate,
     #[serde(rename = "records.csv.preview")]
     RecordsCsvPreview,
+    // CAD-2263: hosted app-storage verbs. Both are CALLs (not SLOTs):
+    // `records.aggregate` is a read, `records.batch` an owner-gated write.
+    // Native execution of either stays unimplemented and refuses.
+    #[serde(rename = "records.batch")]
+    RecordsBatch,
+    #[serde(rename = "records.aggregate")]
+    RecordsAggregate,
     #[serde(rename = "records.csv.import")]
     RecordsCsvImport,
     #[serde(rename = "records.csv.confirm")]
@@ -1805,6 +1812,37 @@ mod tests {
             "operations": operations,
         })
         .to_string()
+    }
+
+    /// CAD-2263: `records.batch` and `records.aggregate` are native
+    /// vocabulary. A declaration listing them passes the strict admission
+    /// with only the `records.call` grant, because both are CALLs; a name
+    /// outside the closed set still refuses there.
+    #[test]
+    fn batch_and_aggregate_are_calls_and_an_unknown_verb_still_refuses() {
+        let operations = ["records.batch", "records.aggregate"];
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let call = records_declaration(BODY, &[MAY_RECORDS_CALL], &operations);
+        let checked = validate_map(&call, &bodies).expect("both verbs decode and validate");
+        assert_eq!(
+            checked.operations(),
+            &[
+                ScreenOperation::RecordsBatch,
+                ScreenOperation::RecordsAggregate
+            ]
+        );
+        assert!(checked.operations().iter().all(|op| !op.is_slot()));
+        assert!(validate_facts(&call, &facts(BODY)).is_ok());
+
+        let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &operations);
+        assert!(
+            validate_map(&slot_only, &bodies).is_err(),
+            "a CALL verb is not granted by the slot permission"
+        );
+
+        let unknown = records_declaration(BODY, &[MAY_RECORDS_CALL], &["records.truncate"]);
+        assert!(validate_map(&unknown, &bodies).is_err());
+        assert!(validate_facts(&unknown, &facts(BODY)).is_err());
     }
 
     /// The seam this operation exists for: a host-only operation passes the
