@@ -4,6 +4,10 @@
 # never the PR's. Editing it is trigger 7. Globs: `*` stays within one
 # path component, `**` crosses directories.
 #
+# `trigger1` and `trigger3` also feed the workflow-only route's never-eligible
+# rule (docs/roles/risk-classes.md trigger 7); there an empty list counts as
+# unreadable, so every path needs the operator (CAD-2257).
+#
 # A delegated approval needs EVERY changed path (both sides of a rename)
 # to match `delegable` and no trigger list. A schema path passes only
 # under a live scope pre-approval. Anything else needs the operator.

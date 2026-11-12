@@ -710,7 +710,7 @@ During implementation and handoff:
   advisory links) remains for a head that cannot produce the workflow rows and ends at
   `EXCEPTION_ENDS` (2026-12-31); it checks only that the links are separate https URLs.
   A second attested human is not required.
-- Ask a person only when the gate does. In the Cadence repository, run
+- In the Cadence repository, ask a person only when the gate does: run
   `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run` and read its
   `class:` line. On `class: auto` with every rule holding, enqueue the PR
   yourself and report the merge. On `class: human (...)`, or a refusal that

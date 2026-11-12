@@ -114,6 +114,11 @@ def focused_tests(root, changed):
         # on CI — the help-bucket invariant lives in cli::help tests.
         "src/cli/commands.rs": ["cargo", "test", "--bin", "cadence", "cli::help"],
         "src/cli/help.rs": ["cargo", "test", "--bin", "cadence", "cli::help"],
+        # CAD-2257: the delegation tests pin risk-classes.md to risk-paths.toml,
+        # and PR CI runs no tests.
+        "docs/roles/risk-classes.md": ["cargo", "test", "--lib", "delegation::tests"],
+        "docs/roles/risk-paths.toml": ["cargo", "test", "--lib", "delegation::tests"],
+        "src/delegation.rs": ["cargo", "test", "--lib", "delegation::tests"],
     }
     out = []
     for path, argv in MAP.items():

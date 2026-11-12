@@ -10,17 +10,12 @@
 # It does not widen anything for owner-attested reviews, the size trigger, or a
 # verdict whose Risk is not `auto`.
 #
-# Whatever `paths` says, the script never treats as eligible:
-# - a path with a segment starting with `.` (.github, .claude, .gitattributes) or a
-#   basename starting `agents.`, `claude.` or `gemini.` in any directory (they can
-#   load as agent instructions; compared casefolded), and a modify must keep mode
-#   100644;
-# - a path that `one-review-paths.toml` excludes or that is on `risk-paths.toml`
-#   trigger 1 or 3: the trust-boundary, identity, secret and UI trees (CAD-2254).
-#   If either of those lists cannot be read, every path needs the operator;
-# - a path that is not itself protected but matches a human-class or never-eligible
-#   path once case is ignored (`docs/Roles/x.md`): a case-insensitive checkout puts
-#   it in the protected directory (CAD-2254).
+# Whatever `paths` says, some names are never eligible (hidden segments, agent-
+# instruction basenames, odd path names, one-review excludes, risk-paths trigger 1
+# and 3, case aliases of protected paths, and unreadable or emptied never-lists).
+# docs/roles/risk-classes.md trigger 7 states the rule; workflow_auto_reasons in
+# scripts/enqueue-reviewed enforces it. A modify must keep mode 100644.
+#
 # The human-class path and size triggers apply as before, so the list does not cover
 # `docs/roles/**` or any other trigger-list path inside `docs/`.
 #
@@ -40,7 +35,8 @@
 # docs/FIRST-RUN.md, docs/CI-DELIVERY.md, docs/REVIEW-EVIDENCE.md and
 # docs/TRUSTED-TEAM-ACTIVITY.md. Rule 7's "any change to who approves what" is
 # enforced for them only by the review's Risk line. Moving one to the operator
-# means adding it to risk-paths.toml trigger 7, as CAD-2256 did for
+# means adding it to risk-paths.toml trigger 7 AND to the trigger 7 list line in
+# risk-classes.md (the delegation test pins the two together), as CAD-2256 did for
 # docs/INSTALL-AGENT.md (the install and attestation commands) and
 # docs/REMOTE-AUTH.md (the credential diagnosis); those two are human-class and
 # not eligible here.

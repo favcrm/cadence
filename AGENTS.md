@@ -173,8 +173,9 @@ the code you just wrote.
   that gate, security, schema and release PRs keep fresh-session Opus reviews and
   the workflow rows are a cheap first pass; on other PRs two workflow rows
   satisfy the requirement. A hosted `routine` PR has no readiness record, so it
-  takes those two workflow rows and the operator approval they carry under the
-  auto-paths rule below (CAD-2135).
+  takes those two workflow rows and the operator approval they carry (CAD-2135),
+  unless the gate's dry run reports `class: auto` (the auto-paths rule below;
+  being on the list is not enough).
   A hosted `ui/**` PR takes those two rows, operator approval and `--browser-qa
   <url>`, naming an unedited comment on this PR by a repository member that is exactly the lines `Browser QA: pass` and
   `Head: <full sha>` (CAD-2173). Until it ends, a `ui/**` PR can instead take
@@ -196,7 +197,7 @@ the code you just wrote.
   (`review-standards.yml` and `review-spec.yml`; no login or person) are a cheap
   first pass on gate, security, schema and release PRs, where fresh-session Opus
   reviews stay the real review; two rows satisfy other PRs, with the operator
-  check still applying outside the auto-paths allowlist.
+  check still applying unless the gate's dry run reports `class: auto`.
 - **The changed set is anchored to main's live tip.** GitHub's PR base SHA can stay
   older than the real merge base after main is merged into the branch, so a PR
   that merges main and restores an old file diffs as docs-only against it.
