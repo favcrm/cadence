@@ -36,12 +36,14 @@
 # Limit: many of these documents are procedures agents and people follow, and a
 # change to one now merges on two workflow reviews. They include docs/DEV-CYCLE.md
 # (the approval handoff), docs/RELEASING.md and docs/guides/rollout-checklist.md
-# (production handover), docs/INSTALL-AGENT.md (the install and attestation
-# commands), docs/REMOTE-AUTH.md, docs/guides/hosted-workspace.md,
-# docs/CLEAN-INSTALL.md, docs/FIRST-RUN.md, docs/CI-DELIVERY.md,
-# docs/REVIEW-EVIDENCE.md and docs/TRUSTED-TEAM-ACTIVITY.md. Rule 7's "any change
-# to who approves what" is enforced for them only by the review's Risk line. Moving
-# one to the operator means adding it to risk-paths.toml trigger 7.
+# (production handover), docs/guides/hosted-workspace.md, docs/CLEAN-INSTALL.md,
+# docs/FIRST-RUN.md, docs/CI-DELIVERY.md, docs/REVIEW-EVIDENCE.md and
+# docs/TRUSTED-TEAM-ACTIVITY.md. Rule 7's "any change to who approves what" is
+# enforced for them only by the review's Risk line. Moving one to the operator
+# means adding it to risk-paths.toml trigger 7, as CAD-2256 did for
+# docs/INSTALL-AGENT.md (the install and attestation commands) and
+# docs/REMOTE-AUTH.md (the credential diagnosis); those two are human-class and
+# not eligible here.
 #
 # Changing this file is class `human` (risk-classes.md trigger 7).
 
