@@ -1,11 +1,16 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {
+  DRAWER_CONTEXT_BYTES,
+  HOST_DRAWER_VERBS,
   MAX_ASSET_BYTES,
+  MAX_REPLY_DATA_BYTES,
   MAX_STATE_BYTES,
+  ScreenBridgeError,
   ScreenClosedError,
   ScreenRefusalError,
   ScreenTimeoutError,
+  createScreenBridge,
   createScreenReceiver,
   readBoot,
   validateBoot,
@@ -404,33 +409,56 @@ test("request shapes are bounded at send time", async () => {
   assert.equal(inbox.filter((m) => m.op === "call" || m.op === "slot" || m.op === "tool").length, 0);
 });
 
-test("records and CRM locale are advertised together", async () => {
-  const { inbox } = connect({ accepts: ["screen.v2", "screen-records.v1", "crm-locale.v1"] });
+test("screen-locale.v1 is advertised on any screen.v2 mount without requiring records", async () => {
+  const { inbox: standalone } = connect({ accepts: ["screen.v2", "screen-surfaces.v1", "screen-locale.v1"] });
+  const { inbox: fiveCap } = connect({
+    accepts: ["screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1"],
+  });
   await tick();
-  assert.deepEqual(inbox[0], {
+  assert.deepEqual(standalone[0], {
     v: 1,
     op: "ready",
-    accepts: ["screen.v2", "screen-records.v1", "crm-locale.v1"],
+    accepts: ["screen.v2", "screen-surfaces.v1", "screen-locale.v1"],
+  });
+  assert.deepEqual(fiveCap[0], {
+    v: 1,
+    op: "ready",
+    accepts: ["screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1"],
   });
 });
 
-test("records capabilities require their base and fit the host's ready bound", () => {
+test("capabilities require screen.v2, reject legacy crm tokens, and fit the five-capability bound", () => {
   const base = { boot, parent: { postMessage() {} }, onPush() {}, timeoutMs: 100 };
   assert.throws(
     () => createScreenReceiver({ ...base, accepts: ["screen.v1", "screen-records.v1"] }),
     /screen-records\.v1 needs screen\.v2/,
   );
   assert.throws(
+    () => createScreenReceiver({ ...base, accepts: ["screen.v1", "screen-locale.v1"] }),
+    /screen-locale\.v1 needs screen\.v2/,
+  );
+  assert.throws(
+    () => createScreenReceiver({ ...base, accepts: ["screen.v1", "screen-media.v1"] }),
+    /screen-media\.v1 needs screen\.v2/,
+  );
+  assert.throws(
     () => createScreenReceiver({ ...base, accepts: ["screen.v2", "crm-locale.v1"] }),
-    /crm-locale\.v1 needs screen-records\.v1/,
+    /accepts must name/,
   );
   assert.throws(
     () =>
       createScreenReceiver({
         ...base,
-        accepts: ["screen.v2", "screen-actions.v1", "screen-surfaces.v1", "screen-records.v1", "crm-locale.v1"],
+        accepts: [
+          "screen.v2",
+          "screen-actions.v1",
+          "screen-media.v1",
+          "screen-presentation.v1",
+          "screen-surfaces.v1",
+          "screen-locale.v1",
+        ],
       }),
-    /at most four ready capabilities/,
+    /at most five ready capabilities/,
   );
 });
 
@@ -543,11 +571,45 @@ test("a refused boot returns an inert receiver whose calls also report closed", 
   assert.equal(receiver.boot, null);
   assert.equal(errors.length, 1);
   assert.equal(receiver.presentation(), "outlet");
+  assert.equal(receiver.surfaceRole(), "primary");
+  assert.equal(receiver.surface(), undefined);
+  assert.equal(receiver.ownLeaveState(), null);
   await assert.rejects(receiver.openDrawer("settings"), ScreenClosedError);
   await assert.rejects(receiver.closeDrawer(), ScreenClosedError);
+  await assert.rejects(receiver.drawerContext(), ScreenClosedError);
   await assert.rejects(receiver.call("read.run", {}), ScreenClosedError);
   await assert.rejects(receiver.asset("media:1"), ScreenClosedError);
   assert.equal(receiver.state("x"), false);
+
+  // Expected tag pin and top-level window guard also fail closed into inert().
+  assert.throws(() => validateBoot(boot, "other-tag"), /tag mismatch/);
+  const tagMismatch = [];
+  const wrongTag = createScreenReceiver({
+    tag: "other-tag",
+    boot,
+    parent: { postMessage() {} },
+    onPush() {},
+    onError: (reason) => tagMismatch.push(reason),
+  });
+  assert.equal(wrongTag.boot, null);
+  assert.match(tagMismatch[0], /tag mismatch/);
+
+  const topWindow = { postMessage() {} };
+  const topErrors = [];
+  const prevParent = globalThis.parent;
+  globalThis.parent = topWindow;
+  try {
+    const selfFramed = createScreenReceiver({
+      boot,
+      window: topWindow,
+      onPush() {},
+      onError: (reason) => topErrors.push(reason),
+    });
+    assert.equal(selfFramed.boot, null);
+    assert.ok(topErrors.some((msg) => /child frame/.test(msg)));
+  } finally {
+    globalThis.parent = prevParent;
+  }
 });
 
 test("a v1-only receiver sends the bare ready envelope", async () => {
@@ -795,4 +857,259 @@ test("a call reply's asset_refs admit those refs; a reply without them (an older
   assert.deepEqual(await told, { draft_id: "sdr-1", asset_id: "ast-1" }, "the app still gets only data");
   assert.equal(receiver.assetAdmitted(ref), true);
   assert.deepEqual(errors, []);
+});
+
+test("openDrawer carries bounded plain-JSON context on surfaces and drawerContext unwraps it on drawer mounts", async () => {
+  const { receiver, inbox, host, pushes } = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the primary push");
+  await assert.rejects(receiver.drawerContext(), /only a drawer surface/);
+  await assert.rejects(receiver.openDrawer("detail", { context: new Date() }), TypeError);
+  await assert.rejects(receiver.openDrawer("detail", { context: { pad: "x".repeat(DRAWER_CONTEXT_BYTES) } }), TypeError);
+
+  const opening = receiver.openDrawer("detail", { size: "wide", context: { record_id: "rec_1", tab: 2 } });
+  const open = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "screen.drawer.open"), "drawer open");
+  assert.deepEqual(open.args, { surface: "detail", size: "wide", context: { record_id: "rec_1", tab: 2 } });
+  host.postMessage({ v: 2, op: "reply", id: open.id, ok: true, data: { mode: "drawer", surface: "detail" } });
+  await opening;
+
+  const pres = connect({ accepts: ["screen.v2", "screen-presentation.v1"] });
+  pres.host.postMessage(push());
+  await waitFor(() => pres.pushes.length === 1, "the presentation push");
+  pres.host.postMessage({ v: 1, op: "presentation", mode: "outlet" });
+  await tick();
+  await assert.rejects(pres.receiver.openDrawer("detail", { context: { a: 1 } }), ScreenClosedError);
+
+  const drawer = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+  drawer.host.postMessage({ v: 1, op: "surface", role: "drawer", modal: false, surface: "detail" });
+  drawer.host.postMessage(push());
+  await waitFor(() => drawer.pushes.length === 1, "the drawer push");
+  const reading = drawer.receiver.drawerContext();
+  const ctxCall = await waitFor(() => drawer.inbox.find((m) => m.op === "call" && m.verb === "screen.drawer.context"), "ctx call");
+  assert.deepEqual(ctxCall.args, {});
+  drawer.host.postMessage({ v: 2, op: "reply", id: ctxCall.id, ok: true, data: { context: { record_id: "rec_1" } } });
+  assert.deepEqual(await reading, { record_id: "rec_1" });
+
+  const badRead = drawer.receiver.drawerContext();
+  const badCall = await waitFor(() => drawer.inbox.filter((m) => m.op === "call" && m.verb === "screen.drawer.context")[1], "bad ctx call");
+  drawer.host.postMessage({ v: 2, op: "reply", id: badCall.id, ok: true, data: "not-an-object" });
+  await assert.rejects(badRead, ScreenClosedError);
+});
+
+test("ownLeaveState publishes v2 leave booleans and symbol-fences overlapping handles", async () => {
+  let syncAcquired = false;
+  let receiverRef = null;
+  const { host, inbox, receiver } = connect({
+    onPush() {
+      const handle = receiverRef.ownLeaveState();
+      syncAcquired = handle !== null;
+      handle?.release();
+    },
+  });
+  receiverRef = receiver;
+  assert.equal(receiver.ownLeaveState(), null);
+  host.postMessage(push());
+  await waitFor(() => syncAcquired, "synchronous ownLeaveState inside onPush");
+
+  const first = receiver.ownLeaveState();
+  assert.equal(first.publish(true), true);
+  assert.equal(first.publish("yes"), false);
+  await waitFor(() => inbox.some((m) => m.v === 2 && m.op === "leave" && m.unsaved === true), "dirty leave");
+
+  const second = receiver.ownLeaveState();
+  assert.equal(second.publish(true), true);
+  await waitFor(() => inbox.filter((m) => m.op === "leave" && m.unsaved === true).length === 2, "second dirty leave");
+  const leavesBeforeStaleRelease = inbox.filter((m) => m.op === "leave").length;
+  first.release();
+  assert.equal(first.publish(false), false);
+  await tick();
+  assert.equal(inbox.filter((m) => m.op === "leave").length, leavesBeforeStaleRelease);
+
+  second.release();
+  await waitFor(() => inbox.at(-1)?.op === "leave" && inbox.at(-1)?.unsaved === false, "active release");
+
+  const v1 = connect({ accepts: ["screen.v1"] });
+  v1.host.postMessage(push({ v: 1 }));
+  await waitFor(() => v1.pushes.length === 1, "v1 push");
+  assert.equal(v1.receiver.ownLeaveState(), null);
+});
+
+function fullPush(overrides = {}) {
+  const install_id = overrides.install_id ?? "install-1";
+  const digest = overrides.digest ?? "sha256:" + "b".repeat(64);
+  return {
+    v: 2, op: "screen", tag: "notes", install_id, digest, context_id: "",
+    installation: { install_id, name: "notes", title: "Meeting Notes", version: "0.4.0", digest, summary: "Notes app" },
+    contexts: [{ id: "ctx-1", label: "Team" }], runs: [], outbox: [],
+    actions: ["records.list", "records.create", "screen.route.patch", ...HOST_DRAWER_VERBS],
+    now: 1700000000, presentation_locale: "zh-TW",
+    route: { section: "open", view: "list", record_id: "rec_1", segment_id: null },
+    ...overrides,
+  };
+}
+
+function startBridge(bridge, bootOverride = { ...boot, tag: bridge.tag }) {
+  let host;
+  const inbox = [];
+  const parent = {
+    postMessage(_msg, _origin, transfer) {
+      host = transfer?.[0];
+      if (host) host.onmessage = (event) => inbox.push(event.data);
+    },
+  };
+  bridge.start({ boot: bootOverride, parent });
+  live.push({ teardown: () => bridge.reset() });
+  return { host, inbox };
+}
+
+test("createScreenBridge transitions to a new error snapshot when initial push or boot is refused", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes", appName: "notes", records: true, surfaces: true, locale: true, calls: { "records.list": ["query"] },
+  });
+  const states = [];
+  bridge.subscribe(() => states.push(bridge.getState()));
+  const initial = bridge.getState();
+  assert.equal(initial.status, "loading");
+
+  const { host } = startBridge(bridge);
+  host.postMessage(fullPush({ actions: ["records.list", "BAD VERB!"] }));
+  await waitFor(() => bridge.getState().status === "error", "error transition");
+  const failed = bridge.getState();
+  assert.notEqual(failed, initial);
+  assert.equal(failed.snapshot, null);
+  assert.ok(failed.error instanceof ScreenBridgeError);
+  assert.equal(failed.error.status, 502);
+  assert.equal(states.at(-1), failed);
+
+  bridge.reset();
+  startBridge(bridge, { ...boot, tag: "wrong-tag" });
+  assert.equal(bridge.getState().status, "error");
+  assert.equal(bridge.getState().error.status, 502);
+});
+
+test("createScreenBridge separates host drawer verbs from app capabilities and parses locale/route/observations", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes", appName: "notes", records: true, surfaces: true, locale: true,
+    calls: { "records.list": ["query", "limit"], "records.create": ["record_id", "profile"], "screen.route.patch": ["section", "view", "record_id"] },
+    observations: ["records.list"],
+    route: { sections: ["all", "open"], defaultSection: "all" },
+  });
+  const { host, inbox } = startBridge(bridge);
+  await tick();
+  assert.deepEqual(inbox[0], {
+    v: 1, op: "ready", accepts: ["screen.v2", "screen-surfaces.v1", "screen-records.v1", "screen-locale.v1"],
+  });
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  host.postMessage(fullPush({ read_observations: [{ operation: "records.list", args: { limit: 20 }, data: { items: [] } }] }));
+  await waitFor(() => bridge.getState().status === "ready", "ready transition");
+
+  const snap = bridge.getSnapshot();
+  assert.equal(snap.presentationLocale, "zh-TW");
+  assert.deepEqual(snap.route, { section: "open", view: "list", record_id: "rec_1", segment_id: null });
+  assert.equal(snap.observations.length, 1);
+  assert.deepEqual(snap.actions, ["records.list", "records.create", "screen.route.patch"]);
+  assert.equal(bridge.can("records.list"), true);
+  assert.equal(bridge.can("screen.drawer.open"), false);
+  await assert.rejects(bridge.call(snap.scope, "screen.drawer.open", { surface: "detail" }), (err) => err.status === 403);
+});
+
+test("createScreenBridge enforces arg allowlists, per-verb byte limits, concurrency, reply bounds, and write/read retirement", async () => {
+  let writes = 0;
+  const bridge = createScreenBridge({
+    tag: "notes", records: true, surfaces: true,
+    calls: { "records.list": ["query"], "records.create": ["record_id", "profile"], "screen.route.patch": ["section", "view", "record_id"] },
+    slots: { "records.export": ["format"] },
+    argBytes: { "records.create": 32768 },
+    singleFlight: ["records."],
+    writeVerbs: ["records.create", "screen.route.patch"],
+    route: { sections: ["all", "open"] },
+    maxInFlight: 2,
+  });
+  bridge.onWrite(() => { writes += 1; });
+  const { host, inbox } = startBridge(bridge);
+  host.postMessage(fullPush({ actions: ["records.list", "records.create", "records.export", "screen.route.patch"] }));
+  await waitFor(() => bridge.getState().status === "ready", "ready transition");
+  const { scope } = bridge.getSnapshot();
+
+  await assert.rejects(bridge.call(scope, "records.list", { bogus: 1 }), (err) => err.status === 400);
+  await assert.rejects(bridge.call(scope, "records.list", { query: "x".repeat(17 * 1024) }), (err) => err.status === 400);
+
+  const createCall = bridge.call(scope, "records.create", {
+    record_id: "rec_1", profile: { body: "x".repeat(20 * 1024) }, extraUndefined: undefined,
+  });
+  await assert.rejects(bridge.call(scope, "records.list", { query: "a" }), (err) => err.status === 429);
+  const createMsg = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "records.create"), "create call");
+  assert.deepEqual(Object.keys(createMsg.args), ["record_id", "profile"]);
+  host.postMessage({ v: 2, op: "reply", id: createMsg.id, ok: true, data: { record_id: "rec_1" } });
+  assert.deepEqual(await createCall, { record_id: "rec_1" });
+  assert.equal(writes, 1);
+
+  const writeForbidden = bridge.call(scope, "records.create", { record_id: "rec_2" });
+  const wfMsg = await waitFor(() => inbox.filter((m) => m.op === "call" && m.verb === "records.create")[1], "forbidden write");
+  host.postMessage({ v: 2, op: "reply", id: wfMsg.id, ok: false, refusal: { code: "forbidden", text: "viewer only" } });
+  await assert.rejects(writeForbidden, (err) => err.status === 403);
+  assert.equal(bridge.getState().status, "ready");
+
+  const slotDone = bridge.slot(scope, "records.export", { format: "csv" });
+  const slotMsg = await waitFor(() => inbox.find((m) => m.op === "slot"), "slot message");
+  host.postMessage({ v: 2, op: "slot-state", id: slotMsg.id, state: "done", data: { exported: 3 } });
+  assert.deepEqual(await slotDone, { exported: 3 });
+
+  const callsBeforePatch = inbox.filter((m) => m.verb === "screen.route.patch").length;
+  bridge.patchRoute({ record_id: "INVALID ID!" });
+  await tick();
+  assert.equal(inbox.filter((m) => m.verb === "screen.route.patch").length, callsBeforePatch);
+  bridge.patchRoute({ section: "open", record_id: "rec_1" });
+  const patchMsg = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "screen.route.patch"), "route patch");
+  host.postMessage({ v: 2, op: "reply", id: patchMsg.id, ok: true, data: {} });
+  await tick();
+  assert.equal(writes, 1);
+
+  const leave = bridge.ownLeaveState();
+  assert.equal(leave.publish(true), true);
+  await waitFor(() => inbox.some((m) => m.op === "leave" && m.unsaved === true), "bridge leave");
+
+  const poisoned = bridge.call(scope, "records.list", { query: "ok" });
+  const listMsg = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "records.list"), "list call");
+  host.postMessage({ v: 2, op: "reply", id: listMsg.id, ok: true, data: { items: [{ nested: { action_token: "leaked" } }] } });
+  await assert.rejects(poisoned, (err) => err.status === 502);
+  assert.equal(bridge.getState().status, "error");
+  assert.equal(leave.publish(false), false);
+
+  bridge.reset();
+  const second = startBridge(bridge);
+  second.host.postMessage(fullPush({ actions: ["records.list"] }));
+  await waitFor(() => bridge.getState().status === "ready", "second ready");
+  const huge = bridge.call(bridge.getSnapshot().scope, "records.list", {});
+  const hugeMsg = await waitFor(() => second.inbox.find((m) => m.op === "call"), "huge call");
+  second.host.postMessage({ v: 2, op: "reply", id: hugeMsg.id, ok: true, data: { blob: "x".repeat(MAX_REPLY_DATA_BYTES) } });
+  await assert.rejects(huge, (err) => err.status === 502);
+  assert.equal(bridge.getState().status, "error");
+});
+
+test("createScreenBridge supports actions/media tool, asset, and state channels", async () => {
+  const bridge = createScreenBridge({ tag: "studio", actions: true, media: true, locale: true, calls: { "social.drafts.list": [] } });
+  const { host, inbox } = startBridge(bridge);
+  host.postMessage(fullPush({
+    tag: "studio",
+    installation: { install_id: "install-1", name: "studio", title: "Studio", version: "1.0.0", digest: "sha256:" + "b".repeat(64), summary: "Studio" },
+    actions: ["social.drafts.list", "social.publish", ...HOST_DRAWER_VERBS],
+  }));
+  await waitFor(() => bridge.getState().status === "ready", "studio ready");
+  const { scope, actions } = bridge.getSnapshot();
+  assert.deepEqual(actions, ["social.drafts.list", "social.publish"]);
+
+  const toolPending = bridge.tool(scope, "social.publish", { text: "hi" }, "req-1");
+  const toolMsg = await waitFor(() => inbox.find((m) => m.op === "tool"), "bridge tool");
+  host.postMessage({ v: 2, op: "tool-reply", id: toolMsg.id, ok: true, data: { posted: true } });
+  assert.deepEqual(await toolPending, { posted: true });
+
+  const assetPending = bridge.asset(scope, "media:1", { timeoutMs: 500 });
+  await waitFor(() => inbox.some((m) => m.op === "asset" && m.ref === "media:1"), "bridge asset");
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  assert.equal(await assetPending, PNG);
+
+  assert.equal(bridge.state("resume-snapshot"), true);
+  await waitFor(() => inbox.some((m) => m.op === "state" && m.data === "resume-snapshot"), "bridge state");
 });

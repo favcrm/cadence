@@ -1,4 +1,4 @@
-import { parseChild, parseDraftImageRef, parseInit, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
+import { parseChild, parseDraftImageRef, parseInit, SCREEN_LOCALE_V1, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
 import { parseMount, ScreenChannel } from "../src/features/workspace-apps/screen/screenLifecycle";
 
 function check(value: unknown, label: string): void { if (!value) throw new Error(label); }
@@ -196,4 +196,60 @@ check(refusedLegacy?.ok === false && legacyDrawerCalls.length === 0, "presentati
 legacyDrawerPort.receive({ v: 2, op: "call", id: "legacy-open", verb: "screen.drawer.open", args: { surface: "settings" } });
 const openedLegacy = legacyDrawerPort.sent.find(m => (m as { id?: string }).id === "legacy-open") as { ok?: boolean } | undefined;
 check(openedLegacy?.ok === true && legacyDrawerCalls.length === 1, "legacy context-free opens still work");
+
+// CAD-2268: generic screen-locale.v1 and {v:2, op:"leave", unsaved} work on
+// any screen.v2 mount; legacy CRM tokens and non-v2 mounts are refused.
+check(SCREEN_LOCALE_V1 === "screen-locale.v1", "generic locale token exported");
+check(!parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "crm-locale.v1"] }), "legacy crm-locale.v1 token is refused");
+check(parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1"] }),
+  "up to five ready capabilities parse");
+check(!parseChild({ v: 1, op: "ready", accepts: ["publish-intents.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1"] }),
+  "more than five ready capabilities refused");
+check(parseChild({ v: 2, op: "leave", unsaved: true })?.op === "leave", "v2 leave boolean parses");
+check(!parseChild({ v: 1, op: "leave", unsaved: true }), "v1 leave refused");
+check(!parseChild({ v: 2, op: "leave", unsaved: "yes" }), "non-boolean leave refused");
+check(!parseChild({ v: 2, op: "leave", unsaved: true, extra: 1 }), "extra leave field refused");
+
+const unsavedEvents: boolean[] = [];
+const genericLocaleSource = {} as Window;
+const genericLocalePort = new Port();
+const genericLocaleChannel = new ScreenChannel(
+  genericLocaleSource,
+  toolReceipt,
+  { ...actingPush, presentation_locale: "zh-TW" },
+  () => {},
+  () => {},
+  () => {},
+  undefined,
+  toolHost,
+  undefined,
+  flag => unsavedEvents.push(flag),
+);
+genericLocaleChannel.receive({ source: genericLocaleSource, origin: "null", data: init, ports: [genericLocalePort as unknown as MessagePort] });
+genericLocalePort.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-actions.v1", "screen-locale.v1"] });
+check(!genericLocalePort.closed && (genericLocalePort.sent[0] as ScreenPush).presentation_locale === "zh-TW",
+  "non-records screen.v2 mount opting into screen-locale.v1 receives presentation_locale");
+genericLocalePort.receive({ v: 1, op: "state", data: JSON.stringify({ contract: "crm-leave.v1", unsaved: true }) });
+check(unsavedEvents.length === 0, "opaque state never toggles leave guard");
+genericLocalePort.receive({ v: 2, op: "leave", unsaved: true });
+genericLocalePort.receive({ v: 2, op: "leave", unsaved: false });
+check(JSON.stringify(unsavedEvents) === "[true,false]", "v2 leave toggles unsaved warning on any screen.v2 mount");
+genericLocalePort.receive({ v: 2, op: "call", id: "forged-locale", verb: "read.run", args: { presentation_locale: "en" } });
+check(genericLocalePort.closed, "frame cannot smuggle presentation_locale in call args");
+
+const noLocaleOptIn = actingMountWith(toolReceipt, { ...actingPush, presentation_locale: "zh-TW" }, ["screen.v2", "screen-actions.v1"]);
+check(!("presentation_locale" in (noLocaleOptIn.sent[0] as ScreenPush)), "presentation_locale is stripped without screen-locale.v1 opt-in");
+
+const v1LocaleSource = {} as Window;
+const v1LocalePort = new Port();
+const v1LocaleChannel = new ScreenChannel(v1LocaleSource, receipt, push, () => {}, () => {}, () => {});
+v1LocaleChannel.receive({ source: v1LocaleSource, origin: "null", data: init, ports: [v1LocalePort as unknown as MessagePort] });
+v1LocalePort.receive({ v: 1, op: "ready", accepts: ["screen-locale.v1"] });
+check(v1LocalePort.closed, "screen-locale.v1 without screen.v2 closes the mount");
+
+const v1Leave = mount();
+v1Leave.channel.receive(v1Leave.event);
+v1Leave.port.receive({ v: 1, op: "ready" });
+v1Leave.port.receive({ v: 2, op: "leave", unsaved: true });
+check(v1Leave.port.closed, "v1 mount closes on v2 leave op");
 console.log("screen lifecycle adversarial checks pass");

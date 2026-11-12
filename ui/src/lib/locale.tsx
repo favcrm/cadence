@@ -2072,3 +2072,8 @@ Object.assign(zhTW, {
   "Show earlier": "顯示更早",
   "Earlier entries could not be loaded.": "無法載入更早的記錄。",
 });
+
+// CAD-2268: generic unsaved-changes leave confirmation for installed app screens.
+Object.assign(zhTW, {
+  "You have unsaved changes. Leave this page and discard your local edits?": "你有未儲存的變更。要離開此頁面並捨棄本機編輯內容嗎？",
+});

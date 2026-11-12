@@ -1,40 +1,58 @@
 /**
  * The app side of the `app-screens` bridge, implemented once.
  *
- * This is the transport and lifecycle only: boot validation, the single
- * window `init` that transfers a port, `ready`, the closed PUSH union,
- * request/reply bookkeeping for `call`/`slot`/`tool`, asset requests, the
- * bounded local-state post, and teardown. What a PUSH *means* — the app's
- * projection and its own payload validation — stays in the app through
- * `onPush`.
+ * Two zero-dependency layers:
+ *  1. `createScreenReceiver` — transport and lifecycle: boot validation, single
+ *     window `init` port transfer, `ready` capability negotiation, `call`/`slot`/
+ *     `tool`/`asset` bookkeeping, drawer surfaces + context, scoped `leave`
+ *     ownership, bounded `state` snapshots, and teardown.
+ *  2. `createScreenBridge` — reactive `screen.v2` store (`subscribe` + `getState`),
+ *     closed `ScreenPush` validation, host drawer verb separation, per-verb
+ *     argument allowlists and byte budgets, concurrency limits, reply size and
+ *     secret-key guards, write vs read retirement, and route patching.
  *
- * Wire shapes are documented in
- * `ui/src/features/workspace-apps/screen/screenProtocol.ts`; this module
- * follows that document, it does not extend it.
+ * Wire shapes follow `ui/src/features/workspace-apps/screen/screenProtocol.ts`.
  */
-import { ScreenClosedError, ScreenRefusalError, ScreenTimeoutError, readRefusal } from "./refusal.mjs";
+import { ScreenBridgeError, ScreenClosedError, ScreenRefusalError, ScreenTimeoutError, readRefusal } from "./refusal.mjs";
 
 export const MAX_STATE_BYTES = 32 * 1024;
 /** The encoded allowance for a 96 KiB image (base64 + prefix), matching
  *  `ASSET_BYTES_MAX` and the reference receiver's `MAX_DATA_URL`. */
 export const MAX_ASSET_BYTES = Math.ceil((96 * 1024 * 4) / 3) + 32;
 export const DEFAULT_TIMEOUT_MS = 15_000;
+export const DRAWER_CONTEXT_BYTES = 1024;
+export const MAX_PUSH_BYTES = 128 * 1024;
+export const MAX_REPLY_DATA_BYTES = 1024 * 1024;
+export const HOST_DRAWER_VERBS = Object.freeze(["screen.drawer.open", "screen.drawer.close", "screen.drawer.context"]);
+export const ROUTABLE_ID = /^[a-z0-9_-]{1,64}$/;
+export const ROUTE_RECORD_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 const BOOT_ID = "cadence-screen-boot";
 const BOOT_KEYS = ["bridge_nonce", "generation", "parent_origin", "tag"];
 const TAG = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const NONCE = /^[0-9a-f]{64}$/;
+const DIGEST = /^sha256:[0-9a-f]{64}$/;
+const SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // Wire bounds from `screenProtocol.ts`: ACTION_ID, TOOL_ALIAS,
 // TOOL_REQUEST_ID, ACTION_ARGS_BYTES and COORD_MAX. The receiver enforces the
 // shape; which verbs an app may send stays the app's closed set.
 const ACTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const PUSH_ACTION_TOKEN = /^[a-z][a-z0-9_.-]{0,127}$/;
+const DRAWER_SURFACE = /^[a-z0-9_-]{1,64}$/;
 const TOOL_ALIAS = /^[a-z][a-z0-9]{0,31}(\.[a-z][a-z0-9]{0,31}){0,3}$/;
 const TOOL_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const ACTION_ARGS_BYTES = 16 * 1024;
-const GEN_SCOPE_KEYS = ["draft_id", "operation", "revision"];
+const OBSERVATION_ROW_BYTES = 64 * 1024;
 const ASSET_DATA_URL = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/;
 const COORD_MAX = 16384;
+const SECRET_KEYS = Object.freeze(["confirmation_nonce", "confirmation_token", "confirm_token", "action_token"]);
+const DEFAULT_PUSH_KEYS = Object.freeze([
+  "v", "op", "install_id", "context_id", "digest", "tag", "installation", "contexts",
+  "runs", "outbox", "publish_intents", "sources", "defaults", "publish_settings",
+  "readiness", "actions", "run_receipts", "original_downloads", "media_previews",
+  "media_chat_references", "now", "resume", "route", "read_observations", "presentation_locale",
+]);
 
 function fail(message) {
   throw new TypeError(message);
@@ -49,13 +67,17 @@ function loopbackHttp(origin) {
   return labels.at(-1) === "localhost" && labels.every((label) => DNS_LABEL.test(label)) && origin.hostname.length <= 253;
 }
 
-export function validateBoot(value) {
+export function validateBoot(value, expectedTag) {
+  if (expectedTag !== undefined && (typeof expectedTag !== "string" || !TAG.test(expectedTag))) {
+    fail("expected tag must be 1-32 lowercase letters, digits or dashes, not leading with a dash");
+  }
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("boot must be an object");
   const keys = Object.keys(value);
   if (keys.length !== BOOT_KEYS.length || keys.some((key) => !BOOT_KEYS.includes(key))) {
     fail("boot keys must be exactly bridge_nonce, generation, parent_origin, tag");
   }
   if (!TAG.test(value.tag ?? "")) fail("boot tag must be 1-32 lowercase letters, digits or dashes, not leading with a dash");
+  if (expectedTag !== undefined && value.tag !== expectedTag) fail(`boot tag mismatch: expected ${expectedTag}, got ${value.tag}`);
   if (!NONCE.test(value.bridge_nonce ?? "")) fail("boot bridge_nonce must be 64 lowercase hex");
   if (typeof value.generation !== "number" || !Number.isSafeInteger(value.generation) || value.generation < 0) {
     fail("boot generation must be a non-negative safe integer");
@@ -79,19 +101,26 @@ export function validateBoot(value) {
   });
 }
 
-export function readBoot(documentRef = globalThis.document) {
+export function readBoot(documentRef = globalThis.document, expectedTag) {
   const node = documentRef?.getElementById?.(BOOT_ID);
   if (!node) fail(`no #${BOOT_ID} element`);
+  const raw = node.textContent ?? "";
+  if (raw.length > 2048) fail(`#${BOOT_ID} exceeds 2 KiB`);
   let parsed;
   try {
-    parsed = JSON.parse(node.textContent ?? "");
+    parsed = JSON.parse(raw);
   } catch {
     fail(`#${BOOT_ID} is not JSON`);
   }
-  return validateBoot(parsed);
+  return validateBoot(parsed, expectedTag);
 }
 
-const isPlain = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+const isPlain = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+};
+const exactKeys = (value, allowed) => Object.keys(value).every((key) => allowed.includes(key));
 
 /** A plain-object args bag within the host's byte bound, or `null`. */
 function validArgs(args, limit = ACTION_ARGS_BYTES) {
@@ -103,6 +132,34 @@ function validArgs(args, limit = ACTION_ARGS_BYTES) {
     return null;
   }
   return text !== undefined && byteLength(text) <= limit ? args : null;
+}
+
+/** SOC-55: bounded plain-JSON check matching `drawerContextBytes` in `screenProtocol.ts`. */
+function validDrawerContext(value) {
+  const ancestors = new Set();
+  let remaining = DRAWER_CONTEXT_BYTES;
+  const check = (item) => {
+    if (--remaining < 0) return false;
+    if (item === null || typeof item === "boolean") return true;
+    if (typeof item === "string") return item.length <= DRAWER_CONTEXT_BYTES;
+    if (typeof item === "number") return Number.isFinite(item);
+    if (typeof item !== "object" || ancestors.has(item)) return false;
+    const array = Array.isArray(item);
+    if ((!array && !isPlain(item)) || (array && item.length > DRAWER_CONTEXT_BYTES)) return false;
+    ancestors.add(item);
+    const ok = array
+      ? item.every(check)
+      : Object.keys(item).every((key) => key.length <= DRAWER_CONTEXT_BYTES && check(item[key]));
+    ancestors.delete(item);
+    return ok;
+  };
+  try {
+    if (!check(value)) return false;
+    const text = JSON.stringify(value);
+    return typeof text === "string" && byteLength(text) <= DRAWER_CONTEXT_BYTES;
+  } catch {
+    return false;
+  }
 }
 
 /** CAD-1365: the optional revision the host binds a generation tool to.
@@ -144,27 +201,20 @@ function inert(reason) {
     asset: refuse,
     assetAdmitted: () => false,
     state: () => false,
+    ownLeaveState: () => null,
     presentation: () => "outlet",
+    surfaceRole: () => "primary",
+    surface: () => undefined,
     openDrawer: refuse,
     closeDrawer: refuse,
+    drawerContext: refuse,
     teardown() {},
   });
 }
 
-/**
- * @param {object} options
- * @param {object} [options.boot] parsed boot (omit to read `#cadence-screen-boot`)
- * @param {(push: object) => void} options.onPush
- * @param {(reason: string) => void} [options.onError]
- * @param {readonly string[]} [options.accepts] advertised PUSH versions
- * @param {number} [options.timeoutMs]
- * @param {{ getElementById(id: string): { textContent: string } | null }} [options.document]
- * @param {{ postMessage(message: unknown, origin: string, transfer?: unknown[]): void }} [options.parent]
- * @param {{ addEventListener?(type: string, fn: () => void, options?: object): void }} [options.window]
- * @param {typeof MessageChannel} [options.MessageChannel]
- */
 export function createScreenReceiver(options = {}) {
   const {
+    tag: expectedTag,
     onPush,
     onError,
     onPresentation,
@@ -179,18 +229,25 @@ export function createScreenReceiver(options = {}) {
     MessageChannel: Channel = globalThis.MessageChannel,
   } = options;
   if (typeof onPush !== "function") throw new TypeError("onPush is required");
-  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-presentation.v1", "screen-surfaces.v1", "screen-records.v1", "crm-locale.v1"]);
+  if (expectedTag !== undefined && (typeof expectedTag !== "string" || !TAG.test(expectedTag))) {
+    throw new TypeError("tag must be 1-32 lowercase letters, digits or dashes, not leading with a dash");
+  }
+  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-presentation.v1", "screen-surfaces.v1", "screen-records.v1", "screen-locale.v1"]);
   if (
     !Array.isArray(accepts) ||
     accepts.length === 0 ||
     accepts.some((value) => !ACCEPTED.has(value)) ||
     !accepts.some((value) => value === "screen.v1" || value === "screen.v2")
   ) {
-    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1, screen-presentation.v1, screen-surfaces.v1, screen-records.v1 or crm-locale.v1");
+    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1, screen-media.v1, screen-presentation.v1, screen-surfaces.v1, screen-records.v1 or screen-locale.v1");
   }
   const actionsAccepted = accepts.includes("screen-actions.v1");
   if (actionsAccepted && !accepts.includes("screen.v2")) {
     throw new TypeError("screen-actions.v1 needs screen.v2");
+  }
+  const mediaAccepted = accepts.includes("screen-media.v1");
+  if (mediaAccepted && !accepts.includes("screen.v2")) {
+    throw new TypeError("screen-media.v1 needs screen.v2");
   }
   const presentationAccepted = accepts.includes("screen-presentation.v1");
   if (presentationAccepted && !accepts.includes("screen.v2")) {
@@ -207,21 +264,22 @@ export function createScreenReceiver(options = {}) {
   if (recordsAccepted && !accepts.includes("screen.v2")) {
     throw new TypeError("screen-records.v1 needs screen.v2");
   }
-  const localeAccepted = accepts.includes("crm-locale.v1");
-  if (localeAccepted && !recordsAccepted) {
-    throw new TypeError("crm-locale.v1 needs screen-records.v1");
+  const localeAccepted = accepts.includes("screen-locale.v1");
+  if (localeAccepted && !accepts.includes("screen.v2")) {
+    throw new TypeError("screen-locale.v1 needs screen.v2");
   }
   // `screen.v1` is a local PUSH filter. The host's ready envelope admits only
   // v2 contract names, and a v1-only mount sends the bare ready. The host
-  // accepts at most four ready capabilities; refuse here rather than let the
+  // accepts at most five ready capabilities; refuse here rather than let the
   // host close a mount for an envelope it never admits.
   const readyAccepts = ["screen.v2",
     ...(actionsAccepted ? ["screen-actions.v1"] : []),
+    ...(mediaAccepted ? ["screen-media.v1"] : []),
     ...(presentationAccepted ? ["screen-presentation.v1"] : []),
     ...(surfacesAccepted ? ["screen-surfaces.v1"] : []),
     ...(recordsAccepted ? ["screen-records.v1"] : []),
-    ...(localeAccepted ? ["crm-locale.v1"] : [])];
-  if (readyAccepts.length > 4) throw new TypeError("the host admits at most four ready capabilities");
+    ...(localeAccepted ? ["screen-locale.v1"] : [])];
+  if (readyAccepts.length > 5) throw new TypeError("the host admits at most five ready capabilities");
   const ready = accepts.includes("screen.v2") ? { v: 1, op: "ready", accepts: readyAccepts } : { v: 1, op: "ready" };
   if (!Number.isSafeInteger(maxArgsBytes) || maxArgsBytes <= 0) throw new TypeError("maxArgsBytes must be a positive safe integer");
   const argsLabel = maxArgsBytes === ACTION_ARGS_BYTES ? "16 KiB" : `${maxArgsBytes} bytes`;
@@ -229,9 +287,15 @@ export function createScreenReceiver(options = {}) {
   if (!parent || typeof parent.postMessage !== "function") throw new TypeError("a parent window is required");
   if (typeof Channel !== "function") throw new TypeError("MessageChannel is unavailable");
 
+  if (options.parent === undefined && windowRef && parent === windowRef) {
+    const reason = "boot refused: screen must run inside a child frame";
+    onError?.(reason);
+    return inert(reason);
+  }
+
   let boot;
   try {
-    boot = validateBoot(options.boot ?? readBoot(documentRef));
+    boot = validateBoot(options.boot ?? readBoot(documentRef), expectedTag);
   } catch (error) {
     const reason = `boot refused: ${error.message}`;
     onError?.(reason);
@@ -265,6 +329,7 @@ export function createScreenReceiver(options = {}) {
   /** CAD-1777 — the host-derived role of this mount and the surface it names. */
   let surfaceRole = "primary";
   let surfaceName = undefined;
+  let leaveOwner = null;
   let seq = 0;
   // The host closes a mount that starts a second tool while one is running.
   // A local timeout does not cancel the host invocation, so busy survives it
@@ -275,6 +340,8 @@ export function createScreenReceiver(options = {}) {
   const close = (reason, notify) => {
     if (tornDown) return;
     tornDown = true;
+    accepted = false;
+    leaveOwner = null;
     try {
       port.onmessage = null;
       port.onmessageerror = null;
@@ -438,7 +505,7 @@ export function createScreenReceiver(options = {}) {
             (message.role !== "primary" && message.role !== "drawer") ||
             (message.modal !== undefined && typeof message.modal !== "boolean") ||
             (message.surface !== undefined &&
-              (typeof message.surface !== "string" || !/^[a-z0-9_-]{1,64}$/.test(message.surface)))) {
+              (typeof message.surface !== "string" || !DRAWER_SURFACE.test(message.surface)))) {
           fail("invalid surface message");
         }
         surfaceRole = message.role;
@@ -468,8 +535,8 @@ export function createScreenReceiver(options = {}) {
         fail("identity/scope mismatch on an accepted port");
       }
       locked = identity;
-      onPush(message);
       accepted = true;
+      onPush(message);
     } catch (error) {
       close(`screen push refused: ${error.message}`, true);
     }
@@ -508,35 +575,56 @@ export function createScreenReceiver(options = {}) {
     /** The closed surface idiom this drawer mounts, when the host named one. */
     surface: () => surfaceName,
     /** Ask the host to present the app's surface in the board-wide drawer.
-     *  `options.size` (CAD-1932) is `"narrow"` (the default) or `"wide"`. */
-    openDrawer(surface, options = {}) {
+     *  `options.size` (CAD-1932) is `"narrow"` (the default) or `"wide"`;
+     *  `options.context` (SOC-55) is bounded plain JSON on `screen-surfaces.v1`. */
+    openDrawer(surface, drawerOptions = {}) {
       if (!presentationAccepted && !surfacesAccepted) {
         return Promise.reject(new ScreenClosedError("the host did not opt into a drawer"));
       }
-      if (presentationAccepted && !presented) {
+      if (presentationAccepted && !surfacesAccepted && !presented) {
         return Promise.reject(new ScreenClosedError("the host has not presented this screen"));
       }
       if (surfaceRole !== "primary") {
         return Promise.reject(new ScreenClosedError("a drawer surface opens no further drawer"));
       }
-      if (typeof surface !== "string" || !/^[a-z0-9_-]{1,64}$/.test(surface)) {
+      if (typeof surface !== "string" || !DRAWER_SURFACE.test(surface)) {
         return Promise.reject(new TypeError("surface must be 1-64 of a-z, 0-9, _ or -"));
       }
-      const size = options?.size;
+      const size = drawerOptions?.size;
       if (size !== undefined && size !== "narrow" && size !== "wide") {
         return Promise.reject(new TypeError('size must be "narrow" or "wide"'));
       }
-      return request("call", { verb: "screen.drawer.open", args: size === undefined ? { surface } : { surface, size } });
+      const hasContext = drawerOptions !== null && typeof drawerOptions === "object" && drawerOptions.context !== undefined;
+      if (hasContext) {
+        if (!surfacesAccepted) return Promise.reject(new ScreenClosedError("drawer context requires screen-surfaces.v1"));
+        if (!validDrawerContext(drawerOptions.context)) {
+          return Promise.reject(new TypeError(`context must be plain JSON within ${DRAWER_CONTEXT_BYTES} bytes`));
+        }
+      }
+      const args = {
+        surface,
+        ...(size !== undefined ? { size } : {}),
+        ...(hasContext ? { context: drawerOptions.context } : {}),
+      };
+      return request("call", { verb: "screen.drawer.open", args });
     },
     /** Ask the host to close the board-wide drawer it opened. */
     closeDrawer() {
       if (!presentationAccepted && !surfacesAccepted) {
         return Promise.reject(new ScreenClosedError("the host did not opt into a drawer"));
       }
-      if (presentationAccepted && !presented) {
+      if (presentationAccepted && !surfacesAccepted && !presented) {
         return Promise.reject(new ScreenClosedError("the host has not presented this screen"));
       }
       return request("call", { verb: "screen.drawer.close", args: {} });
+    },
+    drawerContext() {
+      if (!surfacesAccepted) return Promise.reject(new ScreenClosedError("drawer context requires screen-surfaces.v1"));
+      if (surfaceRole !== "drawer") return Promise.reject(new ScreenClosedError("only a drawer surface has open context"));
+      return request("call", { verb: "screen.drawer.context", args: {} }).then((data) => {
+        if (!isPlain(data) || !("context" in data)) throw new ScreenClosedError("malformed drawer context reply");
+        return data.context ?? null;
+      });
     },
     slot(verb, args = {}, anchor = "footer") {
       if (typeof verb !== "string" || verb.length === 0 || verb.length > 128) {
@@ -633,6 +721,439 @@ export function createScreenReceiver(options = {}) {
         return false;
       }
     },
+    ownLeaveState(leaveOptions = {}) {
+      const isLive = leaveOptions?.isLive;
+      if (isLive !== undefined && typeof isLive !== "function") throw new TypeError("isLive must be a function when provided");
+      if (tornDown || !accepted || !liveV2 || (isLive && !isLive())) return null;
+      const owner = Symbol();
+      leaveOwner = owner;
+      const active = () => !tornDown && accepted && liveV2 && leaveOwner === owner && (!isLive || isLive());
+      const publish = (unsaved) => {
+        if (typeof unsaved !== "boolean" || !active()) return false;
+        try {
+          post({ v: 2, op: "leave", unsaved });
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      return Object.freeze({
+        publish,
+        release() {
+          if (!active()) return;
+          publish(false);
+          leaveOwner = null;
+        },
+      });
+    },
     teardown: () => close("teardown", false),
+  });
+}
+
+/** Domain-agnostic reactive `screen.v2` bridge (`subscribe` + `getState`). */
+export function createScreenBridge(options = {}) {
+  const {
+    tag, appName, records = false, actions = false, media = false, surfaces = false,
+    presentation = false, locale = false, calls = {}, slots = {}, argBytes = ACTION_ARGS_BYTES,
+    singleFlight = [], writeVerbs = [], route: routeConfig, observations: observationVerbs = [],
+    pushKeys = DEFAULT_PUSH_KEYS, maxInFlight = 8, timeoutMs = 65_000, createError,
+  } = options;
+  if (typeof tag !== "string" || !TAG.test(tag)) fail("tag must be 1-32 lowercase letters, digits or dashes, not leading with a dash");
+  if (appName !== undefined && (typeof appName !== "string" || appName.length === 0)) fail("appName must be a non-empty string when provided");
+  if (!isPlain(calls) || !isPlain(slots)) fail("calls and slots must be plain verb -> field-list maps");
+  if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 1) fail("maxInFlight must be a positive safe integer");
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) fail("timeoutMs must be positive");
+  if (createError !== undefined && typeof createError !== "function") fail("createError must be a function when provided");
+
+  let defaultArgBytes = ACTION_ARGS_BYTES;
+  const perVerbBytes = new Map();
+  if (typeof argBytes === "number") {
+    if (!Number.isSafeInteger(argBytes) || argBytes <= 0) fail("argBytes must be a positive safe integer");
+    defaultArgBytes = argBytes;
+  } else if (isPlain(argBytes)) {
+    for (const [verb, limit] of Object.entries(argBytes)) {
+      if (!Number.isSafeInteger(limit) || limit <= 0) fail(`argBytes[${verb}] must be a positive safe integer`);
+      perVerbBytes.set(verb, limit);
+    }
+  } else {
+    fail("argBytes must be a positive safe integer or a plain verb -> byte-limit map");
+  }
+  const receiverMaxArgsBytes = Math.max(defaultArgBytes, ...perVerbBytes.values());
+
+  let parsedRouteConfig = null;
+  if (routeConfig !== undefined) {
+    if (!isPlain(routeConfig) || !Array.isArray(routeConfig.sections) || routeConfig.sections.length === 0 ||
+        routeConfig.sections.some((s) => typeof s !== "string" || s.length === 0)) {
+      fail("route.sections must be a non-empty string array");
+    }
+    const views = routeConfig.views ?? ["list", "new"];
+    if (!Array.isArray(views) || views.length === 0 || views.some((v) => typeof v !== "string" || v.length === 0)) {
+      fail("route.views must be a non-empty string array");
+    }
+    const defaultSection = routeConfig.defaultSection ?? routeConfig.sections[0];
+    if (!routeConfig.sections.includes(defaultSection)) fail("route.defaultSection must be listed in route.sections");
+    parsedRouteConfig = { sections: [...routeConfig.sections], defaultSection, views: [...views], defaultView: views[0] };
+  }
+
+  const declaredOperations = Object.freeze([...new Set([...Object.keys(calls), ...Object.keys(slots)])]);
+  const declaredSet = new Set(declaredOperations);
+  const writeVerbSet = new Set(writeVerbs);
+  const observationSet = new Set(observationVerbs);
+  const allowedPushKeys = [...pushKeys];
+  const singleFlightRules = [...singleFlight];
+  const negotiatedAccepts = [
+    "screen.v2",
+    ...(actions ? ["screen-actions.v1"] : []),
+    ...(media ? ["screen-media.v1"] : []),
+    ...(presentation ? ["screen-presentation.v1"] : []),
+    ...(surfaces ? ["screen-surfaces.v1"] : []),
+    ...(records ? ["screen-records.v1"] : []),
+    ...(locale ? ["screen-locale.v1"] : []),
+  ];
+  if (negotiatedAccepts.length > 5) fail("the host admits at most five ready capabilities");
+
+  const makeError = (message, status = 502, extra) =>
+    createError ? createError(message, status, extra) : new ScreenBridgeError(message, status, extra);
+  const invalidBridge = (detail = "The screen bridge refused an invalid or retired message") => makeError(detail, 502);
+  const initialSurface = Object.freeze({ role: "primary", name: undefined, modal: false });
+  const makeState = (patch) => Object.freeze({
+    status: patch.status, snapshot: patch.snapshot, error: patch.error, pushes: patch.pushes, surface: patch.surface,
+  });
+
+  let currentState = makeState({ status: "loading", snapshot: null, error: null, pushes: 0, surface: initialSurface });
+  let receiver = null;
+  let retired = false;
+  let retiredCause = null;
+  let inFlight = 0;
+  const activeSingleFlight = new Set();
+  const listeners = new Set();
+  const writeListeners = new Set();
+  const notify = () => { for (const listener of [...listeners]) listener(); };
+  const notifyWritten = () => { for (const listener of [...writeListeners]) listener(); };
+
+  const setState = (next) => {
+    currentState = makeState({
+      status: next.status ?? currentState.status,
+      snapshot: "snapshot" in next ? next.snapshot : currentState.snapshot,
+      error: "error" in next ? next.error : currentState.error,
+      pushes: next.pushes ?? currentState.pushes,
+      surface: next.surface ?? currentState.surface,
+    });
+    notify();
+  };
+
+  const parseRoute = (value) => {
+    if (!parsedRouteConfig) return null;
+    const fallback = Object.freeze({
+      section: parsedRouteConfig.defaultSection, view: parsedRouteConfig.defaultView, record_id: null, segment_id: null,
+    });
+    if (value === undefined) return fallback;
+    if (!isPlain(value) || !exactKeys(value, ["section", "view", "record_id", "segment_id"])) {
+      throw invalidBridge("Invalid screen route projection");
+    }
+    return Object.freeze({
+      section: parsedRouteConfig.sections.includes(value.section) ? value.section : parsedRouteConfig.defaultSection,
+      view: parsedRouteConfig.views.includes(value.view) ? value.view : parsedRouteConfig.defaultView,
+      record_id: typeof value.record_id === "string" && ROUTE_RECORD_ID.test(value.record_id) ? value.record_id : null,
+      segment_id: typeof value.segment_id === "string" && ROUTE_RECORD_ID.test(value.segment_id) ? value.segment_id : null,
+    });
+  };
+
+  const can = (verb, actionList) => {
+    const list = actionList ?? currentState.snapshot?.actions;
+    return Array.isArray(list) && declaredSet.has(verb) && list.includes(verb);
+  };
+
+  const acceptPush = (push) => {
+    let serialized;
+    try { serialized = JSON.stringify(push); } catch { throw invalidBridge(); }
+    if (!serialized || byteLength(serialized) > MAX_PUSH_BYTES) throw invalidBridge();
+    if (!isPlain(push) || !exactKeys(push, allowedPushKeys)) throw invalidBridge("Invalid screen scope projection");
+    if (push.v !== 2 || push.op !== "screen" || push.tag !== tag) throw invalidBridge("Invalid screen scope projection");
+    if (typeof push.install_id !== "string" || !SAFE_ID.test(push.install_id)) throw invalidBridge("Invalid screen scope projection");
+    const contextId = push.context_id === undefined ? "" : push.context_id;
+    if (typeof contextId !== "string" || (contextId !== "" && !SAFE_ID.test(contextId))) {
+      throw invalidBridge("Invalid screen scope projection");
+    }
+    if (typeof push.digest !== "string" || !DIGEST.test(push.digest)) throw invalidBridge("Invalid screen scope projection");
+    if ("presentation_locale" in push && push.presentation_locale !== "en" && push.presentation_locale !== "zh-TW") {
+      throw invalidBridge("Invalid screen scope projection");
+    }
+    if (!isPlain(push.installation) ||
+        !exactKeys(push.installation, ["install_id", "name", "title", "version", "digest", "summary"]) ||
+        push.installation.install_id !== push.install_id || push.installation.digest !== push.digest ||
+        (appName !== undefined && push.installation.name !== appName) ||
+        typeof push.installation.name !== "string" || push.installation.name.length === 0 ||
+        typeof push.installation.title !== "string" || typeof push.installation.version !== "string" ||
+        typeof push.installation.summary !== "string") {
+      throw invalidBridge("Invalid screen scope projection");
+    }
+    let contexts = [];
+    if ("contexts" in push && push.contexts !== undefined) {
+      if (!Array.isArray(push.contexts) || !push.contexts.every(
+        (c) => isPlain(c) && exactKeys(c, ["id", "label"]) && typeof c.id === "string" && SAFE_ID.test(c.id) && typeof c.label === "string",
+      )) {
+        throw invalidBridge("Invalid screen scope projection");
+      }
+      contexts = push.contexts.map((c) => Object.freeze({ id: c.id, label: c.label }));
+    }
+    const rawActions = push.actions === undefined ? [] : push.actions;
+    if (!Array.isArray(rawActions) || rawActions.length > 256 || new Set(rawActions).size !== rawActions.length ||
+        !rawActions.every((a) => typeof a === "string" && PUSH_ACTION_TOKEN.test(a))) {
+      throw invalidBridge("Invalid screen scope projection");
+    }
+    const prev = currentState.snapshot;
+    if (prev && (prev.scope.installId !== push.install_id || prev.digest !== push.digest || prev.scope.contextId !== contextId)) {
+      throw invalidBridge("Invalid screen scope projection");
+    }
+    const pushActions = Object.freeze(
+      rawActions.filter((a) => !HOST_DRAWER_VERBS.includes(a) && (actions || declaredSet.size === 0 || declaredSet.has(a))),
+    );
+    const parsedObservations = [];
+    if (push.read_observations !== undefined) {
+      if (!Array.isArray(push.read_observations) || push.read_observations.length > 16) {
+        throw invalidBridge("Invalid screen scope projection");
+      }
+      for (const row of push.read_observations) {
+        if (!isPlain(row) || !exactKeys(row, ["operation", "args", "data"]) || typeof row.operation !== "string" ||
+            !observationSet.has(row.operation) || !can(row.operation, pushActions) || !isPlain(row.args) ||
+            !exactKeys(row.args, calls[row.operation] ?? []) || byteLength(JSON.stringify(row)) > OBSERVATION_ROW_BYTES) {
+          throw invalidBridge("Invalid screen scope projection");
+        }
+        parsedObservations.push(Object.freeze({ operation: row.operation, args: row.args, data: row.data }));
+      }
+    }
+    const scope = Object.freeze({ installId: push.install_id, digest: push.digest, contextId });
+    const snapshot = Object.freeze({
+      scope, digest: push.digest, actions: pushActions,
+      presentationLocale: push.presentation_locale === "zh-TW" ? "zh-TW" : "en",
+      route: parseRoute(push.route), observations: Object.freeze(parsedObservations),
+      contexts: Object.freeze(contexts), installation: Object.freeze({ ...push.installation }), raw: push,
+    });
+    setState({ status: "ready", snapshot, error: null, pushes: currentState.pushes + 1 });
+  };
+
+  const retire = (cause) => {
+    if (retired) return;
+    const err = cause instanceof Error ? cause : makeError(typeof cause === "string" ? cause : "Screen bridge is unavailable", 502);
+    retired = true;
+    retiredCause = err;
+    const live = receiver;
+    receiver = null;
+    live?.teardown();
+    setState({ status: "error", snapshot: null, error: err });
+  };
+
+  const mapError = (error) => {
+    if (createError && error instanceof Error && "status" in error && typeof error.status === "number" &&
+        !(error instanceof ScreenRefusalError) && !(error instanceof ScreenTimeoutError) && !(error instanceof ScreenClosedError)) {
+      return error;
+    }
+    if (error instanceof ScreenBridgeError) return error;
+    if (error instanceof ScreenRefusalError) return makeError(error.text || error.code, error.status, { code: error.code });
+    if (error instanceof ScreenTimeoutError) return makeError("Request did not answer. Inspect fresh status before retrying.", 504, { code: "timeout" });
+    if (error instanceof ScreenClosedError) return retiredCause ?? makeError("Screen bridge is unavailable", 503, { code: "gone" });
+    if (error instanceof TypeError) return makeError(error.message, 400, { code: "invalid" });
+    if (error instanceof Error && typeof error.status === "number") return error;
+    return invalidBridge();
+  };
+
+  const assertScope = (scope) => {
+    const snap = currentState.snapshot;
+    if (!snap || retired || !scope || scope.installId !== snap.scope.installId || scope.digest !== snap.digest ||
+        (scope.contextId !== undefined && scope.contextId !== snap.scope.contextId)) {
+      throw makeError("Screen scope is absent or retired", 403, { code: "forbidden" });
+    }
+  };
+
+  const cleanArgs = (verb, rawArgs, fieldsMap) => {
+    const allowed = fieldsMap[verb];
+    if (!allowed) throw makeError("This workspace doesn't offer that action.", 403, { code: "forbidden" });
+    const source = rawArgs === undefined ? {} : rawArgs;
+    if (!isPlain(source)) throw makeError(`Invalid arguments for ${verb}`, 400, { code: "invalid" });
+    const cleaned = {};
+    for (const [key, value] of Object.entries(source)) {
+      if (value === undefined) continue;
+      if (!allowed.includes(key)) throw makeError(`Unexpected arguments for ${verb}`, 400, { code: "invalid" });
+      cleaned[key] = value;
+    }
+    let encoded;
+    try { encoded = JSON.stringify(cleaned); } catch { throw makeError(`Invalid arguments for ${verb}`, 400, { code: "invalid" }); }
+    if (!encoded || byteLength(encoded) > (perVerbBytes.get(verb) ?? defaultArgBytes)) {
+      throw makeError("Request arguments exceed size limit", 400, { code: "invalid" });
+    }
+    return cleaned;
+  };
+
+  const hasSecretKey = (node) => {
+    if (!node || typeof node !== "object") return false;
+    if (Array.isArray(node)) return node.some(hasSecretKey);
+    if (!isPlain(node)) return false;
+    return Object.keys(node).some((key) => SECRET_KEYS.includes(key) || hasSecretKey(node[key]));
+  };
+
+  const guardData = (value) => {
+    let encoded;
+    try { encoded = JSON.stringify(value ?? null); } catch { throw invalidBridge(); }
+    if (byteLength(encoded) > MAX_REPLY_DATA_BYTES || hasSecretKey(value)) throw invalidBridge();
+    return value;
+  };
+
+  const matchSingleFlight = (verb) =>
+    singleFlightRules.find((rule) => (rule.endsWith(".") ? verb.startsWith(rule) : verb === rule)) ?? null;
+
+  const dispatch = (kind, scope, verb, rawArgs, extra = {}) => {
+    const live = receiver;
+    if (!live || retired) return Promise.reject(retiredCause ?? makeError("Screen bridge is unavailable", 503, { code: "unavailable" }));
+    try {
+      assertScope(scope);
+      const fieldsMap = kind === "call" ? calls : slots;
+      if (!(verb in fieldsMap) || !can(verb)) throw makeError("This workspace doesn't offer that action.", 403, { code: "forbidden" });
+      const args = cleanArgs(verb, rawArgs, fieldsMap);
+      if (inFlight >= maxInFlight) return Promise.reject(makeError("Screen bridge is busy; wait for the current request", 429, { code: "conflict" }));
+      const lockKey = matchSingleFlight(verb);
+      if (lockKey && activeSingleFlight.has(lockKey)) {
+        return Promise.reject(makeError("A conflicting request is already pending", 429, { code: "conflict" }));
+      }
+      inFlight += 1;
+      if (lockKey) activeSingleFlight.add(lockKey);
+      const release = () => { inFlight -= 1; if (lockKey) activeSingleFlight.delete(lockKey); };
+      const pending = kind === "call"
+        ? live.call(verb, args)
+        : live.slot(verb, args, extra.anchor ?? "footer").then((event) => {
+            if (event.state !== "done") {
+              const parsed = readRefusal(event.refusal);
+              if (!parsed) throw invalidBridge();
+              throw new ScreenRefusalError(parsed);
+            }
+            return "receipt" in event && event.receipt !== undefined ? event.receipt : event.data;
+          });
+      return pending.then(
+        (value) => {
+          release();
+          let guarded;
+          try { guarded = guardData(value); } catch (err) { const mapped = mapError(err); retire(mapped); throw mapped; }
+          if (writeVerbSet.has(verb) && !extra.quiet) notifyWritten();
+          return guarded;
+        },
+        (err) => {
+          release();
+          const mapped = mapError(err);
+          const status = mapped.status;
+          const keepOnForbidden = status === 403 && (writeVerbSet.has(verb) || extra.keepAliveOnForbidden === true);
+          if (status === 401 || status === 502 || status === 504 || (status === 403 && !keepOnForbidden)) retire(mapped);
+          throw mapped;
+        },
+      );
+    } catch (syncError) {
+      return Promise.reject(syncError);
+    }
+  };
+
+  return Object.freeze({
+    tag,
+    operations: declaredOperations,
+    subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener); }; },
+    getState: () => currentState,
+    getSnapshot: () => currentState.snapshot,
+    can,
+    assertScope,
+    start(runtime = {}) {
+      if (receiver || retired) return;
+      const created = createScreenReceiver({
+        tag, accepts: negotiatedAccepts, maxArgsBytes: receiverMaxArgsBytes, timeoutMs,
+        ...(runtime.boot !== undefined ? { boot: runtime.boot } : {}),
+        ...(runtime.document !== undefined ? { document: runtime.document } : {}),
+        ...(runtime.parent !== undefined ? { parent: runtime.parent } : {}),
+        ...(runtime.window !== undefined ? { window: runtime.window } : {}),
+        ...(runtime.MessageChannel !== undefined ? { MessageChannel: runtime.MessageChannel } : {}),
+        ...(runtime.onSlotState !== undefined ? { onSlotState: runtime.onSlotState } : {}),
+        onPresentation(mode) {
+          if (!retired && !surfaces) {
+            setState({ surface: Object.freeze({ role: mode === "drawer" ? "drawer" : "primary", name: undefined, modal: false }) });
+          }
+        },
+        onSurface(role, name, modal) { if (!retired) setState({ surface: Object.freeze({ role, name, modal }) }); },
+        onPush(push) { acceptPush(push); },
+        onError(reason) { retire(makeError(reason, 502)); },
+      });
+      if (!created.boot || created.boot.tag !== tag) {
+        created.teardown();
+        if (!retired) retire(invalidBridge());
+        return;
+      }
+      receiver = created;
+    },
+    call: (scope, verb, args = {}, callOptions = {}) => dispatch("call", scope, verb, args, callOptions),
+    slot: (scope, verb, args = {}, anchor = "footer", slotOptions = {}) => dispatch("slot", scope, verb, args, { ...slotOptions, anchor }),
+    tool(scope, alias, input = {}, requestId, generationScope) {
+      const live = receiver;
+      if (!live || retired) return Promise.reject(retiredCause ?? makeError("Screen bridge is unavailable", 503, { code: "unavailable" }));
+      try { assertScope(scope); } catch (syncError) { return Promise.reject(syncError); }
+      return live.tool(alias, input, requestId, generationScope).then(
+        (value) => { try { return guardData(value); } catch (err) { const mapped = mapError(err); retire(mapped); throw mapped; } },
+        (err) => {
+          const mapped = mapError(err);
+          if (mapped.status === 401 || mapped.status === 502 || mapped.status === 504) retire(mapped);
+          throw mapped;
+        },
+      );
+    },
+    asset(scope, ref, assetOptions) {
+      const live = receiver;
+      if (!live || retired) return Promise.reject(retiredCause ?? makeError("Screen bridge is unavailable", 503, { code: "unavailable" }));
+      try { assertScope(scope); } catch (syncError) { return Promise.reject(syncError); }
+      return live.asset(ref, assetOptions).catch((err) => Promise.reject(mapError(err)));
+    },
+    assetAdmitted: (ref) => Boolean(receiver && !retired && receiver.assetAdmitted(ref)),
+    state: (data) => (receiver && !retired && currentState.snapshot ? receiver.state(data) : false),
+    patchRoute(patch = {}) {
+      const snap = currentState.snapshot;
+      if (!parsedRouteConfig || !snap || !("screen.route.patch" in calls) || !can("screen.route.patch", snap.actions) || !isPlain(patch)) return;
+      if (patch.record_id !== undefined && patch.record_id !== null && (typeof patch.record_id !== "string" || !ROUTABLE_ID.test(patch.record_id))) return;
+      if (patch.segment_id !== undefined && patch.segment_id !== null && (typeof patch.segment_id !== "string" || !ROUTABLE_ID.test(patch.segment_id))) return;
+      void dispatch("call", snap.scope, "screen.route.patch", patch, { quiet: true, keepAliveOnForbidden: true }).catch(() => undefined);
+    },
+    ownLeaveState() {
+      const snap = currentState.snapshot;
+      if (!receiver || retired || !snap) return null;
+      const pinnedInstallId = snap.scope.installId;
+      const pinnedDigest = snap.digest;
+      return receiver.ownLeaveState({
+        isLive: () => {
+          const cur = currentState.snapshot;
+          return !retired && !!cur && cur.scope.installId === pinnedInstallId && cur.digest === pinnedDigest;
+        },
+      });
+    },
+    openDrawer(surface, drawerOptions) {
+      if (!receiver || retired) return Promise.reject(retiredCause ?? makeError("Screen bridge is unavailable", 503, { code: "unavailable" }));
+      return receiver.openDrawer(surface, drawerOptions).catch((err) => Promise.reject(mapError(err)));
+    },
+    closeDrawer() {
+      if (!receiver || retired) return Promise.reject(retiredCause ?? makeError("Screen bridge is unavailable", 503, { code: "unavailable" }));
+      return receiver.closeDrawer().catch((err) => Promise.reject(mapError(err)));
+    },
+    drawerContext() {
+      if (!receiver || retired) return Promise.reject(retiredCause ?? makeError("Screen bridge is unavailable", 503, { code: "unavailable" }));
+      return receiver.drawerContext().catch((err) => Promise.reject(mapError(err)));
+    },
+    onWrite(listener) { writeListeners.add(listener); return () => { writeListeners.delete(listener); }; },
+    notifyWritten,
+    markUnreachable(message = "The host is unreachable. Reopen this screen from the board.") {
+      if (currentState.status === "loading" && !retired) setState({ status: "error", error: makeError(message, 504, { code: "timeout" }) });
+    },
+    retire,
+    reset() {
+      const live = receiver;
+      receiver = null;
+      live?.teardown();
+      retired = false;
+      retiredCause = null;
+      inFlight = 0;
+      activeSingleFlight.clear();
+      currentState = makeState({ status: "loading", snapshot: null, error: null, pushes: 0, surface: initialSurface });
+      notify();
+    },
   });
 }
