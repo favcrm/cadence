@@ -538,11 +538,19 @@ fn import_local(
     }
 }
 
-/// A refusal or a stop this client made before sending (`rejected`, `busy`)
-/// proves the request changed nothing. Any other kind may have reached the
-/// board or daemon: a lost local reply is `internal`, not `unknown`.
+/// Whether a stop proves the request changed nothing. Kind alone does not: a
+/// local daemon can publish a page and then answer `busy` or `rejected` when
+/// it fails to record the outcome, and a lost local reply is `internal`. So
+/// only two things count: a hosted board's own transfer refusal (its code is
+/// in [`crate::remote_cli::WIKI_COPY_REFUSAL_CODES`]), and this client's own
+/// stop before it sends (`timeout` at the command deadline, `waking` at the
+/// wake budget). Everything else is reconciled, never called refused.
 fn definite(error: &Error) -> bool {
-    matches!(error.kind(), "rejected" | "busy")
+    match (error.kind(), error.code()) {
+        ("rejected", Some(code)) => crate::remote_cli::WIKI_COPY_REFUSAL_CODES.contains(&code),
+        ("busy", Some(code)) => matches!(code, "timeout" | "waking"),
+        _ => false,
+    }
 }
 
 /// A chunk that did not complete. Only a definite stop gets the plain next
@@ -2845,6 +2853,32 @@ mod tests {
                 !text.contains("stopped") && !text.contains("refused"),
                 "{text}"
             );
+        }
+        // A native daemon can publish and then fail to record the outcome:
+        // its `busy` or code-less `rejected` is not proof of no effect.
+        for after_publish in [
+            apply_stopped(
+                "J",
+                "a.md",
+                Error::busy_coded("busy", "guarded core writer is busy"),
+            ),
+            finish_stopped(
+                "J",
+                Error::busy_coded("busy", "guarded core writer is busy"),
+            ),
+            apply_stopped(
+                "J",
+                "a.md",
+                Error::rejected("the daemon's hosted lease is lost"),
+            ),
+            finish_stopped(
+                "J",
+                Error::invalid("storage_unavailable", "store unavailable"),
+            ),
+        ] {
+            let text = after_publish.to_string();
+            assert!(text.contains("was not confirmed"), "{text}");
+            assert!(!text.contains("stopped"), "{text}");
         }
         let chunk = chunk_stopped("J", "a.bin", Error::internal("io: reset"));
         assert!(

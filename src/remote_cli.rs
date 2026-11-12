@@ -5386,6 +5386,25 @@ fn wiki_copy_unserved(
     ))
 }
 
+/// CAD-2261: every code [`wiki_copy_refusal`] gives a hosted board's refusal
+/// of a transfer. A refusal carrying one of these was answered by the board
+/// before it changed anything, so the copy client may treat it as definite.
+/// A local daemon never answers a transfer with these codes.
+pub(crate) const WIKI_COPY_REFUSAL_CODES: &[&str] = &[
+    "destination_changed",
+    "payload_too_large",
+    "job_conflict",
+    "manifest_invalid",
+    "transfer_invalid",
+    "not_found",
+    "stage_incomplete",
+    "entries_pending",
+    "chunk_conflict",
+    "job_closed",
+    "entry_decided",
+    "revision_changed",
+];
+
 /// CAD-2261: a board that serves `wiki cp` (AOS-566) refuses a transfer
 /// operation with a code of its own. Say what happened and what to do, keep
 /// the board's code as the error's code, and never show the board's text.
