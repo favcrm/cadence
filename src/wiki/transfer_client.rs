@@ -581,6 +581,15 @@ fn write_outcome(error: Error, message: impl Into<String>) -> Error {
     let message = message.into();
     if error.kind() == "unknown" {
         Error::unknown(message)
+    } else if let Some(code) = error.code() {
+        // CAD-2261: the board's refusal code outlives the job wrapper, so a
+        // caller can still branch on it.
+        Error::Structured(crate::error::Structured {
+            kind: "rejected",
+            code: code.to_string(),
+            message,
+            revision: None,
+        })
     } else {
         Error::rejected(message)
     }
@@ -2711,6 +2720,51 @@ mod tests {
     /// CAD-2260: a hosted board names a missing path by code, with no
     /// "not found" wording. Discovery must read that as a new import root, and
     /// must not hide any other refusal.
+    /// CAD-2261: the first cross-language vector. Every manifest the tenant
+    /// board admitted in the AOS-566 fixture (a byte-identical copy of
+    /// agenticos-v2 `apps/api/src/board/fixtures/wiki-transfer.contract.json`
+    /// at `67a3839ae1222b2e6a9be7904aca270f5a449aea`) must hash here to the
+    /// digest the board answered, or no hosted copy could ever begin.
+    #[test]
+    fn manifest_digest_matches_the_tenant_board_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/agenticos/wiki-transfer.contract.json"
+        ))
+        .unwrap();
+        let mut vectors = 0;
+        for step in fixture["steps"].as_array().unwrap() {
+            let transfer = &step["arguments"]["transfer"];
+            if transfer["op"] != "begin" || step["response"]["status"] != 200 {
+                continue;
+            }
+            let manifest: Manifest = serde_json::from_value(transfer["manifest"].clone()).unwrap();
+            check_manifest(&manifest).unwrap();
+            assert_eq!(
+                manifest_digest(&manifest).unwrap(),
+                step["response"]["body"]["digest"].as_str().unwrap(),
+                "{}",
+                step["label"]
+            );
+            vectors += 1;
+        }
+        assert!(vectors > 0, "the fixture holds no admitted manifest");
+    }
+
+    /// CAD-2261: a board refusal wrapped as "wiki cp job J stopped on …"
+    /// keeps the board's code; an unknown outcome stays unknown.
+    #[test]
+    fn the_job_wrapper_keeps_the_board_code() {
+        let refused = Error::invalid("stage_incomplete", "not all bytes yet (stage_incomplete)");
+        let wrapped = write_outcome(refused, "wiki cp job J stopped on 'a.bin': x — resume");
+        assert_eq!(wrapped.kind(), "rejected");
+        assert_eq!(wrapped.code(), Some("stage_incomplete"));
+        assert!(wrapped.to_string().starts_with("wiki cp job J stopped"));
+        let plain = write_outcome(Error::rejected("no code"), "wrapped");
+        assert_eq!((plain.kind(), plain.code()), ("rejected", None));
+        let lost = write_outcome(Error::unknown("lost"), "wrapped");
+        assert_eq!(lost.kind(), "unknown");
+    }
+
     #[test]
     fn a_hosted_not_found_is_a_new_destination_for_discovery() {
         let missing = || Error::invalid("not_found", "no page at that path (HTTP 404)");

@@ -167,9 +167,21 @@ the same transfer operations (`begin`, `chunk`, `apply`, `finish`, `status`,
 empty files are kept. `.md`, `.markdown`, and `.txt` are text pages; other
 regular files are attachments.
 
-A hosted workspace board does not serve these transfer operations. There
-`wiki cp` exits with `not_implemented` and copies nothing; write each text page
-with `wiki put` and send each binary file with `wiki upload`.
+A hosted workspace board serves these transfer operations since its 2026-11-12
+release (AOS-566). On a hosted board:
+
+- Every operation is two requests (authorize, then call), and the whole command
+  has one deadline, `--wake-timeout` (120 seconds by default). A copy of about a
+  hundred small files fits; for a larger one pass a longer `--wake-timeout`, or
+  let it stop and continue the same job with `--resume <job>`.
+- The board sets its own size limits for `wiki cp`, which are lower than this
+  client's. A file over the limit refuses the whole copy before anything is
+  staged; send a large binary file on its own with `wiki upload`.
+- A refusal names the board's code and what to do, for example
+  `destination_changed` (copy again with `--update`) or `payload_too_large`.
+- A board released before then answers `not_implemented` and copies nothing;
+  there, write each text page with `wiki put` and send each binary file with
+  `wiki upload`.
 
 The command hashes the source and refuses symlinks, special files, and
 internal paths before it mutates the wiki. It prints the job id and digest

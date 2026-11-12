@@ -324,6 +324,145 @@ fn wiki_cp_on_a_board_without_transfers_names_the_limit_and_what_works() {
     assert!(wiki_copy_unserved("write", 501, Some("not_implemented"), &put).is_none());
 }
 
+/// CAD-2261: every code a transfer-serving board (AOS-566) refuses a `wiki cp`
+/// operation with becomes one plain sentence that keeps the code.
+#[test]
+fn wiki_cp_refusals_from_a_board_that_serves_transfers_are_plain() {
+    use super::wiki_copy_refusal;
+    let with = |op: &str| {
+        let mut m = serde_json::Map::new();
+        m.insert("path".into(), json!("projects/demo/notes"));
+        m.insert("transfer".into(), json!({ "op": op }));
+        m
+    };
+    for (verb, op, status, code) in [
+        ("write", "begin", 409, "destination_changed"),
+        ("write", "begin", 413, "payload_too_large"),
+        ("write", "begin", 409, "job_conflict"),
+        ("write", "begin", 400, "manifest_invalid"),
+        ("write", "finish", 400, "transfer_invalid"),
+        ("job_status", "status", 404, "not_found"),
+        ("job_status", "export", 404, "not_found"),
+        ("write", "apply", 409, "stage_incomplete"),
+        ("write", "finish", 409, "entries_pending"),
+        ("write", "chunk", 409, "chunk_conflict"),
+        ("write", "chunk", 409, "job_closed"),
+        ("write", "chunk", 409, "entry_decided"),
+        ("job_status", "export", 409, "revision_changed"),
+    ] {
+        let error = wiki_copy_refusal(verb, status, Some(code), &with(op)).unwrap();
+        let text = error.to_string();
+        assert_eq!(error.code(), Some(code), "{text}");
+        assert_eq!(error.kind(), "rejected", "{text}");
+        assert!(
+            text.ends_with(&format!("({code}, HTTP {status})")),
+            "{text}"
+        );
+        for banned in [
+            "unknown",
+            "did not match",
+            "retry later",
+            "MiB",
+            "Tenant remote call",
+        ] {
+            assert!(!text.contains(banned), "{banned}: {text}");
+        }
+    }
+    let missing_job = wiki_copy_refusal("job_status", 404, Some("not_found"), &with("status"));
+    assert!(missing_job
+        .unwrap()
+        .to_string()
+        .contains("no such copy job"));
+    let missing_page = wiki_copy_refusal("job_status", 404, Some("not_found"), &with("export"));
+    assert!(missing_page
+        .unwrap()
+        .to_string()
+        .contains("no readable page"));
+    assert!(
+        wiki_copy_refusal("write", 409, Some("destination_changed"), &with("begin"))
+            .unwrap()
+            .to_string()
+            .contains("--update")
+    );
+    assert!(
+        wiki_copy_refusal("write", 413, Some("payload_too_large"), &with("begin"))
+            .unwrap()
+            .to_string()
+            .contains("wiki upload")
+    );
+    // A text `wiki put` shares the verb and keeps its own refusals.
+    let mut put = serde_json::Map::new();
+    put.insert("path".into(), json!("projects/demo/notes/a.md"));
+    put.insert("text".into(), json!("hello"));
+    assert!(wiki_copy_refusal("write", 413, Some("payload_too_large"), &put).is_none());
+    // A status or code the board does not send for a transfer is left alone.
+    assert!(wiki_copy_refusal("write", 409, Some("revision_conflict"), &with("begin")).is_none());
+    assert!(wiki_copy_refusal("write", 400, Some("invalid_request"), &with("begin")).is_none());
+    assert!(wiki_copy_refusal("write", 409, None, &with("begin")).is_none());
+    assert!(wiki_copy_refusal("read", 404, Some("not_found"), &with("status")).is_none());
+}
+
+/// CAD-2261: the refusals in the board's own fixture (a byte-identical copy of
+/// agenticos-v2 `apps/api/src/board/fixtures/wiki-transfer.contract.json` at
+/// `67a3839ae1222b2e6a9be7904aca270f5a449aea`) replayed through the real
+/// request path: the board's exact bytes in, the board's code out.
+#[test]
+fn wiki_cp_refusals_in_the_board_fixture_reach_the_user_plainly() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/agenticos/wiki-transfer.contract.json"
+    ))
+    .unwrap();
+    let mut replayed = 0;
+    for step in fixture["steps"].as_array().unwrap() {
+        let status = step["response"]["status"].as_u64().unwrap() as u16;
+        if status < 400 {
+            continue;
+        }
+        let label = step["label"].as_str().unwrap();
+        let verb = step["action"].as_str().unwrap();
+        let args = step["arguments"].as_object().unwrap().clone();
+        let body = step["response"]["body"].clone();
+        let code = body["error"]["code"].as_str().unwrap().to_string();
+        if verb != "read" && wiki_transfer_shape(verb, &args).is_err() {
+            // The client refuses this one before any request; the board's
+            // answer to it is still mapped.
+            let error = super::wiki_copy_refusal(verb, status, Some(code.as_str()), &args).unwrap();
+            assert_eq!(error.code(), Some(code.as_str()), "{label}");
+            replayed += 1;
+            continue;
+        }
+        let line: &'static str = match status {
+            400 => "400 Bad Request",
+            404 => "404 Not Found",
+            409 => "409 Conflict",
+            413 => "413 Payload Too Large",
+            other => panic!("{label}: no status line for {other}"),
+        };
+        let answer = body.clone();
+        let (listener, seen, server) = finite_worker(2, move |i, socket, _req| {
+            if i == 0 {
+                upload_authorize_answer(socket);
+            } else {
+                write_answer(socket, line, "", &answer);
+            }
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let error = call_verb_in(&target, verb, args, 5, &dir, |_| {}, |_| {}).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 2, "{label}: sent once");
+        let text = error.to_string();
+        assert_eq!(error.code(), Some(code.as_str()), "{label}: {text}");
+        assert_eq!(error.kind(), "rejected", "{label}: {text}");
+        assert!(!text.contains("unknown"), "{label}: {text}");
+        assert!(!text.contains("Tenant remote call"), "{label}: {text}");
+        replayed += 1;
+    }
+    assert!(
+        replayed >= 4,
+        "the fixture's refusals were not all replayed"
+    );
+}
+
 #[test]
 fn a_missing_wiki_page_on_a_hosted_board_is_named_by_code() {
     let error = message_family_refusal("read", 404, Some("not_found"), reject("generic"));
