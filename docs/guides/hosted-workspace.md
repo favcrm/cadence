@@ -971,8 +971,13 @@ change, even where the board asks for fewer or no approval; ends at
 `EXCEPTION_ENDS` in `scripts/delivery-gate`, 2026-12-31); see AGENTS.md "Review".
 A hosted `routine` PR has no readiness record, because a hosted board has no
 delivery record to prove it from. It takes a pass from both review workflows at
-its head and, unless every changed path is on the workflow auto list, the operator
-approval a workflow row needs; the gate's refusal names what to dispatch. The exception also still waives this until it ends. The exception
+its head and the operator approval a workflow row needs, unless the gate's dry run
+reports `class: auto`. Matching `docs/roles/workflow-auto-paths.toml` is not enough
+on its own: a path that is human-class (for example `docs/INSTALL-AGENT.md` and
+`docs/REMOTE-AUTH.md`, CAD-2256), never eligible, a case variant of a protected
+path, or not a plain add or modify still needs the operator
+(`docs/roles/risk-classes.md` trigger 7 states the rule). The gate's refusal names
+what to dispatch. The exception also still waives this until it ends. The exception
 only checks that the advisory links are separate https URLs; it proves neither
 head binding nor that Browser QA ran. Agents in this workspace do
 not run `audit verdict` below: they post findings as a PR comment and use it as
