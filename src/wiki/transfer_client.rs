@@ -405,11 +405,11 @@ fn import_local(
                         item.rel
                     )
                 } else {
-                    format!(
-                        "wiki cp job {job_id} stopped on '{}': {error} — resume with \
-                         --resume {job_id}; this attempt was not retried",
-                        item.rel
-                    )
+                    return Err(job_refused(
+                        job_id,
+                        &format!("wiki cp job {job_id} stopped on '{}'", item.rel),
+                        error,
+                    ));
                 };
                 return Err(write_outcome(error, message));
             }
@@ -487,10 +487,11 @@ fn import_local(
                         item.rel
                     )
                 } else {
-                    format!(
-                        "wiki cp job {job_id} apply '{}' was not confirmed: {error} — not retried",
-                        item.rel
-                    )
+                    return Err(job_refused(
+                        job_id,
+                        &format!("wiki cp job {job_id} apply '{}' was refused", item.rel),
+                        error,
+                    ));
                 };
                 return Err(write_outcome(error, message));
             }
@@ -504,6 +505,13 @@ fn import_local(
             true,
         )
         .map_err(|error| {
+            if error.kind() != "unknown" {
+                return job_refused(
+                    job_id,
+                    &format!("wiki cp job {job_id} finish was refused"),
+                    error,
+                );
+            }
             let message = format!(
                 "wiki cp job {job_id} finish was not confirmed: {error} — reconcile the \
                  same job with `--resume {job_id}` before repeating anything"
@@ -577,13 +585,25 @@ fn import_local(
 /// redo a write that may already exist; every other kind stays the refusal
 /// this job reported. An op-level answer this client cannot trust goes
 /// through [`unproved`] instead.
+/// CAD-2261: a definite refusal of a chunk, apply or finish, with its next
+/// step. A job the board no longer has cannot be resumed; anything else is
+/// resumed with the same job. The refusal's code is kept.
+fn job_refused(job_id: &str, what: &str, error: Error) -> Error {
+    let message = if error.code() == Some("not_found") {
+        format!("{what}: {error} — that job is gone, so copy again without `--resume`")
+    } else {
+        format!("{what}: {error} — resume with `--resume {job_id}`; this attempt was not retried")
+    };
+    write_outcome(error, message)
+}
+
 fn write_outcome(error: Error, message: impl Into<String>) -> Error {
     let message = message.into();
     if error.kind() == "unknown" {
         Error::unknown(message)
-    } else if let Some(code) = error.code() {
-        // CAD-2261: the board's refusal code outlives the job wrapper, so a
-        // caller can still branch on it.
+    } else if let (Some(code), "rejected") = (error.code(), error.kind()) {
+        // CAD-2261: a refusal's code (the board's, for a hosted copy)
+        // outlives the job wrapper, so a caller can still branch on it.
         Error::Structured(crate::error::Structured {
             kind: "rejected",
             code: code.to_string(),
@@ -2717,9 +2737,6 @@ mod tests {
         }
     }
 
-    /// CAD-2260: a hosted board names a missing path by code, with no
-    /// "not found" wording. Discovery must read that as a new import root, and
-    /// must not hide any other refusal.
     /// CAD-2261: the first cross-language vector. Every manifest the tenant
     /// board admitted in the AOS-566 fixture (a byte-identical copy of
     /// agenticos-v2 `apps/api/src/board/fixtures/wiki-transfer.contract.json`
@@ -2765,6 +2782,37 @@ mod tests {
         assert_eq!(lost.kind(), "unknown");
     }
 
+    /// CAD-2261: a definite mid-job refusal tells the user one next step that
+    /// can work: a job the board no longer has cannot be resumed.
+    #[test]
+    fn a_mid_job_refusal_names_one_next_step_that_works() {
+        let gone = job_refused(
+            "J",
+            "wiki cp job J stopped on 'a.bin'",
+            Error::invalid("not_found", "the board no longer has this copy job"),
+        );
+        let text = gone.to_string();
+        assert_eq!(gone.code(), Some("not_found"));
+        assert_eq!(gone.kind(), "rejected");
+        assert!(text.contains("copy again without `--resume`"), "{text}");
+        assert!(!text.contains("--resume J"), "{text}");
+        let short = job_refused(
+            "J",
+            "wiki cp job J apply 'a.bin' was refused",
+            Error::invalid("stage_incomplete", "not all bytes yet"),
+        );
+        let text = short.to_string();
+        assert_eq!(short.code(), Some("stage_incomplete"));
+        assert!(
+            text.starts_with("wiki cp job J apply 'a.bin' was refused: "),
+            "{text}"
+        );
+        assert!(text.contains("resume with `--resume J`"), "{text}");
+    }
+
+    /// CAD-2260: a hosted board names a missing path by code, with no
+    /// "not found" wording. Discovery must read that as a new import root, and
+    /// must not hide any other refusal.
     #[test]
     fn a_hosted_not_found_is_a_new_destination_for_discovery() {
         let missing = || Error::invalid("not_found", "no page at that path (HTTP 404)");

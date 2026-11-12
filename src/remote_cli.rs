@@ -5379,8 +5379,8 @@ fn wiki_copy_unserved(
         "not_implemented",
         format!(
             "this workspace's board does not serve `wiki cp` (HTTP {status}{shown}): it predates \
-             transfer support, so the operator updates the board first. Until then copy one page \
-             at a time: `wiki put <path> --file <file>` writes a text page, `wiki upload` sends a \
+             transfer support, so the board has to be updated first. Until then copy one page at \
+             a time: `wiki put <path> --file <file>` writes a text page, `wiki upload` sends a \
              binary file and `wiki cat` reads a page. Nothing was {outcome}"
         ),
     ))
@@ -5413,46 +5413,55 @@ fn wiki_copy_refusal(
     let (code, text): (&'static str, &'static str) = match (status, code?) {
         (409, "destination_changed") => (
             "destination_changed",
-            "a file this copy would write is already on the board with other content, or \
-             changed after it was read, so the board refused the copy and nothing was written. \
-             Copy again with `--update` to replace it",
+            "a file this copy would write is already on the board with other content, changed \
+             after it was read, or has a folder in its place, so the board refused this copy and \
+             wrote nothing new. Copy again with `--update` to replace a changed file. \
+             `--update` cannot replace a folder: to copy a file into a folder, name the file \
+             inside it (`wiki:<folder>/<name>`)",
         ),
         (413, "payload_too_large") => (
             "payload_too_large",
             "a file in this copy, or the copy as a whole, is larger than this board accepts \
-             through `wiki cp`, so nothing was copied. Send a large binary file on its own with \
-             `wiki upload`, or copy fewer files at a time",
+             through `wiki cp`, so it refused this copy and wrote nothing new. Send a large \
+             binary file on its own with `wiki upload`, split a long page, or copy fewer files at \
+             a time",
         ),
         (409, "job_conflict") => (
             "job_conflict",
             "the board already holds this job id for a different copy (another source, \
-             destination or member), so it refused the job and nothing was copied. Copy again \
+             destination or member), so it refused the job and wrote nothing new. Copy again \
              without `--resume` to start a new job",
         ),
         (400, "manifest_invalid") => (
             "manifest_invalid",
             "the board does not accept this copy's file list: a name, path, kind or size is \
-             outside what it allows, for example a path longer than its limit. Nothing was \
-             copied",
+             outside what it allows, for example a path longer than its limit. It wrote nothing \
+             new; rename or leave out that file and copy again",
         ),
         (400, "transfer_invalid") => (
             "transfer_invalid",
             "the board refused this request as malformed or out of range and changed nothing. \
-             If it repeats, this client and the board disagree on the copy protocol: update \
-             both",
+             If it repeats, update this Cadence client; the board may need an update too",
         ),
         (404, "not_found") if op == "export" => (
             "not_found",
             "the board has no readable page or folder at that path for this login",
         ),
-        (404, "not_found") => (
+        (404, "not_found") if op == "status" => (
             "not_found",
-            "the board has no such copy job for this login: it may have been removed after \
-             being left idle, or it belongs to someone else. Copy again without `--resume`",
+            "the board has no such copy job for this login and destination: it may have been \
+             removed after being left idle, started for another destination, or belong to \
+             someone else. Copy again without `--resume`",
+        ),
+        // Mid-job, the job wrapper adds the job id and what to try next.
+        (404, "not_found") if matches!(op, "chunk" | "apply" | "finish") => (
+            "not_found",
+            "the board no longer has this copy job for this login",
         ),
         (409, "stage_incomplete") => (
             "stage_incomplete",
-            "the board has not received all of this file's bytes yet",
+            "the board has not received all of this file's bytes yet, so the rest still has to \
+             be sent",
         ),
         (409, "entries_pending") => (
             "entries_pending",
@@ -5460,8 +5469,8 @@ fn wiki_copy_refusal(
         ),
         (409, "chunk_conflict") => (
             "chunk_conflict",
-            "the bytes sent for this file differ from what the board already holds for it; the \
-             local file probably changed during the copy",
+            "the bytes sent for this file differ from what the board already holds for it, \
+             usually because two runs of the same job overlapped or the local file changed",
         ),
         (409, "job_closed") => ("job_closed", "this copy job is already finished"),
         (409, "entry_decided") => (
@@ -5470,7 +5479,8 @@ fn wiki_copy_refusal(
         ),
         (409, "revision_changed") => (
             "revision_changed",
-            "the file changed on the board while it was being copied out; copy it again",
+            "the file changed on the board while it was being copied out; copy it out again \
+             with `--update` to replace what was already written",
         ),
         _ => return None,
     };
@@ -6060,8 +6070,14 @@ fn call_verb_until_retry(
         if let Some(error) = wiki_copy_unserved(verb, status, refusal_code.as_deref(), &arguments) {
             return Err(error);
         }
-        if let Some(error) = wiki_copy_refusal(verb, status, refusal_code.as_deref(), &arguments) {
-            return Err(error);
+        // A 409 that carries a `conflict` body stays a checked conflict.
+        let conflict_body = body.as_ref().is_some_and(|b| b.get("conflict").is_some());
+        if !conflict_body {
+            if let Some(error) =
+                wiki_copy_refusal(verb, status, refusal_code.as_deref(), &arguments)
+            {
+                return Err(error);
+            }
         }
         let platform_details = if platform_outcome_unknown {
             platform_error_details(body.as_ref())

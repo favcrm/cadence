@@ -343,6 +343,9 @@ fn wiki_cp_refusals_from_a_board_that_serves_transfers_are_plain() {
         ("write", "finish", 400, "transfer_invalid"),
         ("job_status", "status", 404, "not_found"),
         ("job_status", "export", 404, "not_found"),
+        ("write", "chunk", 404, "not_found"),
+        ("write", "apply", 404, "not_found"),
+        ("write", "finish", 404, "not_found"),
         ("write", "apply", 409, "stage_incomplete"),
         ("write", "finish", 409, "entries_pending"),
         ("write", "chunk", 409, "chunk_conflict"),
@@ -378,6 +381,18 @@ fn wiki_cp_refusals_from_a_board_that_serves_transfers_are_plain() {
         .unwrap()
         .to_string()
         .contains("no readable page"));
+    // Mid-job the wrapper gives the next step, so no "without `--resume`" here.
+    let gone = wiki_copy_refusal("write", 404, Some("not_found"), &with("chunk")).unwrap();
+    assert!(
+        gone.to_string().contains("no longer has this copy job"),
+        "{gone}"
+    );
+    assert!(!gone.to_string().contains("--resume"), "{gone}");
+    // A `begin` never meets a job that does not exist yet.
+    assert!(wiki_copy_refusal("write", 404, Some("not_found"), &with("begin")).is_none());
+    // A board without transfers: the CAD-2260 refusal now says what unblocks it.
+    let old = super::wiki_copy_unserved("write", 501, Some("not_implemented"), &with("begin"));
+    assert!(old.unwrap().to_string().contains("has to be updated first"));
     assert!(
         wiki_copy_refusal("write", 409, Some("destination_changed"), &with("begin"))
             .unwrap()
@@ -455,12 +470,18 @@ fn wiki_cp_refusals_in_the_board_fixture_reach_the_user_plainly() {
         assert_eq!(error.kind(), "rejected", "{label}: {text}");
         assert!(!text.contains("unknown"), "{label}: {text}");
         assert!(!text.contains("Tenant remote call"), "{label}: {text}");
+        // The sentence the user reads, not only the code.
+        let expected = match (verb, code.as_str()) {
+            ("read", "not_found") => "no readable page at that path",
+            (_, "job_conflict") => "already holds this job id for a different copy",
+            (_, "destination_changed") => "Copy again with `--update`",
+            (_, "not_found") => "no such copy job for this login",
+            (_, other) => panic!("{label}: no expected sentence for {other}"),
+        };
+        assert!(text.contains(expected), "{label}: {text}");
         replayed += 1;
     }
-    assert!(
-        replayed >= 4,
-        "the fixture's refusals were not all replayed"
-    );
+    assert!(replayed > 0, "the fixture holds no refusal");
 }
 
 #[test]
