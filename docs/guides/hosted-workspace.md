@@ -328,6 +328,35 @@ Terminal failed turns carry only a safe `payload.status`/`payload.error`
 projection. Retry and compaction errors stay hidden while their outcome is
 uncertain; raw provider diagnostics, URLs and keys are not presentation data.
 
+A reconciliation or archive gate asks
+`HostedSession.settledOperation(operationId)` before it acts. It answers one of
+three states from the session SQLite alone. `settled` carries
+`{ operationId, conversation, submission, status }` with `status` `done` or
+`unanswered`: exactly one terminal submission holds the id. The engine
+deduplicates a submission by `(conversation_id, request_id)` before it creates
+anything and never rewrites a settled record, so resubmitting that id returns
+the same submission and starts no run. `absent` says no durable submission holds
+the id; a host may pair that with its own durable refusal for an early fenced
+stop. Neither state is answered while the session is working: both require no
+queued or placed submission and no task short of terminal anywhere in this
+object — root or nested conversations — so any work in flight answers
+`unknown`, as does a partial engine schema, a legacy or corrupt row whose
+status is not one the engine writes (including NULL), an ambiguous record, or a
+record that disagrees with itself. A caller must not act on `unknown`. `absent`
+is durable evidence only and not a fence: a submission another instance is still
+admitting is invisible here, so a caller must fence or await its own dispatch
+itself. The answer reads the
+engine's durable rows only: it does not call `pendingOperations()`, `state()` or
+`isBusy()`, because those open the engine session (`resume`/`wake`) and can
+restart queued or parked work; the proof must not cause the replay it exists to
+rule out. A malformed operation id throws.
+This proves this operation's own state only — not another deployment's bundle,
+not storage rolled back or restored from a backup taken before the settlement,
+and not effects outside the conversation (provider requests, tool calls,
+external systems). A cold object still runs its existing constructor setup,
+which ensures the runtime's own bookkeeping tables exist; the call adds no row,
+cancellation or abort.
+
 From `worker-runtime/`, using its pinned Bun version:
 
 ```sh

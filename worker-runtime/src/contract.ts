@@ -336,6 +336,62 @@ export interface PendingOperation {
   readonly status: "queued" | "running" | "parked";
 }
 
+/**
+ * What the runtime's durable records prove about one operation id.
+ *
+ * The runtime answers from the engine's own rows and never opens the engine
+ * session, so asking cannot resume, wake or replay the conversation.
+ *
+ * - `settled` — exactly one terminal submission holds this conversation and
+ *   operation id, and the session is at rest: no queued or placed submission
+ *   and no task short of terminal in any conversation of this object.
+ *   Resubmitting the id returns that submission and starts no run, and nothing
+ *   else here is in flight.
+ * - `absent` — no durable submission holds the id, and the session is at rest.
+ *   No evidence of the operation exists in this session. This is not a fence: a
+ *   submission another instance is still admitting is not visible here, so a
+ *   caller must separately fence or await its own dispatch. A gate may combine
+ *   this with its own durable refusal for an operation that stopped before
+ *   dispatch; absence alone is not proof that anything ran.
+ * - `unknown` — the records prove neither, so a caller must not act. The id is
+ *   held by outstanding work, the session still has work in flight while the
+ *   id is settled or absent, the engine schema is partial, or the record is
+ *   ambiguous, unreadable or self-disagreeing.
+ *
+ * A `settled` proof covers this operation's submission only. It says nothing
+ * about effects outside this conversation (provider requests, tool calls,
+ * external systems), about another deployment's records, or about storage
+ * restored from a backup taken before the settlement; a gate that needs those
+ * must prove them separately.
+ */
+export type OperationSettlement =
+  | {
+      readonly state: "settled";
+      /** The operation id the caller asked about. */
+      readonly operationId: string;
+      /** The engine conversation whose records hold it; the root is "1". */
+      readonly conversation: string;
+      /** The engine's own submission id, for correlating its records. */
+      readonly submission: string;
+      /**
+       * The terminal state the engine stored. `done` ran to an answer;
+       * `unanswered` settled without one — a refused attempt, or an input
+       * withdrawn while still queued. Neither can run again under this
+       * operation id.
+       */
+      readonly status: "done" | "unanswered";
+    }
+  | {
+      readonly state: "absent";
+      readonly operationId: string;
+      readonly conversation: string;
+    }
+  | {
+      readonly state: "unknown";
+      readonly operationId: string;
+      readonly conversation: string;
+    };
+
 /** Cheap header state for a conversation. */
 export interface HostedState {
   readonly running: boolean;

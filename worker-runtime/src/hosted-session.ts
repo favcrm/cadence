@@ -22,6 +22,7 @@ import type {
   GenerationIdentity,
   HostedSessionOptions,
   HostedState,
+  OperationSettlement,
   PendingOperation,
   ThreadContext,
   ThreadEntry,
@@ -42,6 +43,7 @@ import {
   readHeldSubmission,
   readSubmissionEntry,
   readSubmissionRequestId,
+  readSubmissionSettlement,
   type HeldSubmission,
   type TaskSql,
 } from "./identity.ts";
@@ -65,6 +67,7 @@ import {
   OperationScopes,
   parseEntryAppScope,
   parseEntryOperationId,
+  requireOperationId,
   type EngineEvidence,
   type OperationEnvelope,
   type OperationScopeSql,
@@ -987,6 +990,53 @@ export class HostedSession<
         ? COMPACTION_FAILURE_TEXT
         : null,
     };
+  }
+
+  /**
+   * What the engine's durable records prove about one operation id: `settled`,
+   * `absent` or `unknown` (see `OperationSettlement`).
+   *
+   * A reconciliation or archive gate asks this before it acts. The engine's
+   * admission path deduplicates by conversation and request id, so resubmitting
+   * a settled id returns that same submission and starts no run — the id can
+   * never become new work. Both `settled` and `absent` also require the
+   * whole session to be at rest: no queued or placed submission and no task
+   * short of terminal in any conversation of this object. Any work in flight,
+   * an ambiguous or unreadable record, and a partial engine schema all answer
+   * `unknown`, which a caller must not read as safe.
+   *
+   * `absent` is durable evidence only. A submission another instance is still
+   * admitting is not visible in these tables, so a caller must separately fence
+   * or await its own dispatch before relying on it.
+   *
+   * The answer reads only the session's SQLite. It never calls
+   * `pendingOperations()`, `state()` or `isBusy()`: those open the engine
+   * session (`resume`/`wake`) and can restart queued or parked work, which is
+   * the replay this proof exists to rule out. This writes no row and cancels or
+   * aborts nothing; constructing a cold object runs only the runtime's own
+   * existing bookkeeping-table setup, unchanged.
+   *
+   * A malformed operation id throws: it cannot name any operation.
+   */
+  async settledOperation(operationId: string): Promise<OperationSettlement> {
+    const id = requireOperationId(operationId);
+    const conversation = String(ROOT_CONVERSATION_ID);
+    const settlement = readSubmissionSettlement(
+      this.ctx.storage.sql as unknown as TaskSql,
+      ROOT_CONVERSATION_ID,
+      id,
+    );
+    if (settlement.state === "settled")
+      return {
+        state: "settled",
+        operationId: id,
+        conversation,
+        submission: String(settlement.settled.id),
+        status: settlement.settled.status,
+      };
+    if (settlement.state === "absent")
+      return { state: "absent", operationId: id, conversation };
+    return { state: "unknown", operationId: id, conversation };
   }
 
   /**

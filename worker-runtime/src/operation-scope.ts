@@ -94,7 +94,12 @@ function requirePart(value: unknown, label: string, pattern: RegExp): string {
   return value;
 }
 
-function requireOperationId(value: unknown): string {
+/**
+ * The board's operation id grammar, used both to admit an operation and to ask
+ * the engine whether one already settled. Bounds keep an identifier safe to
+ * store, echo and embed in a prompt.
+ */
+export function requireOperationId(value: unknown): string {
   if (
     typeof value !== "string" ||
     value.length === 0 ||

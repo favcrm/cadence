@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { readCompactionFailure, readCompactionIdentity, readGenerationIdentity, type TaskSql } from "../src/identity.ts";
+import {
+  readCompactionFailure,
+  readCompactionIdentity,
+  readGenerationIdentity,
+  readSubmissionSettlement,
+  type TaskSql,
+} from "../src/identity.ts";
 
 const sql = (rows: Record<string, unknown>[]): TaskSql => ({
   exec: () => ({ toArray: () => rows }),
@@ -207,5 +213,194 @@ describe("compaction identity adapter", () => {
     }
     expect(readCompactionIdentity(sql([row(1, 12, 10)]), 9)).toBeNull();
     expect(readCompactionIdentity(sql([row(1, 12, 9, 2)]), 9)).toBeNull();
+  });
+});
+
+describe("submission settlement adapter", () => {
+  /** One engine submission row, as the engine stores it. */
+  const submission = (
+    status: string,
+    overrides: Record<string, unknown> = {},
+    id = 21,
+  ): Record<string, unknown> => ({
+    id,
+    conversation_id: 1,
+    status,
+    record: JSON.stringify({
+      id,
+      conversationId: 1,
+      requestId: "op-a",
+      type: "input",
+      status,
+      ...overrides,
+    }),
+  });
+
+  /**
+   * One session's durable state: the submission rows for the key, whether the
+   * whole session object holds other queued or placed submissions, whether any
+   * task is short of terminal, and which engine tables exist. The keyed read's
+   * bindings are recorded so the JSON-encoded request id the engine indexes can
+   * be asserted, and the work scans must bind nothing so they cover the whole
+   * object.
+   */
+  const sessionState = (
+    options: {
+      rows?: readonly Record<string, unknown>[];
+      outstanding?: boolean;
+      working?: boolean;
+      tables?: readonly string[];
+      bindings?: unknown[];
+    } = {},
+  ): TaskSql => ({
+    exec(query, ...bound) {
+      if (/sqlite_master/.test(query)) {
+        const name = String(bound[0]);
+        const tables = options.tables ?? ["pi_submissions", "pi_tasks"];
+        return {
+          toArray: () =>
+            tables
+              .filter((table) => table === name)
+              .map((table): Record<string, unknown> => ({ name: table })),
+        };
+      }
+      if (/FROM pi_submissions\s+WHERE conversation_id=\? AND request_id=\?/.test(query)) {
+        options.bindings?.push(...bound);
+        return { toArray: () => [...(options.rows ?? [])] };
+      }
+      if (/FROM pi_submissions/.test(query)) {
+        // The scan covers the whole session object, not one conversation.
+        if (bound.length !== 0)
+          throw new Error(`the work scan is conversation-scoped: ${query}`);
+        return { toArray: () => (options.outstanding === true ? [{ held: 1 }] : []) };
+      }
+      if (/FROM pi_tasks/.test(query)) {
+        if (bound.length !== 0)
+          throw new Error(`the work scan is conversation-scoped: ${query}`);
+        return { toArray: () => (options.working === true ? [{ held: 1 }] : []) };
+      }
+      throw new Error(`unexpected query: ${query}`);
+    },
+  });
+
+  it("reads the one settled submission for the engine's exact key", () => {
+    const bindings: unknown[] = [];
+    expect(
+      readSubmissionSettlement(
+        sessionState({ rows: [submission("done")], bindings }),
+        1,
+        "op-a",
+      ),
+    ).toEqual({
+      state: "settled",
+      settled: { id: 21, conversation: 1, operationId: "op-a", status: "done" },
+    });
+    // The pair the engine deduplicates by: the conversation, and the request id
+    // it stores JSON-encoded.
+    expect(bindings).toEqual([1, '"op-a"']);
+
+    expect(
+      readSubmissionSettlement(sessionState({ rows: [submission("unanswered")] }), 1, "op-a"),
+    ).toEqual({
+      state: "settled",
+      settled: {
+        id: 21,
+        conversation: 1,
+        operationId: "op-a",
+        status: "unanswered",
+      },
+    });
+  });
+
+  it("proves absence only while the session holds no outstanding work", () => {
+    expect(readSubmissionSettlement(sessionState(), 1, "op-a")).toEqual({
+      state: "absent",
+    });
+    // Another queued or placed submission anywhere in the session object, or a
+    // task short of terminal, means the id could still be part of a session
+    // that is mid-transition.
+    expect(readSubmissionSettlement(sessionState({ outstanding: true }), 1, "op-a"))
+      .toEqual({ state: "unknown" });
+    expect(readSubmissionSettlement(sessionState({ working: true }), 1, "op-a"))
+      .toEqual({ state: "unknown" });
+    // A database without the engine's submissions table can hold none.
+    expect(readSubmissionSettlement(sessionState({ tables: [] }), 1, "op-a"))
+      .toEqual({ state: "absent" });
+  });
+
+  it("answers unknown for a partial engine schema", () => {
+    // Tasks exist but the submissions table does not: no row can hold the id,
+    // yet this is not the engine's schema and "at rest" cannot be read from it.
+    expect(readSubmissionSettlement(sessionState({ tables: ["pi_tasks"] }), 1, "op-a"))
+      .toEqual({ state: "unknown" });
+    // Submissions exist, tasks do not: outstanding work cannot be ruled out,
+    // with or without a record for the id.
+    expect(
+      readSubmissionSettlement(
+        sessionState({ rows: [submission("done")], tables: ["pi_submissions"] }),
+        1,
+        "op-a",
+      ),
+    ).toEqual({ state: "unknown" });
+    expect(
+      readSubmissionSettlement(sessionState({ tables: ["pi_submissions"] }), 1, "op-a"),
+    ).toEqual({ state: "unknown" });
+  });
+
+  it("answers unknown for a settled record while the session still has work", () => {
+    // The id cannot be resubmitted, but the gate also requires nothing else in
+    // this conversation to be queued, placed or running.
+    expect(
+      readSubmissionSettlement(
+        sessionState({ rows: [submission("done")], outstanding: true }),
+        1,
+        "op-a",
+      ),
+    ).toEqual({ state: "unknown" });
+    expect(
+      readSubmissionSettlement(
+        sessionState({ rows: [submission("done")], working: true }),
+        1,
+        "op-a",
+      ),
+    ).toEqual({ state: "unknown" });
+  });
+
+  it("answers unknown for work still held, or a record that disagrees", () => {
+    for (const outstanding of ["queued", "placed"])
+      expect(
+        readSubmissionSettlement(
+          sessionState({ rows: [submission(outstanding)] }),
+          1,
+          "op-a",
+        ),
+      ).toEqual({ state: "unknown" });
+    const unknown = (rows: Record<string, unknown>[]) =>
+      expect(readSubmissionSettlement(sessionState({ rows }), 1, "op-a"))
+        .toEqual({ state: "unknown" });
+
+    // Two rows for one deduplication key.
+    unknown([submission("done"), submission("unanswered", {}, 22)]);
+    // A record that is not a submission body, readable or not.
+    unknown([{ id: 21, conversation_id: 1, record: "[]" }]);
+    unknown([{ id: 21, conversation_id: 1, record: "{" }]);
+    // An unknown lifecycle status.
+    unknown([submission("later")]);
+    // A body that disagrees with the question or the row it was read by.
+    unknown([submission("done", { requestId: "op-b" })]);
+    unknown([submission("done", { conversationId: 2 })]);
+    unknown([{ ...submission("done"), conversation_id: 2 }]);
+    // The status column its pending scans read disagrees with the record its
+    // admission path returns.
+    unknown([{ ...submission("done"), status: "queued" }]);
+    // A submission that is not a prompt operation.
+    unknown([submission("done", { type: "write" })]);
+    // An unusable row id.
+    unknown([submission("done", {}, 0)]);
+  });
+
+  it("throws on a malformed conversation or operation id", () => {
+    expect(() => readSubmissionSettlement(sessionState(), 0, "op-a")).toThrow();
+    expect(() => readSubmissionSettlement(sessionState(), 1, "")).toThrow();
   });
 });

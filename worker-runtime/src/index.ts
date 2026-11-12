@@ -13,6 +13,7 @@ export type {
   HostedSessionOptions,
   HostedState,
   MasterStatus,
+  OperationSettlement,
   PendingOperation,
   RuntimeTool,
   RuntimeTools,

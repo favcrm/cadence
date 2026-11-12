@@ -228,7 +228,7 @@ export function readSubmissionRequestId(sql: TaskSql, submissionId: string): str
  * it instead of assuming.
  */
 export function submissionHeld(sql: TaskSql, operationId: string): boolean {
-  if (!hasSubmissions(sql)) return false;
+  if (!hasTable(sql, "pi_submissions")) return false;
   const held = sql
     .exec(
       "SELECT 1 AS held FROM pi_submissions WHERE json_extract(record,'$.requestId')=? LIMIT 1",
@@ -285,7 +285,7 @@ export function readHeldSubmission(
   conversationId: number,
   operationId: string,
 ): HeldSubmission | null {
-  if (!hasSubmissions(sql)) return null;
+  if (!hasTable(sql, "pi_submissions")) return null;
   const rows = sql
     .exec(
       `SELECT id, record FROM pi_submissions
@@ -344,11 +344,183 @@ export function readHeldSubmission(
   return { id, type, status, text: entryText(entry.model), entry };
 }
 
-/** Whether the engine's submissions table exists; without it, none is held. */
-function hasSubmissions(sql: TaskSql): boolean {
+/** One submission the engine has settled, as its own record says. */
+export interface SettledSubmission {
+  /** The engine's own submission id. */
+  readonly id: number;
+  /** The conversation whose records hold it. */
+  readonly conversation: number;
+  /** The operation id it was admitted under. */
+  readonly operationId: string;
+  /**
+   * The terminal lifecycle status the engine stored. `done` ran to an answer;
+   * `unanswered` settled without one. Both are terminal for the engine's
+   * admission path, which returns this record for a repeated operation id
+   * instead of creating a submission or starting a run.
+   */
+  readonly status: "done" | "unanswered";
+}
+
+/**
+ * What the session's durable records prove about one conversation's operation
+ * id.
+ *
+ * - `settled`: exactly one terminal submission holds the id, and the session is
+ *   at rest — no queued or placed submission and no task short of terminal in
+ *   any conversation of this object. The engine's admission path can only
+ *   return that submission for it, and nothing else here is in flight.
+ * - `absent`: no durable submission holds the id, and the session is at rest.
+ *   No evidence of the operation exists in this session. This is not a fence:
+ *   an admission another instance is still making is not visible here, so a
+ *   caller must separately fence or await its own dispatch.
+ * - `unknown`: the records prove neither. The id is held by work the engine
+ *   still has, the id is absent while the session holds other work, or the
+ *   record or schema is ambiguous, unreadable or inconsistent.
+ */
+export type SubmissionSettlement =
+  | { readonly state: "settled"; readonly settled: SettledSubmission }
+  | { readonly state: "absent" }
+  | { readonly state: "unknown" };
+
+/**
+ * What the engine's own durable records prove about one operation id.
+ *
+ * The pair — conversation and request id — is the engine's deduplication key
+ * (`pi_submissions.conversation_id` and its JSON-encoded `request_id`), and its
+ * admission path reads exactly that pair before creating anything: a repeated
+ * id returns the stored submission, whatever its lifecycle status, and
+ * `done`/`unanswered` are the states it never rewrites. One terminal record
+ * therefore proves the id can never be submitted as new work.
+ *
+ * Both `settled` and `absent` also require the session to be at rest: the whole
+ * object holds no queued or placed submission and no task short of `terminal`,
+ * in its root or any nested conversation — the same two tables the engine's
+ * optionless pending view scans. A terminal record alone proves the id cannot be
+ * resubmitted, but a caller that must reconcile a finished dispatch also has to
+ * know nothing else in this session is still in flight, so any outstanding work
+ * answers `unknown` rather than `settled`.
+ *
+ * `absent` means only that no durable evidence exists here. A submission an
+ * instance is still admitting is not visible in these tables, so absence is not
+ * a fence and the caller must fence or await that dispatch itself.
+ *
+ * Ambiguity is not resolved: two rows for one key, an unreadable record,
+ * another submission type, an unknown status, a body that disagrees with the
+ * row it was read by, a schema with only one of the engine's two tables, or a
+ * status outside the engine's terminal set anywhere in the session all answer
+ * `unknown`, never `settled` and never `absent`.
+ *
+ * This reads durable rows only: it opens no engine session and wakes no task,
+ * so asking the question cannot resume, restart or replay the conversation.
+ * A failed read throws; callers must not read one as "no record".
+ */
+export function readSubmissionSettlement(
+  sql: TaskSql,
+  conversationId: number,
+  operationId: string,
+): SubmissionSettlement {
+  if (!Number.isSafeInteger(conversationId) || conversationId <= 0)
+    throw new Error("The settlement's conversation is malformed.");
+  if (typeof operationId !== "string" || operationId.length === 0)
+    throw new Error("The settlement's operation id is malformed.");
+  // Without the submissions table nothing can hold the id, but the session
+  // still has to be readable as at rest; a partial schema or any work in
+  // flight answers unknown below.
+  if (!hasTable(sql, "pi_submissions"))
+    return outstandingWork(sql) === "none"
+      ? { state: "absent" }
+      : { state: "unknown" };
+  const rows = sql
+    .exec(
+      `SELECT id, conversation_id, status, record FROM pi_submissions
+        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`,
+      conversationId,
+      JSON.stringify(operationId),
+    )
+    .toArray();
+  if (rows.length > 1) return { state: "unknown" };
+  const row = rows[0];
+  if (row === undefined)
+    return outstandingWork(sql) === "none"
+      ? { state: "absent" }
+      : { state: "unknown" };
+  const id = Number(row.id);
+  if (!Number.isSafeInteger(id) || id <= 0) return { state: "unknown" };
+  const submission = parseRecord(row.record);
+  if (submission === null) return { state: "unknown" };
+  // The stored body must agree with the row it was read by and with the
+  // question, or this row proves nothing about this operation. The engine
+  // writes the key and the lifecycle status to both the columns its pending
+  // scans read and the record its admission path returns; a disagreement means
+  // one of the two views is stale or corrupt.
+  if (
+    submission.requestId !== operationId ||
+    submission.conversationId !== conversationId ||
+    submission.type !== "input" ||
+    Number(row.conversation_id) !== conversationId ||
+    row.status !== submission.status
+  )
+    return { state: "unknown" };
+  const status = submission.status;
+  if (status !== "done" && status !== "unanswered") return { state: "unknown" };
+  // The id cannot be resubmitted, but the gate also requires nothing else in
+  // this session to be in flight.
+  if (outstandingWork(sql) !== "none")
+    return { state: "unknown" };
+  return {
+    state: "settled",
+    settled: { id, conversation: conversationId, operationId, status },
+  };
+}
+
+/** Whether the session is at rest, still working, or unreadable. */
+type OutstandingWork = "none" | "some" | "unknown";
+
+/**
+ * Whether the whole session object is at rest, still working, or unreadable.
+ *
+ * The Durable Object is one session: its root conversation and any nested or
+ * forked conversation it creates share these tables. The scan therefore covers
+ * every conversation, exactly as the engine's own optionless pending view does,
+ * so work in a child conversation cannot be missed. Any submission status other
+ * than the engine's two terminal states counts as outstanding — including NULL
+ * or a value this engine does not write — so a legacy or corrupt schema blocks
+ * instead of reading as at rest. The engine's migrations create both tables
+ * together, so one present without the other is likewise reported as unreadable.
+ */
+function outstandingWork(sql: TaskSql): OutstandingWork {
+  const submissions = hasTable(sql, "pi_submissions");
+  if (submissions !== hasTable(sql, "pi_tasks")) return "unknown";
+  if (!submissions) return "none";
+  // Anything that is not one of the engine's terminal states counts as
+  // outstanding, including NULL or a value this engine does not write: a
+  // legacy or corrupt schema must block, never read as at rest. `NOT IN` and
+  // `<>` are NULL-unsafe, so the NULL test is explicit.
+  if (
+    sql
+      .exec(
+        `SELECT 1 AS held FROM pi_submissions
+          WHERE status IS NULL OR status NOT IN ('done','unanswered') LIMIT 1`,
+      )
+      .toArray().length > 0
+  )
+    return "some";
+  return sql
+    .exec(
+      `SELECT 1 AS held FROM pi_tasks
+        WHERE status IS NULL OR status<>'terminal' LIMIT 1`,
+    )
+    .toArray().length > 0
+    ? "some"
+    : "none";
+}
+
+/** Whether the engine's schema has this table; a migrated engine has both. */
+function hasTable(sql: TaskSql, name: "pi_submissions" | "pi_tasks"): boolean {
   const table = sql
     .exec(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='pi_submissions'",
+      "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+      name,
     )
     .toArray()[0];
   return table !== undefined;

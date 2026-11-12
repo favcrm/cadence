@@ -56116,13 +56116,13 @@ function readSubmissionRequestId(sql, submissionId) {
   return submission.requestId;
 }
 function submissionHeld(sql, operationId) {
-  if (!hasSubmissions(sql))
+  if (!hasTable(sql, "pi_submissions"))
     return false;
   const held = sql.exec("SELECT 1 AS held FROM pi_submissions WHERE json_extract(record,'$.requestId')=? LIMIT 1", operationId).toArray()[0];
   return held !== undefined;
 }
 function readHeldSubmission(sql, conversationId, operationId) {
-  if (!hasSubmissions(sql))
+  if (!hasTable(sql, "pi_submissions"))
     return null;
   const rows = sql.exec(`SELECT id, record FROM pi_submissions
         WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
@@ -56154,8 +56154,52 @@ function readHeldSubmission(sql, conversationId, operationId) {
     throw new Error(`Operation "${operationId}" has an engine submission whose entry is unavailable.`);
   return { id, type, status, text: entryText(entry.model), entry };
 }
-function hasSubmissions(sql) {
-  const table = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='pi_submissions'").toArray()[0];
+function readSubmissionSettlement(sql, conversationId, operationId) {
+  if (!Number.isSafeInteger(conversationId) || conversationId <= 0)
+    throw new Error("The settlement's conversation is malformed.");
+  if (typeof operationId !== "string" || operationId.length === 0)
+    throw new Error("The settlement's operation id is malformed.");
+  if (!hasTable(sql, "pi_submissions"))
+    return outstandingWork(sql) === "none" ? { state: "absent" } : { state: "unknown" };
+  const rows = sql.exec(`SELECT id, conversation_id, status, record FROM pi_submissions
+        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
+  if (rows.length > 1)
+    return { state: "unknown" };
+  const row = rows[0];
+  if (row === undefined)
+    return outstandingWork(sql) === "none" ? { state: "absent" } : { state: "unknown" };
+  const id = Number(row.id);
+  if (!Number.isSafeInteger(id) || id <= 0)
+    return { state: "unknown" };
+  const submission = parseRecord(row.record);
+  if (submission === null)
+    return { state: "unknown" };
+  if (submission.requestId !== operationId || submission.conversationId !== conversationId || submission.type !== "input" || Number(row.conversation_id) !== conversationId || row.status !== submission.status)
+    return { state: "unknown" };
+  const status = submission.status;
+  if (status !== "done" && status !== "unanswered")
+    return { state: "unknown" };
+  if (outstandingWork(sql) !== "none")
+    return { state: "unknown" };
+  return {
+    state: "settled",
+    settled: { id, conversation: conversationId, operationId, status }
+  };
+}
+function outstandingWork(sql) {
+  const submissions = hasTable(sql, "pi_submissions");
+  if (submissions !== hasTable(sql, "pi_tasks"))
+    return "unknown";
+  if (!submissions)
+    return "none";
+  if (sql.exec(`SELECT 1 AS held FROM pi_submissions
+          WHERE status IS NULL OR status NOT IN ('done','unanswered') LIMIT 1`).toArray().length > 0)
+    return "some";
+  return sql.exec(`SELECT 1 AS held FROM pi_tasks
+        WHERE status IS NULL OR status<>'terminal' LIMIT 1`).toArray().length > 0 ? "some" : "none";
+}
+function hasTable(sql, name) {
+  const table = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name=?", name).toArray()[0];
   return table !== undefined;
 }
 function entryData(sql, entryId) {
@@ -58361,6 +58405,22 @@ data: ${JSON.stringify(masterState(status.model, status, context?.conversationId
       model,
       compactionFailure: readCompactionFailure(this.ctx.storage.sql, Number(this.harness.session().id)) ? COMPACTION_FAILURE_TEXT : null
     };
+  }
+  async settledOperation(operationId) {
+    const id = requireOperationId(operationId);
+    const conversation = String(ROOT_CONVERSATION_ID);
+    const settlement = readSubmissionSettlement(this.ctx.storage.sql, ROOT_CONVERSATION_ID, id);
+    if (settlement.state === "settled")
+      return {
+        state: "settled",
+        operationId: id,
+        conversation,
+        submission: String(settlement.settled.id),
+        status: settlement.settled.status
+      };
+    if (settlement.state === "absent")
+      return { state: "absent", operationId: id, conversation };
+    return { state: "unknown", operationId: id, conversation };
   }
   async stopOperation(operationId) {
     if (!operationId)

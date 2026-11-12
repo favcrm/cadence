@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { AppScope, AskResult, HostedSessionOptions, HostedState, PendingOperation, ThreadEntry } from "./contract.js";
+import type { AppScope, AskResult, HostedSessionOptions, HostedState, OperationSettlement, PendingOperation, ThreadEntry } from "./contract.js";
 /**
  * One agent conversation, one Durable Object.
  *
@@ -196,6 +196,33 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
      * call resolves the platform default.
      */
     state(): Promise<HostedState>;
+    /**
+     * What the engine's durable records prove about one operation id: `settled`,
+     * `absent` or `unknown` (see `OperationSettlement`).
+     *
+     * A reconciliation or archive gate asks this before it acts. The engine's
+     * admission path deduplicates by conversation and request id, so resubmitting
+     * a settled id returns that same submission and starts no run — the id can
+     * never become new work. Both `settled` and `absent` also require the
+     * whole session to be at rest: no queued or placed submission and no task
+     * short of terminal in any conversation of this object. Any work in flight,
+     * an ambiguous or unreadable record, and a partial engine schema all answer
+     * `unknown`, which a caller must not read as safe.
+     *
+     * `absent` is durable evidence only. A submission another instance is still
+     * admitting is not visible in these tables, so a caller must separately fence
+     * or await its own dispatch before relying on it.
+     *
+     * The answer reads only the session's SQLite. It never calls
+     * `pendingOperations()`, `state()` or `isBusy()`: those open the engine
+     * session (`resume`/`wake`) and can restart queued or parked work, which is
+     * the replay this proof exists to rule out. This writes no row and cancels or
+     * aborts nothing; constructing a cold object runs only the runtime's own
+     * existing bookkeeping-table setup, unchanged.
+     *
+     * A malformed operation id throws: it cannot name any operation.
+     */
+    settledOperation(operationId: string): Promise<OperationSettlement>;
     /**
      * Stop the turn with this id. The id is required: the engine reads a missing
      * one as "abort this session" even when nothing has been asked to stop.

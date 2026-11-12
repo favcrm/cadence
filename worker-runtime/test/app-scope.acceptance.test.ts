@@ -31,6 +31,7 @@ import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import {
   BOARD_MESSAGE_KIND,
   type AppScope,
+  type OperationSettlement,
   type RuntimeTool,
 } from "../src/contract.ts";
 import { runtimeExtension, type AppScopeResolver } from "../src/engine.ts";
@@ -1906,6 +1907,7 @@ async function constructedSession(
     registry: ReturnType<typeof createRegistry>;
     toolAppScope: AppScopeResolver;
     operationAppScope(root: string): AppScope | null;
+    settledOperation(operationId: string): Promise<OperationSettlement>;
   };
 }
 
@@ -2326,4 +2328,566 @@ describe("session wiring", () => {
     expect(() => parseEntryAppScope(BOARD_MESSAGE_KIND, undefined)).toThrow();
     database.close();
   });
+});
+
+/**
+ * CAD-2255: an operation that already settled must be provable as settled
+ * without running, resuming or replaying it, so a reconciliation or archive
+ * gate can act on it after a restart.
+ *
+ * What these cases prove: the runtime's own `settledOperation` answers from the
+ * engine's durable rows alone (every engine entry point is made to throw), a
+ * settled operation stays provable across a fresh start and a reopened SQLite
+ * file, resubmitting its id returns that same submission and starts no run, a
+ * settled or absent answer is withheld while any work in the session — including
+ * a nested conversation — is in flight, and an ambiguous, unreadable,
+ * partial-schema or malformed-status state answers unknown.
+ *
+ * Not covered here, and deliberately not claimed by the API: another
+ * deployment's bundle, storage rolled back or restored from a backup taken
+ * before the settlement, and effects outside the conversation (provider
+ * requests, tool calls, external systems).
+ */
+describe("settled operation proof", () => {
+  /** The engine's own durable row count for one operation id. */
+  function storedSubmissions(database: Database, operationId: string): number {
+    const row = database
+      .prepare("SELECT COUNT(*) AS count FROM pi_submissions WHERE request_id=?")
+      .get(JSON.stringify(operationId)) as { count: number };
+    return row.count;
+  }
+
+  it("proves a settled operation from the durable rows without touching the engine", async () => {
+    const { database } = sessionDatabase();
+    const scripted = scriptedModels("acknowledged", { gate: false });
+    const storage = await SqliteStorage.open(sqliteFacade(database), {
+      prefix: "pi_",
+    });
+    const harness = await Harness.open(
+      storage,
+      { models: scripted.models, registry: createRegistry() },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const conversation = await harness.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      const operationId = "op-settled";
+      const submitted = await conversation.submit(
+        {
+          type: "input",
+          requestId: operationId,
+          content: "archive the project",
+          entry: operationEntry(operationId),
+        },
+        BACKGROUND_CONTEXT,
+      );
+      expect((await submitted.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      // `settled` requires the session at rest, so wait for every task to end.
+      await harness.waitForIdle(BACKGROUND_CONTEXT);
+      const requests = scripted.requests.length;
+
+      // Every engine entry point refuses: the proof may read the session's
+      // SQLite and nothing else. Opening the harness here would resume or wake
+      // the conversation, which is exactly what a proof must not do.
+      const session = await sessionOver(
+        {
+          submit: async () => {
+            throw new Error("the settlement proof must not submit");
+          },
+          prompt: async () => {
+            throw new Error("the settlement proof must not prompt");
+          },
+          pending: async () => {
+            throw new Error("the settlement proof must not inspect the engine");
+          },
+          pi: async () => {
+            throw new Error("the settlement proof must not open the engine");
+          },
+        },
+        new OperationScopes(sqlStore(database)),
+        sqlStore(database),
+      );
+
+      expect(await session.settledOperation(operationId)).toEqual({
+        state: "settled",
+        operationId,
+        conversation: "1",
+        submission: String(submitted.id),
+        status: "done",
+      });
+      // The session is at rest after the answer, so an id it never saw is
+      // provably absent rather than merely unsettled.
+      expect(await session.settledOperation("op-absent")).toEqual({
+        state: "absent",
+        operationId: "op-absent",
+        conversation: "1",
+      });
+      expect(scripted.requests.length).toBe(requests);
+      expect(storedSubmissions(database, operationId)).toBe(1);
+    } finally {
+      await harness.close(BACKGROUND_CONTEXT);
+      database.close();
+    }
+  }, 30_000);
+
+  it("keeps the proof across a fresh start and never replays the operation", async () => {
+    const { database } = sessionDatabase();
+    const scripted = scriptedModels("acknowledged", { gate: false });
+    const storage = await SqliteStorage.open(sqliteFacade(database), {
+      prefix: "pi_",
+    });
+    const harness = await Harness.open(
+      storage,
+      { models: scripted.models, registry: createRegistry() },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const conversation = await harness.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      const operationId = "op-archived";
+      const submitted = await conversation.submit(
+        {
+          type: "input",
+          requestId: operationId,
+          content: "archive the project",
+          entry: operationEntry(operationId),
+        },
+        BACKGROUND_CONTEXT,
+      );
+      expect((await submitted.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      await harness.waitForIdle(BACKGROUND_CONTEXT);
+      const proof: OperationSettlement = {
+        state: "settled",
+        operationId,
+        conversation: "1",
+        submission: String(submitted.id),
+        status: "done",
+      };
+      const requests = scripted.requests.length;
+      const session = await constructedSession(database, { tools: [] });
+      expect(await session.settledOperation(operationId)).toEqual(proof);
+
+      // A fresh start keeps the thread and its records and only narrows the
+      // model's context, so the settlement still names this operation.
+      await conversation.reset(undefined, BACKGROUND_CONTEXT);
+      expect(await session.settledOperation(operationId)).toEqual(proof);
+
+      // The id is the same submission: the engine starts no run, the model is
+      // never called, and no second row appears.
+      const replay = await conversation.submit(
+        {
+          type: "input",
+          requestId: operationId,
+          content: "archive the project",
+        },
+        BACKGROUND_CONTEXT,
+      );
+      expect(replay.id).toBe(submitted.id);
+      expect((await replay.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      expect(scripted.requests.length).toBe(requests);
+      expect(storedSubmissions(database, operationId)).toBe(1);
+      expect(await session.settledOperation(operationId)).toEqual(proof);
+    } finally {
+      await harness.close(BACKGROUND_CONTEXT);
+      database.close();
+    }
+  }, 30_000);
+
+  it("proves the settlement after the session's SQLite is reopened", async () => {
+    const { database, path } = sessionDatabase();
+    const scripted = scriptedModels("acknowledged", { gate: false });
+    const storage = await SqliteStorage.open(sqliteFacade(database), {
+      prefix: "pi_",
+    });
+    const harness = await Harness.open(
+      storage,
+      { models: scripted.models, registry: createRegistry() },
+      BACKGROUND_CONTEXT,
+    );
+    const operationId = "op-reconstructed";
+    let submission = 0;
+    try {
+      const conversation = await harness.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      const submitted = await conversation.submit(
+        {
+          type: "input",
+          requestId: operationId,
+          content: "archive the project",
+          entry: operationEntry(operationId),
+        },
+        BACKGROUND_CONTEXT,
+      );
+      expect((await submitted.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      await harness.waitForIdle(BACKGROUND_CONTEXT);
+      submission = submitted.id;
+    } finally {
+      await harness.close(BACKGROUND_CONTEXT);
+      database.close();
+    }
+
+    // A rebuilt object reopens the same durable file: the proof is read from
+    // storage, not from the instance that ran the turn.
+    const reopenedDatabase = new Database(path);
+    const reopenedModels = scriptedModels("must not run", { gate: false });
+    const reopenedStorage = await SqliteStorage.open(
+      sqliteFacade(reopenedDatabase),
+      { prefix: "pi_" },
+    );
+    const reopened = await Harness.open(
+      reopenedStorage,
+      { models: reopenedModels.models, registry: createRegistry() },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const proof: OperationSettlement = {
+        state: "settled",
+        operationId,
+        conversation: "1",
+        submission: String(submission),
+        status: "done",
+      };
+      const session = await constructedSession(reopenedDatabase, { tools: [] });
+      expect(await session.settledOperation(operationId)).toEqual(proof);
+
+      const rebuilt = await reopened.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      const replay = await rebuilt.submit(
+        {
+          type: "input",
+          requestId: operationId,
+          content: "archive the project",
+        },
+        BACKGROUND_CONTEXT,
+      );
+      expect(replay.id).toBe(submission);
+      expect((await replay.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      expect(reopenedModels.requests).toHaveLength(0);
+      expect(storedSubmissions(reopenedDatabase, operationId)).toBe(1);
+    } finally {
+      await reopened.close(BACKGROUND_CONTEXT);
+      reopenedDatabase.close();
+    }
+  }, 30_000);
+
+  it("answers unknown while a nested conversation in the session still works", async () => {
+    const { database } = sessionDatabase();
+    const scripted = scriptedModels("acknowledged");
+    const storage = await SqliteStorage.open(sqliteFacade(database), {
+      prefix: "pi_",
+    });
+    const harness = await Harness.open(
+      storage,
+      { models: scripted.models, registry: createRegistry() },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const conversation = await harness.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      const operationId = "op-root-settled";
+      const submitted = await conversation.submit(
+        {
+          type: "input",
+          requestId: operationId,
+          content: "archive the project",
+          entry: operationEntry(operationId),
+        },
+        BACKGROUND_CONTEXT,
+      );
+      await scripted.started;
+      scripted.release();
+      expect((await submitted.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      await harness.waitForIdle(BACKGROUND_CONTEXT);
+      const session = await constructedSession(database, { tools: [] });
+      const proof: OperationSettlement = {
+        state: "settled",
+        operationId,
+        conversation: "1",
+        submission: String(submitted.id),
+        status: "done",
+      };
+      expect(await session.settledOperation(operationId)).toEqual(proof);
+
+      // A nested conversation in this same object still has work in flight.
+      // The scan must cover the whole session, not just the root, or the gate
+      // would read a quiet root while another conversation is running.
+      const child = await harness.createConversation(
+        {
+          ownership: { kind: "ownerless" },
+          agent: { model: { provider: "scripted", modelId: "scripted" } },
+        },
+        BACKGROUND_CONTEXT,
+      );
+      const next = scripted.hold();
+      const childTurn = await child.submit(
+        {
+          type: "input",
+          requestId: "op-child",
+          content: "child question",
+          entry: operationEntry("op-child"),
+        },
+        BACKGROUND_CONTEXT,
+      );
+      await next;
+      expect(await session.settledOperation(operationId)).toEqual({
+        state: "unknown",
+        operationId,
+        conversation: "1",
+      });
+
+      scripted.release();
+      expect((await childTurn.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      await harness.waitForIdle(BACKGROUND_CONTEXT);
+      expect(await session.settledOperation(operationId)).toEqual(proof);
+    } finally {
+      scripted.release();
+      await harness.close(BACKGROUND_CONTEXT);
+      database.close();
+    }
+  }, 30_000);
+
+  it("answers unknown for outstanding work and refuses records that prove nothing", async () => {
+    const { database } = sessionDatabase();
+    // Gated: the first turn stays open, so a second input queues behind it.
+    const scripted = scriptedModels("acknowledged");
+    const storage = await SqliteStorage.open(sqliteFacade(database), {
+      prefix: "pi_",
+    });
+    const harness = await Harness.open(
+      storage,
+      { models: scripted.models, registry: createRegistry() },
+      BACKGROUND_CONTEXT,
+    );
+    try {
+      const conversation = await harness.root(BACKGROUND_CONTEXT, {
+        agent: { model: { provider: "scripted", modelId: "scripted" } },
+      });
+      const session = await constructedSession(database, { tools: [] });
+
+      const running = await conversation.submit(
+        {
+          type: "input",
+          requestId: "op-running",
+          content: "first question",
+          entry: operationEntry("op-running"),
+        },
+        BACKGROUND_CONTEXT,
+      );
+      await scripted.started;
+      const queued = await conversation.submit(
+        {
+          type: "input",
+          requestId: "op-queued",
+          content: "second question",
+          entry: operationEntry("op-queued"),
+        },
+        BACKGROUND_CONTEXT,
+      );
+      // A placed input and a queued one are work the engine still holds, so
+      // neither is proven settled. A parked turn is a placed input too.
+      expect(await session.settledOperation("op-running")).toEqual({
+        state: "unknown",
+        operationId: "op-running",
+        conversation: "1",
+      });
+      expect(await session.settledOperation("op-queued")).toEqual({
+        state: "unknown",
+        operationId: "op-queued",
+        conversation: "1",
+      });
+      // Nothing the session holds is at rest, so absence is not provable.
+      expect(await session.settledOperation("op-never-sent")).toEqual({
+        state: "unknown",
+        operationId: "op-never-sent",
+        conversation: "1",
+      });
+
+      // Withdrawing a queued input settles it without an answer, but the other
+      // turn is still running: the record is terminal while the session is not
+      // at rest, so it is not yet reported as settled.
+      expect(await queued.abort(BACKGROUND_CONTEXT)).toBe("aborted");
+      expect(await session.settledOperation("op-queued")).toEqual({
+        state: "unknown",
+        operationId: "op-queued",
+        conversation: "1",
+      });
+
+      scripted.release();
+      expect((await running.wait(BACKGROUND_CONTEXT)).status).toBe("done");
+      await harness.waitForIdle(BACKGROUND_CONTEXT);
+
+      // At rest: both records are terminal, and the never-sent id is provably
+      // absent; a host may combine that with its own durable refusal.
+      expect(await session.settledOperation("op-running")).toEqual({
+        state: "settled",
+        operationId: "op-running",
+        conversation: "1",
+        submission: String(running.id),
+        status: "done",
+      });
+      expect(await session.settledOperation("op-queued")).toEqual({
+        state: "settled",
+        operationId: "op-queued",
+        conversation: "1",
+        submission: String(queued.id),
+        status: "unanswered",
+      });
+      expect(await session.settledOperation("op-never-sent")).toEqual({
+        state: "absent",
+        operationId: "op-never-sent",
+        conversation: "1",
+      });
+
+      // An id this runtime could never have admitted is refused, not read.
+      await expect(session.settledOperation("")).rejects.toThrow();
+
+      // Two rows for one deduplication key: the engine could return either, so
+      // the proof refuses to name one.
+      database
+        .prepare(
+          "INSERT INTO pi_submissions (id, conversation_id, request_id, status, record) VALUES (?,?,?,?,?)",
+        )
+        .run(
+          999_999,
+          1,
+          JSON.stringify("op-running"),
+          "done",
+          JSON.stringify({
+            id: 999_999,
+            conversationId: 1,
+            requestId: "op-running",
+            type: "input",
+            status: "done",
+          }),
+        );
+      expect(await session.settledOperation("op-running")).toEqual({
+        state: "unknown",
+        operationId: "op-running",
+        conversation: "1",
+      });
+
+      // A record that is not a submission the engine could have written proves
+      // nothing, so it answers unknown rather than "not settled".
+      database
+        .prepare("UPDATE pi_submissions SET record='[]' WHERE id=?")
+        .run(queued.id);
+      expect(await session.settledOperation("op-queued")).toEqual({
+        state: "unknown",
+        operationId: "op-queued",
+        conversation: "1",
+      });
+    } finally {
+      scripted.release();
+      await harness.close(BACKGROUND_CONTEXT);
+      database.close();
+    }
+  }, 30_000);
+
+  it("answers unknown for malformed legacy status rows in the session's own SQLite", async () => {
+    const { database } = sessionDatabase();
+    // A legacy schema without the engine's NOT NULL/CHECK constraints: only a
+    // pre-constraint or corrupt database can hold the rows below.
+    database.exec(`
+      CREATE TABLE pi_submissions (
+        id INTEGER PRIMARY KEY,
+        conversation_id INTEGER,
+        request_id TEXT,
+        status TEXT,
+        record TEXT NOT NULL
+      );
+      CREATE TABLE pi_tasks (
+        id INTEGER PRIMARY KEY,
+        conversation_id INTEGER,
+        status TEXT
+      )
+    `);
+    const insertSubmission = database.prepare(
+      "INSERT INTO pi_submissions (id, conversation_id, request_id, status, record) VALUES (?,?,?,?,?)",
+    );
+    insertSubmission.run(
+      1,
+      1,
+      JSON.stringify("op-settled"),
+      "done",
+      JSON.stringify({
+        id: 1,
+        conversationId: 1,
+        requestId: "op-settled",
+        type: "input",
+        status: "done",
+      }),
+    );
+    const insertTask = database.prepare(
+      "INSERT INTO pi_tasks (id, conversation_id, status) VALUES (?,?,?)",
+    );
+    const session = await sessionOver(
+      {
+        submit: async () => {
+          throw new Error("the settlement proof must not submit");
+        },
+        prompt: async () => {
+          throw new Error("the settlement proof must not prompt");
+        },
+      },
+      new OperationScopes(sqlStore(database)),
+      sqlStore(database),
+    );
+    const proof: OperationSettlement = {
+      state: "settled",
+      operationId: "op-settled",
+      conversation: "1",
+      submission: "1",
+      status: "done",
+    };
+    const unknown = async (operationId: string) => {
+      expect(await session.settledOperation(operationId)).toEqual({
+        state: "unknown",
+        operationId,
+        conversation: "1",
+      });
+    };
+    try {
+      expect(await session.settledOperation("op-settled")).toEqual(proof);
+
+      // An unrelated submission whose status is not one the engine writes
+      // blocks the whole session.
+      insertSubmission.run(
+        2,
+        1,
+        JSON.stringify("op-legacy"),
+        "legacy",
+        JSON.stringify({
+          id: 2,
+          conversationId: 1,
+          requestId: "op-legacy",
+          type: "input",
+          status: "legacy",
+        }),
+      );
+      await unknown("op-settled");
+      await unknown("op-never-sent");
+
+      // NULL is the same: `NULL NOT IN (...)` must not slip past the scan.
+      database.prepare("UPDATE pi_submissions SET status=NULL WHERE id=2").run();
+      await unknown("op-settled");
+
+      database.prepare("DELETE FROM pi_submissions WHERE id=2").run();
+      expect(await session.settledOperation("op-settled")).toEqual(proof);
+
+      // A task with no status, then one with an unknown status, blocks too.
+      insertTask.run(1, 1, null);
+      await unknown("op-settled");
+      database.prepare("UPDATE pi_tasks SET status='legacy' WHERE id=1").run();
+      await unknown("op-settled");
+      database.prepare("UPDATE pi_tasks SET status='terminal' WHERE id=1").run();
+      expect(await session.settledOperation("op-settled")).toEqual(proof);
+    } finally {
+      database.close();
+    }
+  }, 30_000);
 });
