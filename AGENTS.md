@@ -173,8 +173,9 @@ the code you just wrote.
   that gate, security, schema and release PRs keep fresh-session Opus reviews and
   the workflow rows are a cheap first pass; on other PRs two workflow rows
   satisfy the requirement. A hosted `routine` PR has no readiness record, so it
-  takes those two workflow rows and the operator approval they carry under the
-  auto-paths rule below (CAD-2135).
+  takes those two workflow rows and the operator approval they carry (CAD-2135),
+  unless the gate's dry run reports `class: auto` (the auto-paths rule below;
+  being on the list is not enough).
   A hosted `ui/**` PR takes those two rows, operator approval and `--browser-qa
   <url>`, naming an unedited comment on this PR by a repository member that is exactly the lines `Browser QA: pass` and
   `Head: <full sha>` (CAD-2173). Until it ends, a `ui/**` PR can instead take
@@ -196,7 +197,7 @@ the code you just wrote.
   (`review-standards.yml` and `review-spec.yml`; no login or person) are a cheap
   first pass on gate, security, schema and release PRs, where fresh-session Opus
   reviews stay the real review; two rows satisfy other PRs, with the operator
-  check still applying outside the auto-paths allowlist.
+  check still applying unless the gate's dry run reports `class: auto`.
 - **The changed set is anchored to main's live tip.** GitHub's PR base SHA can stay
   older than the real merge base after main is merged into the branch, so a PR
   that merges main and restores an old file diffs as docs-only against it.
@@ -246,13 +247,23 @@ the code you just wrote.
     applies. The gate therefore inverts the rule: a PR with any workflow-issued
   row needs the operator's approval unless EVERY changed path matches
   `docs/roles/workflow-auto-paths.toml`, read at main's live tip, and every
-  change is a plain add or modify (mode 100644). That list is EMPTY (`paths =
-  []`) and the reader and rules stay, so today the operator approves every
-  merge, and workflow rows only satisfy the two reviews. Enabling a path later
-  is one reviewed line and a later, deliberate decision, made only after reading
-  what the path holds. Whatever the list says, a path with a segment starting
-  with `.` or a basename starting `agents.`, `claude.` or `gemini.` is never
-  eligible. `cadence delivery requirements` does not report this rule; the
+  change is a plain add or modify (mode 100644). That list names Markdown
+  documentation only, `docs/**/*.md` (CAD-2254). A PR whose every path is on
+  it and in no human-class list (`docs/roles/**`, `docs/AUDIT.md` and the
+  other rule-7 documents stay human), with both workflow reviews passing at
+  its head, merges without the operator unless the size trigger, a non-`auto`
+  `Risk:` or the board's own approval requirement applies. Every other PR
+  still takes the
+  operator's approval, and workflow rows only satisfy its two reviews. No
+  code is listed: the path lists are not a complete map of sensitive code.
+  Adding a path is one reviewed line and a deliberate decision, made only
+  after reading what the path holds. Whatever the list says, some paths are
+  never eligible (hidden, agent-instruction and odd names, the one-review
+  excludes, the trigger 1 and 3 trees, and case variants of protected
+  paths), and an unreadable or emptied list means the operator:
+  `docs/roles/risk-classes.md` trigger 7 states the rule and
+  `workflow_auto_reasons` in `scripts/enqueue-reviewed` enforces it.
+  `cadence delivery requirements` does not report this rule; the
   script adds it. Rule-7 paths, the size trigger and a non-`auto` `Risk:` also
   force the operator. A workflow row that is not a pass refuses in every class.
   The tenant stops re-filing, not re-rolling: a run can be cancelled and
@@ -503,6 +514,17 @@ limitation; only an authorized operator can decide an exception.
   favcrm/cadence --disable-auto`; re-enable it, pinned to the new head, only
   after that head passes review.
 - `--admin` only in a declared emergency, never as routine.
+- Ask the operator only when the gate does (CAD-2254). Run
+  `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run` and read its
+  `class:` line:
+  - `class: auto` and the dry run ends with every rule holding: enqueue the
+    PR yourself and report the merge. Do not ask for an approval the gate
+    does not need.
+  - `class: human (...)`, or a refusal that names a missing operator
+    approval: ask the operator once, and name the trigger the gate gives.
+  - A workflow review that says revise: fix the finding, push, and let the
+    new head be reviewed. Ask for `cadence audit accept-revise` only when
+    the finding is wrong, and say why it is wrong.
 - Temporary path (CAD-1946, remove this note when it ends): while the hosted
   reviewer attestation cannot be produced, `scripts/enqueue-reviewed <pr>
   --head <sha> --exception --advisory standards=<url> --advisory

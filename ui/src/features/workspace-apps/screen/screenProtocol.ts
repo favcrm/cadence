@@ -46,10 +46,12 @@ export interface ScreenInit {
 
 /** The only messages the child may ever send over the port. Anything
  *  else closes the port. `state` is the child's opaque draft snapshot
- *  (≤ 32 KiB string), held host-side in memory only; `asset` is screen.v2. */
+ *  (≤ 32 KiB string), held host-side in memory only; `leave` and `asset`
+ *  are screen.v2. */
 export type ChildToHost =
   | { v: 1; op: "ready"; accepts?: Accept[] | [typeof CHAT_DIRECTIVE_V1] }
   | { v: 1; op: "state"; data: string }
+  | { v: 2; op: "leave"; unsaved: boolean }
   | { v: 2; op: "asset"; ref: string }
   | CallRequest
   | SlotRequest
@@ -210,8 +212,8 @@ export interface ScreenNavigation { section_query: string; default_section: stri
 export interface ScreenRoute { section: string; view: "list" | "new"; record_id: string | null; segment_id: string | null }
 export interface ReadObservation { operation: string; args: ActionArgs; data: unknown }
 export const SCREEN_RECORDS_V1 = "screen-records.v1";
-/** CRM presentation data only; never an operation or permission. */
-export const CRM_LOCALE_V1 = "crm-locale.v1";
+/** Host-selected presentation locale only (`"en" | "zh-TW"`); never an operation or permission. */
+export const SCREEN_LOCALE_V1 = "screen-locale.v1";
 /** Larger envelopes are admitted only after verified records negotiation and rights. */
 export function recordArgsLimit(verb: string): number {
   return ["records.csv.preview", "records.csv.import", "records.csv.confirm"].includes(verb) ? 327680
@@ -304,7 +306,7 @@ export const SCREEN_SURFACES_V1 = "screen-surfaces.v1";
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof CRM_LOCALE_V1 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -632,7 +634,7 @@ export interface ScreenPush {
   /** Records-negotiated display only, never authority. */
   route?: ScreenRoute;
   read_observations?: ReadObservation[];
-  /** Host-selected presentation only, for CRM records peers opting into crm-locale.v1. */
+  /** Host-selected presentation locale, for screen.v2 peers opting into screen-locale.v1. */
   presentation_locale?: "en" | "zh-TW";
 }
 
@@ -710,11 +712,15 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   }
   if (
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
-    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 4 &&
+    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 5 &&
     new Set(d.accepts).size === d.accepts.length &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === CRM_LOCALE_V1 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
+  }
+  if (Object.keys(d).sort().join() === "op,unsaved,v" && d.v === 2 && d.op === "leave" &&
+      typeof d.unsaved === "boolean") {
+    return { v: 2, op: "leave", unsaved: d.unsaved };
   }
   if (Object.keys(d).sort().join() === "op,ref,v" && d.v === 2 && d.op === "asset" &&
       typeof d.ref === "string" && ASSET_REF.test(d.ref)) {

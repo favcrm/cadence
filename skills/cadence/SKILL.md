@@ -710,6 +710,14 @@ During implementation and handoff:
   advisory links) remains for a head that cannot produce the workflow rows and ends at
   `EXCEPTION_ENDS` (2026-12-31); it checks only that the links are separate https URLs.
   A second attested human is not required.
+- In the Cadence repository, ask a person only when the gate does: run
+  `scripts/enqueue-reviewed <n> --head <full-sha> --dry-run` and read its
+  `class:` line. On `class: auto` with every rule holding, enqueue the PR
+  yourself and report the merge. On `class: human (...)`, or a refusal that
+  names a missing operator approval, ask the operator once and name the
+  trigger the gate gives. When a workflow review says revise, fix the finding, push
+  and let the new head be reviewed; ask the operator to accept a revise only
+  when the finding is wrong, and say why (CAD-2254).
 - Make review converge. First inspect the complete change against acceptance;
   verify each blocking finding with a concrete failure scenario and source
   evidence before sending it to the author. Report the class of bug and all
