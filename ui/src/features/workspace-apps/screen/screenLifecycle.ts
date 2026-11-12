@@ -1,5 +1,5 @@
 import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
   type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
@@ -199,6 +199,8 @@ export abstract class FrameChannel {
   protected drawerCapable(): boolean | readonly ScreenDrawerVerb[] { return false; }
   /** Opaque state is ignored unless this frame kind explicitly understands it. */
   protected state(_data: string): void {}
+  /** screen.v2 unsaved-edit leave warning hint: a frame kind without it closes. */
+  protected leave(_unsaved: boolean): void { this.close(true); }
   receive(event: Pick<MessageEvent, "origin" | "source" | "data" | "ports">): void {
     if (this.closed || event.source !== this.source) return;
     if (event.origin !== "null") {
@@ -227,6 +229,10 @@ export abstract class FrameChannel {
       if (child.op === "asset") {
         if (!this.ready) { this.close(true); return; }
         this.asset(child.ref);
+      }
+      if (child.op === "leave") {
+        if (!this.ready) { this.close(true); return; }
+        this.leave(child.unsaved);
       }
       if (child.op === "call" || child.op === "slot" || child.op === "tool") {
         if (!this.ready) { this.close(true); return; }
@@ -274,7 +280,7 @@ export class ScreenChannel extends FrameChannel {
     super(source, receipt, removeFrame, failed, onReady);
   }
   private records = false;
-  private crmLocale = false;
+  private wantsLocale = false;
   private wantsPresentation = false;
   private wantsSurfaces = false;
   /** CAD-1777 — the host-derived surface role of this mount. The outlet
@@ -318,21 +324,11 @@ export class ScreenChannel extends FrameChannel {
     const message: ScreenSurface = { v: 1, op: "surface", role: this.surfaceState.role, modal: this.surfaceState.modal, ...(named ? { surface: named } : {}) };
     this.port.postMessage(message);
   }
-  protected state(data: string): void {
-    // Any records-contract screen may publish the hint; the payload's own
-    // `contract` field is the declaration (CAD-1543), never the app name.
-    if (!this.ready || this.closed || !this.records || data.length > 128 ||
-        new TextEncoder().encode(data).byteLength > 128) return;
-    // This closed boolean is a warning hint, never navigation/effect authority.
-    // Unknown or malformed opaque state must not clear an existing warning.
-    try {
-      const value: unknown = JSON.parse(data);
-      if (!value || typeof value !== "object" || Array.isArray(value)) return;
-      const state = value as Record<string, unknown>;
-      if (Object.keys(state).sort().join() !== "contract,unsaved" ||
-          state.contract !== "crm-leave.v1" || typeof state.unsaved !== "boolean") return;
-      this.onUnsaved?.(state.unsaved);
-    } catch { /* Ignore other opaque state, without changing the warning. */ }
+  protected leave(unsaved: boolean): void {
+    // Any screen.v2 frame may publish the boolean warning hint; it carries no
+    // navigation or effect authority, and non-v2 mounts close on v2 ops.
+    if (!this.ready || this.closed || this.shape !== "v2") { this.close(true); return; }
+    this.onUnsaved?.(unsaved);
   }
   private csvBusy = false;
   private csvSlot: string | null = null;
@@ -405,7 +401,7 @@ export class ScreenChannel extends FrameChannel {
   /** Only a v2 child with an action host; the verb set was closed by the parser. */
   protected call(request: CallRequest): void {
     const actions = this.actions;
-    if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
+    if (this.wantsLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || this.calls >= CALL_QUEUE_MAX) { this.close(true); return; }
     // CAD-1777 / CAD-1932 — a drawer request is host-local UI, never a
     // records operation or an app action: a capable frame (records or not)
@@ -461,7 +457,7 @@ export class ScreenChannel extends FrameChannel {
 /** Only a v2 child with an action host. At most one live slot per frame. */
   protected slot(request: SlotRequest): void {
     const actions = this.actions;
-    if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
+    if (this.wantsLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || (this.records ? !this.receipt.operations?.includes(request.verb) || !(RECORD_SLOT_VERBS as readonly string[]).includes(request.verb) : !(SLOT_VERBS as readonly string[]).includes(request.verb))) { this.close(true); return; }
     const csv = this.records && (request.verb === "records.csv.import" || request.verb === "records.csv.confirm");
     if (csv && (this.csvBusy || this.csvSlot !== null && this.csvSlot !== request.id)) { this.close(true); return; }
@@ -532,9 +528,11 @@ export class ScreenChannel extends FrameChannel {
     if (!shape) return false;
     const accepts: readonly string[] = ready.accepts ?? [];
     const records = accepts.includes(SCREEN_RECORDS_V1);
+    const wantsLocale = accepts.includes(SCREEN_LOCALE_V1);
+    if (wantsLocale && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
     if (records !== (this.receipt.host_contract === SCREEN_RECORDS_V1) || records && (shape !== "v2" || !accepts.includes(SCREEN_V2) || wantsActions(ready.accepts) || !this.receipt.action_token || !this.actions)) return false;
     this.records = records;
-    this.crmLocale = records && accepts.includes(CRM_LOCALE_V1);
+    this.wantsLocale = wantsLocale;
     this.shape = shape;
     // Record the tool/action opt-in: the child may then send `tool` ops,
     // which only run when the host holds a live mount action context.
@@ -620,7 +618,7 @@ export class ScreenChannel extends FrameChannel {
       projection.actions = [...advertised, ...drawerVerbs.filter(verb => !advertised.includes(verb))];
     }
     // Presentation negotiation grants no actions. Older/other peers retain their exact shape.
-    if (!this.crmLocale || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
+    if (!this.wantsLocale || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
     delete projection.run_receipts;
     if (!this.records && this.shape === "v2" && this.wantsMedia && this.actions?.planner && projection.actions?.includes("run.start")) {
       projection.run_receipts = 1;

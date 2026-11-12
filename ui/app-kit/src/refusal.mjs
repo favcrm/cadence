@@ -53,6 +53,17 @@ export class ScreenTimeoutError extends Error {
   }
 }
 
+/** Structured application-level bridge error carrying HTTP-aligned status and
+ *  optional refusal code without coupling `app-kit` to any UI package. */
+export class ScreenBridgeError extends Error {
+  constructor(message, status = 502, options = {}) {
+    super(message);
+    this.name = "ScreenBridgeError";
+    this.status = status;
+    this.code = typeof options?.code === "string" ? options.code : undefined;
+  }
+}
+
 /** A refusal record the host sent, or `null` when the shape is malformed. */
 export function readRefusal(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;

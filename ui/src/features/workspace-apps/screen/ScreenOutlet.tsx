@@ -11,7 +11,7 @@ import { parseDraftImageRef, parseUploadImageRef, SOCIAL_SOURCES_INVALIDATED, ty
 import { DrawerRestorer } from "./drawerRestore";
 import { SourcesInvalidator } from "./sourcesInvalidation";
 import { workspaceApps } from "../workspaceApps";
-import { useLocale } from "../../../lib/locale";
+import { translateUiText, useLocale } from "../../../lib/locale";
 import { appliedFrameTheme, onAppliedThemeChange, type FrameTheme } from "../../../lib/theme";
 import { downscaleToDataUrl } from "./screenAssets";
 import { registerNavigationGuard, useHref } from "../../../lib/useLocation";
@@ -101,7 +101,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href });
   navigationCallbacks.current = { onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href };
   const mounted = useRef<MountReceipt | null>(null);
-  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, presentation_locale: presentationLocale.current, route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : p;
+  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, presentation_locale: presentationLocale.current, route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : { ...p, presentation_locale: presentationLocale.current };
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ScreenChannel | null>(null);
   const latest = useRef(projection);
@@ -413,7 +413,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
             clearLeaveGuard();
             if (!unsaved) return;
             releaseLeaveGuard = registerNavigationGuard(() => !isCurrent() || channel.current !== owned ||
-              window.confirm("Your email draft has not been saved. Leave this page and discard those local edits?"));
+              window.confirm(translateUiText("You have unsaved changes. Leave this page and discard your local edits?", presentationLocale.current)));
             window.addEventListener("beforeunload", warnBeforeUnload);
           });
         // The role is host-derived from this outlet's mount; the surface
