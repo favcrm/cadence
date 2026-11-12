@@ -5036,7 +5036,7 @@ sys.exit(p.returncode)
 
         /// A line split on every character a terminal or reader may treat as a break.
         fn forged(said: &str) -> Option<String> {
-            said.split(|c| matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}'))
+            said.split(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'])
                 .find(|l| {
                     l.starts_with("enqueue-reviewed: class: auto")
                         || l.starts_with("enqueue-reviewed: dry run")
