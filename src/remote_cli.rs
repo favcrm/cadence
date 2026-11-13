@@ -2072,6 +2072,9 @@ fn settings_receipt_correlates(
 /// Stable code for a board that refused `include_body` on the verdict read.
 pub const VERDICT_BODY_UNSUPPORTED: &str = "verdict_body_unsupported";
 
+/// Stable code for a board that predates `limit` on `issue_ls`.
+pub const ISSUE_LS_LIMIT_UNSUPPORTED: &str = "issue_ls_limit_unsupported";
+
 /// CAD-2001: the project-scoped review-evidence verbs. Every one carries an
 /// explicit `project` — plus `issue` for the two approvals — so the answer is
 /// that project's evidence and no other's. They are newer than the tenant
@@ -6189,6 +6192,19 @@ fn call_verb_until_retry(
             return Err(Error::invalid(
                 VERDICT_BODY_UNSUPPORTED,
                 "the board does not know `include_body` for verdicts",
+            ));
+        }
+        // CAD-2277: a board that predates `limit` on `issue_ls` refuses the field
+        // as `invalid_request` (400). Surface a typed code so the CLI can retry
+        // once without `limit` and slice locally instead of failing outright.
+        if verb == "issue_ls"
+            && arguments.contains_key("limit")
+            && status == 400
+            && refusal_code.as_deref() == Some("invalid_request")
+        {
+            return Err(Error::invalid(
+                ISSUE_LS_LIMIT_UNSUPPORTED,
+                "the board does not know `limit` for `issue ls`",
             ));
         }
         if PROJECT_SCOPED_GATE_VERBS.contains(&verb) {

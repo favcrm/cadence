@@ -2157,4 +2157,14 @@ Object.assign(zhTW, {
   "Use transcript": "完成並使用逐字稿",
   "Discard the current audio capture and start over?": "要捨棄目前的音訊與逐字稿並重新開始嗎？",
   "Some audio segments failed to transcribe. Use the partial transcript anyway?": "部分音訊片段未能完成轉錄。仍要使用目前已完成的逐字稿嗎？",
+  // CAD-2277: inline ticket deliverable preview controls and provenance footers.
+  "No evidence yet": "尚無證據或附件",
+  "Add screenshots, test results, and other supporting files.": "加入螢幕截圖、測試結果及其他支援檔案。",
+  "Artifacts": "交付檔案",
+  "Document view": "文件檢視模式",
+  "sandboxed frame · no scripts · no network": "沙盒頁框 · 不執行腳本 · 不連線網路",
+  "board Markdown renderer · no raw HTML": "看板 Markdown 檢視器 · 不載入原始 HTML",
+  "table · first 2,000 rows · 50 columns": "表格 · 首 2,000 列 · 首 50 欄",
+  "browser PDF tab or download": "瀏覽器 PDF 分頁開啟或下載",
+  "Contain and close out incidents across teams": "跨團隊遏止事件並完成復盤結案",
 });
