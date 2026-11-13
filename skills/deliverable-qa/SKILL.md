@@ -31,8 +31,13 @@ workspace rules still decides merges, publishing, sends and spend
 1. Name the exact revision: the PR head's full 40-hex sha, the file's sha256,
    or the artifact's version id. QA of anything else does not count.
 2. Read what it was meant to be: the ticket's outcome and acceptance, the
-   accepted mockup or brief, and the brand or design tokens if any.
-3. Serve or open that exact revision, and record how (provenance below).
+   accepted mockup or brief, and the brand or design tokens if any. A later
+   ticket may have changed the brief on purpose: read the linked and later
+   tickets, judge against the brief in force, and say which one you used.
+3. Serve or open that exact revision, and record how (provenance below). For
+   something already published, QA what is actually served. If it is not the
+   revision the ticket names, say so and name the commits or tickets that
+   changed it.
 
 ## Browser
 
@@ -54,6 +59,9 @@ workspace rules still decides merges, publishing, sends and spend
 - The reviewed revision, whether or not it is what was served.
 - Anything you could not prove: write "unverified". A successful build, a
   restart or a familiar-looking URL is not evidence.
+- A published page can differ by request: an edge or CDN may inject scripts.
+  Hash the origin response (or record its ETag), and note any injected
+  difference.
 
 Hosted board surfaces (member chat, the Browser panel, member app screens)
 cannot be signed into from an agent session. Use the QA board (CAD-2291) when
@@ -65,6 +73,17 @@ real hosted board stays the operator's.
 
 Every kind: the content matches its brief; no console errors or page errors;
 screenshots of what you judged, named `NN-<what>-<width>.png`.
+
+- Console tools can miss content-security-policy violations: register a
+  `securitypolicyviolation` listener with an init script before the first
+  navigation, and report what it catches.
+- Before a screenshot, set `scroll-behavior: auto`; a fixed header or footer
+  repeated in a full-page shot is the capture, not a defect.
+- A check that does not apply (a page with one theme or one language) is "not
+  applicable" with the reason, never a pass.
+- A third-party destination that fails only in a headless browser (a booking
+  or payment page) is "unverified": hand it to a person to open once. Never
+  change the browser's identity to get past it.
 
 **UI change (an app screen or board view)**
 - Desktop and narrow widths (at least 1440, 1024 and 390), both themes, and
@@ -80,7 +99,13 @@ screenshots of what you judged, named `NN-<what>-<width>.png`.
 **Web or landing page**
 - The UI checks above that apply, plus: every link resolves, the page title and
   meta description are set and true, images load and have meaningful `alt`
-  text, headings run in order, and the page is not needlessly heavy.
+  text, and headings run in order.
+- The page still says what it must with JavaScript off, and its own content
+  security policy does not block what the page needs.
+- Report the page weight (KB transferred and request count) rather than
+  judging it by feel.
+- Tracking and query parameters: only the ones the brief allows are passed on
+  (load the page with an unknown parameter and inspect the outgoing links).
 - Forms submit nowhere real during QA.
 
 **Ad creative, social post or image**
@@ -124,10 +149,19 @@ screenshots of what you judged, named `NN-<what>-<width>.png`.
   screenshots attached (`cadence --org <org> issue attach <ID> <file>`).
 - First line: `QA of <deliverable> at <revision>: PASS` or `: FAIL`.
 
+**Either way**
+- Pass the report on stdin when you cannot write files
+  (`cadence --org <org> issue comment <ID> --file -`, `gh pr comment <n> --body-file -`).
+- The comment is recorded under the login the command uses. Never pass
+  `--author` or otherwise post as someone else.
+- QA never changes a ticket's status, owner or acceptance; the person who acts
+  on the result does.
+
 **The report** (keep it under a page)
 - Provenance.
-- A checklist table: check, width or kind, result (pass, fail, unverified),
-  evidence (screenshot name; real or fixture).
+- A checklist table: check, width or kind, result (pass, fail, unverified,
+  not applicable), evidence (screenshot name, marked attached or local; real
+  or fixture).
 - Failures with steps to reproduce.
 - Non-blocking notes.
 - What you could not check, and why.
@@ -141,4 +175,5 @@ screenshots of what you judged, named `NN-<what>-<width>.png`.
 - It changes nothing in the deliverable. A fix is the maker's next revision,
   and that revision gets its own QA run.
 - Clean up: close the browser session, stop every process you started (by
-  process id), and delete scratch files other than the evidence you filed.
+  process id), and delete scratch files. Evidence lives in what you filed (the
+  comment and its attachments), not in local files.
