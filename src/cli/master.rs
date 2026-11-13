@@ -112,8 +112,9 @@ pub(crate) enum MasterAction {
     /// {"surfaceId":"<id>","catalogId":"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json",
     /// "components":[...],"dataModel":{...}}}. The components form one tree
     /// under the id `root`; the first Text is the title; one Button's
-    /// `action.event` (a name, and a context of values or {"@path":"/x"}
-    /// bindings) sends the answer. Only Text (caption|body), Row, Column,
+    /// `action.event` (a name, and a context of {"@path":"/x"} bindings,
+    /// each naming an input's own `value` binding) sends the answer; each
+    /// input's dataModel default must be something it shows. Only Text (caption|body), Row, Column,
     /// Card, Divider, Button, CheckBox, ChoicePicker (multipleSelection|
     /// mutuallyExclusive, chips|checkbox; its value is a list), TextField
     /// (shortText|longText|number) and DateTimeInput (enableDate,

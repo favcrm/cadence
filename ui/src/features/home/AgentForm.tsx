@@ -140,6 +140,18 @@ function failedCheck(c: Comp, data: Data): string | null {
 
 const INPUTS = new Set(["CheckBox", "ChoicePicker", "TextField", "DateTimeInput"]);
 
+/** What an input shows: a CheckBox's tick, a picker's own options only, a field's text. */
+function displayed(c: Comp, data: Data): unknown {
+  const v = resolve(c.value, data);
+  if (c.component === "CheckBox") return v === true;
+  if (c.component === "ChoicePicker") {
+    const options = (Array.isArray(c.options) ? (c.options as { value?: unknown }[]) : []).map((o) => o.value);
+    const picked = asList(v).filter((x) => options.includes(x));
+    return c.variant === "mutuallyExclusive" ? picked.slice(0, 1) : picked;
+  }
+  return asText(v);
+}
+
 /** Every component under root in reading order (the daemon checked it is a tree). */
 function walk(comps: Map<string, Comp>): Comp[] {
   const out: Comp[] = [];
@@ -166,6 +178,8 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
   // A sent or closed form keeps no draft on this device.
   useEffect(() => {
     if (status.state === "sent" || status.state === "closed") writeDraft(entry.seq, null);
+    // Open again (a failed answer was discarded): Send works again.
+    if (status.state === "open") sent.current = false;
   }, [status.state, entry.seq]);
   const root = useRef<HTMLElement>(null);
 
@@ -216,10 +230,17 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
     }
     const event = ((button.action as Record<string, unknown> | undefined)?.event ?? {}) as { name?: unknown; context?: unknown };
     const context: Data = {};
+    // Each context binding names an input's value (the daemon checks it);
+    // send what that input shows, never the raw data behind it.
+    const inputs = order.filter((c) => INPUTS.has(c.component));
     if (event.context && typeof event.context === "object") {
-      for (const [k, v] of Object.entries(event.context as Data)) context[k] = resolve(v, data) ?? null;
+      for (const [k, v] of Object.entries(event.context as Data)) {
+        const input = inputs.find((c) => binding(c.value) !== null && binding(c.value) === binding(v));
+        context[k] = input ? displayed(input, data) : null;
+      }
     }
-    const lines = order.filter((c) => INPUTS.has(c.component)).map((c) => `${label(c) || c.id}: ${shown(c)}`);
+    // One line per field, whatever the values hold.
+    const lines = inputs.map((c) => `${label(c) || c.id}: ${shown(c)}`.replace(/\s*[\r\n]+\s*/g, " "));
     const action = {
       version: "1.0",
       action: { name: event.name, surfaceId: surface.id, sourceComponentId: button.id, timestamp: new Date().toISOString(), context },
