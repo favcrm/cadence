@@ -243,6 +243,15 @@
 .bz-addr { flex: 1 1 0; min-width: 0; display: flex; align-items: baseline; white-space: nowrap; overflow: hidden; font: var(--text-label) var(--font-mono); color: var(--color-ink-500); }
 .bz-host { flex: 0 0 auto; max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; color: var(--color-ink-100); font-weight: 600; }
 .bz-rest { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* A narrow drawer (push mode at a laptop width) leaves the first row no room for the address, which
+   would shrink to its last character. Below 560 px of panel width it takes its own row under the
+   header instead, still one line and clipped from the start, and the actions keep the right edge. */
+.bz-panel { container: bz-panel / inline-size; }
+@container bz-panel (max-width: 560px) {
+  .bz-head:has(> .bz-addr) { flex-wrap: wrap; row-gap: 4px; }
+  .bz-head > .bz-addr { order: 10; flex: 1 0 100%; }
+  .bz-head:has(> .bz-addr) > .bz-actions { margin-left: auto; }
+}
 
 .bz-body { gap: 12px; }
 .bz-body .sempty { flex: none; text-align: center; }
