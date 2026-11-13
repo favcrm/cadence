@@ -198,6 +198,21 @@ An empty directory is admitted with no entries, and finish creates that root.
 `--update` pins the destination's current revisions and replaces changed
 bytes. Without it, identical content can be skipped, but changed existing
 pages are create-only. A partial job exits nonzero and names the job id.
+When a chunk, apply or finish stops partway, the exit code says what is known:
+
+- **3** — a hosted board refused it with one of its own transfer codes, and the
+  error keeps that code. Nothing changed. Follow the message: resume with
+  `--resume <job>`, or copy again without `--resume` when the job is gone.
+- **75** — the command deadline passed, or the board was still waking, before
+  the request was sent. Nothing changed. Run the same copy again with
+  `--resume <job>`; a plain rerun starts a new job instead.
+- **1** — the request went out and its outcome was not confirmed: a lost reply,
+  or a local daemon's refusal, which can follow a publish. It may have landed.
+  Run the same copy with `--resume <job>` before repeating anything; the job
+  shows what was recorded.
+
+A local source problem found while sending a chunk, such as a file that changed
+after the manifest was pinned, keeps its own kind and exits 3.
 `--wait-index` polls that job's own status until the index is covered, the job
 fails, or the command deadline
 passes. It does not refresh the global index.

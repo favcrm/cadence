@@ -5512,6 +5512,13 @@ pub(crate) fn is_wiki_copy_refusal(code: &str) -> bool {
     WIKI_COPY_REFUSALS.iter().any(|row| row.code == code)
 }
 
+/// Every code with a row in [`WIKI_COPY_REFUSALS`], for the copy client's
+/// tests.
+#[cfg(test)]
+pub(crate) fn wiki_copy_refusal_codes() -> impl Iterator<Item = &'static str> {
+    WIKI_COPY_REFUSALS.iter().map(|row| row.code)
+}
+
 /// CAD-2261: a board that serves `wiki cp` (AOS-566) refuses a transfer
 /// operation with a code of its own. Say what happened and what to do, keep
 /// the board's code as the error's code, and never show the board's text.
