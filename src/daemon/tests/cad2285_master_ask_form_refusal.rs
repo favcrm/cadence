@@ -63,7 +63,7 @@ fn only_the_masters_live_home_turn_asks_a_form_once() {
             .store
             .register_agent(&NewAgent {
                 alias,
-                provider: "pi",
+                provider: "claude",
                 endpoint_kind: "managed",
                 role,
                 cwd: &cwd,
@@ -126,7 +126,7 @@ fn only_the_masters_live_home_turn_asks_a_form_once() {
             [MESSAGE],
         )
         .unwrap();
-    let token = crate::adapter::registry::PI_MANAGED_TURN_TOKENS.mint(GENERATION);
+    let token = crate::adapter::registry::CLAUDE_MANAGED_TURN_TOKENS.mint(GENERATION);
     shared.store.mark_running(MESSAGE, &token).unwrap();
 
     // Still refused for the operator and another agent while the turn is live.
