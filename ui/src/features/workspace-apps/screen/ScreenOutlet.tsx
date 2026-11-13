@@ -7,7 +7,8 @@ import type { ScreenFailure, ScreenPaneState } from "./screenFailure";
 import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
-import { parseDraftImageRef, parseUploadImageRef, SOCIAL_SOURCES_INVALIDATED, type ScreenPush, type ScreenSurfaceRole } from "./screenProtocol";
+import ScreenAudioModal from "./ScreenAudioModal";
+import { parseDraftImageRef, parseUploadImageRef, SOCIAL_SOURCES_INVALIDATED, type ActionResult, type ScreenAudioMode, type ScreenPush, type ScreenSurfaceRole } from "./screenProtocol";
 import { DrawerRestorer } from "./drawerRestore";
 import { SourcesInvalidator } from "./sourcesInvalidation";
 import { workspaceApps } from "../workspaceApps";
@@ -116,6 +117,14 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const [remoteImages, setRemoteImages] = useState<string[]>([]);
   const [slot, setSlot] = useState<SlotView | null>(null);
   const [link, setLink] = useState<string | null>(null);
+  const [audioModal, setAudioModal] = useState<{
+    key: number;
+    mode: ScreenAudioMode;
+    actionToken: string;
+    signal: AbortSignal;
+    resolve: (result: ActionResult) => void;
+  } | null>(null);
+  const audioKeyRef = useRef(0);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
   // The board's applied pick, carried on the frame URL: a sandboxed frame is
   // its own document and never sees the board's `data-theme`. A later change is
@@ -278,11 +287,11 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     };
     setState("loading");
     setFailure(null);
-    setSlot(null); setLink(null); setPreview(null); setRemoteImages([]);
+    setSlot(null); setLink(null); setPreview(null); setRemoteImages([]); setAudioModal(null);
     // A new frame identity cannot keep the old identity's drawer.
     setOverlay(null);
     setOverlaySize(undefined);
-    const fail = (why: ScreenPaneState) => { clearLeaveGuard(); if (isCurrent()) { setFailure(why); services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setState("fallback"); setOverlay(null); setOverlaySize(undefined); if (overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true); } };
+    const fail = (why: ScreenPaneState) => { clearLeaveGuard(); if (isCurrent()) { setFailure(why); services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setAudioModal(null); setState("fallback"); setOverlay(null); setOverlaySize(undefined); if (overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true); } };
     const onMessage = (event: MessageEvent) => owned?.receive(event);
     window.addEventListener("message", onMessage);
     void (async () => {
@@ -408,6 +417,24 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
               if (result.ok && isCurrent()) await toolInvoked.current?.();
               return result;
             } } : {}),
+            ...(actionToken ? { captureAudio: (mode: ScreenAudioMode, ui: { actionToken: string; signal: AbortSignal }) =>
+              new Promise<ActionResult>(resolve => {
+                if (!isCurrent() || ui.signal.aborted) {
+                  resolve({ ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } });
+                  return;
+                }
+                const key = ++audioKeyRef.current;
+                setAudioModal({
+                  key,
+                  mode,
+                  actionToken: ui.actionToken,
+                  signal: ui.signal,
+                  resolve: result => {
+                    setAudioModal(currentModal => (currentModal?.key === key ? null : currentModal));
+                    resolve(result);
+                  },
+                });
+              }) } : {}),
           } : undefined, undefined, unsaved => {
             if (!isCurrent() || mounted.current !== receipt || channel.current !== owned) return;
             clearLeaveGuard();
@@ -448,7 +475,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       window.removeEventListener("message", onMessage);
       owned?.close();
       channel.current = null;
-      setSlot(null); setLink(null); setPreview(null);
+      setSlot(null); setLink(null); setPreview(null); setAudioModal(null);
       container.current?.replaceChildren();
       // A primary's retirement takes its child drawer with it; the shell
       // overlay closes so no blank blocking panel can remain.
@@ -486,6 +513,16 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         onTap={(token, trusted, at, input) => { channel.current?.tapSlot(token, trusted, at, input); }}
         onCancel={token => channel.current?.cancelSlot(token)} />
     </div>
+    {audioModal && typeof document !== "undefined" && createPortal(
+      <ScreenAudioModal
+        key={audioModal.key}
+        initialMode={audioModal.mode}
+        actionToken={audioModal.actionToken}
+        signal={audioModal.signal}
+        onResolve={audioModal.resolve}
+      />,
+      document.body,
+    )}
     {/* CAD-1137: a quiet first-mount skeleton, with the blank frame hidden until handshake readiness. */}
     {state === "loading" && (
       <div className="wa-skeleton wa-screen-skeleton" role="status" aria-label={t("Loading installed app")} style={{ padding: "0.5rem 0.25rem" }}>

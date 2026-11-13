@@ -27,6 +27,8 @@ export interface ScreenPush {
 export type ScreenPresentationMode = "outlet" | "drawer";
 export type ScreenSurfaceRole = "primary" | "drawer";
 export type ScreenLocale = "en" | "zh-TW";
+export type ScreenAudioMode = "record" | "upload";
+export type ScreenAudioSource = "recording" | "upload";
 export type ScreenCapability =
   | "screen.v1"
   | "screen.v2"
@@ -35,7 +37,20 @@ export type ScreenCapability =
   | "screen-presentation.v1"
   | "screen-surfaces.v1"
   | "screen-records.v1"
-  | "screen-locale.v1";
+  | "screen-locale.v1"
+  | "screen-audio.v1";
+
+export interface ScreenAudioCapture {
+  readonly transcript: string;
+  readonly duration_seconds: number;
+  readonly held_at: string;
+  readonly source: ScreenAudioSource;
+}
+
+export interface ScreenAudioCaptureOptions {
+  mode?: ScreenAudioMode;
+  timeoutMs?: number;
+}
 
 export type SlotAnchor = "footer" | { x: number; y: number; w: number; h: number };
 
@@ -87,6 +102,7 @@ export interface ScreenReceiver {
   call<T = unknown>(verb: string, args?: unknown): Promise<T>;
   slot(verb: string, args?: unknown, anchor?: SlotAnchor): Promise<SlotState>;
   tool<T = unknown>(alias: string, input?: unknown, requestId?: string, generationScope?: GenerationScope): Promise<T>;
+  audioCapture(options?: ScreenAudioCaptureOptions): Promise<ScreenAudioCapture>;
   asset(ref: string, options?: { timeoutMs?: number }): Promise<string>;
   assetAdmitted(ref: string): boolean;
   state(data: string): boolean;
@@ -139,6 +155,7 @@ export interface ScreenScopeSnapshot<
   readonly scope: Required<ScreenScope>;
   readonly digest: string;
   readonly actions: readonly string[];
+  readonly audioCapture: boolean;
   readonly presentationLocale: ScreenLocale;
   readonly route: ScreenRoute<Section, View> | null;
   readonly observations: readonly ScreenReadObservation[];
@@ -186,6 +203,7 @@ export interface ScreenBridgeOptions<
   surfaces?: boolean;
   presentation?: boolean;
   locale?: boolean;
+  audio?: boolean;
   calls?: Record<string, readonly string[]>;
   slots?: Record<string, readonly string[]>;
   argBytes?: number | Record<string, number>;
@@ -214,6 +232,7 @@ export interface ScreenBridge<
   getState(): ScreenBridgeState<Section, View, Err>;
   getSnapshot(): ScreenScopeSnapshot<Section, View> | null;
   can(verb: string, actions?: readonly string[]): boolean;
+  canAudioCapture(snapshot?: ScreenScopeSnapshot<Section, View> | null): boolean;
   assertScope(scope: ScreenScope): void;
   start(runtime?: ScreenBridgeRuntimeOverrides): void;
   call<T = unknown>(
@@ -236,6 +255,10 @@ export interface ScreenBridge<
     requestId?: string,
     generationScope?: GenerationScope,
   ): Promise<T>;
+  audioCapture(
+    scope: ScreenScope,
+    options?: ScreenAudioCaptureOptions,
+  ): Promise<ScreenAudioCapture>;
   asset(scope: ScreenScope, ref: string, options?: { timeoutMs?: number }): Promise<string>;
   assetAdmitted(ref: string): boolean;
   state(data: string): boolean;
@@ -288,6 +311,8 @@ export declare const DEFAULT_TIMEOUT_MS: number;
 export declare const DRAWER_CONTEXT_BYTES: number;
 export declare const MAX_PUSH_BYTES: number;
 export declare const MAX_REPLY_DATA_BYTES: number;
+export declare const MAX_AUDIO_TRANSCRIPT_CHARS: number;
+export declare const SCREEN_AUDIO_V1: "screen-audio.v1";
 export declare const HOST_DRAWER_VERBS: readonly [
   "screen.drawer.open",
   "screen.drawer.close",

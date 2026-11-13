@@ -53,6 +53,7 @@ export type ChildToHost =
   | { v: 1; op: "state"; data: string }
   | { v: 2; op: "leave"; unsaved: boolean }
   | { v: 2; op: "asset"; ref: string }
+  | AudioRequest
   | CallRequest
   | SlotRequest
   | ToolRequest;
@@ -214,6 +215,33 @@ export interface ReadObservation { operation: string; args: ActionArgs; data: un
 export const SCREEN_RECORDS_V1 = "screen-records.v1";
 /** Host-selected presentation locale only (`"en" | "zh-TW"`); never an operation or permission. */
 export const SCREEN_LOCALE_V1 = "screen-locale.v1";
+/** Generic host-mediated microphone recording and audio file upload (`screen-audio.v1`). */
+export const SCREEN_AUDIO_V1 = "screen-audio.v1";
+export type ScreenAudioMode = "record" | "upload";
+export type ScreenAudioSource = "recording" | "upload";
+export interface AudioRequest { v: 2; op: "audio"; id: string; mode: ScreenAudioMode }
+export interface ScreenAudioCapture {
+  transcript: string;
+  duration_seconds: number;
+  held_at: string;
+  source: ScreenAudioSource;
+}
+export const AUDIO_TRANSCRIPT_CHARS_MAX = 200_000;
+export function parseScreenAudioCapture(value: unknown): ScreenAudioCapture | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const r = value as Record<string, unknown>;
+  if (Object.keys(r).sort().join() !== "duration_seconds,held_at,source,transcript") return null;
+  if (typeof r.transcript !== "string" || r.transcript.length > AUDIO_TRANSCRIPT_CHARS_MAX) return null;
+  if (typeof r.duration_seconds !== "number" || !Number.isSafeInteger(r.duration_seconds) || r.duration_seconds < 0 || r.duration_seconds > 86_400) return null;
+  if (typeof r.held_at !== "string" || r.held_at.length === 0 || r.held_at.length > 64) return null;
+  if (r.source !== "recording" && r.source !== "upload") return null;
+  return {
+    transcript: r.transcript,
+    duration_seconds: r.duration_seconds,
+    held_at: r.held_at,
+    source: r.source,
+  };
+}
 /** Larger envelopes are admitted only after verified records negotiation and rights. */
 export function recordArgsLimit(verb: string): number {
   return ["records.csv.preview", "records.csv.import", "records.csv.confirm"].includes(verb) ? 327680
@@ -278,6 +306,8 @@ export type ReplyMessage =
   | { v: 2; op: "reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "tool-reply"; id: string; ok: true; data: unknown }
   | { v: 2; op: "tool-reply"; id: string; ok: false; refusal: ActionRefusal }
+  | { v: 2; op: "audio-reply"; id: string; ok: true; data: ScreenAudioCapture }
+  | { v: 2; op: "audio-reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "slot-state"; id: string; state: "done"; receipt?: RunSlotReceipt; data?: never }
   | { v: 2; op: "slot-state"; id: string; state: "done"; data: unknown; receipt?: never }
   | { v: 2; op: "slot-state"; id: string; state: "pending" | "refused"; refusal?: ActionRefusal };
@@ -306,7 +336,7 @@ export const SCREEN_SURFACES_V1 = "screen-surfaces.v1";
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -627,6 +657,8 @@ export interface ScreenPush {
   media_previews?: 1;
   /** Host marker. 1 only when this mount may media.chat.attach. */
   media_chat_references?: 1;
+  /** Host marker. 1 only when this mount opted into screen-audio.v1 and has a live audio host + action token. */
+  audio_capture?: 1;
   /** Server epoch seconds for day-row alignment. */
   now: number;
   /** The child's own last `state` snapshot, replayed on remount. */
@@ -712,11 +744,21 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   }
   if (
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
-    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 5 &&
+    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 6 &&
     new Set(d.accepts).size === d.accepts.length &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
+  }
+  if (
+    Object.keys(d).sort().join() === "id,mode,op,v" &&
+    d.v === 2 &&
+    d.op === "audio" &&
+    typeof d.id === "string" &&
+    ACTION_ID.test(d.id) &&
+    (d.mode === "record" || d.mode === "upload")
+  ) {
+    return { v: 2, op: "audio", id: d.id, mode: d.mode };
   }
   if (Object.keys(d).sort().join() === "op,unsaved,v" && d.v === 2 && d.op === "leave" &&
       typeof d.unsaved === "boolean") {
@@ -805,7 +847,7 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   return null;
 }
 
-const V2_TOP = ["sources", "defaults", "publish_settings", "readiness", "actions", "run_receipts", "original_downloads", "media_previews", "media_chat_references", "route", "read_observations", "presentation_locale"] as const;
+const V2_TOP = ["sources", "defaults", "publish_settings", "readiness", "actions", "run_receipts", "original_downloads", "media_previews", "media_chat_references", "audio_capture", "route", "read_observations", "presentation_locale"] as const;
 const V2_RUN = ["created", "closed", "phase", "steps", "inputs_used", "caption_excerpt", "artifact_id",
   "review", "approved", "source_post_id", "refusal", "image_ref"] as const;
 /** The publish-intents.v1 shape: every screen.v2 field is removed. */

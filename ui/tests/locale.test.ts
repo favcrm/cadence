@@ -21,3 +21,19 @@ const leavePrompt = "You have unsaved changes. Leave this page and discard your 
 if (translateUiText(leavePrompt, "zh-TW") !== "你有未儲存的變更。要離開此頁面並捨棄本機編輯內容嗎？") {
   throw new Error("Expected generic screen leave confirmation to translate in zh-TW");
 }
+
+const audioTranslations: Record<string, string> = {
+  "Record audio": "即時錄音",
+  "Upload audio file": "上載錄音檔",
+  "Start recording": "開始錄音",
+  "Finish recording": "結束錄音",
+  "Use transcript": "完成並使用逐字稿",
+  "Speech language hint (optional)": "語音語言提示（選填）",
+};
+
+for (const [source, expected] of Object.entries(audioTranslations)) {
+  const translated = translateUiText(source, "zh-TW");
+  if (translated !== expected) {
+    throw new Error(`Expected zh-TW audio string "${source}" to be "${expected}", got "${translated}"`);
+  }
+}

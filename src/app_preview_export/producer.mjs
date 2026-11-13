@@ -278,6 +278,7 @@ var V2_TOP = [
 	"original_downloads",
 	"media_previews",
 	"media_chat_references",
+	"audio_capture",
 	"route",
 	"read_observations",
 	"presentation_locale"

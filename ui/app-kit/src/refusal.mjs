@@ -6,8 +6,10 @@
 export const REFUSAL_STATUS = Object.freeze({
   invalid: 400,
   refused: 400,
+  cancelled: 400,
   unauthorized: 401,
   forbidden: 403,
+  owner_required: 403,
   not_found: 404,
   missing: 404,
   stale_revision: 409,
