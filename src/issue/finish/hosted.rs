@@ -291,14 +291,30 @@ pub(crate) fn gh_merged_prs(slug: &str, branch: &str) -> Option<Value> {
 }
 
 /// Top-level ignored build output a hosted release may delete without asking.
-/// Anything else ignored (`.env`, `docs/*`, `claudedocs/`, `docs/target/`) is
-/// the operator's. `.cadence/` is not listed: nothing the hosted lane writes
-/// there was found, and it could hold operator files. Git reports an ignored
-/// directory collapsed (`!! target/`), so a file an operator keeps inside
-/// `target/` or `node_modules/` is deleted with it; that is accepted.
-const ALLOWED_IGNORED: [&str; 2] = ["target/", "node_modules/"];
+/// `.cadence/` is not listed: nothing the hosted lane writes there was found,
+/// and it could hold operator files. Git reports an ignored directory
+/// collapsed (`!! target/`), so a file an operator keeps inside `target/` or a
+/// cache directory below is deleted with it; that is accepted.
+const ALLOWED_IGNORED: [&str; 1] = ["target/"];
 
-/// A short sample of ignored paths outside [`ALLOWED_IGNORED`], or `None`.
+/// Dependency and bytecode caches a lane regenerates, deletable at any depth
+/// (CAD-2290): an ignored path with one of these as a whole segment.
+const CACHE_DIRS: [&str; 2] = ["node_modules", "__pycache__"];
+
+/// Whether an ignored path a hosted release may delete. Everything else
+/// ignored (`docs/*`, `claudedocs/`, `docs/target/`, an `.env` lane setup did
+/// not write) is the operator's. The lane's `.env` goes only while it is
+/// exactly what setup last recorded for this worktree (CAD-2290).
+fn removable_ignored(lane: &Path, entry: &str) -> bool {
+    ALLOWED_IGNORED.iter().any(|a| entry.starts_with(a))
+        || entry
+            .trim_end_matches('/')
+            .split('/')
+            .any(|segment| CACHE_DIRS.contains(&segment))
+        || (entry == ".env" && crate::worktree::lane_env_is_setups(lane))
+}
+
+/// A short sample of ignored paths a hosted release may not delete, or `None`.
 fn unexpected_ignored(path: &Path) -> Result<Option<String>> {
     let status = git(
         path,
@@ -312,7 +328,7 @@ fn unexpected_ignored(path: &Path) -> Result<Option<String>> {
     let rest: Vec<&str> = status
         .lines()
         .filter_map(|l| l.strip_prefix("!! "))
-        .filter(|p| !ALLOWED_IGNORED.iter().any(|a| p.starts_with(a)))
+        .filter(|p| !removable_ignored(path, p))
         .collect();
     if rest.is_empty() {
         return Ok(None);

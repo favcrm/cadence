@@ -570,7 +570,50 @@ fn install_cargo_shim(wt_dir: &Path) -> Result<PathBuf> {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
     }
     std::fs::rename(&tmp, &file)?;
+    record_lane_env(wt_dir);
     Ok(shim)
+}
+
+/// CAD-2290: the file, in the worktree's own git dir, holding the sha256 of
+/// the `.env` lane setup last wrote. Hosted finish removes a lane's `.env`
+/// only while its content still matches: a line anyone else adds keeps it.
+const LANE_ENV_DIGEST: &str = "cadence-lane-env.sha256";
+
+fn lane_env_digest_path(wt_dir: &Path) -> Result<PathBuf> {
+    let dir = git(wt_dir, &["rev-parse", "--absolute-git-dir"])?;
+    Ok(PathBuf::from(dir.trim()).join(LANE_ENV_DIGEST))
+}
+
+/// Record the digest of the `.env` setup has just written in `wt_dir`.
+/// Best effort: without a record, hosted finish keeps refusing the `.env`
+/// as before, which is the safe side, so a failure never fails setup.
+pub(crate) fn record_lane_env(wt_dir: &Path) {
+    let write = || -> Result<()> {
+        let bytes = std::fs::read(wt_dir.join(".env"))?;
+        let path = lane_env_digest_path(wt_dir)?;
+        let tmp = path.with_extension("sha256.tmp");
+        std::fs::write(&tmp, crate::delegation::sha256_hex(&bytes))?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    };
+    let _ = write();
+}
+
+/// Whether `wt_dir/.env` is a regular file whose content is exactly what lane
+/// setup last recorded. No record (a lane from before CAD-2290), a symlink,
+/// or any changed byte answers false.
+pub(crate) fn lane_env_is_setups(wt_dir: &Path) -> bool {
+    let file = wt_dir.join(".env");
+    if !std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_file()) {
+        return false;
+    }
+    let Ok(path) = lane_env_digest_path(wt_dir) else {
+        return false;
+    };
+    match (std::fs::read_to_string(path), std::fs::read(&file)) {
+        (Ok(recorded), Ok(bytes)) => recorded.trim() == crate::delegation::sha256_hex(&bytes),
+        _ => false,
+    }
 }
 
 /// The `debug/` children cargo fills with *hashed* names —
