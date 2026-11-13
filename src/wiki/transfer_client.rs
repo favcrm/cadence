@@ -421,8 +421,9 @@ fn import_local(
                 deadline,
             ) {
                 // A dropped chunk is ambiguous: do not finish and do not
-                // retry. Only a stop the channel proves left nothing staged
-                // reads as stopped; only the same job can reconcile the rest.
+                // retry. Only an unchanged stop (the board's own refusal, or
+                // the deadline before sending) reads as stopped; a channel
+                // error is reconciled by the same job.
                 return Err(chunk_stopped(job_id, &item.rel, stop));
             }
         }
@@ -577,18 +578,18 @@ enum Stop {
     /// The channel answered with an error it cannot prove changed nothing,
     /// so the step may have landed: `unknown`, reconciled by the same job.
     Unconfirmed(Error),
-    /// This client stopped while preparing or checking a chunk: the local
-    /// source, or a chunk answer it could not read. Hedged, in the shape it
-    /// had before CAD-2271 ([`write_outcome`]): `rejected` (exit 3), or
-    /// `unknown` (exit 1) for a chunk answer it could not read. There is no
-    /// `From` into `Stop`: each site names its class, so a channel error
-    /// cannot become `Local` through `?`.
-    Local(Error),
+    /// This client stopped while preparing or checking a chunk, before the
+    /// file was applied: a local source problem (`rejected`, exit 3), or a
+    /// chunk answer it could not read (`unknown`, exit 1). Not the local
+    /// daemon: its refusals are [`Stop::Unconfirmed`]. There is no `From`
+    /// into `Stop`: each site names its class, so a channel error cannot
+    /// become `Client` through `?`.
+    Client(Error),
 }
 
-/// A [`Stop::Local`] from anything this client raises itself, I/O included.
-fn local(error: impl Into<Error>) -> Stop {
-    Stop::Local(error.into())
+/// A [`Stop::Client`] from anything this client raises itself, I/O included.
+fn client_stop(error: impl Into<Error>) -> Stop {
+    Stop::Client(error.into())
 }
 
 /// Send one chunk, apply or finish. A command deadline that has already
@@ -610,23 +611,27 @@ fn send_step(
     })
 }
 
-/// A chunk that did not complete. Only an unchanged stop gets the plain next
-/// step; otherwise the chunk may have staged, and only the same job can tell.
+/// A chunk that did not complete. An unchanged stop gets the plain next
+/// step. A channel error, or a chunk answer this client could not read, may
+/// have staged the chunk, and only the same job can tell. A local source
+/// problem stopped before the file was applied, so it makes no staging claim.
 fn chunk_stopped(job_id: &str, rel: &str, stop: Stop) -> Error {
     let what = format!("wiki cp job {job_id} stopped on '{rel}'");
     let hedged = |error: &Error| {
-        format!(
+        Error::unknown(format!(
             "{what}: {error} — the chunk may or may not have been staged; reconcile the same job \
              with `--resume {job_id}` before repeating anything; this attempt was not retried"
-        )
+        ))
     };
     match stop {
         Stop::Unchanged(error) => job_refused(job_id, &what, error),
-        Stop::Unconfirmed(error) => Error::unknown(hedged(&error)),
-        Stop::Local(error) => {
-            let message = hedged(&error);
-            write_outcome(error, message)
-        }
+        Stop::Unconfirmed(error) => hedged(&error),
+        Stop::Client(error) if error.kind() == "unknown" => hedged(&error),
+        Stop::Client(error) => Error::rejected(format!(
+            "{what}: {error} — this file was not applied and the job was not finished; resume \
+             with `--resume {job_id}` once the local source matches what was pinned, or copy \
+             again without `--resume`"
+        )),
     }
 }
 
@@ -639,7 +644,7 @@ fn apply_stopped(job_id: &str, rel: &str, stop: Stop) -> Error {
             &format!("wiki cp job {job_id} apply '{rel}' stopped"),
             error,
         ),
-        Stop::Unconfirmed(error) | Stop::Local(error) => Error::unknown(format!(
+        Stop::Unconfirmed(error) | Stop::Client(error) => Error::unknown(format!(
             "wiki cp job {job_id} apply '{rel}' was not confirmed: {error} — this attempt was \
              not retried; reconcile that job with `--resume {job_id}` before repeating anything"
         )),
@@ -654,7 +659,7 @@ fn finish_stopped(job_id: &str, stop: Stop) -> Error {
             &format!("wiki cp job {job_id} finish stopped"),
             error,
         ),
-        Stop::Unconfirmed(error) | Stop::Local(error) => Error::unknown(format!(
+        Stop::Unconfirmed(error) | Stop::Client(error) => Error::unknown(format!(
             "wiki cp job {job_id} finish was not confirmed: {error} — reconcile the same job \
              with `--resume {job_id}` before repeating anything"
         )),
@@ -667,13 +672,25 @@ fn finish_stopped(job_id: &str, stop: Stop) -> Error {
 /// resumed; anything else is resumed with the same job.
 ///
 /// CAD-2271: the stop keeps its kind and code. A board refusal stays
-/// `rejected` with the board's code (exit 3); this client's own stop stays
-/// `busy` with `timeout` or `waking` (exit 75), which `--resume` retries.
+/// `rejected` with the board's code (exit 3). A pre-send stop stays `busy`
+/// (exit 75), which `--resume` retries: `timeout` at the command deadline, or
+/// `waking` when the board's gateway did not forward the request.
+///
+/// CAD-2275: a `waking` stop gets this client's own sentence. The wake
+/// budget's text says "retry", and a plain rerun would start a new job.
 fn job_refused(job_id: &str, what: &str, error: Error) -> Error {
-    let message = if error.code() == Some("not_found") {
-        format!("{what}: {error} — that job is gone, so copy again without `--resume`")
-    } else {
-        format!("{what}: {error} — resume with `--resume {job_id}`; this attempt was not retried")
+    let message = match error.code() {
+        Some("not_found") => {
+            format!("{what}: {error} — that job is gone, so copy again without `--resume`")
+        }
+        Some("waking") => format!(
+            "{what}: the board was still waking, so its gateway did not forward the request — \
+             resume with `--resume {job_id}`, with a larger `--wake-timeout` if the board is \
+             slow to wake; this attempt was not retried"
+        ),
+        _ => format!(
+            "{what}: {error} — resume with `--resume {job_id}`; this attempt was not retried"
+        ),
     };
     match error.code() {
         Some(code) => Error::Structured(crate::error::Structured {
@@ -682,23 +699,9 @@ fn job_refused(job_id: &str, what: &str, error: Error) -> Error {
             message,
             revision: None,
         }),
-        // Every unchanged stop carries a code; keep the old shape otherwise.
-        None => Error::rejected(message),
-    }
-}
-
-/// A [`Stop::Local`] chunk stop with this attempt's context, in the shape it
-/// had before CAD-2271. An `unknown` (a chunk answer this client could not
-/// read) stays unknown, since the chunk may have staged; anything else (the
-/// local source changed or shrank, or could not be read) is `rejected`. An
-/// op-level answer this client cannot trust goes through [`unproved`]
-/// instead.
-fn write_outcome(error: Error, message: impl Into<String>) -> Error {
-    let message = message.into();
-    if error.kind() == "unknown" {
-        Error::unknown(message)
-    } else {
-        Error::rejected(message)
+        // Not reached: every unchanged stop carries a code. Without one,
+        // nothing proves the stop, so it is reconciled.
+        None => Error::unknown(message),
     }
 }
 
@@ -750,7 +753,7 @@ fn optional_job_id(body: &Value, job_id: &str) -> bool {
 
 /// Send one entry's remaining chunks. A chunk request goes through
 /// [`send_step`]; anything this client finds itself (the local source, an
-/// answer it cannot read) is a [`Stop::Local`].
+/// answer it cannot read) is a [`Stop::Client`].
 fn send_entry(
     channel: &mut dyn Channel,
     root: &str,
@@ -783,7 +786,7 @@ fn send_entry(
         {
             // Dispatched: a body that names another job or entry cannot be
             // read as this chunk's acknowledgment.
-            return Err(local(Error::unknown(format!(
+            return Err(client_stop(Error::unknown(format!(
                 "chunk '{}' answered for another job or entry",
                 item.rel
             ))));
@@ -792,7 +795,7 @@ fn send_entry(
             // Dispatched: the stage may hold these bytes even though the
             // answer did not confirm an empty file. The caller adds the
             // same-job reconciliation.
-            return Err(local(Error::unknown(format!(
+            return Err(client_stop(Error::unknown(format!(
                 "chunk '{}' did not confirm an empty file",
                 item.rel
             ))));
@@ -800,7 +803,7 @@ fn send_entry(
         return Ok(());
     }
     if received > item.size {
-        return Err(local(Error::rejected(format!(
+        return Err(client_stop(Error::rejected(format!(
             "staged length {received} exceeds source size {}",
             item.size
         ))));
@@ -811,16 +814,16 @@ fn send_entry(
         local_root.join(&item.rel)
     };
     // Re-check the ancestor chain, then open only through no-follow fds.
-    let mut file = open_contained(&path).map_err(local)?;
+    let mut file = open_contained(&path).map_err(client_stop)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK_BYTES];
     let mut hashed = 0u64;
     while hashed < received {
         let want =
             usize::try_from((received - hashed).min(CHUNK_BYTES as u64)).unwrap_or(CHUNK_BYTES);
-        let n = file.read(&mut buf[..want]).map_err(local)?;
+        let n = file.read(&mut buf[..want]).map_err(client_stop)?;
         if n == 0 {
-            return Err(local(Error::rejected(format!(
+            return Err(client_stop(Error::rejected(format!(
                 "source '{}' shrank during copy",
                 item.rel
             ))));
@@ -832,9 +835,9 @@ fn send_entry(
     while offset < item.size {
         let want =
             usize::try_from((item.size - offset).min(CHUNK_BYTES as u64)).unwrap_or(CHUNK_BYTES);
-        let n = file.read(&mut buf[..want]).map_err(local)?;
+        let n = file.read(&mut buf[..want]).map_err(client_stop)?;
         if n == 0 {
-            return Err(local(Error::rejected(format!(
+            return Err(client_stop(Error::rejected(format!(
                 "source '{}' shrank during copy",
                 item.rel
             ))));
@@ -863,20 +866,20 @@ fn send_entry(
         if identity(&body, "job_id") != Some(job_id)
             || identity(&body, "entry_id") != Some(want_entry.as_str())
         {
-            return Err(local(Error::unknown(format!(
+            return Err(client_stop(Error::unknown(format!(
                 "chunk '{}' answered for another job or entry",
                 item.rel
             ))));
         }
         let want = offset + n as u64;
         let got = body["received"].as_u64().ok_or_else(|| {
-            local(Error::unknown(format!(
+            client_stop(Error::unknown(format!(
                 "chunk '{}' did not confirm its received bytes",
                 item.rel
             )))
         })?;
         if got != want {
-            return Err(local(Error::unknown(format!(
+            return Err(client_stop(Error::unknown(format!(
                 "chunk '{}' confirmed {got} bytes where {want} were sent",
                 item.rel
             ))));
@@ -885,7 +888,7 @@ fn send_entry(
     }
     let digest = hex_encode(hasher.finalize());
     if item.sha256.as_deref() != Some(digest.as_str()) {
-        return Err(local(Error::rejected(format!(
+        return Err(client_stop(Error::rejected(format!(
             "source '{}' changed after the manifest was pinned",
             item.rel
         ))));
@@ -2887,14 +2890,34 @@ mod tests {
         );
         assert_eq!((late.kind(), late.code()), ("busy", Some("timeout")));
         assert_eq!(exit(&late), 75);
-        // A local chunk stop keeps the shape it had before CAD-2271: a source
-        // read failure (`internal`) is reported as a refusal.
-        let plain = write_outcome(Error::rejected("no code"), "wrapped");
-        assert_eq!((plain.kind(), plain.code()), ("rejected", None));
-        let unread = write_outcome(Error::internal("io: read failed"), "wrapped");
-        assert_eq!((unread.kind(), exit(&unread)), ("rejected", 3));
-        let lost = write_outcome(Error::unknown("lost"), "wrapped");
-        assert_eq!(lost.kind(), "unknown");
+    }
+
+    /// CAD-2275: a `waking` stop names one next step. The wake budget's own
+    /// text says "retry", and a plain rerun would start a new job, so this
+    /// client says what happened and to resume the same job.
+    #[test]
+    fn a_waking_stop_names_one_next_step() {
+        let waking = job_refused(
+            "J",
+            "wiki cp job J apply 'a.md' stopped",
+            Error::busy_coded(
+                "waking",
+                "org 'demo' is still waking after 120s — retry, or pass a larger --wake-timeout",
+            ),
+        );
+        let text = waking.to_string();
+        assert_eq!(
+            (waking.kind(), waking.code(), exit(&waking)),
+            ("busy", Some("waking"), 75),
+            "{text}"
+        );
+        assert!(
+            text.contains("did not forward the request — resume with `--resume J`"),
+            "{text}"
+        );
+        assert!(text.contains("a larger `--wake-timeout`"), "{text}");
+        assert!(!text.contains("retry"), "{text}");
+        assert!(!text.contains("still waking after"), "{text}");
     }
 
     /// CAD-2261: a mid-job stop tells the user one next step that works. A
@@ -3020,30 +3043,39 @@ mod tests {
             chunk.to_string().contains("resume with `--resume J`"),
             "{chunk}"
         );
-        // What this client finds itself while sending a chunk keeps the kind
-        // it had before CAD-2271: a changed source is still a refusal.
-        let changed = chunk_stopped(
-            "J",
-            "a.bin",
-            Stop::Local(Error::rejected(
-                "source 'a.bin' changed after the manifest was pinned",
-            )),
-        );
-        assert_eq!((changed.kind(), exit(&changed)), ("rejected", 3));
-        assert!(
-            changed
-                .to_string()
-                .contains("may or may not have been staged"),
-            "{changed}"
-        );
+        // CAD-2275: a local source problem stopped before the file was
+        // applied. It is a refusal (exit 3) with one claim about the board:
+        // nothing of this file was applied. It never also says the chunk may
+        // or may not have been staged, so "nothing was sent" from a refused
+        // path cannot contradict the wrapper.
+        for source in [
+            Error::rejected("source 'a.bin' changed after the manifest was pinned"),
+            Error::rejected("source 'a.bin' shrank during copy"),
+            refused_path(Path::new("notes/a.bin"), "a symlink"),
+            Error::internal("io: read failed"),
+        ] {
+            let error = chunk_stopped("J", "a.bin", Stop::Client(source));
+            let text = error.to_string();
+            assert_eq!((error.kind(), exit(&error)), ("rejected", 3), "{text}");
+            assert!(
+                text.contains("this file was not applied and the job was not finished"),
+                "{text}"
+            );
+            assert!(!text.contains("may or may not have been staged"), "{text}");
+            assert!(text.contains("--resume J"), "{text}");
+        }
+        // A chunk answer this client could not read may have staged it.
         let unread = chunk_stopped(
             "J",
             "a.bin",
-            Stop::Local(Error::unknown(
+            Stop::Client(Error::unknown(
                 "chunk 'a.bin' did not confirm its received bytes",
             )),
         );
+        let text = unread.to_string();
         assert_eq!(exit(&unread), 1);
+        assert!(text.contains("may or may not have been staged"), "{text}");
+        assert!(!text.contains("nothing was sent"), "{text}");
     }
 
     /// CAD-2271: a stop at the command deadline is decided before anything is

@@ -216,7 +216,9 @@ in every case.
   before repeating anything; the job shows what was recorded.
 
 A local source problem found while sending a chunk, such as a file that changed
-or shrank after the manifest was pinned or could not be read, exits 3; a chunk
+or shrank after the manifest was pinned or could not be read, exits 3: that file
+was not applied and the job was not finished. Resume with `--resume <job>` once
+the source matches what was pinned, or copy again without `--resume`. A chunk
 answer the client cannot read exits 1.
 
 `--wait-index` polls that job's own status until the index is covered, the job
