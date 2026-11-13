@@ -835,11 +835,9 @@ fn send_entry(
             usize::try_from((received - hashed).min(CHUNK_BYTES as u64)).unwrap_or(CHUNK_BYTES);
         let n = file.read(&mut buf[..want])?;
         if n == 0 {
-            return Err(Error::rejected(format!(
-                "source '{}' shrank during copy",
-                item.rel
-            ))
-            .into());
+            return Err(
+                Error::rejected(format!("source '{}' shrank during copy", item.rel)).into(),
+            );
         }
         hasher.update(&buf[..n]);
         hashed += n as u64;
@@ -850,11 +848,9 @@ fn send_entry(
             usize::try_from((item.size - offset).min(CHUNK_BYTES as u64)).unwrap_or(CHUNK_BYTES);
         let n = file.read(&mut buf[..want])?;
         if n == 0 {
-            return Err(Error::rejected(format!(
-                "source '{}' shrank during copy",
-                item.rel
-            ))
-            .into());
+            return Err(
+                Error::rejected(format!("source '{}' shrank during copy", item.rel)).into(),
+            );
         }
         hasher.update(&buf[..n]);
         let data_base64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
@@ -2957,13 +2953,24 @@ mod tests {
             late.to_string().contains("resume with `--resume J`"),
             "{late}"
         );
-        assert_eq!((late.kind(), late.code(), exit(&late)), ("busy", Some("timeout"), 75));
+        assert_eq!(
+            (late.kind(), late.code(), exit(&late)),
+            ("busy", Some("timeout"), 75)
+        );
 
         // A lost reply may have committed: never "stopped" or "refused".
         for lost in [
-            apply_stopped("J", "a.bin", Stop::Unconfirmed(Error::internal("io: timed out"))),
+            apply_stopped(
+                "J",
+                "a.bin",
+                Stop::Unconfirmed(Error::internal("io: timed out")),
+            ),
             finish_stopped("J", Stop::Unconfirmed(Error::internal("io: timed out"))),
-            apply_stopped("J", "a.bin", Stop::Unconfirmed(Error::unknown("reply lost"))),
+            apply_stopped(
+                "J",
+                "a.bin",
+                Stop::Unconfirmed(Error::unknown("reply lost")),
+            ),
             finish_stopped("J", Stop::Unconfirmed(Error::unknown("reply lost"))),
         ] {
             let text = lost.to_string();
@@ -3003,7 +3010,11 @@ mod tests {
             assert!(!text.contains("stopped"), "{text}");
             assert_eq!(exit(&after_publish), 1, "{text}");
         }
-        let chunk = chunk_stopped("J", "a.bin", Stop::Unconfirmed(Error::internal("io: reset")));
+        let chunk = chunk_stopped(
+            "J",
+            "a.bin",
+            Stop::Unconfirmed(Error::internal("io: reset")),
+        );
         assert!(
             chunk
                 .to_string()
@@ -3033,13 +3044,17 @@ mod tests {
         );
         assert_eq!((changed.kind(), exit(&changed)), ("rejected", 3));
         assert!(
-            changed.to_string().contains("may or may not have been staged"),
+            changed
+                .to_string()
+                .contains("may or may not have been staged"),
             "{changed}"
         );
         let unread = chunk_stopped(
             "J",
             "a.bin",
-            Stop::Local(Error::unknown("chunk 'a.bin' did not confirm its received bytes")),
+            Stop::Local(Error::unknown(
+                "chunk 'a.bin' did not confirm its received bytes",
+            )),
         );
         assert_eq!(exit(&unread), 1);
     }
@@ -3202,7 +3217,11 @@ mod tests {
         for code in crate::remote_cli::wiki_copy_refusal_codes() {
             let error = run(false, code);
             let text = error.to_string();
-            assert_eq!((error.kind(), exit(&error)), ("unknown", 1), "{code}: {text}");
+            assert_eq!(
+                (error.kind(), exit(&error)),
+                ("unknown", 1),
+                "{code}: {text}"
+            );
             assert!(text.contains("was not confirmed"), "{code}: {text}");
             assert!(!text.contains("stopped"), "{code}: {text}");
         }
