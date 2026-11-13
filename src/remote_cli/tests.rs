@@ -355,7 +355,7 @@ fn wiki_cp_refusals_from_a_board_that_serves_transfers_are_plain() {
     ] {
         let error = wiki_copy_refusal(verb, status, Some(code), &with(op)).unwrap();
         // The copy client trusts exactly these codes as definite refusals.
-        assert!(super::WIKI_COPY_REFUSAL_CODES.contains(&code), "{code}");
+        assert!(super::is_wiki_copy_refusal(code), "{code}");
         let text = error.to_string();
         assert_eq!(error.code(), Some(code), "{text}");
         assert_eq!(error.kind(), "rejected", "{text}");
@@ -484,6 +484,62 @@ fn wiki_cp_refusals_in_the_board_fixture_reach_the_user_plainly() {
         replayed += 1;
     }
     assert!(replayed > 0, "the fixture holds no refusal");
+}
+
+/// CAD-2271: the copy client trusts a hosted mid-job error as "nothing
+/// changed" by its code alone. That holds only if a code from the refusal
+/// table reaches a `chunk`, `apply` or `finish` error through
+/// [`wiki_copy_refusal`] and nothing else. So each table code, answered at a
+/// status that has no row for it, comes back through the real request path
+/// without that code.
+#[test]
+fn a_board_code_off_its_row_is_not_a_trusted_refusal() {
+    let lines: &[(u16, &'static str)] = &[
+        (400, "400 Bad Request"),
+        (404, "404 Not Found"),
+        (409, "409 Conflict"),
+        (413, "413 Payload Too Large"),
+        (422, "422 Unprocessable Entity"),
+    ];
+    let root = "projects/demo/notes";
+    let mut checked = 0;
+    for op in ["chunk", "apply", "finish"] {
+        let mut transfer = json!({"op": op, "job_id": "job-1", "root": root});
+        if op != "finish" {
+            transfer["entry_id"] = json!("entry-1");
+        }
+        if op == "chunk" {
+            transfer["offset"] = json!(0);
+            transfer["data_base64"] = json!("");
+        }
+        let args = json!({"path": root, "transfer": transfer});
+        let mut seen_codes: Vec<&str> = Vec::new();
+        for row in super::WIKI_COPY_REFUSALS {
+            if seen_codes.contains(&row.code) {
+                continue;
+            }
+            seen_codes.push(row.code);
+            let mapped_at = |status: u16| {
+                super::WIKI_COPY_REFUSALS.iter().any(|r| {
+                    r.code == row.code
+                        && r.status == status
+                        && (r.ops.is_empty() || r.ops.contains(&op))
+                })
+            };
+            for &(status, line) in lines.iter().filter(|(status, _)| !mapped_at(*status)) {
+                let (error, seen) = wiki_call_refused(line, row.code, "write", args.clone());
+                let text = error.to_string();
+                assert!(
+                    !error.code().is_some_and(super::is_wiki_copy_refusal),
+                    "{op} {status} {}: {text}",
+                    row.code
+                );
+                assert_eq!(seen.len(), 2, "{op} {status} {}: sent once", row.code);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 0);
 }
 
 #[test]

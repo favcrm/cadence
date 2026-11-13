@@ -646,7 +646,8 @@ An issue `status=doing` update is not a local assignment claim or delivery.
 
 `wiki cp` copies a file or a folder into the hosted wiki and out of it on a
 board released since 2026-11-12 (AOS-566); see "Recursive copy" in
-`docs/guides/wiki-knowledge.md` for the board's limits and the timeout. An older
+`docs/guides/wiki-knowledge.md` for the board's limits, the timeout and what each
+exit code of a stopped job means. An older
 board answers `not_implemented` and copies nothing; there, write pages one at a
 time with `wiki put` (text) or `wiki upload` (binary).
 
