@@ -1104,12 +1104,15 @@ and [remote ticket writes](../REMOTE-AUTH.md#remote-ticket-writes-cad-1179).
   immutable-notice snapshot pages under one captured watermark, then resumes newer
   events. Older generations cannot replace newer local custody. A transient claim
   failure retains its pending invalidation; blocked work needs explicit resumption.
-- A kickoff to a fenced default agent (`attention`, or holding an unknown message)
-  is not queued: the daemon refuses it and reports the assignment `blocked` with
-  that reason, so the board never shows it `running` behind an agent that cannot
-  run (CAD-2259). Resume the agent or connect another default, then run
+- When the daemon's workspace worker picks up a kickoff from the board for a
+  fenced default agent (`attention`, or holding an unknown message), it does not
+  queue it: the assignment is reported `blocked` with that reason instead of
+  `running` (CAD-2259). Resume the agent (reconcile or `agent unfence` first if
+  it holds an unknown message) or connect another default, then run
   `cadence --org acme agent connect --local --alias <alias>` again (the saved
-  checkout is kept) to pick the blocked work up.
+  checkout is kept) to pick the blocked work up. `issue start <id> --repo`
+  without `--profile` sends from the CLI and is not checked this way yet
+  (CAD-2274).
 - Native custody is bounded to 512 entries / 4 MiB. The server limits unacknowledged
   events to 64 with a 30-second progress deadline. Slow consumers are disconnected,
   not treated as successful execution. When the inbox is full, inspect it and use

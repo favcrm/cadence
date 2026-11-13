@@ -109,14 +109,7 @@ impl Shared {
                                     "hosted workspace was disconnected or rebound",
                                 ));
                             }
-                            let alias = params["alias"].as_str().unwrap_or_default();
-                            refuse_fenced_default(
-                                alias,
-                                &shared.store.agent(alias)?.state,
-                                shared.store.has_unknown(alias)?,
-                            )?;
-                            // Existing agent_send semantics, without operator or steering authority.
-                            shared.send_as(&params, &|_| Ok(store::Sender::Unattributed))
+                            shared.send_hosted_kickoff(&params)
                         });
                         let notifier = self.clone();
                         let notify = Arc::new(move || notifier.wake());
@@ -138,16 +131,30 @@ impl Shared {
             stop.store(true, Ordering::SeqCst);
         }
     }
+
+    /// The send a workspace worker makes for a hosted kickoff to the bound
+    /// default agent, after its binding checks. A fenced default is refused
+    /// first (CAD-2259); otherwise this is the existing agent_send, without
+    /// operator or steering authority.
+    pub(super) fn send_hosted_kickoff(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let alias = required_str(params, "alias")?;
+        refuse_fenced_default(
+            alias,
+            &self.store.agent(alias)?.state,
+            self.store.has_unknown(alias)?,
+        )?;
+        self.send_as(params, &|_| Ok(store::Sender::Unattributed))
+    }
 }
 
 /// CAD-2259: a fenced default agent (`attention`, or holding an unknown
-/// message) runs nothing until the operator resumes it, so a kickoff sent to
-/// it would only queue while the board shows the assignment `running`. This
-/// refusal is not `binding_cancelled`, so the coordinator reports the claim
-/// `blocked` with this text instead. Only these persisted states count: right
-/// after a daemon start every managed agent still reads as dead until
-/// relaunch, and an idle-stopped agent is auto-resumed for queued work
-/// (CAD-413), so neither is refused here.
+/// message) runs nothing until the operator resumes or unfences it, so a
+/// kickoff sent to it would only queue while the board shows the assignment
+/// `running`. This refusal is not `binding_cancelled`, so the coordinator
+/// reports the claim `blocked` with this text instead. Only these persisted
+/// states count: right after a daemon start every enabled managed agent
+/// still reads as dead until relaunch, and an idle-stopped agent is
+/// auto-resumed for queued work (CAD-413), so neither is refused here.
 fn refuse_fenced_default(alias: &str, state: &str, has_unknown: bool) -> Result<()> {
     if state != "attention" && !has_unknown {
         return Ok(());
@@ -156,8 +163,8 @@ fn refuse_fenced_default(alias: &str, state: &str, has_unknown: bool) -> Result<
         "default_agent_unavailable",
         format!(
             "The local agent {alias} is fenced and needs the operator, so this kickoff was \
-             not queued. Resume it or connect another default agent, then connect again \
-             to pick this assignment up."
+             not queued. Resume or unfence it, or connect another default agent, then \
+             connect again to pick this assignment up."
         ),
     ))
 }
