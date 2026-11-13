@@ -58,7 +58,7 @@ fn only_the_masters_live_home_turn_asks_a_form_once() {
         .set("CADENCE_PM_DIR", pm.to_str().unwrap());
     let shared = Shared::new(dir.path(), &opts).unwrap();
     let cwd = dir.path().to_str().unwrap().to_string();
-    for (alias, role) in [(crate::master::ALIAS, "master"), ("worker", "worker")] {
+    for (alias, role) in [(crate::master::ALIAS, "pm"), ("worker", "worker")] {
         shared
             .store
             .register_agent(&NewAgent {
