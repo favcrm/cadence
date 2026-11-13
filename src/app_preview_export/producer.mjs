@@ -175,6 +175,8 @@ var RECORD_CALL_VERBS = [
 	"records.create",
 	"records.update",
 	"records.csv.preview",
+	"records.batch",
+	"records.aggregate",
 	"segments.list",
 	"segments.show",
 	"segments.save",
