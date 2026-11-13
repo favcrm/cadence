@@ -2964,4 +2964,98 @@ mod tests {
         assert_eq!(fs::read(&ledger_path).unwrap(), before);
         fx.assert_intact(&tip);
     }
+
+    /// CAD-2259: the daemon refuses a kickoff to a fenced default agent. That
+    /// refusal must leave the claim `blocked` with its reason on the board, and
+    /// answer `assignment_blocked` so the event worker settles instead of
+    /// retrying; a `running` row with no live actor is the defect.
+    #[test]
+    fn cad2259_refused_kickoff_reports_the_claim_blocked_with_its_reason() {
+        use std::cell::RefCell;
+
+        struct ClaimThenReport {
+            claim: Value,
+            reports: Rc<RefCell<Vec<Value>>>,
+        }
+
+        impl CoordHttp for ClaimThenReport {
+            fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
+                assert_eq!(method, "POST");
+                if path.ends_with("/hla_test/claim") {
+                    return Ok(Reply {
+                        status: 200,
+                        body: self.claim.clone(),
+                    });
+                }
+                assert!(path.ends_with("/hla_test/report"), "{path}");
+                let body = body.expect("report body").clone();
+                self.reports.borrow_mut().push(body.clone());
+                let mut row = self.claim.clone();
+                row["state"] = body["state"].clone();
+                row["text"] = body["text"].clone();
+                Ok(Reply {
+                    status: 200,
+                    body: row,
+                })
+            }
+        }
+
+        let fx = CancelReleaseFixture::new(true);
+        git(
+            &fx.repo,
+            &["remote", "add", "origin", fx.repo.to_str().unwrap()],
+        );
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let client = ledger.client_agent_id.clone();
+        let attempt = ledger
+            .attempts
+            .get_mut(&attempt_key("CAD-1", "start", None))
+            .unwrap();
+        attempt.worktree = None;
+        attempt.lane = None;
+        attempt.lane_claim = None;
+        attempt.lane_generation = None;
+        ledger.save(&fx.auth, "ws_test").unwrap();
+        let claim = json!({
+            "version": VERSION,
+            "assignment_id": "hla_test",
+            "organization_id": "ws_test",
+            "issue_id": "CAD-1",
+            "action": "start",
+            "execution": "local",
+            "state": "running",
+            "generation": 1,
+            "claim_id": "hlc_test",
+            "target": "usr_test",
+            "created_by_subject_id": "usr_test",
+            "client_agent_id": client,
+            "guidance": null,
+            "reported_head_sha": null,
+            "text": null
+        });
+        let reports = Rc::new(RefCell::new(Vec::new()));
+        let claimed = parse_assignment(&claim).unwrap();
+        let mut coord = Coordinator::new(
+            ClaimThenReport {
+                claim,
+                reports: reports.clone(),
+            },
+            "ws_test".into(),
+            fx.auth.clone(),
+        )
+        .unwrap();
+        let reason = "The local agent roster-a is fenced and needs the operator, so this kickoff was not queued.";
+        let error = coord
+            .activate(&claimed, &fx.repo, None, "roster-a", &mut |_| {
+                Err(Error::invalid("default_agent_unavailable", reason))
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), Some("assignment_blocked"), "{error}");
+        assert_eq!(error.to_string(), reason);
+        let reports = reports.borrow();
+        assert_eq!(reports.len(), 1, "exactly one report reaches the board");
+        assert_eq!(reports[0]["state"], "blocked");
+        assert_eq!(reports[0]["claim_id"], "hlc_test");
+        assert_eq!(reports[0]["text"], reason);
+    }
 }
