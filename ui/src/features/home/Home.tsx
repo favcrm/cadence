@@ -751,9 +751,11 @@ export default function Home({
   resolveAppPath,
   setupNotice = null,
   operator = null,
+  credentialRequestsEnabled = true,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  credentialRequestsEnabled?: boolean;
   /** CAD-1817: the verified session proves operator authority, the only
    *  viewer that may edit the workspace coordinator's identity. `null`
    *  is unproven, never an operator. */
@@ -820,6 +822,7 @@ export default function Home({
       resolveAppPath={resolveAppPath}
       setupNotice={setupNotice}
       operator={operator}
+      credentialRequestsEnabled={credentialRequestsEnabled}
     />
   );
 }
@@ -838,9 +841,11 @@ function MasterHome({
   resolveAppPath,
   setupNotice = null,
   operator = null,
+  credentialRequestsEnabled = true,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  credentialRequestsEnabled?: boolean;
   operator?: boolean | null;
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
@@ -1591,7 +1596,7 @@ function MasterHome({
               </div>
             )}
 
-            <CredentialRequestList conversationId={homeConversation} enabled={hosted === false} className="mx-1" />
+            <CredentialRequestList conversationId={homeConversation} enabled={credentialRequestsEnabled} className="mx-1" />
             <ImageConversation.Provider value={homeConversation ?? null}>
             <ThreadList
               items={items}

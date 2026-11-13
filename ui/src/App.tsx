@@ -286,6 +286,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const workflowsOn = boardSupports(meta, "workflows");
   const workConversationsOn = boardSupports(meta, "work_conversations");
   const humanThreadsOn = boardSupports(meta, "human_threads");
+  const credentialRequestsOn = boardSupports(meta, "credential_requests");
   const automaticUpdatesOn = boardSupports(meta, "app_automatic_updates");
   const hiddenScreens: Screen[] = [
     ...(!myWorkOn ? ["myWork" as const] : []),
@@ -1222,6 +1223,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <Home
             readOnly={readOnly}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
+            credentialRequestsEnabled={credentialRequestsOn}
             viewerSub={meta?.session?.user?.sub ?? null}
             viewerIsMember={meta?.session?.user?.role === "member"}
             sessionId={meta?.session?.id ?? null}
