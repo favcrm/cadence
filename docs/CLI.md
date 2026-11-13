@@ -35,6 +35,26 @@ local-only before any transport, credential read or container wake, and
 `--org local`/`CADENCE_ORG=local` selects the registered local
 connection. A `--state-dir` pin stays a plain local binding.
 
+The `cadence org=local ...` receipt identifies the installation being
+maintained, not the saved default for ordinary commands. Native update and
+`--check` also print their local-only scope on stderr. When resolving the
+command already read the local registry, the receipt may name the saved
+default separately; it is not used or changed by the update.
+
+The change summary is a list of merged pull-request titles, not a complete
+changelog. An owned release snapshot does not carry those titles, and an
+unavailable or incomplete comparison cannot prove an empty summary. In
+`--check --json`, `changes_available: false` with `changes: null` and
+`change_count: null` means unavailable; an available empty summary uses
+`true`, `[]` and `0`. The board treats older cached reports without the
+availability field as unknown rather than as zero changes.
+
+On the board's `GET /api/update`, an unavailable-summary check is carried in
+`check_with_unavailable_summary` while the legacy `check` field is null.
+Updated clients use that field; a tab loaded before the update sees its
+check as unavailable rather than crashing or receiving a fabricated empty
+summary.
+
 `cadence update` is operator-only and proves it the same way
 `rollout claim --as` does: the process must run outside every pane and
 managed endpoint, which a process in a registered agent's pane or a pane
@@ -73,6 +93,13 @@ update's exit status. File match and provider links do not mean an agent
 session has reloaded the guidance — start a fresh session or reread it at
 a task boundary. Client-only update does not install guidance or start a
 daemon. A sandbox profile still does not write the shared home.
+
+After a successful switch, the updater process can still be the previous
+binary while the local daemon answers on the new build. Guidance calls this
+expected only when the switch and health receipt, the old updater build and
+the observed daemon build agree. A mismatch during a rollback or an
+unconfirmed switch remains a warning. If either build is unknown, guidance
+says that it cannot make the comparison.
 
 In an unmanaged native session, `cadence skill status` and `cadence skill show`
 inspect this machine even when a hosted org is the saved default. An explicit

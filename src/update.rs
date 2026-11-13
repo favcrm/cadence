@@ -496,8 +496,8 @@ pub struct CheckReport {
     pub target: String,
     pub target_version: Option<String>,
     pub up_to_date: bool,
-    /// Merged PR titles between the linked release and the target.
-    pub changes: Vec<String>,
+    /// Merged PR titles, or `None` when the source cannot provide them.
+    pub changes: Option<Vec<String>>,
     /// The store's schema, when a database exists.
     pub schema_current: Option<i64>,
     /// The target build's `SCHEMA_VERSION`, read from the repository at
@@ -539,13 +539,19 @@ impl CheckReport {
         }
         if self.older {
             out.push("changes: the target is older than current — no changes list".to_string());
-        } else if !self.changes.is_empty() {
-            out.push(format!("changes: {} merged PR(s)", self.changes.len()));
-            for change in &self.changes {
-                out.push(format!("  - {change}"));
+        } else if let Some(changes) = &self.changes {
+            if !changes.is_empty() {
+                out.push(format!("changes: {} merged PR(s)", changes.len()));
+                for change in changes {
+                    out.push(format!("  - {change}"));
+                }
+            } else if !self.up_to_date {
+                out.push(
+                    "changes: no merged PR titles recorded between the two builds".to_string(),
+                );
             }
         } else if !self.up_to_date {
-            out.push("changes: none recorded between the two builds".to_string());
+            out.push("changes: unavailable from this release source".to_string());
         }
         out.push(match (self.schema_current, self.schema_target) {
             (Some(from), Some(to)) if to > from => format!(
@@ -586,8 +592,9 @@ impl CheckReport {
             "target": self.target,
             "target_version": self.target_version,
             "up_to_date": self.up_to_date,
+            "changes_available": self.changes.is_some(),
             "changes": self.changes,
-            "change_count": self.changes.len(),
+            "change_count": self.changes.as_ref().map(Vec::len),
             "schema": {"current": self.schema_current, "target": self.schema_target,
                        "migration": self.migration},
             "lease": self.lease,
@@ -891,8 +898,9 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
         }
     }
     let changes = match (&current_sha, up_to_date, older) {
-        (Some(from), false, false) => src.merged_titles(from, &target).unwrap_or_default(),
-        _ => Vec::new(),
+        (Some(_), true, _) => Some(Vec::new()),
+        (Some(from), false, false) => src.merged_titles(from, &target).unwrap_or(None),
+        _ => None,
     };
     let migration = matches!((schema_current, schema_target), (Some(from), Some(to)) if to > from);
     let lease = rollout::status(state_dir)?;
@@ -1527,7 +1535,12 @@ fn run_inner(
             });
         }
     };
-    progress(host, format!("health: daemon and board answer on {target}"));
+    let healthy = if board_before {
+        "local daemon and board answer"
+    } else {
+        "local daemon answers"
+    };
+    progress(host, format!("health: {healthy} on {target}"));
     host.set_pending(Some(&pending("verifying")))?;
     let pruned = prune_releases(host, opts.keep)?;
     if !pruned.is_empty() {
@@ -1747,7 +1760,7 @@ fn check_after_rollback(host: &dyn UpdateHost, sha: &str) -> CheckReport {
         target: sha.to_string(),
         target_version: None,
         up_to_date: true,
-        changes: Vec::new(),
+        changes: Some(Vec::new()),
         schema_current: None,
         schema_target: None,
         migration: false,
@@ -1825,8 +1838,8 @@ mod tests {
         fn verify_attestation(&self, _: &Path, _: &str) -> Result<String> {
             Err(Error::internal("no network in tests"))
         }
-        fn merged_titles(&self, _: &str, _: &str) -> Result<Vec<String>> {
-            Ok(Vec::new())
+        fn merged_titles(&self, _: &str, _: &str) -> Result<Option<Vec<String>>> {
+            Ok(Some(Vec::new()))
         }
         fn schema_version(&self, _: &str) -> Result<Option<i64>> {
             Ok(self.schema)
