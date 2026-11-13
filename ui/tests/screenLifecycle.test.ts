@@ -1,4 +1,4 @@
-import { parseChild, parseDraftImageRef, parseInit, SCREEN_LOCALE_V1, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
+import { parseChild, parseDraftImageRef, parseInit, parseScreenAudioCapture, SCREEN_AUDIO_V1, SCREEN_LOCALE_V1, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
 import { parseMount, ScreenChannel } from "../src/features/workspace-apps/screen/screenLifecycle";
 
 function check(value: unknown, label: string): void { if (!value) throw new Error(label); }
@@ -203,8 +203,10 @@ check(SCREEN_LOCALE_V1 === "screen-locale.v1", "generic locale token exported");
 check(!parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "crm-locale.v1"] }), "legacy crm-locale.v1 token is refused");
 check(parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1"] }),
   "up to five ready capabilities parse");
-check(!parseChild({ v: 1, op: "ready", accepts: ["publish-intents.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1"] }),
-  "more than five ready capabilities refused");
+check(parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "screen-actions.v1", "screen-records.v1", "screen-surfaces.v1", "screen-locale.v1", "screen-audio.v1"] }),
+  "up to six ready capabilities parse");
+check(!parseChild({ v: 1, op: "ready", accepts: ["publish-intents.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1", "screen-audio.v1"] }),
+  "more than six ready capabilities refused");
 check(parseChild({ v: 2, op: "leave", unsaved: true })?.op === "leave", "v2 leave boolean parses");
 check(!parseChild({ v: 1, op: "leave", unsaved: true }), "v1 leave refused");
 check(!parseChild({ v: 2, op: "leave", unsaved: "yes" }), "non-boolean leave refused");
@@ -252,4 +254,117 @@ v1Leave.channel.receive(v1Leave.event);
 v1Leave.port.receive({ v: 1, op: "ready" });
 v1Leave.port.receive({ v: 2, op: "leave", unsaved: true });
 check(v1Leave.port.closed, "v1 mount closes on v2 leave op");
-console.log("screen lifecycle adversarial checks pass");
+
+// CAD-2272: generic screen-audio.v1 capability and {v:2, op:"audio", id, mode}.
+check(SCREEN_AUDIO_V1 === "screen-audio.v1", "generic audio token exported");
+check(parseChild({ v: 2, op: "audio", id: "aud-1", mode: "record" })?.op === "audio", "audio record request parses");
+check(parseChild({ v: 2, op: "audio", id: "aud-2", mode: "upload" })?.op === "audio", "audio upload request parses");
+check(!parseChild({ v: 1, op: "audio", id: "aud-1", mode: "record" }), "v1 audio request refused");
+check(!parseChild({ v: 2, op: "audio", id: "aud-1", mode: "stream" }), "unknown audio mode refused");
+check(!parseChild({ v: 2, op: "audio", id: "aud-1", mode: "record", audio_base64: "AAAA" }), "forged audio payload field refused");
+check(!parseChild({ v: 2, op: "audio", id: "bad id", mode: "record" }), "malformed audio id refused");
+check(
+  parseScreenAudioCapture({
+    transcript: "Action items agreed.",
+    duration_seconds: 95,
+    held_at: "2026-11-13T03:00:00.000Z",
+    source: "recording",
+  })?.duration_seconds === 95,
+  "valid ScreenAudioCapture parses",
+);
+check(
+  !parseScreenAudioCapture({
+    transcript: "Action items agreed.",
+    duration_seconds: 95,
+    held_at: "2026-11-13T03:00:00.000Z",
+    source: "recording",
+    action_token: "leaked",
+  }),
+  "extra ScreenAudioCapture field refused",
+);
+
+// Forged incoming audio_capture is stripped unless all gates hold.
+const noAudioOptIn = actingMountWith(toolReceipt, { ...actingPush, audio_capture: 1 }, ["screen.v2", "screen-actions.v1"]);
+check(!("audio_capture" in (noAudioOptIn.sent[0] as ScreenPush)), "audio_capture stripped without screen-audio.v1 opt-in");
+const noAudioHost = actingMountWith(toolReceipt, { ...actingPush, audio_capture: 1 }, ["screen.v2", "screen-actions.v1", "screen-audio.v1"]);
+check(!("audio_capture" in (noAudioHost.sent[0] as ScreenPush)), "audio_capture stripped without host captureAudio handler");
+
+// Sending op:"audio" without screen-audio.v1 opt-in closes the mount.
+noAudioOptIn.receive({ v: 2, op: "audio", id: "forged-aud", mode: "record" });
+check(noAudioOptIn.closed, "audio op without screen-audio.v1 opt-in closes mount");
+
+void (async () => {
+  let activeSignals: AbortSignal[] = [];
+  let releaseFirst: ((res: { ok: true; data: unknown }) => void) | null = null;
+  const audioHost = {
+    ...toolHost,
+    captureAudio: (_mode: "record" | "upload", opts: { actionToken: string; signal: AbortSignal }) => {
+      check(opts.actionToken === tokenA, "captureAudio receives host-held actionToken");
+      activeSignals.push(opts.signal);
+      return new Promise<{ ok: true; data: unknown }>(resolve => {
+        releaseFirst = resolve;
+      });
+    },
+  } as unknown as ConstructorParameters<typeof ScreenChannel>[7];
+
+  const noTokenAudioSource = {} as Window;
+  const noTokenAudioPort = new Port();
+  const noTokenAudioChannel = new ScreenChannel(
+    noTokenAudioSource,
+    receipt,
+    actingPush,
+    () => {},
+    () => {},
+    () => {},
+    undefined,
+    audioHost,
+  );
+  noTokenAudioChannel.receive({ source: noTokenAudioSource, origin: "null", data: init, ports: [noTokenAudioPort as unknown as MessagePort] });
+  noTokenAudioPort.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-audio.v1"] });
+  check(!("audio_capture" in (noTokenAudioPort.sent[0] as ScreenPush)), "audio_capture omitted without receipt action_token");
+
+  const audioSource = {} as Window;
+  const audioPort = new Port();
+  const audioChannel = new ScreenChannel(
+    audioSource,
+    toolReceipt,
+    actingPush,
+    () => {},
+    () => {},
+    () => {},
+    undefined,
+    audioHost,
+  );
+  audioChannel.receive({ source: audioSource, origin: "null", data: init, ports: [audioPort as unknown as MessagePort] });
+  audioPort.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-audio.v1"] });
+  check((audioPort.sent[0] as ScreenPush).audio_capture === 1, "audio_capture projected when opted in with action_token and host");
+
+  audioPort.receive({ v: 2, op: "audio", id: "aud-1", mode: "record" });
+  audioPort.receive({ v: 2, op: "audio", id: "aud-2", mode: "upload" });
+  const conflictReply = audioPort.sent.find(m => (m as { id?: string }).id === "aud-2") as { ok?: boolean; refusal?: { code?: string } } | undefined;
+  check(conflictReply?.ok === false && conflictReply.refusal?.code === "conflict" && !audioPort.closed,
+    "concurrent audio capture refuses in-place with conflict");
+
+  releaseFirst!({
+    ok: true,
+    data: {
+      transcript: "Captured transcript",
+      duration_seconds: 12,
+      held_at: "2026-11-13T03:00:00.000Z",
+      source: "recording",
+    },
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  const okReply = audioPort.sent.find(m => (m as { id?: string }).id === "aud-1") as { ok?: boolean; data?: { transcript?: string } } | undefined;
+  check(okReply?.ok === true && okReply.data?.transcript === "Captured transcript", "audio-reply delivers validated transcript");
+
+  // Channel close aborts an in-flight captureAudio signal.
+  activeSignals = [];
+  audioPort.receive({ v: 2, op: "audio", id: "aud-3", mode: "upload" });
+  check(activeSignals.length === 1 && !activeSignals[0]!.aborted, "in-flight signal starts active");
+  audioChannel.close();
+  check(activeSignals[0]!.aborted, "closing channel aborts in-flight captureAudio signal");
+
+  console.log("screen lifecycle adversarial checks pass");
+})();

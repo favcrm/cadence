@@ -4,8 +4,10 @@ import {
   DRAWER_CONTEXT_BYTES,
   HOST_DRAWER_VERBS,
   MAX_ASSET_BYTES,
+  MAX_AUDIO_TRANSCRIPT_CHARS,
   MAX_REPLY_DATA_BYTES,
   MAX_STATE_BYTES,
+  SCREEN_AUDIO_V1,
   ScreenBridgeError,
   ScreenClosedError,
   ScreenRefusalError,
@@ -427,7 +429,7 @@ test("screen-locale.v1 is advertised on any screen.v2 mount without requiring re
   });
 });
 
-test("capabilities require screen.v2, reject legacy crm tokens, and fit the five-capability bound", () => {
+test("capabilities require screen.v2, reject legacy crm tokens, and fit the six-capability bound", async () => {
   const base = { boot, parent: { postMessage() {} }, onPush() {}, timeoutMs: 100 };
   assert.throws(
     () => createScreenReceiver({ ...base, accepts: ["screen.v1", "screen-records.v1"] }),
@@ -438,6 +440,10 @@ test("capabilities require screen.v2, reject legacy crm tokens, and fit the five
     /screen-locale\.v1 needs screen\.v2/,
   );
   assert.throws(
+    () => createScreenReceiver({ ...base, accepts: ["screen.v1", "screen-audio.v1"] }),
+    /screen-audio\.v1 needs screen\.v2/,
+  );
+  assert.throws(
     () => createScreenReceiver({ ...base, accepts: ["screen.v1", "screen-media.v1"] }),
     /screen-media\.v1 needs screen\.v2/,
   );
@@ -445,6 +451,18 @@ test("capabilities require screen.v2, reject legacy crm tokens, and fit the five
     () => createScreenReceiver({ ...base, accepts: ["screen.v2", "crm-locale.v1"] }),
     /accepts must name/,
   );
+  const { inbox: sixCap } = connect({
+    accepts: [
+      "screen.v2",
+      "screen-actions.v1",
+      "screen-records.v1",
+      "screen-surfaces.v1",
+      "screen-locale.v1",
+      "screen-audio.v1",
+    ],
+  });
+  await tick();
+  assert.equal(sixCap[0].accepts.length, 6);
   assert.throws(
     () =>
       createScreenReceiver({
@@ -456,9 +474,10 @@ test("capabilities require screen.v2, reject legacy crm tokens, and fit the five
           "screen-presentation.v1",
           "screen-surfaces.v1",
           "screen-locale.v1",
+          "screen-audio.v1",
         ],
       }),
-    /at most five ready capabilities/,
+    /at most six ready capabilities/,
   );
 });
 
@@ -578,6 +597,7 @@ test("a refused boot returns an inert receiver whose calls also report closed", 
   await assert.rejects(receiver.closeDrawer(), ScreenClosedError);
   await assert.rejects(receiver.drawerContext(), ScreenClosedError);
   await assert.rejects(receiver.call("read.run", {}), ScreenClosedError);
+  await assert.rejects(receiver.audioCapture(), ScreenClosedError);
   await assert.rejects(receiver.asset("media:1"), ScreenClosedError);
   assert.equal(receiver.state("x"), false);
 
@@ -1112,4 +1132,136 @@ test("createScreenBridge supports actions/media tool, asset, and state channels"
 
   assert.equal(bridge.state("resume-snapshot"), true);
   await waitFor(() => inbox.some((m) => m.op === "state" && m.data === "resume-snapshot"), "bridge state");
+});
+
+test("receiver.audioCapture negotiates screen-audio.v1, waits without default timeout, enforces single-flight, and validates replies", async () => {
+  const unopted = connect();
+  unopted.host.postMessage(push());
+  await waitFor(() => unopted.pushes.length === 1, "unopted push");
+  await assert.rejects(unopted.receiver.audioCapture(), (err) => err instanceof ScreenClosedError && /screen-audio\.v1/.test(err.message));
+
+  const { host, inbox, pushes, errors, receiver } = connect({
+    accepts: ["screen.v2", SCREEN_AUDIO_V1],
+    timeoutMs: 20,
+  });
+  await tick();
+  assert.deepEqual(inbox[0], { v: 1, op: "ready", accepts: ["screen.v2", "screen-audio.v1"] });
+  await assert.rejects(receiver.audioCapture(), ScreenClosedError);
+
+  host.postMessage(push({ audio_capture: 1 }));
+  await waitFor(() => pushes.length === 1, "audio push");
+  await assert.rejects(receiver.audioCapture({ mode: "stream" }), TypeError);
+  await assert.rejects(receiver.audioCapture({ extra: true }), TypeError);
+  await assert.rejects(receiver.audioCapture({ timeoutMs: 0 }), TypeError);
+
+  // Interactive audio modal stays open past receiver timeoutMs (20ms) when timeoutMs is omitted.
+  const recording = receiver.audioCapture();
+  const req1 = await waitFor(() => inbox.find((m) => m.op === "audio"), "record request");
+  assert.deepEqual(req1, { v: 2, op: "audio", id: req1.id, mode: "record" });
+  await new Promise((resolve) => setTimeout(resolve, 55));
+  assert.equal(await Promise.race([recording.then(() => "settled", () => "settled"), tick().then(() => "open")]), "open");
+
+  // Single-flight refuses a concurrent capture without tearing down the port.
+  await assert.rejects(receiver.audioCapture({ mode: "upload" }), (err) => err instanceof ScreenRefusalError && err.code === "conflict");
+  assert.equal(inbox.filter((m) => m.op === "audio").length, 1);
+
+  const capturePayload = {
+    transcript: "Reviewed Q4 launch checklist.",
+    duration_seconds: 185,
+    held_at: "2026-11-13T03:00:00.000Z",
+    source: "recording",
+  };
+  host.postMessage({ v: 2, op: "audio-reply", id: req1.id, ok: true, data: capturePayload });
+  const result = await recording;
+  assert.deepEqual(result, capturePayload);
+  assert.equal(Object.isFrozen(result), true);
+  assert.deepEqual(errors, []);
+
+  // Malformed audio-reply data tears down the port.
+  const broken = receiver.audioCapture({ mode: "upload" });
+  const brokenRejected = assert.rejects(broken, ScreenClosedError);
+  const req2 = await waitFor(() => inbox.filter((m) => m.op === "audio")[1], "upload request");
+  assert.equal(req2.mode, "upload");
+  host.postMessage({
+    v: 2,
+    op: "audio-reply",
+    id: req2.id,
+    ok: true,
+    data: { transcript: "x".repeat(MAX_AUDIO_TRANSCRIPT_CHARS + 1), duration_seconds: 10, held_at: "2026-11-13T03:00:00Z", source: "upload" },
+  });
+  await waitFor(() => errors.length === 1, "malformed audio-reply teardown");
+  await brokenRejected;
+});
+
+test("createScreenBridge projects audioCapture, preserves state on cancel/refusal, and retires on unauthorized or malformed replies", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes",
+    appName: "notes",
+    records: true,
+    surfaces: true,
+    locale: true,
+    audio: true,
+    calls: { "records.list": ["query"] },
+  });
+  const { host, inbox } = startBridge(bridge);
+  await tick();
+  assert.deepEqual(inbox[0], {
+    v: 1,
+    op: "ready",
+    accepts: ["screen.v2", "screen-surfaces.v1", "screen-records.v1", "screen-locale.v1", "screen-audio.v1"],
+  });
+
+  // Without audio_capture: 1, canAudioCapture() is false and audioCapture refuses locally with 403.
+  host.postMessage(fullPush({ actions: ["records.list"] }));
+  await waitFor(() => bridge.getState().status === "ready", "ready without audio_capture");
+  assert.equal(bridge.canAudioCapture(), false);
+  await assert.rejects(
+    bridge.audioCapture(bridge.getSnapshot().scope, { mode: "record" }),
+    (err) => err.status === 403 && err.code === "forbidden",
+  );
+  assert.equal(bridge.getState().status, "ready");
+
+  // With audio_capture: 1, record and upload resolve and cancelled/owner_required keep the bridge ready.
+  host.postMessage(fullPush({ actions: ["records.list"], audio_capture: 1 }));
+  await waitFor(() => bridge.getState().pushes === 2, "push with audio_capture");
+  assert.equal(bridge.canAudioCapture(), true);
+  const { scope } = bridge.getSnapshot();
+
+  const cancelled = bridge.audioCapture(scope, { mode: "record" });
+  const cancelMsg = await waitFor(() => inbox.find((m) => m.op === "audio"), "cancel audio op");
+  host.postMessage({ v: 2, op: "audio-reply", id: cancelMsg.id, ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } });
+  await assert.rejects(cancelled, (err) => err.status === 400 && err.code === "cancelled");
+  assert.equal(bridge.getState().status, "ready", "cancelling the audio modal leaves the screen bridge ready");
+
+  const ownerRefused = bridge.audioCapture(scope, { mode: "upload" });
+  const ownerMsg = await waitFor(() => inbox.filter((m) => m.op === "audio")[1], "owner_required audio op");
+  host.postMessage({ v: 2, op: "audio-reply", id: ownerMsg.id, ok: false, refusal: { code: "owner_required", text: "Workspace owner required." } });
+  await assert.rejects(ownerRefused, (err) => err.status === 403 && err.code === "owner_required");
+  assert.equal(bridge.getState().status, "ready");
+
+  const uploaded = bridge.audioCapture(scope, { mode: "upload" });
+  const uploadMsg = await waitFor(() => inbox.filter((m) => m.op === "audio")[2], "upload audio op");
+  const uploadData = {
+    transcript: "Uploaded voice memo transcript.",
+    duration_seconds: 42,
+    held_at: "2026-11-13T02:30:00.000Z",
+    source: "upload",
+  };
+  host.postMessage({ v: 2, op: "audio-reply", id: uploadMsg.id, ok: true, data: uploadData });
+  assert.deepEqual(await uploaded, uploadData);
+  assert.equal(bridge.getState().status, "ready");
+
+  // Unauthorized retires the bridge.
+  const unauth = bridge.audioCapture(scope, { mode: "record" });
+  const unauthMsg = await waitFor(() => inbox.filter((m) => m.op === "audio")[3], "unauthorized audio op");
+  host.postMessage({ v: 2, op: "audio-reply", id: unauthMsg.id, ok: false, refusal: { code: "unauthorized", text: "Session expired." } });
+  await assert.rejects(unauth, (err) => err.status === 401);
+  assert.equal(bridge.getState().status, "error");
+
+  // Forged audio_capture marker (not 1) is rejected on push.
+  bridge.reset();
+  const second = startBridge(bridge);
+  second.host.postMessage(fullPush({ actions: ["records.list"], audio_capture: 2 }));
+  await waitFor(() => bridge.getState().status === "error", "forged audio_capture error");
+  assert.equal(bridge.getState().error.status, 502);
 });

@@ -118,12 +118,24 @@ const asset = await receiver.asset("draft-image:d1:0");
 receiver.state(JSON.stringify(localDraft)); // ≤ 32 KiB
 ```
 
-### Generic locale, leave guard, and records screens
+### Generic locale, audio capture, leave guard, and records screens
 
 Any `screen.v2` screen may opt into `screen-locale.v1` to receive the
 host-selected UI locale (`push.presentation_locale`: `"en" | "zh-TW"`), and may
 call `ownLeaveState()` after an accepted `screen.v2` PUSH to publish
 `{ v: 2, op: "leave", unsaved }` with symbol-fenced handle ownership.
+
+Any `screen.v2` screen may opt into `screen-audio.v1` (`audio: true` on
+`createScreenBridge`, or `accepts: ["screen.v2", "screen-audio.v1"]` on
+`createScreenReceiver`). When the host projects `audio_capture: 1` for the live
+mount (`bridge.canAudioCapture()`), calling
+`bridge.audioCapture(scope, { mode: "record" | "upload" })` asks the top-level
+host shell to run microphone recording or audio file upload outside the
+sandboxed iframe and resolves `{ transcript, duration_seconds, held_at, source }`.
+Unlike `call`/`tool`, interactive audio capture waits without a wall-clock RPC
+timeout unless `timeoutMs` is passed explicitly, and cancelling or refusing the
+modal (`cancelled`, `owner_required`, `conflict`, `unavailable`) leaves the
+open screen bridge intact.
 
 A records screen names `screen-records.v1` (with `screen.v2`) in `accepts`; the
 host then sends the records projection, which the app validates in `onPush` (or
