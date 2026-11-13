@@ -387,6 +387,14 @@ projects default to `workspace_visible`.
 acceptance checks are incomplete. Do not rely on project policy as a
 completed isolation boundary.
 
+Hosted boards keep the policy in the workspace rather than `project.yaml`.
+Project settings show the recorded hosted visibility and resolve grants to
+workspace member IDs; only a workspace owner can change them. A project with no
+stored policy is shown as unrecorded, not as a newly recorded policy. Hosted
+boards also refuse new private policies until isolation is qualified. Selecting
+Private in the editor is only a draft while that gate is closed; it cannot be
+saved.
+
 `POST /api/assist/job_request` requires a JSON `issue` field (the hosted
 platform call uses `arguments.issue`): an existing issue in a project the
 member can read. Every valid request is accepted durably, whether the issue

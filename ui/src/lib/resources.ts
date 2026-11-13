@@ -28,7 +28,6 @@ import type {
   OutboxItem,
   Overview,
   Project,
-  ProjectPolicyPayload,
   WorkflowRow,
 } from "./types";
 
@@ -182,8 +181,9 @@ export const resources = {
   projects: cache.resource<Project[]>("projects", () => api.projects().then((r) => r.projects), {
     isEmpty: (rows) => rows.length === 0,
   }),
-  /** `GET /api/projects/<key>/policy` — the recorded access policy (CAD-1950). */
-  projectPolicy: cache.family<string, ProjectPolicyPayload>("projectPolicy", (project) =>
+  /** `GET /api/projects/<key>/policy` — the board's policy record. Native and
+   *  hosted answer different shapes (CAD-2255), validated by policyContract. */
+  projectPolicy: cache.family<string, unknown>("projectPolicy", (project) =>
     api.projectPolicy(project),
   ),
   /** `GET /api/agents` — agent rows, task bindings and `by_issue`. */

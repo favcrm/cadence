@@ -2517,3 +2517,37 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   .tl-more, .tl-empty { margin-left: 0; }
   .tl-open { margin-left: 0; }
 }
+
+/* CAD-2255: project settings. The grant editor pairs the shared `.field`
+   (2.25rem) with the shared `.btn` (1.75rem); the scoped rules below give the
+   button and the Select trigger the field's height and type so the row reads
+   as one control at every width. Focus and disabled states stay the shared
+   ones — nothing here overrides them. */
+.ps-grant-add {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: .5rem;
+}
+.ps-grant-add > .ps-grant-field,
+.ps-grant-add > .field,
+.ps-grant-add .select,
+.ps-grant-add .select-trigger,
+.ps-grant-add > .btn {
+  height: 2.25rem;
+  font-size: .8125rem;
+}
+.ps-grant-add .select {
+  width: 100%;
+}
+.ps-grant-add > .btn {
+  padding-inline: .85rem;
+}
+@media (width < 640px) {
+  .ps-grant-add {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ps-grant-add > .btn {
+    width: 100%;
+  }
+}
