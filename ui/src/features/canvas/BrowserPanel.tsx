@@ -115,22 +115,28 @@ function Address({ url }: { url: string }) {
  *  leaves it: the row's width less every other item on it and the gaps. That
  *  room does not depend on where the address sits, so moving it to its own row
  *  cannot flip the answer back. During a stop confirm the actions have their own
- *  row and are not counted. Without layout (a test DOM) there is no decision. */
+ *  row and are not counted. Widths are fractional, with a pixel to spare, so a
+ *  rounded width never lets a host that is a fraction too wide stay and clip.
+ *  An address that is not shown (a phone's sheet), or no layout at all (a test
+ *  DOM), needs no row: no decision. */
 function hostFitsInRow(head: HTMLElement): boolean {
   const items = Array.from(head.children) as HTMLElement[];
   const addr = items.find((el) => el.classList.contains("bz-addr"));
   const host = addr?.querySelector<HTMLElement>(".bz-host");
-  if (!addr || !host || head.clientWidth === 0) return true;
+  if (!addr || !host || head.clientWidth === 0 || getComputedStyle(addr).display === "none") return true;
   const cs = getComputedStyle(head);
   const gap = parseFloat(cs.columnGap) || 0;
-  let room = head.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+  let room = head.getBoundingClientRect().width - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0)
+    - (parseFloat(cs.borderLeftWidth) || 0) - (parseFloat(cs.borderRightWidth) || 0);
   const confirm = head.hasAttribute("data-confirm");
   for (const el of items) {
     if (el === addr || (confirm && el.classList.contains("bz-actions"))) continue;
     if (getComputedStyle(el).display === "none") continue;
-    room -= el.offsetWidth + gap;
+    room -= el.getBoundingClientRect().width + gap;
   }
-  return host.scrollWidth <= room;
+  // The host's text box keeps its full width even while its box clips it.
+  const text = (host.firstElementChild as HTMLElement | null) ?? host;
+  return text.getBoundingClientRect().width + 1 <= room;
 }
 
 const Icon = ({ d, children }: { d?: string; children?: React.ReactNode }) => (

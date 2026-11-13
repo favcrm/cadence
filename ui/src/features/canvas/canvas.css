@@ -248,11 +248,13 @@
    few characters at a laptop width. The title then pushes the actions and canvas controls right. */
 .bz-head[data-addr="below"] { flex-wrap: wrap; row-gap: 4px; }
 .bz-head[data-addr="below"] > .bz-title { margin-right: auto; }
+.bz-head[data-addr="below"] > .bz-actions { margin-left: auto; }
 .bz-head[data-addr="below"] > .bz-addr { order: 10; flex: 1 0 100%; }
-/* A panel 420 px wide or less (a phone's sheet, or a small window's drawer) shows the actions as
-   icons; each keeps its accessible name. */
+/* A panel 480 px wide or less (a phone's sheet, or a small window's drawer) shows the actions as
+   icons; each keeps its accessible name. The labelled actions and the canvas controls need about
+   460 px in the longest locale (English), so wider panels keep the labels on one row. */
 .bz-panel { container: bz-panel / inline-size; }
-@container bz-panel (max-width: 420px) { .bz-actions .bz-lbl { display: none; } }
+@container bz-panel (max-width: 480px) { .bz-actions .bz-lbl { display: none; } }
 
 .bz-body { gap: 12px; }
 .bz-body .sempty { flex: none; text-align: center; }
