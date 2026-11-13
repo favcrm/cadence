@@ -2168,3 +2168,15 @@ Object.assign(zhTW, {
   "browser PDF tab or download": "瀏覽器 PDF 分頁開啟或下載",
   "Contain and close out incidents across teams": "跨團隊遏止事件並完成復盤結案",
 });
+
+// CAD-2285: the master's form in chat.
+Object.assign(zhTW, {
+  "Form": "表單",
+  "Sent": "已送出",
+  "Closed": "已關閉",
+  "Goes to the assistant as your message.": "會以你的訊息送給助理。",
+  "You answered in chat.": "你已在對話中回答。",
+  "Check this field.": "請檢查此欄位。",
+  "Answered with the form": "以表單回答",
+  "Form from the assistant": "助理的表單",
+});

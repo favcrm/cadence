@@ -107,6 +107,25 @@ pub(crate) enum MasterAction {
         #[arg(long)]
         grant: Option<String>,
     },
+    /// Ask the operator with a form (master only, on its live Home turn).
+    /// The file is one A2UI v1.0 envelope: {"version":"1.0","createSurface":
+    /// {"surfaceId":"<id>","catalogId":"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json",
+    /// "components":[...],"dataModel":{...}}}. The components form one tree
+    /// under the id `root`; the first Text is the title; one Button's
+    /// `action.event` (a name, and a context of values or {"@path":"/x"}
+    /// bindings) sends the answer. Only Text (caption|body), Row, Column,
+    /// Card, Divider, Button, CheckBox, ChoicePicker (multipleSelection|
+    /// mutuallyExclusive, chips|checkbox; its value is a list), TextField
+    /// (shortText|longText|number) and DateTimeInput (enableDate,
+    /// enableTime), with `@checks` of required, length, numeric or email;
+    /// at most depth 4, 40 components and 12 options. Anything else is
+    /// refused whole and nothing is written. The answer comes back as the
+    /// operator's message; the form grants nothing else.
+    AskForm {
+        /// The envelope, as the cwd-relative `./../tmp/<f>.json`.
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Ask the operator to approve one plain command (master only).
     /// The command is the exact argv after `--`.
     AskPermission {
@@ -255,6 +274,20 @@ pub(super) fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> 
                 json!({"operation": "master.resume", "expected_revision": Value::Null,
                        "payload": payload}),
             )?
+        }
+        MasterAction::AskForm { file } => {
+            let text = crate::cli::read_master_command_file(
+                state_dir,
+                Some(&file),
+                cadence_agent::agent_form::MAX_BYTES as u64,
+            )?;
+            let form: Value = serde_json::from_str(&text).map_err(|e| {
+                cadence_agent::error::Error::usage(format!(
+                    "{} is not JSON ({e}); nothing was sent",
+                    file.display()
+                ))
+            })?;
+            client::rpc(state_dir, "master_ask_form", json!({"form": form}))?
         }
         MasterAction::AskPermission { reason, argv } => {
             let cwd = std::env::current_dir().map_err(|e| {

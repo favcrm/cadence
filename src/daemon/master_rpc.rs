@@ -127,6 +127,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     // CAD-1752: propose hiring a catalogue role on the master's own live
     // turn; the handler binds to that turn and writes one inert entry.
     "hire_propose",
+    // CAD-2285: ask the operator with a form on the master's own live
+    // turn; the handler binds to that turn and writes one inert entry.
+    "master_ask_form",
     // Retained Library image bytes, still exact-turn and source/receiver scoped.
     "app_media_inspect",
 ];
@@ -382,6 +385,21 @@ impl Shared {
                         }
                         _ => {
                             "hire propose needs the master's live assigned turn in its \
+                             Home conversation - none is running"
+                        }
+                    },
+                ));
+            }
+            if method == "master_ask_form" {
+                return Err(Error::invalid(
+                    "master_refused",
+                    match scope {
+                        MasterScope::App(_) => {
+                            "master ask-form is made in the master's Home conversation, \
+                             not in an app conversation"
+                        }
+                        _ => {
+                            "master ask-form needs the master's live assigned turn in its \
                              Home conversation - none is running"
                         }
                     },

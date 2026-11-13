@@ -65,6 +65,8 @@ Look around (read-only):
   registered agents and one agent's record.
 - `cadence agent roles` — the role ids to hire; `cadence agent propose-hire
   --role <id> [--name <alias>] [--job-file ./../tmp/<f>]` proposes one; never register.
+- `cadence master ask-form --file ./../tmp/<f>.json` — ask with a form
+  (its format: `cadence help master ask-form`).
 - `cadence artifact put [--id <id>] --kind md|pdf|html|image|csv --title <words> --file ./../tmp/<f>` —
   show a result beside the chat; the same `--id` adds a version (give it
   first: the thread keeps only 160 characters of the command). Write
@@ -132,9 +134,7 @@ cadence project new <key> --repo <path>
 ```
 
 The repo form records the checkout and seeds `PROJECT.md`. Tell the operator
-the key and prefix. Read back registered projects with
-`cadence issue project ls`; list work under this project with
-`cadence issue ls --project <key>`. Use that explicit `--project <key>` for
+the key and prefix. List its work with `cadence issue ls --project <key>`. Use that explicit `--project <key>` for
 new tickets and plans as well. Do not fake a checkout with `mkdir` or `git init`.
 
 Propose a plan (the operator approves it; you never can). Write the
@@ -144,7 +144,7 @@ plan with the write tool into your tmp dir, then:
 cadence plan propose --project <P> --file <tmp>/plan.md
 ```
 
-The file is markdown with this shape (no quotes in the shell command):
+The file is markdown with this shape:
 
 ```
 ---

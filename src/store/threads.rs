@@ -970,6 +970,45 @@ impl Store {
         })
     }
 
+    /// CAD-2285: record the master's form on its conversation. One entry
+    /// per (turn, digest): asking the same form twice on one turn is
+    /// refused, so a replayed call cannot stack forms. It writes only this
+    /// thread entry.
+    pub fn surface_put(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        text: &str,
+        payload: Value,
+    ) -> Result<i64> {
+        let digest = payload["digest"].as_str().unwrap_or_default().to_string();
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let dup: Option<i64> = tx
+                .query_row(
+                    "SELECT seq FROM thread_entries WHERE thread_id=? AND kind=? AND message_id=?
+                       AND json_extract(payload,'$.digest')=?",
+                    params![thread_id, KIND_SURFACE, message_id, digest],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if dup.is_some() {
+                return Err(Error::rejected("this turn already asked exactly this form"));
+            }
+            Self::thread_write_by_id_in(
+                tx,
+                thread_id,
+                NewEntry {
+                    role: ROLE_AGENT,
+                    kind: KIND_SURFACE,
+                    text,
+                    payload: Some(payload),
+                    message_id: Some(message_id),
+                },
+            )
+        })
+    }
+
     /// Append inside a caller's transaction to one thread by id.
     pub(super) fn thread_write_by_id_in(
         tx: &impl super::StoreConn,
@@ -1500,13 +1539,14 @@ impl Store {
         let limit = limit.clamp(1, PAGE_MAX);
         let mut rows = conn.query_vec(
             "SELECT * FROM thread_entries
-             WHERE thread_id=? AND seq>? AND kind NOT IN (?,?)
+             WHERE thread_id=? AND seq>? AND kind NOT IN (?,?,?)
              ORDER BY seq LIMIT ?",
             params![
                 thread_id,
                 after,
                 KIND_ARTIFACT,
                 KIND_HIRE_PROPOSAL,
+                KIND_SURFACE,
                 limit + 1
             ],
             row_entry,
@@ -1528,13 +1568,14 @@ impl Store {
         let limit = limit.clamp(1, PAGE_MAX);
         let mut rows = conn.query_vec(
             "SELECT * FROM thread_entries
-             WHERE thread_id=? AND seq<? AND kind NOT IN (?,?)
+             WHERE thread_id=? AND seq<? AND kind NOT IN (?,?,?)
              ORDER BY seq DESC LIMIT ?",
             params![
                 thread_id,
                 before.unwrap_or(i64::MAX),
                 KIND_ARTIFACT,
                 KIND_HIRE_PROPOSAL,
+                KIND_SURFACE,
                 limit + 1
             ],
             row_entry,
@@ -1566,7 +1607,7 @@ impl Store {
         let sql = format!(
             "SELECT thread_entries.* FROM thread_entries
              WHERE thread_id=? AND seq>? AND {}
-               AND (?=0 OR thread_entries.kind NOT IN (?,?))
+               AND (?=0 OR thread_entries.kind NOT IN (?,?,?))
              ORDER BY seq LIMIT ?",
             scoped_thread_message()
         );
@@ -1579,6 +1620,7 @@ impl Store {
                 member,
                 KIND_ARTIFACT,
                 KIND_HIRE_PROPOSAL,
+                KIND_SURFACE,
                 limit.clamp(1, PAGE_MAX)
             ],
             row_entry,
@@ -1605,7 +1647,7 @@ impl Store {
         let sql = format!(
             "SELECT thread_entries.* FROM thread_entries
              WHERE thread_id=? AND seq<? AND {}
-               AND (?=0 OR thread_entries.kind NOT IN (?,?))
+               AND (?=0 OR thread_entries.kind NOT IN (?,?,?))
              ORDER BY seq DESC LIMIT ?",
             scoped_thread_message()
         );
@@ -1618,6 +1660,7 @@ impl Store {
                 member,
                 KIND_ARTIFACT,
                 KIND_HIRE_PROPOSAL,
+                KIND_SURFACE,
                 limit + 1
             ],
             row_entry,

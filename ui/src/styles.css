@@ -1029,6 +1029,41 @@ pre {
   gap: .375rem;
   margin-top: .5rem;
 }
+/* CAD-2285: the master's form. A board card; every control is an existing
+   board class (chip-btn, field, btn). The header's chip is its one status. */
+.turn-artifacts > div:has(> .agentform) { flex-basis: 100%; }
+.agentform { max-width: min(100%, 32rem); overflow: hidden; }
+.agentform-body { padding: .75rem; display: grid; gap: .85rem; }
+.agentform-head { display: flex; align-items: center; gap: .5rem; min-height: 1.25rem; margin-bottom: -.4rem; }
+.agentform-head .chip { margin-left: auto; }
+.agentform-kind { display: inline-flex; align-items: center; gap: .3rem; font-size: var(--text-micro); color: var(--color-ink-500); }
+.agentform-kind svg { width: 12px; height: 12px; flex: none; }
+.agentform h3 { margin: 0; font-size: var(--text-cardtitle); font-weight: 600; color: var(--color-ink-100); }
+.agentform-lead { margin: -.55rem 0 0; font-size: var(--text-label); color: var(--color-ink-400); }
+.agentform-text { margin: 0; font-size: var(--text-label); color: var(--color-ink-200); }
+.agentform-col { display: grid; gap: .85rem; min-width: 0; }
+.agentform-row { display: flex; flex-wrap: wrap; gap: .85rem 1.5rem; align-items: flex-start; }
+.agentform-hr { border: 0; border-top: 1px solid var(--color-ink-700); margin: 0; }
+.agentform-field { border: 0; margin: 0; padding: 0; min-width: 0; display: grid; gap: .4rem; }
+.agentform-field > legend { padding: 0; margin-bottom: .4rem; font-size: var(--text-label); font-weight: 500; color: var(--color-ink-300); }
+.agentform-opts { display: flex; flex-wrap: wrap; gap: .375rem; }
+.agentform .chip-btn { font: 500 var(--text-label)/1.4 var(--font-sans); padding: .25rem .6rem; border: 1px solid var(--color-edge); background: var(--color-ink-900); color: var(--color-ink-300); border-radius: .375rem; }
+.agentform .chip-btn[aria-pressed="true"], .agentform .chip-btn[aria-checked="true"] {
+  border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-ink-700));
+  color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 10%, var(--color-ink-900));
+}
+.agentform .chip-btn[aria-pressed="true"]::before, .agentform .chip-btn[aria-checked="true"]::before { content: "✓" / ""; font-size: .75em; }
+.agentform .chip-btn:disabled { opacity: .6; cursor: default; }
+.agentform-field[data-invalid] .chip-btn { border-color: color-mix(in srgb, var(--color-fail) 55%, var(--color-ink-700)); }
+.agentform-input { width: min(100%, 16rem); height: 1.75rem; }
+textarea.agentform-input { height: auto; width: 100%; }
+.agentform-check { display: inline-flex; align-items: center; gap: .5rem; font-size: var(--text-label); color: var(--color-ink-200); }
+.agentform-check input { width: 1rem; height: 1rem; margin: 0; accent-color: var(--color-accent); }
+.agentform-foot { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .75rem; }
+.agentform-foot .btn { max-width: none; }
+.agentform[data-form-state="sent"] .agentform-body, .agentform[data-form-state="closed"] .agentform-body { background: color-mix(in srgb, var(--color-ink-900) 45%, transparent); }
+.agentform-fallback { max-width: min(100%, 40rem); }
 /* Streaming: the collapsed trace and three dots — never a skeleton or a
    made-up answer body. */
 .typing {

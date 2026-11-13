@@ -23,7 +23,7 @@ use rusqlite::params;
 use super::messages::{row_message, INDEX_PROJECT_FILTER};
 use super::{
     Message, PrivateJobDenials, Store, StoreConn, ThreadEntry, KIND_ARTIFACT, KIND_ASSISTANT_TEXT,
-    KIND_HIRE_PROPOSAL, KIND_TURN_RESULT, ROLE_AGENT, THREAD_PAGE_MAX,
+    KIND_HIRE_PROPOSAL, KIND_SURFACE, KIND_TURN_RESULT, ROLE_AGENT, THREAD_PAGE_MAX,
 };
 
 /// The granted-conversation branch appended after [`INDEX_PROJECT_FILTER`].
@@ -259,7 +259,7 @@ impl Store {
         let sql = format!(
             "SELECT thread_entries.* FROM thread_entries
              WHERE thread_id=? AND seq>? AND {}
-               AND (?=0 OR thread_entries.kind NOT IN (?,?))
+               AND (?=0 OR thread_entries.kind NOT IN (?,?,?))
              ORDER BY seq LIMIT ?",
             granted_entry_filter()
         );
@@ -273,6 +273,7 @@ impl Store {
                 member,
                 KIND_ARTIFACT,
                 KIND_HIRE_PROPOSAL,
+                KIND_SURFACE,
                 limit.clamp(1, THREAD_PAGE_MAX)
             ],
             row_entry,
@@ -297,7 +298,7 @@ impl Store {
         let sql = format!(
             "SELECT thread_entries.* FROM thread_entries
              WHERE thread_id=? AND seq<? AND {}
-               AND (?=0 OR thread_entries.kind NOT IN (?,?))
+               AND (?=0 OR thread_entries.kind NOT IN (?,?,?))
              ORDER BY seq DESC LIMIT ?",
             granted_entry_filter()
         );
@@ -311,6 +312,7 @@ impl Store {
                 member,
                 KIND_ARTIFACT,
                 KIND_HIRE_PROPOSAL,
+                KIND_SURFACE,
                 limit + 1
             ],
             row_entry,

@@ -16,7 +16,7 @@ import type { SseEvent } from "../../lib/sse";
  */
 
 export type ThreadRole = "operator" | "agent" | "system";
-export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "video_job" | "hire_proposal" | "ticket_proposal";
+export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "video_job" | "hire_proposal" | "ticket_proposal" | "surface";
 
 /** One stored entry (`thread_read` / the stream's `entry` frame). */
 export interface ThreadEntry {
@@ -347,7 +347,36 @@ export type ThreadItem =
   | { type: "video"; key: string; entry: ThreadEntry }
   | { type: "hire"; key: string; entry: ThreadEntry; reason: string | null }
   | { type: "ticket"; key: string; entry: ThreadEntry }
+  | { type: "form"; key: string; entry: ThreadEntry; status: FormStatus }
   | { type: "pending"; key: string; pending: PendingMessage };
+
+/** CAD-2285: where the master's form stands, read from the thread itself.
+ *  Its answer is the operator message that cites it (`refs` kind
+ *  `surface`, id the entry seq); any other later operator message closes
+ *  it, so a late answer can never be sent. */
+export type FormStatus =
+  | { state: "open" }
+  | { state: "sending" }
+  | { state: "failed"; pending: PendingMessage }
+  | { state: "sent"; at: string | null }
+  | { state: "closed" };
+
+const answers = (refs: unknown, seq: number): boolean =>
+  Array.isArray(refs) &&
+  refs.some((r) => !!r && typeof r === "object" && (r as { kind?: unknown }).kind === "surface" && (r as { id?: unknown }).id === String(seq));
+
+export function formStatus(seq: number, entries: ThreadEntry[], pending: PendingMessage[]): FormStatus {
+  let closed = false;
+  for (const e of entries) {
+    if (e.seq <= seq || e.role !== "operator") continue;
+    if (answers(e.payload?.refs, seq)) return { state: "sent", at: e.created ?? null };
+    closed = true;
+  }
+  const own = pending.find((p) => answers(p.refs, seq));
+  if (closed || pending.some((p) => !answers(p.refs, seq))) return { state: "closed" };
+  if (own) return own.state === "failed" ? { state: "failed", pending: own } : { state: "sending" };
+  return { state: "open" };
+}
 
 const TOOL_KINDS = new Set(["tool_call", "tool_result"]);
 
@@ -374,8 +403,14 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
   for (const entry of state?.entries ?? []) {
     const key = `e${entry.seq}`;
     const card = cardType(entry.kind);
-    if (card && items[items.length - 1]?.type === "tools") {
-      held.push({ type: card, key, entry });
+    // CAD-2285: the form is written inside its `ask-form` tool call, so it
+    // waits for the run to end like any other card.
+    const form: ThreadItem | null =
+      entry.kind === "surface"
+        ? { type: "form", key, entry, status: formStatus(entry.seq, state?.entries ?? [], state?.pending ?? []) }
+        : null;
+    if ((card || form) && items[items.length - 1]?.type === "tools") {
+      held.push(form ?? { type: card!, key, entry });
       continue;
     }
     if (!TOOL_KINDS.has(entry.kind)) flush();
@@ -402,6 +437,8 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
       // AOS-517: Master's inert ticket proposal. Its own payload carries the
       // card; nothing is created or assigned until the person clicks.
       items.push({ type: "ticket", key, entry });
+    } else if (form) {
+      items.push(form);
     } else if (entry.kind === "artifact") {
       // CAD-1726: a card for a canvas artifact — metadata, never content.
       items.push({ type: "artifact", key, entry });
@@ -425,11 +462,11 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
 }
 
 /** Item types that belong to an assistant turn. */
-const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "image", "video", "hire"]);
+const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "image", "video", "hire", "form"]);
 
 /** A card that follows its turn's answer without ending or starting a turn. */
 export const isCardItem = (item: { type: string }): boolean =>
-  item.type === "artifact" || item.type === "image" || item.type === "video";
+  item.type === "artifact" || item.type === "image" || item.type === "video" || item.type === "form";
 
 /** One render run: an assistant turn (its flat items), or one item that is
  *  not part of a turn. The items themselves stay flat — `threadItems` is
