@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 const SCRIPT = fileURLToPath(import.meta.url);
 const FIXTURES = path.join(path.dirname(SCRIPT), "qa-board", "fixtures");
 const VALIDATOR = path.join(path.dirname(SCRIPT), "qa-board", "validate.ts");
+const APP_BUNDLE = path.resolve(path.dirname(SCRIPT), "..", "..", "app-toolchain", "template", "app");
 const NAME = /^[a-z0-9][a-z0-9-]{0,15}$/;
 const ROOT = /^\/tmp\/qa-board-[a-z0-9][a-z0-9-]{0,15}$/;
 const SANDBOX = "qa";
@@ -88,15 +89,17 @@ function cmdline(pid) {
 /** Our process, identified by a marker in its command line (never a reused pid). */
 const ours = (proc) => Number.isInteger(proc?.pid) && (cmdline(proc.pid) ?? []).join(" ").includes(proc.marker);
 function signal(proc, sig) {
-  try { process.kill(proc.group ? -proc.pid : proc.pid, sig); } catch { /* already gone */ }
+  try { process.kill(proc.group ? -proc.pid : proc.pid, sig); return true; } catch { return false; }
 }
+/** Stop processes proven ours; a process group is waited on until every member is gone. */
 async function stop(procs) {
   const live = procs.filter(ours);
+  const alive = (proc) => (proc.group ? signal(proc, 0) : ours(proc));
   for (const proc of live) signal(proc, "SIGTERM");
-  for (let i = 0; i < 50 && live.some(ours); i++) await sleep(200);
-  for (const proc of live.filter(ours)) signal(proc, "SIGKILL");
-  for (let i = 0; i < 25 && live.some(ours); i++) await sleep(200);
-  return live.filter(ours).map((proc) => proc.pid);
+  for (let i = 0; i < 50 && live.some(alive); i++) await sleep(200);
+  for (const proc of live.filter(alive)) signal(proc, "SIGKILL");
+  for (let i = 0; i < 25 && live.some(alive); i++) await sleep(200);
+  return live.filter(alive).map((proc) => proc.pid);
 }
 function sandboxPids(stateDir) {
   const found = [];
@@ -193,6 +196,19 @@ async function up(opts) {
     const viewUrl = `https://127.0.0.1:${viewerPort}/live`;
     state.validator = validate(root, ui, served, viewUrl);
 
+    // The member app screen's frame: the binary's own canonical frame around
+    // the repo's starter app. It accepts an http parent only on a `localhost`
+    // name, so the UI is opened at localhost, not 127.0.0.1.
+    const uiOrigin = `http://localhost:${uiPort}`;
+    const frame = path.join(root, "frame");
+    const kit = spawnSync(bin, ["--state-dir", stateDir, "app", "frame-kit", "--out", frame, "--bundle", APP_BUNDLE, "--parent-origin", uiOrigin], { encoding: "utf8" });
+    if (kit.status !== 0) throw new Error(`cadence app frame-kit failed: ${kit.stderr.trim()}`);
+    const boot = JSON.parse(/id="cadence-screen-boot">([^<]*)</.exec(fs.readFileSync(path.join(frame, "frame.html"), "utf8"))?.[1] ?? "null");
+    const mount = readJson(path.join(served, "app-screen-mount.json"));
+    if (boot?.bridge_nonce !== mount.bridge_nonce || boot?.generation !== mount.generation || boot?.tag !== mount.tag) {
+      throw new Error("app-screen-mount.json does not match the exported frame's boot (bridge_nonce, generation, tag)");
+    }
+
     // (e) the stand-in viewer's self-signed certificate; the key stays in a file
     const certs = path.join(root, "viewer");
     fs.mkdirSync(certs, { mode: 0o700 });
@@ -221,13 +237,14 @@ async function up(opts) {
     const provenance = {
       qa_board: name,
       fixture_evidence: EVIDENCE,
-      ui: { checkout, ...revision(checkout), url: `http://127.0.0.1:${uiPort}/`, served_by: "vite dev server from the checkout's ui/" },
+      ui: { checkout, ...revision(checkout), url: `${uiOrigin}/`, served_by: "vite dev server from the checkout's ui/" },
       sandbox: { build: version.build ?? "unverified", hosted: sandboxMeta.hosted, url: `http://127.0.0.1:${sandboxPort}/`, root: path.join(root, SANDBOX) },
       fixtures: { dir: FIXTURES, ...revision(path.dirname(SCRIPT)), validated_against: `${ui}/src` },
       ports: state.ports,
       control: `http://127.0.0.1:${proxyPort}/__qa/state`,
       counts: `http://127.0.0.1:${proxyPort}/__qa/counts`,
       viewer: `${viewUrl} (self-signed: run the browser with --ignore-https-errors)`,
+      app_screen: { url: `${uiOrigin}/apps/${readJson(path.join(served, "app-installation.json")).name}`, bundle: APP_BUNDLE, frame: `cadence app frame-kit from ${version.build ?? "unverified"}`, ...readJson(path.join(frame, "metadata.json")).screen },
       state_dir: root,
       down: `node ${SCRIPT} down --name ${name}`,
     };
@@ -301,6 +318,9 @@ function serve(opts) {
   const locale = { ...fx.locale };
   const history = fx["member-assistant-history"];
   const entries = [...history.entries];
+  const app = `/api/app-installations/${fx["app-installation"].install_id}`;
+  const context = fx["app-contexts"].contexts[0].id;
+  const mount = fx["app-screen-mount"];
   let views = 0;
   const counts = { routes: {}, proxied: 0, masked_401: {}, views: 0, viewer_loads: 0, viewer_done: 0 };
   const count = (key) => (counts.routes[key] = (counts.routes[key] ?? 0) + 1);
@@ -351,6 +371,15 @@ function serve(opts) {
       entries.push({ id: `csrid_qa_${entries.length + 1}`, role: "member", kind: "message", text: String(b?.text ?? ""), message: b?.message ?? null, created: Date.now() / 1000 });
       return { ...fx["member-assistant-send"], message: b?.message };
     },
+    // The member app screen: one installed app with one context and run.
+    "GET /api/app-home": () => fx["app-home"],
+    [`GET ${app}`]: () => fx["app-installation"],
+    [`GET ${app}/contexts`]: () => fx["app-contexts"],
+    [`GET ${app}/effects`]: () => fx["app-effects"],
+    [`GET ${app}/contexts/${context}/effects`]: () => fx["app-effects"],
+    "GET /api/app-runs": () => fx["app-runs"],
+    [`POST ${app}/screens/${mount.tag}/mount`]: () => mount,
+    [`GET ${mount.mount}`]: (_b, res) => send(res, 200, fs.readFileSync(path.join(root, "frame", "frame.html")), "text/html; charset=utf-8"),
     "GET /api/browser": () => browser,
     "POST /api/browser/view": (_b, res) => {
       if (browser.state === "none" || browser.state === "ended") return send(res, 409, { error: "not_in_handoff" });

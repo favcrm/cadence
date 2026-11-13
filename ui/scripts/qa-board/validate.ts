@@ -12,6 +12,10 @@ import { kickoffBlock, writeBlock } from "../../src/features/auth/gate";
 import { mutatePersonalProfile, readPersonalBootstrap, readPersonalIdentity } from "../../src/features/assistant/identity";
 import { parseBrowserRead, readBrowser, stopBrowser, viewBrowser } from "../../src/features/canvas/browserClient";
 import { memberHistory, memberThreadStore, sendToAssistant } from "../../src/features/home/memberThread";
+import { parseMount } from "../../src/features/workspace-apps/screen/screenLifecycle";
+import { screenProjection, screenTag } from "../../src/features/workspace-apps/screen/screenProjection";
+import { shapeFor } from "../../src/features/workspace-apps/screen/screenProtocol";
+import type { AppContext, AppEffect, HomeInstallation, Installation, WorkspaceRun } from "../../src/features/workspace-apps/workspaceApps";
 import { api } from "../../src/lib/api";
 import { allowPrivateReads } from "../../src/lib/privateSession";
 import type { Meta } from "../../src/lib/types";
@@ -78,7 +82,8 @@ const failed = (error: unknown) => (error instanceof Error ? error.message : Str
 export async function validateFixtures(fx: Fixtures, viewUrl: string): Promise<string[]> {
   const failures: string[] = [];
   const fail = (payload: string, why: string) => failures.push(`${payload}.json: ${why}`);
-  for (const name of ["meta", "locale", "browser-stop", "member-assistant-state", "member-assistant-history", "member-assistant-profile", "member-assistant-send", ...BROWSER_PRESETS.map((p) => `browser-${p}`)]) {
+  for (const name of ["meta", "locale", "browser-stop", "member-assistant-state", "member-assistant-history", "member-assistant-profile", "member-assistant-send", ...BROWSER_PRESETS.map((p) => `browser-${p}`),
+    "app-home", "app-installation", "app-contexts", "app-runs", "app-effects", "app-screen-mount"]) {
     if (!(name in fx)) fail(name, "missing");
   }
   if (failures.length > 0) return failures;
@@ -88,6 +93,30 @@ export async function validateFixtures(fx: Fixtures, viewUrl: string): Promise<s
   const meta = fx.meta as Meta;
   if (writeBlock(meta) !== null) fail("meta", `writeBlock refused it: ${writeBlock(meta)}`);
   if (kickoffBlock(meta) === null) fail("meta", "kickoffBlock reads it as the operator, not a member");
+
+  // The member app screen, as the board's WorkspaceApp builds it: the screen
+  // tag, the projection and its v2 push (as ui/scripts/app-fixtures/producer.ts
+  // does), and the mount receipt.
+  const installation = fx["app-installation"] as Installation;
+  const tag = screenTag(installation);
+  if (tag === null) fail("app-installation", "screenTag finds no mountable screen");
+  else {
+    const contexts = (fx["app-contexts"] as { contexts: AppContext[] }).contexts;
+    const runs = (fx["app-runs"] as { runs: WorkspaceRun[] }).runs;
+    const effects = (fx["app-effects"] as { effects: AppEffect[] }).effects;
+    const contextId = contexts[0]?.id ?? "";
+    try {
+      const projection = screenProjection(installation, tag, contextId, contexts, runs, effects,
+        { installId: installation.install_id, contextId, status: "ok", intents: [] },
+        { installId: installation.install_id, contextId, bindings: [], workers: null, texts: new Map() });
+      if (!shapeFor(projection, "v2")) fail("app-runs", "shapeFor refused the screen's v2 push");
+    } catch (error) { fail("app-contexts", `screenProjection refused it: ${failed(error)}`); }
+    if (parseMount(fx["app-screen-mount"], tag) === null) fail("app-screen-mount", "parseMount refused it");
+  }
+  const home = (fx["app-home"] as { installations?: HomeInstallation[] }).installations ?? [];
+  if (!home.some((row) => row.install_id === installation.install_id && row.name === installation.name)) {
+    fail("app-home", "no row names app-installation.json, so /apps/<key> would not resolve");
+  }
 
   for (const preset of BROWSER_PRESETS) {
     const why = checkBrowser(fx[`browser-${preset}`]);
