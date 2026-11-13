@@ -136,12 +136,21 @@ const INCIDENT_RESPONSE: BundledSkill = BundledSkill {
     ],
 };
 
-pub const SKILL_NAMES: [&str; 5] = [
+const DELIVERABLE_QA: BundledSkill = BundledSkill {
+    name: "deliverable-qa",
+    files: &[(
+        "SKILL.md",
+        include_str!("../skills/deliverable-qa/SKILL.md"),
+    )],
+};
+
+pub const SKILL_NAMES: [&str; 6] = [
     CADENCE.name,
     BUSINESS_DOCUMENTS.name,
     COMPANY_OUTPUTS.name,
     WEBSITE_BUILDER.name,
     INCIDENT_RESPONSE.name,
+    DELIVERABLE_QA.name,
 ];
 
 /// Provider skill directories that receive links to each selected bundle.
@@ -172,12 +181,14 @@ fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> {
             COMPANY_OUTPUTS,
             WEBSITE_BUILDER,
             INCIDENT_RESPONSE,
+            DELIVERABLE_QA,
         ]),
         Some("cadence") => Ok(&[CADENCE]),
         Some("business-documents") => Ok(&[BUSINESS_DOCUMENTS]),
         Some("company-outputs") => Ok(&[BUSINESS_DOCUMENTS, COMPANY_OUTPUTS]),
         Some("website-builder") => Ok(&[WEBSITE_BUILDER]),
         Some("incident-response") => Ok(&[INCIDENT_RESPONSE]),
+        Some("deliverable-qa") => Ok(&[DELIVERABLE_QA]),
         Some(name) => Err(Error::rejected(format!(
             "unknown bundled skill {name:?}; expected {}",
             SKILL_NAMES.join(", ")
@@ -841,6 +852,26 @@ mod tests {
             ShowOutput::File(html) => {
                 assert!(html.contains("--doc-accent"));
                 assert!(html.contains("@page"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+    }
+
+    #[test]
+    fn deliverable_qa_bundle_installs_one_procedure_with_the_gate_pass_lines() {
+        assert!(SKILL_NAMES.contains(&"deliverable-qa"));
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("deliverable-qa")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("deliverable-qa");
+        assert!(root.join("SKILL.md").is_file());
+        let second = sync(dir.path(), false, Some("deliverable-qa")).unwrap();
+        assert_eq!(second["wrote"], false);
+        match show("deliverable-qa", Some("SKILL.md")).unwrap() {
+            ShowOutput::File(text) => {
+                // The exact two lines the merge gate counts (scripts/enqueue-reviewed).
+                assert!(text.contains("Browser QA: pass\n   Head: <full 40-hex sha>"));
+                assert!(text.contains("never approves on a person's behalf"));
             }
             ShowOutput::Manifest(_) => panic!("file expected"),
         }
