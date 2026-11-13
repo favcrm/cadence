@@ -526,19 +526,17 @@ fn a_board_code_off_its_row_is_not_a_trusted_refusal() {
                         && (r.ops.is_empty() || r.ops.contains(&op))
                 })
             };
-            let &(status, line) = lines
-                .iter()
-                .find(|(status, _)| !mapped_at(*status))
-                .unwrap();
-            let (error, seen) = wiki_call_refused(line, row.code, "write", args.clone());
-            let text = error.to_string();
-            assert!(
-                !error.code().is_some_and(super::is_wiki_copy_refusal),
-                "{op} {status} {}: {text}",
-                row.code
-            );
-            assert_eq!(seen.len(), 2, "{op} {status} {}: sent once", row.code);
-            checked += 1;
+            for &(status, line) in lines.iter().filter(|(status, _)| !mapped_at(*status)) {
+                let (error, seen) = wiki_call_refused(line, row.code, "write", args.clone());
+                let text = error.to_string();
+                assert!(
+                    !error.code().is_some_and(super::is_wiki_copy_refusal),
+                    "{op} {status} {}: {text}",
+                    row.code
+                );
+                assert_eq!(seen.len(), 2, "{op} {status} {}: sent once", row.code);
+                checked += 1;
+            }
         }
     }
     assert!(checked > 0);

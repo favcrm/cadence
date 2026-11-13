@@ -578,21 +578,17 @@ enum Stop {
     /// so the step may have landed: `unknown`, reconciled by the same job.
     Unconfirmed(Error),
     /// This client stopped while preparing or checking a chunk: the local
-    /// source, or a chunk answer it could not read. Hedged, with the error's
-    /// own kind kept as before CAD-2271.
+    /// source, or a chunk answer it could not read. Hedged, in the shape it
+    /// had before CAD-2271 ([`write_outcome`]): `rejected` (exit 3), or
+    /// `unknown` (exit 1) for a chunk answer it could not read. There is no
+    /// `From` into `Stop`: each site names its class, so a channel error
+    /// cannot become `Local` through `?`.
     Local(Error),
 }
 
-impl From<Error> for Stop {
-    fn from(error: Error) -> Self {
-        Stop::Local(error)
-    }
-}
-
-impl From<std::io::Error> for Stop {
-    fn from(error: std::io::Error) -> Self {
-        Stop::Local(error.into())
-    }
+/// A [`Stop::Local`] from anything this client raises itself, I/O included.
+fn local(error: impl Into<Error>) -> Stop {
+    Stop::Local(error.into())
 }
 
 /// Send one chunk, apply or finish. A command deadline that has already
@@ -693,22 +689,14 @@ fn job_refused(job_id: &str, what: &str, error: Error) -> Error {
 
 /// A [`Stop::Local`] chunk stop with this attempt's context, in the shape it
 /// had before CAD-2271. An `unknown` (a chunk answer this client could not
-/// read) stays unknown, since the chunk may have staged; every other kind
-/// stays the refusal this job reported. An op-level answer this client
-/// cannot trust goes through [`unproved`] instead.
+/// read) stays unknown, since the chunk may have staged; anything else (the
+/// local source changed or shrank, or could not be read) is `rejected`. An
+/// op-level answer this client cannot trust goes through [`unproved`]
+/// instead.
 fn write_outcome(error: Error, message: impl Into<String>) -> Error {
     let message = message.into();
     if error.kind() == "unknown" {
         Error::unknown(message)
-    } else if let (Some(code), "rejected") = (error.code(), error.kind()) {
-        // CAD-2261: a refusal's code (the board's, for a hosted copy)
-        // outlives the job wrapper, so a caller can still branch on it.
-        Error::Structured(crate::error::Structured {
-            kind: "rejected",
-            code: code.to_string(),
-            message,
-            revision: None,
-        })
     } else {
         Error::rejected(message)
     }
@@ -795,30 +783,27 @@ fn send_entry(
         {
             // Dispatched: a body that names another job or entry cannot be
             // read as this chunk's acknowledgment.
-            return Err(Error::unknown(format!(
+            return Err(local(Error::unknown(format!(
                 "chunk '{}' answered for another job or entry",
                 item.rel
-            ))
-            .into());
+            ))));
         }
         if body["received"].as_u64() != Some(0) {
             // Dispatched: the stage may hold these bytes even though the
             // answer did not confirm an empty file. The caller adds the
             // same-job reconciliation.
-            return Err(Error::unknown(format!(
+            return Err(local(Error::unknown(format!(
                 "chunk '{}' did not confirm an empty file",
                 item.rel
-            ))
-            .into());
+            ))));
         }
         return Ok(());
     }
     if received > item.size {
-        return Err(Error::rejected(format!(
+        return Err(local(Error::rejected(format!(
             "staged length {received} exceeds source size {}",
             item.size
-        ))
-        .into());
+        ))));
     }
     let path = if item.single_file {
         local_root.to_path_buf()
@@ -826,18 +811,19 @@ fn send_entry(
         local_root.join(&item.rel)
     };
     // Re-check the ancestor chain, then open only through no-follow fds.
-    let mut file = open_contained(&path)?;
+    let mut file = open_contained(&path).map_err(local)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK_BYTES];
     let mut hashed = 0u64;
     while hashed < received {
         let want =
             usize::try_from((received - hashed).min(CHUNK_BYTES as u64)).unwrap_or(CHUNK_BYTES);
-        let n = file.read(&mut buf[..want])?;
+        let n = file.read(&mut buf[..want]).map_err(local)?;
         if n == 0 {
-            return Err(
-                Error::rejected(format!("source '{}' shrank during copy", item.rel)).into(),
-            );
+            return Err(local(Error::rejected(format!(
+                "source '{}' shrank during copy",
+                item.rel
+            ))));
         }
         hasher.update(&buf[..n]);
         hashed += n as u64;
@@ -846,11 +832,12 @@ fn send_entry(
     while offset < item.size {
         let want =
             usize::try_from((item.size - offset).min(CHUNK_BYTES as u64)).unwrap_or(CHUNK_BYTES);
-        let n = file.read(&mut buf[..want])?;
+        let n = file.read(&mut buf[..want]).map_err(local)?;
         if n == 0 {
-            return Err(
-                Error::rejected(format!("source '{}' shrank during copy", item.rel)).into(),
-            );
+            return Err(local(Error::rejected(format!(
+                "source '{}' shrank during copy",
+                item.rel
+            ))));
         }
         hasher.update(&buf[..n]);
         let data_base64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
@@ -876,35 +863,32 @@ fn send_entry(
         if identity(&body, "job_id") != Some(job_id)
             || identity(&body, "entry_id") != Some(want_entry.as_str())
         {
-            return Err(Error::unknown(format!(
+            return Err(local(Error::unknown(format!(
                 "chunk '{}' answered for another job or entry",
                 item.rel
-            ))
-            .into());
+            ))));
         }
         let want = offset + n as u64;
         let got = body["received"].as_u64().ok_or_else(|| {
-            Error::unknown(format!(
+            local(Error::unknown(format!(
                 "chunk '{}' did not confirm its received bytes",
                 item.rel
-            ))
+            )))
         })?;
         if got != want {
-            return Err(Error::unknown(format!(
+            return Err(local(Error::unknown(format!(
                 "chunk '{}' confirmed {got} bytes where {want} were sent",
                 item.rel
-            ))
-            .into());
+            ))));
         }
         offset = got;
     }
     let digest = hex_encode(hasher.finalize());
     if item.sha256.as_deref() != Some(digest.as_str()) {
-        return Err(Error::rejected(format!(
+        return Err(local(Error::rejected(format!(
             "source '{}' changed after the manifest was pinned",
             item.rel
-        ))
-        .into());
+        ))));
     }
     Ok(())
 }
@@ -2903,9 +2887,12 @@ mod tests {
         );
         assert_eq!((late.kind(), late.code()), ("busy", Some("timeout")));
         assert_eq!(exit(&late), 75);
-        // A local chunk stop keeps the shape it had before CAD-2271.
+        // A local chunk stop keeps the shape it had before CAD-2271: a source
+        // read failure (`internal`) is reported as a refusal.
         let plain = write_outcome(Error::rejected("no code"), "wrapped");
         assert_eq!((plain.kind(), plain.code()), ("rejected", None));
+        let unread = write_outcome(Error::internal("io: read failed"), "wrapped");
+        assert_eq!((unread.kind(), exit(&unread)), ("rejected", 3));
         let lost = write_outcome(Error::unknown("lost"), "wrapped");
         assert_eq!(lost.kind(), "unknown");
     }
@@ -3100,15 +3087,27 @@ mod tests {
     /// definite. Only the hosted channel trusts the board's refusal table.
     #[test]
     fn a_coded_refusal_from_the_local_daemon_is_never_definite() {
-        let local = LocalChannel {
+        let daemon = LocalChannel {
             state_dir: Path::new("/nonexistent-cad2271"),
+            deadline: Instant::now(),
+        };
+        // The real hosted channel, never sent anything here.
+        let target = crate::remote_cli::RemoteTarget {
+            org: "synthetic".to_string(),
+            endpoint: "https://synthetic.invalid".to_string(),
+            org_id: "ws_synthetic".to_string(),
+            identity: None,
+        };
+        let hosted = RemoteChannel {
+            target: &target,
+            wake_timeout: 0,
             deadline: Instant::now(),
         };
         let mut codes = 0;
         for code in crate::remote_cli::wiki_copy_refusal_codes() {
-            let refusal = Error::invalid(code, "from the daemon");
-            assert!(!local.proves_unchanged(&refusal), "{code}");
-            assert!(hosted_stop_is_unchanged(&refusal), "{code}");
+            let refusal = Error::invalid(code, "refused");
+            assert!(!daemon.proves_unchanged(&refusal), "{code}");
+            assert!(hosted.proves_unchanged(&refusal), "{code}");
             codes += 1;
         }
         assert!(codes > 0);
@@ -3116,8 +3115,8 @@ mod tests {
             Error::busy_coded("timeout", "deadline elapsed"),
             Error::busy_coded("waking", "still waking"),
         ] {
-            assert!(!local.proves_unchanged(&stop), "{stop}");
-            assert!(hosted_stop_is_unchanged(&stop), "{stop}");
+            assert!(!daemon.proves_unchanged(&stop), "{stop}");
+            assert!(hosted.proves_unchanged(&stop), "{stop}");
         }
         for other in [
             Error::rejected("no code"),
@@ -3126,7 +3125,7 @@ mod tests {
             Error::internal("io: reset"),
             Error::unknown("reply lost"),
         ] {
-            assert!(!hosted_stop_is_unchanged(&other), "{other}");
+            assert!(!hosted.proves_unchanged(&other), "{other}");
         }
 
         // Through a whole copy: the same refusal after `apply` is a stop on a
