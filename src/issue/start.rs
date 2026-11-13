@@ -1580,7 +1580,7 @@ fn write_slot_env(wt_dir: &Path, pm_dir: &Path) -> Result<PathBuf> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    crate::worktree::record_lane_env(wt_dir);
+    crate::worktree::record_lane_env(wt_dir, &text);
     Ok(file)
 }
 

@@ -570,7 +570,7 @@ fn install_cargo_shim(wt_dir: &Path) -> Result<PathBuf> {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
     }
     std::fs::rename(&tmp, &file)?;
-    record_lane_env(wt_dir);
+    record_lane_env(wt_dir, &text);
     Ok(shim)
 }
 
@@ -584,19 +584,41 @@ fn lane_env_digest_path(wt_dir: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(dir.trim()).join(LANE_ENV_DIGEST))
 }
 
-/// Record the digest of the `.env` setup has just written in `wt_dir`.
-/// Best effort: without a record, hosted finish keeps refusing the `.env`
-/// as before, which is the safe side, so a failure never fails setup.
-pub(crate) fn record_lane_env(wt_dir: &Path) {
+/// The lines lane setup itself writes into a lane's `.env`: the cargo-shim
+/// `PATH` and the slot env (`write_slot_env`).
+const SETUP_ENV_PREFIXES: [&str; 4] = [
+    "PATH=",
+    "CARGO_BUILD_JOBS=",
+    "CADENCE_BUILD_SLOT=",
+    "export CADENCE_BUILD_SLOT=",
+];
+
+/// Record the digest of `written`, the `.env` setup has just written in
+/// `wt_dir`, but only when every line in it is one setup writes. Both writers
+/// keep any other line they find; a `.env` carrying one is never recorded as
+/// setup's, and an earlier record is dropped. Best effort: without a record,
+/// hosted finish keeps refusing the `.env`, which is the safe side, so a
+/// failure never fails setup.
+pub(crate) fn record_lane_env(wt_dir: &Path, written: &str) {
+    let Ok(path) = lane_env_digest_path(wt_dir) else {
+        return;
+    };
+    let setups = written
+        .lines()
+        .all(|line| SETUP_ENV_PREFIXES.iter().any(|p| line.starts_with(p)));
+    if !setups {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let tmp = path.with_extension("sha256.tmp");
     let write = || -> Result<()> {
-        let bytes = std::fs::read(wt_dir.join(".env"))?;
-        let path = lane_env_digest_path(wt_dir)?;
-        let tmp = path.with_extension("sha256.tmp");
-        std::fs::write(&tmp, crate::delegation::sha256_hex(&bytes))?;
+        std::fs::write(&tmp, crate::delegation::sha256_hex(written.as_bytes()))?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
     };
-    let _ = write();
+    if write().is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Whether `wt_dir/.env` is a regular file whose content is exactly what lane

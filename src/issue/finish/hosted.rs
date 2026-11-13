@@ -297,8 +297,8 @@ pub(crate) fn gh_merged_prs(slug: &str, branch: &str) -> Option<Value> {
 /// cache directory below is deleted with it; that is accepted.
 const ALLOWED_IGNORED: [&str; 1] = ["target/"];
 
-/// Dependency and bytecode caches a lane regenerates, deletable at any depth
-/// (CAD-2290): an ignored path with one of these as a whole segment.
+/// Dependency and bytecode cache directories a lane regenerates, deletable at
+/// any depth (CAD-2290).
 const CACHE_DIRS: [&str; 2] = ["node_modules", "__pycache__"];
 
 /// Whether an ignored path a hosted release may delete. Everything else
@@ -307,11 +307,24 @@ const CACHE_DIRS: [&str; 2] = ["node_modules", "__pycache__"];
 /// exactly what setup last recorded for this worktree (CAD-2290).
 fn removable_ignored(lane: &Path, entry: &str) -> bool {
     ALLOWED_IGNORED.iter().any(|a| entry.starts_with(a))
-        || entry
-            .trim_end_matches('/')
-            .split('/')
-            .any(|segment| CACHE_DIRS.contains(&segment))
+        || in_cache_dir(lane, entry)
         || (entry == ".env" && crate::worktree::lane_env_is_setups(lane))
+}
+
+/// Whether an ignored path is, or lies inside, a `node_modules` or
+/// `__pycache__` directory (or a symlink to one; removal unlinks it and leaves
+/// its target). The first such segment decides. A regular file with one of
+/// those names is not a cache: it stays the operator's.
+fn in_cache_dir(lane: &Path, entry: &str) -> bool {
+    let mut at = lane.to_path_buf();
+    for segment in entry.trim_end_matches('/').split('/') {
+        at.push(segment);
+        if CACHE_DIRS.contains(&segment) {
+            return std::fs::symlink_metadata(&at)
+                .is_ok_and(|meta| meta.is_dir() || meta.file_type().is_symlink());
+        }
+    }
+    false
 }
 
 /// A short sample of ignored paths a hosted release may not delete, or `None`.
@@ -364,4 +377,42 @@ fn refuse(reason: &str) -> Error {
          `git branch -d <branch>` (`-D` for a squash-merged branch, only after verifying \
          the merge). Nothing was removed"
     ))
+}
+
+#[cfg(test)]
+mod cache_dir_tests {
+    use super::in_cache_dir;
+    use std::fs;
+
+    #[test]
+    fn only_cache_directories_or_their_links_count_never_a_file_with_that_name() {
+        let lane = tempfile::tempdir().unwrap();
+        let root = lane.path();
+        fs::create_dir_all(root.join("ui/node_modules/pkg")).unwrap();
+        fs::create_dir_all(root.join("scripts/__pycache__")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/node_modules"), "operator notes\n").unwrap();
+        fs::write(root.join("docs/__pycache__"), "operator notes\n").unwrap();
+        fs::write(root.join("docs/notes.md"), "operator notes\n").unwrap();
+        std::os::unix::fs::symlink(root.join("ui/node_modules"), root.join("node_modules"))
+            .unwrap();
+
+        assert!(in_cache_dir(root, "ui/node_modules/"));
+        assert!(in_cache_dir(root, "ui/node_modules/pkg/index.js"));
+        assert!(in_cache_dir(root, "scripts/__pycache__/"));
+        assert!(in_cache_dir(root, "node_modules"));
+        assert!(
+            !in_cache_dir(root, "docs/node_modules"),
+            "a regular file is kept"
+        );
+        assert!(
+            !in_cache_dir(root, "docs/__pycache__"),
+            "a regular file is kept"
+        );
+        assert!(!in_cache_dir(root, "docs/notes.md"));
+        assert!(
+            !in_cache_dir(root, "missing/node_modules/"),
+            "absent is not a cache"
+        );
+    }
 }
