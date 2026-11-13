@@ -243,15 +243,16 @@
 .bz-addr { flex: 1 1 0; min-width: 0; display: flex; align-items: baseline; white-space: nowrap; overflow: hidden; font: var(--text-label) var(--font-mono); color: var(--color-ink-500); }
 .bz-host { flex: 0 0 auto; max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; color: var(--color-ink-100); font-weight: 600; }
 .bz-rest { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-/* A narrow drawer (push mode at a laptop width) leaves the first row no room for the address, which
-   would shrink to its last character. Below 560 px of panel width it takes its own row under the
-   header instead, still one line and clipped from the start, and the actions keep the right edge. */
+/* The address keeps the first row only while its whole host fits there (BrowserPanel measures it,
+   `data-addr`); otherwise it takes its own row under the header, so a host is never cut to its last
+   few characters at a laptop width. The title then pushes the actions and canvas controls right. */
+.bz-head[data-addr="below"] { flex-wrap: wrap; row-gap: 4px; }
+.bz-head[data-addr="below"] > .bz-title { margin-right: auto; }
+.bz-head[data-addr="below"] > .bz-addr { order: 10; flex: 1 0 100%; }
+/* A panel 420 px wide or less (a phone's sheet, or a small window's drawer) shows the actions as
+   icons; each keeps its accessible name. */
 .bz-panel { container: bz-panel / inline-size; }
-@container bz-panel (max-width: 560px) {
-  .bz-head:has(> .bz-addr) { flex-wrap: wrap; row-gap: 4px; }
-  .bz-head > .bz-addr { order: 10; flex: 1 0 100%; }
-  .bz-head:has(> .bz-addr) > .bz-actions { margin-left: auto; }
-}
+@container bz-panel (max-width: 420px) { .bz-actions .bz-lbl { display: none; } }
 
 .bz-body { gap: 12px; }
 .bz-body .sempty { flex: none; text-align: center; }
@@ -288,6 +289,9 @@
 .canvas-drawer[data-mode="sheet"] .cv-iconbtn { min-width: 2.25rem; min-height: 2.25rem; }
 .canvas-drawer[data-mode="sheet"] .cv-tab-close { min-width: 2.25rem; min-height: 2.25rem; }
 /* A phone's canvas is the whole screen with its actions in the header: the toast stays at the foot, clear of them.
-   Narrow: the address goes first, then the action labels (they keep their accessible names). */
-@media (max-width: 520px) { .canvas-drawer[data-mode="sheet"] .bz-addr { display: none; } }
-@media (max-width: 420px) { .canvas-drawer[data-mode="sheet"] .bz-actions .bz-lbl { display: none; } }
+   Narrow: the address goes first (the actions then keep the right edge), then the action labels (the
+   container rule above). */
+@media (max-width: 520px) {
+  .canvas-drawer[data-mode="sheet"] .bz-addr { display: none; }
+  .canvas-drawer[data-mode="sheet"] .bz-title { margin-right: auto; }
+}

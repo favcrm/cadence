@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FocusEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type FocusEvent } from "react";
 import { useTranslate } from "../../lib/locale";
 import { IconClose } from "../../ui/icons";
 import { useCanvas } from "./canvasStore";
@@ -88,10 +88,12 @@ function addressParts(address: string): { scheme: string; host: string; rest: st
   }
 }
 
-/** The last page the assistant read, inline in the header and outside the live
- *  view only: inside it the provider's own address bar is the one that matters.
- *  One line. The path gives way first; a host that still does not fit is clipped
- *  from its START, so the registrable end stays visible. */
+/** The last page the assistant read, in the header and outside the live view
+ *  only: inside it the provider's own address bar is the one that matters.
+ *  One line. The path gives way first. Inline in the first row only while the
+ *  whole host fits there (`hostFitsInRow`); otherwise on its own row under the
+ *  header, where a host that still does not fit is clipped from its START, so
+ *  the registrable end stays visible. */
 function Address({ url }: { url: string }) {
   const t = useTranslate();
   const parts = addressParts(url);
@@ -107,6 +109,28 @@ function Address({ url }: { url: string }) {
       )}
     </div>
   );
+}
+
+/** Whether the address's whole host fits in the room the header's first row
+ *  leaves it: the row's width less every other item on it and the gaps. That
+ *  room does not depend on where the address sits, so moving it to its own row
+ *  cannot flip the answer back. During a stop confirm the actions have their own
+ *  row and are not counted. Without layout (a test DOM) there is no decision. */
+function hostFitsInRow(head: HTMLElement): boolean {
+  const items = Array.from(head.children) as HTMLElement[];
+  const addr = items.find((el) => el.classList.contains("bz-addr"));
+  const host = addr?.querySelector<HTMLElement>(".bz-host");
+  if (!addr || !host || head.clientWidth === 0) return true;
+  const cs = getComputedStyle(head);
+  const gap = parseFloat(cs.columnGap) || 0;
+  let room = head.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+  const confirm = head.hasAttribute("data-confirm");
+  for (const el of items) {
+    if (el === addr || (confirm && el.classList.contains("bz-actions"))) continue;
+    if (getComputedStyle(el).display === "none") continue;
+    room -= el.offsetWidth + gap;
+  }
+  return host.scrollWidth <= room;
 }
 
 const Icon = ({ d, children }: { d?: string; children?: React.ReactNode }) => (
@@ -170,6 +194,34 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
   const asking = phase === "handoff" && !stopping && !showFrame;
   const loadingUrl = viewer.phase === "loading" ? viewer.url : null;
   const instructions = b.session?.instructions ?? "";
+
+  // Where the header puts the address: inline while its whole host fits, else
+  // on its own row. Measured again when the header or any item in it resizes,
+  // on the next frame so the move never feeds back into the same observation.
+  const head = useRef<HTMLElement | null>(null);
+  const [addrBelow, setAddrBelow] = useState(false);
+  const addrUrl = live && !showFrame ? b.session?.url ?? "" : "";
+  useLayoutEffect(() => {
+    const el = head.current;
+    if (!el || !addrUrl) {
+      setAddrBelow(false);
+      return;
+    }
+    const measure = () => setAddrBelow(!hostFitsInRow(el));
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    let frame = 0;
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(measure);
+    });
+    ro.observe(el);
+    for (const item of Array.from(el.children)) ro.observe(item);
+    return () => {
+      cancelAnimationFrame(frame);
+      ro.disconnect();
+    };
+  }, [addrUrl, b.stop, phase, viewing, fetching, sheet, expanded, st.text]);
 
   useEffect(() => {
     if (phase !== "handoff" && !viewOnly && (viewer.phase !== "idle" || fetching)) {
@@ -373,7 +425,7 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
       onFocus={onFocusIn}
       onBlur={onFocusOut}
     >
-      <header className="cv-head bz-head" data-confirm={b.stop === "confirm" || undefined}>
+      <header ref={head} className="cv-head bz-head" data-confirm={b.stop === "confirm" || undefined} data-addr={addrBelow ? "below" : undefined}>
         {sheet ? (
           <button type="button" className="cv-iconbtn cv-back" onClick={onClose} aria-label={t("Back to chat")}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
