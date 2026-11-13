@@ -35,9 +35,11 @@ impl Shared {
             .ok_or_else(|| {
                 Error::rejected("master ask-form: the turn's conversation cannot be resolved")
             })?;
-        if !thread.runs_as_home() {
+        // Home only: the Recruit conversation has no form renderer.
+        if !thread.is_home() {
             return Err(Error::rejected(
-                "master ask-form is made in the master's Home conversation",
+                "master ask-form is made in the master's Home conversation, \
+                 not Recruit or an app conversation",
             ));
         }
         self.prove_home_conversation(Some(&thread.id))?;

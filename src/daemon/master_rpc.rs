@@ -373,35 +373,25 @@ impl Shared {
         // narrowed to `MASTER_APP_ALLOWED`.
         let scope = self.master_turn_scope();
         if scope != MasterScope::Home {
-            // CAD-1767: say what is actually missing for a hire proposal -
-            // a live Home turn - instead of the app-conversation rule.
-            if method == "hire_propose" {
+            // CAD-1767 / CAD-2285: say what is actually missing for a verb
+            // bound to a live Home turn instead of the app-conversation rule.
+            let home_verb = match method {
+                "hire_propose" => Some("hire propose"),
+                "master_ask_form" => Some("master ask-form"),
+                _ => None,
+            };
+            if let Some(verb) = home_verb {
                 return Err(Error::invalid(
                     "master_refused",
                     match scope {
-                        MasterScope::App(_) => {
-                            "hire propose is made in the master's Home conversation, \
+                        MasterScope::App(_) => format!(
+                            "{verb} is made in the master's Home conversation, \
                              not in an app conversation"
-                        }
-                        _ => {
-                            "hire propose needs the master's live assigned turn in its \
+                        ),
+                        _ => format!(
+                            "{verb} needs the master's live assigned turn in its \
                              Home conversation - none is running"
-                        }
-                    },
-                ));
-            }
-            if method == "master_ask_form" {
-                return Err(Error::invalid(
-                    "master_refused",
-                    match scope {
-                        MasterScope::App(_) => {
-                            "master ask-form is made in the master's Home conversation, \
-                             not in an app conversation"
-                        }
-                        _ => {
-                            "master ask-form needs the master's live assigned turn in its \
-                             Home conversation - none is running"
-                        }
+                        ),
                     },
                 ));
             }

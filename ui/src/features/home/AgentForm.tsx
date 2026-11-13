@@ -1,6 +1,7 @@
-import { useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
 import { useWriteBlock } from "../auth/WriteGate";
+import { resources } from "../../lib/resources";
 import { carriesSecret } from "../app-shell/chat/directive";
 import { sendToMaster } from "./send";
 import { newMessageId, type FormStatus, type ThreadEntry } from "./thread";
@@ -21,6 +22,10 @@ type Data = Record<string, unknown>;
 export const ACTION_MARK = "\n\nA2UI action: ";
 
 const DRAFT = (seq: number) => `cadence.form.${seq}`;
+/** The daemon's tree limit (agent_form MAX_DEPTH). */
+const MAX_DEPTH = 4;
+/** The default check message; also the key it is translated by. */
+const CHECK = "Check this field.";
 
 function clock(at: string | null): string {
   if (!at) return "";
@@ -128,7 +133,7 @@ function failedCheck(c: Comp, data: Data): string | null {
           break;
       }
     }
-    if (!ok) return typeof rule.message === "string" && rule.message ? rule.message : "Check this field.";
+    if (!ok) return typeof rule.message === "string" && rule.message ? rule.message : CHECK;
   }
   return null;
 }
@@ -140,7 +145,7 @@ function walk(comps: Map<string, Comp>): Comp[] {
   const out: Comp[] = [];
   const visit = (id: string, depth: number) => {
     const c = comps.get(id);
-    if (!c || depth > 4) return;
+    if (!c || depth > MAX_DEPTH) return;
     out.push(c);
     const kids = Array.isArray(c.children) ? c.children : typeof c.child === "string" ? [c.child] : [];
     for (const k of kids) if (typeof k === "string") visit(k, depth + 1);
@@ -157,6 +162,11 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
   const [data, setData] = useState<Data>(() => (surface ? { ...surface.data, ...(open ? readDraft(entry.seq) ?? {} : {}) } : {}));
   const [errors, setErrors] = useState<Record<string, string>>({});
   const message = useRef(newMessageId());
+  const sent = useRef(false);
+  // A sent or closed form keeps no draft on this device.
+  useEffect(() => {
+    if (status.state === "sent" || status.state === "closed") writeDraft(entry.seq, null);
+  }, [status.state, entry.seq]);
   const root = useRef<HTMLElement>(null);
 
   if (!surface) {
@@ -168,7 +178,7 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
   }
   const order = walk(surface.comps);
   const title = order.find((c) => c.component === "Text" && typeof c.text === "string");
-  const disabled = !open || block !== null;
+  const disabled = status.state !== "open" || block !== null;
 
   const update = (path: string | null, value: unknown) => {
     if (path === null || disabled) return;
@@ -191,6 +201,8 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
   };
 
   const submit = (button: Comp) => {
+    // One send per form: a double click must not post a second, different action.
+    if (sent.current) return;
     const bad: Record<string, string> = {};
     for (const c of order) {
       const why = failedCheck(c, data);
@@ -199,7 +211,7 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
     if (Object.keys(bad).length > 0) {
       setErrors(bad);
       const first = order.find((c) => bad[c.id]);
-      root.current?.querySelector<HTMLElement>(`[data-form-field="${first?.id}"] :is(input,textarea,button)`)?.focus();
+      if (first) root.current?.querySelector<HTMLElement>(`[data-form-field="${CSS.escape(first.id)}"] :is(input,textarea,button)`)?.focus();
       return;
     }
     const event = ((button.action as Record<string, unknown> | undefined)?.event ?? {}) as { name?: unknown; context?: unknown };
@@ -215,13 +227,16 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
     const json = JSON.stringify(action);
     // The daemon already refuses reserved keys; never send one regardless.
     if (carriesSecret(json)) {
-      setErrors({ [button.id]: "Check this field." });
+      setErrors({ [button.id]: "This answer carries a reserved key and was not sent." });
       return;
     }
     // Host wording, not the agent's title: the lines echo the form's own labels.
     const text = [`Form answer (${surface.id}):`, ...lines].join("\n") + ACTION_MARK + json;
     writeDraft(entry.seq, null);
-    void sendToMaster(text, message.current, [{ kind: "surface", id: String(entry.seq) }]);
+    sent.current = true;
+    // The Home conversation the composer sends to, so the answer lands beside the form.
+    const conversation = resources.masterThread.get().data?.conversation;
+    void sendToMaster(text, message.current, [{ kind: "surface", id: String(entry.seq) }], undefined, conversation);
   };
 
   const field = (c: Comp, body: ReactNode, legend = true): ReactNode => {
@@ -233,19 +248,21 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
         {body}
         {err && (
           <p className="text-micro text-fail" id={`${id}-err`} role="alert">
-            {err === "Check this field." ? t(err) : err}
+            {err === CHECK ? t(err) : err}
           </p>
         )}
       </fieldset>
     );
   };
 
-  const render = (c: Comp | undefined): ReactNode => {
-    if (!c) return null;
-    const kids = (list: unknown) => (Array.isArray(list) ? list : []).map((k) => render(typeof k === "string" ? surface.comps.get(k) : undefined));
+  // The daemon checked the tree; the depth guard keeps a bad payload finite.
+  const render = (c: Comp | undefined, depth = 1): ReactNode => {
+    if (!c || depth > MAX_DEPTH) return null;
+    const kids = (list: unknown) =>
+      (Array.isArray(list) ? list : []).map((k) => render(typeof k === "string" ? surface.comps.get(k) : undefined, depth + 1));
     switch (c.component) {
       case "Card":
-        return <div key={c.id} className="agentform-col">{render(surface.comps.get(asText(c.child)))}</div>;
+        return <div key={c.id} className="agentform-col">{render(surface.comps.get(asText(c.child)), depth + 1)}</div>;
       case "Column":
         return <div key={c.id} className="agentform-col">{kids(c.children)}</div>;
       case "Row":
@@ -265,8 +282,9 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
           <div key={c.id} className="agentform-foot">
             {status.state === "failed" ? (
               <>
-                <button type="button" className="btn btn-sm btn-primary" onClick={() => void sendToMaster(status.pending.text, status.pending.message, status.pending.refs)} disabled={block !== null}>{t("Retry")}</button>
+                {/* One Retry: the answer's own row below resends the same message. */}
                 <span className="text-micro text-fail" role="alert">{status.pending.error ?? t("Not sent")}</span>
+                <span className="text-micro text-ink-500">{t("Use Retry on your message below.")}</span>
               </>
             ) : (
               <>
@@ -385,7 +403,7 @@ export default function AgentForm({ entry, status }: { entry: ThreadEntry; statu
           </span>
         </div>
         {render(surface.comps.get("root"))}
-        {status.state === "closed" && <p className="text-micro text-ink-500">{t("You answered in chat.")}</p>}
+        {status.state === "closed" && <p className="text-micro text-ink-500">{t("A newer message closed this form.")}</p>}
       </div>
     </section>
   );

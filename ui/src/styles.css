@@ -1029,8 +1029,9 @@ pre {
   gap: .375rem;
   margin-top: .5rem;
 }
-/* CAD-2285: the master's form. A board card; every control is an existing
-   board class (chip-btn, field, btn). The header's chip is its one status. */
+/* CAD-2285: the master's form. A board card built from board classes (card,
+   field, btn); its choices restyle chip-btn as input chips with a pressed
+   state. The header's chip is the form's one status. */
 .turn-artifacts > div:has(> .agentform) { flex-basis: 100%; }
 .agentform { max-width: min(100%, 32rem); overflow: hidden; }
 .agentform-body { padding: .75rem; display: grid; gap: .85rem; }

@@ -411,16 +411,17 @@ function SystemNote({
   );
 }
 
-/** The subjects an operator bubble cites (CAD-574 `refs`) — one chip
- *  each under the text. An `issue` ref is a real link to its page so a
- *  result sent with citations is one tap from the work it names
- *  (CAD-1574); other kinds stay a label. */
 /** CAD-2285: an operator message citing a form is that form's answer. */
 const isFormAnswer = (refs: ThreadRef[]): boolean => refs.some((r) => r.kind === "surface");
 /** The answer's readable lines; the A2UI action after them is for the master. */
 const formAnswerText = (text: string, refs: ThreadRef[]): string =>
   isFormAnswer(refs) ? text.split(ACTION_MARK)[0] : text;
 
+/** The subjects an operator bubble cites (CAD-574 `refs`) — one chip
+ *  each under the text, except a form answer's `surface` ref, which the
+ *  bubble names instead. An `issue` ref is a real link to its page so a
+ *  result sent with citations is one tap from the work it names
+ *  (CAD-1574); other kinds stay a label. */
 function RefChips({ refs: all, onOpenIssue }: { refs: ThreadRef[]; onOpenIssue?: (id: string) => void }) {
   const t = useTranslate();
   const refs = all.filter((r) => r.kind !== "surface");

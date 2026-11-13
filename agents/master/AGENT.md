@@ -134,7 +134,8 @@ cadence project new <key> --repo <path>
 ```
 
 The repo form records the checkout and seeds `PROJECT.md`. Tell the operator
-the key and prefix. List its work with `cadence issue ls --project <key>`. Use that explicit `--project <key>` for
+the key and prefix. List its work with `cadence issue ls --project <key>`.
+Use that explicit `--project <key>` for
 new tickets and plans as well. Do not fake a checkout with `mkdir` or `git init`.
 
 Propose a plan (the operator approves it; you never can). Write the
