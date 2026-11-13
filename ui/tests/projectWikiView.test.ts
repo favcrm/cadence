@@ -25,6 +25,7 @@ const FolderPane = (require("../src/features/wiki/FolderPane") as typeof import(
 const { WikiScopeContext } = require("../src/features/wiki/shared") as typeof import("../src/features/wiki/shared");
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { wiki, WikiError } = require("../src/features/wiki/api") as typeof import("../src/features/wiki/api");
+const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
 const { draftKey, stashDraft } = require("../src/features/wiki/editor") as typeof import("../src/features/wiki/editor");
 const requests: string[] = [];
 const imageFetchRequests: { path: string; headers: HeadersInit }[] = [];
@@ -35,12 +36,29 @@ let finishSave: (() => void) | null = null;
 let unavailable = false;
 let missing = false;
 let hostedHistory = false;
+let lifecycleState: "active" | "unknown" | "archived" = "active";
 const pagePath = "projects/cadence/README.md";
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 globalThis.fetch = async (input, init) => {
   const url = new URL(String(input), "http://localhost");
   requests.push(url.pathname + url.search);
   const path = url.searchParams.get("path") ?? "";
+  const lifecycle = /^\/api\/projects\/([^/]+)\/lifecycle$/.exec(url.pathname);
+  if (lifecycle) {
+    if (lifecycleState === "unknown") return json({ error: "unavailable" }, 503);
+    const archived = lifecycleState === "archived";
+    return json({
+      archive_capability: "cad2255.project-archive.v1",
+      project: decodeURIComponent(lifecycle[1]!),
+      archived,
+      revision: archived ? 1 : 0,
+      archived_at: archived ? "2026-11-01T00:00:00Z" : null,
+      archived_by: archived ? "operator" : null,
+      changed_at: archived ? "2026-11-01T00:00:00Z" : null,
+      changed_by: archived ? "operator" : null,
+      blockers: [],
+    });
+  }
   if (init?.method === "PUT" || init?.method === "POST") {
     const body = JSON.parse(String(init.body));
     writes.push(body);
@@ -159,6 +177,17 @@ async function run() {
   await render({ readOnly: false });
   const typing = host.querySelector("textarea");
   assert(typing, "editor still mounted");
+  lifecycleState = "unknown";
+  await React.act(async () => { await resources.projectLifecycle("cadence").refresh(); });
+  const gatedSave = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Save");
+  assert(typing.readOnly && gatedSave?.disabled === true, "an unavailable lifecycle makes project editing read-only");
+  assert(host.textContent?.includes("archive state could not be verified") && gatedSave.title.includes("archive state"), "read-only editing explains the lifecycle refusal");
+  lifecycleState = "archived";
+  await React.act(async () => { await resources.projectLifecycle("cadence").refresh(); });
+  assert(typing.readOnly, "an archived lifecycle keeps project editing read-only");
+  lifecycleState = "active";
+  await React.act(async () => { await resources.projectLifecycle("cadence").refresh(); });
+  assert(!typing.readOnly, "a current active receipt restores project editing");
   await React.act(() => {
     Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, "value")?.set?.call(typing, "A last second edit");
     typing.dispatchEvent(new win.Event("input", { bubbles: true }));
@@ -341,6 +370,23 @@ async function run() {
   assert(writes.length === beforeMove && folderErrors.some((error) => error.includes("inside this project")), "Move cannot leave the selected project's context");
   await renderFolder(true);
   assert(host.querySelector<HTMLButtonElement>("button[type='submit']")?.disabled && destination.disabled, "an open file form becomes disabled when the board is read-only");
+
+  lifecycleState = "archived";
+  await React.act(async () => { await resources.projectLifecycle("cadence").refresh(); });
+  const globalEntry = { name: "note.md", path: "global/note.md", kind: "page" as const };
+  await React.act(() => renderWithNavigation(React.createElement(FolderPane, { ...folderProps, entries: [globalEntry] })));
+  await React.act(() => host.querySelector<HTMLButtonElement>("[aria-label='note.md actions']")?.click());
+  await React.act(() => Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Move")?.click());
+  const target = host.querySelector<HTMLInputElement>("input[name='destination']");
+  assert(target, "a global file can name a move destination");
+  await React.act(() => {
+    Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")?.set?.call(target, "projects/cadence/note.md");
+    target.dispatchEvent(new win.Event("input", { bubbles: true }));
+  });
+  await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 180)); });
+  const moveIntoProject = host.querySelector<HTMLButtonElement>("button[type='submit']");
+  assert(moveIntoProject?.disabled === true && host.textContent?.includes("archived"), "a move into an archived project is refused before a write");
+  assert(writes.length === beforeMove, "the refused cross-project move sends no mutation");
   await React.act(() => view.unmount());
   console.log("project Wiki interaction checks passed");
 }

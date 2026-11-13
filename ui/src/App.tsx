@@ -25,7 +25,7 @@ import { applyDecisionDone, homeNeedIssueId, type HomeDecisionOpen, type MyWorkD
 import ProjectSettings from "./features/projects/ProjectSettings";
 import ProjectsOverview from "./features/projects/ProjectsOverview";
 import { readLifecycle } from "./features/projects/archiveContract";
-import { drawerArchiveGate, issuePageWriteBlock } from "./features/projects/drawerArchiveGate";
+import { drawerArchiveGate, issuePageWriteBlock, projectArchiveBlock } from "./features/projects/drawerArchiveGate";
 import IssuePage from "./features/issues/IssuePage";
 import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
 import Epics from "./features/projects/Epics";
@@ -260,6 +260,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     : null;
   const archivedRoute =
     routeArchive !== null && routeArchive.kind === "available" && routeArchive.receipt.archived;
+  const projectWriteBlock =
+    route.screen === "projects"
+      ? route.slug
+        ? projectArchiveBlock(route.slug, projectLifecycleState)
+        : "Select a project to verify its archive state before changing its work."
+      : null;
   const projectIssueState = useMaybeResource(
     archivedRoute && route.screen === "projects" && route.slug ? resources.projectIssues(route.slug) : null,
   );
@@ -311,7 +317,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     routeSlugOutsideActive &&
     !archivedRoute &&
     projectLifecycleState !== null &&
-    (routeArchive?.kind === "unknown" || routeArchive?.kind === "unreadable");
+    (projectLifecycleState.status === "failed" ||
+      projectLifecycleState.status === "stale" ||
+      routeArchive?.kind === "unknown" ||
+      routeArchive?.kind === "unreadable" ||
+      routeArchive?.kind === "unavailable");
   const routeArchivedPending: "reading" | "unproved" | undefined = routeArchiveReading
     ? "reading"
     : routeArchiveUnproved
@@ -1490,6 +1500,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onToast={(text) => say("ok", text)}
           />
         </>)}
+        {route.screen === "projects" &&
+          ["issues", "epics", "workflows"].includes(route.section) &&
+          projectWriteBlock !== null && (
+            <p className="roadmap-notice px-4 lg:px-8" role="status">{t(projectWriteBlock)}</p>
+          )}
         {route.screen === "projects" && route.section === "issues" && (
           <Board
             issues={routeIssues}
@@ -1501,7 +1516,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             view={view}
             onView={setView}
             query={query}
-            readOnly={readOnly || archivedRoute || meta === null}
+            readOnly={readOnly || projectWriteBlock !== null || meta === null}
+            writeReason={block === null ? projectWriteBlock : null}
             sessionId={meta === null ? undefined : meta.session?.id ?? null}
             hosted={meta?.hosted === true}
             actor={actor}
@@ -1519,7 +1535,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <Epics
             project={route.slug}
             issues={routeIssues}
-            viewer={archivedRoute ? { ...viewer, readOnly: true } : viewer}
+            viewer={projectWriteBlock !== null ? { ...viewer, readOnly: true } : viewer}
             onOpenIssue={openIssue}
             onRetry={retryRouteIssues}
           />
@@ -1530,7 +1546,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {route.screen === "projects" && route.slug && route.section === "workflows" && (
           <Workflows
             project={route.slug}
-            viewer={archivedRoute ? { ...viewer, readOnly: true } : viewer}
+            viewer={projectWriteBlock !== null ? { ...viewer, readOnly: true } : viewer}
             onOpenIssue={openIssue}
             onHome={() => goRoute({ screen: "home" })}
           />
@@ -1540,8 +1556,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             noWiki={!wikiAvailable(meta)}
             hosted={hosted}
             viewerSub={viewerSub}
-            readOnly={readOnly || archivedRoute}
-            readOnlyReason={archivedRoute ? "This project is archived — restore it before changing its context." : block}
+            readOnly={readOnly || projectWriteBlock !== null}
+            readOnlyReason={projectWriteBlock ?? block}
             actor={actor}
             onToast={say}
             navHref={hrefFor}

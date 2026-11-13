@@ -9,8 +9,8 @@ export const UNVERIFIED_WRITE_BLOCK =
   "This project's archive state could not be verified, so its work stays read-only until it answers.";
 
 /**
- * CAD-2255: the write gate for one project's work (an issue drawer, a direct
- * issue page).
+ * CAD-2255: the shared UI write gate for one project's work, including
+ * project routes, the wiki, an issue drawer and a direct issue page.
  *
  * Only a lifecycle read that is CURRENT (no refresh in flight, last read
  * succeeded), names `project`, and proves it ACTIVE unlocks. A cached active
@@ -18,7 +18,7 @@ export const UNVERIFIED_WRITE_BLOCK =
  * the project since that answer. Unknown, unavailable, stale, failed,
  * malformed or archived all block.
  */
-function projectArchiveBlock(project: string, state: ResourceState<unknown> | null): string | null {
+export function projectArchiveBlock(project: string, state: ResourceState<unknown> | null): string | null {
   const current =
     state !== null &&
     !state.inFlight &&

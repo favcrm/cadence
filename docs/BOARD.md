@@ -395,6 +395,16 @@ boards also refuse new private policies until isolation is qualified. Selecting
 Private in the editor is only a draft while that gate is closed; it cannot be
 saved.
 
+Project work controls require a current active lifecycle receipt. An archived,
+missing, stale or unreadable receipt keeps the project read-only; the
+cross-project Issues view requires a project selection before editing. An open
+issue draft keeps its own project gate even when the route changes, and reports
+also check the actual triage project. The Wiki checks project-scoped pages and
+both the original and destination paths of moves and restores. These are
+presentation safeguards, not an authoritative
+write fence. Native archive remains unavailable until the old-writer and
+offline-clone cutover is enforced outside the browser.
+
 `POST /api/assist/job_request` requires a JSON `issue` field (the hosted
 platform call uses `arguments.issue`): an existing issue in a project the
 member can read. Every valid request is accepted durably, whether the issue

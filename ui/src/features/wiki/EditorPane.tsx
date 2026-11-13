@@ -18,7 +18,7 @@ import {
 } from "./editor";
 import { diffCounts, lineDiff, type DiffLine } from "./diff";
 import Button from "../../ui/Button";
-import { Failure, Loading, WikiToolbar } from "./shared";
+import { Failure, Loading, Note, WikiToolbar } from "./shared";
 
 /**
  * The editor (CAD-581): source on the left, live preview on the right.
@@ -46,12 +46,14 @@ export default function EditorPane({
   path,
   navHref,
   readOnly,
+  readOnlyReason,
   onToast,
   onSaved,
 }: {
   path: string;
   navHref: (route: Route) => string;
   readOnly: boolean;
+  readOnlyReason?: string | null;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onSaved: () => void;
 }) {
@@ -137,7 +139,7 @@ export default function EditorPane({
   const save = async () => {
     if (savingRef.current || !dirty || status !== "ready") return;
     if (readOnly) {
-      onToast("err", "writes are disabled on this board — sign in with editing access to edit.");
+      onToast("err", readOnlyReason ?? "writes are disabled on this board — sign in with editing access to edit.");
       return;
     }
     savingRef.current = true;
@@ -228,11 +230,12 @@ export default function EditorPane({
             onClick={() => void save()}
             loading={saving}
             disabled={readOnly || !dirty}
-            title={readOnly ? t("Sign in with editing access to edit") : undefined}
+            title={readOnly ? readOnlyReason ?? t("Sign in with editing access to edit") : undefined}
           >
             {t("Save")}
           </Button>
       </>} />
+      {readOnly && readOnlyReason && <Note warn>{readOnlyReason}</Note>}
 
       {conflict && (
         <div className="wk-conflict" role="alert">

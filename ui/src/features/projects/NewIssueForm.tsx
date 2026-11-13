@@ -1,9 +1,12 @@
-import { useId, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { api, type WriteResp } from "../../lib/api";
+import { resources } from "../../lib/resources";
+import { useMaybeResource } from "../../lib/useResource";
 import type { Project } from "../../lib/types";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import { useLocale } from "../../lib/locale";
+import { projectArchiveBlock, UNVERIFIED_WRITE_BLOCK } from "./drawerArchiveGate";
 
 /**
  * What the create form files: a plain task, or a report — a
@@ -55,10 +58,26 @@ export default function NewIssueForm({
   const kindId = useId();
   const detailsId = useId();
   const projectKey = project === "all" ? selProject : project;
+  const projectResource = projectKey ? resources.projectLifecycle(projectKey) : null;
+  const projectState = useMaybeResource(projectResource);
+  const triageResource = kind !== "task" && kind !== "idea" && projectKey !== "cadence"
+    ? resources.projectLifecycle("cadence")
+    : null;
+  const triageState = useMaybeResource(triageResource);
+  useEffect(() => {
+    if (projectResource) void projectResource.revalidate();
+  }, [projectResource]);
+  useEffect(() => {
+    if (triageResource) void triageResource.revalidate();
+  }, [triageResource]);
+  const projectBlock = projectKey ? projectArchiveBlock(projectKey, projectState) : UNVERIFIED_WRITE_BLOCK;
+  const triageBlock = triageResource ? projectArchiveBlock("cadence", triageState) : null;
+  const formReadOnly = readOnly || projectBlock !== null || triageBlock !== null;
+  const formReason = writeReason ?? projectBlock ?? triageBlock;
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const t = title.trim();
-    if (!t || !projectKey || readOnly || pending.current) return;
+    if (!t || !projectKey || formReadOnly || pending.current) return;
     pending.current = true;
     setError(null);
     setBusy(true);
@@ -116,7 +135,7 @@ export default function NewIssueForm({
       <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(9rem,14rem)_7rem] items-end">
         <div className="min-w-0">
           <label className="slabel block mb-1" htmlFor={fieldId}>{t("Title")}</label>
-          <input id={fieldId} name="title" autoFocus required maxLength={200} value={title} onChange={(event) => setTitle(event.target.value)} disabled={busy || readOnly} className="field w-full" placeholder={t("What needs to happen?")} />
+          <input id={fieldId} name="title" autoFocus required maxLength={200} value={title} onChange={(event) => setTitle(event.target.value)} disabled={busy || formReadOnly} className="field w-full" placeholder={t("What needs to happen?")} />
         </div>
         {project === "all" ? (
           <div className="min-w-0">
@@ -126,13 +145,13 @@ export default function NewIssueForm({
         ) : <div className="min-w-0"><span className="slabel block mb-1">{t("Project")}</span><span className="block text-label text-ink-300 py-2">{projectKey}</span></div>}
         <div className="min-w-0">
           <label className="slabel block mb-1" htmlFor={priorityId}>{t("Priority")}</label>
-          <Select id={priorityId} full value={priority} onChange={setPriority} disabled={busy || readOnly} options={["P0", "P1", "P2", "P3"].map((p) => ({ value: p, label: p }))} />
+          <Select id={priorityId} full value={priority} onChange={setPriority} disabled={busy || formReadOnly} options={["P0", "P1", "P2", "P3"].map((p) => ({ value: p, label: p }))} />
         </div>
       </div>
       <div className="grid gap-3 sm:grid-cols-[minmax(9rem,14rem)_minmax(0,1fr)] items-start mt-3">
         <div className="min-w-0">
           <label className="slabel block mb-1" htmlFor={kindId}>{t("Kind")}</label>
-          <Select id={kindId} full value={kind} onChange={(v) => { const k = v as NewIssueKind; setKind(k); setPriority(k === "task" || k === "bug" ? "P2" : "P3"); }} disabled={busy || readOnly} options={KIND_OPTIONS.map((option) => ({ ...option, label: t(option.label) }))} />
+          <Select id={kindId} full value={kind} onChange={(v) => { const k = v as NewIssueKind; setKind(k); setPriority(k === "task" || k === "bug" ? "P2" : "P3"); }} disabled={busy || readOnly || projectBlock !== null} options={KIND_OPTIONS.map((option) => ({ ...option, label: t(option.label) }))} />
           {kind === "idea" && (
             <p className="text-micro text-ink-500 mt-1">{t("Files into")} {projectKey || t("this project")} {t("and triggers research + a plan draft.")}</p>
           )}
@@ -142,13 +161,13 @@ export default function NewIssueForm({
         </div>
         <div className="min-w-0">
           <label className="slabel block mb-1" htmlFor={detailsId}>{t("Details")} <span className="text-ink-500">({t("optional")})</span></label>
-          <textarea id={detailsId} rows={3} maxLength={32768} value={details} onChange={(event) => setDetails(event.target.value)} disabled={busy || readOnly} className="field w-full !h-auto py-2 text-secondary" placeholder={t(kind === "task" ? "Acceptance, context, links…" : "What happened, what you expected, what you tried…")} />
+          <textarea id={detailsId} rows={3} maxLength={32768} value={details} onChange={(event) => setDetails(event.target.value)} disabled={busy || formReadOnly} className="field w-full !h-auto py-2 text-secondary" placeholder={t(kind === "task" ? "Acceptance, context, links…" : "What happened, what you expected, what you tried…")} />
         </div>
       </div>
       {error && <p className="text-label text-fail mt-3" role="alert">{t("Could not create issue:")} {error}</p>}
-      {readOnly && <p className="text-label text-ink-400 mt-3" role="status">{t("Draft saved.")} {writeReason ?? t("Writes are unavailable.")}</p>}
+      {formReadOnly && <p className="text-label text-ink-400 mt-3" role="status">{t("Draft saved.")} {formReason ?? t("Writes are unavailable.")}</p>}
       <div className="flex justify-end mt-3">
-        <Button variant="primary" type="submit" loading={busy} disabled={readOnly || !title.trim() || !projectKey}>{kind === "task" ? t("Create issue") : `${t("File")} ${t(kind)}`}</Button>
+        <Button variant="primary" type="submit" loading={busy} disabled={formReadOnly || !title.trim() || !projectKey}>{kind === "task" ? t("Create issue") : `${t("File")} ${t(kind)}`}</Button>
       </div>
     </form>
   );

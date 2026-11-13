@@ -6,7 +6,9 @@ import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
 import { IconLock, IconRestore, IconWarning } from "../../ui/icons";
+import { UNVERIFIED_WRITE_BLOCK } from "../projects/drawerArchiveGate";
 import { wiki, WikiError, type TrashEntry, type TrashLanding } from "./api";
+import { useWikiArchiveBlock } from "./archiveGate";
 import { baseName } from "./paths";
 import { confirmedRestoreDestination, destinationError, kindWord, mergeEntries, mergeLandings, restoreBlock } from "./trash";
 import { EmptyCard, Failure, KindIcon, Loading, Note } from "./shared";
@@ -398,10 +400,16 @@ function LandingDetail({ landing, navHref, readOnly, readOnlyReason, onBack, onR
   // One landing is one move: a second click before the first answer must
   // not send a second restore.
   const inFlight = useRef(false);
+  const sourceArchiveBlock = useWikiArchiveBlock(landing.path);
+  const destinationArchiveBlock = useWikiArchiveBlock(destination.trim(), true);
+  const archiveBlock = !landing.path
+    ? UNVERIFIED_WRITE_BLOCK
+    : sourceArchiveBlock ?? destinationArchiveBlock;
 
   const block = restoreBlock(landing);
   const blocked = block ?? serverBlock;
-  const canRestore = !blocked && !readOnly && landing.from !== null && !outcome?.reload;
+  const canEditDestination = !blocked && !readOnly && landing.from !== null && !outcome?.reload;
+  const canRestore = canEditDestination && archiveBlock === null;
 
   useEffect(() => {
     heading.current?.focus();
@@ -709,6 +717,7 @@ function LandingDetail({ landing, navHref, readOnly, readOnlyReason, onBack, onR
           {readOnly && (
             <Note warn>{readOnlyReason ?? t("Writes are disabled on this board.")}</Note>
           )}
+          {archiveBlock && <Note warn>{archiveBlock}</Note>}
 
           {landing.from !== null && (
             <>
@@ -722,7 +731,7 @@ function LandingDetail({ landing, navHref, readOnly, readOnlyReason, onBack, onR
                 spellCheck={false}
                 autoComplete="off"
                 autoCapitalize="off"
-                disabled={!canRestore || busy}
+                disabled={!canEditDestination || busy}
                 aria-invalid={touched && localError ? "true" : "false"}
                 aria-describedby="wk-restore-hint wk-restore-state"
                 onChange={(event) => { setTouched(true); setDestination(event.target.value); }}
@@ -800,7 +809,7 @@ function LandingDetail({ landing, navHref, readOnly, readOnlyReason, onBack, onR
           </dl>
           <div className="wk-actions">
             <Button onClick={() => setConfirming(false)}>{t("Cancel")}</Button>
-            <Button variant="primary" loading={busy} onClick={() => { setConfirming(false); void attempt(); }}>
+            <Button variant="primary" loading={busy} disabled={!canRestore} onClick={() => { setConfirming(false); void attempt(); }}>
               {t("Restore")}
             </Button>
           </div>

@@ -16,6 +16,7 @@ import {
   type WikiListing,
   type WikiPage,
 } from "./api";
+import { useWikiArchiveBlock } from "./archiveGate";
 import { isCollectionRoot, readRevision } from "./knowledge";
 import CollectionPane from "./CollectionPane";
 import { treeRows } from "./tree";
@@ -92,11 +93,14 @@ function unavailableRevision(error: unknown): boolean {
   );
 }
 
-export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, onToast, scope, hosted, viewerSub, operator }: WikiProps) {
+export default function Wiki({ route, navHref, readOnly: boardReadOnly, readOnlyReason: boardReadOnlyReason, actor, onToast, scope, hosted, viewerSub, operator }: WikiProps) {
   const t = useTranslate();
   const root = scope?.root ?? "";
   const current = route.path ?? root;
   const validPath = withinScope(current, root);
+  const archiveBlock = useWikiArchiveBlock(current);
+  const readOnly = boardReadOnly || archiveBlock !== null;
+  const readOnlyReason = archiveBlock ?? boardReadOnlyReason;
   const trashMode = route.mode === "trash";
   // Trash is the workspace's, not a project context's, and only a proven
   // operator gets the entry. A proven non-operator gets no discovery at all.
@@ -335,6 +339,7 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
               path={route.path}
               navHref={navHref}
               readOnly={readOnly}
+              readOnlyReason={readOnlyReason}
               onToast={onToast}
               onSaved={() => {
                 refresh();
@@ -480,7 +485,7 @@ function BrowsePane({
   if (!open || open.path !== path) return <Loading what="loading the wiki…" />;
 
   const write = async () => {
-    if (!creating) return;
+    if (!creating || readOnly) return;
     const name = creating.value.trim();
     if (!name) return;
     if (name.includes("/") || !withinScope(joinPath(dir, name), scope?.root ?? "")) {
@@ -525,7 +530,7 @@ function BrowsePane({
         value={creating.value}
         onChange={(e) => setCreating({ ...creating, value: e.target.value })}
       />
-      <Button variant="primary" onClick={() => void write()} disabled={busy}>
+      <Button variant="primary" onClick={() => void write()} disabled={busy || readOnly}>
         create
       </Button>
       <Button onClick={() => setCreating(null)}>cancel</Button>
@@ -596,7 +601,7 @@ function BrowsePane({
   }
 
   const page = open.page;
-  if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} hosted={hosted} viewerSub={viewerSub} section={section} citedPage={citedPage} />;
+  if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} readOnlyReason={readOnly ? readOnlyReason : null} hosted={hosted} viewerSub={viewerSub} section={section} citedPage={citedPage} />;
   return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} hosted={hosted} viewerSub={viewerSub} />;
 }
 

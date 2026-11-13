@@ -28,6 +28,18 @@ const Detail = (props: React.ComponentProps<typeof DetailComponent>) =>
   React.createElement(LocaleProvider, null,
     React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(DetailComponent, props) }));
 const { api } = require("../src/lib/api") as typeof import("../src/lib/api");
+const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
+const originalLifecycle = api.projectLifecycle;
+let unverifiedProject: string | null = null;
+(api as any).projectLifecycle = async (project: string) => {
+  if (project === unverifiedProject) throw new Error("offline");
+  return {
+    archive_capability: "cad2255.project-archive.v1",
+    project, archived: false, revision: 0,
+    archived_at: null, archived_by: null, changed_at: null, changed_by: null,
+    blockers: [],
+  };
+};
 const { NO_FILTERS } = require("../src/lib/filters") as typeof import("../src/lib/filters");
 type Card = import("../src/lib/types").IssueCard;
 function assert(value: unknown, what: string): asserts value { if (!value) throw new Error(what); }
@@ -161,6 +173,18 @@ async function run() {
     assert(host.querySelector("form.board-new-issue") === form && title.value === "Draft for cadence", "switching to board keeps the draft");
     await render({ project: "other", projects });
     assert(host.querySelector("form.board-new-issue") === form && form.textContent?.includes("Start work in cadence"), "changing workspace scope does not silently retarget an open draft");
+    unverifiedProject = "cadence";
+    await React.act(async () => { await resources.projectLifecycle("cadence").refresh(); });
+    assert(title.disabled && title.value === "Draft for cadence", "an unverified original project locks the pinned draft without losing it");
+    let refusedWrites = 0;
+    const createBeforeRefusal = api.create;
+    (api as any).create = async () => { refusedWrites++; return { card }; };
+    await React.act(async () => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    assert(refusedWrites === 0, "the pinned draft cannot submit under another project's lifecycle");
+    (api as any).create = createBeforeRefusal;
+    unverifiedProject = null;
+    await React.act(async () => { await resources.projectLifecycle("cadence").refresh(); });
+    assert(!title.disabled, "the pinned draft unlocks when its own project is proved active");
     await render({ project: "all", projects });
     assert(host.querySelector("form.board-new-issue") === form && form.textContent?.includes("Start work in cadence"), "returning to all projects keeps a scoped draft pinned");
     const original = api.create;
@@ -244,6 +268,7 @@ async function run() {
     await React.act(() => drawerRoot.unmount());
     assert(document.activeElement === opener, "closing the detail returns focus to its trigger");
   }
+  (api as any).projectLifecycle = originalLifecycle;
   console.log(`issueBoardUX ${scenario}: passed`);
 }
 run().catch((error) => { console.error(error); throw error; });

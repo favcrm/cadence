@@ -3,6 +3,7 @@ import type { Route } from "../../lib/router";
 import Link from "../../ui/Link";
 import { IconFolder, IconGrid, IconList, IconMore, IconTrash } from "../../ui/icons";
 import { wiki, WikiError, wikiBlob, type WikiEntry } from "./api";
+import { useWikiArchiveBlock, wikiPathProject } from "./archiveGate";
 import { baseName, joinPath, parentPath } from "./paths";
 import { withinScope } from "./scope";
 import { kindLabel, previewKind } from "./preview";
@@ -51,6 +52,20 @@ export default function FolderPane({
   const [dialog, setDialog] = useState<{ kind: "rename" | "move"; entry: WikiEntry; value: string } | null>(null);
   const [confirm, setConfirm] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const fromBlock = useWikiArchiveBlock(dialog?.entry.path ?? null);
+  const destination = dialog
+    ? dialog.kind === "rename"
+      ? joinPath(parentPath(dialog.entry.path), dialog.value.trim())
+      : dialog.value.trim()
+    : null;
+  const destinationProof = destination !== null && scope && !withinScope(destination, scope.root)
+    ? null
+    : destination;
+  const destinationBlock = useWikiArchiveBlock(
+    destinationProof,
+    wikiPathProject(destinationProof) !== wikiPathProject(dialog?.entry.path ?? null),
+  );
+  const archiveBlock = fromBlock ?? destinationBlock;
   const fieldId = useId();
   const menuId = useId();
   const menuTrigger = useRef<HTMLButtonElement | null>(null);
@@ -92,7 +107,7 @@ export default function FolderPane({
   };
 
   const submit = async () => {
-    if (!dialog || busy || readOnly) return;
+    if (!dialog || busy || readOnly || archiveBlock !== null) return;
     const value = dialog.value.trim();
     if (!value) return;
     const from = dialog.entry.path;
@@ -120,6 +135,7 @@ export default function FolderPane({
   };
 
   const remove = async (entry: WikiEntry) => {
+    if (readOnly) return;
     setBusy(true);
     try {
       // Both hosts answer the landing this delete created. Name it as the
@@ -305,8 +321,9 @@ export default function FolderPane({
             value={dialog.value}
             onChange={(e) => setDialog({ ...dialog, value: e.target.value })}
           />
+          {archiveBlock && <Note warn>{archiveBlock}</Note>}
           <div className="wk-tools">
-            <Button type="submit" variant="primary" loading={busy} disabled={readOnly}>
+            <Button type="submit" variant="primary" loading={busy} disabled={readOnly || archiveBlock !== null}>
               {dialog.kind === "rename" ? t("Rename") : t("Move")}
             </Button>
             <Button disabled={busy} onClick={closeDialog}>{t("Cancel")}</Button>
@@ -323,7 +340,7 @@ export default function FolderPane({
           <div className="wk-tools">
             <Button
               variant="danger"
-              disabled={busy}
+              disabled={busy || readOnly}
               onClick={() => {
                 const entry = rows.find((r) => r.path === confirm);
                 if (entry) void remove(entry);

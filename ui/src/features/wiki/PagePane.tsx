@@ -12,10 +12,11 @@ import { whoLabel } from "./hosted";
 import PageText from "./PageText";
 
 /** The same document toolbar and reader in Wiki and project Context. */
-export default function PagePane({ page, navHref, readOnly, hosted, section, citedPage, viewerSub }: {
+export default function PagePane({ page, navHref, readOnly, readOnlyReason, hosted, section, citedPage, viewerSub }: {
   page: WikiPage;
   navHref: (route: Route) => string;
   readOnly: boolean;
+  readOnlyReason?: string | null;
   /** A hosted Worker board: it serves a pinned page's text, not the transfer export route. */
   hosted?: boolean;
   section?: string;
@@ -63,9 +64,10 @@ export default function PagePane({ page, navHref, readOnly, hosted, section, cit
           {page.historical && canDownload && <Button onClick={() => void download()}>{t("Download original")}</Button>}
           {page.historical && <Button href={navHref({ screen: "wiki", mode: "browse", path: page.path, query: null })}>{t("Open the current revision")}</Button>}
           <Button variant="primary" disabled={readOnly}
-            title={readOnly ? t("Sign in with editing access to edit") : undefined}
+            title={readOnly ? readOnlyReason ?? (page.historical ? t("Open the current revision to edit") : t("Sign in with editing access to edit")) : undefined}
             href={readOnly ? undefined : navHref({ screen: "wiki", mode: "edit", path: page.path, query: null })}>{t("Edit")}</Button>
       </>} />
+      {readOnly && readOnlyReason && <Note warn>{readOnlyReason}</Note>}
       {page.historical && <Note>{t("Pinned revision")} <span className="num">{page.rev}</span>. {t("Open the current revision to read the live page.")}</Note>}
       {section && <p className="wk-meta">{t("Cited section")}: {section}</p>}
       {citedPage !== undefined && <p className="wk-meta">{t("Cited page")}: {citedPage}</p>}

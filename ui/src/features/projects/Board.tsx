@@ -156,6 +156,8 @@ interface Props {
   onView: (view: ProjectView) => void;
   query: string;
   readOnly: boolean;
+  /** A project-specific reason shown separately above this board. */
+  writeReason?: string | null;
   /** Undefined while metadata is unresolved; null when resolved without a session. */
   sessionId?: string | null;
   /** A hosted board writes to its own store; the local source/daemon footer is not true there. */
@@ -182,6 +184,7 @@ export default function Board({
   onView,
   query,
   readOnly,
+  writeReason,
   sessionId,
   hosted = false,
   actor,
@@ -195,7 +198,8 @@ export default function Board({
   onAgents,
 }: Props) {
   const { t, formatNumber, locale } = useLocale();
-  const block = useWriteBlock(readOnly);
+  const boardBlock = useWriteBlock(readOnly);
+  const block = writeReason ?? boardBlock;
   const [over, setOver] = useState<string | null>(null);
   const [newOpen, setNewOpen] = useState(false);
   const [draftSession, setDraftSession] = useState<string | null>(null);
@@ -672,7 +676,7 @@ export default function Board({
           {t("source:")} {(health !== null && health !== "unavailable" ? health.pm_dir : null) ?? "~/pm"} {t("issue folders")} ·{" "}
           /var/www/agent-notes {t("chains")} · {t("cadence daemon socket")} ·{" "}
           {readOnly
-            ? `${t("writes are disabled")} — ${block}`
+            ? `${t("writes are disabled")}${writeReason ? "" : ` — ${block}`}`
             : `${t("writes commit as")} ${actor}.`}
         </footer>
       )}
