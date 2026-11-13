@@ -79,10 +79,16 @@ function unavailableMessage(
   if (status === 404) {
     return t("Audio transcription is not enabled on this board.");
   }
-  if (code === "insufficient_balance") {
+  if (status === 402 || code === "insufficient_funds" || code === "insufficient_balance") {
     return t("Workspace credits are insufficient for audio transcription.");
   }
-  if (code === "unpriced_default" || code === "not_configured" || code === "provider_unavailable") {
+  if (
+    code === "disabled" ||
+    code === "speech_unavailable" ||
+    code === "unpriced_default" ||
+    code === "not_configured" ||
+    code === "provider_unavailable"
+  ) {
     return t("Speech transcription is not configured for this workspace yet.");
   }
   return t("Audio transcription is currently unavailable. Try again shortly.");
@@ -92,11 +98,14 @@ function transcribeFailureMessage(
   code: string | null,
   t: (english: string) => string,
 ): string {
-  if (code === "insufficient_balance") {
+  if (code === "insufficient_funds" || code === "insufficient_balance") {
     return t("Workspace credits are insufficient to finish transcribing.");
   }
-  if (code === "rate_limited") {
+  if (code === "rate_limited" || code === "idempotency_in_progress" || code === "uncertain") {
     return t("Speech transcription is busy right now. Retry the failed segment.");
+  }
+  if (code === "disabled" || code === "speech_unavailable") {
+    return t("Speech transcription is not configured for this workspace yet.");
   }
   if (code === "audio_too_large" || code === "unsupported_audio_format") {
     return t("One audio segment could not be accepted by the speech service.");
@@ -179,6 +188,9 @@ export default function ScreenAudioModal({
   const segmentsRef = useRef<SegmentItem[]>([]);
   segmentsRef.current = segments;
 
+  const onResolveRef = useRef(onResolve);
+  onResolveRef.current = onResolve;
+
   const finishOnce = (result: ActionResult) => {
     if (resolvedRef.current) return;
     resolvedRef.current = true;
@@ -187,7 +199,7 @@ export default function ScreenAudioModal({
     if (liveRecorder) {
       void liveRecorder.abort();
     }
-    onResolve(result);
+    onResolveRef.current(result);
   };
 
   // Abort if parent screen unmounts or private session pauses.
@@ -286,6 +298,7 @@ export default function ScreenAudioModal({
     const next = segmentsRef.current.find((item) => item.status === "queued");
     if (!next) return;
 
+    const activeSession = sessionNonceRef.current;
     pumpingRef.current = true;
     setSegments((prev) =>
       prev.map((item) =>
@@ -314,7 +327,7 @@ export default function ScreenAudioModal({
           }),
         });
         const body = (await res.json().catch(() => null)) as TranscribeReply | Record<string, unknown> | null;
-        if (signal.aborted || resolvedRef.current) return;
+        if (signal.aborted || resolvedRef.current || sessionNonceRef.current !== activeSession) return;
         if (!res.ok || !body || typeof (body as TranscribeReply).text !== "string") {
           const code = readErrorCode(body) ?? "failed";
           setSegments((prev) =>
@@ -332,7 +345,7 @@ export default function ScreenAudioModal({
           );
         }
       } catch {
-        if (!signal.aborted && !resolvedRef.current) {
+        if (!signal.aborted && !resolvedRef.current && sessionNonceRef.current === activeSession) {
           setSegments((prev) =>
             prev.map((item) =>
               item.requestId === next.requestId ? { ...item, status: "failed", errorCode: "network" } : item,
@@ -388,6 +401,9 @@ export default function ScreenAudioModal({
   };
 
   const resetCaptureState = (nextMode: ScreenAudioMode) => {
+    if (hasUnsavedCapture && !window.confirm(t("Discard the current audio capture and start over?"))) {
+      return;
+    }
     sessionNonceRef.current = randomSessionId();
     setActiveMode(nextMode);
     setRecordPhase("idle");
@@ -406,20 +422,22 @@ export default function ScreenAudioModal({
     setEditedTranscript(null);
     setSegments([]);
     sessionNonceRef.current = randomSessionId();
+    const recordSession = sessionNonceRef.current;
     setRecordPhase("starting");
     try {
       const capture = await startLiveMicrophoneCapture({
         onLevel: (lvl) => setMicLevel(lvl),
         onElapsedMs: (ms) => setElapsedMs(ms),
         onSegment: (chunk) => {
-          const requestId = `aud_${sessionNonceRef.current}_${chunk.index}`;
+          if (sessionNonceRef.current !== recordSession) return;
+          const requestId = `aud_${recordSession}_${chunk.index}`;
           setSegments((prev) => [
             ...prev,
             { chunk, requestId, status: "queued", text: "", errorCode: null },
           ]);
         },
       });
-      if (resolvedRef.current || signal.aborted) {
+      if (resolvedRef.current || signal.aborted || sessionNonceRef.current !== recordSession) {
         await capture.abort();
         return;
       }
@@ -466,10 +484,14 @@ export default function ScreenAudioModal({
 
   const handleFileChosen = async (file: File | null | undefined) => {
     if (!file || isBusy) return;
+    if (hasUnsavedCapture && !window.confirm(t("Discard the current audio capture and start over?"))) {
+      return;
+    }
     setBannerError(null);
     setEditedTranscript(null);
     setSegments([]);
     sessionNonceRef.current = randomSessionId();
+    const uploadSession = sessionNonceRef.current;
     setSelectedFileName(file.name);
     setNormalizing({ fileName: file.name, done: 0, total: 1 });
 
@@ -477,23 +499,25 @@ export default function ScreenAudioModal({
       const normalized = await normalizeAudioFile(file, {
         signal,
         onChunkNormalized: (done, total) => {
-          setNormalizing({ fileName: file.name, done, total });
+          if (sessionNonceRef.current === uploadSession) {
+            setNormalizing({ fileName: file.name, done, total });
+          }
         },
       });
-      if (signal.aborted || resolvedRef.current) return;
+      if (signal.aborted || resolvedRef.current || sessionNonceRef.current !== uploadSession) return;
       setNormalizing(null);
       setHeldAt(normalized.heldAt);
       setCapturedDurationSec(normalized.durationSeconds);
       const queued: SegmentItem[] = normalized.chunks.map((chunk) => ({
         chunk,
-        requestId: `aud_${sessionNonceRef.current}_${chunk.index}`,
+        requestId: `aud_${uploadSession}_${chunk.index}`,
         status: "queued",
         text: "",
         errorCode: null,
       }));
       setSegments(queued);
     } catch (error) {
-      if (signal.aborted || resolvedRef.current) return;
+      if (signal.aborted || resolvedRef.current || sessionNonceRef.current !== uploadSession) return;
       setNormalizing(null);
       setBannerError(normalizeFailureMessage(error, t));
     }
@@ -510,6 +534,12 @@ export default function ScreenAudioModal({
 
   const handleUseTranscript = () => {
     if (!effectiveTranscript || isBusy) return;
+    if (
+      failedCount > 0 &&
+      !window.confirm(t("Some audio segments failed to transcribe. Use the partial transcript anyway?"))
+    ) {
+      return;
+    }
     const totalChunkMs = segments.reduce((acc, s) => acc + s.chunk.durationMs, 0);
     const durationSeconds =
       capturedDurationSec > 0

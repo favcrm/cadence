@@ -2155,4 +2155,6 @@ Object.assign(zhTW, {
   "English (en)": "英文 (en)",
   "Chinese (zh)": "中文 (zh)",
   "Use transcript": "完成並使用逐字稿",
+  "Discard the current audio capture and start over?": "要捨棄目前的音訊與逐字稿並重新開始嗎？",
+  "Some audio segments failed to transcribe. Use the partial transcript anyway?": "部分音訊片段未能完成轉錄。仍要使用目前已完成的逐字稿嗎？",
 });
