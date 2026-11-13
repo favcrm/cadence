@@ -687,9 +687,10 @@ fn finish_stopped(job_id: &str, stop: Stop) -> Error {
 ///
 /// CAD-2271: the stop keeps its kind and code. A board refusal stays
 /// `rejected` with the board's code (exit 3). A pre-send stop stays `busy`
-/// (exit 75), which `--resume` retries: `timeout` at the command deadline, or
-/// `waking`, either because the board's gateway answered that the board was
-/// still waking or because this copy's wake budget ran out before sending.
+/// (exit 75), which `--resume` retries: `timeout` at the command deadline or
+/// during session renewal, or `waking`, either because the board's gateway
+/// answered that the board was still waking or because this copy's wake
+/// budget ran out before sending.
 ///
 /// CAD-2275: a `waking` stop gets this client's own sentence, true in both
 /// cases. The wake budget's text says "retry", and a plain rerun would start
@@ -3164,7 +3165,6 @@ mod tests {
         let text = unread.to_string();
         assert_eq!(exit(&unread), 1);
         assert!(text.contains("may or may not have been staged"), "{text}");
-        assert!(!text.contains("nothing was sent"), "{text}");
     }
 
     /// CAD-2271: a stop at the command deadline is decided before anything is

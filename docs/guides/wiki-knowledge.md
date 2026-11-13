@@ -209,7 +209,8 @@ in every case.
 - **75** — the command deadline passed before the request was sent, or the
   board's gateway answered that the board was still waking and did not forward
   it. That request changed nothing. Run the same copy again with
-  `--resume <job>`; a plain rerun starts a new job instead.
+  `--resume <job>`, with a larger `--wake-timeout` if the board was still
+  waking; a plain rerun starts a new job instead.
 - **1** — the outcome is not confirmed: a reply was lost, a local daemon refused
   (its refusal can follow a publish), or the client cannot prove the request
   was never sent. It may have landed. Run the same copy with `--resume <job>`
