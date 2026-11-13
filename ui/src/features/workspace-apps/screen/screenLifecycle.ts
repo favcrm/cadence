@@ -1,4 +1,4 @@
-import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, pushedAssetRefs, shapeFor, shapeOf,
+import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRefusal, parseChild, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, pushedAssetRefs, shapeFor, shapeOf,
   wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
   type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
@@ -520,7 +520,7 @@ export class ScreenChannel extends FrameChannel {
     const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
     const dispatchSession = this.actions?.audioSession;
     const token = this.receipt.action_token;
-    if (!dispatchSession || !token) {
+    if (!dispatchSession || !token || !this.hasBaseActions()) {
       reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "Audio capture is unavailable on this screen." } });
       return;
     }
@@ -535,7 +535,8 @@ export class ScreenChannel extends FrameChannel {
         this.audioSessionRetire.delete(retire);
         if (this.closed) return;
         if (!result.ok) {
-          reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: result.refusal });
+          const safeRefusal = parseActionRefusal(result.refusal) ?? { code: "failed", text: "Audio session failed." };
+          reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: safeRefusal });
           return;
         }
         const parsed = parseScreenAudioSessionSnapshot(result.data);
@@ -714,6 +715,9 @@ export class ScreenChannel extends FrameChannel {
     if (!advertised.length || !projection.actions?.length) return projection;
     return { ...projection, actions: [...projection.actions, ...advertised] };
   }
+  private hasBaseActions(): boolean {
+    return this.records ? Boolean(this.receipt.operations?.length) : Boolean(this.projection.actions?.length);
+  }
   /** Send the negotiated shape, or close when it cannot be sent within bounds. */
   protected send(): void {
     // DSN-1: `run_receipts` is a host-derived marker, never forwarded. Any
@@ -724,7 +728,7 @@ export class ScreenChannel extends FrameChannel {
     // the slot path still validates, plans and confirms natively.
     // CAD-1447: the marker also requires the child's `screen-media.v1` opt-in —
     // the released `screen-actions.v1` SDK rejects the unknown root field.
-    const hasBaseActions = this.records ? Boolean(this.receipt.operations?.length) : Boolean(this.projection.actions?.length);
+    const hasBaseActions = this.hasBaseActions();
     const projection: ScreenPush = this.records ? { ...this.projection, actions: [...(this.receipt.operations ?? [])] } : { ...this.projection };
     // CAD-1777 — the host-local presentation verbs are advertised beside
     // the receipt's records operations, and only to a frame that has both

@@ -47,17 +47,54 @@ export function randomAudioSessionId(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+const REFUSAL_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
+const MAX_TRANSCRIPT_UTF8_BYTES = 240 * 1024;
+const UTF8_ENCODER = new TextEncoder();
+
+export function normalizeRefusalCode(raw: unknown, fallback = "failed"): string {
+  if (typeof raw !== "string") return fallback;
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return fallback;
+  const cleaned = trimmed.replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "");
+  if (!cleaned) return fallback;
+  const prefixed = /^[a-z]/.test(cleaned) ? cleaned : `e_${cleaned}`;
+  const bounded = prefixed.slice(0, 64).replace(/_+$/g, "");
+  return REFUSAL_CODE_RE.test(bounded) ? bounded : fallback;
+}
+
+export function clampTranscriptUtf8(raw: string): string {
+  const charBounded = raw.slice(0, AUDIO_TRANSCRIPT_CHARS_MAX);
+  if (UTF8_ENCODER.encode(charBounded).length <= MAX_TRANSCRIPT_UTF8_BYTES) {
+    return charBounded;
+  }
+  let lo = 0;
+  let hi = charBounded.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (UTF8_ENCODER.encode(charBounded.slice(0, mid)).length <= MAX_TRANSCRIPT_UTF8_BYTES) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return charBounded.slice(0, lo);
+}
+
 export function readErrorCode(body: unknown): string | null {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
   const record = body as Record<string, unknown>;
-  if (typeof record.code === "string") return record.code;
+  if (typeof record.code === "string") {
+    const norm = normalizeRefusalCode(record.code, "");
+    return norm || null;
+  }
   if (
     record.error &&
     typeof record.error === "object" &&
     !Array.isArray(record.error) &&
     typeof (record.error as Record<string, unknown>).code === "string"
   ) {
-    return (record.error as Record<string, unknown>).code as string;
+    const norm = normalizeRefusalCode((record.error as Record<string, unknown>).code, "");
+    return norm || null;
   }
   return null;
 }
@@ -177,11 +214,12 @@ export function createScreenAudioSession({
     const failed = segments.filter((s) => s.status === "failed").length;
     const noSpeech = segments.filter((s) => s.status === "done" && s.text.length === 0).length;
     const total = segments.length > 0 ? segments.length : normalizingTotal;
-    const transcript = segments
-      .filter((s) => s.status === "done" && s.text.length > 0)
-      .map((s) => s.text)
-      .join("\n")
-      .slice(0, AUDIO_TRANSCRIPT_CHARS_MAX);
+    const transcript = clampTranscriptUtf8(
+      segments
+        .filter((s) => s.status === "done" && s.text.length > 0)
+        .map((s) => s.text)
+        .join("\n"),
+    );
     return {
       session_id: sessionId,
       mode,
@@ -291,7 +329,7 @@ export function createScreenAudioSession({
         };
       }
       if (!quote.available) {
-        const reason = quote.unavailable_reason ?? "unavailable";
+        const reason = normalizeRefusalCode(quote.unavailable_reason, "unavailable");
         return { code: reason, text: unavailableMessage(reason, 200, t) };
       }
       quoteVerified = true;
@@ -374,6 +412,10 @@ export function createScreenAudioSession({
         }
       } finally {
         op?.dispose();
+        if (next.status === "transcribing") {
+          next.status = "failed";
+          next.errorCode = next.errorCode ?? "cancelled";
+        }
         pumping = false;
         if (!disposed && sessionId === activeSessionId && !activeAbort.signal.aborted) {
           if (segments.some((item) => item.status === "queued")) {
@@ -382,7 +424,9 @@ export function createScreenAudioSession({
             notifyDrainIfIdle();
           }
         } else {
-          notifyDrainIfIdle();
+          const waiters = drainWaiters;
+          drainWaiters = [];
+          for (const wake of waiters) wake();
         }
       }
     })();
@@ -432,13 +476,21 @@ export function createScreenAudioSession({
     }
 
     if (request.action === "start") {
+      if (callSignal.aborted) {
+        return { ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } };
+      }
       if (isBusyPhase()) {
         return { ok: false, refusal: { code: "conflict", text: "Audio capture is already active." } };
       }
       abortActiveWork();
       const currentSession = randomAudioSessionId();
       const ctrl = new AbortController();
-      const onCallAbort = () => ctrl.abort();
+      const onCallAbort = () => {
+        ctrl.abort();
+        const waiters = drainWaiters;
+        drainWaiters = [];
+        for (const wake of waiters) wake();
+      };
       callSignal.addEventListener("abort", onCallAbort, { once: true });
       sessionAbort = ctrl;
       resetSessionState({
@@ -544,56 +596,82 @@ export function createScreenAudioSession({
     }
 
     if (request.action === "stop") {
+      if (callSignal.aborted) {
+        return { ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } };
+      }
       const live = liveRecorder;
       if (!live || (phase !== "recording" && phase !== "paused")) {
         return { ok: false, refusal: { code: "conflict", text: "No active recording to stop." } };
       }
       const currentSession = sessionId;
+      if (!sessionAbort || sessionAbort.signal.aborted) {
+        sessionAbort = new AbortController();
+      }
+      const stopAbort = sessionAbort;
+      const onStopAbort = () => {
+        stopAbort.abort();
+        const waiters = drainWaiters;
+        drainWaiters = [];
+        for (const wake of waiters) wake();
+      };
+      callSignal.addEventListener("abort", onStopAbort, { once: true });
       liveRecorder = null;
       level = 0;
       peak = 0;
       phase = "stopping";
       emit();
 
-      const summary = await live.finish();
-      if (disposed || sessionId !== currentSession || sessionAbort?.signal.aborted) {
-        return { ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } };
-      }
-      elapsedSeconds = Math.max(elapsedSeconds, summary.durationSeconds);
-      if (summary.totalFrames === 0 && segments.length === 0) {
-        const refusal: ActionRefusal = {
-          code: "empty_audio",
-          text: t("No audio was captured. Start recording again when ready."),
-        };
-        phase = "error";
-        lastError = refusal;
-        emit();
-        return { ok: false, refusal };
-      }
-
-      if (hasPendingSegments()) {
-        phase = "transcribing";
-        emit();
-        pumpSegments();
-        await waitForDrain(currentSession);
-        if (disposed || sessionId !== currentSession || sessionAbort?.signal.aborted) {
+      try {
+        const summary = await live.finish();
+        if (disposed || sessionId !== currentSession || stopAbort.signal.aborted) {
           return { ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } };
         }
+        elapsedSeconds = Math.max(elapsedSeconds, summary.durationSeconds);
+        if (summary.totalFrames === 0 && segments.length === 0) {
+          const refusal: ActionRefusal = {
+            code: "empty_audio",
+            text: t("No audio was captured. Start recording again when ready."),
+          };
+          phase = "error";
+          lastError = refusal;
+          emit();
+          return { ok: false, refusal };
+        }
+
+        if (hasPendingSegments()) {
+          phase = "transcribing";
+          emit();
+          pumpSegments();
+          await waitForDrain(currentSession);
+          if (disposed || sessionId !== currentSession || stopAbort.signal.aborted) {
+            return { ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } };
+          }
+        }
+        elapsedSeconds = Math.max(1, elapsedSeconds);
+        phase = "ready";
+        emit();
+        return { ok: true, data: buildSnapshot() };
+      } finally {
+        callSignal.removeEventListener("abort", onStopAbort);
       }
-      elapsedSeconds = Math.max(1, elapsedSeconds);
-      phase = "ready";
-      emit();
-      return { ok: true, data: buildSnapshot() };
     }
 
     if (request.action === "upload") {
+      if (callSignal.aborted) {
+        return { ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } };
+      }
       if (isBusyPhase()) {
         return { ok: false, refusal: { code: "conflict", text: "Audio capture is already active." } };
       }
       abortActiveWork();
       const currentSession = randomAudioSessionId();
       const ctrl = new AbortController();
-      const onCallAbort = () => ctrl.abort();
+      const onCallAbort = () => {
+        ctrl.abort();
+        const waiters = drainWaiters;
+        drainWaiters = [];
+        for (const wake of waiters) wake();
+      };
       callSignal.addEventListener("abort", onCallAbort, { once: true });
       sessionAbort = ctrl;
       resetSessionState({
@@ -672,6 +750,9 @@ export function createScreenAudioSession({
     }
 
     // request.action === "retry"
+    if (callSignal.aborted) {
+      return { ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } };
+    }
     if (phase !== "ready" || !segments.some((s) => s.status === "failed")) {
       return { ok: false, refusal: { code: "conflict", text: "No failed audio segments to retry." } };
     }
@@ -680,7 +761,12 @@ export function createScreenAudioSession({
       sessionAbort = new AbortController();
     }
     const retryAbort = sessionAbort;
-    const onRetryAbort = () => retryAbort.abort();
+    const onRetryAbort = () => {
+      retryAbort.abort();
+      const waiters = drainWaiters;
+      drainWaiters = [];
+      for (const wake of waiters) wake();
+    };
     callSignal.addEventListener("abort", onRetryAbort, { once: true });
     lastError = null;
     for (const item of segments) {

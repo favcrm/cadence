@@ -1,5 +1,10 @@
 import { encodeWav16kMonoPcm16 } from "../src/features/workspace-apps/screen/audioNormalize";
-import { createScreenAudioSession } from "../src/features/workspace-apps/screen/screenAudioSession";
+import {
+  clampTranscriptUtf8,
+  createScreenAudioSession,
+  normalizeRefusalCode,
+  readErrorCode,
+} from "../src/features/workspace-apps/screen/screenAudioSession";
 import type { ScreenAudioSessionSnapshot } from "../src/features/workspace-apps/screen/screenProtocol";
 
 declare const process: { exit(code: number): never };
@@ -217,6 +222,16 @@ void (async () => {
     const uploadCallsAfterRetry = fetchCalls.filter((c) => c.url === "/api/app-screen-audio/transcribe");
     check(uploadCallsAfterRetry.at(-1)?.body.request_id === uploadReqId, "retry reuses exact request_id");
 
+    // 0. Refusal code normalization & UTF-8 transcript byte bound.
+    check(normalizeRefusalCode("SPEECH-UNAVAILABLE") === "speech_unavailable", "hyphenated uppercase code normalizes");
+    check(normalizeRefusalCode("", "unavailable") === "unavailable", "empty string code falls back");
+    check(normalizeRefusalCode("503_bad_gateway") === "e_503_bad_gateway", "digit-prefixed code receives letter prefix");
+    check(readErrorCode({ code: "" }) === null, "readErrorCode ignores empty string");
+    check(readErrorCode({ error: { code: "RATE-LIMITED" } }) === "rate_limited", "readErrorCode normalizes nested code");
+    const cjkHeavy = "會".repeat(90_000); // 270,000 UTF-8 bytes (> 240 KiB)
+    const clampedCjk = clampTranscriptUtf8(cjkHeavy);
+    check(new TextEncoder().encode(clampedCjk).length <= 240 * 1024, "clampTranscriptUtf8 enforces 240 KiB UTF-8 bound");
+
     // 4. Mount abort during active live recording stops hardware mic track immediately.
     const live2 = await session.dispatch(
       { v: 2, op: "audio-session", id: "s6", action: "start" },
@@ -229,6 +244,50 @@ void (async () => {
     const stopsAfterAbort: number = micTrackStops;
     const closesAfterAbort: number = closedAudioContexts;
     check(stopsAfterAbort === 2 && closesAfterAbort === 2, "mount abort disposes active microphone and AudioContext");
+
+    // 5. Aborting an individual callSignal mid-transcribe resolves waitForDrain immediately without hanging.
+    const mountAbort2 = new AbortController();
+    let hangTranscribe = true;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/app-screen-audio/transcribe" && hangTranscribe) {
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
+            once: true,
+          });
+        });
+      }
+      return origFetch(input, init);
+    }) as typeof fetch;
+
+    const session2 = createScreenAudioSession({
+      actionToken: "tok_v2_abort_test",
+      signal: mountAbort2.signal,
+      getLocale: () => "en",
+      onEvent: () => {},
+    });
+    const perCallAbort = new AbortController();
+    const pendingUpload = session2.dispatch(
+      {
+        v: 2,
+        op: "audio-session",
+        id: "u-abort",
+        action: "upload",
+        bytes: makeCanonicalWavBuffer(1),
+        mime_type: "audio/wav",
+      },
+      perCallAbort.signal,
+    );
+    await new Promise((r) => setTimeout(r, 25));
+    perCallAbort.abort();
+    const abortedUploadRes = await pendingUpload;
+    check(
+      !abortedUploadRes.ok && abortedUploadRes.refusal.code === "cancelled",
+      "aborting upload callSignal during segment transcription resolves cancelled without hanging",
+    );
+    hangTranscribe = false;
+    session2.dispose();
 
     console.log("screenAudioSession checks pass");
   } finally {

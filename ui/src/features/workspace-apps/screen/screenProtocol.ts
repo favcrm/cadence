@@ -288,16 +288,40 @@ const AUDIO_SESSION_PHASES: readonly ScreenAudioSessionPhase[] = [
 ];
 const AUDIO_SESSION_KEYS =
   "elapsed_seconds,error,held_at,level,mode,no_speech_segments,peak,phase,segments_done,segments_failed,segments_in_flight,segments_total,session_id,transcript";
+const REFUSAL_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+const ARRAY_BUFFER_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "byteLength",
+)?.get;
+
 function isBoundedSafeInt(value: unknown, min: number, max: number): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
 }
-function isCrossRealmArrayBuffer(value: unknown): value is ArrayBuffer {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    Object.prototype.toString.call(value) === "[object ArrayBuffer]" &&
-    typeof (value as ArrayBuffer).byteLength === "number"
-  );
+function readArrayBufferByteLength(value: unknown): number | null {
+  if (typeof value !== "object" || value === null || typeof ARRAY_BUFFER_BYTE_LENGTH !== "function") {
+    return null;
+  }
+  try {
+    const len = ARRAY_BUFFER_BYTE_LENGTH.call(value);
+    return typeof len === "number" && Number.isSafeInteger(len) && len >= 0 ? len : null;
+  } catch {
+    return null;
+  }
+}
+export function parseActionRefusal(value: unknown): ActionRefusal | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const errRec = value as Record<string, unknown>;
+  if (
+    Object.keys(errRec).sort().join() !== "code,text" ||
+    typeof errRec.code !== "string" ||
+    !REFUSAL_CODE.test(errRec.code) ||
+    typeof errRec.text !== "string" ||
+    errRec.text.length === 0 ||
+    errRec.text.length > 512
+  ) {
+    return null;
+  }
+  return { code: errRec.code, text: errRec.text };
 }
 export function parseScreenAudioSessionSnapshot(value: unknown): ScreenAudioSessionSnapshot | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -321,20 +345,8 @@ export function parseScreenAudioSessionSnapshot(value: unknown): ScreenAudioSess
   if (typeof r.transcript !== "string" || r.transcript.length > AUDIO_TRANSCRIPT_CHARS_MAX) return null;
   let error: ActionRefusal | null = null;
   if (r.error !== null) {
-    if (typeof r.error !== "object" || Array.isArray(r.error)) return null;
-    const errRec = r.error as Record<string, unknown>;
-    if (
-      Object.keys(errRec).sort().join() !== "code,text" ||
-      typeof errRec.code !== "string" ||
-      errRec.code.length === 0 ||
-      errRec.code.length > 64 ||
-      typeof errRec.text !== "string" ||
-      errRec.text.length === 0 ||
-      errRec.text.length > 512
-    ) {
-      return null;
-    }
-    error = { code: errRec.code, text: errRec.text };
+    error = parseActionRefusal(r.error);
+    if (!error) return null;
   }
   return {
     session_id: r.session_id,
@@ -916,11 +928,11 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
         "last_modified",
         "language",
       ]);
+      const byteLen = readArrayBufferByteLength(d.bytes);
       if (
         !Object.keys(d).every(k => allowedUploadKeys.has(k)) ||
-        !isCrossRealmArrayBuffer(d.bytes) ||
-        d.bytes.byteLength <= 0 ||
-        d.bytes.byteLength > AUDIO_UPLOAD_BYTES_MAX ||
+        byteLen === null ||
+        !isBoundedSafeInt(byteLen, 1, AUDIO_UPLOAD_BYTES_MAX) ||
         typeof d.mime_type !== "string" ||
         d.mime_type.length > 128 ||
         (d.file_name !== undefined && (typeof d.file_name !== "string" || d.file_name.length > 255)) ||
@@ -934,7 +946,7 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
         op: "audio-session",
         id: d.id,
         action: "upload",
-        bytes: d.bytes,
+        bytes: d.bytes as ArrayBuffer,
         mime_type: d.mime_type,
         ...(d.file_name !== undefined ? { file_name: d.file_name } : {}),
         ...(d.last_modified !== undefined ? { last_modified: d.last_modified } : {}),

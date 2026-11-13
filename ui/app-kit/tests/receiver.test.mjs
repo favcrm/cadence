@@ -1,5 +1,6 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import {
   DRAWER_CONTEXT_BYTES,
   HOST_DRAWER_VERBS,
@@ -1320,7 +1321,23 @@ test("screen-audio.v2 negotiates mutually exclusively with v1, validates audioSe
   await assert.rejects(
     receiver.audioSession({
       action: "upload",
-      bytes: { [Symbol.toStringTag]: "ArrayBuffer", byteLength: MAX_AUDIO_UPLOAD_BYTES + 1 },
+      bytes: { [Symbol.toStringTag]: "ArrayBuffer", byteLength: 16 },
+      mimeType: "audio/wav",
+    }),
+    TypeError,
+  );
+  await assert.rejects(
+    receiver.audioSession({
+      action: "upload",
+      bytes: { [Symbol.toStringTag]: "ArrayBuffer", byteLength: Number.NaN },
+      mimeType: "audio/wav",
+    }),
+    TypeError,
+  );
+  await assert.rejects(
+    receiver.audioSession({
+      action: "upload",
+      bytes: new ArrayBuffer(MAX_AUDIO_UPLOAD_BYTES + 1),
       mimeType: "audio/wav",
     }),
     TypeError,
@@ -1339,7 +1356,7 @@ test("screen-audio.v2 negotiates mutually exclusively with v1, validates audioSe
   host.postMessage({ v: 2, op: "audio-session-reply", id: startMsg.id, ok: true, data: sessionSnapshot() });
   assert.equal((await starting).phase, "recording");
 
-  const buf = new Uint8Array([1, 2, 3, 4]).buffer;
+  const buf = vm.runInNewContext("new Uint8Array([1, 2, 3, 4]).buffer");
   const uploading = receiver.audioSession({
     action: "upload",
     bytes: buf,

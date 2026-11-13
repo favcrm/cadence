@@ -387,11 +387,28 @@ void (async () => {
   );
   check(!parseChild({ v: 2, op: "audio-session", id: "as-bad", action: "upload", bytes: new Uint8Array([1]), mime_type: "audio/wav" }),
     "audio-session upload rejects non-ArrayBuffer typed array");
-  const overCapFakeBuffer = Object.create(ArrayBuffer.prototype);
-  Object.defineProperty(overCapFakeBuffer, "byteLength", { value: AUDIO_UPLOAD_BYTES_MAX + 1 });
-  Object.defineProperty(overCapFakeBuffer, Symbol.toStringTag, { value: "ArrayBuffer" });
-  check(!parseChild({ v: 2, op: "audio-session", id: "as-huge", action: "upload", bytes: overCapFakeBuffer, mime_type: "audio/wav" }),
-    "audio-session upload rejects payload over 50 MiB");
+  const vmMod = await (Function('return import("node:vm")')() as Promise<{ runInNewContext(code: string): unknown }>);
+  const crossRealmBuffer = vmMod.runInNewContext("new ArrayBuffer(16)");
+  check(
+    parseChild({
+      v: 2,
+      op: "audio-session",
+      id: "as-cross-realm",
+      action: "upload",
+      bytes: crossRealmBuffer,
+      mime_type: "audio/wav",
+    })?.op === "audio-session",
+    "audio-session upload accepts genuine cross-realm ArrayBuffer",
+  );
+  const spoofedBuffer = Object.create(ArrayBuffer.prototype);
+  Object.defineProperty(spoofedBuffer, "byteLength", { value: 16 });
+  Object.defineProperty(spoofedBuffer, Symbol.toStringTag, { value: "ArrayBuffer" });
+  check(!parseChild({ v: 2, op: "audio-session", id: "as-spoof", action: "upload", bytes: spoofedBuffer, mime_type: "audio/wav" }),
+    "audio-session upload rejects Symbol.toStringTag spoof without [[ArrayBufferData]]");
+  check(!parseChild({ v: 2, op: "audio-session", id: "as-nan", action: "upload", bytes: { [Symbol.toStringTag]: "ArrayBuffer", byteLength: Number.NaN }, mime_type: "audio/wav" }),
+    "audio-session upload rejects NaN byteLength spoof");
+  check(!parseChild({ v: 2, op: "audio-session", id: "as-huge", action: "upload", bytes: new ArrayBuffer(AUDIO_UPLOAD_BYTES_MAX + 1), mime_type: "audio/wav" }),
+    "audio-session upload rejects genuine ArrayBuffer over 50 MiB");
   check(!parseChild({ v: 2, op: "audio-session", id: "as-extra", action: "start", action_token: "forged" }),
     "audio-session start rejects extra authority fields");
 
@@ -413,6 +430,13 @@ void (async () => {
   };
   check(parseScreenAudioSessionSnapshot(validSessionSnap)?.session_id === "sess_v2", "valid session snapshot parses");
   check(!parseScreenAudioSessionSnapshot({ ...validSessionSnap, level: 101 }), "out-of-range level rejected");
+  check(
+    !parseScreenAudioSessionSnapshot({
+      ...validSessionSnap,
+      error: { code: "BAD-CODE", text: "Invalid code" },
+    }),
+    "non-canonical error.code rejected by parseScreenAudioSessionSnapshot",
+  );
 
   // Combining screen-audio.v1 and screen-audio.v2 in ready.accepts closes the mount.
   const combinedSource = {} as Window;
@@ -471,6 +495,23 @@ void (async () => {
   check(sessionSignals.length === 2 && !sessionSignals[1]!.aborted, "in-flight audioSession signal starts active");
   v2Channel.close();
   check(sessionSignals[1]!.aborted && disposedCount === 1, "closing channel aborts in-flight audioSession and calls disposeAudioSession");
+
+  // Malformed refusal from audioSession dispatcher is sanitized to canonical CODE instead of crashing child bridge.
+  const badRefusalHost = {
+    ...toolHost,
+    audioSession: async () => ({ ok: false as const, refusal: { code: "BAD-UPSTREAM", text: "Upstream error" } }),
+  } as unknown as ConstructorParameters<typeof ScreenChannel>[7];
+  const sanitizeSource = {} as Window;
+  const sanitizePort = new Port();
+  const sanitizeChannel = new ScreenChannel(sanitizeSource, toolReceipt, actingPush, () => {}, () => {}, () => {}, undefined, badRefusalHost);
+  sanitizeChannel.receive({ source: sanitizeSource, origin: "null", data: init, ports: [sanitizePort as unknown as MessagePort] });
+  sanitizePort.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-audio.v2"] });
+  sanitizePort.receive({ v: 2, op: "audio-session", id: "as-bad-ref", action: "start" });
+  await Promise.resolve();
+  await Promise.resolve();
+  const sanitizedReply = sanitizePort.sent.find(m => (m as { id?: string }).id === "as-bad-ref") as { ok?: boolean; refusal?: { code?: string; text?: string } } | undefined;
+  check(sanitizedReply?.ok === false && sanitizedReply.refusal?.code === "failed" && !sanitizePort.closed,
+    "malformed host audioSession refusal is sanitized to canonical code");
 
   console.log("screen lifecycle adversarial checks pass");
 })();

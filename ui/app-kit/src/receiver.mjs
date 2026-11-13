@@ -214,17 +214,25 @@ const AUDIO_SESSION_PHASES = new Set([
 const AUDIO_SESSION_SNAPSHOT_KEYS =
   "elapsed_seconds,error,held_at,level,mode,no_speech_segments,peak,phase,segments_done,segments_failed,segments_in_flight,segments_total,session_id,transcript";
 
+const ARRAY_BUFFER_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "byteLength",
+)?.get;
+
 function isSafeBoundedInt(value, min, max) {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
 }
 
-function isCrossRealmArrayBuffer(value) {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    Object.prototype.toString.call(value) === "[object ArrayBuffer]" &&
-    typeof value.byteLength === "number"
-  );
+function readArrayBufferByteLength(value) {
+  if (typeof value !== "object" || value === null || typeof ARRAY_BUFFER_BYTE_LENGTH !== "function") {
+    return null;
+  }
+  try {
+    const len = ARRAY_BUFFER_BYTE_LENGTH.call(value);
+    return isSafeBoundedInt(len, 0, Number.MAX_SAFE_INTEGER) ? len : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Closed `audio-session-reply` / `audio-session-event` payload matching `parseScreenAudioSessionSnapshot`. */
@@ -909,7 +917,8 @@ export function createScreenReceiver(options = {}) {
         if (!exactKeys(command, ["action", "bytes", "mimeType", "fileName", "lastModified", "language", "timeoutMs"])) {
           return Promise.reject(new TypeError("audioSession upload has unknown keys"));
         }
-        if (!isCrossRealmArrayBuffer(command.bytes) || command.bytes.byteLength <= 0 || command.bytes.byteLength > MAX_AUDIO_UPLOAD_BYTES) {
+        const byteLen = readArrayBufferByteLength(command.bytes);
+        if (byteLen === null || !isSafeBoundedInt(byteLen, 1, MAX_AUDIO_UPLOAD_BYTES)) {
           return Promise.reject(new TypeError("audioSession upload bytes must be a non-empty ArrayBuffer up to 50 MiB"));
         }
         if (typeof command.mimeType !== "string" || command.mimeType.length > 128) {
@@ -1352,7 +1361,13 @@ export function createScreenBridge(options = {}) {
         ...(runtime.MessageChannel !== undefined ? { MessageChannel: runtime.MessageChannel } : {}),
         ...(runtime.onSlotState !== undefined ? { onSlotState: runtime.onSlotState } : {}),
         onAudioSessionEvent(snap) {
-          if (!retired) publishAudioSession(snap);
+          if (retired) return;
+          try {
+            const guarded = guardData(snap);
+            publishAudioSession(guarded);
+          } catch (err) {
+            retire(mapError(err));
+          }
         },
         onPresentation(mode) {
           if (!retired && !surfaces) {
