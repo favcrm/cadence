@@ -1,0 +1,36 @@
+{
+  "actor": "QA Member",
+  "anonymous_reads": false,
+  "build_commit": "qa-board-fixture",
+  "build_time": "1970-01-01T00:00:00Z",
+  "daemon": null,
+  "delivery_sync": null,
+  "device_login": false,
+  "hosted": true,
+  "login_hint": "qa-board: the fixture member is always signed in",
+  "operator": false,
+  "platform_account_configured": false,
+  "read_only": false,
+  "session": {
+    "account_id": "acct_qa_board",
+    "created": 1794600000,
+    "expires_at": 4102444800,
+    "id": "qa-board-session",
+    "idle_expires_at": 4102444800,
+    "last_used": 1794600000,
+    "origin": "public",
+    "scope": { "issuer": "https://qa-board.invalid", "organization_id": "org_qa_board" },
+    "user": {
+      "email": "qa-member@example.test",
+      "handle": "qa-member",
+      "name": "QA Member",
+      "role": "member",
+      "sub": "usr_qa_member"
+    },
+    "user_agent": "qa-board"
+  },
+  "signed_in": true,
+  "tab_signed_out": false,
+  "tailnet_url": null,
+  "version": "qa-board-fixture"
+}
