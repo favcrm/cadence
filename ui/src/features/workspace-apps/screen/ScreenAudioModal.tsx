@@ -5,13 +5,19 @@ import { beginPrivateOperation, type PrivateOperation } from "../../../lib/priva
 import { sessionHeaders } from "../../../lib/sessionKey";
 import { WorkspaceDialog } from "../WorkspaceDialog";
 import {
-  AudioNormalizeError,
   normalizeAudioFile,
   SCREEN_AUDIO_ACCEPT,
   startLiveMicrophoneCapture,
   type LiveMicrophoneCapture,
   type WavAudioChunk,
 } from "./audioNormalize";
+import {
+  normalizeFailureMessage,
+  randomAudioSessionId,
+  readErrorCode,
+  transcribeFailureMessage,
+  unavailableMessage,
+} from "./screenAudioSession";
 import {
   AUDIO_TRANSCRIPT_CHARS_MAX,
   type ActionResult,
@@ -39,104 +45,11 @@ interface SegmentItem {
   errorCode: string | null;
 }
 
-function randomSessionId(): string {
-  const bytes = new Uint8Array(12);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
 function formatClock(totalSeconds: number): string {
   const clamped = Math.max(0, Math.floor(totalSeconds));
   const mins = Math.floor(clamped / 60);
   const secs = clamped % 60;
   return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-}
-
-function readErrorCode(body: unknown): string | null {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
-  const record = body as Record<string, unknown>;
-  if (typeof record.code === "string") return record.code;
-  if (
-    record.error &&
-    typeof record.error === "object" &&
-    !Array.isArray(record.error) &&
-    typeof (record.error as Record<string, unknown>).code === "string"
-  ) {
-    return (record.error as Record<string, unknown>).code as string;
-  }
-  return null;
-}
-
-function unavailableMessage(
-  code: string | null,
-  status: number,
-  t: (english: string) => string,
-): string {
-  if (status === 403 || code === "owner_required") {
-    return t("Only a workspace owner can run audio transcription.");
-  }
-  if (status === 404) {
-    return t("Audio transcription is not enabled on this board.");
-  }
-  if (status === 402 || code === "insufficient_funds" || code === "insufficient_balance") {
-    return t("Workspace credits are insufficient for audio transcription.");
-  }
-  if (
-    code === "disabled" ||
-    code === "speech_unavailable" ||
-    code === "unpriced_default" ||
-    code === "not_configured" ||
-    code === "provider_unavailable"
-  ) {
-    return t("Speech transcription is not configured for this workspace yet.");
-  }
-  return t("Audio transcription is currently unavailable. Try again shortly.");
-}
-
-function transcribeFailureMessage(
-  code: string | null,
-  t: (english: string) => string,
-): string {
-  if (code === "insufficient_funds" || code === "insufficient_balance") {
-    return t("Workspace credits are insufficient to finish transcribing.");
-  }
-  if (code === "rate_limited" || code === "idempotency_in_progress" || code === "uncertain") {
-    return t("Speech transcription is busy right now. Retry the failed segment.");
-  }
-  if (code === "disabled" || code === "speech_unavailable") {
-    return t("Speech transcription is not configured for this workspace yet.");
-  }
-  if (code === "audio_too_large" || code === "unsupported_audio_format") {
-    return t("One audio segment could not be accepted by the speech service.");
-  }
-  if (code === "owner_required") {
-    return t("Only a workspace owner can run audio transcription.");
-  }
-  return t("Some audio segments did not finish transcribing. Retry to complete.");
-}
-
-function normalizeFailureMessage(
-  error: unknown,
-  t: (english: string) => string,
-): string {
-  if (error instanceof AudioNormalizeError) {
-    if (error.code === "empty_audio") {
-      return t("That audio file is empty.");
-    }
-    if (error.code === "audio_too_large") {
-      return t("That file exceeds the 50 MB audio upload limit.");
-    }
-    if (error.code === "unsupported_audio_format") {
-      return t(
-        "Unsupported audio file. Choose an M4A, MP3, WAV, Opus/Ogg, WebM, AAC, FLAC, 3GP, or AMR recording.",
-      );
-    }
-    if (error.code === "duration_too_long") {
-      return t("Audio recordings over 2 hours must be split before uploading.");
-    }
-    return t("This browser could not decode that audio file. Try M4A, MP3, WAV, Ogg, or WebM.");
-  }
-  return t("Could not read that audio file.");
 }
 
 export default function ScreenAudioModal({
@@ -178,7 +91,7 @@ export default function ScreenAudioModal({
   const [editedTranscript, setEditedTranscript] = useState<string | null>(null);
   const [bannerError, setBannerError] = useState<string | null>(null);
 
-  const sessionNonceRef = useRef<string>(randomSessionId());
+  const sessionNonceRef = useRef<string>(randomAudioSessionId());
   const recorderRef = useRef<LiveMicrophoneCapture | null>(null);
   const resolvedRef = useRef(false);
   const pumpingRef = useRef(false);
@@ -411,7 +324,7 @@ export default function ScreenAudioModal({
     if (hasUnsavedCapture && !window.confirm(t("Discard the current audio capture and start over?"))) {
       return;
     }
-    sessionNonceRef.current = randomSessionId();
+    sessionNonceRef.current = randomAudioSessionId();
     setActiveMode(nextMode);
     setRecordPhase("idle");
     setElapsedMs(0);
@@ -428,7 +341,7 @@ export default function ScreenAudioModal({
     setBannerError(null);
     setEditedTranscript(null);
     setSegments([]);
-    sessionNonceRef.current = randomSessionId();
+    sessionNonceRef.current = randomAudioSessionId();
     const recordSession = sessionNonceRef.current;
     setRecordPhase("starting");
     try {
@@ -497,7 +410,7 @@ export default function ScreenAudioModal({
     setBannerError(null);
     setEditedTranscript(null);
     setSegments([]);
-    sessionNonceRef.current = randomSessionId();
+    sessionNonceRef.current = randomAudioSessionId();
     const uploadSession = sessionNonceRef.current;
     setSelectedFileName(file.name);
     setNormalizing({ fileName: file.name, done: 0, total: 1 });

@@ -29,6 +29,16 @@ export type ScreenSurfaceRole = "primary" | "drawer";
 export type ScreenLocale = "en" | "zh-TW";
 export type ScreenAudioMode = "record" | "upload";
 export type ScreenAudioSource = "recording" | "upload";
+export type ScreenAudioLanguage = "" | "en" | "zh";
+export type ScreenAudioSessionPhase =
+  | "idle"
+  | "starting"
+  | "recording"
+  | "paused"
+  | "stopping"
+  | "transcribing"
+  | "ready"
+  | "error";
 export type ScreenCapability =
   | "screen.v1"
   | "screen.v2"
@@ -38,7 +48,8 @@ export type ScreenCapability =
   | "screen-surfaces.v1"
   | "screen-records.v1"
   | "screen-locale.v1"
-  | "screen-audio.v1";
+  | "screen-audio.v1"
+  | "screen-audio.v2";
 
 export interface ScreenAudioCapture {
   readonly transcript: string;
@@ -52,6 +63,36 @@ export interface ScreenAudioCaptureOptions {
   timeoutMs?: number;
 }
 
+export interface ScreenAudioSessionSnapshot {
+  readonly session_id: string;
+  readonly mode: ScreenAudioMode;
+  readonly phase: ScreenAudioSessionPhase;
+  readonly held_at: string;
+  readonly elapsed_seconds: number;
+  readonly level: number;
+  readonly peak: number;
+  readonly segments_total: number;
+  readonly segments_done: number;
+  readonly segments_in_flight: number;
+  readonly segments_failed: number;
+  readonly no_speech_segments: number;
+  readonly transcript: string;
+  readonly error: { readonly code: string; readonly text: string } | null;
+}
+
+export type ScreenAudioSessionCommand =
+  | { action: "start"; language?: ScreenAudioLanguage; timeoutMs?: number }
+  | { action: "pause" | "resume" | "stop" | "retry" | "cancel"; timeoutMs?: number }
+  | {
+      action: "upload";
+      bytes: ArrayBuffer;
+      mimeType: string;
+      fileName?: string;
+      lastModified?: number;
+      language?: ScreenAudioLanguage;
+      timeoutMs?: number;
+    };
+
 export type SlotAnchor = "footer" | { x: number; y: number; w: number; h: number };
 
 export interface ScreenReceiverOptions {
@@ -61,6 +102,7 @@ export interface ScreenReceiverOptions {
   onPush(push: ScreenPush): void;
   onError?(reason: string): void;
   onSlotState?(event: SlotState): void;
+  onAudioSessionEvent?(state: ScreenAudioSessionSnapshot): void;
   onPresentation?(mode: ScreenPresentationMode): void;
   onSurface?(role: ScreenSurfaceRole, surface: string | undefined, modal: boolean): void;
   accepts?: readonly ScreenCapability[];
@@ -103,6 +145,7 @@ export interface ScreenReceiver {
   slot(verb: string, args?: unknown, anchor?: SlotAnchor): Promise<SlotState>;
   tool<T = unknown>(alias: string, input?: unknown, requestId?: string, generationScope?: GenerationScope): Promise<T>;
   audioCapture(options?: ScreenAudioCaptureOptions): Promise<ScreenAudioCapture>;
+  audioSession(command: ScreenAudioSessionCommand): Promise<ScreenAudioSessionSnapshot>;
   asset(ref: string, options?: { timeoutMs?: number }): Promise<string>;
   assetAdmitted(ref: string): boolean;
   state(data: string): boolean;
@@ -203,7 +246,7 @@ export interface ScreenBridgeOptions<
   surfaces?: boolean;
   presentation?: boolean;
   locale?: boolean;
-  audio?: boolean;
+  audio?: boolean | "v1" | "v2";
   calls?: Record<string, readonly string[]>;
   slots?: Record<string, readonly string[]>;
   argBytes?: number | Record<string, number>;
@@ -259,6 +302,12 @@ export interface ScreenBridge<
     scope: ScreenScope,
     options?: ScreenAudioCaptureOptions,
   ): Promise<ScreenAudioCapture>;
+  audioSession(
+    scope: ScreenScope,
+    command: ScreenAudioSessionCommand,
+  ): Promise<ScreenAudioSessionSnapshot>;
+  getAudioSession(): ScreenAudioSessionSnapshot | null;
+  onAudioSession(listener: (state: ScreenAudioSessionSnapshot) => void): () => void;
   asset(scope: ScreenScope, ref: string, options?: { timeoutMs?: number }): Promise<string>;
   assetAdmitted(ref: string): boolean;
   state(data: string): boolean;
@@ -312,7 +361,9 @@ export declare const DRAWER_CONTEXT_BYTES: number;
 export declare const MAX_PUSH_BYTES: number;
 export declare const MAX_REPLY_DATA_BYTES: number;
 export declare const MAX_AUDIO_TRANSCRIPT_CHARS: number;
+export declare const MAX_AUDIO_UPLOAD_BYTES: number;
 export declare const SCREEN_AUDIO_V1: "screen-audio.v1";
+export declare const SCREEN_AUDIO_V2: "screen-audio.v2";
 export declare const HOST_DRAWER_VERBS: readonly [
   "screen.drawer.open",
   "screen.drawer.close",

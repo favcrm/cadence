@@ -1,7 +1,7 @@
-import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, parseScreenAudioCapture, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_AUDIO_V1, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, pushedAssetRefs, shapeFor, shapeOf,
+  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
-  type ActionResult, type AssetReply, type AudioRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenPush,
+  type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 
@@ -67,6 +67,9 @@ export interface ScreenActions {
   /** CAD-2272: open the generic host-mediated audio capture/upload modal under
    *  this mount's server-bound action context. Raw audio stays on the host. */
   captureAudio?(mode: ScreenAudioMode, ui: { actionToken: string; signal: AbortSignal }): Promise<ActionResult>;
+  /** CAD-2281: dispatch a headless inline audio session command (`screen-audio.v2`). */
+  audioSession?(request: AudioSessionRequest, ui: { actionToken: string; signal: AbortSignal }): Promise<ActionResult>;
+  disposeAudioSession?(): void;
 }
 /** Most calls one frame may have outstanding; one more closes it. */
 export const CALL_QUEUE_MAX = 8;
@@ -207,6 +210,7 @@ export abstract class FrameChannel {
   protected leave(_unsaved: boolean): void { this.close(true); }
   /** screen.v2 host-mediated audio capture/upload: a frame kind without it closes. */
   protected audio(_request: AudioRequest): void { this.close(true); }
+  protected audioSession(_request: AudioSessionRequest): void { this.close(true); }
   receive(event: Pick<MessageEvent, "origin" | "source" | "data" | "ports">): void {
     if (this.closed || event.source !== this.source) return;
     if (event.origin !== "null") {
@@ -243,6 +247,10 @@ export abstract class FrameChannel {
       if (child.op === "audio") {
         if (!this.ready) { this.close(true); return; }
         this.audio(child);
+      }
+      if (child.op === "audio-session") {
+        if (!this.ready) { this.close(true); return; }
+        this.audioSession(child);
       }
       if (child.op === "call" || child.op === "slot" || child.op === "tool") {
         if (!this.ready) { this.close(true); return; }
@@ -493,9 +501,55 @@ export class ScreenChannel extends FrameChannel {
   private wantsTools = false;
   private wantsMedia = false;
   private wantsAudio = false;
+  private wantsAudioV2 = false;
   private toolBusy = false;
   private audioBusy = false;
   private audioRetire: AbortController | null = null;
+  private audioSessionRetire = new Set<AbortController>();
+  sendAudioSessionEvent(state: ScreenAudioSessionSnapshot): void {
+    if (this.closed || !this.ready || this.shape !== "v2" || !this.wantsAudioV2) return;
+    const parsed = parseScreenAudioSessionSnapshot(state);
+    if (!parsed || jsonBytes(parsed) > AUDIO_REPLY_BYTES_MAX) return;
+    const message: AudioSessionEvent = { v: 2, op: "audio-session-event", state: parsed };
+    this.port?.postMessage(message);
+  }
+  protected audioSession(request: AudioSessionRequest): void {
+    if (this.shape !== "v2" || !this.wantsAudioV2) {
+      this.close(true); return;
+    }
+    const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
+    const dispatchSession = this.actions?.audioSession;
+    const token = this.receipt.action_token;
+    if (!dispatchSession || !token) {
+      reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "Audio capture is unavailable on this screen." } });
+      return;
+    }
+    if (this.audioSessionRetire.size >= CALL_QUEUE_MAX) {
+      this.close(true); return;
+    }
+    const retire = new AbortController();
+    this.audioSessionRetire.add(retire);
+    void dispatchSession(request, { actionToken: token, signal: retire.signal })
+      .catch((): ActionResult => ({ ok: false, refusal: { code: "failed", text: "That didn't work." } }))
+      .then(result => {
+        this.audioSessionRetire.delete(retire);
+        if (this.closed) return;
+        if (!result.ok) {
+          reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: result.refusal });
+          return;
+        }
+        const parsed = parseScreenAudioSessionSnapshot(result.data);
+        if (!parsed) {
+          reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: { code: "failed", text: "Audio session returned an invalid state." } });
+          return;
+        }
+        if (jsonBytes(parsed) > AUDIO_REPLY_BYTES_MAX) {
+          reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That transcript is too large to return." } });
+          return;
+        }
+        reply({ v: 2, op: "audio-session-reply", id: request.id, ok: true, data: parsed });
+      });
+  }
   protected audio(request: AudioRequest): void {
     if (this.shape !== "v2" || !this.wantsAudio) {
       this.close(true); return;
@@ -571,6 +625,9 @@ export class ScreenChannel extends FrameChannel {
   close(report = false): void {
     for (const retire of this.callRetire) retire.abort();
     this.callRetire = [];
+    for (const retire of this.audioSessionRetire) retire.abort();
+    this.audioSessionRetire.clear();
+    this.actions?.disposeAudioSession?.();
     this.audioRetire?.abort();
     this.audioRetire = null;
     this.audioBusy = false;
@@ -585,12 +642,15 @@ export class ScreenChannel extends FrameChannel {
     const records = accepts.includes(SCREEN_RECORDS_V1);
     const wantsLocale = accepts.includes(SCREEN_LOCALE_V1);
     const wantsAudio = accepts.includes(SCREEN_AUDIO_V1);
+    const wantsAudioV2 = accepts.includes(SCREEN_AUDIO_V2);
+    if (wantsAudio && wantsAudioV2) return false;
     if (wantsLocale && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
-    if (wantsAudio && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
+    if ((wantsAudio || wantsAudioV2) && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
     if (records !== (this.receipt.host_contract === SCREEN_RECORDS_V1) || records && (shape !== "v2" || !accepts.includes(SCREEN_V2) || wantsActions(ready.accepts) || !this.receipt.action_token || !this.actions)) return false;
     this.records = records;
     this.wantsLocale = wantsLocale;
     this.wantsAudio = wantsAudio;
+    this.wantsAudioV2 = wantsAudioV2;
     this.shape = shape;
     // Record the tool/action opt-in: the child may then send `tool` ops,
     // which only run when the host holds a live mount action context.
@@ -691,7 +751,7 @@ export class ScreenChannel extends FrameChannel {
     if (this.shape === "v2" && this.originalDownloadAdmits() && projection.actions?.length) projection.original_downloads = 1;
     if (this.shape === "v2" && this.mediaAdmits("media.read")) projection.media_previews = 1;
     if (this.shape === "v2" && this.mediaAdmits("media.chat.attach")) projection.media_chat_references = 1;
-    if (this.shape === "v2" && this.wantsAudio && this.actions?.captureAudio && this.receipt.action_token && hasBaseActions) projection.audio_capture = 1;
+    if (this.shape === "v2" && ((this.wantsAudio && this.actions?.captureAudio) || (this.wantsAudioV2 && this.actions?.audioSession)) && this.receipt.action_token && hasBaseActions) projection.audio_capture = 1;
     const push = shapeFor(this.records ? projection : this.withMediaVerbs(this.withToolAliases(projection)), this.shape);
     if (!push) { this.close(true); return; }
     this.refs = this.shape === "v2" ? pushedAssetRefs(push) : new Set();

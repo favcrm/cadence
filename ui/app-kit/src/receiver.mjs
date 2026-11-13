@@ -24,7 +24,9 @@ export const DRAWER_CONTEXT_BYTES = 1024;
 export const MAX_PUSH_BYTES = 128 * 1024;
 export const MAX_REPLY_DATA_BYTES = 1024 * 1024;
 export const MAX_AUDIO_TRANSCRIPT_CHARS = 200_000;
+export const MAX_AUDIO_UPLOAD_BYTES = 50 * 1024 * 1024;
 export const SCREEN_AUDIO_V1 = "screen-audio.v1";
+export const SCREEN_AUDIO_V2 = "screen-audio.v2";
 export const HOST_DRAWER_VERBS = Object.freeze(["screen.drawer.open", "screen.drawer.close", "screen.drawer.context"]);
 export const ROUTABLE_ID = /^[a-z0-9_-]{1,64}$/;
 export const ROUTE_RECORD_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -206,6 +208,70 @@ function validAudioCaptureData(value) {
   });
 }
 
+const AUDIO_SESSION_PHASES = new Set([
+  "idle", "starting", "recording", "paused", "stopping", "transcribing", "ready", "error",
+]);
+const AUDIO_SESSION_SNAPSHOT_KEYS =
+  "elapsed_seconds,error,held_at,level,mode,no_speech_segments,peak,phase,segments_done,segments_failed,segments_in_flight,segments_total,session_id,transcript";
+
+function isSafeBoundedInt(value, min, max) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
+}
+
+function isCrossRealmArrayBuffer(value) {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    Object.prototype.toString.call(value) === "[object ArrayBuffer]" &&
+    typeof value.byteLength === "number"
+  );
+}
+
+/** Closed `audio-session-reply` / `audio-session-event` payload matching `parseScreenAudioSessionSnapshot`. */
+function validAudioSessionSnapshot(value) {
+  if (!isPlain(value) || Object.keys(value).sort().join() !== AUDIO_SESSION_SNAPSHOT_KEYS) return null;
+  if (typeof value.session_id !== "string" || !/^[A-Za-z0-9_-]{0,64}$/.test(value.session_id)) return null;
+  if (value.mode !== "record" && value.mode !== "upload") return null;
+  if (typeof value.phase !== "string" || !AUDIO_SESSION_PHASES.has(value.phase)) return null;
+  if (typeof value.held_at !== "string" || value.held_at.length > 64 || (value.phase !== "idle" && value.held_at.length === 0)) {
+    return null;
+  }
+  if (!isSafeBoundedInt(value.elapsed_seconds, 0, 86_400)) return null;
+  if (!isSafeBoundedInt(value.level, 0, 100) || !isSafeBoundedInt(value.peak, 0, 100)) return null;
+  if (
+    !isSafeBoundedInt(value.segments_total, 0, 10_000) ||
+    !isSafeBoundedInt(value.segments_done, 0, 10_000) ||
+    !isSafeBoundedInt(value.segments_in_flight, 0, 10_000) ||
+    !isSafeBoundedInt(value.segments_failed, 0, 10_000) ||
+    !isSafeBoundedInt(value.no_speech_segments, 0, 10_000)
+  ) {
+    return null;
+  }
+  if (typeof value.transcript !== "string" || value.transcript.length > MAX_AUDIO_TRANSCRIPT_CHARS) return null;
+  let parsedError = null;
+  if (value.error !== null) {
+    const refusal = readRefusal(value.error);
+    if (!refusal || Object.keys(value.error).sort().join() !== "code,text") return null;
+    parsedError = Object.freeze({ code: refusal.code, text: refusal.text });
+  }
+  return Object.freeze({
+    session_id: value.session_id,
+    mode: value.mode,
+    phase: value.phase,
+    held_at: value.held_at,
+    elapsed_seconds: value.elapsed_seconds,
+    level: value.level,
+    peak: value.peak,
+    segments_total: value.segments_total,
+    segments_done: value.segments_done,
+    segments_in_flight: value.segments_in_flight,
+    segments_failed: value.segments_failed,
+    no_speech_segments: value.no_speech_segments,
+    transcript: value.transcript,
+    error: parsedError,
+  });
+}
+
 function byteLength(value) {
   try {
     return new TextEncoder().encode(value).length;
@@ -223,6 +289,7 @@ function inert(reason) {
     slot: refuse,
     tool: refuse,
     audioCapture: refuse,
+    audioSession: refuse,
     asset: refuse,
     assetAdmitted: () => false,
     state: () => false,
@@ -248,6 +315,7 @@ export function createScreenReceiver(options = {}) {
     maxArgsBytes = ACTION_ARGS_BYTES,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     onSlotState,
+    onAudioSessionEvent,
     document: documentRef = globalThis.document,
     parent = globalThis.parent,
     window: windowRef = globalThis.window,
@@ -257,14 +325,17 @@ export function createScreenReceiver(options = {}) {
   if (expectedTag !== undefined && (typeof expectedTag !== "string" || !TAG.test(expectedTag))) {
     throw new TypeError("tag must be 1-32 lowercase letters, digits or dashes, not leading with a dash");
   }
-  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-presentation.v1", "screen-surfaces.v1", "screen-records.v1", "screen-locale.v1", SCREEN_AUDIO_V1]);
+  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-presentation.v1", "screen-surfaces.v1", "screen-records.v1", "screen-locale.v1", SCREEN_AUDIO_V1, SCREEN_AUDIO_V2]);
   if (
     !Array.isArray(accepts) ||
     accepts.length === 0 ||
     accepts.some((value) => !ACCEPTED.has(value)) ||
     !accepts.some((value) => value === "screen.v1" || value === "screen.v2")
   ) {
-    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1, screen-media.v1, screen-presentation.v1, screen-surfaces.v1, screen-records.v1, screen-locale.v1 or screen-audio.v1");
+    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1, screen-media.v1, screen-presentation.v1, screen-surfaces.v1, screen-records.v1, screen-locale.v1, screen-audio.v1 or screen-audio.v2");
+  }
+  if (accepts.includes(SCREEN_AUDIO_V1) && accepts.includes(SCREEN_AUDIO_V2)) {
+    throw new TypeError("accepts cannot combine screen-audio.v1 and screen-audio.v2");
   }
   const actionsAccepted = accepts.includes("screen-actions.v1");
   if (actionsAccepted && !accepts.includes("screen.v2")) {
@@ -297,6 +368,10 @@ export function createScreenReceiver(options = {}) {
   if (audioAccepted && !accepts.includes("screen.v2")) {
     throw new TypeError("screen-audio.v1 needs screen.v2");
   }
+  const audioV2Accepted = accepts.includes(SCREEN_AUDIO_V2);
+  if (audioV2Accepted && !accepts.includes("screen.v2")) {
+    throw new TypeError("screen-audio.v2 needs screen.v2");
+  }
   // `screen.v1` is a local PUSH filter. The host's ready envelope admits only
   // v2 contract names, and a v1-only mount sends the bare ready. The host
   // accepts at most six ready capabilities; refuse here rather than let the
@@ -308,7 +383,8 @@ export function createScreenReceiver(options = {}) {
     ...(surfacesAccepted ? ["screen-surfaces.v1"] : []),
     ...(recordsAccepted ? ["screen-records.v1"] : []),
     ...(localeAccepted ? ["screen-locale.v1"] : []),
-    ...(audioAccepted ? [SCREEN_AUDIO_V1] : [])];
+    ...(audioAccepted ? [SCREEN_AUDIO_V1] : []),
+    ...(audioV2Accepted ? [SCREEN_AUDIO_V2] : [])];
   if (readyAccepts.length > 6) throw new TypeError("the host admits at most six ready capabilities");
   const ready = accepts.includes("screen.v2") ? { v: 1, op: "ready", accepts: readyAccepts } : { v: 1, op: "ready" };
   if (!Number.isSafeInteger(maxArgsBytes) || maxArgsBytes <= 0) throw new TypeError("maxArgsBytes must be a positive safe integer");
@@ -428,7 +504,13 @@ export function createScreenReceiver(options = {}) {
     });
   };
 
-  const expectedOp = { call: "reply", slot: "slot-state", tool: "tool-reply", audio: "audio-reply" };
+  const expectedOp = {
+    call: "reply",
+    slot: "slot-state",
+    tool: "tool-reply",
+    audio: "audio-reply",
+    "audio-session": "audio-session-reply",
+  };
 
   /** A reply whose outcome is well-formed for its op. A late/replayed reply
    *  is validated exactly like a waiting one before it can release a gate. */
@@ -439,6 +521,10 @@ export function createScreenReceiver(options = {}) {
     }
     if (message.op === "audio-reply") {
       return (message.ok === true && validAudioCaptureData(message.data) !== null) ||
+        (message.ok === false && readRefusal(message.refusal) !== null);
+    }
+    if (message.op === "audio-session-reply") {
+      return (message.ok === true && validAudioSessionSnapshot(message.data) !== null) ||
         (message.ok === false && readRefusal(message.refusal) !== null);
     }
     return message.ok === true || (message.ok === false && readRefusal(message.refusal) !== null);
@@ -497,7 +583,14 @@ export function createScreenReceiver(options = {}) {
     }
     const refusal = message.ok === false ? readRefusal(message.refusal) : null;
     const audioData = message.op === "audio-reply" && message.ok === true ? validAudioCaptureData(message.data) : null;
-    if ((message.ok !== true && !(message.ok === false && refusal)) || (message.op === "audio-reply" && message.ok === true && !audioData)) {
+    const audioSessionData = message.op === "audio-session-reply" && message.ok === true
+      ? validAudioSessionSnapshot(message.data)
+      : null;
+    if (
+      (message.ok !== true && !(message.ok === false && refusal)) ||
+      (message.op === "audio-reply" && message.ok === true && !audioData) ||
+      (message.op === "audio-session-reply" && message.ok === true && !audioSessionData)
+    ) {
       // Throw before removal: teardown then rejects this entry with the rest.
       throw new Error(`malformed ${message.op} reply`);
     }
@@ -510,7 +603,15 @@ export function createScreenReceiver(options = {}) {
         admitted.add(ref);
       }
     }
-    if (message.ok === true) entry.resolve(message.op === "audio-reply" ? audioData : message.data);
+    if (message.ok === true) {
+      entry.resolve(
+        message.op === "audio-reply"
+          ? audioData
+          : message.op === "audio-session-reply"
+            ? audioSessionData
+            : message.data,
+      );
+    }
     else entry.reject(new ScreenRefusalError(refusal));
     return true;
   };
@@ -536,8 +637,24 @@ export function createScreenReceiver(options = {}) {
         entry.resolve(message.data_url);
         return;
       }
-      if (message.op === "reply" || message.op === "tool-reply" || message.op === "audio-reply" || message.op === "slot-state") {
+      if (
+        message.op === "reply" ||
+        message.op === "tool-reply" ||
+        message.op === "audio-reply" ||
+        message.op === "audio-session-reply" ||
+        message.op === "slot-state"
+      ) {
         if (!settle(message)) fail(`reply for an id this mount never sent: ${message.id}`);
+        return;
+      }
+      if (message.op === "audio-session-event") {
+        if (!audioV2Accepted) fail("audio-session-event without the opt-in");
+        if (message.v !== 2 || Object.keys(message).sort().join() !== "op,state,v") {
+          fail("invalid audio-session-event envelope");
+        }
+        const stateSnapshot = validAudioSessionSnapshot(message.state);
+        if (!stateSnapshot) fail("invalid audio-session-event state");
+        onAudioSessionEvent?.(stateSnapshot);
         return;
       }
       if (message.op === "surface") {
@@ -752,6 +869,76 @@ export function createScreenReceiver(options = {}) {
       });
       return pendingAudio;
     },
+    audioSession(command = {}) {
+      if (!audioV2Accepted) {
+        return Promise.reject(new ScreenClosedError('the inline audio channel needs accepts to include "screen-audio.v2"'));
+      }
+      if (!isPlain(command)) {
+        return Promise.reject(new TypeError("audioSession command must be a plain object"));
+      }
+      const action = command.action;
+      const wait = command.timeoutMs;
+      if (wait !== undefined && !(Number.isSafeInteger(wait) && wait > 0 && wait <= 2147483647)) {
+        return Promise.reject(new TypeError("audioSession timeoutMs must be a positive integer"));
+      }
+      const validLanguage = (lang) => lang === "" || lang === "en" || lang === "zh";
+      let body = null;
+      if (action === "start") {
+        if (!exactKeys(command, ["action", "language", "timeoutMs"])) {
+          return Promise.reject(new TypeError("audioSession start accepts only action, language and timeoutMs"));
+        }
+        if (command.language !== undefined && !validLanguage(command.language)) {
+          return Promise.reject(new TypeError('audioSession language must be "", "en" or "zh"'));
+        }
+        body = {
+          action: "start",
+          ...(command.language !== undefined ? { language: command.language } : {}),
+        };
+      } else if (
+        action === "pause" ||
+        action === "resume" ||
+        action === "stop" ||
+        action === "retry" ||
+        action === "cancel"
+      ) {
+        if (!exactKeys(command, ["action", "timeoutMs"])) {
+          return Promise.reject(new TypeError(`audioSession ${action} accepts only action and timeoutMs`));
+        }
+        body = { action };
+      } else if (action === "upload") {
+        if (!exactKeys(command, ["action", "bytes", "mimeType", "fileName", "lastModified", "language", "timeoutMs"])) {
+          return Promise.reject(new TypeError("audioSession upload has unknown keys"));
+        }
+        if (!isCrossRealmArrayBuffer(command.bytes) || command.bytes.byteLength <= 0 || command.bytes.byteLength > MAX_AUDIO_UPLOAD_BYTES) {
+          return Promise.reject(new TypeError("audioSession upload bytes must be a non-empty ArrayBuffer up to 50 MiB"));
+        }
+        if (typeof command.mimeType !== "string" || command.mimeType.length > 128) {
+          return Promise.reject(new TypeError("audioSession upload mimeType must be a string of at most 128 characters"));
+        }
+        if (command.fileName !== undefined && (typeof command.fileName !== "string" || command.fileName.length > 255)) {
+          return Promise.reject(new TypeError("audioSession upload fileName must be a string of at most 255 characters"));
+        }
+        if (command.lastModified !== undefined && !isSafeBoundedInt(command.lastModified, 0, 8_640_000_000_000_000)) {
+          return Promise.reject(new TypeError("audioSession upload lastModified must be a non-negative safe integer"));
+        }
+        if (command.language !== undefined && !validLanguage(command.language)) {
+          return Promise.reject(new TypeError('audioSession language must be "", "en" or "zh"'));
+        }
+        body = {
+          action: "upload",
+          bytes: command.bytes,
+          mime_type: command.mimeType,
+          ...(command.fileName !== undefined ? { file_name: command.fileName } : {}),
+          ...(command.lastModified !== undefined ? { last_modified: command.lastModified } : {}),
+          ...(command.language !== undefined ? { language: command.language } : {}),
+        };
+      } else {
+        return Promise.reject(new TypeError('audioSession action must be "start", "pause", "resume", "stop", "upload", "retry" or "cancel"'));
+      }
+      if (tornDown) return Promise.reject(new ScreenClosedError("screen bridge is closed"));
+      if (!liveV2) return Promise.reject(new ScreenClosedError("the action channel opens only after a screen.v2 PUSH"));
+      return request("audio-session", body, undefined, wait ?? null);
+    },
     /** True once a call reply named `ref` as served now; an older host never says so. It
      *  stays true: decide from the latest reply's own data (e.g. a draft still has an image). */
     assetAdmitted(ref) {
@@ -877,6 +1064,12 @@ export function createScreenBridge(options = {}) {
   const observationSet = new Set(observationVerbs);
   const allowedPushKeys = [...pushKeys];
   const singleFlightRules = [...singleFlight];
+  const negotiatedAudio =
+    audio === "v2" ? [SCREEN_AUDIO_V2]
+      : audio === true || audio === "v1" ? [SCREEN_AUDIO_V1]
+        : audio === false ? []
+          : null;
+  if (negotiatedAudio === null) fail('audio must be a boolean, "v1", or "v2"');
   const negotiatedAccepts = [
     "screen.v2",
     ...(actions ? ["screen-actions.v1"] : []),
@@ -885,7 +1078,7 @@ export function createScreenBridge(options = {}) {
     ...(surfaces ? ["screen-surfaces.v1"] : []),
     ...(records ? ["screen-records.v1"] : []),
     ...(locale ? ["screen-locale.v1"] : []),
-    ...(audio ? [SCREEN_AUDIO_V1] : []),
+    ...negotiatedAudio,
   ];
   if (negotiatedAccepts.length > 6) fail("the host admits at most six ready capabilities");
 
@@ -898,6 +1091,7 @@ export function createScreenBridge(options = {}) {
   });
 
   let currentState = makeState({ status: "loading", snapshot: null, error: null, pushes: 0, surface: initialSurface });
+  let latestAudioSession = null;
   let receiver = null;
   let retired = false;
   let retiredCause = null;
@@ -905,8 +1099,13 @@ export function createScreenBridge(options = {}) {
   const activeSingleFlight = new Set();
   const listeners = new Set();
   const writeListeners = new Set();
+  const audioSessionListeners = new Set();
   const notify = () => { for (const listener of [...listeners]) listener(); };
   const notifyWritten = () => { for (const listener of [...writeListeners]) listener(); };
+  const publishAudioSession = (snap) => {
+    latestAudioSession = snap;
+    for (const listener of [...audioSessionListeners]) listener(snap);
+  };
 
   const setState = (next) => {
     currentState = makeState({
@@ -1022,6 +1221,7 @@ export function createScreenBridge(options = {}) {
     retiredCause = err;
     const live = receiver;
     receiver = null;
+    latestAudioSession = null;
     live?.teardown();
     setState({ status: "error", snapshot: null, error: err });
   };
@@ -1151,6 +1351,9 @@ export function createScreenBridge(options = {}) {
         ...(runtime.window !== undefined ? { window: runtime.window } : {}),
         ...(runtime.MessageChannel !== undefined ? { MessageChannel: runtime.MessageChannel } : {}),
         ...(runtime.onSlotState !== undefined ? { onSlotState: runtime.onSlotState } : {}),
+        onAudioSessionEvent(snap) {
+          if (!retired) publishAudioSession(snap);
+        },
         onPresentation(mode) {
           if (!retired && !surfaces) {
             setState({ surface: Object.freeze({ role: mode === "drawer" ? "drawer" : "primary", name: undefined, modal: false }) });
@@ -1202,6 +1405,39 @@ export function createScreenBridge(options = {}) {
         },
       );
     },
+    audioSession(scope, command = {}) {
+      const live = receiver;
+      if (!live || retired) return Promise.reject(retiredCause ?? makeError("Screen bridge is unavailable", 503, { code: "unavailable" }));
+      try {
+        assertScope(scope);
+        if (!canAudioCapture()) throw makeError("This workspace doesn't offer audio capture.", 403, { code: "forbidden" });
+      } catch (syncError) {
+        return Promise.reject(syncError);
+      }
+      return live.audioSession(command).then(
+        (value) => {
+          try {
+            const guarded = guardData(value);
+            publishAudioSession(guarded);
+            return guarded;
+          } catch (err) {
+            const mapped = mapError(err);
+            retire(mapped);
+            throw mapped;
+          }
+        },
+        (err) => {
+          const mapped = mapError(err);
+          if (mapped.status === 401 || mapped.status === 502) retire(mapped);
+          throw mapped;
+        },
+      );
+    },
+    getAudioSession: () => latestAudioSession,
+    onAudioSession(listener) {
+      audioSessionListeners.add(listener);
+      return () => { audioSessionListeners.delete(listener); };
+    },
     asset(scope, ref, assetOptions) {
       const live = receiver;
       if (!live || retired) return Promise.reject(retiredCause ?? makeError("Screen bridge is unavailable", 503, { code: "unavailable" }));
@@ -1250,6 +1486,7 @@ export function createScreenBridge(options = {}) {
     reset() {
       const live = receiver;
       receiver = null;
+      latestAudioSession = null;
       live?.teardown();
       retired = false;
       retiredCause = null;

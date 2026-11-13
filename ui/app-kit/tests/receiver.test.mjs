@@ -5,9 +5,11 @@ import {
   HOST_DRAWER_VERBS,
   MAX_ASSET_BYTES,
   MAX_AUDIO_TRANSCRIPT_CHARS,
+  MAX_AUDIO_UPLOAD_BYTES,
   MAX_REPLY_DATA_BYTES,
   MAX_STATE_BYTES,
   SCREEN_AUDIO_V1,
+  SCREEN_AUDIO_V2,
   ScreenBridgeError,
   ScreenClosedError,
   ScreenRefusalError,
@@ -1264,4 +1266,154 @@ test("createScreenBridge projects audioCapture, preserves state on cancel/refusa
   second.host.postMessage(fullPush({ actions: ["records.list"], audio_capture: 2 }));
   await waitFor(() => bridge.getState().status === "error", "forged audio_capture error");
   assert.equal(bridge.getState().error.status, 502);
+});
+
+const sessionSnapshot = (overrides = {}) => ({
+  session_id: "sess_01",
+  mode: "record",
+  phase: "recording",
+  held_at: "2026-11-13T05:00:00.000Z",
+  elapsed_seconds: 12,
+  level: 44,
+  peak: 68,
+  segments_total: 1,
+  segments_done: 1,
+  segments_in_flight: 0,
+  segments_failed: 0,
+  no_speech_segments: 0,
+  transcript: "Inline transcript ready.",
+  error: null,
+  ...overrides,
+});
+
+test("screen-audio.v2 negotiates mutually exclusively with v1, validates audioSession commands, and streams events", async () => {
+  assert.equal(SCREEN_AUDIO_V2, "screen-audio.v2");
+  assert.throws(
+    () => connect({ accepts: ["screen.v2", SCREEN_AUDIO_V1, SCREEN_AUDIO_V2] }),
+    /cannot combine screen-audio\.v1 and screen-audio\.v2/,
+  );
+
+  const unopted = connect({ accepts: ["screen.v2"] });
+  unopted.host.postMessage(push());
+  await waitFor(() => unopted.pushes.length === 1, "unopted push");
+  await assert.rejects(unopted.receiver.audioSession({ action: "start" }), ScreenClosedError);
+  unopted.host.postMessage({ v: 2, op: "audio-session-event", state: sessionSnapshot() });
+  await waitFor(() => unopted.errors.length === 1, "unsolicited audio-session-event teardown");
+
+  const events = [];
+  const { receiver, host, inbox, pushes, errors } = connect({
+    accepts: ["screen.v2", SCREEN_AUDIO_V2],
+    onAudioSessionEvent: (snap) => events.push(snap),
+  });
+  await tick();
+  assert.deepEqual(inbox[0], { v: 1, op: "ready", accepts: ["screen.v2", "screen-audio.v2"] });
+  host.postMessage(push({ audio_capture: 1 }));
+  await waitFor(() => pushes.length === 1, "audio v2 push");
+
+  await assert.rejects(receiver.audioSession({ action: "unknown" }), TypeError);
+  await assert.rejects(receiver.audioSession({ action: "start", language: "fr" }), TypeError);
+  await assert.rejects(receiver.audioSession({ action: "pause", extra: true }), TypeError);
+  await assert.rejects(
+    receiver.audioSession({ action: "upload", bytes: new ArrayBuffer(0), mimeType: "audio/wav" }),
+    TypeError,
+  );
+  await assert.rejects(
+    receiver.audioSession({
+      action: "upload",
+      bytes: { [Symbol.toStringTag]: "ArrayBuffer", byteLength: MAX_AUDIO_UPLOAD_BYTES + 1 },
+      mimeType: "audio/wav",
+    }),
+    TypeError,
+  );
+
+  // Streaming host events reach onAudioSessionEvent frozen.
+  host.postMessage({ v: 2, op: "audio-session-event", state: sessionSnapshot({ level: 71, peak: 85 }) });
+  await waitFor(() => events.length === 1, "streamed audio-session-event");
+  assert.equal(events[0].level, 71);
+  assert.equal(Object.isFrozen(events[0]), true);
+
+  // Start, pause, stop, and upload round-trip cleanly.
+  const starting = receiver.audioSession({ action: "start", language: "zh" });
+  const startMsg = await waitFor(() => inbox.find((m) => m.op === "audio-session"), "start request");
+  assert.deepEqual(startMsg, { v: 2, op: "audio-session", id: startMsg.id, action: "start", language: "zh" });
+  host.postMessage({ v: 2, op: "audio-session-reply", id: startMsg.id, ok: true, data: sessionSnapshot() });
+  assert.equal((await starting).phase, "recording");
+
+  const buf = new Uint8Array([1, 2, 3, 4]).buffer;
+  const uploading = receiver.audioSession({
+    action: "upload",
+    bytes: buf,
+    mimeType: "audio/mp4",
+    fileName: "memo.m4a",
+    lastModified: 1_763_000_000_000,
+    language: "",
+  });
+  const uploadMsg = await waitFor(
+    () => inbox.find((m) => m.op === "audio-session" && m.action === "upload"),
+    "upload request",
+  );
+  assert.equal(uploadMsg.mime_type, "audio/mp4");
+  assert.equal(uploadMsg.file_name, "memo.m4a");
+  assert.equal(uploadMsg.last_modified, 1_763_000_000_000);
+  assert.equal(uploadMsg.bytes.byteLength, 4);
+  const uploadDone = sessionSnapshot({ mode: "upload", phase: "ready", transcript: "Uploaded clip." });
+  host.postMessage({ v: 2, op: "audio-session-reply", id: uploadMsg.id, ok: true, data: uploadDone });
+  assert.deepEqual(await uploading, uploadDone);
+  assert.deepEqual(errors, []);
+
+  // Malformed audio-session-event tears down the port.
+  host.postMessage({ v: 2, op: "audio-session-event", state: { ...sessionSnapshot(), level: 101 } });
+  await waitFor(() => errors.length === 1, "malformed audio-session-event teardown");
+});
+
+test("createScreenBridge audio: 'v2' streams audioSession snapshots and preserves bridge state on user/device refusals", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes",
+    appName: "notes",
+    records: true,
+    locale: true,
+    audio: "v2",
+    calls: { "records.list": ["query"] },
+  });
+  const observed = [];
+  const unsub = bridge.onAudioSession((snap) => observed.push(snap));
+  const { host, inbox } = startBridge(bridge);
+  await tick();
+  assert.deepEqual(inbox[0], {
+    v: 1,
+    op: "ready",
+    accepts: ["screen.v2", "screen-records.v1", "screen-locale.v1", "screen-audio.v2"],
+  });
+
+  host.postMessage(fullPush({ actions: ["records.list"], audio_capture: 1 }));
+  await waitFor(() => bridge.getState().status === "ready", "ready with audio v2");
+  assert.equal(bridge.canAudioCapture(), true);
+  const { scope } = bridge.getSnapshot();
+
+  host.postMessage({ v: 2, op: "audio-session-event", state: sessionSnapshot({ elapsed_seconds: 5 }) });
+  await waitFor(() => observed.length === 1, "bridge streamed session event");
+  assert.equal(bridge.getAudioSession().elapsed_seconds, 5);
+
+  const micDenied = bridge.audioSession(scope, { action: "start" });
+  const micMsg = await waitFor(() => inbox.find((m) => m.op === "audio-session"), "mic_unavailable start");
+  host.postMessage({
+    v: 2,
+    op: "audio-session-reply",
+    id: micMsg.id,
+    ok: false,
+    refusal: { code: "mic_unavailable", text: "Microphone access was blocked." },
+  });
+  await assert.rejects(micDenied, (err) => err.code === "mic_unavailable");
+  assert.equal(bridge.getState().status, "ready", "mic refusal keeps bridge alive");
+
+  const stopped = bridge.audioSession(scope, { action: "stop" });
+  const stopMsg = await waitFor(
+    () => inbox.find((m) => m.op === "audio-session" && m.action === "stop"),
+    "stop session",
+  );
+  const readySnap = sessionSnapshot({ phase: "ready", elapsed_seconds: 34, transcript: "Final line." });
+  host.postMessage({ v: 2, op: "audio-session-reply", id: stopMsg.id, ok: true, data: readySnap });
+  assert.deepEqual(await stopped, readySnap);
+  assert.equal(bridge.getAudioSession().phase, "ready");
+  unsub();
 });
