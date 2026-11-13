@@ -1770,13 +1770,23 @@ for (const mode of ["404", "unavailable"] as const) {
   assert(text(el(m.host, '.bz-body [role="status"]')).includes("view only"), "and the state is not silent to assistive tech");
   await advance(20_000);
   equal(board.views, 1, "never a viewer request while active");
-  // The assistant hands over again: the same frame takes input and the reopen route returns.
-  board.body = takeover;
+  // The assistant hands over again, with a new request: the kept frame does not
+  // carry over, so nothing takes input until the person opens a fresh view.
+  board.body = { ...takeover, url: "https://portal.example.test/orders/confirm", instructions: "Please confirm the order." };
   await advance(2000);
-  assert(el(m.host, "iframe[data-bz-frame]") === frame && !el(m.host, ".bz-viewer")!.hasAttribute("inert"), "a later handoff lifts inert on the same frame");
-  assert(btn(m, "view"), "and the reopen control is back");
+  assert(!frame.isConnected && !el(m.host, "iframe"), "a new takeover does not inherit the kept frame");
+  assert(text(el(m.host, ".bz-says")).includes("Please confirm the order."), "the assistant's new request is shown");
+  equal(btn(m, "view")?.getAttribute("aria-label"), "Open live view", "opening a view is the explicit way in");
+  equal(board.views, 1, "no viewer request until the person asks");
+  await click(btn(m, "view")!);
+  equal(board.views, 2, "a fresh viewer URL, on purpose");
+  const again = el(m.host, "iframe[data-bz-frame]") as HTMLIFrameElement;
+  assert(again && again !== frame, "in a new frame");
+  await React.act(async () => { again.dispatchEvent(new win.Event("load")); });
+  await settle();
   board.body = read;
   await advance(2000);
+  assert(el(m.host, "iframe[data-bz-frame]") === again && el(m.host, ".bz-viewer")!.hasAttribute("inert"), "Done again: the new frame stays, view only");
   // Stop from the view-only state.
   await click(btn(m, "stop")!);
   await click(btn(m, "go")!);

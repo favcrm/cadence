@@ -196,7 +196,15 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
   // has succeeded. A frame already open when the person presses Done stays, view
   // only (inert), while the assistant reads on: the same node, never reloaded.
   const viewOnly = phase === "active" && viewer.phase === "open" && !fetching;
-  const showFrame = viewing && (phase === "handoff" || viewOnly);
+  // A new takeover never inherits the frame kept view only: the person sees the
+  // assistant's new request and opens a fresh view on purpose. It is hidden in
+  // the same render the takeover arrives in (no moment where it takes input),
+  // then torn down.
+  const [kept, setKept] = useState<number | null>(null);
+  const frameN = viewer.phase === "loading" || viewer.phase === "open" ? viewer.n : null;
+  const carried = phase === "handoff" && frameN !== null && frameN === kept;
+  const fresh = viewing && !carried;
+  const showFrame = viewing && ((phase === "handoff" && !carried) || viewOnly);
   const asking = phase === "handoff" && !stopping && !showFrame;
   const loadingUrl = viewer.phase === "loading" ? viewer.url : null;
   const instructions = b.session?.instructions ?? "";
@@ -236,6 +244,16 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
       setViewer({ phase: "idle" });
     }
   }, [phase, viewer.phase, fetching, viewOnly]);
+  useEffect(() => {
+    if (viewOnly && frameN !== null) setKept(frameN);
+  }, [viewOnly, frameN]);
+  useEffect(() => {
+    if (!carried) return;
+    attempt.current++;
+    setFetching(false);
+    setViewer({ phase: "idle" });
+    setKept(null);
+  }, [carried]);
 
   // Focus inside the frame goes with the takeover: it moves to the tab, or the
   // heading, never onto Stop, and only if the person is still where the view was.
@@ -285,7 +303,7 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
     claim.current = null;
     const specific =
       b.stop === "failed" ? '[data-bz-act="stop"]'
-      : phase === "handoff" && !viewing ? '[data-bz-act="view"]'
+      : phase === "handoff" && !fresh ? '[data-bz-act="view"]'
       : null;
     (specific ? root.current?.querySelector<HTMLElement>(specific) : null)?.focus();
     if (document.activeElement === document.body) (document.getElementById("bz-tab") ?? heading.current)?.focus();
@@ -407,7 +425,7 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, on
   } else if (live) {
     dock = (
       <>
-        {phase === "handoff" && viewing ? (
+        {phase === "handoff" && fresh ? (
           <button key="view" type="button" className="cv-iconbtn" data-bz-act="view" aria-disabled={wait} aria-label={t("Open live view again")} title={t("Open live view again")} onClick={onView}>
             {spin ?? <Icon d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5" />}
           </button>
